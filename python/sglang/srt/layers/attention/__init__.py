@@ -63,9 +63,7 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
     ):
         """Run forward on an attention layer."""
-        if forward_batch.forward_mode.is_spec_verify():
-            return self.forward_extend(q, k, v, layer, forward_batch)
-        elif forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode():
             return self.forward_decode(q, k, v, layer, forward_batch)
         else:
             return self.forward_extend(q, k, v, layer, forward_batch)

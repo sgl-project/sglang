@@ -323,7 +323,7 @@ class EAGLEDraftInput(SpecDraftInput):
                 topk_cs_index + (self.topk**2 * (self.iter - 1) + self.topk)
             )  # b, topk
 
-        elif self.prev_mode in (ForwardMode.EXTEND, ForwardMode.SPEC_EXTEND):
+        elif self.prev_mode in (ForwardMode.EXTEND, ForwardMode.DRAFT_EXTEND):
             self.scores = topk_p  # b, top_k
             self.score_list.append(topk_p.unsqueeze(1))
             self.token_list.append(topk_index)

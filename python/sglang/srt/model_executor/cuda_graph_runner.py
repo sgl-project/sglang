@@ -136,7 +136,7 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_runner:
                 expand_num = self.model_runner.server_args.eagle_topk
             else:
-                self.capture_forward_mode = ForwardMode.SPEC_VERIFY
+                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
                 expand_num = self.model_runner.server_args.num_draft_tokens
             self.num_tokens = [bs * expand_num for bs in self.capture_bs]
         else:

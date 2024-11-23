@@ -79,9 +79,9 @@ class ForwardMode(IntEnum):
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
     # Speculative Verify stage
-    SPEC_VERIFY = auto()
+    TARGET_VERIFY = auto()
     # Speculative draft Extend stage which after verify stage
-    SPEC_EXTEND = auto()
+    DRAFT_EXTEND = auto()
     # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
 
@@ -96,23 +96,24 @@ class ForwardMode(IntEnum):
         return self in (
             ForwardMode.EXTEND,
             ForwardMode.MIXED,
-            ForwardMode.SPEC_EXTEND,
+            ForwardMode.DRAFT_EXTEND,
+            ForwardMode.TARGET_VERIFY,
         )
 
     def is_decode(self):
-        return self in (ForwardMode.DECODE, ForwardMode.SPEC_VERIFY)
+        return self == ForwardMode.DECODE
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
 
-    def is_spec_verify(self):
-        return self == ForwardMode.SPEC_VERIFY
+    def is_target_verify(self):
+        return self == ForwardMode.TARGET_VERIFY
 
-    def is_spec_extend(self):
-        return self == ForwardMode.SPEC_EXTEND
+    def is_draft_extend(self):
+        return self == ForwardMode.DRAFT_EXTEND
 
     def is_cuda_graph(self):
-        return self in (ForwardMode.DECODE, ForwardMode.SPEC_VERIFY)
+        return self in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
 
     def is_idle(self):
         return self == ForwardMode.IDLE

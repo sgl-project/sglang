@@ -191,7 +191,10 @@ class LogitsProcessor(nn.Module):
         assert isinstance(logits_metadata, LogitsMetadata)
 
         # Get the last hidden states and last logits for the next token prediction
-        if logits_metadata.forward_mode.is_decode():
+        if (
+            logits_metadata.forward_mode.is_decode()
+            or logits_metadata.forward_mode.is_target_verify()
+        ):
             last_index = None
             last_hidden = hidden_states
         else:

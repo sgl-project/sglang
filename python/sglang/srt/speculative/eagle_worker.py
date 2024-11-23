@@ -104,7 +104,7 @@ class EAGLEWorker(SpeculativeWorker):
 
     def verify(self, batch: ScheduleBatch):
         verify_input = batch.spec_info.prepare_for_verify(batch)
-        batch.forward_mode = ForwardMode.SPEC_VERIFY
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
         verify_input.prepare_for_verify(batch)
         batch.spec_info = verify_input
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -123,7 +123,7 @@ class EAGLEWorker(SpeculativeWorker):
 
     def forward_extend_after_decode(self, batch: ScheduleBatch):
         self._swap_mem_pool(batch, self.model_runner)
-        batch.forward_mode = ForwardMode.SPEC_EXTEND
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
         if batch.spec_info.has_finished:
             index = batch.spec_info.unfinished_index
             seq_lens = batch.seq_lens

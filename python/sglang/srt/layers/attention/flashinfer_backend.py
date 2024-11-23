@@ -129,24 +129,30 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
-            wrappers = (
-                self.prefill_wrappers_verify
-                if forward_batch.forward_mode.is_spec_verify()
-                else self.decode_wrappers
-            )
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
-                decode_wrappers=wrappers,
+                decode_wrappers=None,
                 encoder_lens=forward_batch.encoder_lens,
                 forward_batch=forward_batch,
             )
-            if forward_batch.forward_mode.is_spec_verify():
-                self.forward_metadata = (False, False, None)
-            else:
-                self.forward_metadata = (wrappers,)
-        elif forward_batch.forward_mode.is_spec_extend():
+            self.forward_metadata = (self.decode_wrappers,)
+        elif forward_batch.forward_mode.is_draft_extend():
+            use_ragged = False
+            extend_no_prefix = True
+            prefix_lens = None
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                prefix_lens,
+                use_ragged=use_ragged,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_batch=forward_batch,
+            )
+            self.forward_metadata = (use_ragged, extend_no_prefix, None)
+        elif forward_batch.forward_mode.is_target_verify():
             use_ragged = False
             extend_no_prefix = True
             prefix_lens = None
@@ -164,11 +170,7 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Some heuristics to check whether to use ragged forward
-            if (
-                forward_batch.extend_num_tokens >= 4096
-                and self.num_wrappers == 1
-                and not forward_batch.forward_mode.is_spec_verify()
-            ):
+            if forward_batch.extend_num_tokens >= 4096 and self.num_wrappers == 1:
                 use_ragged = True
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             else:
@@ -217,7 +219,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch = None,
     ):
         decode_wrappers = []
-        # speculative decodign verify stage
+        # speculative decoding verify stage
         if spec_info is not None and not is_draft_runner:
             for i in range(self.num_wrappers):
                 decode_wrappers.append(
@@ -233,6 +235,17 @@ class FlashInferAttnBackend(AttentionBackend):
                         qk_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                     )
                 )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                prefix_lens=None,
+                use_ragged=False,
+                encoder_lens=encoder_lens,
+                forward_batch=forward_batch,
+            )
+            self.cuda_graph_metadata[num_token] = decode_wrappers
             self.forward_metadata = (False, False, decode_wrappers)
 
         else:
@@ -250,16 +263,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             self.forward_metadata = (decode_wrappers,)
 
-        seq_lens_sum = seq_lens.sum().item()
-        self.indices_updater_decode.update(
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            decode_wrappers=decode_wrappers,
-            encoder_lens=encoder_lens,
-            forward_batch=forward_batch,
-        )
-        self.cuda_graph_metadata[num_token] = decode_wrappers
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_decode.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                decode_wrappers=decode_wrappers,
+                encoder_lens=encoder_lens,
+                forward_batch=forward_batch,
+            )
+            self.cuda_graph_metadata[num_token] = decode_wrappers
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -271,7 +284,11 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens=None,
         forward_batch=None,
     ):
-        self.indices_updater_decode.update(
+        if forward_batch is not None and forward_batch.forward_mode.is_target_verify():
+            updater = self.indices_updater_prefill
+        else:
+            updater = self.indices_updater_decode
+        updater.update(
             req_pool_indices[:bs],
             seq_lens[:bs],
             seq_lens_sum,
@@ -286,7 +303,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def forward_extend(
         self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
     ):
-        if forward_batch.forward_mode.is_spec_verify():
+        if forward_batch.forward_mode.is_target_verify():
             prefill_wrapper_paged = self.prefill_wrappers_verify[
                 self._get_wrapper_idx(layer)
             ]
@@ -308,7 +325,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
             if (
                 graph_wrapper is not None
-                and forward_batch.forward_mode.is_spec_verify()
+                and forward_batch.forward_mode.is_target_verify()
             ):
                 o = graph_wrapper[self._get_wrapper_idx(layer)].forward(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -555,34 +572,18 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
 
-        if forward_batch is not None and forward_batch.forward_mode.is_spec_verify():
-            bs = len(req_pool_indices)
-            custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
-            wrapper.end_forward()
-            wrapper.begin_forward(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                custom_mask=custom_mask,
-            )
-        else:
-            wrapper.end_forward()
-            wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                data_type=self.data_type,
-                q_data_type=self.q_data_type,
-            )
+        wrapper.end_forward()
+        wrapper.begin_forward(
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len[:bs],
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            data_type=self.data_type,
+            q_data_type=self.q_data_type,
+        )
 
 
 class FlashInferIndicesUpdaterPrefill:
@@ -608,6 +609,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.wrappers_paged = attn_backend.prefill_wrappers_paged
+        self.wrappers_verify = attn_backend.prefill_wrappers_verify
 
         # Dispatch
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -756,7 +758,7 @@ class FlashInferIndicesUpdaterPrefill:
         forward_batch: ForwardBatch = None,
     ):
         bs = len(req_pool_indices)
-        if forward_batch is not None and forward_batch.forward_mode.is_spec_extend():
+        if forward_batch is not None and forward_batch.forward_mode.is_draft_extend():
             # spec extend update generate arg
             kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
                 forward_batch.spec_info.generate_attn_arg_spec_extend(
@@ -764,6 +766,29 @@ class FlashInferIndicesUpdaterPrefill:
                     paged_kernel_lens,
                     self.req_to_token,
                 )
+            )
+        elif (
+            forward_batch is not None and forward_batch.forward_mode.is_target_verify()
+        ):
+            kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
+                forward_batch.spec_info.generate_attn_arg(
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    self.req_to_token,
+                )
+            )
+            custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
+            self.wrappers_verify[0].end_forward()
+            self.wrappers_verify[0].begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                custom_mask=custom_mask,
             )
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)

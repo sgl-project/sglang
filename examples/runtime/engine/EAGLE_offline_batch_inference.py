@@ -10,19 +10,16 @@ def main():
         "The future of AI is",
     ]
     # Create a sampling params object.
-    sampling_params = {"temperature": 0, "max_new_tokens": 256}
+    sampling_params = {"temperature": 0, "max_new_tokens": 30}
 
     # Create an LLM.
     llm = sgl.Engine(
         model_path="meta-llama/Llama-2-7b-chat-hf",
         draft_model_path="kavio/Sglang-EAGLE-llama2-chat-7B",
-        disable_radix_cache=True,
-        disable_overlap_schedule=True,
+        speculative_algorithm="EAGLE",
         num_speculative_steps=3,
         eagle_topk=4,
         num_draft_tokens=16,
-        speculative_algorithm="EAGLE",
-        mem_fraction_static=0.70,
     )
 
     outputs = llm.generate(prompts, sampling_params)
