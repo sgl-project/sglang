@@ -952,7 +952,11 @@ async def benchmark(
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
-    print("{:<40} {:<10}".format("Max reqeuest concurrency:", max_concurrency))
+    print(
+        "{:<40} {:<10}".format(
+            "Max reqeuest concurrency:", max_concurrency if max_concurrency else "not set"
+        )
+    )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
