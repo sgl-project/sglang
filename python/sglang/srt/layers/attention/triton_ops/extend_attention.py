@@ -29,6 +29,8 @@ is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
+is_hip_ = is_hip()
+
 
 @triton.jit
 def tanh(x):
@@ -311,7 +313,7 @@ def extend_attention_fwd(
     num_stages = 1
 
     extra_kargs = {}
-    if is_hip():
+    if is_hip_:
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
