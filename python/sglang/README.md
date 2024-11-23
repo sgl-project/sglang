@@ -11,4 +11,5 @@
 - `check_env.py`: Check the environment variables.
 - `global_config.py`: The global configs and constants.
 - `launch_server.py`: The entry point for launching the local server.
+- `launch_debug_server.py`: The entry point for launching the debug server + web app
 - `utils.py`: Common utilities.

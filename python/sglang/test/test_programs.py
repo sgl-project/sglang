@@ -550,3 +550,22 @@ def test_gen_min_new_tokens():
 
     state = convo_1.run()
     assert_min_tokens(tokenizer, state["answer"])
+
+
+def test_debug_server():
+    """
+    Validate debug server works.
+
+    As long as it doesn't crash it's fine, it's on the debug studio to not
+    release regressions
+    """
+
+    @sgl.function
+    def text_qa(s, question):
+        s.begin_debug_region("TEXT_QA")
+        s += "Q: " + question + "\n"
+        s += "A:" + sgl.gen("answer", stop="\n")
+
+    state = text_qa.run(
+        question="What is the capital of France?", temperature=0.1, stream=True
+    )

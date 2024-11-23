@@ -1,3 +1,5 @@
+import uuid
+from datetime import datetime
 from typing import Mapping, Optional
 
 from sglang.lang.backend.base_backend import BaseBackend
@@ -57,6 +59,21 @@ class LiteLLM(BaseBackend):
         else:
             messages = [{"role": "user", "content": s.text_}]
 
+        debug_request_id = str(uuid.uuid4())
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": str(messages),
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": {
+                        **self.client_params,
+                        **sampling_params.to_litellm_kwargs(),
+                    },
+                }
+            ]
+        )
+
         ret = litellm.completion(
             model=self.model_name,
             messages=messages,
@@ -64,6 +81,17 @@ class LiteLLM(BaseBackend):
             **sampling_params.to_litellm_kwargs(),
         )
         comp = ret.choices[0].message.content
+
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "responseContent": comp,
+                    "responseTimestamp": datetime.now().isoformat(),
+                    "responseMetadata": ret.to_json(),
+                }
+            ]
+        )
 
         return comp, {}
 
@@ -77,6 +105,21 @@ class LiteLLM(BaseBackend):
         else:
             messages = [{"role": "user", "content": s.text_}]
 
+        debug_request_id = str(uuid.uuid4())
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": str(messages),
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": {
+                        **self.client_params,
+                        **sampling_params.to_litellm_kwargs(),
+                    },
+                }
+            ]
+        )
+
         ret = litellm.completion(
             model=self.model_name,
             messages=messages,
@@ -84,7 +127,21 @@ class LiteLLM(BaseBackend):
             **self.client_params,
             **sampling_params.to_litellm_kwargs(),
         )
+
+        full_text = ""
         for chunk in ret:
             text = chunk.choices[0].delta.content
             if text is not None:
+                full_text += text
                 yield text, {}
+
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "responseContent": full_text,
+                    "responseTimestamp": datetime.now().isoformat(),
+                    "responseMetadata": {},
+                }
+            ]
+        )

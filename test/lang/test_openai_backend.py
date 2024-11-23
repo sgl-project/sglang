@@ -4,6 +4,7 @@ from sglang import OpenAI, set_default_backend
 from sglang.test.test_programs import (
     test_chat_completion_speculative,
     test_completion_speculative,
+    test_debug_server,
     test_decode_int,
     test_decode_json,
     test_expert_answer,
@@ -17,18 +18,25 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
+from sglang.test.test_utils import launch_debug_server
 
 
 class TestOpenAIBackend(unittest.TestCase):
     instruct_backend = None
     chat_backend = None
     chat_vision_backend = None
+    debug_server = None
 
     @classmethod
     def setUpClass(cls):
         cls.instruct_backend = OpenAI("gpt-3.5-turbo-instruct")
         cls.chat_backend = OpenAI("gpt-3.5-turbo")
         cls.chat_vision_backend = OpenAI("gpt-4-turbo")
+        cls.debug_server = launch_debug_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.debug_server.kill()
 
     def test_few_shot_qa(self):
         set_default_backend(self.instruct_backend)
@@ -85,6 +93,10 @@ class TestOpenAIBackend(unittest.TestCase):
     def test_chat_completion_speculative(self):
         set_default_backend(self.chat_backend)
         test_chat_completion_speculative()
+
+    def test_debug_server(self):
+        set_default_backend(self.chat_backend)
+        test_debug_server()
 
 
 if __name__ == "__main__":
