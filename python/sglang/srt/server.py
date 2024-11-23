@@ -145,12 +145,6 @@ async def get_model_info():
     }
     return result
 
-
-@app.get("/get_server_args")
-async def get_server_args():
-    """Get the server arguments."""
-    return dataclasses.asdict(tokenizer_manager.server_args)
-
 @app.get("/get_server_info")
 async def get_server_info():
     try:
@@ -192,17 +186,6 @@ async def stop_profile():
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
-
-
-@app.get("/get_max_total_num_tokens")
-async def get_max_total_num_tokens():
-    try:
-        return {"max_total_num_tokens": _get_max_total_num_tokens()}
-
-    except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
 
 @app.post("/update_weights")
 @time_func_latency
@@ -536,10 +519,6 @@ def launch_server(
     finally:
         t.join()
 
-
-def _get_max_total_num_tokens():
-    return _max_total_num_tokens
-
 async def _get_server_info():
     return {
         **dataclasses.asdict(tokenizer_manager.server_args),                # server args
@@ -787,15 +766,6 @@ class Runtime:
         json_data = {"text": prompt}
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
-
-    def get_max_total_num_tokens(self):
-        response = requests.get(f"{self.url}/get_max_total_num_tokens")
-        if response.status_code == 200:
-            return response.json()["max_total_num_tokens"]
-        else:
-            raise RuntimeError(
-                f"Failed to get max tokens. {response.json()['error']['message']}"
-            )
     
     async def get_server_info(self):
         async with aiohttp.ClientSession() as session:
@@ -958,8 +928,5 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
 
-    def get_max_total_num_tokens(self):
-        return _get_max_total_num_tokens()
-    
     async def get_server_info(self):
         return await _get_server_info()
