@@ -870,15 +870,13 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     # From https://github.com/vllm-project/vllm/pull/9390
-    semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else None)
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
         async with semaphore:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
@@ -954,7 +952,8 @@ async def benchmark(
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print(
         "{:<40} {:<10}".format(
-            "Max reqeuest concurrency:", max_concurrency if max_concurrency else "not set"
+            "Max reqeuest concurrency:",
+            max_concurrency if max_concurrency else "not set",
         )
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -1350,7 +1349,7 @@ if __name__ == "__main__":
         "initiated, this argument will control how many are actually allowed "
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
-        "if the server is not processing requests fast enough to keep up."
+        "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
