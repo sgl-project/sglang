@@ -429,10 +429,19 @@ class ModelRunner:
                 rank=rank,
                 group_name=group_name,
             )
-            logger.info("`_model_update_group` initialized.")
+            logger.error(
+                f"self._model_update_group.rank={self._model_update_group.rank()}"
+            )
+            logger.error(
+                f"self._model_update_group.group_name={self._model_update_group.group_name}"
+            )
+            logger.error(f"world_size={torch.distributed.get_world_size()}")
+            logger.error(f"device={torch.cuda.current_device()}")
+            logger.error("`_model_update_group` initialized.")
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
+            logger.error(message)
             return False, message
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
@@ -448,64 +457,75 @@ class ModelRunner:
             empty_cache: whether to empty the cache after updating the parameter.
         """
 
-        logger.warning(
-            f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+        logger.info(
+            f"update_parameter_from_distributed: {name}, {dtype}, {shape}, {empty_cache}"
         )
-
-        # 统一 dtype 格式
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        torch.distributed.barrier(group=self._model_update_group)
+        logger.info(f"barrier done")
+        tensor = torch.zeros(1).cuda()
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.SUM, group=self._model_update_group
         )
-        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
+        print(f"tensor={tensor}")
 
-        assert str(target_dtype) == str(
-            current_dtype
-        ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
+        # logger.warning(
+        #     f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+        # )
 
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
+        # # 统一 dtype 格式
+        # target_dtype = (
+        #     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        # )
+        # current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
 
-        rank = self.tp_rank
-        logger.warning(f"rank={rank}")
-        if rank == 0:
-            logger.info(
-                f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
-            )
+        # assert str(target_dtype) == str(
+        #     current_dtype
+        # ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
 
-        try:
-            # 确保在正确的设备上创建tensor并同步
-            print(f"[Rank {rank}] Barrier")
-            print(f"[Rank {rank}] Barrier done")
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            logger.warning(f"weights is created")
+        # assert (
+        #     self._model_update_group is not None
+        # ), "model update group must be initialized"
 
-            # 执行广播
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            logger.warning(f"weights is broadcasted")
+        # rank = self.tp_rank
+        # logger.warning(f"rank={rank}")
+        # if rank == 0:
+        #     logger.info(
+        #         f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+        #     )
 
-            # 加载权重
-            self.model.load_weights([name, weights])
+        # try:
+        #     # 确保在正确的设备上创建tensor并同步
+        #     print(f"[Rank {rank}] Barrier")
+        #     print(f"[Rank {rank}] Barrier done")
+        #     weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+        #     logger.warning(f"weights is created")
 
-            if empty_cache and self.device == "cuda":
-                torch.cuda.empty_cache()
+        #     # 执行广播
+        #     torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+        #     logger.warning(f"weights is broadcasted")
 
-            logger.warning(f"weights is loaded")
+        #     # 加载权重
+        #     self.model.load_weights([name, weights])
 
-            # 最后同步确保所有进程完成更新
-            torch.distributed.barrier(group=self._model_update_group)
-            logger.warning(f"barrier is called")
+        #     if empty_cache and self.device == "cuda":
+        #         torch.cuda.empty_cache()
 
-            return True, f"Succeeded to update parameter {name} online."
+        #     logger.warning(f"weights is loaded")
 
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
+        #     # 最后同步确保所有进程完成更新
+        #     torch.distributed.barrier(group=self._model_update_group)
+        #     logger.warning(f"barrier is called")
+
+        #     return True, f"Succeeded to update parameter {name} online."
+
+        # except Exception as e:
+        #     error_msg = (
+        #         f"Failed to update parameter online: {e}. "
+        #         f"The full weights of the ModelRunner are partially updated. "
+        #         f"Please discard the whole weights."
+        #     )
+        #     logger.error(error_msg)
+        #     return False, error_msg
 
     def get_parameter_by_name(
         self, name: str, truncate_size: int = 100

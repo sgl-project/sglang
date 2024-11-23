@@ -24,63 +24,40 @@ class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
     def init_process(cls, rank, world_size, base_url, model_name, server_pid):
         try:
+            # 基础环境设置
             os.environ["MASTER_ADDR"] = "localhost"
             os.environ["MASTER_PORT"] = "29500"
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-            torch.cuda.set_device(0)
+            # 确保每个进程使用正确的GPU
+            torch.cuda.set_device(rank)
 
+            # 打印GPU信息用于调试
             print(
                 f"[Rank {rank}] Using GPU: {torch.cuda.current_device()} "
-                f"(CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})"
+                f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')})"
+            )
+            print(f"[Rank {rank}] Available GPUs: {torch.cuda.device_count()}")
+            print(
+                f"[Rank {rank}] Device capabilities: {torch.cuda.get_device_capability()}"
             )
 
-            if rank == 0:
-                print(f"[Rank 0] Starting initialization")
-                hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="bfloat16").to("cuda:0")
-                print(f"[Rank 0] HF model loaded")
-
-                group = init_custom_process_group(
-                    backend="nccl",
-                    init_method="tcp://localhost:29500",
-                    world_size=world_size,
-                    rank=rank,
-                    group_name="test_parameter_update_group",
-                )
-                print(f"[Rank 0] Process group initialized")
-
-                # Test parameter update
-                param_name = "model.layers.0.self_attn.q_proj.weight"
-                param = hf_model.get_parameter(param_name)
-                shape = list(param.shape)
-                dtype = str(param.dtype).split('.')[-1]  # e.g., "float32"
-                print(f"[Rank 0] Parameter shape: {shape}, dtype: {dtype}")
-
-                # Wait for rank 1 to be ready
-                time.sleep(5)
-
-                # Broadcast parameter data
-                print(f"[Rank 0] Broadcasting parameter {param_name}")
-                print(f"[Rank 0] Group: {group}")
-                print(f"[Rank 0] Param data: {shape}")
-                print(f"[Rank 0] Dtype: {dtype}")
-                #! 到此为止
-                dist.broadcast(param.data, src=0, group=group)
-                print(f"[Rank 0] Parameter {param_name} broadcasted")
-
-            elif rank == 1:
+            if rank == 1:
                 print(f"[Rank 1] Starting server launch")
-                server_env = os.environ.copy()
-                server_env["RANK"] = str(rank)
-                server_env["BACKEND"] = "nccl"
+                # 准备服务器环境
+
+                # 启动服务器
                 process = popen_launch_server(
                     model_name,
                     base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    env=server_env,
+                    other_args=("--base-gpu-id", "1"),
                 )
                 server_pid.value = process.pid
                 print(f"[Rank 1] Server launched with pid {process.pid}")
 
+                # 等待服务器完全启动
+                time.sleep(5)
+
+                # 初始化参数更新组
                 response = requests.post(
                     f"{base_url}/init_parameter_update_group",
                     json={
@@ -97,40 +74,78 @@ class TestParameterUpdateGroup(unittest.TestCase):
                     f"[Rank 1] Parameter update group initialized with response: {response.status_code}"
                 )
 
-                # Test parameter update
-                param_name = "model.layers.0.self_attn.q_proj.weight"
-                # 根据模型配置计算参数形状
-                hidden_size = 2048
-                # 计算 qkv_proj.weight 的形状
-                shape = [hidden_size, hidden_size]
-                dtype = "bfloat16"  # 根据配置文件中的 torch_dtype
-                print(f"[Rank 1] Preparing to receive parameter with shape: {shape}, dtype: {dtype}")
+                # 等待rank 0完成初始化
+                time.sleep(2)
 
+                # 测试参数更新
+                param_name = "model.layers.0.self_attn.q_proj.weight"
+                shape = [2048, 2048]
+                dtype = "bfloat16"
+                print(
+                    f"[Rank 1] Preparing to receive parameter with shape: {shape}, dtype: {dtype}"
+                )
+
+                # 发送更新参数请求
                 response = requests.post(
                     f"{base_url}/update_parameter_from_distributed",
                     json={
                         "name": param_name,
                         "shape": shape,
                         "dtype": dtype,
-                        "empty_cache": True
+                        "empty_cache": True,
                     },
                     timeout=30,
                 )
-                print(f"[Rank 1] Update parameter response: {response.status_code}, {response.json()}")
+                print(
+                    f"[Rank 1] Update parameter response: {response.status_code}, {response.json()}"
+                )
 
-                # 验证参数是否成功更新
-                response = requests.post(
-                    f"{base_url}/get_parameter_by_name",
-                    json={
-                        "name": param_name,
-                        "truncate_size": 100  # 只获取部分参数用于验证
-                    },
-                    timeout=30,
+            elif rank == 0:
+
+                torch.cuda.set_device(rank)
+                print(f"[Rank 0] Starting initialization")
+
+                # 加载模型
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype="bfloat16"
+                ).cuda()
+                print(f"[Rank 0] HF model loaded")
+
+                # 初始化进程组
+                group = init_custom_process_group(
+                    backend="nccl",
+                    init_method="tcp://localhost:29500",
+                    world_size=world_size,
+                    rank=rank,
+                    group_name="test_parameter_update_group",
                 )
-                if response.status_code == 200:
-                    print(f"[Rank 1] Successfully verified parameter update")
-                else:
-                    print(f"[Rank 1] Failed to verify parameter update: {response.status_code}")
+                # cuda device sync
+                torch.cuda.synchronize()
+                print(f"[Rank 0] Process group initialized: {group.rank()}")
+                print(f"[Rank 0] Process group initialized: {group.group_name}")
+                print(f"[Rank 0] Process group initialized: {group.size()}")
+                print(f"[Rank 0] Process group initialized")
+
+                # 获取参数信息
+                param_name = "model.layers.0.self_attn.q_proj.weight"
+                param = hf_model.get_parameter(param_name)
+                shape = list(param.shape)
+                dtype = str(param.dtype).split(".")[-1]
+                print(f"[Rank 0] Parameter shape: {shape}, dtype: {dtype}")
+
+                # 创建测试tensor并执行all_reduce
+                tensor = torch.ones(1).cuda()
+                print(f"[Rank 0] Created test tensor on device: {tensor.device}")
+
+                # 同步所有进程
+                print(f"[Rank 0] Barrier")
+                torch.distributed.barrier(group=group)
+                print(f"[Rank 0] Barrier done")
+                # 执行all_reduce
+                torch.distributed.all_reduce(
+                    tensor, op=torch.distributed.ReduceOp.SUM, group=group
+                )
+                print(f"[Rank 0] All-reduce completed. Result: {tensor}")
 
             print(f"[Rank {rank}] Process initialization completed")
 
@@ -162,12 +177,12 @@ class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         print("Starting teardown")
-        # 先清理分布式进程组
+        # 清理分布式进程组
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
             print("Process group destroyed")
 
-        # 然后清理服务器进程
+        # 清理服务器进程
         if cls.server_pid.value != 0:
             print(f"Cleaning up server process {cls.server_pid.value}")
             kill_child_process(cls.server_pid.value, include_self=True)

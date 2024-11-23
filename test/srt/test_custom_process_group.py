@@ -38,20 +38,16 @@ class TestParameterUpdateDistributed(unittest.TestCase):
             )
 
             if rank == 0:
-                hf_model = AutoModelForCausalLM.from_pretrained(model_name).to(
-                    f"cuda:{rank}"
-                )
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype="bfloat16"
+                ).to(f"cuda:{rank}")
                 print("HF model loaded on rank 0")
             elif rank == 1:
-                server_env = os.environ.copy()
-                server_env["CUDA_VISIBLE_DEVICES"] = str(rank)
-                server_env["RANK"] = str(rank)
-                server_env["BACKEND"] = "nccl"
                 process = popen_launch_server(
                     model_name,
                     base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    env=server_env,
+                    other_args=("--base-gpu-id", "1"),
                 )
                 server_pid.value = process.pid
                 print("SGLang server launched on rank 1")
