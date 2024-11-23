@@ -1389,7 +1389,7 @@ def run_scheduler_process(
 ):
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "DP_RANK" in os.environ:
-        dp_rank = int(os["DP_RANK"])
+        dp_rank = int(os.environ["DP_RANK"])
 
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
