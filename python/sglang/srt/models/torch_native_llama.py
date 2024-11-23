@@ -1,24 +1,22 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-"""Inference-only LLaMA model compatible with HuggingFace weights."""
-
-# PyTorch Tensor Parallel Available for This Model
 """
+Inference-only LLaMA model compatible with HuggingFace weights.
+
 This model supports tensor parallelism (TP) using the PyTorch tensor parallel package.
 Reference: https://pytorch.org/docs/stable/distributed.tensor.parallel.html
 
@@ -30,10 +28,10 @@ device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
 tensor_parallel(model, device_mesh)
 ```
 
-An end-to-end example can be found in `python/sglang/bench_latency.py`.
+An end-to-end example can be found in `python/sglang/bench_one_batch.py`.
 You can run it with the following command:
 ```bash
-$ python3 -m sglang.bench_latency --correct \
+$ python3 -m sglang.bench_one_batch --correct \
   --model meta-llama/Meta-Llama-3-8B \
   --json-model-override-args '{"architectures": ["TorchNativeLlamaForCausalLM"]}' \
   --tensor-parallel-size 2 \
