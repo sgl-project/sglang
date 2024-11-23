@@ -1108,7 +1108,7 @@ def run_benchmark(args_: argparse.Namespace):
     args = args_
 
     # Set default value for max_concurrency if not present
-    if not hasattr(args, 'max_concurrency'):
+    if not hasattr(args, "max_concurrency"):
         args.max_concurrency = None
 
     # Set global environments
