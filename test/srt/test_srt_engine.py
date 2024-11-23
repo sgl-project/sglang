@@ -152,15 +152,7 @@ class TestSRTEngine(unittest.TestCase):
 
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3))
 
-    def test_7_engine_offline_throughput(self):
-        server_args = ServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-        )
-        bench_args = BenchArgs(num_prompts=10)
-        result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertGreater(result["total_throughput"], 3500)
-
-    def test_8_engine_cpu_offload(self):
+    def test_7_engine_cpu_offload(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -189,6 +181,14 @@ class TestSRTEngine(unittest.TestCase):
         print("==== Answer 2 ====")
         print(out2)
         self.assertEqual(out1, out2)
+
+    def test_8_engine_offline_throughput(self):
+        server_args = ServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+        )
+        bench_args = BenchArgs(num_prompts=10)
+        result = throughput_test(server_args=server_args, bench_args=bench_args)
+        self.assertGreater(result["total_throughput"], 3500)
 
 
 if __name__ == "__main__":
