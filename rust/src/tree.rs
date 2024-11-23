@@ -316,6 +316,71 @@ impl Tree {
         (ret_text, tenant)
     }
 
+    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        let mut curr = Arc::clone(&self.root);
+        let mut curr_idx = 0;
+
+        let mut prev = Arc::clone(&self.root);
+        let text_count = text.chars().count();
+
+        while curr_idx < text_count {
+            let first_char = text.chars().nth(curr_idx).unwrap();
+            let curr_text = slice_by_chars(text, curr_idx, text_count);
+
+            curr = prev.clone();
+
+            match curr.children.entry(first_char) {
+                Entry::Occupied(entry) => {
+                    let matched_node = entry.get().clone();
+
+                    // Only continue matching if this node belongs to the specified tenant
+                    if !matched_node.tenant_last_access_time.contains_key(tenant) {
+                        break;
+                    }
+
+                    let shared_count =
+                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
+
+                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
+
+                    if shared_count == matched_node_text_count {
+                        // Full match with current node's text, continue to next node
+                        curr_idx += shared_count;
+                        prev = Arc::clone(&matched_node);
+                    } else {
+                        // Partial match, stop here
+                        curr_idx += shared_count;
+                        prev = Arc::clone(&matched_node);
+                        break;
+                    }
+                }
+                Entry::Vacant(_) => {
+                    // No match found, stop here
+                    break;
+                }
+            }
+        }
+
+        curr = prev.clone();
+
+        // Only update timestamp if we found a match for the specified tenant
+        if curr.tenant_last_access_time.contains_key(tenant) {
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+
+            let mut current_node = Some(curr);
+            while let Some(node) = current_node {
+                node.tenant_last_access_time
+                    .insert(tenant.to_string(), timestamp_ms);
+                current_node = node.parent.read().unwrap().clone();
+            }
+        }
+
+        slice_by_chars(text, 0, curr_idx)
+    }
+
     fn leaf_of(node: &NodeRef) -> Vec<String> {
         /*
         Return the list of tenants if it's a leaf for the tenant
@@ -1260,5 +1325,41 @@ mod tests {
         assert_eq!(sizes.get("tenant3").unwrap(), &2); // 2 Chinese characters
 
         tree.pretty_print();
+    }
+
+    #[test]
+    fn test_prefix_match_tenant() {
+        let tree = Tree::new();
+
+        // Insert overlapping prefixes for different tenants
+        tree.insert("hello", "tenant1"); // tenant1: hello
+        tree.insert("hello", "tenant2"); // tenant2: hello
+        tree.insert("hello world", "tenant2"); // tenant2: hello -> world
+        tree.insert("help", "tenant1"); // tenant1: hel -> p
+        tree.insert("helicopter", "tenant2"); // tenant2: hel -> icopter
+
+        // Test tenant1's data
+        assert_eq!(tree.prefix_match_tenant("hello", "tenant1"), "hello"); // Full match for tenant1
+        assert_eq!(tree.prefix_match_tenant("help", "tenant1"), "help"); // Exclusive to tenant1
+        assert_eq!(tree.prefix_match_tenant("hel", "tenant1"), "hel"); // Shared prefix
+        assert_eq!(tree.prefix_match_tenant("hello world", "tenant1"), "hello"); // Should stop at tenant1's boundary
+        assert_eq!(tree.prefix_match_tenant("helicopter", "tenant1"), "hel"); // Should stop at tenant1's boundary
+
+        // Test tenant2's data
+        assert_eq!(tree.prefix_match_tenant("hello", "tenant2"), "hello"); // Full match for tenant2
+        assert_eq!(
+            tree.prefix_match_tenant("hello world", "tenant2"),
+            "hello world"
+        ); // Exclusive to tenant2
+        assert_eq!(
+            tree.prefix_match_tenant("helicopter", "tenant2"),
+            "helicopter"
+        ); // Exclusive to tenant2
+        assert_eq!(tree.prefix_match_tenant("hel", "tenant2"), "hel"); // Shared prefix
+        assert_eq!(tree.prefix_match_tenant("help", "tenant2"), "hel"); // Should stop at tenant2's boundary
+
+        // Test non-existent tenant
+        assert_eq!(tree.prefix_match_tenant("hello", "tenant3"), ""); // Non-existent tenant
+        assert_eq!(tree.prefix_match_tenant("help", "tenant3"), ""); // Non-existent tenant
     }
 }
