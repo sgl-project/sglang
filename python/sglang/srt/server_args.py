@@ -157,6 +157,10 @@ class ServerArgs:
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
+        # Sometimes this function may be called twice, reinit it as 1
+        # if it have been set as None in first call.
+        if self.chunked_prefill_size is None:
+            self.chunked_prefill_size = -1
         if self.chunked_prefill_size <= 0:
             # Disable chunked prefill
             self.chunked_prefill_size = None
@@ -183,7 +187,8 @@ class ServerArgs:
         else:
             gpu_mem = get_nvgpu_memory_capacity()
         if gpu_mem < 25000:
-            self.chunked_prefill_size //= 4  # make it 2048
+            if self.chunked_prefill_size is not None:
+                self.chunked_prefill_size //= 4  # make it 2048
             self.cuda_graph_max_bs = 4
             logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
 
