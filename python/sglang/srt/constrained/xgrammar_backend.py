@@ -18,20 +18,18 @@ from typing import List, Tuple
 
 import torch
 
-try:
-    from xgrammar import (
-        CachedGrammarCompiler,
-        CompiledGrammar,
-        GrammarMatcher,
-        TokenizerInfo,
-    )
 
-    import_error = None
-except ImportError as e:
-    CachedGrammarCompiler = CompiledGrammar = GrammarMatcher = TokenizerInfo = (
-        ImportError
-    )
-    import_error = e
+from xgrammar import (
+    GrammarCompiler,
+    CompiledGrammar,
+    GrammarMatcher,
+    TokenizerInfo,
+)
+
+from xgrammar.matcher import (
+    allocate_token_bitmask,
+    apply_token_bitmask_inplace
+)
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -86,20 +84,19 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return self.matcher.allocate_token_bitmask(vocab_size, batch_size)
+        return allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        GrammarMatcher.apply_token_bitmask_inplace(logits, vocab_mask)
+        apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
             self.ctx,
-            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
-            vocab_size=self.vocab_size,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS
         )
         return XGrammarGrammar(matcher, self.vocab_size, self.ctx)
 
@@ -112,25 +109,16 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
 
-        if import_error:
-            logger.warning(
-                f"Ignore import error for the grammar backend: {import_error}"
-            )
-            self.grammar_cache = None
-            return
-
         tokenizer_info = TokenizerInfo.from_huggingface(tokenizer)
-        self.grammar_cache = CachedGrammarCompiler(tokenizer_info=tokenizer_info)
+        self.grammar_cache = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
 
     def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
-        if import_error:
-            raise import_error
 
         key_type, key_string = key
         if key_type == "json":
             try:
-                ctx = self.grammar_cache.compile_json_schema_grammar(schema=key_string)
+                ctx = self.grammar_cache.compile_json_schema(schema=key_string)
             except RuntimeError as e:
                 logging.warning(
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"
@@ -146,11 +134,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
         matcher = GrammarMatcher(
             ctx,
-            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
-            vocab_size=self.vocab_size,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS
         )
         return XGrammarGrammar(matcher, self.vocab_size, ctx)
 
     def reset(self):
         if self.grammar_cache:
-            self.grammar_cache.clear()
+            self.grammar_cache.clear_cache()
