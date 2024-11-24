@@ -2,6 +2,7 @@ import argparse
 import copy
 import multiprocessing as mp
 import os
+import random
 import signal
 import sys
 import time
@@ -11,7 +12,7 @@ import requests
 from sglang_router.launch_router import RouterArgs, launch_router
 
 from sglang.srt.server import launch_server
-from sglang.srt.server_args import ServerArgs, prepare_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
 from sglang.utils import get_exception_traceback
 
@@ -94,7 +95,7 @@ def find_available_ports(base_port: int, count: int) -> List[int]:
     while len(available_ports) < count:
         if is_port_available(current_port):
             available_ports.append(current_port)
-        current_port += 1
+        current_port += random.randint(100, 1000)
 
     return available_ports
 
