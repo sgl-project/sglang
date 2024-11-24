@@ -85,7 +85,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 3800)
+            self.assertGreater(res["output_throughput"], 3850)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
