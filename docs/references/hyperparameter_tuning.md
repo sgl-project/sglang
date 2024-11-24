@@ -31,7 +31,6 @@ If you see out of memory (OOM) errors, you can try to tune the following paramet
 - You can also try to decrease `--mem-fraction-static`, which reduces the memory usage of the KV cache memory pool and helps both prefill and decoding.
 
 ### Try Advanced Options
-- To enable the experimental overlapped scheduler, add `--enable-overlap-schedule`. It overlaps CPU scheduler with GPU computation and can accelerate almost all workloads. This does not work for constrained decoding currently.
 - To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currently.
 
 ### Tune `--schedule-policy`
