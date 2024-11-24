@@ -979,7 +979,14 @@ class Scheduler:
                     continue
 
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    raise ValueError("Unhandled error!")
+                    # Free the one delayed token for the mixed decode batch
+                    j = (
+                        (len(batch.out_cache_loc) - len(batch.decoding_reqs))
+                        + i
+                        - len(batch.decoding_reqs)
+                    )
+                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                    continue
 
                 if req.is_being_chunked <= 0:
                     req.completion_tokens_wo_jump_forward += 1
