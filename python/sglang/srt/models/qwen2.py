@@ -40,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import make_layers
 
 Qwen2Config = None
 
@@ -230,11 +231,13 @@ class Qwen2Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen2DecoderLayer(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Qwen2DecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

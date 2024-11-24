@@ -33,7 +33,10 @@ async fn forward_request(
                 .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
 
             // print the status
-            println!("Worker URL: {}, Status: {}", worker_url, status);
+            println!(
+                "Forwarding Request Worker URL: {}, Route: {}, Status: {}",
+                worker_url, route, status
+            );
             match res.bytes().await {
                 Ok(body) => HttpResponse::build(status).body(body.to_vec()),
                 Err(_) => HttpResponse::InternalServerError().finish(),
@@ -43,8 +46,38 @@ async fn forward_request(
     }
 }
 
+#[get("/health")]
+async fn health(data: web::Data<AppState>) -> impl Responder {
+    let worker_url = match data.router.get_first() {
+        Some(url) => url,
+        None => return HttpResponse::InternalServerError().finish(),
+    };
+
+    forward_request(&data.client, worker_url, "/health".to_string()).await
+}
+
+#[get("/health_generate")]
+async fn health_generate(data: web::Data<AppState>) -> impl Responder {
+    let worker_url = match data.router.get_first() {
+        Some(url) => url,
+        None => return HttpResponse::InternalServerError().finish(),
+    };
+
+    forward_request(&data.client, worker_url, "/health_generate".to_string()).await
+}
+
+#[get("/get_server_args")]
+async fn get_server_args(data: web::Data<AppState>) -> impl Responder {
+    let worker_url = match data.router.get_first() {
+        Some(url) => url,
+        None => return HttpResponse::InternalServerError().finish(),
+    };
+
+    forward_request(&data.client, worker_url, "/get_server_args".to_string()).await
+}
+
 #[get("/v1/models")]
-async fn v1_model(data: web::Data<AppState>) -> impl Responder {
+async fn v1_models(data: web::Data<AppState>) -> impl Responder {
     let worker_url = match data.router.get_first() {
         Some(url) => url,
         None => return HttpResponse::InternalServerError().finish(),
@@ -65,7 +98,31 @@ async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
 
 #[post("/generate")]
 async fn generate(req: HttpRequest, body: Bytes, data: web::Data<AppState>) -> impl Responder {
-    data.router.dispatch(&data.client, req, body).await
+    data.router
+        .dispatch(&data.client, req, body, "generate")
+        .await
+}
+
+#[post("/v1/chat/completions")]
+async fn v1_chat_completions(
+    req: HttpRequest,
+    body: Bytes,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    data.router
+        .dispatch(&data.client, req, body, "v1/chat/completions")
+        .await
+}
+
+#[post("/v1/completions")]
+async fn v1_completions(
+    req: HttpRequest,
+    body: Bytes,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    data.router
+        .dispatch(&data.client, req, body, "v1/completions")
+        .await
 }
 
 pub async fn startup(
@@ -76,6 +133,7 @@ pub async fn startup(
 ) -> std::io::Result<()> {
     println!("Starting server on {}:{}", host, port);
     println!("Worker URLs: {:?}", worker_urls);
+    println!("Policy Config: {:?}", policy_config);
 
     // Create client once with configuration
     let client = reqwest::Client::builder()
@@ -89,8 +147,13 @@ pub async fn startup(
         App::new()
             .app_data(app_state.clone())
             .service(generate)
-            .service(v1_model)
+            .service(v1_chat_completions)
+            .service(v1_completions)
+            .service(v1_models)
             .service(get_model_info)
+            .service(health)
+            .service(health_generate)
+            .service(get_server_args)
     })
     .bind((host, port))?
     .run()
