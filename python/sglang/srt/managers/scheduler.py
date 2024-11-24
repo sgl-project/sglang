@@ -848,7 +848,11 @@ class Scheduler:
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
-        if self.is_mixed_chunk and self.running_batch is not None:
+        if (
+            self.is_mixed_chunk
+            and self.running_batch is not None
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
