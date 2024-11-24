@@ -744,10 +744,6 @@ class ScheduleBatch:
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-        # for i in range(self.batch_size()):
-        #     print(f"{self.extend_lens[i]=}, {self.seq_lens[i].item()=}, {self.prefix_lens[i]=}")
-        #     assert self.extend_lens[i] == self.seq_lens[i].item() - self.prefix_lens[i]
-
     def check_decode_mem(self):
         bs = len(self.reqs)
         if self.token_to_kv_pool.available_size() >= bs:
