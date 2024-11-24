@@ -133,6 +133,7 @@ class TestSRTEndpoint(unittest.TestCase):
             )
 
     def test_logprob_with_chunked_prefill(self):
+        """Test a long prompt that requests output logprobs will not hit OOM."""
         new_tokens = 4
         prompts = "I have a very good idea on this. " * 8000
 
@@ -156,6 +157,8 @@ class TestSRTEndpoint(unittest.TestCase):
         self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), new_tokens)
 
     def test_logprob_match(self):
+        """Test the output logprobs are close to the input logprobs if we run a prefill again."""
+
         def run_generate(
             prompt, return_logprob=False, max_new_tokens=512, logprob_start_len=-1
         ):
