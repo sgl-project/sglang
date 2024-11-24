@@ -723,7 +723,7 @@ class Scheduler:
 
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        if self.last_batch and not self.last_batch.forward_mode.is_decode():
             if self.being_chunked_req:
                 # Move the chunked request out of the batch
                 self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
@@ -731,6 +731,7 @@ class Scheduler:
                 # Inflight request keeps its rid but will get a new req_pool_idx
                 self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
+                print("set self.batch_is_full = False")
 
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
@@ -755,7 +756,9 @@ class Scheduler:
             self.move_ready_grammar_requests()
 
         # Handle the cases where prefill is not allowed
-        if self.batch_is_full or len(self.waiting_queue) == 0:
+        if (
+            self.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.being_chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
