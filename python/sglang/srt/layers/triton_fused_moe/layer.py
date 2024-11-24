@@ -1,3 +1,5 @@
+# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
+
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -18,7 +20,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import set_weight_attrs
 
 if torch.cuda.is_available() or torch.hip.is_available():
-    from .fused_moe import fused_experts
+    from sglang.srt.layers.triton_fused_moe.fused_moe import fused_experts
 else:
     fused_experts = None  # type: ignore
 
@@ -512,7 +514,7 @@ class FusedMoE(torch.nn.Module):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ):
-        from vllm.model_executor.layers.fused_moe.fused_moe import (
+        from sglang.srt.layers.triton_fused_moe.fused_moe import (
             fused_topk,
             grouped_topk,
         )
