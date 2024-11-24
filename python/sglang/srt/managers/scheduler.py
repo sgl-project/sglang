@@ -980,11 +980,7 @@ class Scheduler:
 
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
-                    j = (
-                        (len(batch.out_cache_loc) - len(batch.decoding_reqs))
-                        + i
-                        - len(batch.decoding_reqs)
-                    )
+                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
                     self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
                     continue
 
