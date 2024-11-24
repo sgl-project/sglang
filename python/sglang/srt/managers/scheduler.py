@@ -977,7 +977,7 @@ class Scheduler:
                 if req.is_retracted:
                     continue
 
-                if self.enable_overlap and req.finished():
+                if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     raise ValueError("Unhandled error!")
 
                 if req.is_being_chunked <= 0:
