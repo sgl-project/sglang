@@ -843,6 +843,7 @@ class Scheduler:
             self.token_to_kv_pool,
             self.tree_cache,
             self.model_config,
+            self.enable_overlap,
         )
         new_batch.prepare_for_extend()
 

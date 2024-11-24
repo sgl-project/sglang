@@ -6,6 +6,7 @@ python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_logprob_with_chunked_
 import json
 import unittest
 
+import numpy as np
 import requests
 
 from sglang.srt.utils import kill_child_process
@@ -153,6 +154,48 @@ class TestSRTEndpoint(unittest.TestCase):
         res = response_json
         self.assertEqual(res["meta_info"]["completion_tokens"], new_tokens)
         self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), new_tokens)
+
+    def test_logprob_match(self):
+        def run_generate(
+            prompt, return_logprob=False, max_new_tokens=512, logprob_start_len=-1
+        ):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 1.0,
+                        "max_new_tokens": max_new_tokens,
+                        "ignore_eos": True,
+                    },
+                    "return_logprob": return_logprob,
+                    "return_text_in_logprobs": True,
+                    "logprob_start_len": logprob_start_len,
+                },
+            )
+            return response.json()
+
+        prompt = "I have a very good idea on"
+
+        gen = run_generate(prompt, return_logprob=True)
+        output_logprobs = np.array(
+            [x[0] for x in gen["meta_info"]["output_token_logprobs"]]
+        )
+        num_prompts_tokens = gen["meta_info"]["prompt_tokens"]
+
+        new_prompt = prompt + gen["text"]
+        score = run_generate(
+            new_prompt, return_logprob=True, logprob_start_len=0, max_new_tokens=0
+        )
+        output_logprobs_score = np.array(
+            [
+                x[0]
+                for x in score["meta_info"]["input_token_logprobs"][num_prompts_tokens:]
+            ]
+        )
+
+        max_diff = np.max(output_logprobs - output_logprobs_score)
+        self.assertLess(max_diff, 1e-3)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")
