@@ -723,7 +723,7 @@ class Scheduler:
 
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
-        if self.last_batch and not self.last_batch.forward_mode.is_decode():
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.being_chunked_req:
                 # Move the chunked request out of the batch
                 self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
