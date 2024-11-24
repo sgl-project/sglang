@@ -24,11 +24,11 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
+from sglang.srt.layers.fused_moe_triton import fused_moe
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,

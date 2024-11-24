@@ -66,14 +66,14 @@ async fn health_generate(data: web::Data<AppState>) -> impl Responder {
     forward_request(&data.client, worker_url, "/health_generate".to_string()).await
 }
 
-#[get("/get_server_args")]
-async fn get_server_args(data: web::Data<AppState>) -> impl Responder {
+#[get("/get_server_info")]
+async fn get_server_info(data: web::Data<AppState>) -> impl Responder {
     let worker_url = match data.router.get_first() {
         Some(url) => url,
         None => return HttpResponse::InternalServerError().finish(),
     };
 
-    forward_request(&data.client, worker_url, "/get_server_args".to_string()).await
+    forward_request(&data.client, worker_url, "/get_server_info".to_string()).await
 }
 
 #[get("/v1/models")]
@@ -153,7 +153,7 @@ pub async fn startup(
             .service(get_model_info)
             .service(health)
             .service(health_generate)
-            .service(get_server_args)
+            .service(get_server_info)
     })
     .bind((host, port))?
     .run()

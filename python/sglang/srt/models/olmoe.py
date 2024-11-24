@@ -27,7 +27,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -39,6 +38,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.utils import print_warning_once
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

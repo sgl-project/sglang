@@ -63,12 +63,13 @@ class TestDataParallelism(unittest.TestCase):
         assert response.status_code == 200
 
     def test_get_memory_pool_size(self):
-        response = requests.get(self.base_url + "/get_memory_pool_size")
+        # use `get_server_info` instead since `get_memory_pool_size` is merged into `get_server_info`
+        response = requests.get(self.base_url + "/get_server_info")
         assert response.status_code == 200
 
         time.sleep(5)
 
-        response = requests.get(self.base_url + "/get_memory_pool_size")
+        response = requests.get(self.base_url + "/get_server_info")
         assert response.status_code == 200
 
 

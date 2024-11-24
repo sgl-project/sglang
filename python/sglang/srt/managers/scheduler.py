@@ -13,7 +13,6 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import dataclasses
 import logging
 import os
 import threading
@@ -28,7 +27,7 @@ import torch
 import zmq
 
 from sglang.global_config import global_config
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -308,6 +307,9 @@ class Scheduler:
         ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
+        # Tells whether the current running batch is full so that we can skip
+        # the check of whether to prefill new requests.
+        # This is an optimization to reduce the overhead of the prefill check.
         self.batch_is_full = False
 
         # Init watchdog thread
@@ -470,6 +472,7 @@ class Scheduler:
             self.token_to_kv_pool,
             self.tree_cache,
             self.model_config,
+            self.enable_overlap,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -742,40 +745,30 @@ class Scheduler:
 
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
-        if (
-            self.last_batch
-            and not self.last_batch.forward_mode.is_decode()
-            and not self.last_batch.is_empty()
-        ):
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.being_chunked_req:
+                # Move the chunked request out of the batch
                 self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
                 self.tree_cache.cache_unfinished_req(self.being_chunked_req)
-                # Inflight request keeps its rid but will get a new req_pool_idx.
+                # Inflight request keeps its rid but will get a new req_pool_idx
                 self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
+
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
                     self.running_batch = self.last_batch
                 else:
                     self.running_batch.merge_batch(self.last_batch)
 
-        # Prefill first
+        # Run prefill first if possible
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
             return new_batch
 
-        # Check memory
-        if self.running_batch is None:
-            return
-
         # Run decode
-        before_bs = self.running_batch.batch_size()
-        self.update_running_batch()
-        if not self.running_batch:
-            self.batch_is_full = False
+        if self.running_batch is None:
             return None
-        if before_bs != self.running_batch.batch_size():
-            self.batch_is_full = False
+        self.running_batch = self.update_running_batch(self.running_batch)
         return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -871,14 +864,20 @@ class Scheduler:
             self.token_to_kv_pool,
             self.tree_cache,
             self.model_config,
+            self.enable_overlap,
         )
-        new_batch.prepare_for_extend(self.enable_overlap)
+        new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
-        if self.is_mixed_chunk and self.running_batch is not None:
+        if (
+            self.is_mixed_chunk
+            and self.running_batch is not None
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode(self.enable_overlap)
+                self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
@@ -887,15 +886,16 @@ class Scheduler:
 
         return new_batch
 
-    def update_running_batch(self):
+    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         global test_retract
-        batch = self.running_batch
+
+        initial_bs = batch.batch_size()
 
         batch.filter_batch()
         if batch.is_empty():
-            self.running_batch = None
-            return
+            self.batch_is_full = False
+            return None
 
         # Check if decode out of memory
         if not batch.check_decode_mem() or (test_retract and batch.batch_size() > 10):
@@ -921,11 +921,15 @@ class Scheduler:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
-                self.running_batch = None
-                return
+                self.batch_is_full = False
+                return None
+
+        if batch.batch_size() < initial_bs:
+            self.batch_is_full = False
 
         # Update batch tensors
-        batch.prepare_for_decode(self.enable_overlap)
+        batch.prepare_for_decode()
+        return batch
 
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
@@ -1000,8 +1004,13 @@ class Scheduler:
                 if req.is_retracted:
                     continue
 
+                if self.is_mixed_chunk and self.enable_overlap and req.finished():
+                    # Free the one delayed token for the mixed decode batch
+                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
+                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                    continue
+
                 if req.is_being_chunked <= 0:
-                    # Inflight reqs' prefill is not finished
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -1011,14 +1020,15 @@ class Scheduler:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
-                    if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
-
                     if req.return_logprob:
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
+
+                    if req.grammar is not None:
+                        req.grammar.accept_token(next_token_id)
                 else:
+                    # Inflight reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
             if batch.next_batch_sampling_info:
@@ -1036,18 +1046,18 @@ class Scheduler:
                     continue
 
                 req.embedding = embeddings[i]
-                if req.is_being_chunked > 0:
-                    req.is_being_chunked -= 1
-                else:
-                    # Inflight reqs' prefill is not finished
-                    # dummy output token for embedding models
+                if req.is_being_chunked <= 0:
+                    # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.check_finished()
 
-                if req.finished():
-                    self.tree_cache.cache_finished_req(req)
+                    if req.finished():
+                        self.tree_cache.cache_finished_req(req)
+                    else:
+                        self.tree_cache.cache_unfinished_req(req)
                 else:
-                    self.tree_cache.cache_unfinished_req(req)
+                    # Inflight reqs' prefill is not finished
+                    req.is_being_chunked -= 1
 
         self.stream_output(batch.reqs)
 
@@ -1075,15 +1085,13 @@ class Scheduler:
                 continue
 
             if self.enable_overlap and req.finished():
+                # Free the one delayed token
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
-
-            if req.grammar is not None:
-                req.grammar.accept_token(next_token_id)
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
@@ -1094,6 +1102,9 @@ class Scheduler:
                 )
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+
+            if req.grammar is not None:
+                req.grammar.accept_token(next_token_id)
 
         if batch.next_batch_sampling_info:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
