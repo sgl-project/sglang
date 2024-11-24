@@ -303,7 +303,7 @@ class Scheduler:
 
         # Tells whether the current running batch is full so that we can skip
         # the check of whether to prefill new requests.
-        # This is an optimization to reduce the prefill check overhead.
+        # This is an optimization to reduce the overhead of the prefill check.
         self.batch_is_full = False
 
         # Init watchdog thread
