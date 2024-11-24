@@ -41,15 +41,10 @@ The core features include:
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
 ## Getting Started
-Install SGLang: See [https://sgl-project.github.io/start/install.html](https://sgl-project.github.io/start/install.html)
-
-Send requests: See [https://sgl-project.github.io/start/send_request.html](https://sgl-project.github.io/start/send_request.html)
-
-## Backend: SGLang Runtime (SRT)
-See [https://sgl-project.github.io/backend/backend.html](https://sgl-project.github.io/backend/backend.html)
-
-## Frontend: Structured Generation Language (SGLang)
-See [https://sgl-project.github.io/frontend/frontend.html](https://sgl-project.github.io/frontend/frontend.html)
+- [Install SGLang](https://sgl-project.github.io/start/install.html)
+- [Send requests](https://sgl-project.github.io/start/send_request.html)
+- [Backend: SGLang Runtime (SRT)](https://sgl-project.github.io/backend/backend.html)
+- [Frontend: Structured Generation Language (SGLang)](https://sgl-project.github.io/frontend/frontend.html)
 
 ## Benchmark And Performance
 Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)
@@ -57,6 +52,9 @@ Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-s
 ## Roadmap
 [Development Roadmap (2024 Q4)](https://github.com/sgl-project/sglang/issues/1487)
 
-## Citation And Acknowledgment
+## Adoption and Sponsorship
+The project is supported by (alphabetically): AMD, Baseten, Etched, Hyperbolic, Jam & Tea Studios, LinkedIn, NVIDIA, RunPod, Stanford, UC Berkeley, and xAI.
+
+## Acknowledgment and Citation
+We learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
 Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
-We also learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
