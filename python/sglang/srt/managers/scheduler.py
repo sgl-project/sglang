@@ -974,8 +974,10 @@ class Scheduler:
                 if req.is_retracted:
                     continue
 
+                if self.enable_overlap and req.finished():
+                    raise ValueError("!!")
+
                 if req.is_being_chunked <= 0:
-                    # Inflight reqs' prefill is not finished
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -985,14 +987,16 @@ class Scheduler:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
-                    if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
-
                     if req.return_logprob:
+                        # TODO (lianmin): need to think the case w/ mixed chunked prefill
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
+
+                    if req.grammar is not None:
+                        req.grammar.accept_token(next_token_id)
                 else:
+                    # Inflight reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
             if batch.next_batch_sampling_info:
@@ -1010,18 +1014,18 @@ class Scheduler:
                     continue
 
                 req.embedding = embeddings[i]
-                if req.is_being_chunked > 0:
-                    req.is_being_chunked -= 1
-                else:
-                    # Inflight reqs' prefill is not finished
-                    # dummy output token for embedding models
+                if req.is_being_chunked <= 0:
+                    # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.check_finished()
 
-                if req.finished():
-                    self.tree_cache.cache_finished_req(req)
+                    if req.finished():
+                        self.tree_cache.cache_finished_req(req)
+                    else:
+                        self.tree_cache.cache_unfinished_req(req)
                 else:
-                    self.tree_cache.cache_unfinished_req(req)
+                    # Inflight reqs' prefill is not finished
+                    req.is_being_chunked -= 1
 
         self.stream_output(batch.reqs)
 
@@ -1056,9 +1060,6 @@ class Scheduler:
             req.output_ids.append(next_token_id)
             req.check_finished()
 
-            if req.grammar is not None:
-                req.grammar.accept_token(next_token_id)
-
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
 
@@ -1068,6 +1069,9 @@ class Scheduler:
                 )
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+
+            if req.grammar is not None:
+                req.grammar.accept_token(next_token_id)
 
         if batch.next_batch_sampling_info:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
