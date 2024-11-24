@@ -975,7 +975,7 @@ class Scheduler:
                     continue
 
                 if self.enable_overlap and req.finished():
-                    raise ValueError("!!")
+                    raise ValueError("Unhandled error!")
 
                 if req.is_being_chunked <= 0:
                     req.completion_tokens_wo_jump_forward += 1
