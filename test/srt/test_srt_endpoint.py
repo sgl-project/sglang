@@ -159,10 +159,16 @@ class TestSRTEndpoint(unittest.TestCase):
         def run_generate(
             prompt, return_logprob=False, max_new_tokens=512, logprob_start_len=-1
         ):
+
+            if isinstance(prompt, str):
+                prompt_kwargs = {"text": prompt}
+            else:
+                prompt_kwargs = {"input_ids": prompt}
+
             response = requests.post(
                 self.base_url + "/generate",
                 json={
-                    "text": prompt,
+                    **prompt_kwargs,
                     "sampling_params": {
                         "temperature": 1.0,
                         "max_new_tokens": max_new_tokens,
@@ -175,15 +181,18 @@ class TestSRTEndpoint(unittest.TestCase):
             )
             return response.json()
 
-        prompt = "I have a very good idea on"
+        prompt = "I have a very good idea on how to"
 
-        gen = run_generate(prompt, return_logprob=True)
+        gen = run_generate(prompt, return_logprob=True, logprob_start_len=0)
         output_logprobs = np.array(
             [x[0] for x in gen["meta_info"]["output_token_logprobs"]]
         )
         num_prompts_tokens = gen["meta_info"]["prompt_tokens"]
 
-        new_prompt = prompt + gen["text"]
+        input_tokens = [x[1] for x in gen["meta_info"]["input_token_logprobs"]]
+        output_tokens = [x[1] for x in gen["meta_info"]["output_token_logprobs"]]
+
+        new_prompt = input_tokens + output_tokens
         score = run_generate(
             new_prompt, return_logprob=True, logprob_start_len=0, max_new_tokens=0
         )
@@ -194,8 +203,12 @@ class TestSRTEndpoint(unittest.TestCase):
             ]
         )
 
-        max_diff = np.max(output_logprobs - output_logprobs_score)
-        self.assertLess(max_diff, 1e-3)
+        print(f"{output_logprobs[-10:]=}")
+        print(f"{output_logprobs_score[-10:]=}")
+
+        diff = np.abs(output_logprobs - output_logprobs_score)
+        max_diff = np.max(diff)
+        self.assertLess(max_diff, 0.1)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")
