@@ -512,7 +512,7 @@ class FusedMoE(torch.nn.Module):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ):
-        from vllm.model_executor.layers.fused_moe.fused_moe import (
+        from sglang.srt.layers.triton_fused_moe.fused_moe import (
             fused_topk,
             grouped_topk,
         )
