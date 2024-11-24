@@ -940,9 +940,10 @@ class Scheduler:
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 if self.server_args.speculative_algorithm.is_not_none():
-                    logits_output, next_token_ids, model_worker_batch = (
+                    logits_output, next_token_ids, model_worker_batch, spec_info = (
                         self.draft_worker.forward_batch_speculative_generate(batch)
                     )
+                    batch.spec_info = spec_info
                 else:
                     model_worker_batch = batch.get_model_worker_batch()
                     logits_output, next_token_ids = (

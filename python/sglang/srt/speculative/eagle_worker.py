@@ -69,6 +69,7 @@ class EAGLEWorker(SpeculativeWorker):
 
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):
         if batch.forward_mode.is_decode():
+            prev_spec_info = batch.spec_info
             self._swap_mem_pool(batch, self.model_runner)
             for i in range(self.server_args.num_speculative_steps):
                 self.forward_draft_decode(batch)
@@ -86,21 +87,24 @@ class EAGLEWorker(SpeculativeWorker):
             # if it is None, means all requsets are finished
             if batch.spec_info.verified_id is not None:
                 self.forward_extend_after_decode(batch)
-
-            return logits_output, verified_id, model_worker_batch
+            batch.spec_info = prev_spec_info
+            return logits_output, verified_id, model_worker_batch, next_draft_input
 
         else:
-            batch.spec_info = EAGLEDraftInput()
-            batch.spec_info.init(self.server_args)
+            spec_info = EAGLEDraftInput()
+            spec_info.init(self.server_args)
             model_worker_batch = batch.get_model_worker_batch()
-            batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.spec_info = spec_info
+            spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
             logits_output, next_token_ids = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
             model_worker_batch.spec_info.verified_id = next_token_ids
             model_worker_batch.spec_info.hidden_states = logits_output.hidden_states
+            batch.spec_info = spec_info
             self.forward_draft_extend(batch)
-            return logits_output, next_token_ids, model_worker_batch
+            batch.spec_info = None
+            return logits_output, next_token_ids, model_worker_batch, spec_info
 
     def verify(self, batch: ScheduleBatch):
         verify_input = batch.spec_info.prepare_for_verify(batch)
