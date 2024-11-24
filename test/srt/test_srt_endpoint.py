@@ -167,5 +167,6 @@ class TestSRTEndpoint(unittest.TestCase):
         attention_backend = response_json["attention_backend"]
         self.assertIsInstance(attention_backend, str)
 
+
 if __name__ == "__main__":
     unittest.main()

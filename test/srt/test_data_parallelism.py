@@ -72,5 +72,6 @@ class TestDataParallelism(unittest.TestCase):
         response = requests.get(self.base_url + "/get_server_info")
         assert response.status_code == 200
 
+
 if __name__ == "__main__":
     unittest.main()

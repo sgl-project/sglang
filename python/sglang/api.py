@@ -64,6 +64,7 @@ def flush_cache(backend: Optional[BaseBackend] = None):
         backend = backend.endpoint
     return backend.flush_cache()
 
+
 def get_server_info(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
@@ -73,6 +74,7 @@ def get_server_info(backend: Optional[BaseBackend] = None):
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
     return backend.get_server_info()
+
 
 def gen(
     name: Optional[str] = None,
