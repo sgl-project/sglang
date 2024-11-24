@@ -212,6 +212,7 @@ def extend(reqs, model_runner):
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
         model_config=model_runner.model_config,
+        enable_overlap=False,
     )
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()

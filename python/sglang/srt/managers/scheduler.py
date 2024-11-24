@@ -466,6 +466,7 @@ class Scheduler:
             self.token_to_kv_pool,
             self.tree_cache,
             self.model_config,
+            self.enable_overlap,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -842,14 +843,15 @@ class Scheduler:
             self.token_to_kv_pool,
             self.tree_cache,
             self.model_config,
+            self.enable_overlap,
         )
-        new_batch.prepare_for_extend(self.enable_overlap)
+        new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode(self.enable_overlap)
+                self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
@@ -900,7 +902,7 @@ class Scheduler:
             self.batch_is_full = False
 
         # Update batch tensors
-        batch.prepare_for_decode(self.enable_overlap)
+        batch.prepare_for_decode()
         return batch
 
     def run_batch(self, batch: ScheduleBatch):
@@ -1055,6 +1057,7 @@ class Scheduler:
                 continue
 
             if self.enable_overlap and req.finished():
+                # Free the one delayed token
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
