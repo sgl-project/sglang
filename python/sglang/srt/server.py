@@ -146,10 +146,15 @@ async def get_model_info():
     return result
 
 
-@app.get("/get_server_args")
-async def get_server_args():
-    """Get the server arguments."""
-    return dataclasses.asdict(tokenizer_manager.server_args)
+@app.get("/get_server_info")
+async def get_server_info():
+    try:
+        return await _get_server_info()
+
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 @app.post("/flush_cache")
@@ -183,30 +188,6 @@ async def stop_profile():
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
-
-
-@app.get("/get_max_total_num_tokens")
-async def get_max_total_num_tokens():
-    try:
-        return {"max_total_num_tokens": _get_max_total_num_tokens()}
-
-    except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
-
-
-@app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
-async def get_memory_pool_size():
-    """Get the memory pool size in number of tokens"""
-    try:
-        ret = await tokenizer_manager.get_memory_pool_size()
-
-        return ret
-    except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
 
 
 @app.post("/update_weights")
@@ -542,8 +523,12 @@ def launch_server(
         t.join()
 
 
-def _get_max_total_num_tokens():
-    return _max_total_num_tokens
+async def _get_server_info():
+    return {
+        **dataclasses.asdict(tokenizer_manager.server_args),  # server args
+        "memory_pool_size": await tokenizer_manager.get_memory_pool_size(),  # memory pool size
+        "max_total_num_tokens": _max_total_num_tokens,  # max total num tokens
+    }
 
 
 def _set_envs_and_config(server_args: ServerArgs):
@@ -787,14 +772,16 @@ class Runtime:
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
-    def get_max_total_num_tokens(self):
-        response = requests.get(f"{self.url}/get_max_total_num_tokens")
-        if response.status_code == 200:
-            return response.json()["max_total_num_tokens"]
-        else:
-            raise RuntimeError(
-                f"Failed to get max tokens. {response.json()['error']['message']}"
-            )
+    async def get_server_info(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.url}/get_server_info") as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_data = await response.json()
+                    raise RuntimeError(
+                        f"Failed to get server info. {error_data['error']['message']}"
+                    )
 
     def __del__(self):
         self.shutdown()
@@ -946,5 +933,5 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
 
-    def get_max_total_num_tokens(self):
-        return _get_max_total_num_tokens()
+    async def get_server_info(self):
+        return await _get_server_info()
