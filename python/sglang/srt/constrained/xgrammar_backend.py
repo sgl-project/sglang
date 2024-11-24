@@ -17,15 +17,13 @@ import logging
 from typing import List, Tuple
 
 import torch
-
-
 from xgrammar import (
-    GrammarCompiler,
     CompiledGrammar,
+    GrammarCompiler,
     GrammarMatcher,
     TokenizerInfo,
+    allocate_token_bitmask,
     apply_token_bitmask_inplace,
-    allocate_token_bitmask
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -89,17 +87,14 @@ class XGrammarGrammar(BaseGrammarObject):
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if vocab_mask.device.type != logits.device.type:
-            # vocab_mask must then be on the same device as logits 
+            # vocab_mask must then be on the same device as logits
             # when applying the token bitmask, so we check and move if needed
             vocab_mask = vocab_mask.to(logits.device)
 
         apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
-        matcher = GrammarMatcher(
-            self.ctx,
-            max_rollback_tokens=MAX_ROLLBACK_TOKENS
-        )
+        matcher = GrammarMatcher(self.ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
         return XGrammarGrammar(matcher, self.vocab_size, self.ctx)
 
 
@@ -111,7 +106,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
 
-        tokenizer_info = TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
+        tokenizer_info = TokenizerInfo.from_huggingface(
+            tokenizer, vocab_size=vocab_size
+        )
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
 
@@ -134,10 +131,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-        matcher = GrammarMatcher(
-            ctx,
-            max_rollback_tokens=MAX_ROLLBACK_TOKENS
-        )
+        matcher = GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
         return XGrammarGrammar(matcher, self.vocab_size, ctx)
 
     def reset(self):
