@@ -853,6 +853,7 @@ class Scheduler:
             and self.running_batch is not None
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -999,7 +1000,6 @@ class Scheduler:
                         self.tree_cache.cache_unfinished_req(req)
 
                     if req.return_logprob:
-                        # TODO (lianmin): need to think the case w/ mixed chunked prefill
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
