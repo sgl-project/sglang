@@ -20,7 +20,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 2850)
+            self.assertGreater(res["output_throughput"], 3350)
 
     def test_offline_throughput_non_stream_small_batch_size(self):
         res = run_bench_serving(
@@ -47,7 +47,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 2900)
+            self.assertGreater(res["output_throughput"], 3350)
 
     def test_offline_throughput_without_chunked_prefill(self):
         res = run_bench_serving(
@@ -74,7 +74,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 2950)
+            self.assertGreater(res["output_throughput"], 3450)
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(
@@ -85,7 +85,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 3200)
+            self.assertGreater(res["output_throughput"], 3800)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
@@ -109,7 +109,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 1900)
+            self.assertGreater(res["output_throughput"], 2150)
 
     def test_moe_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -120,7 +120,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 1950)
+            self.assertGreater(res["output_throughput"], 2150)
 
 
 if __name__ == "__main__":
