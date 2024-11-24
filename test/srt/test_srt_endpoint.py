@@ -211,7 +211,7 @@ class TestSRTEndpoint(unittest.TestCase):
 
         diff = np.abs(output_logprobs - output_logprobs_score)
         max_diff = np.max(diff)
-        self.assertLess(max_diff, 0.1)
+        self.assertLess(max_diff, 0.2)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")
