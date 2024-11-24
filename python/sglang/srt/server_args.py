@@ -199,9 +199,6 @@ class ServerArgs:
                 "Overlap schedule is disabled."
             )
 
-        # For CI tests
-        self.enable_mixed_chunk = True
-
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
