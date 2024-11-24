@@ -18,7 +18,7 @@ struct Router {
     worker_urls: Vec<String>,
     policy: PolicyType,
     cache_threshold: f32,
-    cache_routing_prob: f32,
+    imbalance_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
 }
@@ -32,7 +32,7 @@ impl Router {
         host = String::from("127.0.0.1"),
         port = 3001,
         cache_threshold = 0.50,
-        cache_routing_prob = 1.0,
+        imbalance_threshold = 2.0,
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24)
     ))]
@@ -42,7 +42,7 @@ impl Router {
         host: String,
         port: u16,
         cache_threshold: f32,
-        cache_routing_prob: f32,
+        imbalance_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
     ) -> PyResult<Self> {
@@ -52,7 +52,7 @@ impl Router {
             worker_urls,
             policy,
             cache_threshold,
-            cache_routing_prob,
+            imbalance_threshold,
             eviction_interval_secs,
             max_tree_size,
         })
@@ -68,7 +68,7 @@ impl Router {
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
             PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
                 cache_threshold: self.cache_threshold,
-                cache_routing_prob: self.cache_routing_prob,
+                imbalance_threshold: self.imbalance_threshold,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_tree_size: self.max_tree_size,
             },

@@ -80,8 +80,8 @@ pub enum Router {
         running_queue: Arc<Mutex<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
         cache_threshold: f32,
-        cache_routing_prob: f32,
-        _eviction_thread: Option<thread::JoinHandle<()>>, // Store thread handle
+        imbalance_threshold: f32,
+        _eviction_thread: Option<thread::JoinHandle<()>>,
     },
 }
 
@@ -91,7 +91,7 @@ pub enum PolicyConfig {
     RoundRobinConfig,
     CacheAwareConfig {
         cache_threshold: f32,
-        cache_routing_prob: f32,
+        imbalance_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
     },
@@ -128,7 +128,7 @@ impl Router {
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
-                cache_routing_prob,
+                imbalance_threshold,
                 eviction_interval_secs,
                 max_tree_size,
             } => {
@@ -174,7 +174,7 @@ impl Router {
                     running_queue,
                     processed_queue,
                     cache_threshold,
-                    cache_routing_prob,
+                    imbalance_threshold,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -203,8 +203,6 @@ impl Router {
         route: &str,
     ) -> HttpResponse {
         let text = get_text_from_request(&body, route);
-        // For Debug
-        // println!("text: {:?}, route: {:?}", text, route);
 
         let worker_url = match self {
             Router::RoundRobin {
@@ -218,7 +216,6 @@ impl Router {
                         |x| Some((x + 1) % worker_urls.len()),
                     )
                     .unwrap();
-
                 worker_urls[idx].clone()
             }
 
@@ -232,44 +229,35 @@ impl Router {
                 running_queue,
                 processed_queue,
                 cache_threshold,
-                cache_routing_prob,
+                imbalance_threshold,
                 ..
             } => {
-                // even though the tree is thread-safe, we still put a lock to ensure the whole op (tree read + queue read + tree write + queue write) is atomic to handle some edge cases (e.g. multiple requests with long prefix entering at the same time)
-
                 let mut tree = tree.lock().unwrap();
                 let mut running_queue = running_queue.lock().unwrap();
 
-                // Generate a random float between 0 and 1 for probability check
-                let sampled_p: f32 = rand::random();
+                // Check for load imbalance
+                let max_load = *running_queue.values().max().unwrap_or(&0);
+                let min_load = *running_queue.values().min().unwrap_or(&0);
 
-                let selected_url = if sampled_p < *cache_routing_prob {
-                    // Cache-aware routing logic
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
-                    let matched_rate =
-                        matched_text.chars().count() as f32 / text.chars().count() as f32;
+                let use_load_balancing = max_load > (min_load * *imbalance_threshold as usize);
 
-                    if matched_rate > *cache_threshold {
-                        matched_worker.to_string()
-                    } else {
-                        // For Debug
-                        // let m_map: HashMap<String, usize> = tree
-                        //     .tenant_char_count
-                        //     .iter()
-                        //     .map(|entry| (entry.key().clone(), *entry.value()))
-                        //     .collect();
-
-                        // println!("map: {:?}, mmap: {:?}", tree.get_tenant_char_count(), m_map);
-
-                        tree.get_smallest_tenant()
-                    }
-                } else {
-                    // Shortest queue routing logic
+                let selected_url = if use_load_balancing {
+                    // Use shortest queue routing when load is imbalanced
                     running_queue
                         .iter()
                         .min_by_key(|(_url, &count)| count)
                         .map(|(url, _)| url.clone())
                         .unwrap_or_else(|| worker_urls[0].clone())
+                } else {
+                    // Use cache-aware routing when load is balanced
+                    let (matched_text, matched_worker) = tree.prefix_match(&text);
+                    let matched_rate = matched_text.chars().count() as f32 / text.chars().count() as f32;
+
+                    if matched_rate > *cache_threshold {
+                        matched_worker.to_string()
+                    } else {
+                        tree.get_smallest_tenant()
+                    }
                 };
 
                 // Update running queue

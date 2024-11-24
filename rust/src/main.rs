@@ -1,4 +1,3 @@
-// src/main.rs
 use clap::Parser;
 use clap::ValueEnum;
 
@@ -57,12 +56,12 @@ struct Args {
 
     #[arg(
         long,
-        default_value_t = 1.0,
+        default_value_t = 2.0,
         requires = "policy",
         required_if_eq("policy", "cache_aware"),
-        help = "Probability of using cache-aware routing (0.0-1.0). Default 1.0 for full cache-aware routing, suitable for perfectly divided prefix workloads. For uneven workloads, use a lower value to better distribute requests"
+        help = "Threshold for load imbalance (>= 1.0). Load balancing is used when max_load > min_load * threshold. Default: 2.0 meaning load balancing triggers when any worker has more than double the load of the least loaded worker"
     )]
-    cache_routing_prob: f32,
+    imbalance_threshold: f32,
 
     #[arg(
         long,
@@ -90,7 +89,7 @@ impl Args {
             PolicyType::RoundRobin => PolicyConfig::RoundRobinConfig,
             PolicyType::CacheAware => PolicyConfig::CacheAwareConfig {
                 cache_threshold: self.cache_threshold,
-                cache_routing_prob: self.cache_routing_prob,
+                imbalance_threshold: self.imbalance_threshold,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_tree_size: self.max_tree_size,
             },

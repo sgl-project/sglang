@@ -17,7 +17,7 @@ class RouterArgs:
     # Routing policy
     policy: str = "cache_aware"
     cache_threshold: float = 0.5
-    cache_routing_prob: float = 1.0
+    imbalance_threshold: float = 2.0
     eviction_interval: int = 60
     max_tree_size: int = 2**24
 
@@ -74,10 +74,10 @@ class RouterArgs:
             help="Cache threshold (0.0-1.0) for cache-aware routing",
         )
         parser.add_argument(
-            f"--{prefix}cache-routing-prob",
+            f"--{prefix}imbalance-threshold",
             type=float,
-            default=RouterArgs.cache_routing_prob,
-            help="Probability of using cache-aware routing (0.0-1.0)",
+            default=RouterArgs.imbalance_threshold,
+            help="Threshold for load imbalance (>= 1.0). Load balancing is used when max_load > min_load * threshold",
         )
         parser.add_argument(
             f"--{prefix}eviction-interval",
@@ -110,7 +110,7 @@ class RouterArgs:
             port=args.port,
             policy=getattr(args, f"{prefix}policy"),
             cache_threshold=getattr(args, f"{prefix}cache_threshold"),
-            cache_routing_prob=getattr(args, f"{prefix}cache_routing_prob"),
+            imbalance_threshold=getattr(args, f"{prefix}imbalance_threshold"),
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
         )
@@ -150,7 +150,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             host=router_args.host,
             port=router_args.port,
             cache_threshold=router_args.cache_threshold,
-            cache_routing_prob=router_args.cache_routing_prob,
+            imbalance_threshold=router_args.imbalance_threshold,
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
         )
@@ -167,7 +167,6 @@ class CustomHelpFormatter(
     argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter
 ):
     """Custom formatter that preserves both description formatting and shows defaults"""
-
     pass
 
 
@@ -182,7 +181,7 @@ multi-node setups or when you want to start workers and router separately.
 
 Examples:
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
-  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000 --cache-threshold 0.7 --cache-routing-prob 0.5
+  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000 --cache-threshold 0.7 --imbalance-threshold 3.0
 
     """,
         formatter_class=CustomHelpFormatter,

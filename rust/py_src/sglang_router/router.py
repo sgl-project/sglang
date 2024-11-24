@@ -20,9 +20,9 @@ class Router:
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
             if the match rate exceeds threshold, otherwise routes to the worker with the smallest
             tree. Default: 0.5
-        cache_routing_prob: Probability of using cache-aware routing (0.0-1.0). Default 1.0 for
-            full cache-aware routing, suitable for perfectly divided prefix workloads. For uneven
-            workloads, use a lower value to better distribute requests
+        imbalance_threshold: Threshold for load imbalance (>= 1.0). Load balancing is used when
+            max_load > min_load * threshold. Default: 2.0 meaning load balancing triggers when any
+            worker has more than double the load of the least loaded worker.
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
@@ -35,7 +35,7 @@ class Router:
         host: str = "127.0.0.1",
         port: int = 3001,
         cache_threshold: float = 0.50,
-        cache_routing_prob: float = 1.0,
+        imbalance_threshold: float = 2.0,
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
     ):
@@ -45,7 +45,7 @@ class Router:
             host=host,
             port=port,
             cache_threshold=cache_threshold,
-            cache_routing_prob=cache_routing_prob,
+            imbalance_threshold=imbalance_threshold,
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
         )
