@@ -27,7 +27,7 @@ import torch
 import zmq
 
 from sglang.global_config import global_config
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -731,7 +731,6 @@ class Scheduler:
                 # Inflight request keeps its rid but will get a new req_pool_idx
                 self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
-                print("set self.batch_is_full = False")
 
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
