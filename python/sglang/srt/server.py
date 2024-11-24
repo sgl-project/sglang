@@ -36,6 +36,7 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import aiohttp
 import orjson
 import requests
+import torch.distributed as dist
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -83,6 +84,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     delete_directory,
+    init_custom_process_group,
     is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
@@ -332,6 +334,20 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return ORJSONResponse(
                 {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
             )
+
+
+@time_func_latency
+async def init_parameter_update_group_request(
+    obj: InitParameterUpdateGroupReqInput, request: Request
+):
+    """Handle an init parameter update group request."""
+    try:
+        ret = await tokenizer_manager.init_parameter_update_group(obj, request)
+        return ret
+    except ValueError as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -1004,3 +1020,127 @@ class Engine:
 
     async def get_server_info(self):
         return await _get_server_info()
+
+    def generate(
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
+    ):
+        obj = GenerateReqInput(
+            text=prompt,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            lora_path=lora_path,
+            stream=stream,
+        )
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        ret = loop.run_until_complete(generate_request(obj, None))
+
+        if stream is True:
+
+            def generator_wrapper():
+                offset = 0
+                loop = asyncio.get_event_loop()
+                generator = ret.body_iterator
+                while True:
+                    chunk = loop.run_until_complete(generator.__anext__())
+
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+
+            # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
+            # however, it allows to wrap the generator as a subfunction and return
+            return generator_wrapper()
+        else:
+            return ret
+
+    def init_parameter_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str = "nccl",
+    ):
+        obj = InitParameterUpdateGroupReqInput(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+        )
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(init_parameter_update_group_request(obj, None))
+
+    def mock_init_parameter_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        """Initialize the Torch process group for model parameter updates.
+
+        `_model_update_group` is used in the RLHF workflow, where rank 0 is the actor model in the training engine,
+        and the inference engine is used for rollout.
+
+        In the RLHF workflow, the training engine updates the model weights/parameters online,
+        and broadcasts them to the inference engine through the `_model_update_group` process group.
+        """
+        assert group_name != "", "Group name cannot be empty"
+
+        rank = rank_offset + 0
+
+        logger.info(
+            f"init custom process group: master_address={master_address}, master_port={master_port}, "
+            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        try:
+            self._model_update_group = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_address}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+            )
+            logger.error(
+                f"self._model_update_group.rank={self._model_update_group.rank()}"
+            )
+            logger.error(
+                f"self._model_update_group.group_name={self._model_update_group.group_name}"
+            )
+            logger.error(f"world_size={torch.distributed.get_world_size()}")
+            logger.error(f"device={torch.cuda.current_device()}")
+            logger.error("`_model_update_group` initialized.")
+            logger.error(f"before barrier")
+            dist.barrier(group=self._model_update_group)
+            logger.error(f"after barrier")
+            return True, "Succeeded to initialize custom process group."
+        except Exception as e:
+            message = f"Failed to initialize custom process group: {e}."
+            logger.error(message)
+            return False, message

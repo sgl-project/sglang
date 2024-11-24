@@ -24,6 +24,7 @@ from functools import lru_cache
 from typing import Any, Optional, Type, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
@@ -444,6 +445,9 @@ class ModelRunner:
             logger.error(f"world_size={torch.distributed.get_world_size()}")
             logger.error(f"device={torch.cuda.current_device()}")
             logger.error("`_model_update_group` initialized.")
+            logger.error(f"before barrier")
+            dist.barrier(group=self._model_update_group)
+            logger.error(f"after barrier")
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."

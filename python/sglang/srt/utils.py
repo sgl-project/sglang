@@ -997,6 +997,9 @@ def init_custom_process_group(
         timeout=timeout,
     )
 
+    logger.error(f"pg pass in init_custom_process_group world size: {world_size}")
+    logger.error(f"pg pass in init_custom_process_group rank: {rank}")
+
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
     return pg
