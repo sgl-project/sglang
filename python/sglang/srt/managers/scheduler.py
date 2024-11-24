@@ -301,6 +301,9 @@ class Scheduler:
         ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
+        # Tells whether the current running batch is full so that we can skip
+        # the check of whether to prefill new requests.
+        # This is an optimization to reduce the prefill check overhead.
         self.batch_is_full = False
 
         # Init watchdog thread
@@ -752,9 +755,7 @@ class Scheduler:
             self.move_ready_grammar_requests()
 
         # Handle the cases where prefill is not allowed
-        if (
-            self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.being_chunked_req is None:
+        if self.batch_is_full or len(self.waiting_queue) == 0:
             return None
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
