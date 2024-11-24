@@ -59,10 +59,19 @@ class TestEAGLEEngine(unittest.TestCase):
         bench_args = BenchArgs(num_prompts=10)
         result_eagle = throughput_test(server_args=server_args, bench_args=bench_args)
 
+        server_args = ServerArgs(
+            model_path="meta-llama/Llama-2-7b-chat-hf",
+        )
+        result_naive = throughput_test(server_args=server_args, bench_args=bench_args)
+
         print("==== Throughput EAGLE ====")
         print(result_eagle["total_throughput"])
+        print("==== Throughput Baseline ====")
+        print(result_naive["total_throughput"])
 
-        self.assertGreater(result_eagle["total_throughput"], 1200.0)
+        self.assertGreater(
+            result_eagle["total_throughput"], result_naive["total_throughput"] * 1.5
+        )
 
 
 if __name__ == "__main__":
