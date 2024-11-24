@@ -729,10 +729,13 @@ class ScheduleBatch:
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
+        # For overlap scheduler, the output_ids has one step delay
+        delta = 0 if self.enable_overlap else -1
+
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) - 1
+                len(r.origin_input_ids) + len(r.output_ids) + delta
                 for r in running_batch.reqs
             ]
         )
@@ -740,6 +743,10 @@ class ScheduleBatch:
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
+
+        # for i in range(self.batch_size()):
+        #     print(f"{self.extend_lens[i]=}, {self.seq_lens[i].item()=}, {self.prefix_lens[i]=}")
+        #     assert self.extend_lens[i] == self.seq_lens[i].item() - self.prefix_lens[i]
 
     def check_decode_mem(self):
         bs = len(self.reqs)
