@@ -1425,8 +1425,8 @@ def run_scheduler_process(
     pipe_writer,
 ):
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
-    if dp_rank is None:
-        dp_rank = int(os.getenv("DP_RANK", -1))
+    if dp_rank is None and "DP_RANK" in os.environ:
+        dp_rank = int(os.environ["DP_RANK"])
 
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -1437,7 +1437,9 @@ def run_scheduler_process(
 
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
-        pipe_writer.send("ready")
+        pipe_writer.send(
+            {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
+        )
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:

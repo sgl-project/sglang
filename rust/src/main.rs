@@ -1,18 +1,14 @@
 // src/main.rs
 use clap::Parser;
 use clap::ValueEnum;
-// declare child modules
-mod router;
-mod server;
-mod tree;
 
-use crate::router::PolicyConfig;
+use sglang_router_rs::{router::PolicyConfig, server};
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum PolicyType {
     Random,
     RoundRobin,
-    ApproxTree,
+    CacheAware,
 }
 
 #[derive(Parser, Debug)]
@@ -21,44 +17,70 @@ struct Args {
     #[arg(
         long,
         default_value = "127.0.0.1",
-        help = "Host address to bind the server to"
+        help = "Host address to bind the router server to. Default: 127.0.0.1"
     )]
     host: String,
 
-    #[arg(long, default_value_t = 3001, help = "Port number to listen on")]
+    #[arg(
+        long,
+        default_value_t = 3001,
+        help = "Port number to bind the router server to. Default: 3001"
+    )]
     port: u16,
 
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Comma-separated list of worker URLs to distribute requests to"
+        help = "Comma-separated list of worker URLs that will handle the requests. Each URL should include the protocol, host, and port (e.g., http://worker1:8000,http://worker2:8000)"
     )]
     worker_urls: Vec<String>,
 
     #[arg(
         long,
-        default_value_t = PolicyType::RoundRobin,
+        default_value_t = PolicyType::CacheAware,
         value_enum,
-        help = "Load balancing policy to use: random, round_robin, or approx_tree"
+        help = "Load balancing policy to use for request distribution:\n\
+              - random: Randomly select workers\n\
+              - round_robin: Distribute requests in round-robin fashion\n\
+              - cache_aware: Distribute requests in cache-aware fashion\n"
     )]
     policy: PolicyType,
 
     #[arg(
         long,
+        default_value_t = 0.5,
         requires = "policy",
-        required_if_eq("policy", "approx_tree"),
-        help = "Path to the tokenizer file, required when using approx_tree policy"
+        required_if_eq("policy", "cache_aware"),
+        help = "Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker if the match rate exceeds threshold, otherwise routes to the worker with the smallest tree. Default: 0.5"
     )]
-    tokenizer_path: Option<String>,
+    cache_threshold: f32,
 
     #[arg(
         long,
-        default_value = "0.50",
+        default_value_t = 1.0,
         requires = "policy",
-        required_if_eq("policy", "approx_tree"),
-        help = "Cache threshold (0.0-1.0) for approx_tree routing. Routes to cached worker if match rate exceeds threshold, otherwise routes to shortest queue worker"
+        required_if_eq("policy", "cache_aware"),
+        help = "Probability of using cache-aware routing (0.0-1.0). Default 1.0 for full cache-aware routing, suitable for perfectly divided prefix workloads. For uneven workloads, use a lower value to better distribute requests"
     )]
-    cache_threshold: Option<f32>,
+    cache_routing_prob: f32,
+
+    #[arg(
+        long,
+        default_value_t = 60,
+        requires = "policy",
+        required_if_eq("policy", "cache_aware"),
+        help = "Interval in seconds between cache eviction operations in cache-aware routing. Default: 60"
+    )]
+    eviction_interval_secs: u64,
+
+    #[arg(
+        long,
+        default_value_t = 2usize.pow(24),
+        requires = "policy",
+        required_if_eq("policy", "cache_aware"),
+        help = "Maximum size of the approximation tree for cache-aware routing. Default: 2^24"
+    )]
+    max_tree_size: usize,
 }
 
 impl Args {
@@ -66,14 +88,11 @@ impl Args {
         match self.policy {
             PolicyType::Random => PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => PolicyConfig::RoundRobinConfig,
-            PolicyType::ApproxTree => PolicyConfig::ApproxTreeConfig {
-                tokenizer_path: self
-                    .tokenizer_path
-                    .clone()
-                    .expect("tokenizer_path is required for approx_tree policy"),
-                cache_threshold: self
-                    .cache_threshold
-                    .expect("cache_threshold is required for approx_tree policy"),
+            PolicyType::CacheAware => PolicyConfig::CacheAwareConfig {
+                cache_threshold: self.cache_threshold,
+                cache_routing_prob: self.cache_routing_prob,
+                eviction_interval_secs: self.eviction_interval_secs,
+                max_tree_size: self.max_tree_size,
             },
         }
     }
