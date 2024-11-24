@@ -147,6 +147,13 @@ class ModelRunner:
             }
         )
 
+        if server_args.enable_te:
+            global_server_args_dict.update(
+                {
+                    "TELLaMAForCausalLM": ("llama", "LlamaForCausalLM"), #TODO update TELLaMAForCausalLM with TE integreated (zhuohaol)
+                }
+            )
+
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()
         self.sampler = Sampler()
