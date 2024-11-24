@@ -199,12 +199,6 @@ class ServerArgs:
                 "Overlap schedule is disabled."
             )
 
-        if self.enable_mixed_chunk:
-            logger.info(
-                "Overlap schedule is disabled because mixed-style chunked prefill is enabled."
-            )
-            self.disable_overlap_schedule = True
-
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
