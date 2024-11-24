@@ -20,7 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.utils import set_weight_attrs
 
-from sglang.srt.layers.fused_moe.fused_moe import padding_size
+from sglang.srt.layers.fused_moe_grok.fused_moe import padding_size
 from sglang.srt.utils import is_hip
 
 logger = init_logger(__name__)
@@ -123,7 +123,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int],
         topk_group: Optional[int],
     ) -> torch.Tensor:
-        from sglang.srt.layers.fused_moe.fused_moe import fused_moe
+        from sglang.srt.layers.fused_moe_grok.fused_moe import fused_moe
 
         return fused_moe(
             x,
@@ -609,7 +609,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         topk_group: Optional[int] = None,
     ) -> torch.Tensor:
 
-        from sglang.srt.layers.fused_moe.fused_moe import fused_moe
+        from sglang.srt.layers.fused_moe_grok.fused_moe import fused_moe
 
         return fused_moe(
             x,

@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import set_weight_attrs
 
 if torch.cuda.is_available() or torch.hip.is_available():
-    from sglang.srt.layers.triton_fused_moe.fused_moe import fused_experts
+    from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
 else:
     fused_experts = None  # type: ignore
 
@@ -514,7 +514,7 @@ class FusedMoE(torch.nn.Module):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ):
-        from sglang.srt.layers.triton_fused_moe.fused_moe import (
+        from sglang.srt.layers.fused_moe_triton.fused_moe import (
             fused_topk,
             grouped_topk,
         )
