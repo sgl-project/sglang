@@ -57,12 +57,23 @@ __all__ = [
     "QUANTIZATION_METHODS",
 ]
 
-"""
-def fp8_get_quant_method(
-    self, layer: torch.nn.Module, prefix: str
-) -> Optional["QuantizeMethodBase"]:
+
+def fp8_get_quant_method(self, layer, prefix):
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.fp8 import (
+        Fp8LinearMethod,
+        Fp8MoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        is_layer_skipped,
+    )
+
+    from sglang.srt.layers.triton_fused_moe.layer import FusedMoE
+
     if isinstance(layer, LinearBase):
         if is_layer_skipped(prefix, self.ignored_layers):
+            from sglang.srt.layers.linear import UnquantizedLinearMethod
+
             return UnquantizedLinearMethod()
         return Fp8LinearMethod(self)
     elif isinstance(layer, FusedMoE):
@@ -71,4 +82,3 @@ def fp8_get_quant_method(
 
 
 setattr(Fp8Config, "get_quant_method", fp8_get_quant_method)
-"""
