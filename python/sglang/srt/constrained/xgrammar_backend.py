@@ -24,11 +24,8 @@ from xgrammar import (
     CompiledGrammar,
     GrammarMatcher,
     TokenizerInfo,
-)
-
-from xgrammar.matcher import (
-    allocate_token_bitmask,
-    apply_token_bitmask_inplace
+    apply_token_bitmask_inplace,
+    allocate_token_bitmask
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -39,7 +36,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 logger = logging.getLogger(__name__)
 
 
-MAX_ROLLBACK_TOKENS = 10
+MAX_ROLLBACK_TOKENS = 200
 
 
 class XGrammarGrammar(BaseGrammarObject):
@@ -84,13 +81,18 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return allocate_token_bitmask(vocab_size, batch_size)
+        return allocate_token_bitmask(batch_size, vocab_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        if vocab_mask.device.type != logits.device.type:
+            # vocab_mask must then be on the same device as logits 
+            # when applying the token bitmask, so we check and move if needed
+            vocab_mask = vocab_mask.to(logits.device)
+
         apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
@@ -109,8 +111,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
 
-        tokenizer_info = TokenizerInfo.from_huggingface(tokenizer)
-        self.grammar_cache = GrammarCompiler(tokenizer_info=tokenizer_info)
+        tokenizer_info = TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
+        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
 
     def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
@@ -118,7 +120,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         key_type, key_string = key
         if key_type == "json":
             try:
-                ctx = self.grammar_cache.compile_json_schema(schema=key_string)
+                ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
             except RuntimeError as e:
                 logging.warning(
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"
@@ -139,5 +141,5 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         return XGrammarGrammar(matcher, self.vocab_size, ctx)
 
     def reset(self):
-        if self.grammar_cache:
-            self.grammar_cache.clear_cache()
+        if self.grammar_compiler:
+            self.grammar_compiler.clear_cache()
