@@ -242,15 +242,17 @@ class ModelRunner:
             )
             return get_model(vllm_config=vllm_config)
         except ImportError:
-            return get_model(
-                model_config=self.vllm_model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-                parallel_config=None,
-                scheduler_config=None,
-                lora_config=None,
-                cache_config=None,
-            )
+            pass
+
+        return get_model(
+            model_config=self.vllm_model_config,
+            load_config=self.load_config,
+            device_config=DeviceConfig(self.device),
+            parallel_config=None,
+            scheduler_config=None,
+            lora_config=None,
+            cache_config=None,
+        )
 
     def get_model_config_params(self):
         sig = inspect.signature(VllmModelConfig.__init__)

@@ -1,7 +1,6 @@
-// Python Binding
 use pyo3::prelude::*;
 pub mod router;
-mod server;
+pub mod server;
 pub mod tree;
 
 #[pyclass(eq)]
@@ -9,7 +8,7 @@ pub mod tree;
 pub enum PolicyType {
     Random,
     RoundRobin,
-    ApproxTree,
+    CacheAware,
 }
 
 #[pyclass]
@@ -18,8 +17,10 @@ struct Router {
     port: u16,
     worker_urls: Vec<String>,
     policy: PolicyType,
-    tokenizer_path: Option<String>,
-    cache_threshold: Option<f32>,
+    cache_threshold: f32,
+    cache_routing_prob: f32,
+    eviction_interval_secs: u64,
+    max_tree_size: usize,
 }
 
 #[pymethods]
@@ -30,33 +31,30 @@ impl Router {
         policy = PolicyType::RoundRobin,
         host = String::from("127.0.0.1"),
         port = 3001,
-        tokenizer_path = None,
-        cache_threshold = Some(0.50)
+        cache_threshold = 0.50,
+        cache_routing_prob = 1.0,
+        eviction_interval_secs = 60,
+        max_tree_size = 2usize.pow(24)
     ))]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
         host: String,
         port: u16,
-        tokenizer_path: Option<String>,
-        cache_threshold: Option<f32>,
+        cache_threshold: f32,
+        cache_routing_prob: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
     ) -> PyResult<Self> {
-        // Validate required parameters for approx_tree policy
-        if matches!(policy, PolicyType::ApproxTree) {
-            if tokenizer_path.is_none() {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "tokenizer_path is required for approx_tree policy",
-                ));
-            }
-        }
-
         Ok(Router {
             host,
             port,
             worker_urls,
             policy,
-            tokenizer_path,
             cache_threshold,
+            cache_routing_prob,
+            eviction_interval_secs,
+            max_tree_size,
         })
     }
 
@@ -68,14 +66,11 @@ impl Router {
         let policy_config = match &self.policy {
             PolicyType::Random => router::PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
-            PolicyType::ApproxTree => router::PolicyConfig::ApproxTreeConfig {
-                tokenizer_path: self
-                    .tokenizer_path
-                    .clone()
-                    .expect("tokenizer_path is required for approx_tree policy"),
-                cache_threshold: self
-                    .cache_threshold
-                    .expect("cache_threshold is required for approx_tree policy"),
+            PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
+                cache_threshold: self.cache_threshold,
+                cache_routing_prob: self.cache_routing_prob,
+                eviction_interval_secs: self.eviction_interval_secs,
+                max_tree_size: self.max_tree_size,
             },
         };
 
