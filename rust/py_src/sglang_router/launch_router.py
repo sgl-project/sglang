@@ -176,7 +176,6 @@ class CustomHelpFormatter(
     argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter
 ):
     """Custom formatter that preserves both description formatting and shows defaults"""
-
     pass
 
 
