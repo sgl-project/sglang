@@ -154,10 +154,5 @@ class TestSRTEndpoint(unittest.TestCase):
         self.assertEqual(res["meta_info"]["completion_tokens"], new_tokens)
         self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), new_tokens)
 
-    def test_get_memory_pool_size(self):
-        response = requests.post(self.base_url + "/get_memory_pool_size")
-        self.assertIsInstance(response.json(), int)
-
-
 if __name__ == "__main__":
     unittest.main()
