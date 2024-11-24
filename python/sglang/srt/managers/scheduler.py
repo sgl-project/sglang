@@ -848,7 +848,12 @@ class Scheduler:
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
-        if self.is_mixed_chunk and self.running_batch is not None:
+        if (
+            self.is_mixed_chunk
+            and self.running_batch is not None
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -979,7 +984,10 @@ class Scheduler:
                     continue
 
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    raise ValueError("Unhandled error!")
+                    # Free the one delayed token for the mixed decode batch
+                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
+                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                    continue
 
                 if req.is_being_chunked <= 0:
                     req.completion_tokens_wo_jump_forward += 1
@@ -992,7 +1000,6 @@ class Scheduler:
                         self.tree_cache.cache_unfinished_req(req)
 
                     if req.return_logprob:
-                        # TODO (lianmin): need to think the case w/ mixed chunked prefill
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )

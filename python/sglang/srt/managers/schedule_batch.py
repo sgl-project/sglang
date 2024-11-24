@@ -729,10 +729,13 @@ class ScheduleBatch:
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
+        # For overlap scheduler, the output_ids has one step delay
+        delta = 0 if self.enable_overlap else -1
+
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) - 1
+                len(r.origin_input_ids) + len(r.output_ids) + delta
                 for r in running_batch.reqs
             ]
         )
