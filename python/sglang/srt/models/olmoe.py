@@ -38,11 +38,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.utils import print_warning_once
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.triton_fused_moe import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,

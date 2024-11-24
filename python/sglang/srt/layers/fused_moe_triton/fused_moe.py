@@ -376,7 +376,7 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
 ):
-    from sglang.srt.layers.triton_fused_moe import get_config
+    from sglang.srt.layers.fused_moe_triton import get_config
 
     override_config = get_config()
     if override_config:

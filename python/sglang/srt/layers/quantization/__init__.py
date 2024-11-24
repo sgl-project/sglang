@@ -68,7 +68,7 @@ def fp8_get_quant_method(self, layer, prefix):
         is_layer_skipped,
     )
 
-    from sglang.srt.layers.triton_fused_moe.layer import FusedMoE
+    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         if is_layer_skipped(prefix, self.ignored_layers):
