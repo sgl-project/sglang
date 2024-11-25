@@ -1413,9 +1413,7 @@ def run_scheduler_process(
     if psutil.cpu_count() != psutil.cpu_count(logical=False):
         # HT on
         upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        lower_cpu_ids = [
-            id + total_pcores for id in range(start_cpu_id, end_cpu_id)
-        ]
+        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
         bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
     else:
         # HT off
