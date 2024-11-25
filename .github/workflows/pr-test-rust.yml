@@ -53,6 +53,7 @@ jobs:
 
       - name: Build python binding
         run: |
+          cd rust
           pip install setuptools-rust wheel build
           python -m build
           ls
