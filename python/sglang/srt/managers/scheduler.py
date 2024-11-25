@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     configure_logger,
     crash_on_warnings,
     get_zmq_socket,
+    gpu_proc_affinity,
     kill_parent_process,
     set_random_seed,
     suppress_other_loggers,
@@ -1393,6 +1394,9 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # set cpu affinity to this gpu process
+    gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "DP_RANK" in os.environ:
         dp_rank = int(os.environ["DP_RANK"])
