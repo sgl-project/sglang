@@ -59,6 +59,7 @@ jobs:
           python3 -m build
           pip install dist/*.whl
       - name: Test
+        run: |
           pip show sglang-router
 
   finish:
