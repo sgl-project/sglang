@@ -14,7 +14,7 @@ suites = {
         "test_double_sparsity.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
-        "test_json_constrained.py",
+        "test_input_embeddings.py" "test_json_constrained.py",
         "test_large_max_new_tokens.py",
         "test_metrics.py",
         "test_no_chunked_prefill.py",
