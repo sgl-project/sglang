@@ -33,7 +33,7 @@ def popen_launch_router(
     host = host[2:]
 
     command = [
-        "python",
+        "python3",
         "-m",
         "sglang_router.launch_server",
         "--model-path",
