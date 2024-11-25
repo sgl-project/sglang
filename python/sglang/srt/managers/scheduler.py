@@ -1401,19 +1401,20 @@ def run_scheduler_process(
 
     tp_size_per_node = server_args.tp_size // server_args.nnodes
 
-    # total logic cores
-    total_cores = psutil.cpu_count()
-    # physical cores per TP (N.B. more Cores than GPUs per node)
-    num_cores_bind = psutil.cpu_count(logical=False) // tp_size_per_node
+    # total physical cores
+    total_pcores = psutil.cpu_count(logical=False)
+    # physical cores per TP (N.B. more Cores than GPUs on node)
+    num_cores_bind = total_pcores // tp_size_per_node
 
-    start_cpu_id = gpu_id * num_cores_bind
-    end_cpu_id = (gpu_id + 1) * num_cores_bind
+    # able to handle multiple DP per node
+    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
+    end_cpu_id = start_cpu_id + num_cores_bind
 
     if psutil.cpu_count() != psutil.cpu_count(logical=False):
         # HT on
         upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
         lower_cpu_ids = [
-            id + total_cores // 2 for id in range(start_cpu_id, end_cpu_id)
+            id + total_pcores for id in range(start_cpu_id, end_cpu_id)
         ]
         bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
     else:
