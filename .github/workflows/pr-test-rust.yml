@@ -60,8 +60,8 @@ jobs:
           pip install dist/*.whl
       - name: Run e2e test
         run: |
-          cd rust
-          python3 -m pytest tests/e2e
+          cd rust/py_test
+          python3 run_suite.py
 
   finish:
     needs: [unit-test-rust, e2e-rust]
