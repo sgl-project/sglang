@@ -19,7 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -55,8 +55,9 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Session id info for continual prompting
-    session_id: Optional[Union[List[str], str]] = None
-    session_rid: Optional[Union[List[str], str]] = None
+    session: Optional[
+        Union[List[Tuple[str, Optional[str]]], Tuple[str, Optional[str]]]
+    ] = None
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -203,7 +204,7 @@ class TokenizedGenerateReqInput:
     lora_path: Optional[str] = None  # None means just use the base model
 
     # Session id info for continual prompting
-    session_id: Optional[int] = None
+    session_id: Optional[str] = None
     session_rid: Optional[str] = None
 
 
@@ -299,8 +300,6 @@ class BatchTokenIDOut:
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
     no_stop_trim: List[bool]
-    # The updated session unique id
-    session_ids: List[str]
 
 
 @dataclass
@@ -313,8 +312,6 @@ class BatchStrOut:
     meta_info: List[Dict]
     # The finish reason
     finished_reason: List[BaseFinishReason]
-    # The update session unique id
-    session_ids: List[str]
 
 
 @dataclass
