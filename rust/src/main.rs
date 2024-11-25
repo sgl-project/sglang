@@ -41,7 +41,7 @@ struct Args {
         help = "Load balancing policy to use for request distribution:\n\
               - random: Randomly select workers\n\
               - round_robin: Distribute requests in round-robin fashion\n\
-              - cache_aware: Distribute requests in cache-aware fashion\n"
+              - cache_aware: Distribute requests based on cache state and load balance\n"
     )]
     policy: PolicyType,
 
@@ -56,12 +56,21 @@ struct Args {
 
     #[arg(
         long,
-        default_value_t = 2.0,
+        default_value_t = 32,
         requires = "policy",
         required_if_eq("policy", "cache_aware"),
-        help = "Threshold for load imbalance (>= 1.0). Load balancing is used when max_load > min_load * threshold. Default: 2.0 meaning load balancing triggers when any worker has more than double the load of the least loaded worker"
+        help = "Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 32"
     )]
-    imbalance_threshold: f32,
+    balance_abs_threshold: usize,
+
+    #[arg(
+        long,
+        default_value_t = 1.0001,
+        requires = "policy",
+        required_if_eq("policy", "cache_aware"),
+        help = "Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001"
+    )]
+    balance_rel_threshold: f32,
 
     #[arg(
         long,
@@ -89,7 +98,8 @@ impl Args {
             PolicyType::RoundRobin => PolicyConfig::RoundRobinConfig,
             PolicyType::CacheAware => PolicyConfig::CacheAwareConfig {
                 cache_threshold: self.cache_threshold,
-                imbalance_threshold: self.imbalance_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_tree_size: self.max_tree_size,
             },

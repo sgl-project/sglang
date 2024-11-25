@@ -17,7 +17,8 @@ class RouterArgs:
     # Routing policy
     policy: str = "cache_aware"
     cache_threshold: float = 0.5
-    imbalance_threshold: float = 2.0
+    balance_abs_threshold: int = 32
+    balance_rel_threshold: float = 1.0001
     eviction_interval: int = 60
     max_tree_size: int = 2**24
 
@@ -74,10 +75,16 @@ class RouterArgs:
             help="Cache threshold (0.0-1.0) for cache-aware routing",
         )
         parser.add_argument(
-            f"--{prefix}imbalance-threshold",
+            f"--{prefix}balance-abs-threshold",
+            type=int,
+            default=RouterArgs.balance_abs_threshold,
+            help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
+        )
+        parser.add_argument(
+            f"--{prefix}balance-rel-threshold",
             type=float,
-            default=RouterArgs.imbalance_threshold,
-            help="Threshold for load imbalance (>= 1.0). Load balancing is used when max_load > min_load * threshold",
+            default=RouterArgs.balance_rel_threshold,
+            help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
         )
         parser.add_argument(
             f"--{prefix}eviction-interval",
@@ -110,7 +117,8 @@ class RouterArgs:
             port=args.port,
             policy=getattr(args, f"{prefix}policy"),
             cache_threshold=getattr(args, f"{prefix}cache_threshold"),
-            imbalance_threshold=getattr(args, f"{prefix}imbalance_threshold"),
+            balance_abs_threshold=getattr(args, f"{prefix}balance_abs_threshold"),
+            balance_rel_threshold=getattr(args, f"{prefix}balance_rel_threshold"),
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
         )
@@ -150,7 +158,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             host=router_args.host,
             port=router_args.port,
             cache_threshold=router_args.cache_threshold,
-            imbalance_threshold=router_args.imbalance_threshold,
+            balance_abs_threshold=router_args.balance_abs_threshold,
+            balance_rel_threshold=router_args.balance_rel_threshold,
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
         )
@@ -181,7 +190,7 @@ multi-node setups or when you want to start workers and router separately.
 
 Examples:
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
-  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000 --cache-threshold 0.7 --imbalance-threshold 3.0
+  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000 --cache-threshold 0.7 --balance-abs-threshold 64 --balance-rel-threshold 1.2
 
     """,
         formatter_class=CustomHelpFormatter,
