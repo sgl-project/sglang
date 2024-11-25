@@ -491,7 +491,7 @@ impl Tree {
             }
         }
 
-        info!("After eviction - Used size per tenant:");
+        info!("After eviction - Used size per tenant: ");
         for (tenant, size) in &used_size_per_tenant {
             info!("Tenant: {}, Size: {}", tenant, size);
         }
