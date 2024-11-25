@@ -1,5 +1,6 @@
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use log::info;
 use rand::distributions::{Alphanumeric, DistString};
 use rand::thread_rng;
 use std::cmp::min;
@@ -434,9 +435,9 @@ impl Tree {
             }
         }
 
-        println!("Before eviction - Used size per tenant:");
+        info!("Before eviction - Used size per tenant:");
         for (tenant, size) in &used_size_per_tenant {
-            println!("Tenant: {}, Size: {}", tenant, size);
+            info!("Tenant: {}, Size: {}", tenant, size);
         }
 
         // Process eviction
@@ -490,9 +491,9 @@ impl Tree {
             }
         }
 
-        println!("\nAfter eviction - Used size per tenant:");
+        info!("\nAfter eviction - Used size per tenant:");
         for (tenant, size) in &used_size_per_tenant {
-            println!("Tenant: {}, Size: {}", tenant, size);
+            info!("Tenant: {}, Size: {}", tenant, size);
         }
     }
 
