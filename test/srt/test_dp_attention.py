@@ -24,8 +24,6 @@ class TestDPAttention(unittest.TestCase):
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--dp",
-                "2",
                 "--enable-dp-attention",
             ],
         )

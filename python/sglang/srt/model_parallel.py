@@ -2,7 +2,7 @@
 Common utilities for torch model parallelism.
 """
 
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh

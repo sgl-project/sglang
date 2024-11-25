@@ -48,9 +48,13 @@ def run_eval(args):
     # Select backend
     set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
-    # Read data
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
+    if args.data_path is None:
+        # Read data
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        filename = download_and_cache_file(url)
+    else:
+        filename = args.data_path
+
     lines = list(read_jsonl(filename))
 
     # Construct prompts
@@ -131,7 +135,7 @@ def run_eval(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
+    parser.add_argument("--data-path", type=str)
     parser.add_argument("--num-questions", type=int, default=200)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)

@@ -1,21 +1,19 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 # Integrates "S-LoRA: Serving Thousands of Concurrent LoRA Adapters"
 # and "Punica: Multi-Tenant LoRA Serving"
-
 
 import logging
 import re
@@ -146,9 +144,9 @@ class LoRAManager:
             }
         else:
             logger.warning(
-                f"WARNING: get_module_name() is not defined, "
-                f"which is used to map config module name to model implementation module name."
-                f"Use the default one, but please check if it is correct for your model."
+                "WARNING: get_module_name() is not defined, "
+                "which is used to map config module name to model implementation module name."
+                "Use the default one, but please check if it is correct for your model."
             )
             self.target_modules = {
                 get_module_name(module) for module in self.origin_target_modules
@@ -194,9 +192,9 @@ class LoRAManager:
                 hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
             else:
                 logger.warning(
-                    f"WARNING: get_hidden_dim() is not defined, "
-                    f"which is used to get the hidden dim for different lora modules"
-                    f"Use the default one, but please check if it is correct for your model."
+                    "WARNING: get_hidden_dim() is not defined, "
+                    "which is used to get the hidden dim for different lora modules"
+                    "Use the default one, but please check if it is correct for your model."
                 )
                 hidden_dim_A, _ = get_hidden_dim(module_A, self.base_hf_config)
             c = self.loras[-1].get_stacked_multiply(module_A)
@@ -218,9 +216,9 @@ class LoRAManager:
                 _, hidden_dim_B = self.base_model.get_hidden_dim(module_B)
             else:
                 logger.warning(
-                    f"WARNING: get_hidden_dim() is not defined, "
-                    f"which is used to get the hidden dim for different lora modules"
-                    f"Use the default one, but please check if it is correct for your model."
+                    "WARNING: get_hidden_dim() is not defined, "
+                    "which is used to get the hidden dim for different lora modules"
+                    "Use the default one, but please check if it is correct for your model."
                 )
                 _, hidden_dim_B = get_hidden_dim(module_B, self.base_hf_config)
             c = self.loras[-1].get_stacked_multiply(module_B)

@@ -1,21 +1,20 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """A tensor parallel worker."""
 
 import logging
+import threading
 from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -128,9 +127,6 @@ class TpModelWorker:
     def get_tp_cpu_group(self):
         return self.model_runner.tp_group.cpu_group
 
-    def get_tp_device_group(self):
-        return self.model_runner.tp_group.device_group
-
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
@@ -141,9 +137,15 @@ class TpModelWorker:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         self.model_runner.forward(forward_batch)
 
-    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+    def forward_batch_generation(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        launch_done: Optional[threading.Event] = None,
+    ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
+        if launch_done:
+            launch_done.set()
         next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         return logits_output, next_token_ids
 

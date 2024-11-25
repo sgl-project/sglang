@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import copy
 import os
 import random
 import subprocess
@@ -43,7 +44,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 
 def is_in_ci():
     """Return whether it is in CI runner."""
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return os.getenv("SGLANG_IS_IN_CI", "false").lower() == "true"
 
 
 if is_in_ci():
@@ -438,18 +439,22 @@ def popen_launch_server(
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {api_key}",
-            }
-            response = requests.get(f"{base_url}/health_generate", headers=headers)
-            if response.status_code == 200:
-                return process
-        except requests.RequestException:
-            pass
-        time.sleep(10)
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                )
+                if response.status_code == 200:
+                    return process
+            except requests.RequestException:
+                pass
+            time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
@@ -529,6 +534,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    need_warmup=False,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -562,9 +568,14 @@ def run_bench_serving(
         disable_stream=disable_stream,
         disable_ignore_eos=False,
         extra_request_body=None,
+        profile=None,
     )
 
     try:
+        if need_warmup:
+            warmup_args = copy.deepcopy(args)
+            warmup_args.num_prompts = 16
+            run_benchmark(warmup_args)
         res = run_benchmark(args)
     finally:
         kill_child_process(process.pid, include_self=True)
@@ -573,11 +584,11 @@ def run_bench_serving(
     return res
 
 
-def run_bench_latency(model, other_args):
+def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_latency",
+        "sglang.bench_one_batch",
         "--model-path",
         model,
         "--batch-size",
@@ -664,7 +675,7 @@ def run_and_check_memory_leak(
     workload_func,
     disable_radix_cache,
     enable_mixed_chunk,
-    enable_overlap,
+    disable_overlap,
     chunked_prefill_size,
 ):
     other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
@@ -672,8 +683,8 @@ def run_and_check_memory_leak(
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:
         other_args += ["--enable-mixed-chunk"]
-    if enable_overlap:
-        other_args += ["--enable-overlap-schedule"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)
@@ -725,7 +736,7 @@ def run_and_check_memory_leak(
 def run_mmlu_test(
     disable_radix_cache=False,
     enable_mixed_chunk=False,
-    enable_overlap=False,
+    disable_overlap=False,
     chunked_prefill_size=32,
 ):
     def workload_func(base_url, model):
@@ -748,7 +759,7 @@ def run_mmlu_test(
         workload_func,
         disable_radix_cache,
         enable_mixed_chunk,
-        enable_overlap,
+        disable_overlap,
         chunked_prefill_size,
     )
 

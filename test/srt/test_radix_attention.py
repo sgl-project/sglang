@@ -107,7 +107,7 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
         )
 
 
-class TestRadixCacheOverlapLPM(TestRadixCacheFCFS):
+class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -117,7 +117,7 @@ class TestRadixCacheOverlapLPM(TestRadixCacheFCFS):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-overlap-schedule",
+                "--disable-overlap-schedule",
                 "--chunked-prefill-size",
                 "128",
                 "--max-total-tokens",

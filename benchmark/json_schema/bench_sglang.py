@@ -113,7 +113,7 @@ def main(args):
 
     # Compute accuracy
     tokenizer = get_tokenizer(
-        global_config.default_backend.get_server_args()["tokenizer_path"]
+        global_config.default_backend.get_server_info()["tokenizer_path"]
     )
     output_jsons = [state["json_output"] for state in states]
     num_output_tokens = sum(len(tokenizer.encode(x)) for x in output_jsons)
