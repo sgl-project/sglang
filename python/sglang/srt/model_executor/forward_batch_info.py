@@ -136,7 +136,7 @@ class ForwardBatch:
     # For split prefill
     hidden_states: torch.Tensor = None
     residual: torch.Tensor = None
-    split_index: int
+    split_index: int = 0
 
 
     def compute_mrope_positions(

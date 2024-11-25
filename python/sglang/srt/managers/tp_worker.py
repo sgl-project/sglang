@@ -147,9 +147,10 @@ class TpModelWorker:
         return embeddings
     
     def forward_batch_split_prefill(self, schedule_batch: ScheduleBatch):
-        if schedule_batch == 0:
-            model_worker_batch = schedule_batch.get_model_worker_batch()
+        model_worker_batch = schedule_batch.get_model_worker_batch()
+        if schedule_batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch.forward_mode = schedule_batch.forward_mode
             schedule_batch.split_forward_batch = forward_batch
         logits_output = self.model_runner.forward(schedule_batch.split_forward_batch)
         next_token_ids = None

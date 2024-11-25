@@ -475,7 +475,7 @@ class ScheduleBatch:
     device: str = "cuda"
 
     # split prefill
-    split_index: int
+    split_index: int = 0
     split_forward_batch: ForwardBatch = None
     split_prefill_finished: bool = False
 
@@ -683,6 +683,9 @@ class ScheduleBatch:
             self.model_config.vocab_size,
             global_server_args_dict["disable_penalizer"],
         )
+    
+    def prepare_for_split_prefill(self):
+        self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED

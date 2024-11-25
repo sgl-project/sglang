@@ -331,8 +331,6 @@ class Scheduler:
     @torch.inference_mode()
     def event_loop_pdmux(self):
         """A scheduler loop for pd multiplexing."""
-        self.running_batch = None
-        self.split_prefill_batch = None
 
         while True:
             recv_reqs = self.recv_requests()
@@ -345,10 +343,10 @@ class Scheduler:
                 self.new_token_ratio = global_config.init_new_token_ratio
                 continue
             self.update_running_batch()
-            if self.running_batch:
+            if self.running_batch and not self.running_batch.is_empty():
                 result = self.run_batch(self.running_batch)
                 self.process_batch_result(self.running_batch, result)
-            if self.split_prefill_batch:
+            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
                 result = self.run_batch(self.split_prefill_batch)
                 if self.split_prefill_batch.split_prefill_finished:
                     self.process_batch_result(self.split_prefill_batch, result)
@@ -714,26 +712,30 @@ class Scheduler:
 
         return new_batch
     
-    def update_split_prefil_batch(self):
-        # merge prefill batch to decode batch
+    def update_split_prefill_batch(self):
+        
         if self.split_prefill_batch and not self.split_prefill_batch.is_empty() and self.split_prefill_batch.split_prefill_finished:
+            # merge prefill batch to decode batch
             if self.running_batch:
                 self.running_batch.merge_batch(self.split_prefill_batch)
             else:
                 self.running_batch = self.split_prefill_batch
-
-        
-        
-
-        
+            self.split_prefill_batch = None
+            # add new request
+        if not self.split_prefill_batch or self.split_prefill_batch.is_empty():
+            batch = self.get_new_batch_prefill()
+            if batch and not batch.is_empty():
+                batch.prepare_for_split_prefill()
+                self.split_prefill_batch = batch
 
     def update_running_batch(self):
         """Update the current running decoding batch."""
         global test_retract
         batch = self.running_batch
 
-        batch.filter_batch()
-        if batch.is_empty():
+        if batch:
+            batch.filter_batch()
+        if not batch or batch.is_empty():
             self.running_batch = None
             return
 
@@ -770,12 +772,12 @@ class Scheduler:
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
         if self.is_generation:
+            model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_split_prefill():
                 logits_output, next_token_ids = self.tp_worker.forward_batch_split_prefill(
                     batch
                 )
             elif batch.forward_mode.is_decode()  or batch.extend_num_tokens != 0:
-                model_worker_batch = batch.get_model_worker_batch()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
