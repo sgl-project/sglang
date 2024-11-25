@@ -1,32 +1,25 @@
 import asyncio
 import json
-from multiprocessing import process
-import unittest
-from types import SimpleNamespace
-
-import torch
-
-import sglang as sgl
-from sglang.bench_offline_throughput import BenchArgs, throughput_test
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server_args import ServerArgs
-from sglang.test.few_shot_gsm8k_engine import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-)
 import os
 import time
 import unittest
-import time
+from multiprocessing import process
+from types import SimpleNamespace
+
 import requests
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
+import sglang as sgl
+from sglang.bench_offline_throughput import BenchArgs, throughput_test
+from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import init_custom_process_group, kill_child_process
+from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -37,13 +30,13 @@ mp.set_start_method("spawn", force=True)
 
 
 def mock_init_parameter_update_group(
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
+    master_address,
+    master_port,
+    rank_offset,
+    world_size,
+    group_name,
+    backend="nccl",
+):
     rank = rank_offset + 0
 
     _model_update_group = init_custom_process_group(
@@ -55,6 +48,7 @@ def mock_init_parameter_update_group(
     )
 
     return _model_update_group
+
 
 class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
@@ -69,6 +63,8 @@ class TestParameterUpdateGroup(unittest.TestCase):
             )
 
             if rank == 0:
+                os.environ["NCCL_CUMEM_ENABLE"] = "0"
+                os.environ["NCCL_NVLS_ENABLE"] = "0"
                 print(f"[Rank 0] Starting initialization")
                 group = init_custom_process_group(
                     backend="nccl",
@@ -106,13 +102,11 @@ class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.world_size = 2
-        
+
         print("Starting multiprocessing spawn")
         mp.spawn(
             cls.init_process,
-            args=(
-                cls.world_size,
-            ),
+            args=(cls.world_size,),
             nprocs=cls.world_size,
             join=True,
         )
@@ -136,4 +130,3 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

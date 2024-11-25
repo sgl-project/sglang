@@ -57,7 +57,7 @@ from sglang.srt.managers.io_struct import (
     GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
     OpenSessionReqInput,
-    UpdateParameteFromDistributedReqInput,
+    UpdateParameterFromDistributedReqInput,
     UpdateWeightFromDistReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -254,7 +254,7 @@ async def init_parameter_update_group(
 
 @app.post("/update_parameter_from_distributed")
 async def update_parameter_from_distributed(
-    obj: UpdateParameteFromDistributedReqInput, request: Request
+    obj: UpdateParameterFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
     success, message = await tokenizer_manager.update_parameter_from_distributed(
@@ -343,6 +343,20 @@ async def init_parameter_update_group_request(
     """Handle an init parameter update group request."""
     try:
         ret = await tokenizer_manager.init_parameter_update_group(obj, request)
+        return ret
+    except ValueError as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+@time_func_latency
+async def update_parameter_from_distributed_request(
+    obj: UpdateParameterFromDistributedReqInput, request: Request
+):
+    """Handle an update parameter from distributed request."""
+    try:
+        ret = await tokenizer_manager.update_parameter_from_distributed(obj, request)
         return ret
     except ValueError as e:
         return ORJSONResponse(
@@ -1093,54 +1107,16 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(init_parameter_update_group_request(obj, None))
 
-    def mock_init_parameter_update_group(
-        self,
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
-        """Initialize the Torch process group for model parameter updates.
-
-        `_model_update_group` is used in the RLHF workflow, where rank 0 is the actor model in the training engine,
-        and the inference engine is used for rollout.
-
-        In the RLHF workflow, the training engine updates the model weights/parameters online,
-        and broadcasts them to the inference engine through the `_model_update_group` process group.
-        """
-        assert group_name != "", "Group name cannot be empty"
-
-        rank = rank_offset + 0
-
-        logger.info(
-            f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
+    def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
+        obj = UpdateParameterFromDistributedReqInput(
+            name=name,
+            dtype=dtype,
+            shape=shape,
+            empty_cache=empty_cache,
         )
 
-        try:
-            self._model_update_group = init_custom_process_group(
-                backend=backend,
-                init_method=f"tcp://{master_address}:{master_port}",
-                world_size=world_size,
-                rank=rank,
-                group_name=group_name,
-            )
-            logger.error(
-                f"self._model_update_group.rank={self._model_update_group.rank()}"
-            )
-            logger.error(
-                f"self._model_update_group.group_name={self._model_update_group.group_name}"
-            )
-            logger.error(f"world_size={torch.distributed.get_world_size()}")
-            logger.error(f"device={torch.cuda.current_device()}")
-            logger.error("`_model_update_group` initialized.")
-            logger.error(f"before barrier")
-            dist.barrier(group=self._model_update_group)
-            logger.error(f"after barrier")
-            return True, "Succeeded to initialize custom process group."
-        except Exception as e:
-            message = f"Failed to initialize custom process group: {e}."
-            logger.error(message)
-            return False, message
+        loop = asyncio.get_event_loop()
+        print(f"update parameter from distributed request in engine")
+        return loop.run_until_complete(
+            update_parameter_from_distributed_request(obj, None)
+        )

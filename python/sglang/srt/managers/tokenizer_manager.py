@@ -56,8 +56,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateParameteFromDistributedReqInput,
-    UpdateParameteFromDistributedReqOutput,
+    UpdateParameterFromDistributedReqInput,
+    UpdateParameterFromDistributedReqOutput,
     UpdateWeightFromDistReqInput,
     UpdateWeightFromDistReqOutput,
 )
@@ -495,9 +495,10 @@ class TokenizerManager:
 
     async def update_parameter_from_distributed(
         self,
-        obj: UpdateParameteFromDistributedReqInput,
+        obj: UpdateParameterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ):
+        print(f"update parameter from distributed request in tokenizer manager")
         if self.to_create_loop:
             self.create_handle_loop()
 
@@ -622,7 +623,7 @@ class TokenizerManager:
                 BatchEmbeddingOut,
                 BatchTokenIDOut,
                 UpdateWeightFromDistReqOutput,
-                UpdateParameteFromDistributedReqOutput,
+                UpdateParameterFromDistributedReqOutput,
                 GetParameterByNameReqOutput,
                 InitParameterUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
@@ -636,14 +637,16 @@ class TokenizerManager:
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
                 continue
-            elif isinstance(recv_obj, UpdateParameteFromDistributedReqOutput):
+            elif isinstance(recv_obj, UpdateParameterFromDistributedReqOutput):
                 if self.server_args.dp_size == 1:
-                    self.model_update_result.set_result(recv_obj)
+                    self.parameter_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
-                    self.model_update_tmp.append(recv_obj)
+                    self.parameter_update_tmp.append(recv_obj)
                     # set future if the all results are recevied
-                    if len(self.model_update_tmp) == self.server_args.dp_size:
-                        self.model_update_result.set_result(self.model_update_tmp)
+                    if len(self.parameter_update_tmp) == self.server_args.dp_size:
+                        self.parameter_update_result.set_result(
+                            self.parameter_update_tmp
+                        )
                 continue
             elif isinstance(recv_obj, GetParameterByNameReqOutput):
                 if self.server_args.dp_size == 1:

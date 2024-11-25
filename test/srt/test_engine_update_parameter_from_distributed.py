@@ -18,23 +18,6 @@ from sglang.test.test_utils import (
 mp.set_start_method("spawn", force=True)
 
 
-def mock_init_parameter_update_group(
-    master_address, master_port, rank_offset, world_size, group_name, backend="nccl"
-):
-    """初始化模型参数更新的进程组"""
-    rank = rank_offset + 0
-    try:
-        _model_update_group = init_custom_process_group(
-            backend=backend,
-            init_method=f"tcp://{master_address}:{master_port}",
-            world_size=world_size,
-            rank=rank,
-            group_name=group_name,
-        )
-        return _model_update_group, "Succeeded to initialize custom process group."
-    except Exception as e:
-        return False, f"Failed to initialize custom process group: {e}."
-
 
 class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
@@ -47,7 +30,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
             # Rank 0: 加载HF模型
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
             os.environ["NCCL_NVLS_ENABLE"] = "0"
-            hf_model = AutoModelForCausalLM.from_pretrained(model_name).to("cuda:0")
+            hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="bfloat16").to("cuda:0")
             group = init_custom_process_group(
                 backend="nccl",
                 init_method="tcp://localhost:65500",
@@ -58,12 +41,20 @@ class TestParameterUpdateGroup(unittest.TestCase):
             print(f"rank: {rank}, before barrier")
             dist.barrier(group=group)
             print(f"rank: {rank}, after barrier")
+            param_name = "model.layers.0.self_attn.q_proj.weight"
+            param = hf_model.get_parameter(param_name)
+            shape = list(param.shape)
+            print(f"rank: {rank}, param_name: {param_name}, shape: {shape}")
+            dtype = str(param.dtype).split(".")[-1]
+            print(f"[Rank 0] Parameter shape: {shape}, dtype: {dtype}")
+            torch.distributed.broadcast(
+                param, src=0, group=group
+            )
             del hf_model
             gc.collect()
             torch.cuda.empty_cache()
 
         elif rank == 1:
-            # Rank 1: 启动SGLang服务器
             engine = sgl.Engine(model_path=model_name, random_seed=42, base_gpu_id=rank)
             engine.init_parameter_update_group(
                 master_address="localhost",
@@ -72,6 +63,15 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 world_size=world_size,
                 group_name="test_parameter_update_group",
                 backend="nccl",
+            )
+            param_name = "model.layers.0.self_attn.q_proj.weight"
+            shape = [2048, 2048]
+            dtype = "bfloat16"
+            engine.update_parameter_from_distributed(
+                name=param_name,
+                dtype=dtype,
+                shape=shape,
+                empty_cache=True,
             )
             engine.shutdown()
 
@@ -102,3 +102,5 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

@@ -24,7 +24,7 @@ import torch
 from sglang.srt.managers.io_struct import (
     GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
-    UpdateParameteFromDistributedReqInput,
+    UpdateParameterFromDistributedReqInput,
     UpdateWeightFromDistReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -209,7 +209,7 @@ class TpModelWorkerClient:
         return success, message
 
     def update_parameter_from_distributed(
-        self, recv_req: UpdateParameteFromDistributedReqInput
+        self, recv_req: UpdateParameterFromDistributedReqInput
     ):
         success, message = self.worker.update_parameter_from_distributed(recv_req)
         return success, message

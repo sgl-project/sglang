@@ -466,76 +466,87 @@ class ModelRunner:
             shape: the shape of the parameter to be updated.
             empty_cache: whether to empty the cache after updating the parameter.
         """
-
-        logger.info(
-            f"update_parameter_from_distributed: {name}, {dtype}, {shape}, {empty_cache}"
+        print(f"update parameter from distributed request in model runner")
+        logger.error(
+            f"update parameter from distributed: {name}, {dtype}, {shape}, {empty_cache}"
         )
-        torch.distributed.barrier(group=self._model_update_group)
-        logger.info(f"barrier done")
-        tensor = torch.zeros(1).cuda()
-        torch.distributed.all_reduce(
-            tensor, op=torch.distributed.ReduceOp.SUM, group=self._model_update_group
+
+        logger.error(
+            f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
         )
-        print(f"tensor={tensor}")
 
-        # logger.warning(
-        #     f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
-        # )
+        # 统一 dtype 格式
+        target_dtype = (
+            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        )
+        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
 
-        # # 统一 dtype 格式
-        # target_dtype = (
-        #     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-        # )
-        # current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
+        assert str(target_dtype) == str(
+            current_dtype
+        ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
 
-        # assert str(target_dtype) == str(
-        #     current_dtype
-        # ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
+        assert (
+            self._model_update_group is not None
+        ), "model update group must be initialized"
 
-        # assert (
-        #     self._model_update_group is not None
-        # ), "model update group must be initialized"
+        rank = self.tp_rank
+        logger.error(f"rank={rank}")
+        if rank == 0:
+            logger.info(
+                f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+            )
 
-        # rank = self.tp_rank
-        # logger.warning(f"rank={rank}")
-        # if rank == 0:
-        #     logger.info(
-        #         f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
-        #     )
+        try:
+            # 确保在正确的设备上创建tensor并同步
+            print(f"[Rank {rank}] Barrier")
+            print(f"[Rank {rank}] Barrier done")
+            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+            logger.error(f"weights is created")
 
-        # try:
-        #     # 确保在正确的设备上创建tensor并同步
-        #     print(f"[Rank {rank}] Barrier")
-        #     print(f"[Rank {rank}] Barrier done")
-        #     weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-        #     logger.warning(f"weights is created")
+            # 执行广播
+            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+            logger.error(f"weights is broadcasted")
 
-        #     # 执行广播
-        #     torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-        #     logger.warning(f"weights is broadcasted")
+            # TODO: 加载参数
 
-        #     # 加载权重
-        #     self.model.load_weights([name, weights])
+            mapped_name = name
+            mapped_shard_id = None
+            for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
+                if weight_name in name:
+                    mapped_name = name.replace(weight_name, param_name)
+                    mapped_shard_id = shard_id
+                    break
 
-        #     if empty_cache and self.device == "cuda":
-        #         torch.cuda.empty_cache()
+            # 查找并更新参数
+            params_dict = dict(self.model.named_parameters())
+            if mapped_name in params_dict:
+                param = params_dict[mapped_name]
+                if mapped_shard_id is not None:
+                    # 使用weight_loader处理分片参数
+                    weight_loader = param.weight_loader
+                    weight_loader(param, weights, mapped_shard_id)
+                else:
+                    # 直接更新非分片参数
+                    param.data.copy_(weights)
+            else:
+                raise ValueError(
+                    f"Parameter {name} (mapped to {mapped_name}) not found in model"
+                )
 
-        #     logger.warning(f"weights is loaded")
+            if empty_cache and self.device == "cuda":
+                torch.cuda.empty_cache()
 
-        #     # 最后同步确保所有进程完成更新
-        #     torch.distributed.barrier(group=self._model_update_group)
-        #     logger.warning(f"barrier is called")
+            logger.error(f"weights is loaded")
+            return True, f"Succeeded to update parameter {name} online."
 
-        #     return True, f"Succeeded to update parameter {name} online."
-
-        # except Exception as e:
-        #     error_msg = (
-        #         f"Failed to update parameter online: {e}. "
-        #         f"The full weights of the ModelRunner are partially updated. "
-        #         f"Please discard the whole weights."
-        #     )
-        #     logger.error(error_msg)
-        #     return False, error_msg
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
 
     def get_parameter_by_name(
         self, name: str, truncate_size: int = 100
@@ -543,23 +554,72 @@ class ModelRunner:
         """
         Get the parameter from model weights by its name.
         Args:
-            name: parameter name
+            name: parameter name. The name will be mapped to the actual parameter name in the engine.
+            truncate_size: maximum number of elements to return
 
         Returns:
-            If found, return the corresponding tensor; otherwise, return None.
-
-        Example:
-            >>> param = model_runner.get_parameter_by_name("model.layers.0.self_attn.qkv_proj.weight", 100)
+            If found, return the first truncate_size elements of the parameter as a list; otherwise, return None.
         """
         try:
+            # 先检查是否需要映射参数名
+            mapped_name = name
+            mapped_shard_id = None
+            for param_name, weight_name, shard_id in getattr(
+                self.model, "stacked_params_mapping", []
+            ):
+                if weight_name in name:
+                    logger.info(f"Inquire parameter {name} is mapped to {param_name}")
+                    mapped_name = name.replace(weight_name, param_name)
+                    mapped_shard_id = shard_id
+                    break
 
-            for param_name, param in self.model.named_parameters():
-                if param_name == name:
+            # 查找参数
+            params_dict = dict(self.model.named_parameters())
+            if mapped_name in params_dict:
+                param = params_dict[mapped_name]
+                if mapped_shard_id is not None:
+                    # 处理分片参数
+                    # 1. 获取weight_loader
+                    weight_loader = getattr(param, "weight_loader", None)
+                    if weight_loader is None:
+                        logger.warning(
+                            f"Parameter {name} is sharded but has no weight_loader"
+                        )
+                        return None
+
+                    # 2. 创建临时tensor用于加载完整权重
+                    full_shape = (
+                        param.full_shape
+                        if hasattr(param, "full_shape")
+                        else param.shape
+                    )
+                    temp_weight = torch.empty(
+                        full_shape, dtype=param.dtype, device=param.device
+                    )
+
+                    # 3. 使用weight_loader加载完整权重
+                    try:
+                        weight_loader(temp_weight, param, mapped_shard_id)
+                    except Exception as e:
+                        logger.error(f"Failed to load sharded weight for {name}: {e}")
+                        return None
+
+                    # 4. 转换并截断
+                    return (
+                        temp_weight.cpu()
+                        .to(torch.float32)
+                        .numpy()
+                        .tolist()[:truncate_size]
+                    )
+                else:
+                    # 非分片参数直接返回
                     return (
                         param.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
                     )
 
-            logger.warning(f"Parameter {name} not found in model.")
+            logger.warning(
+                f"Parameter {name} (mapped to {mapped_name}) not found in model."
+            )
             return None
 
         except Exception as e:

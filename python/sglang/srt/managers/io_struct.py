@@ -351,7 +351,7 @@ class UpdateWeightFromDistReqOutput:
 
 
 @dataclass
-class UpdateParameteFromDistributedReqInput:
+class UpdateParameterFromDistributedReqInput:
     name: str
     dtype: str
     shape: List[int]
@@ -359,7 +359,7 @@ class UpdateParameteFromDistributedReqInput:
 
 
 @dataclass
-class UpdateParameteFromDistributedReqOutput:
+class UpdateParameterFromDistributedReqOutput:
     success: bool
     message: str
 

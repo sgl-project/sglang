@@ -47,8 +47,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateParameteFromDistributedReqInput,
-    UpdateParameteFromDistributedReqOutput,
+    UpdateParameterFromDistributedReqInput,
+    UpdateParameterFromDistributedReqOutput,
     UpdateWeightFromDistReqInput,
     UpdateWeightFromDistReqOutput,
 )
@@ -519,10 +519,10 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(
                     InitParameterUpdateGroupReqOutput(success, message)
                 )
-            elif isinstance(recv_req, UpdateParameteFromDistributedReqInput):
+            elif isinstance(recv_req, UpdateParameterFromDistributedReqInput):
                 success, message = self.update_parameter_from_distributed(recv_req)
                 self.send_to_tokenizer.send_pyobj(
-                    UpdateParameteFromDistributedReqOutput(success, message)
+                    UpdateParameterFromDistributedReqOutput(success, message)
                 )
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
@@ -1383,7 +1383,7 @@ class Scheduler:
         return success, message
 
     def update_parameter_from_distributed(
-        self, recv_req: UpdateParameteFromDistributedReqInput
+        self, recv_req: UpdateParameterFromDistributedReqInput
     ):
         """Update the online model parameter."""
         success, message = self.tp_worker.update_parameter_from_distributed(recv_req)

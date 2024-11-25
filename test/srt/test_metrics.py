@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import requests
@@ -11,71 +12,99 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEnableMetrics(unittest.TestCase):
-    def test_metrics_enabled(self):
-        """Test that metrics endpoint returns data when enabled"""
-        process = popen_launch_server(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            DEFAULT_URL_FOR_TEST,
+class TestUpdateWeights(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-metrics"],
+            other_args=("--mem-",),
         )
 
-        try:
-            # Make some requests to generate some metrics
-            response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
-            self.assertEqual(response.status_code, 200)
+    @classmethod
+    def tearDownClass(cls):
+        kill_child_process(cls.process.pid, include_self=True)
 
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
-                json={
-                    "text": "The capital of France is",
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 32,
-                    },
-                    "stream": True,
+    def run_decode(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 32,
                 },
-                stream=True,
-            )
-            for _ in response.iter_lines(decode_unicode=False):
-                pass
+            },
+        )
+        print(json.dumps(response.json()))
+        print("=" * 100)
+        text = response.json()["text"]
+        return text
 
-            # Get metrics
-            metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
-            self.assertEqual(metrics_response.status_code, 200)
-            metrics_content = metrics_response.text
+    def get_model_info(self):
+        response = requests.get(self.base_url + "/get_model_info")
+        model_path = response.json()["model_path"]
+        print(json.dumps(response.json()))
+        return model_path
 
-            print(f"metrics_content=\n{metrics_content}")
+    def run_update_weights(self, model_path):
+        response = requests.post(
+            self.base_url + "/update_weights_from_disk",
+            json={
+                "model_path": model_path,
+            },
+        )
+        ret = response.json()
+        print(json.dumps(response.json()))
+        return ret
 
-            # Verify essential metrics are present
-            essential_metrics = [
-                "sglang:num_running_reqs",
-                "sglang:token_usage",
-                "sglang:gen_throughput",
-                "sglang:cache_hit_rate",
-                "sglang:func_latency_seconds",
-                "sglang:prompt_tokens_total",
-                "sglang:generation_tokens_total",
-                "sglang:time_to_first_token_seconds",
-                "sglang:time_per_output_token_seconds",
-                "sglang:e2e_request_latency_seconds",
-            ]
+    def test_update_weights(self):
+        origin_model_path = self.get_model_info()
+        print(f"origin_model_path: {origin_model_path}")
+        origin_response = self.run_decode()
 
-            for metric in essential_metrics:
-                self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
+        # update weights
+        new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
+        ret = self.run_update_weights(new_model_path)
+        assert ret["success"]
 
-            # Verify model name label is present and correct
-            expected_model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-            self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
+        updated_model_path = self.get_model_info()
+        print(f"updated_model_path: {updated_model_path}")
+        assert updated_model_path == new_model_path
+        assert updated_model_path != origin_model_path
 
-            # Verify metrics have values (not empty)
-            self.assertIn("_sum{", metrics_content)
-            self.assertIn("_count{", metrics_content)
-            self.assertIn("_bucket{", metrics_content)
+        updated_response = self.run_decode()
+        assert origin_response[:32] != updated_response[:32]
 
-        finally:
-            kill_child_process(process.pid, include_self=True)
+        # update weights back
+        ret = self.run_update_weights(origin_model_path)
+        assert ret["success"]
+
+        updated_model_path = self.get_model_info()
+        assert updated_model_path == origin_model_path
+
+        updated_response = self.run_decode()
+        assert origin_response[:32] == updated_response[:32]
+
+    def test_update_weights_unexist_model(self):
+        origin_model_path = self.get_model_info()
+        print(f"origin_model_path: {origin_model_path}")
+        origin_response = self.run_decode()
+
+        # update weights
+        new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "wrong")
+        ret = self.run_update_weights(new_model_path)
+        assert not ret["success"]
+
+        updated_model_path = self.get_model_info()
+        print(f"updated_model_path: {updated_model_path}")
+        assert updated_model_path == origin_model_path
+
+        updated_response = self.run_decode()
+        assert origin_response[:32] == updated_response[:32]
 
 
 if __name__ == "__main__":

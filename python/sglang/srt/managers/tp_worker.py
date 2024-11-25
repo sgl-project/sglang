@@ -22,7 +22,7 @@ from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
-    UpdateParameteFromDistributedReqInput,
+    UpdateParameterFromDistributedReqInput,
     UpdateWeightFromDistReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
@@ -178,8 +178,9 @@ class TpModelWorker:
         return success, message
 
     def update_parameter_from_distributed(
-        self, recv_req: UpdateParameteFromDistributedReqInput
+        self, recv_req: UpdateParameterFromDistributedReqInput
     ):
+        print(f"update parameter from distributed request in tp worker")
         success, message = self.model_runner.update_parameter_from_distributed(
             recv_req.name, recv_req.dtype, recv_req.shape, recv_req.empty_cache
         )
