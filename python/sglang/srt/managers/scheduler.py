@@ -526,6 +526,7 @@ class Scheduler:
         recv_req: TokenizedGenerateReqInput,
     ):
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
+            # Create a new request
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -534,6 +535,7 @@ class Scheduler:
                 lora_path=recv_req.lora_path,
             )
             req.tokenizer = self.tokenizer
+
             if recv_req.session_id is not None:
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_id} does not exist"
@@ -541,7 +543,7 @@ class Scheduler:
                 self.waiting_queue.append(req)
                 return
         else:
-            # Handle sessions
+            # Create a new request from a previsou session
             session = self.sessions[recv_req.session_id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
