@@ -13,7 +13,6 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import itertools
 import logging
 import os
 import threading
@@ -24,7 +23,6 @@ from concurrent import futures
 from types import SimpleNamespace
 from typing import List, Optional
 
-import psutil
 import torch
 import zmq
 
@@ -74,6 +72,7 @@ from sglang.srt.utils import (
     configure_logger,
     crash_on_warnings,
     get_zmq_socket,
+    gpu_proc_affinity,
     kill_parent_process,
     set_random_seed,
     suppress_other_loggers,
@@ -1395,33 +1394,8 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    # current process
-    pid = os.getpid()
-    p = psutil.Process(pid)
-
-    tp_size_per_node = server_args.tp_size // server_args.nnodes
-
-    # total physical cores
-    total_pcores = psutil.cpu_count(logical=False)
-    # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = total_pcores // tp_size_per_node
-
-    # able to handle multiple DP per node
-    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
-    end_cpu_id = start_cpu_id + num_cores_bind
-
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
-    else:
-        # HT off
-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-
-    # set cpu_affinities of current process
-    p.cpu_affinity(bind_cpu_ids)
-    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+    # set cpu affinity to this gpu process
+    gpu_proc_affinity(server_args, gpu_id)
 
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "DP_RANK" in os.environ:
