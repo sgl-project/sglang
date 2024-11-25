@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import itertools
 import logging
 import os
 import threading
@@ -23,6 +24,7 @@ from concurrent import futures
 from types import SimpleNamespace
 from typing import List, Optional
 
+import psutil
 import torch
 import zmq
 
@@ -1393,6 +1395,35 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # current process
+    pid = os.getpid()
+    p = psutil.Process(pid)
+
+    tp_size_per_node = server_args.tp_size // server_args.nnodes
+
+    # total logic cores
+    total_cores = psutil.cpu_count()
+    # physical cores per TP (N.B. more Cores than GPUs per node)
+    num_cores_bind = psutil.cpu_count(logical=False) // tp_size_per_node
+
+    start_cpu_id = gpu_id * num_cores_bind
+    end_cpu_id = (gpu_id + 1) * num_cores_bind
+
+    if psutil.cpu_count() != psutil.cpu_count(logical=False):
+        # HT on
+        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        lower_cpu_ids = [
+            id + total_cores // 2 for id in range(start_cpu_id, end_cpu_id)
+        ]
+        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
+    else:
+        # HT off
+        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+
+    # set cpu_affinities of current process
+    p.cpu_affinity(bind_cpu_ids)
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "DP_RANK" in os.environ:
         dp_rank = int(os.environ["DP_RANK"])
