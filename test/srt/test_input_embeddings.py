@@ -1,7 +1,5 @@
 import json
 import unittest
-import subprocess
-import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import requests
 
