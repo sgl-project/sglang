@@ -249,6 +249,8 @@ impl Router {
                 balance_rel_threshold,
                 ..
             } => {
+                // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
+
                 let mut tree = tree.lock().unwrap();
                 let mut running_queue = running_queue.lock().unwrap();
 

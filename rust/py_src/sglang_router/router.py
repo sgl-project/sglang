@@ -20,9 +20,9 @@ class Router:
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
             if the match rate exceeds threshold, otherwise routes to the worker with the smallest
             tree. Default: 0.5
-        balance_abs_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold 
+        balance_abs_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold
             AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 32
-        balance_rel_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold 
+        balance_rel_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold
             AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
