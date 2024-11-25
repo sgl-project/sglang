@@ -1,3 +1,8 @@
+"""
+Torch-native implementation for FusedMoE. This is used for torch.compile.
+It is based on https://github.com/pytorch-labs/gpt-fast/blob/32971d3129541c5bfb4f715abc33d1c5f408d204/mixtral-moe/model.py#L204
+"""
+
 from typing import Callable, Optional
 
 import torch

@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 The definition of objects transfered between different
 processes (TokenizerManager, DetokenizerManager, Controller).
@@ -55,6 +53,10 @@ class GenerateReqInput:
     modalities: Optional[List[str]] = None
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+
+    # Session id info for continual prompting
+    session_id: Optional[Union[List[str], str]] = None
+    session_rid: Optional[Union[List[str], str]] = None
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -200,6 +202,10 @@ class TokenizedGenerateReqInput:
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model
 
+    # Session id info for continual prompting
+    session_id: Optional[int] = None
+    session_rid: Optional[str] = None
+
 
 @dataclass
 class EmbeddingReqInput:
@@ -293,6 +299,8 @@ class BatchTokenIDOut:
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
     no_stop_trim: List[bool]
+    # The updated session unique id
+    session_ids: List[str]
 
 
 @dataclass
@@ -305,6 +313,8 @@ class BatchStrOut:
     meta_info: List[Dict]
     # The finish reason
     finished_reason: List[BaseFinishReason]
+    # The update session unique id
+    session_ids: List[str]
 
 
 @dataclass
@@ -357,3 +367,18 @@ class GetMemPoolSizeReq:
 @dataclass
 class GetMemPoolSizeReqOutput:
     size: int
+
+
+@dataclass
+class OpenSessionReqInput:
+    capacity_of_str_len: int
+
+
+@dataclass
+class CloseSessionReqInput:
+    session_id: str
+
+
+@dataclass
+class OpenSessionReqOutput:
+    session_id: str

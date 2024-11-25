@@ -20,7 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.utils import set_weight_attrs
 
-from sglang.srt.layers.fused_moe.fused_moe import padding_size
+from sglang.srt.layers.fused_moe_grok.fused_moe import padding_size
 from sglang.srt.utils import is_hip
 
 logger = init_logger(__name__)
@@ -123,7 +123,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int],
         topk_group: Optional[int],
     ) -> torch.Tensor:
-        from sglang.srt.layers.fused_moe.fused_moe import fused_moe
+        from sglang.srt.layers.fused_moe_grok.fused_moe import fused_moe
 
         return fused_moe(
             x,
@@ -153,12 +153,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int],
         topk_group: Optional[int],
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.fused_moe.moe_pallas import fused_moe
-
-        assert not use_grouped_topk
-        assert num_expert_group is None
-        assert topk_group is None
-        return fused_moe(x, w1, w2, router_logits, top_k, renormalize)
+        raise NotImplementedError("The TPU backend currently does not support MoE.")
 
 
 class FusedMoE(torch.nn.Module):
@@ -614,7 +609,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         topk_group: Optional[int] = None,
     ) -> torch.Tensor:
 
-        from sglang.srt.layers.fused_moe.fused_moe import fused_moe
+        from sglang.srt.layers.fused_moe_grok.fused_moe import fused_moe
 
         return fused_moe(
             x,

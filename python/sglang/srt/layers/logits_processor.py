@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Logits processing."""
 
 import dataclasses
@@ -62,21 +60,21 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        extend_logprob_pruned_lens_cpu = None
+
         if forward_batch.return_logprob:
             return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
+            if forward_batch.forward_mode.is_extend():
+                extend_logprob_pruned_lens_cpu = [
+                    extend_len - start_len
+                    for extend_len, start_len in zip(
+                        forward_batch.extend_seq_lens_cpu,
+                        forward_batch.extend_logprob_start_lens_cpu,
+                    )
+                ]
         else:
             return_top_logprob = False
 
-        if forward_batch.forward_mode.is_extend():
-            extend_logprob_pruned_lens_cpu = [
-                extend_len - start_len
-                for extend_len, start_len in zip(
-                    forward_batch.extend_seq_lens,
-                    forward_batch.extend_logprob_start_lens_cpu,
-                )
-            ]
-        else:
-            extend_logprob_pruned_lens_cpu = None
         return cls(
             forward_mode=forward_batch.forward_mode,
             top_logprobs_nums=forward_batch.top_logprobs_nums,

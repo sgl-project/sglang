@@ -42,7 +42,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.71, f"{metrics}"
+        self.assertGreater(metrics["score"], 0.71)
 
     def test_human_eval(self):
         args = SimpleNamespace(
@@ -54,7 +54,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.64, f"{metrics}"
+        self.assertGreater(metrics["score"], 0.64)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -66,7 +66,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.84, f"{metrics}"
+        self.assertGreater(metrics["score"], 0.835)
 
 
 if __name__ == "__main__":

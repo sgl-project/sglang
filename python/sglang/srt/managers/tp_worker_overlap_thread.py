@@ -1,23 +1,21 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """A tensor parallel worker."""
 
+import dataclasses
 import logging
 import threading
-import time
 from queue import Queue
 from typing import Optional
 
@@ -26,7 +24,6 @@ import torch
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -56,6 +53,7 @@ class TpModelWorkerClient:
         self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
+        self.gpu_id = gpu_id
 
         # Init future mappings
         self.future_token_ids_ct = 0
@@ -72,12 +70,6 @@ class TpModelWorkerClient:
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
-
-        self.copy_queue = Queue()
-        self.copy_thread = threading.Thread(
-            target=self.copy_thread_func,
-        )
-        self.copy_thread.start()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -98,15 +90,25 @@ class TpModelWorkerClient:
         with torch.cuda.stream(self.forward_stream):
             self.forward_thread_func_()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_thread_func_(self):
+        batch_pt = 0
+        batch_lists = [None] * 2
+
         while True:
-            self.has_inflight_batch = False
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
-            self.has_inflight_batch = True
-            self.launch_event = threading.Event()
+
+            # Keep a reference of model_worker_batch by storing it into a list.
+            # Otherwise, the tensor members of model_worker_batch will be released
+            # by pytorch and cause CUDA illegal memory access errors.
+            batch_lists[batch_pt % 2] = model_worker_batch
+            batch_pt += 1
+
+            # Create event
+            self.launch_done = threading.Event()
+            copy_done = torch.cuda.Event()
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
@@ -114,7 +116,7 @@ class TpModelWorkerClient:
 
             # Run forward
             logits_output, next_token_ids = self.worker.forward_batch_generation(
-                model_worker_batch
+                model_worker_batch, self.launch_done
             )
 
             # Update the future token ids map
@@ -139,44 +141,45 @@ class TpModelWorkerClient:
                         )
                     )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
-            copy_event = torch.cuda.Event(blocking=True)
-            copy_event.record()
+            copy_done.record()
 
-            self.launch_event.set()
-            self.copy_queue.put((copy_event, logits_output, next_token_ids))
+            self.output_queue.put((copy_done, logits_output, next_token_ids))
 
-    def copy_thread_func(self):
-        while True:
-            copy_event, logits_output, next_token_ids = self.copy_queue.get()
-            if not copy_event:
-                break
-            while not copy_event.query():
-                time.sleep(1e-5)
+    def resolve_batch_result(self, bid: int):
+        copy_done, logits_output, next_token_ids = self.output_queue.get()
+        copy_done.synchronize()
+        self.launch_done.wait()
 
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.tolist()
+        if logits_output.next_token_logprobs is not None:
+            logits_output.next_token_logprobs = (
+                logits_output.next_token_logprobs.tolist()
+            )
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = (
+                    logits_output.input_token_logprobs.tolist()
                 )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.tolist()
-                    )
-                    logits_output.normalized_prompt_logprobs = (
-                        logits_output.normalized_prompt_logprobs.tolist()
-                    )
-
-            self.output_queue.put((logits_output, next_token_ids.tolist()))
-
-    def resulve_batch_result(self, bid: int):
-        logits_output, next_token_ids = self.output_queue.get()
-        if self.has_inflight_batch:
-            # Wait until the batch is launched
-            self.launch_event.wait()
+                logits_output.normalized_prompt_logprobs = (
+                    logits_output.normalized_prompt_logprobs.tolist()
+                )
+        next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
+        sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
+        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
+            sampling_info,
+            sampling_info_done=threading.Event(),
+            scaling_penalties=sampling_info.scaling_penalties,
+            linear_penalties=sampling_info.linear_penalties,
+        )
+
+        # A cuda stream sync here to avoid the cuda illegal memory access error.
+        torch.cuda.current_stream().synchronize()
+
         # Push a new batch to the queue
-        self.input_queue.put((model_worker_batch.copy(), self.future_token_ids_ct))
+        self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
@@ -192,16 +195,8 @@ class TpModelWorkerClient:
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
-    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch)
-        embeddings = logits_output.embeddings
-        return embeddings
-
     def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.model_runner.update_weights(
-            recv_req.model_path, recv_req.load_format
-        )
+        success, message = self.worker.update_weights(recv_req)
         return success, message
 
     def __delete__(self):

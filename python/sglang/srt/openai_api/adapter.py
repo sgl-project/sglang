@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
@@ -989,11 +987,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
             )
             token_logprobs = []
-            for token, logprob in zip(logprobs.tokens, logprobs.token_logprobs):
+            for token_idx, (token, logprob) in enumerate(
+                zip(logprobs.tokens, logprobs.token_logprobs)
+            ):
                 token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
                 if logprobs.top_logprobs:
-                    for top_token, top_logprob in logprobs.top_logprobs[0].items():
+                    for top_token, top_logprob in logprobs.top_logprobs[
+                        token_idx
+                    ].items():
                         top_token_bytes = list(top_token.encode("utf-8"))
                         top_logprobs.append(
                             TopLogprob(

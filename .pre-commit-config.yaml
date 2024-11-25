@@ -1,6 +1,3 @@
-default_language_version:
-    python: python3.9
-
 default_stages: [pre-commit, pre-push, manual]
 
 repos:
@@ -28,7 +25,11 @@ repos:
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
-      - id: black
-        types: [python]
       - id: black-jupyter
-        types: [jupyter]
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+        args:
+          - '--keep-output'
+          - '--extra-keys=metadata.kernelspec metadata.language_info.version'
