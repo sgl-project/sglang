@@ -199,6 +199,11 @@ class TokenizerManager:
         # Tokenize
         input_text = obj.text
         if obj.input_embeds is not None:
+            if self.server_args.disable_radix_cache == False:
+                raise ValueError(
+                    "input_embeds is provided while disable_radix_cache is False. "
+                    "Radix cache should be enabled when input_embeds is provided."
+                )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
         elif obj.input_ids is None:

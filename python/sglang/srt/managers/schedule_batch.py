@@ -177,7 +177,7 @@ class Req:
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
         lora_path: Optional[str] = None,
-        input_embeds: Optional = None,
+        input_embeds: Optional[List[List[float]]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -444,7 +444,7 @@ class ScheduleBatch:
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    input_embeds: Optional[torch.Tensor] = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     # The output locations of the KV cache
@@ -1107,7 +1107,7 @@ class ModelWorkerBatch:
     sampling_info: SamplingBatchInfo
 
     # The input Embeds
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    input_embeds: Optional[torch.tensor] = None
 
     def copy(self):
         return dataclasses.replace(self, sampling_info=self.sampling_info.copy())

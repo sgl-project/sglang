@@ -492,14 +492,9 @@ class Scheduler:
     ):
         # Check if input_embeds is present and create dummy input_ids
         if recv_req.input_embeds is not None:
-            input_embeds_tensor = torch.tensor(recv_req.input_embeds)
-            # Generate fake input_ids based on the length of input_embeds
-            seq_length = input_embeds_tensor.shape[
-                0
-            ]  # Assuming embeddings are shaped (batch_size, seq_length, hidden_size)
-            fake_input_ids = [
-                1
-            ] * seq_length  # Create dummy input_ids as ones (or use zeros if preferred)
+        # Generate fake input_ids based on the length of input_embeds
+            seq_length = len(recv_req.input_embeds)  # Use length directly without tensor conversion
+            fake_input_ids = [1] * seq_length  # Create dummy input_ids as ones (or use zeros if preferred)
             recv_req.input_ids = fake_input_ids
         # Pass input_embeds to Req if present, otherwise pass as None
 

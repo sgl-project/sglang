@@ -224,11 +224,10 @@ class ForwardBatch:
             global_num_tokens=batch.global_num_tokens,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
-            input_embeds=(
-                batch.input_embeds.clone().detach().to(device)
+            input_embeds=batch.input_embeds
                 if batch.input_embeds is not None
                 else None
-            ),
+            ,
         )
 
         if ret.global_num_tokens is not None:
