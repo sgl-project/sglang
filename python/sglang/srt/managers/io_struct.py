@@ -60,9 +60,7 @@ class GenerateReqInput:
     ] = None
 
     def normalize_batch_and_arguments(self):
-        if (self.text is None and self.input_ids is None) or (
-            self.text is not None and self.input_ids is not None
-        ):
+        if self.text is None and self.input_ids is None:
             raise ValueError("Either text or input_ids should be provided.")
 
         # Derive the batch size
