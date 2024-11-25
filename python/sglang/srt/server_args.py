@@ -218,7 +218,6 @@ class ServerArgs:
                 "Overlap schedule is disabled."
             )
 
-
         # Speculative Decoding
         self.speculative_algorithm = SpeculativeAlgorithm.get_algorithm(
             self.speculative_algorithm
