@@ -20,33 +20,35 @@ $ python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8
 ```
 
 ### 2. Launch only router
-This is useful if you for multi node DP. You can launch workers on different nodes, then connect the router to them.
+This is useful for multi-node DP. You can launch workers on different nodes, then connect the router to them.
 
 ```bash
 $ python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
 
 $ python -m sglang_router.launch_router --help
 usage: launch_router.py [-h] [--host HOST] [--port PORT] [--worker-urls WORKER_URLS [WORKER_URLS ...]]
-                        [--policy {random,round_robin,cache_aware}] [--cache-threshold CACHE_THRESHOLD]
-                        [--cache-routing-prob CACHE_ROUTING_PROB] [--eviction-interval EVICTION_INTERVAL]
-                        [--max-tree-size MAX_TREE_SIZE]
+                       [--policy {random,round_robin,cache_aware}] [--cache-threshold CACHE_THRESHOLD]
+                       [--balance-abs-threshold BALANCE_ABS_THRESHOLD] [--balance-rel-threshold BALANCE_REL_THRESHOLD]
+                       [--eviction-interval EVICTION_INTERVAL] [--max-tree-size MAX_TREE_SIZE]
 
 options:
   -h, --help            show this help message and exit
-  --host HOST           Host address to bind the router server (default: 127.0.0.1)
-  --port PORT           Port number to bind the router server (default: 30000)
+  --host HOST          Host address to bind the router server (default: 127.0.0.1)
+  --port PORT          Port number to bind the router server (default: 30000)
   --worker-urls WORKER_URLS [WORKER_URLS ...]
-                        List of worker URLs (e.g., http://worker1:8000 http://worker2:8000) (default: None)
+                       List of worker URLs (e.g., http://worker1:8000 http://worker2:8000) (default: None)
   --policy {random,round_robin,cache_aware}
-                        Load balancing policy to use (default: cache_aware)
+                       Load balancing policy to use (default: cache_aware)
   --cache-threshold CACHE_THRESHOLD
-                        Cache threshold (0.0-1.0) for cache-aware routing (default: 0.5)
-  --cache-routing-prob CACHE_ROUTING_PROB
-                        Probability of using cache-aware routing (0.0-1.0) (default: 1.0)
+                       Cache threshold (0.0-1.0) for cache-aware routing (default: 0.5)
+  --balance-abs-threshold BALANCE_ABS_THRESHOLD
+                       Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold (default: 32)
+  --balance-rel-threshold BALANCE_REL_THRESHOLD
+                       Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold (default: 1.0001)
   --eviction-interval EVICTION_INTERVAL
-                        Interval in seconds between cache eviction operations (default: 60)
+                       Interval in seconds between cache eviction operations (default: 60)
   --max-tree-size MAX_TREE_SIZE
-                        Maximum size of the approximation tree for cache-aware routing (default: 16777216)
+                       Maximum size of the approximation tree for cache-aware routing (default: 16777216)
 ```
 
 ## Strategy
@@ -56,7 +58,15 @@ options:
 This router combines two strategies to optimize both cache utilization and request distribution:
 
 1. Cache-Aware Routing (Approximate Tree)
-2. Load-Balancing Routing (Shortest Queue)
+2. Load-Balancing Routing (Shortest Queue with Balance Thresholds)
+
+The router dynamically switches between these strategies based on load conditions:
+- Uses load balancing when the system is imbalanced
+- Uses cache-aware routing when the system is balanced
+
+A system is considered imbalanced if both conditions are met:
+1. (max_load - min_load) > balance_abs_threshold
+2. max_load > balance_rel_threshold * min_load
 
 #### 1. Cache-Aware Routing (Approximate Tree)
 This strategy maintains an approximate radix tree for each worker based on request history,
@@ -74,26 +84,31 @@ Process:
 
 #### 2. Load-Balancing (Shortest Queue)
 This strategy tracks pending request counts per worker and routes new requests
-to the least busy worker for optimal load distribution.
+to the least busy worker when the system is detected to be imbalanced. This helps
+maintain optimal load distribution across workers.
 
 ### Configuration Parameters
 
-1. `cache_routing_prob`: (float, 0.0 to 1.0)
-   - 0.0: Exclusively use load balancing
-   - 1.0: Exclusively use cache-aware routing
-   - Between 0-1: Probability of using cache-aware routing vs load balancing
-
-2. `cache_threshold`: (float, 0.0 to 1.0)
+1. `cache_threshold`: (float, 0.0 to 1.0, default: 0.5)
    - Minimum prefix match ratio to use highest-match routing
    - Below this threshold, routes to worker with most available cache space
 
-3. `eviction_interval_secs`: (integer)
-   - Interval between LRU eviction cycles for the approximate trees
+2. `balance_abs_threshold`: (integer, default: 32)
+   - Absolute difference threshold for load imbalance detection
+   - System is potentially imbalanced if (max_load - min_load) > abs_threshold
 
-4. `max_tree_size`: (integer)
+3. `balance_rel_threshold`: (float, default: 1.0001)
+   - Relative ratio threshold for load imbalance detection
+   - System is potentially imbalanced if max_load > min_load * rel_threshold
+   - Used in conjunction with abs_threshold to determine final imbalance state
+
+4. `eviction_interval`: (integer, default: 60)
+   - Interval in seconds between LRU eviction cycles for the approximate trees
+   - Background thread periodically evicts least recently used nodes to maintain tree size
+
+5. `max_tree_size`: (integer, default: 16777216)
    - Maximum nodes per tree
    - When exceeded, LRU leaf nodes are evicted during the next eviction cycle
-
 
 ## Development
 
