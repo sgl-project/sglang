@@ -172,7 +172,7 @@ class SamplingBatchInfo:
             if grammar is not None:
                 try:
                     grammar.fill_vocab_mask(self.vocab_mask, i)
-                except Exception as e:
+                except RuntimeError:
                     continue
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
