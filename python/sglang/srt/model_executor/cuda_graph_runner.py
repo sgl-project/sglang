@@ -65,7 +65,8 @@ def patch_model(
             _to_torch(model)
             monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
-            tp_group.ca_comm = None
+            # Use custom-allreduce here
+            # tp_group.ca_comm = None
             yield torch.compile(
                 torch.no_grad()(model.forward), mode="max-autotune-no-cudagraphs"
             )
