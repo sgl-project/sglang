@@ -1,4 +1,5 @@
 # SGLang Documentation
+This is the documentation repository for SGLang. It is auto-generated from https://github.com/sgl-project/sglang/tree/main/docs.
 
 ## Build the documentation website
 
