@@ -53,6 +53,7 @@ jobs:
 
       - name: Build python binding
         run: |
+          source "$HOME/.cargo/env"
           cd rust
           pip install setuptools-rust wheel build
           python3 -m build
