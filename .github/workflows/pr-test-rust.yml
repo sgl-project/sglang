@@ -55,7 +55,7 @@ jobs:
         run: |
           cd rust
           pip install setuptools-rust wheel build
-          python -m build
+          python3 -m build
           ls
 
   finish:
