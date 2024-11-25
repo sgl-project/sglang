@@ -1,5 +1,6 @@
 import argparse
 import copy
+import logging
 import multiprocessing as mp
 import os
 import random
@@ -15,6 +16,22 @@ from sglang.srt.server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
 from sglang.utils import get_exception_traceback
+
+
+def setup_logger():
+    logger = logging.getLogger("router")
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
 
 
 # Create new process group
@@ -42,20 +59,20 @@ def launch_server_process(
 
 
 def cleanup_processes(processes: List[mp.Process]):
-    """Clean up all processes using process groups."""
-    print("\nCleaning up processes...")
+    logger = logging.getLogger("router")
+    logger.info("Cleaning up processes...")
     for proc in processes:
         if proc.is_alive():
             try:
-                # Kill the entire process group
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                # Give processes some time to terminate gracefully
                 proc.join(timeout=3)
-                # If process is still alive, force kill
                 if proc.is_alive():
+                    logger.warning(
+                        f"Process {proc.pid} did not terminate gracefully, force killing..."
+                    )
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except ProcessLookupError:
-                pass  # Process already terminated
+                pass
 
 
 def setup_signal_handlers(cleanup_func):
@@ -101,6 +118,8 @@ def find_available_ports(base_port: int, count: int) -> List[int]:
 
 
 def main():
+    logger = setup_logger()
+
     # CUDA runtime isn't fork-safe, which can lead to subtle bugs or crashes
     mp.set_start_method("spawn")
 
@@ -130,8 +149,8 @@ def main():
     server_processes = []
 
     try:
-        # Launch server processes
         for i, worker_port in enumerate(worker_ports):
+            logger.info(f"Launching DP server process {i} on port {worker_port}")
             proc = launch_server_process(server_args, worker_port, i)
             server_processes.append(proc)
 
@@ -140,18 +159,19 @@ def main():
 
         # Wait for all servers to be healthy
         all_healthy = True
+
         for port in worker_ports:
             if not wait_for_server_health(server_args.host, port):
-                print(f"Server on port {port} failed to become healthy")
+                logger.error(f"Server on port {port} failed to become healthy")
                 all_healthy = False
                 break
 
         if not all_healthy:
-            print("Not all servers are healthy. Shutting down...")
+            logger.error("Not all servers are healthy. Shutting down...")
             cleanup_processes(server_processes)
             sys.exit(1)
 
-        print("All servers are healthy. Starting router...")
+        logger.info("All servers are healthy. Starting router...")
 
         # Update router args with worker URLs
         router_args.worker_urls = [
@@ -162,16 +182,17 @@ def main():
         router = launch_router(router_args)
 
         if router is None:
-            print("Failed to start router. Shutting down...")
+            logger.error("Failed to start router. Shutting down...")
             cleanup_processes(server_processes)
             sys.exit(1)
 
     except KeyboardInterrupt:
-        print("\nReceived shutdown signal...")
+        logger.info("Received shutdown signal...")
     except Exception as e:
-        print(f"Error occurred: {e}")
-        print(get_exception_traceback())
+        logger.error(f"Error occurred: {e}")
+        logger.error(get_exception_traceback())
     finally:
+        logger.info("Cleaning up processes...")
         cleanup_processes(server_processes)
 
 
