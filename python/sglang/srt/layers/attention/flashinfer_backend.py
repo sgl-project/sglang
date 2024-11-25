@@ -30,7 +30,6 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 
 class WrapperDispatch(Enum):
@@ -45,13 +44,6 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        if not _grouped_size_compiled_for_decode_kernels(
-            model_runner.model_config.num_attention_heads // model_runner.tp_size,
-            model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
-        ):
-            self.decode_use_tensor_cores = True
-        else:
-            self.decode_use_tensor_cores = False
         self.max_context_len = model_runner.model_config.context_len
 
         assert not (
@@ -108,7 +100,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
                     "NHD",
-                    use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
 
@@ -178,7 +169,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.workspace_buffer,
                     "NHD",
                     use_cuda_graph=True,
-                    use_tensor_cores=self.decode_use_tensor_cores,
                     paged_kv_indptr_buffer=self.kv_indptr[i][: bs + 1],
                     paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
                     paged_kv_last_page_len_buffer=self.kv_last_page_len[:bs],
@@ -658,6 +648,8 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
             )
 
         # cached part
@@ -671,6 +663,8 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_kv_heads,
             self.head_dim,
             1,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
         )
 
 
