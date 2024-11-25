@@ -22,7 +22,7 @@ runtime_common = ["aiohttp", "decord", "fastapi",
     "packaging", "pillow", "prometheus-client>=0.20.0",
     "psutil", "pydantic", "python-multipart",
     "pyzmq>=25.1.2", "torchao", "uvicorn", "uvloop",
-    "modelscope", "xgrammar"]
+    "modelscope", "xgrammar==0.1.4"]
 srt = ["sglang[runtime_common]", "torch", "vllm>=0.6.3.post1"]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
