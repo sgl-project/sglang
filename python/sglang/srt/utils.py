@@ -930,7 +930,7 @@ def get_nvgpu_memory_capacity():
 
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return os.getenv("SGLANG_IS_IN_CI", "false").lower() == "true"
 
 
 def get_device_name(device_id: int = 0) -> str:
