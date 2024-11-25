@@ -222,8 +222,8 @@ class TokenizerManager:
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
-            session_id = obj.session_id
-            session_rid = obj.session_rid
+            session_id = obj.session[0] if obj.session else None
+            session_rid = obj.session[1] if obj.session else None
 
         if len(input_ids) >= self.context_len:
             raise ValueError(
@@ -700,13 +700,11 @@ class TokenizerManager:
                     out_dict = {
                         "text": recv_obj.output_strs[i],
                         "meta_info": recv_obj.meta_info[i],
-                        "session_id": recv_obj.session_ids[i],
                     }
                 elif isinstance(recv_obj, BatchTokenIDOut):
                     out_dict = {
                         "token_ids": recv_obj.output_ids[i],
                         "meta_info": recv_obj.meta_info[i],
-                        "session_id": recv_obj.session_ids[i],
                     }
                 else:
                     assert isinstance(recv_obj, BatchEmbeddingOut)

@@ -173,7 +173,6 @@ class DetokenizerManager:
                     output_strs=output_strs,
                     meta_info=recv_obj.meta_info,
                     finished_reason=recv_obj.finished_reason,
-                    session_ids=recv_obj.session_ids,
                 )
             )
 
