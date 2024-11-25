@@ -1,7 +1,7 @@
 use clap::Parser;
 use clap::ValueEnum;
 
-use sglang_router_rs::{router::PolicyConfig, server};
+use sglang_router_rs::{router::PolicyConfig, server, server::ServerConfig};
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum PolicyType {
@@ -89,6 +89,9 @@ struct Args {
         help = "Maximum size of the approximation tree for cache-aware routing. Default: 2^24"
     )]
     max_tree_size: usize,
+
+    #[arg(long, default_value_t = false, help = "Enable verbose logging")]
+    verbose: bool,
 }
 
 impl Args {
@@ -111,5 +114,12 @@ impl Args {
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let policy_config = args.get_policy_config();
-    server::startup(args.host, args.port, args.worker_urls, policy_config).await
+    server::startup(ServerConfig {
+        host: args.host,
+        port: args.port,
+        worker_urls: args.worker_urls,
+        policy_config,
+        verbose: args.verbose,
+    })
+    .await
 }
