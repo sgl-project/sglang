@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
 )
 
+
 def popen_launch_router(
     model: str,
     base_url: str,
