@@ -1,4 +1,3 @@
-
 """
 Usage:
 python3 -m unittest test_session_control.TestSessionControl.test_session_control
@@ -6,6 +5,7 @@ python3 -m unittest test_session_control.TestSessionControl.test_session_control
 """
 
 import unittest
+
 import requests
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -32,7 +32,12 @@ class TestSessionControl(unittest.TestCase):
         kill_child_process(cls.process.pid, include_self=True)
 
     def test_session_control(self):
-        chunks = ["Let me tell you something about France.", "The capital of France is", "A brief history about that city is", "To plan a travel, the budget is"]
+        chunks = [
+            "Let me tell you something about France.",
+            "The capital of France is",
+            "A brief history about that city is",
+            "To plan a travel, the budget is",
+        ]
         tokenizer = get_tokenizer(self.model)
         chunks_ids = [tokenizer.encode(x) for x in chunks]
 
@@ -50,33 +55,33 @@ class TestSessionControl(unittest.TestCase):
                 self.base_url + "/generate",
                 json={
                     "input_ids": chunk_ids,
-                    "session_id": session_id,
-                    "session_rid": rid,
+                    "session": [session_id, rid],
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 16 if i > 0 else 0, # prefill only for the first chunk
+                        "max_new_tokens": (
+                            16 if i > 0 else 0
+                        ),  # prefill only for the first chunk
                     },
                 },
             ).json()
-            session_id = response["session_id"]
             rid = response["meta_info"]["id"]
-            if i == 0: first_rid = rid
-            if i > 0: outputs_from_session.append(response["text"])
+            if i == 0:
+                first_rid = rid
+            if i > 0:
+                outputs_from_session.append(response["text"])
 
         # backtrack to the first request and regenerate
         response = requests.post(
             self.base_url + "/generate",
             json={
                 "input_ids": chunks_ids[-1],
-                "session_id": session_id,
-                "session_rid": first_rid,
+                "session": [session_id, first_rid],
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 16,
                 },
             },
         ).json()
-        session_id = response["session_id"]
         outputs_from_session.append(response["text"])
 
         # query with a non-existing rid (the last one should be disappeared becuase of backtrack), should see abort
@@ -84,15 +89,13 @@ class TestSessionControl(unittest.TestCase):
             self.base_url + "/generate",
             json={
                 "input_ids": chunks_ids[-1],
-                "session_id": session_id,
-                "session_rid": rid,
+                "session": [session_id, rid],
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 16,
                 },
             },
         ).json()
-        session_id = response["session_id"]
         assert response["meta_info"]["finish_reason"]["type"] == "abort"
 
         ret = requests.post(
@@ -106,8 +109,7 @@ class TestSessionControl(unittest.TestCase):
             self.base_url + "/generate",
             json={
                 "input_ids": chunks_ids[-1],
-                "session_id": session_id,
-                "session_rid": first_rid,
+                "session": [session_id, first_rid],
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 16,
@@ -128,14 +130,19 @@ class TestSessionControl(unittest.TestCase):
                     "input_ids": input_ids,
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 16 if i > 0 else 0, # prefill only for the first chunk
+                        "max_new_tokens": (
+                            16 if i > 0 else 0
+                        ),  # prefill only for the first chunk
                     },
                 },
             ).json()
             if i > 0:
-                input_ids += tokenizer.encode(response["text"])[1:] # drop the bos token
+                input_ids += tokenizer.encode(response["text"])[
+                    1:
+                ]  # drop the bos token
                 outputs_normal.append(response["text"])
-            if i == 0: input_ids_first_req = input_ids.copy()
+            if i == 0:
+                input_ids_first_req = input_ids.copy()
 
         input_ids_first_req += chunks_ids[-1]
         response = requests.post(
@@ -150,9 +157,9 @@ class TestSessionControl(unittest.TestCase):
         ).json()
         outputs_normal.append(response["text"])
 
-        print("outputs from chunked queries with session control")
+        print("outputs from chunked queries with session control:")
         print(outputs_from_session)
-        print("outputs from normal queries")
+        print("outputs from normal queries:")
         print(outputs_normal)
         assert outputs_from_session == outputs_normal
 
