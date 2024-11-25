@@ -58,7 +58,7 @@ jobs:
           ls
 
   finish:
-    needs: [unit-test-rust]
+    needs: [unit-test-rust, e2e-rust]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
