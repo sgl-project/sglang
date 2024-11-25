@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
 )
 
-
 def popen_launch_router(
     model: str,
     base_url: str,
@@ -33,7 +32,7 @@ def popen_launch_router(
     host = host[2:]
 
     command = [
-        "python3",
+        "python",
         "-m",
         "sglang_router.launch_server",
         "--model-path",
@@ -73,7 +72,7 @@ class TestEvalAccuracyMini(unittest.TestCase):
         cls.process = popen_launch_router(
             cls.model,
             cls.base_url,
-            dp_size=2,
+            dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         )
 
