@@ -23,65 +23,73 @@ pub enum Router {
     },
     CacheAware {
         /*
-        Cache-Aware Load Balancing Router
+            Cache-Aware Load Balancing Router
 
-        This router combines two strategies to optimize both cache utilization and request distribution:
+            This router combines two strategies to optimize both cache utilization and request distribution:
 
-        1. Cache-Aware Routing (Approximate Tree)
-        2. Load Balancing (Shortest Queue)
+            1. Cache-Aware Routing (Approximate Tree)
+            2. Load Balancing (Shortest Queue with Balance Thresholds)
 
-        For each incoming request, the router chooses between these strategies:
-        - With probability P: Uses cache-aware routing
-        - With probability (1-P): Uses load balancing
-        where P is configured via `cache_routing_prob`
+            The router dynamically switches between these strategies based on load conditions:
+            - Uses load balancing when the system is imbalanced
+            - Uses cache-aware routing when the system is balanced
 
-        Strategy Details:
+            A system is considered imbalanced if both conditions are met:
+            1. (max - min) > abs_threshold
+            2. max > rel_threshold * min
 
-        1. Cache-Aware Routing (Approximate Tree)
-        -------------------------------------------
-        This strategy maintains an approximate radix tree for each worker based on request history,
-        eliminating the need for direct cache state queries. The tree stores raw text characters
-        instead of token IDs to avoid tokenization overhead.
+            Strategy Details:
 
-        Process:
-        a. For each request, find the worker with the highest prefix match
-        b. If match rate > cache_threshold:
-        Route to the worker with highest match (likely has relevant data cached)
-        c. If match rate ≤ cache_threshold:
-        Route to the worker with smallest tree size (most available cache capacity)
-        d. Background maintenance:
-        Periodically evict least recently used leaf nodes to prevent memory overflow
+            1. Cache-Aware Routing (Approximate Tree)
+            -------------------------------------------
+            This strategy maintains an approximate radix tree for each worker based on request history,
+            eliminating the need for direct cache state queries. The tree stores raw text characters
+            instead of token IDs to avoid tokenization overhead.
 
-        2. Load Balancing (Shortest Queue)
-        -------------------------------------------
-        This strategy tracks pending request counts per worker and routes new requests
-        to the least busy worker for optimal load distribution.
+            Process:
+            a. For each request, find the worker with the highest prefix match
+            b. If match rate > cache_threshold:
+            Route to the worker with highest match (likely has relevant data cached)
+            c. If match rate ≤ cache_threshold:
+            Route to the worker with smallest tree size (most available cache capacity)
+            d. Background maintenance:
+            Periodically evict least recently used leaf nodes to prevent memory overflow
 
-        Configuration Parameters:
-        ------------------------
-        1. cache_routing_prob: (float, 0.0 to 1.0)
-        - 0.0: Exclusively use load balancing
-        - 1.0: Exclusively use cache-aware routing
-        - Between 0-1: Probability of using cache-aware routing vs load balancing
+            2. Load Balancing (Shortest Queue)
+            -------------------------------------------
+            This strategy tracks pending request counts per worker and routes new requests
+            to the least busy worker when the system is detected to be imbalanced.
 
-        2. cache_threshold: (float, 0.0 to 1.0)
-        Minimum prefix match ratio to use highest-match routing.
-        Below this threshold, routes to worker with most available cache space.
+            Configuration Parameters:
+            ------------------------
+            1. cache_threshold: (float, 0.0 to 1.0)
+            Minimum prefix match ratio to use highest-match routing.
+            Below this threshold, routes to worker with most available cache space.
 
-        3. eviction_interval_secs: (integer)
-        Interval between LRU eviction cycles for the approximate trees.
+            2. balance_abs_threshold: (integer)
+            Absolute difference threshold for load imbalance detection.
+            System is potentially imbalanced if (max_load - min_load) > abs_threshold
 
-        4. max_tree_size: (integer)
-        Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
-        during the next eviction cycle.
+            3. balance_rel_threshold: (float)
+            Relative ratio threshold for load imbalance detection.
+            System is potentially imbalanced if max_load > min_load * rel_threshold
+            Used in conjunction with abs_threshold to determine final imbalance state.
+
+            4. eviction_interval_secs: (integer)
+            Interval between LRU eviction cycles for the approximate trees.
+
+            5. max_tree_size: (integer)
+            Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
+            during the next eviction cycle.
         */
         worker_urls: Vec<String>,
         tree: Arc<Mutex<Tree>>,
         running_queue: Arc<Mutex<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
         cache_threshold: f32,
-        cache_routing_prob: f32,
-        _eviction_thread: Option<thread::JoinHandle<()>>, // Store thread handle
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        _eviction_thread: Option<thread::JoinHandle<()>>,
     },
 }
 
@@ -91,7 +99,8 @@ pub enum PolicyConfig {
     RoundRobinConfig,
     CacheAwareConfig {
         cache_threshold: f32,
-        cache_routing_prob: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
     },
@@ -128,7 +137,8 @@ impl Router {
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
-                cache_routing_prob,
+                balance_abs_threshold,
+                balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
             } => {
@@ -149,6 +159,7 @@ impl Router {
                 // Create background eviction thread
                 let tree_clone = Arc::clone(&tree);
                 let processed_queue_clone = Arc::clone(&processed_queue);
+                let running_queue_clone = Arc::clone(&running_queue);
                 let eviction_thread = thread::spawn(move || {
                     loop {
                         // Sleep for the specified interval
@@ -161,6 +172,10 @@ impl Router {
                         // Print the process queue
                         let locked_processed_queue = processed_queue_clone.lock().unwrap();
                         println!("Processed Queue: {:?}", locked_processed_queue);
+
+                        // Print the running queue
+                        let locked_running_queue = running_queue_clone.lock().unwrap();
+                        println!("Running Queue: {:?}", locked_running_queue);
                     }
                 });
 
@@ -174,7 +189,8 @@ impl Router {
                     running_queue,
                     processed_queue,
                     cache_threshold,
-                    cache_routing_prob,
+                    balance_abs_threshold,
+                    balance_rel_threshold,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -203,8 +219,6 @@ impl Router {
         route: &str,
     ) -> HttpResponse {
         let text = get_text_from_request(&body, route);
-        // For Debug
-        // println!("text: {:?}, route: {:?}", text, route);
 
         let worker_url = match self {
             Router::RoundRobin {
@@ -218,7 +232,6 @@ impl Router {
                         |x| Some((x + 1) % worker_urls.len()),
                     )
                     .unwrap();
-
                 worker_urls[idx].clone()
             }
 
@@ -232,19 +245,42 @@ impl Router {
                 running_queue,
                 processed_queue,
                 cache_threshold,
-                cache_routing_prob,
+                balance_abs_threshold,
+                balance_rel_threshold,
                 ..
             } => {
-                // even though the tree is thread-safe, we still put a lock to ensure the whole op (tree read + queue read + tree write + queue write) is atomic to handle some edge cases (e.g. multiple requests with long prefix entering at the same time)
+                // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
 
                 let mut tree = tree.lock().unwrap();
                 let mut running_queue = running_queue.lock().unwrap();
 
-                // Generate a random float between 0 and 1 for probability check
-                let sampled_p: f32 = rand::random();
+                // Get current load statistics
+                let max_load = *running_queue.values().max().unwrap_or(&0);
+                let min_load = *running_queue.values().min().unwrap_or(&0);
 
-                let selected_url = if sampled_p < *cache_routing_prob {
-                    // Cache-aware routing logic
+                // Load is considered imbalanced if:
+                // 1. (max - min) > abs_threshold AND
+                // 2. max > rel_threshold * min
+                let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
+                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
+
+                let selected_url = if is_imbalanced {
+                    // Log load balancing trigger and current queue state
+                    println!(
+                        "Load balancing triggered due to workload imbalance:\n\
+                        Max load: {}, Min load: {}\n\
+                        Current running queue: {:?}",
+                        max_load, min_load, running_queue
+                    );
+
+                    // Use shortest queue routing when load is imbalanced
+                    running_queue
+                        .iter()
+                        .min_by_key(|(_url, &count)| count)
+                        .map(|(url, _)| url.clone())
+                        .unwrap_or_else(|| worker_urls[0].clone())
+                } else {
+                    // Use cache-aware routing when load is balanced
                     let (matched_text, matched_worker) = tree.prefix_match(&text);
                     let matched_rate =
                         matched_text.chars().count() as f32 / text.chars().count() as f32;
@@ -252,36 +288,18 @@ impl Router {
                     if matched_rate > *cache_threshold {
                         matched_worker.to_string()
                     } else {
-                        // For Debug
-                        // let m_map: HashMap<String, usize> = tree
-                        //     .tenant_char_count
-                        //     .iter()
-                        //     .map(|entry| (entry.key().clone(), *entry.value()))
-                        //     .collect();
-
-                        // println!("map: {:?}, mmap: {:?}", tree.get_tenant_char_count(), m_map);
-
                         tree.get_smallest_tenant()
                     }
-                } else {
-                    // Shortest queue routing logic
-                    running_queue
-                        .iter()
-                        .min_by_key(|(_url, &count)| count)
-                        .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls[0].clone())
                 };
 
-                // Update running queue
-                let count = running_queue.get_mut(&selected_url).unwrap();
-                *count += 1;
+                // Update queues and tree
+                *running_queue.get_mut(&selected_url).unwrap() += 1;
 
-                // Update processed queue
-                let mut locked_processed_queue = processed_queue.lock().unwrap();
-                let count = locked_processed_queue.get_mut(&selected_url).unwrap();
-                *count += 1;
-
-                // Update tree with the new request
+                *processed_queue
+                    .lock()
+                    .unwrap()
+                    .get_mut(&selected_url)
+                    .unwrap() += 1;
                 tree.insert(&text, &selected_url);
 
                 selected_url
