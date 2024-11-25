@@ -542,9 +542,7 @@ class Scheduler:
         else:
             # Handle sessions
             session = self.sessions[recv_req.session_id]
-            req, new_session_id = session.create_req(recv_req, self.tokenizer)
-            del self.sessions[recv_req.session_id]
-            self.sessions[new_session_id] = session
+            req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.waiting_queue.append(req)
                 return
@@ -1188,7 +1186,6 @@ class Scheduler:
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
             output_no_stop_trim = []
-            output_session_ids = []
         else:  # embedding or reward model
             output_embeddings = []
 
@@ -1216,7 +1213,6 @@ class Scheduler:
                         req.sampling_params.spaces_between_special_tokens
                     )
                     output_no_stop_trim.append(req.sampling_params.no_stop_trim)
-                    output_session_ids.append(req.session_id)
 
                     meta_info = {
                         "prompt_tokens": len(req.origin_input_ids),
@@ -1267,7 +1263,6 @@ class Scheduler:
                         output_meta_info,
                         output_finished_reason,
                         output_no_stop_trim,
-                        output_session_ids,
                     )
                 )
             else:  # embedding or reward model
