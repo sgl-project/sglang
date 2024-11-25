@@ -27,6 +27,7 @@ class Router:
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        verbose: Enable verbose logging. Default: False
     """
 
     def __init__(
@@ -40,6 +41,7 @@ class Router:
         balance_rel_threshold: float = 1.0001,
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
+        verbose: bool = False,
     ):
         self._router = _Router(
             worker_urls=worker_urls,
@@ -51,6 +53,7 @@ class Router:
             balance_rel_threshold=balance_rel_threshold,
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
+            verbose=verbose,
         )
 
     def start(self) -> None:

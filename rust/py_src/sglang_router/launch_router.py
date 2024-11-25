@@ -5,7 +5,22 @@ from typing import List, Optional
 
 from sglang_router import Router
 from sglang_router_rs import PolicyType
+import logging
 
+def setup_logger():
+    logger = logging.getLogger("router")
+    logger.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter(
+        '[Router (Python)] %(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    return logger
 
 @dataclasses.dataclass
 class RouterArgs:
@@ -21,6 +36,7 @@ class RouterArgs:
     balance_rel_threshold: float = 1.0001
     eviction_interval: int = 60
     max_tree_size: int = 2**24
+    verbose: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -98,6 +114,11 @@ class RouterArgs:
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
         )
+        parser.add_argument(
+            f"--{prefix}verbose",
+            action="store_true",
+            help="Enable verbose logging",
+        )
 
     @classmethod
     def from_cli_args(
@@ -121,6 +142,7 @@ class RouterArgs:
             balance_rel_threshold=getattr(args, f"{prefix}balance_rel_threshold"),
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
+            verbose=getattr(args, f"{prefix}verbose", False),
         )
 
 
@@ -145,6 +167,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
     Returns:
         Router instance if successful, None if failed
     """
+    logger = logging.getLogger("router")
     try:
         # Convert to RouterArgs if needed
         if not isinstance(args, RouterArgs):
@@ -168,7 +191,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         return router
 
     except Exception as e:
-        print(f"Error starting router: {e}", file=sys.stderr)
+        logger.error(f"Error starting router: {e}", file=sys.stderr)
         return None
 
 
@@ -201,6 +224,7 @@ Examples:
 
 
 def main() -> None:
+    logger = setup_logger()
     router_args = parse_router_args(sys.argv[1:])
     router = launch_router(router_args)
 

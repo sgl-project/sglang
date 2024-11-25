@@ -141,7 +141,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         .format(|buf, record| {
             use chrono::Local;
             writeln!(buf,
-                "[Router] {} - {} - {}",
+                "[Router (Rust)] {} - {} - {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S"),
                 record.level(),
                 record.args()
@@ -151,8 +151,8 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         .init();
 
     info!("Starting server on {}:{}", config.host, config.port);
-    debug!("Worker URLs: {:?}", config.worker_urls);
-    debug!("Policy Config: {:?}", config.policy_config);
+    info!("Worker URLs: {:?}", config.worker_urls);
+    info!("Policy Config: {:?}", config.policy_config);
 
     let client = reqwest::Client::builder()
         .build()
