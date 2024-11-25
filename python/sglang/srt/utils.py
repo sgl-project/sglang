@@ -991,14 +991,15 @@ def direct_register_custom_op(
 
 
 def gpu_proc_affinity(
-    server_args,
+    tp_size: int,
+    nnodes: int,
     gpu_id: int,
 ):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    tp_size_per_node = server_args.tp_size // server_args.nnodes
+    tp_size_per_node = tp_size // nnodes
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)

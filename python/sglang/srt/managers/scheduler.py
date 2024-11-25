@@ -1395,7 +1395,7 @@ def run_scheduler_process(
     pipe_writer,
 ):
     # set cpu affinity to this gpu process
-    gpu_proc_affinity(server_args, gpu_id)
+    gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "DP_RANK" in os.environ:
