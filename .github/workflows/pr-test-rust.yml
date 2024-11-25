@@ -58,9 +58,10 @@ jobs:
           pip install setuptools-rust wheel build
           python3 -m build
           pip install dist/*.whl
-      - name: Test
+      - name: Run e2e test
         run: |
-          pip show sglang-router
+          cd rust
+          python3 -m pytest tests/e2e
 
   finish:
     needs: [unit-test-rust, e2e-rust]
