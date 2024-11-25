@@ -81,7 +81,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 # Test retract decode
-test_retract = os.getenv("SGLANG_TEST_RETRACT", "false") == "true"
+test_retract = os.getenv("SGLANG_TEST_RETRACT", "false").lower() == "true"
 
 
 class Scheduler:
