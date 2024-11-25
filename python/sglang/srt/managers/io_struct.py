@@ -29,9 +29,9 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can either specify text or input_ids.
+    # The token ids for text; one can specify either text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The embeddings for input_ids
+    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.

@@ -450,7 +450,7 @@ class ScheduleBatch:
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
-    input_embeds: Optional[torch.Tensor] = None
+    input_embeds: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     # The output locations of the KV cache
@@ -682,9 +682,10 @@ class ScheduleBatch:
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-
-        self.input_embeds = torch.tensor(input_embeds).to(
-            self.device, non_blocking=True
+        self.input_embeds = (
+            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            if input_embeds
+            else None
         )
 
         self.out_cache_loc = out_cache_loc
@@ -1142,20 +1143,6 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
-
-    def copy(self):
-        return dataclasses.replace(self, sampling_info=self.sampling_info.copy())
-
-    def to(self, device: str):
-        self.input_ids = self.input_ids.to(device, non_blocking=True)
-        self.req_pool_indices = self.req_pool_indices.to(device, non_blocking=True)
-        self.seq_lens = self.seq_lens.to(device, non_blocking=True)
-        self.out_cache_loc = self.out_cache_loc.to(device, non_blocking=True)
-        self.req_to_token_pool_records = [
-            (x, y.to(device, non_blocking=True))
-            for x, y in self.req_to_token_pool_records
-        ]
-        self.sampling_info.to(device)
 
 
 @triton.jit

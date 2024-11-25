@@ -200,14 +200,15 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
-        input_embeds = None
         # Tokenize
+        input_embeds = None
         input_text = obj.text
         if obj.input_embeds is not None:
-            if self.server_args.disable_radix_cache == False:
+            if not self.server_args.disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
-                    "Radix cache should be enabled when input_embeds is provided."
+                    "Please add `--disable-radix-cach` when you launch the server "
+                    "if you want to use input_embeds as inputs."
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
@@ -228,12 +229,11 @@ class TokenizerManager:
             session_id = obj.session_id
             session_rid = obj.session_rid
 
-        if obj.input_ids is not None:
-            if len(input_ids) >= self.context_len:
-                raise ValueError(
-                    f"The input ({len(input_ids)} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
-                )
+        if obj.input_ids is not None and len(input_ids) >= self.context_len:
+            raise ValueError(
+                f"The input ({len(input_ids)} tokens) is longer than the "
+                f"model's context length ({self.context_len} tokens)."
+            )
 
         # Parse sampling parameters
         sampling_params = SamplingParams(**obj.sampling_params)
@@ -252,8 +252,8 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                input_embeds=input_embeds,
                 lora_path=obj.lora_path,
+                input_embeds=input_embeds,
                 session_id=session_id,
                 session_rid=session_rid,
             )

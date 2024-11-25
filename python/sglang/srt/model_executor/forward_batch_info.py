@@ -234,7 +234,7 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
-            input_embeds=batch.input_embeds if batch.input_embeds is not None else None,
+            input_embeds=batch.input_embeds,
         )
 
         if ret.global_num_tokens is not None:
