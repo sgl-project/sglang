@@ -23,7 +23,7 @@ import torch
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.fused_moe.patch import fused_moe_forward_native
+from sglang.srt.layers.fused_moe_patch import fused_moe_forward_native
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,

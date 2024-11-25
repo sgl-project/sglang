@@ -218,11 +218,6 @@ class ServerArgs:
                 "Overlap schedule is disabled."
             )
 
-        if self.enable_mixed_chunk:
-            logger.info(
-                "Overlap schedule is disabled because mixed-style chunked prefill is enabled."
-            )
-            self.disable_overlap_schedule = True
 
         # Speculative Decoding
         self.speculative_algorithm = SpeculativeAlgorithm.get_algorithm(
@@ -230,13 +225,12 @@ class ServerArgs:
         )
         if self.speculative_algorithm.is_eagle():
             self.split_prefill_batch = True
-            # EAGLE don't support it currently.
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
             self.disable_overlap_schedule = True
             self.chunked_prefill_size = None
             logger.info(
-                "EAGLE2 is not suppport radix cache and chunked_prefill currently."
+                "The radix cache, chunked_prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
             )
 
     @staticmethod

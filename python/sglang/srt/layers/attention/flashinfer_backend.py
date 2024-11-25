@@ -7,6 +7,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import os
 from enum import Enum, auto
 from typing import TYPE_CHECKING, List
 
@@ -46,13 +47,19 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        if not _grouped_size_compiled_for_decode_kernels(
-            model_runner.model_config.num_attention_heads // model_runner.tp_size,
-            model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
-        ):
-            self.decode_use_tensor_cores = True
+        if "SGLANG_FLASHINFER_USE_TENSOR_CORE" in os.environ:
+            self.decode_use_tensor_cores = (
+                os.environ["SGLANG_FLASHINFER_USE_TENSOR_CORE"].lower() == "true"
+            )
         else:
-            self.decode_use_tensor_cores = False
+            if not _grouped_size_compiled_for_decode_kernels(
+                model_runner.model_config.num_attention_heads // model_runner.tp_size,
+                model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
+            ):
+                self.decode_use_tensor_cores = True
+            else:
+                self.decode_use_tensor_cores = False
+
         self.max_context_len = model_runner.model_config.context_len
 
         assert not (
