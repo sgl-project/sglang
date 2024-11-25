@@ -1157,6 +1157,7 @@ class ModelWorkerBatch:
         ]
         self.sampling_info.to(device)
 
+
 @triton.jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]

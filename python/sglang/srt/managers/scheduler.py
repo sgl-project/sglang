@@ -527,11 +527,15 @@ class Scheduler:
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
             # Check if input_embeds is present and create dummy input_ids
             if recv_req.input_embeds is not None:
-              # Generate fake input_ids based on the length of input_embeds
-              seq_length = len(recv_req.input_embeds)  # Use length directly without tensor conversion
-              fake_input_ids = [1] * seq_length  # Create dummy input_ids as ones (or use zeros if preferred)
-              recv_req.input_ids = fake_input_ids
-              # Pass input_embeds to Req if present, otherwise pass as None
+                # Generate fake input_ids based on the length of input_embeds
+                seq_length = len(
+                    recv_req.input_embeds
+                )  # Use length directly without tensor conversion
+                fake_input_ids = [
+                    1
+                ] * seq_length  # Create dummy input_ids as ones (or use zeros if preferred)
+                recv_req.input_ids = fake_input_ids
+                # Pass input_embeds to Req if present, otherwise pass as None
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -556,7 +560,6 @@ class Scheduler:
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.waiting_queue.append(req)
                 return
-
 
         # Image inputs
         if recv_req.image_inputs is not None:

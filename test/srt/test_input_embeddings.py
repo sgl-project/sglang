@@ -1,7 +1,8 @@
 import json
 import unittest
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
 import requests
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
@@ -11,6 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 class TestInputEmbeds(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -19,12 +21,10 @@ class TestInputEmbeds(unittest.TestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model)
         cls.ref_model = AutoModelForCausalLM.from_pretrained(cls.model)
         cls.process = popen_launch_server(
-                cls.model, 
-                cls.base_url, 
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                "--disable-radix"
-            ],
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--disable-radix"],
         )
         cls.texts = [
             "The capital of France is",
@@ -46,7 +46,9 @@ class TestInputEmbeds(unittest.TestCase):
         )
         if response.status_code == 200:
             return response.json()
-        return {"error": f"Request failed with status {response.status_code}: {response.text}"}
+        return {
+            "error": f"Request failed with status {response.status_code}: {response.text}"
+        }
 
     def test_text_based_response(self):
         """Print API response using text-based input."""
@@ -57,7 +59,9 @@ class TestInputEmbeds(unittest.TestCase):
                 "sampling_params": {"temperature": 0, "max_new_tokens": 50},
             }
             response = self.send_request(payload)
-            print(f"Text Input: {text}\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}")
+            print(
+                f"Text Input: {text}\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}"
+            )
 
     def test_embedding_based_response(self):
         """Print API response using input embeddings."""
@@ -69,7 +73,9 @@ class TestInputEmbeds(unittest.TestCase):
                 "sampling_params": {"temperature": 0, "max_new_tokens": 50},
             }
             response = self.send_request(payload)
-            print(f"Embeddings Input (for text '{text}'):\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}")
+            print(
+                f"Embeddings Input (for text '{text}'):\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}"
+            )
 
     def test_compare_text_vs_embedding(self):
         """Print responses for both text-based and embedding-based inputs."""
@@ -91,8 +97,12 @@ class TestInputEmbeds(unittest.TestCase):
             text_response = self.send_request(text_payload)
             embed_response = self.send_request(embed_payload)
             # Print responses
-            print(f"Text Input: {text}\nText-Based Response: {json.dumps(text_response, indent=2)}\n")
-            print(f"Embeddings Input (for text '{text}'):\nEmbedding-Based Response: {json.dumps(embed_response, indent=2)}\n{'-' * 80}")
+            print(
+                f"Text Input: {text}\nText-Based Response: {json.dumps(text_response, indent=2)}\n"
+            )
+            print(
+                f"Embeddings Input (for text '{text}'):\nEmbedding-Based Response: {json.dumps(embed_response, indent=2)}\n{'-' * 80}"
+            )
 
     @classmethod
     def tearDownClass(cls):
