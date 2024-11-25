@@ -550,3 +550,44 @@ def test_gen_min_new_tokens():
 
     state = convo_1.run()
     assert_min_tokens(tokenizer, state["answer"])
+
+
+def test_select_concurrency():
+    @sgl.function
+    def gen_concurrency(s):
+        s += sgl.system("You are a helpful assistant.")
+        s += sgl.user(
+            "Shopping list:\n1. Milk\n2. Bread\n3. Eggs\n\nHow many items are on the shopping list?"
+        )
+        s += sgl.assistant("There are " + sgl.gen("answer", max_tokens=1, top_k=1))
+
+    @sgl.function
+    def select_concurrency(s):
+        s += sgl.system("You are a helpful assistant.")
+        s += sgl.user(
+            "Shopping list:\n1. Milk\n2. Bread\n3. Eggs\n\nHow many items are on the shopping list?"
+        )
+        s += sgl.assistant(
+            "There are " + sgl.select("answer", choices=[str(i) for i in range(5)])
+        )
+
+    # Test gen as baseline to rule out generic determinism issues
+    states = gen_concurrency.run_batch(
+        [{} for _ in range(512)],
+        num_threads=128,
+    )
+    assert all(state["answer"] == "3" for state in states)
+
+    # Test with no concurrency
+    states = select_concurrency.run_batch(
+        [{} for _ in range(16)],
+        num_threads=1,
+    )
+    assert all(state["answer"] == "3" for state in states)
+
+    # Test with high concurrency
+    states = select_concurrency.run_batch(
+        [{} for _ in range(128)],
+        num_threads=16,
+    )
+    assert all(state["answer"] == "3" for state in states)
