@@ -1,9 +1,9 @@
 use crate::router::PolicyConfig;
 use crate::router::Router;
-use env_logger::Builder;
-use log::{info, debug, LevelFilter};
 use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use bytes::Bytes;
+use env_logger::Builder;
+use log::{debug, info, LevelFilter};
 use std::io::Write;
 
 #[derive(Debug)]
@@ -140,14 +140,22 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     Builder::new()
         .format(|buf, record| {
             use chrono::Local;
-            writeln!(buf,
+            writeln!(
+                buf,
                 "[Router (Rust)] {} - {} - {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S"),
                 record.level(),
                 record.args()
             )
         })
-        .filter(None, if config.verbose { LevelFilter::Debug } else { LevelFilter::Info })
+        .filter(
+            None,
+            if config.verbose {
+                LevelFilter::Debug
+            } else {
+                LevelFilter::Info
+            },
+        )
         .init();
 
     info!("Starting server on {}:{}", config.host, config.port);
@@ -158,7 +166,11 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         .build()
         .expect("Failed to create HTTP client");
 
-    let app_state = web::Data::new(AppState::new(config.worker_urls, client, config.policy_config));
+    let app_state = web::Data::new(AppState::new(
+        config.worker_urls,
+        client,
+        config.policy_config,
+    ));
 
     HttpServer::new(move || {
         App::new()

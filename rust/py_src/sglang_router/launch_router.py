@@ -1,26 +1,28 @@
 import argparse
 import dataclasses
+import logging
 import sys
 from typing import List, Optional
 
 from sglang_router import Router
 from sglang_router_rs import PolicyType
-import logging
+
 
 def setup_logger():
     logger = logging.getLogger("router")
     logger.setLevel(logging.INFO)
-    
+
     formatter = logging.Formatter(
-        '[Router (Python)] %(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    
+
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    
+
     return logger
+
 
 @dataclasses.dataclass
 class RouterArgs:
@@ -185,6 +187,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             balance_rel_threshold=router_args.balance_rel_threshold,
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
+            verbose=router_args.verbose,
         )
 
         router.start()
@@ -199,6 +202,7 @@ class CustomHelpFormatter(
     argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter
 ):
     """Custom formatter that preserves both description formatting and shows defaults"""
+
     pass
 
 

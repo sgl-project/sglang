@@ -114,13 +114,12 @@ impl Args {
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let policy_config = args.get_policy_config();
-    server::startup(
-        ServerConfig {
-            host: args.host,
-            port: args.port,
-            worker_urls: args.worker_urls,
-            policy_config,
-            verbose: args.verbose,
-        }
-    ).await
+    server::startup(ServerConfig {
+        host: args.host,
+        port: args.port,
+        worker_urls: args.worker_urls,
+        policy_config,
+        verbose: args.verbose,
+    })
+    .await
 }

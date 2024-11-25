@@ -1,5 +1,6 @@
 import argparse
 import copy
+import logging
 import multiprocessing as mp
 import os
 import random
@@ -15,22 +16,23 @@ from sglang.srt.server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
 from sglang.utils import get_exception_traceback
-import logging
+
 
 def setup_logger():
     logger = logging.getLogger("router")
     logger.setLevel(logging.INFO)
-    
+
     formatter = logging.Formatter(
-        '[Router (Python)] %(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    
+
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    
+
     return logger
+
 
 # Create new process group
 def run_server(server_args, dp_rank):
@@ -65,7 +67,9 @@ def cleanup_processes(processes: List[mp.Process]):
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 proc.join(timeout=3)
                 if proc.is_alive():
-                    logger.warning(f"Process {proc.pid} did not terminate gracefully, force killing...")
+                    logger.warning(
+                        f"Process {proc.pid} did not terminate gracefully, force killing..."
+                    )
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
@@ -155,7 +159,7 @@ def main():
 
         # Wait for all servers to be healthy
         all_healthy = True
-        
+
         for port in worker_ports:
             if not wait_for_server_health(server_args.host, port):
                 logger.error(f"Server on port {port} failed to become healthy")
