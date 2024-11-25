@@ -44,7 +44,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 
 def is_in_ci():
     """Return whether it is in CI runner."""
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return os.getenv("SGLANG_IS_IN_CI", "false").lower() == "true"
 
 
 if is_in_ci():
