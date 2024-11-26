@@ -47,8 +47,8 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 import transformer_engine as te
-from transformer_engine.pytorch.attention import RotaryPositionEmbedding
-from transformer_engine.pytorch.fp8 import fp8_model_init
+# from transformer_engine.pytorch.attention import RotaryPositionEmbedding
+# from transformer_engine.pytorch.fp8 import fp8_model_init
 
 
 class TELlamaAttention(nn.Module):
@@ -172,13 +172,14 @@ class TELlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.layernorm_mlp = LayerNormMLP(
+        self.layernorm_mlp = te.pytorch.LayerNormMLP(
                 hidden_size = self.hidden_size,
                 ffn_hidden_size = config.intermediate_size,
                 eps=config.rms_norm_eps,
                 tp_size=tp_size,
                 bias=False,
                 return_layernorm_output=True,
+                return_layernorm_output_gathered=True,
                 set_parallel_mode=True,
                 ub_bulk_wgrad=True,
                 ub_bulk_dgrad=True,
@@ -266,7 +267,7 @@ class TELlamaModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-# the complete llama model
+# the complete tellama model
 class TELlamaForCausalLM(nn.Module):
     def __init__(
         self,
@@ -286,7 +287,7 @@ class TELlamaForCausalLM(nn.Module):
         # logits processing
         self.logits_processor = LogitsProcessor(config)
         
-        print("load TE llama")
+        print("sucessfully load TE llama") #zhuohaol: test if TELlamaForCausalLM imported
 
     @torch.no_grad()
     def forward(
@@ -349,14 +350,19 @@ class TELlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         return len(params_dict)
 
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
+            (".qkv_proj", ".q_proj.weight", "q"),
+            (".qkv_proj", ".k_proj.weight", "k"),
+            (".qkv_proj", ".v_proj.weight", "v"),
+            # (".gate_up_proj", ".gate_proj", 0),
+            # (".gate_up_proj", ".up_proj", 1),
+            (".layernorm_mlp.fc1_weight", ".gate_proj.weight", 0),
+            (".layernorm_mlp.fc1_weight", ".up_proj.weight", 1),
+            (".layernorm_mlp.fc2_weight", ".down_proj.weight", 0),
+            (".layernorm_mlp.layer_norm_weight", ".post_attention_layernorm.weight", 0),
         ]
         params_dict = dict(self.named_parameters())
 
@@ -369,23 +375,67 @@ class TELlamaForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            
+            if loaded_weight.numel() == 0:
+                print(f"Warning: loaded_weight for {name} is empty.")
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
+                    continue # 如果当前 weight_name 不在参数 name 中，跳过。
+                mapped_name = name.replace(weight_name, param_name)
+                # **处理 qkv_proj 权重**
+                if param_name == ".qkv_proj":
+                    if mapped_name not in params_dict:
+                        params_dict[mapped_name] = torch.zeros_like(loaded_weight)
+
+                    # 分割 loaded_weight 为 q_proj, k_proj, v_proj
+                    q_weight, k_weight, v_weight = torch.chunk(loaded_weight, 3, dim=0)
+
+                    if shard_id == 0:  # q_proj 部分
+                        params_dict[mapped_name][: q_weight.shape[0]] = q_weight
+                    elif shard_id == 1:  # k_proj 部分
+                        params_dict[mapped_name][q_weight.shape[0]: 2 * q_weight.shape[0]] = k_weight
+                    elif shard_id == 2:  # v_proj 部分
+                        params_dict[mapped_name][2 * q_weight.shape[0]:] = v_weight
+                    break
+                if param_name == ".layernorm_mlp.layer_norm_weight":
+                    if mapped_name in params_dict:
+                        params_dict[mapped_name].data.copy_(loaded_weight)
+                    break
+                # Handle combined weights (fc1_weight -> gate_proj + up_proj)
+                if param_name == ".layernorm_mlp.fc1_weight":
+                    # Initialize the combined weight if not present
+                    if mapped_name not in params_dict:
+                        params_dict[mapped_name] = torch.zeros_like(loaded_weight)
+                    
+                    # Split loaded_weight into gate_proj and up_proj
+                    gate_weight, up_weight = torch.split(loaded_weight, loaded_weight.shape[0] // 2, dim=0)
+
+                    if shard_id == 0:  # gate_proj part
+                        params_dict[mapped_name][: gate_weight.shape[0]] = gate_weight
+                    elif shard_id == 1:  # up_proj part
+                        params_dict[mapped_name][gate_weight.shape[0]:] = up_weight
+                    break
+
+                # **处理单独权重**
+                elif param_name == ".layernorm_mlp.fc2_weight":
+                    if mapped_name in params_dict:
+                        params_dict[mapped_name].data.copy_(loaded_weight)
+                    break
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                break
+                break  
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip loading kv_scale from ckpts towards new design.
+                # 跳过加载 kv_scale（这部分是新设计中移除的）。
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -408,8 +458,3 @@ class TEPhi3ForCausalLM(TELlamaForCausalLM):
 
 
 EntryClass = [TELlamaForCausalLM, TEPhi3ForCausalLM]
-
-
-
-
-

@@ -700,6 +700,11 @@ class ServerArgs:
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
         )
+        parser.add_argument(
+            "--enable-te",
+            action="store_true",
+            help="Enable TranformerEngine for Communication Overlapping in Tensor Parallelism"
+        )
 
         # Deprecated arguments
         parser.add_argument(
