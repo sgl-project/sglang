@@ -1,6 +1,5 @@
 """Launch the inference server."""
 
-import os
 import sys
 
 from sglang.srt.server import launch_server
