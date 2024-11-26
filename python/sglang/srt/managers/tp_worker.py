@@ -186,8 +186,8 @@ class TpModelWorker:
         )
         return success, message
 
-    def get_parameter_by_name(self, recv_req: GetParameterByNameReqInput):
-        parameter = self.model_runner.get_parameter_by_name(
+    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
+        parameter = self.model_runner.get_weights_by_parameter_name(
             recv_req.name, recv_req.truncate_size
         )
         return parameter

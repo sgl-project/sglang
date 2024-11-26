@@ -533,20 +533,20 @@ class TokenizerManager:
                 "Another parameter update is in progress. Please try again later.",
             )
 
-    async def get_parameter_by_name(
+    async def get_weights_by_parameter_name(
         self, obj: GetParameterByNameReqInput, request: Optional[fastapi.Request] = None
     ):
         if self.to_create_loop:
             self.create_handle_loop()
 
         self.send_to_scheduler.send_pyobj(obj)
-        self.get_parameter_by_name_result = asyncio.Future()
+        self.get_weights_by_parameter_name_result = asyncio.Future()
         if self.server_args.dp_size == 1:
-            result = await self.get_parameter_by_name_result
+            result = await self.get_weights_by_parameter_name_result
             return result.parameter
         else:
-            self.get_parameter_by_name_tmp = []
-            result = await self.get_parameter_by_name_result
+            self.get_weights_by_parameter_name_tmp = []
+            result = await self.get_weights_by_parameter_name_result
             all_parameters = [r.parameter for r in result]
             return all_parameters
 
@@ -650,12 +650,15 @@ class TokenizerManager:
                 continue
             elif isinstance(recv_obj, GetParameterByNameReqOutput):
                 if self.server_args.dp_size == 1:
-                    self.get_parameter_by_name_result.set_result(recv_obj)
+                    self.get_weights_by_parameter_name_result.set_result(recv_obj)
                 else:
-                    self.get_parameter_by_name_tmp.append(recv_obj)
-                    if len(self.get_parameter_by_name_tmp) == self.server_args.dp_size:
-                        self.get_parameter_by_name_result.set_result(
-                            self.get_parameter_by_name_tmp
+                    self.get_weights_by_parameter_name_tmp.append(recv_obj)
+                    if (
+                        len(self.get_weights_by_parameter_name_tmp)
+                        == self.server_args.dp_size
+                    ):
+                        self.get_weights_by_parameter_name_result.set_result(
+                            self.get_weights_by_parameter_name_tmp
                         )
                 continue
             elif isinstance(recv_obj, InitParameterUpdateGroupReqOutput):

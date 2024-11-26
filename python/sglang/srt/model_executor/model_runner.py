@@ -548,11 +548,102 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def get_parameter_by_name(
+    # def get_weights_by_parameter_name(
+    #     self, name: str, truncate_size: int = 100
+    # ) -> Optional[torch.Tensor]:
+    #     try:
+    #         # 1. 获取参数和映射信息
+    #         mapped_name = name
+    #         mapped_shard_id = None
+    #         for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
+    #             if weight_name in name:
+    #                 mapped_name = name.replace(weight_name, param_name)
+    #                 mapped_shard_id = shard_id
+    #                 break
+
+    #         # 2. 获取参数字典
+    #         params_dict = dict(self.model.named_parameters())
+    #         if mapped_name not in params_dict:
+    #             logger.warning(f"Parameter {name} (mapped to {mapped_name}) not found")
+    #             return None
+
+    #         param = params_dict[mapped_name]
+    #         weight = param.data
+    #         print(f"weight shape: {weight.shape}")
+
+    #         # 3. 如果是TP>1的情况，需要在不同GPU间gather权重
+    #         if self.tp_size > 1:
+    #             # 确定切分维度和是否需要gather
+    #             gather_dim = None
+    #             need_gather = True
+
+    #             if "qkv_proj.weight" in mapped_name:
+    #                 # QKV投影在输出维度上切分
+    #                 gather_dim = 0
+    #             elif "o_proj.weight" in mapped_name:
+    #                 # O投影在输入维度上切分
+    #                 gather_dim = 1
+    #             elif "gate_up_proj.weight" in mapped_name:
+    #                 # gate_up投影在输出维度上切分
+    #                 gather_dim = 0
+    #             elif "down_proj.weight" in mapped_name:
+    #                 # down投影在输入维度上切分
+    #                 gather_dim = 1
+    #             elif any(x in mapped_name.lower() for x in ["norm", "embed", "bias"]):
+    #                 # LayerNorm、嵌入层和偏置项不需要gather
+    #                 need_gather = False
+    #             else:
+    #                 logger.warning(f"Unknown parameter type for TP: {mapped_name}")
+    #                 need_gather = False
+
+    #             if need_gather:
+    #                 # 获取当前切片的形状
+    #                 shard_shape = list(weight.shape)
+
+    #                 # 计算完整权重的形状
+    #                 full_shape = shard_shape.copy()
+    #                 full_shape[gather_dim] *= self.tp_size
+
+    #                 # 在每个GPU上创建相同大小的tensor列表
+    #                 gathered_list = [
+    #                     torch.empty(
+    #                         shard_shape, dtype=weight.dtype, device=weight.device
+    #                     )
+    #                     for _ in range(self.tp_size)
+    #                 ]
+
+    #                 print(
+    #                     f"[Rank {self.tp_rank}] Before all_gather: weight shape={weight.shape}, "
+    #                     f"mean={weight.mean():.6f}, std={weight.std():.6f}"
+    #                 )
+
+    #                 # 收集所有GPU上的权重
+    #                 torch.distributed.all_gather(gathered_list, weight)
+
+    #                 print(
+    #                     f"[Rank {self.tp_rank}] After all_gather: gathered shapes="
+    #                     f"{[t.shape for t in gathered_list]}"
+    #                 )
+
+    #                 weight = torch.cat(gathered_list, dim=gather_dim)
+
+    #                 print(
+    #                     f"[Rank {self.tp_rank}] After cat: weight shape={weight.shape}, "
+    #                     f"mean={weight.mean():.6f}, std={weight.std():.6f}"
+    #                 )
+
+    #         # 4. 转换格式并截断
+    #         return weight.cpu().to(torch.float32).tolist()[:truncate_size]
+
+    #     except Exception as e:
+    #         logger.error(f"Error when getting parameter {name}: {e}")
+    #         return None
+
+    def get_weights_by_parameter_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         try:
-            # 1. 获取参数和映射信息
+            # 检查是否是合并的参数
             mapped_name = name
             mapped_shard_id = None
             for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
@@ -561,85 +652,50 @@ class ModelRunner:
                     mapped_shard_id = shard_id
                     break
 
-            # 2. 获取参数字典
+            # 获取参数
             params_dict = dict(self.model.named_parameters())
-            if mapped_name not in params_dict:
-                logger.warning(f"Parameter {name} (mapped to {mapped_name}) not found")
-                return None
+            if mapped_name in params_dict:
+                param = params_dict[mapped_name]
 
-            param = params_dict[mapped_name]
-            weight = param.data
-
-            # 3. 如果是TP>1的情况，需要在不同GPU间gather权重
-            if self.tp_size > 1:
-                # 确定切分维度和是否需要gather
-                gather_dim = None
-                need_gather = True
-
-                if "qkv_proj.weight" in mapped_name:
-                    # QKV投影在输出维度上切分
-                    gather_dim = 0
-                elif "o_proj.weight" in mapped_name:
-                    # O投影在输入维度上切分
-                    gather_dim = 1
-                elif "gate_up_proj.weight" in mapped_name:
-                    # gate_up投影在输出维度上切分
-                    gather_dim = 0
-                elif "down_proj.weight" in mapped_name:
-                    # down投影在输入维度上切分
-                    gather_dim = 1
-                elif any(x in mapped_name.lower() for x in ["norm", "embed", "bias"]):
-                    # LayerNorm、嵌入层和偏置项不需要gather
-                    need_gather = False
-                else:
-                    logger.warning(f"Unknown parameter type for TP: {mapped_name}")
-                    need_gather = False
-
-                if need_gather:
-                    # 获取当前切片的形状
-                    shard_shape = list(weight.shape)
-
-                    # 计算完整权重的形状
-                    full_shape = shard_shape.copy()
-                    full_shape[gather_dim] *= self.tp_size
-
-                    # 在每个GPU上创建相同大小的tensor列表
-                    gathered_list = [
-                        torch.empty(
-                            shard_shape, dtype=weight.dtype, device=weight.device
+                if mapped_shard_id is not None:
+                    # 处理合并参数的情况
+                    if mapped_shard_id in ["q", "k", "v"]:
+                        # 计算在qkv_proj中的偏移和大小
+                        num_heads = (
+                            self.model.config.num_attention_heads // self.tp_size
                         )
-                        for _ in range(self.tp_size)
-                    ]
+                        num_kv_heads = (
+                            self.model.config.num_key_value_heads // self.tp_size
+                        )
+                        head_dim = (
+                            self.model.config.hidden_size
+                            // self.model.config.num_attention_heads
+                        )
 
-                    print(f"[Rank {self.tp_rank}] Before barrier")
-                    # 添加同步点
-                    tp_group = get_tp_group()
-                    torch.distributed.barrier(group=tp_group)
-                    print(f"[Rank {self.tp_rank}] After barrier")
+                        if mapped_shard_id == "q":
+                            offset = 0
+                            size = num_heads * head_dim
+                        elif mapped_shard_id == "k":
+                            offset = num_heads * head_dim
+                            size = num_kv_heads * head_dim
+                        elif mapped_shard_id == "v":
+                            offset = (num_heads + num_kv_heads) * head_dim
+                            size = num_kv_heads * head_dim
 
-                    print(
-                        f"[Rank {self.tp_rank}] Before all_gather: weight shape={weight.shape}, "
-                        f"mean={weight.mean():.6f}, std={weight.std():.6f}"
-                    )
+                        # 提取对应部分的权重
+                        weight = param.data.narrow(0, offset, size)
+                    else:
+                        weight = param.data
+                else:
+                    weight = param.data
 
-                    # 收集所有GPU上的权重
-                    torch.distributed.all_gather(gathered_list, weight, group=tp_group)
-
-                    print(
-                        f"[Rank {self.tp_rank}] After all_gather: gathered shapes="
-                        f"{[t.shape for t in gathered_list]}"
-                    )
-
-                    # 在指定维度上拼接所有分片
-                    weight = torch.cat(gathered_list, dim=gather_dim)
-
-                    print(
-                        f"[Rank {self.tp_rank}] After cat: weight shape={weight.shape}, "
-                        f"mean={weight.mean():.6f}, std={weight.std():.6f}"
-                    )
-
-            # 4. 转换格式并截断
-            return weight.cpu().to(torch.float32).tolist()[:truncate_size]
+                # 转换并截断
+                return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+            else:
+                logger.warning(
+                    f"Parameter {name} (mapped to {mapped_name}) not found in model"
+                )
+                return None
 
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")

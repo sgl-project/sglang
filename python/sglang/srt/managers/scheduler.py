@@ -510,7 +510,7 @@ class Scheduler:
                     UpdateWeightFromDistReqOutput(success, message)
                 )
             elif isinstance(recv_req, GetParameterByNameReqInput):
-                parameter = self.get_parameter_by_name(recv_req)
+                parameter = self.get_weights_by_parameter_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(
                     GetParameterByNameReqOutput(parameter)
                 )
@@ -1389,8 +1389,8 @@ class Scheduler:
             logger.error(message)
         return success, message
 
-    def get_parameter_by_name(self, recv_req: GetParameterByNameReqInput):
-        parameter = self.tp_worker.get_parameter_by_name(recv_req)
+    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
+        parameter = self.tp_worker.get_weights_by_parameter_name(recv_req)
         return parameter
 
     def start_profile(self) -> None:

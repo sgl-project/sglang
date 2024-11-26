@@ -1,0 +1,34 @@
+name: Weight Update Test
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+concurrency:
+  group: weight-update-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  weight-update-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+          pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
+
+      - name: Test get parameter by name
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 test_get_parameter_by_name.py

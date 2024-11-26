@@ -256,11 +256,13 @@ async def update_parameter_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
-@app.api_route("/get_parameter_by_name", methods=["GET", "POST"])
-async def get_parameter_by_name(obj: GetParameterByNameReqInput, request: Request):
+@app.api_route("/get_weights_by_parameter_name", methods=["GET", "POST"])
+async def get_weights_by_parameter_name(
+    obj: GetParameterByNameReqInput, request: Request
+):
     """Get model parameter by name."""
     try:
-        ret = await tokenizer_manager.get_parameter_by_name(obj, request)
+        ret = await tokenizer_manager.get_weights_by_parameter_name(obj, request)
         if ret is None:
             return ORJSONResponse(
                 {"error": {"message": "Get parameter by name failed"}},
@@ -346,12 +348,12 @@ async def init_parameter_update_group_request(
 
 
 @time_func_latency
-async def get_parameter_by_name_request(
+async def get_weights_by_parameter_name_request(
     obj: GetParameterByNameReqInput, request: Request
 ):
     """Handle a get parameter by name request."""
     try:
-        ret = await tokenizer_manager.get_parameter_by_name(obj, request)
+        ret = await tokenizer_manager.get_weights_by_parameter_name(obj, request)
         return ret
     except ValueError as e:
         return ORJSONResponse(
@@ -1130,7 +1132,7 @@ class Engine:
             update_parameter_from_distributed_request(obj, None)
         )
 
-    def get_parameter_by_name(self, name, truncate_size=100):
+    def get_weights_by_parameter_name(self, name, truncate_size=100):
         obj = GetParameterByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(get_parameter_by_name_request(obj, None))
+        return loop.run_until_complete(get_weights_by_parameter_name_request(obj, None))

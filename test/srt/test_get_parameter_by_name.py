@@ -2,6 +2,7 @@ import gc
 import json
 import time
 import unittest
+from itertools import product
 from signal import signal
 
 import numpy as np
@@ -64,12 +65,15 @@ class TestUpdateWeights(unittest.TestCase):
         torch.cuda.empty_cache()
 
     @classmethod
-    def assert_update_weights_unexist_model(cls, param_name, truncate_size):
+    def assert_update_weights_all_close(cls, param_name, truncate_size):
+        print(
+            f"shape: {cls.hf_model.get_parameter(param_name).shape}, truncate_size: {truncate_size}"
+        )
         param = cls.hf_model.get_parameter(param_name)[:truncate_size]
         print(
             f"param_name: {param_name}, shape: {list(param.shape)}, dtype: {str(param.dtype).split('.')[-1]}"
         )
-        engine_ret = cls.engine.get_parameter_by_name(param_name, truncate_size)
+        engine_ret = cls.engine.get_weights_by_parameter_name(param_name, truncate_size)
 
         # 如果 engine_ret 是标量值的列表
         if isinstance(engine_ret, list) and len(engine_ret) == 2:
@@ -86,7 +90,7 @@ class TestUpdateWeights(unittest.TestCase):
         )
 
         runtime_ret = requests.get(
-            f"{cls.base_url}/get_parameter_by_name",
+            f"{cls.base_url}/get_weights_by_parameter_name",
             json={
                 "name": param_name,
                 "truncate_size": truncate_size,
@@ -107,35 +111,28 @@ class TestUpdateWeights(unittest.TestCase):
 
     @classmethod
     def test_update_weights_unexist_model(cls):
-        # assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
-        # test_suits = [(1, 1, 1, 1)]
-        # # test_suits = []
-        # if torch.cuda.device_count() >= 4:
-        #     # test_suits.extend([(2, 2, 1, 1)])
-        #     test_suits.extend([(1, 1, 2, 2), (2, 2, 1, 1)])
-        # # if torch.cuda.device_count() == 8:
-        # #     test_suits.append((2, 2, 2, 2))
 
-        test_suits = [(2, 2, 1, 1)]
+        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
+        test_suits = [(1, 1, 1, 1)]
 
-        for engine_tp, server_tp, engine_dp, server_dp in test_suits:
-            print(
-                f"engine_tp: {engine_tp}, server_tp: {server_tp}, engine_dp: {engine_dp}, server_dp: {server_dp}"
-            )
-            cls.init_engine_and_server(engine_tp, server_tp, engine_dp, server_dp)
-            cls.assert_update_weights_unexist_model(
-                "model.layers.1.self_attn.q_proj.weight", 100
-            )
-            cls.assert_update_weights_unexist_model(
-                "model.layers.2.self_attn.k_proj.weight", 100
-            )
-            cls.assert_update_weights_unexist_model(
-                "model.layers.3.self_attn.v_proj.weight", 100
-            )
-            cls.assert_update_weights_unexist_model(
-                "model.layers.4.self_attn.o_proj.weight", 100
-            )
-            cls.assert_update_weights_unexist_model("lm_head.weight", 100)
+        if torch.cuda.device_count() >= 4:
+            test_suits.extend([(2, 2, 1, 1), (1, 1, 2, 2)])
+
+        if torch.cuda.device_count() >= 8:
+            test_suits.append((2, 2, 2, 2))
+
+        parameters = [
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.2.self_attn.k_proj.weight",
+            "model.layers.3.self_attn.v_proj.weight",
+            "lm_head.weight",
+        ]
+
+        for test_suit in test_suits:
+            cls.init_engine_and_server(*test_suit)
+            for param_name in parameters:
+                cls.assert_update_weights_all_close(param_name, 100)
+                print(f"test {test_suit} {param_name}")
             cls.close_engine_and_server()
 
 
