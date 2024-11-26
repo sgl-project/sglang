@@ -72,5 +72,6 @@ Traces can be visualized using https://ui.perfetto.dev/.
 
 - To profile offline
 ```bash
-python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --profile-dir=/root/sglang/profile_log --mem-frac=0.8
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
 ```
