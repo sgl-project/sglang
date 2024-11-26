@@ -526,12 +526,20 @@ class Scheduler:
         recv_req: TokenizedGenerateReqInput,
     ):
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
+            # Check if input_embeds is present and create dummy input_ids
+            if recv_req.input_embeds is not None:
+                # Generate fake input_ids based on the length of input_embeds
+                seq_length = len(recv_req.input_embeds)
+                fake_input_ids = [1] * seq_length
+                recv_req.input_ids = fake_input_ids
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 lora_path=recv_req.lora_path,
+                input_embeds=recv_req.input_embeds,
             )
             req.tokenizer = self.tokenizer
             if recv_req.session_id is not None:
