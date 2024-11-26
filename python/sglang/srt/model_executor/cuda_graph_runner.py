@@ -23,7 +23,7 @@ import torch
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.fused_moe.patch import fused_moe_forward_native
+from sglang.srt.layers.fused_moe_patch import fused_moe_forward_native
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -65,7 +65,10 @@ def patch_model(
             _to_torch(model)
             monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
-            tp_group.ca_comm = None
+            # Use custom-allreduce here.
+            # We found the custom allreduce is much faster than the built-in allreduce in torch,
+            # even with ENABLE_INTRA_NODE_COMM=1.
+            # tp_group.ca_comm = None
             yield torch.compile(
                 torch.no_grad()(model.forward), mode="max-autotune-no-cudagraphs"
             )

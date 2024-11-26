@@ -178,6 +178,7 @@ class Req:
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
         lora_path: Optional[str] = None,
+        input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
     ):
         # Input and output info
@@ -191,6 +192,7 @@ class Req:
 
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.input_embeds = input_embeds
 
         # Memory pool info
         self.req_pool_idx = None
@@ -437,14 +439,18 @@ class ScheduleBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     tree_cache: BasePrefixCache = None
 
-    # For utility
+    # Batch configs
     model_config: ModelConfig = None
     forward_mode: ForwardMode = None
+    enable_overlap: bool = False
+
+    # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
+    input_embeds: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     # The output locations of the KV cache
@@ -467,6 +473,7 @@ class ScheduleBatch:
     extend_lens: List[int] = None
     extend_num_tokens: int = None
     decoding_reqs: List[Req] = None
+    extend_logprob_start_lens: List[int] = None
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -487,10 +494,11 @@ class ScheduleBatch:
     def init_new(
         cls,
         reqs: List[Req],
-        req_to_token_pool,
-        token_to_kv_pool,
-        tree_cache,
-        model_config,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool: ReqToTokenPool,
+        tree_cache: BasePrefixCache,
+        model_config: ModelConfig,
+        enable_overlap: bool,
     ):
         return cls(
             reqs=reqs,
@@ -498,6 +506,7 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             model_config=model_config,
+            enable_overlap=enable_overlap,
             return_logprob=any(req.return_logprob for req in reqs),
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
@@ -611,7 +620,7 @@ class ScheduleBatch:
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
 
-    def prepare_for_extend(self, enable_overlap_schedule: bool = False):
+    def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         bs = len(self.reqs)
@@ -625,6 +634,9 @@ class ScheduleBatch:
         req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
+        input_embeds = []
+
+        pt = 0
         for i, req in enumerate(reqs):
             already_computed = (
                 req.extend_logprob_start_len + 1 + req.cached_tokens
@@ -642,6 +654,11 @@ class ScheduleBatch:
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+
+            # If input_embeds are available, store them
+            if req.input_embeds is not None:
+                # If req.input_embeds is already a list, append its content directly
+                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
@@ -665,6 +682,12 @@ class ScheduleBatch:
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
+        self.input_embeds = (
+            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            if input_embeds
+            else None
+        )
+
         self.out_cache_loc = out_cache_loc
 
         self.seq_lens_sum = sum(seq_lens)
@@ -705,7 +728,7 @@ class ScheduleBatch:
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
-            enable_overlap_schedule=enable_overlap_schedule,
+            enable_overlap_schedule=self.enable_overlap,
         )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
@@ -722,16 +745,20 @@ class ScheduleBatch:
         self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
-        self.extend_num_tokens += running_bs
+
+        # For overlap scheduler, the output_ids has one step delay
+        delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) - 1
+                len(r.origin_input_ids) + len(r.output_ids) + delta
                 for r in running_batch.reqs
             ]
         )
         self.extend_lens.extend([1] * running_bs)
+        self.extend_num_tokens += running_bs
+        # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
     def check_decode_mem(self):
@@ -895,7 +922,7 @@ class ScheduleBatch:
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
 
-    def prepare_for_decode(self, enable_overlap: bool = False):
+    def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
 
         self.input_ids = self.output_ids
@@ -912,7 +939,7 @@ class ScheduleBatch:
         else:
             locs = self.seq_lens
 
-        if enable_overlap:
+        if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.req_to_token_pool.write(
                 (self.req_pool_indices, locs), self.out_cache_loc
@@ -1043,6 +1070,7 @@ class ScheduleBatch:
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
+            input_embeds=self.input_embeds,
         )
 
     def copy(self):
@@ -1112,6 +1140,9 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # The input Embeds
+    input_embeds: Optional[torch.tensor] = None
 
 
 @triton.jit

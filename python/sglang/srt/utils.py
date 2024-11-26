@@ -15,6 +15,7 @@
 
 import base64
 import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import psutil
@@ -44,6 +45,8 @@ from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from starlette.routing import Mount
 from torch import nn
+from torch.func import functional_call
+from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
     FileCacheManager,
@@ -188,6 +191,94 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
         free_gpu_memory = tensor.item()
 
     return free_gpu_memory / (1 << 30)
+
+
+def is_pin_memory_available() -> bool:
+    return torch.cuda.is_available()
+
+
+_CPU_OFFLOAD_BYTES = 0
+_CPU_OFFLOAD_MAX_BYTES = 0
+
+
+def set_cpu_offload_max_bytes(max_bytes: int) -> None:
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    _CPU_OFFLOAD_BYTES = 0
+    _CPU_OFFLOAD_MAX_BYTES = max_bytes
+
+
+def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+    device = next(module.parameters()).device
+
+    if device == torch.device("cpu"):
+        return module
+
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+        return module
+
+    pin_memory = is_pin_memory_available()
+    # offload parameters to CPU
+    # use pin_memory if possible, which helps cudagraph capture speed
+    offloaded_parameters = False
+    for p in module.parameters():
+        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+            # we use per-parameter offloading
+            # one module might have some parameters offloaded and some not
+            break
+
+        # `torch.empty_like` does not support `pin_memory` argument
+        cpu_data = torch.empty_strided(
+            size=p.data.size(),
+            stride=p.data.stride(),
+            dtype=p.data.dtype,
+            layout=p.data.layout,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        cpu_data.copy_(p.data)
+        p.data = cpu_data
+        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
+        offloaded_parameters = True
+
+    if offloaded_parameters:
+        original_forward = module.forward
+
+        def forward(*args, **kwargs):
+            module.forward = original_forward
+            device_state = {
+                # here we blindly call `to(device)`
+                # if the parameter is already on the device, it will be a no-op
+                k: v.to(device, non_blocking=True)
+                for k, v in module.state_dict().items()
+            }
+            output = functional_call(module, device_state, args=args, kwargs=kwargs)
+            module.forward = forward
+            return output
+
+        module.forward = forward
+
+    return module
+
+
+class LayerFn(Protocol):
+
+    def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
+
+
+def make_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+) -> Tuple[int, int, torch.nn.ModuleList]:
+    """Make a list of layers with the given layer function"""
+    modules = torch.nn.ModuleList(
+        [
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=f"{prefix}.{idx}"))
+            for idx in range(num_hidden_layers)
+        ]
+    )
+    return modules
 
 
 def set_random_seed(seed: int) -> None:
@@ -840,4 +931,94 @@ def get_nvgpu_memory_capacity():
 
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return os.getenv("SGLANG_IS_IN_CI", "false").lower() == "true"
+
+
+def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda.get_device_name(device_id)
+
+    if hasattr(torch, "hip") and torch.hip.is_available():
+        return torch.hip.get_device_name(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_name(device_id)
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return torch.hpu.get_device_name(device_id)
+
+
+sglang_lib = Library("sglang", "FRAGMENT")  # noqa
+
+
+def direct_register_custom_op(
+    op_name: str,
+    op_func: Callable,
+    mutates_args: List[str],
+    fake_impl: Optional[Callable] = None,
+    target_lib: Optional[Library] = None,
+):
+    """
+    `torch.library.custom_op` can have significant overhead because it
+    needs to consider complicated dispatching logic. This function
+    directly registers a custom op and dispatches it to the CUDA backend.
+    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
+    for more details.
+
+    By default, the custom op is registered to the vLLM library. If you
+    want to register it to a different library, you can pass the library
+    object to the `target_lib` argument.
+
+    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
+    library object. If you want to bind the operator to a different library,
+    make sure the library object is alive when the operator is used.
+    """
+    import torch.library
+
+    if hasattr(torch.library, "infer_schema"):
+        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    else:
+        # for pytorch 2.4
+        import torch._custom_op.impl
+
+        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+
+    my_lib = target_lib or sglang_lib
+    my_lib.define(op_name + schema_str)
+    my_lib.impl(op_name, op_func, "CUDA")
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)
+
+
+def gpu_proc_affinity(
+    tp_size: int,
+    nnodes: int,
+    gpu_id: int,
+):
+    # current process
+    pid = os.getpid()
+    p = psutil.Process(pid)
+
+    tp_size_per_node = tp_size // nnodes
+
+    # total physical cores
+    total_pcores = psutil.cpu_count(logical=False)
+    # physical cores per TP (N.B. more Cores than GPUs on node)
+    num_cores_bind = total_pcores // tp_size_per_node
+
+    # able to handle multiple DP per node
+    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
+    end_cpu_id = start_cpu_id + num_cores_bind
+
+    if psutil.cpu_count() != psutil.cpu_count(logical=False):
+        # HT on
+        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
+    else:
+        # HT off
+        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+
+    # set cpu_affinity to current process
+    p.cpu_affinity(bind_cpu_ids)
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")

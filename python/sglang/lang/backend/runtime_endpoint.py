@@ -58,9 +58,9 @@ class RuntimeEndpoint(BaseBackend):
         )
         self._assert_success(res)
 
-    def get_server_args(self):
+    def get_server_info(self):
         res = http_request(
-            self.base_url + "/get_server_args",
+            self.base_url + "/get_server_info",
             api_key=self.api_key,
             verify=self.verify,
         )

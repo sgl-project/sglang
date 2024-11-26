@@ -25,6 +25,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
@@ -407,7 +408,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "False").lower() == "true":
+    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
         import huggingface_hub.constants
         from modelscope import snapshot_download
 
@@ -693,6 +694,19 @@ def gen_prompt(tokenizer, token_num):
     return tokenizer.decode(selected_tokens)
 
 
+def get_gen_prefix_cache_path(args, tokenizer):
+    """Create cache directory under ~/.cache/sglang/benchmark"""
+    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
+
+    # Create a unique cache filename based on the generation parameters
+    cache_key = (
+        f"gen_prefix_{args.gen_num_groups}_{args.gen_prompts_per_group}_"
+        f"{args.gen_system_prompt_len}_{args.gen_question_len}_{args.gen_output_len}_"
+        f"{tokenizer.__class__.__name__}.pkl"
+    )
+    return cache_dir / cache_key
+
+
 def sample_generated_shared_prefix_requests(
     num_groups: int,
     prompts_per_group: int,
@@ -701,12 +715,17 @@ def sample_generated_shared_prefix_requests(
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
 ) -> List[Tuple[str, int, int]]:
-    if args.generated_input_path and os.path.exists(args.generated_input_path):
-        print(f"\nloading generated input data from {args.generated_input_path}")
-        with open(args.generated_input_path, "rb") as f:
+    """Generate benchmark requests with shared system prompts using random tokens and caching."""
+    cache_path = get_gen_prefix_cache_path(args, tokenizer)
+
+    # Try to load from cache first
+    if cache_path.exists():
+        print(f"\nLoading cached generated input data from {cache_path}")
+        with open(cache_path, "rb") as f:
             return pickle.load(f)
 
-    """Generate benchmark requests with shared system prompts using random tokens."""
+    print("\nGenerating new input data...")
+
     # Generate system prompts for each group
     system_prompts = []
     for _ in range(num_groups):
@@ -719,17 +738,16 @@ def sample_generated_shared_prefix_requests(
         question = gen_prompt(tokenizer, question_len)
         questions.append(question)
 
-    # Shuffle questions
-    random.shuffle(questions)
-
     # Combine system prompts with questions
     input_requests = []
     total_input_tokens = 0
     total_output_tokens = 0
 
-    for group_idx in range(num_groups):
+    for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
-        for prompt_idx in range(prompts_per_group):
+        for prompt_idx in tqdm(
+            range(prompts_per_group), desc="Generating questions", leave=False
+        ):
             question = questions[group_idx * prompts_per_group + prompt_idx]
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
@@ -738,6 +756,10 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_len
 
+    # Shuffle questions
+    random.shuffle(input_requests)
+
+    # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
@@ -750,11 +772,12 @@ def sample_generated_shared_prefix_requests(
     print(
         f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
     )
-    if args.generated_input_save_path:
-        print(f"Saving generated input data to {args.generated_input_save_path}")
-        os.makedirs(os.path.dirname(args.generated_input_save_path), exist_ok=True)
-        with open(args.generated_input_save_path, "wb") as f:
-            pickle.dump(input_requests, f)
+
+    # Save to cache
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Caching generated input data to {cache_path}")
+    with open(cache_path, "wb") as f:
+        pickle.dump(input_requests, f)
 
     return input_requests
 
@@ -859,6 +882,7 @@ async def benchmark(
     tokenizer: PreTrainedTokenizerBase,
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
+    max_concurrency: Optional[int],
     disable_tqdm: bool,
     extra_request_body: Dict[str, Any],
     profile: bool,
@@ -867,6 +891,15 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    # From https://github.com/vllm-project/vllm/pull/9390
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+
+    async def limited_request_func(request_func_input, pbar):
+        if semaphore is None:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
+        async with semaphore:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
@@ -913,7 +946,7 @@ async def benchmark(
         )
         tasks.append(
             asyncio.create_task(
-                request_func(request_func_input=request_func_input, pbar=pbar)
+                limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
@@ -940,6 +973,12 @@ async def benchmark(
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
+    print(
+        "{:<40} {:<10}".format(
+            "Max reqeuest concurrency:",
+            max_concurrency if max_concurrency else "not set",
+        )
+    )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
@@ -1003,6 +1042,7 @@ async def benchmark(
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": request_rate,
+            "max_concurrency": max_concurrency,
             "total_input_tokens": metrics.total_input,
             "total_output_tokens": metrics.total_output,
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
@@ -1089,6 +1129,10 @@ def check_chat_template(model_path):
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
+
+    # Set default value for max_concurrency if not present
+    if not hasattr(args, "max_concurrency"):
+        args.max_concurrency = None
 
     # Set global environments
     set_ulimit()
@@ -1201,6 +1245,7 @@ def run_benchmark(args_: argparse.Namespace):
                 tokenizer=tokenizer,
                 input_requests=input_requests,
                 request_rate=args.request_rate,
+                max_concurrency=args.max_concurrency,
                 disable_tqdm=args.disable_tqdm,
                 extra_request_body=extra_request_body,
                 profile=args.profile,
@@ -1220,6 +1265,7 @@ def run_benchmark(args_: argparse.Namespace):
                     tokenizer=tokenizer,
                     input_requests=input_requests,
                     request_rate=rate,
+                    max_concurrency=args.max_concurrency,
                     disable_tqdm=args.disable_tqdm,
                     extra_request_body=extra_request_body,
                     profile=args.profile,
@@ -1319,6 +1365,19 @@ if __name__ == "__main__":
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=None,
+        help="Maximum number of concurrent requests. This can be used "
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.",
+    )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--multi",
@@ -1385,16 +1444,6 @@ if __name__ == "__main__":
         type=int,
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
-    )
-    parser.add_argument(
-        "--generated-input-save-path",
-        type=str,
-        help="Path to save generated input data",
-    )
-    parser.add_argument(
-        "--generated-input-path",
-        type=str,
-        help="Path to load previously generated input data",
     )
     parser.add_argument(
         "--profile",
