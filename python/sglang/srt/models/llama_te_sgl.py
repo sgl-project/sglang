@@ -337,6 +337,7 @@ class TELlamaForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v", 3),
             ("gate_up_proj", "gate_proj", 0, 2),
             ("gate_up_proj", "up_proj", 1, 2),
+            #TODO: (zhuohaol) need to be updated later for get_module_name usage in other files
         ]
         for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
             if weight_name in name:
@@ -382,21 +383,21 @@ class TELlamaForCausalLM(nn.Module):
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
-                    continue # 如果当前 weight_name 不在参数 name 中，跳过。
+                    continue 
                 mapped_name = name.replace(weight_name, param_name)
-                # **处理 qkv_proj 权重**
+                # qkv_proj 
                 if param_name == ".qkv_proj":
                     if mapped_name not in params_dict:
                         params_dict[mapped_name] = torch.zeros_like(loaded_weight)
 
-                    # 分割 loaded_weight 为 q_proj, k_proj, v_proj
+                    # split loaded_weight into q_proj, k_proj, v_proj
                     q_weight, k_weight, v_weight = torch.chunk(loaded_weight, 3, dim=0)
 
-                    if shard_id == 0:  # q_proj 部分
+                    if shard_id == 0:  # q_proj 
                         params_dict[mapped_name][: q_weight.shape[0]] = q_weight
-                    elif shard_id == 1:  # k_proj 部分
+                    elif shard_id == 1:  # k_proj 
                         params_dict[mapped_name][q_weight.shape[0]: 2 * q_weight.shape[0]] = k_weight
-                    elif shard_id == 2:  # v_proj 部分
+                    elif shard_id == 2:  # v_proj 
                         params_dict[mapped_name][2 * q_weight.shape[0]:] = v_weight
                     break
                 if param_name == ".layernorm_mlp.layer_norm_weight":
@@ -418,7 +419,7 @@ class TELlamaForCausalLM(nn.Module):
                         params_dict[mapped_name][gate_weight.shape[0]:] = up_weight
                     break
 
-                # **处理单独权重**
+                # fc2
                 elif param_name == ".layernorm_mlp.fc2_weight":
                     if mapped_name in params_dict:
                         params_dict[mapped_name].data.copy_(loaded_weight)
@@ -435,7 +436,6 @@ class TELlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip loading kv_scale from ckpts towards new design.
-                # 跳过加载 kv_scale（这部分是新设计中移除的）。
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
                 param = params_dict[name]
