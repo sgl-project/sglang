@@ -14,6 +14,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import random
 import time
 from pathlib import Path
@@ -29,7 +30,7 @@ from sglang.bench_serving import (
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Runtime
+from sglang.srt.server import Runtime, start_profile_sync, stop_profile_sync
 from sglang.srt.server_args import ServerArgs
 
 
@@ -55,7 +56,6 @@ class BenchArgs:
     skip_warmup: bool = False
     do_not_exit: bool = False
     profile: bool = False
-    profile_dir: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -163,16 +163,8 @@ class BenchArgs:
         parser.add_argument(
             "--profile",
             action="store_true",
-            help="Use Torch Profiler",
-        )
-        parser.add_argument(
-            "--profile-dir",
-            type=str,
-            default=None,
-            help=(
-                "path to save the pytorch profiler output. Can be visualized "
-                "with ui.perfetto.dev or Tensorboard."
-            ),
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
 
     @classmethod
@@ -188,7 +180,6 @@ def throughput_test_once(
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
-    profile_dir: str,
 ):
     measurement_results = {
         "backend": backend_name,
@@ -215,22 +206,14 @@ def throughput_test_once(
 
     st = time.perf_counter()
     if profile:
-        if not profile_dir:
-            profile_dir = (
-                Path(".") / "sglang_benchmark_result" / f"latency_result_{time.time()}"
-            )
-        print(f"Profiling (results will be saved to '{profile_dir}')...")
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            with_stack=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir)),
-        ) as p:
-            gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
-    else:
-        gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+        start_profile_sync()
+
+    gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+
+    if profile:
+        stop_profile_sync()
+        monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
+
     latency = time.perf_counter() - st
 
     if backend_name == "runtime":
@@ -255,6 +238,41 @@ def throughput_test_once(
     ) / latency
 
     return measurement_results
+
+
+def monitor_trace_file(directory, interval=1):
+
+    print(f"Monitoring {directory} for new trace files...")
+
+    known_files = set(os.listdir(directory))
+
+    while True:
+        flag = False
+        time.sleep(interval)
+        current_files = set(os.listdir(directory))
+
+        new_files = current_files - known_files
+        for new_file in new_files:
+            new_file_path = os.path.join(directory, new_file)
+            print(f"New file detected: {new_file}")
+
+            previous_size = 0
+            while True:
+                try:
+                    current_size = os.path.getsize(new_file_path)
+                except FileNotFoundError:
+                    print(f"File {new_file} is no longer accessible.")
+                    break
+
+                if current_size > previous_size:
+                    previous_size = current_size
+                else:
+                    flag = True
+                    break
+
+                time.sleep(interval)
+        if flag:
+            break
 
 
 def throughput_test(
@@ -305,7 +323,6 @@ def throughput_test(
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
             profile=False,
-            profile_dir=bench_args.profile_dir,
         )
 
     logging.info("\nBenchmark...")
@@ -316,7 +333,6 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
-        profile_dir=bench_args.profile_dir,
     )
 
     if bench_args.result_filename:
