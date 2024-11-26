@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(
             tree.get_smallest_tenant(),
             "tenant2",
-            "Expected tenant2 to be smallest with 3 characters"
+            "Expected tenant2 to be smallest with 3 characters."
         );
 
         // Insert overlapping data for tenant3 and tenant4 to test equal counts
