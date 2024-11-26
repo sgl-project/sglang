@@ -10,18 +10,16 @@ import triton.language as tl
 from tqdm import tqdm
 from vllm import _custom_ops as ops
 
-from sglang.srt.layers.fused_moe.fused_moe import fused_moe, get_config_file_name
+from sglang.srt.layers.fused_moe_grok.fused_moe import fused_moe, get_config_file_name
 
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
 
-def main(model, tp_size, gpu, dtype: str, batches):
+def main(model, tp_size, dtype: str, batches):
     method = fused_moe
 
     for bs in batches:
-        run_grid(
-            int(bs), model=model, method=method, gpu=gpu, tp_size=tp_size, dtype=dtype
-        )
+        run_grid(int(bs), model=model, method=method, tp_size=tp_size, dtype=dtype)
 
 
 def prune_configs(M, N, K, configs):
@@ -110,23 +108,28 @@ def union_of_list_of_dicts(l1, l2):
     return result
 
 
-def run_grid(bs, model, method, gpu, tp_size, dtype: str):
+def run_grid(bs, model, method, tp_size, dtype: str):
+    top_k = 2
+    num_total_experts = 8
+
     if model == "8x7B":
         d_model = 4096
         model_intermediate_size = 14336
         num_layers = 32
+        hidden_states_dtype = torch.float16
     elif model == "8x22B":
         d_model = 6144
         model_intermediate_size = 16384
         num_layers = 56
+        hidden_states_dtype = torch.float16
     elif model == "grok1":
         d_model = 6144
         model_intermediate_size = 32768
         num_layers = 64
+        hidden_states_dtype = torch.bfloat16
     else:
         raise ValueError(f"Unsupported Mixtral model {model}")
-    num_total_experts = 8
-    top_k = 2
+
     # tp_size = 2
     num_warmup_calls = 10
     num_calls = 30
@@ -144,7 +147,7 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
     # For now we see better perf with num_stages=0 for all gemm configs we care
     # But keep this explicit so that we do not forget we may need to set it to
     # other values in the future
-    num_stage_range = [0]
+    num_stage_range = [2]
     waves_per_eu_range = [0, 1, 2, 4, 8]
     # Remove 32 because of triton compiling error
     matrix_instr_nonkdim_range = [16]
@@ -211,6 +214,7 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
                     method=method,
                     config=config,
                     dtype=dtype,
+                    hidden_states_dtype=hidden_states_dtype,
                 )
         except triton.runtime.autotuner.OutOfResources:
             continue
@@ -228,6 +232,7 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
                 method=method,
                 config=config,
                 dtype=dtype,
+                hidden_states_dtype=hidden_states_dtype,
             )
 
             kernel_dur_us = 1000 * kernel_dur_ms
@@ -274,13 +279,14 @@ def run_timing(
     method,
     config,
     dtype: str,
+    hidden_states_dtype,
 ) -> float:
     shard_intermediate_size = model_intermediate_size // tp_size
 
     hidden_states = torch.rand(
         (bs, d_model),
         device="cuda:0",
-        dtype=torch.float16,
+        dtype=hidden_states_dtype,
     )
 
     w1 = torch.rand(
@@ -337,7 +343,7 @@ def run_timing(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             gating_output=gating_output[0],
-            topk=2,
+            topk=top_k,
             renormalize=True,
             inplace=True,
             override_config=config,
@@ -360,7 +366,7 @@ if __name__ == "__main__":
         "--dtype",
         type=str,
         default="auto",
-        choices=["float8", "float16"],
+        choices=["float8", "float16", "bfloat16"],
         help="Data type used for fused_moe kernel computations",
     )
     parser.add_argument(
@@ -377,4 +383,4 @@ if __name__ == "__main__":
 
     batches = args.batches.split(",")
 
-    sys.exit(main(args.model, args.tp_size, args.gpu, args.dtype, batches))
+    sys.exit(main(args.model, args.tp_size, args.dtype, batches))
