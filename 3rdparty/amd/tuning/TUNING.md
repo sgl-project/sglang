@@ -93,6 +93,20 @@ TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 TORCHINDU
 #Inference with large improvement on AMD GPU
 TORCHINDUCTOR_FREEZING=1 your_script.sh
 ```
+## 4. Fused MOE kernel
+To maximize moe kernel efficiency, need to use below scripts to find out the best launch configuration
+
+### Key parameters:
+- **--model**: what moe model type to do tuning, it will automatically decide the size of d_model, model_intermediate_size, num_layers
+- **--tp-size**: simulate the whole model run configuration to set the dimension size using tp correctly
+- **--batch**: M dimension size of moe kernel, for prefill moe kernel the value is batch*input_len, for decode moe kernel the value is batch
+- **--dtype**: computation type
+
+```bash
+#Tuning
+python benchmark_moe_rocm.py --model grok1 --tp-size 8 --dtype float8 --batch "32"
+
+```
 
 ## Reference
 
