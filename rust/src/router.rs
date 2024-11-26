@@ -2,12 +2,10 @@ use crate::tree::Tree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt};
 use log::{debug, info};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::hash::Hash;
-use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -252,7 +250,7 @@ impl Router {
             } => {
                 // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
 
-                let mut tree = tree.lock().unwrap();
+                let tree = tree.lock().unwrap();
                 let mut running_queue = running_queue.lock().unwrap();
 
                 // Get current load statistics
