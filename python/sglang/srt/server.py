@@ -465,7 +465,6 @@ def launch_engine(
         data = scheduler_pipe_readers[i].recv()
 
         if data["status"] != "ready":
-            self.shutdown()
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
