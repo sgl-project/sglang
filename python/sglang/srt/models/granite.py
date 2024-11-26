@@ -51,6 +51,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import make_layers
 
 
 class GraniteMLP(nn.Module):
@@ -278,11 +279,13 @@ class GraniteModel(nn.Module):
             org_num_embeddings=config.vocab_size,
             quant_config=quant_config,
         )
-        self.layers = nn.ModuleList(
-            [
-                GraniteDecoderLayer(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: GraniteDecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+            ),
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

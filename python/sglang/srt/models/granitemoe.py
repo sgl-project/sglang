@@ -22,10 +22,10 @@ from torch import nn
 from transformers.models.granitemoe import GraniteMoeConfig
 from vllm.config import LoRAConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -41,6 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import make_layers
 
 
 class GraniteMoeMoE(nn.Module):
@@ -264,11 +265,13 @@ class GraniteMoeModel(nn.Module):
         )
         self.embedding_multiplier = config.embedding_multiplier
 
-        self.layers = nn.ModuleList(
-            [
-                GraniteMoeDecoderLayer(config, layer_id=i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: GraniteMoeDecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+            ),
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
