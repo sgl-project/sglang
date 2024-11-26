@@ -278,6 +278,6 @@ class TracingScope:
 
     def add_child_state(self, state: TracerProgramState):
         cur_scope = self
-        while cur_scope != None:
+        while cur_scope is not None:
             cur_scope.tracer_state.child_states.append(state)
             cur_scope = cur_scope.last_scope
