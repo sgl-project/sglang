@@ -8,22 +8,21 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from tqdm import tqdm
-
 from vllm import _custom_ops as ops
-from sglang.srt.layers.fused_moe.fused_moe import (fused_moe, get_config_file_name)
+
+from sglang.srt.layers.fused_moe.fused_moe import fused_moe, get_config_file_name
 
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
+
 def main(model, tp_size, gpu, dtype: str, batches):
     method = fused_moe
-    
+
     for bs in batches:
-        run_grid(int(bs),
-                 model=model,
-                 method=method,
-                 gpu=gpu,
-                 tp_size=tp_size,
-                 dtype=dtype)
+        run_grid(
+            int(bs), model=model, method=method, gpu=gpu, tp_size=tp_size, dtype=dtype
+        )
+
 
 def prune_configs(M, N, K, configs):
     pruned_configs = []
@@ -54,8 +53,7 @@ def prune_configs(M, N, K, configs):
             continue
         SPLIT_K = 1  # config.get("SPLIT_K")
         GROUP_M = config.get("GROUP_SIZE_M")
-        if (matrix_instr_nonkdim > BLOCK_SIZE_M
-                or matrix_instr_nonkdim > BLOCK_SIZE_N):
+        if matrix_instr_nonkdim > BLOCK_SIZE_M or matrix_instr_nonkdim > BLOCK_SIZE_N:
             continue
         if matrix_instr_nonkdim >= M and matrix_instr_nonkdim != BLOCK_SIZE_M:
             continue
@@ -80,8 +78,10 @@ def prune_configs(M, N, K, configs):
             continue
         # out of shared memory resource
         # TODO (zhanglx): This does not consider the LDS usage in the epilogue
-        LDS = (BLOCK_SIZE_K * BLOCK_SIZE_M * elemBytes_a +
-               BLOCK_SIZE_K * BLOCK_SIZE_N * elemBytes_b)
+        LDS = (
+            BLOCK_SIZE_K * BLOCK_SIZE_M * elemBytes_a
+            + BLOCK_SIZE_K * BLOCK_SIZE_N * elemBytes_b
+        )
         if LDS > 65536:
             continue
         # Skip small block sizes and num_warps for large gemm
@@ -98,6 +98,7 @@ def prune_configs(M, N, K, configs):
 
     return pruned_configs
 
+
 def union_of_list_of_dicts(l1, l2):
     result = []
     temp_list = l1.copy()
@@ -108,21 +109,22 @@ def union_of_list_of_dicts(l1, l2):
 
     return result
 
+
 def run_grid(bs, model, method, gpu, tp_size, dtype: str):
-    if model == '8x7B':
+    if model == "8x7B":
         d_model = 4096
         model_intermediate_size = 14336
         num_layers = 32
-    elif model == '8x22B':
+    elif model == "8x22B":
         d_model = 6144
         model_intermediate_size = 16384
         num_layers = 56
-    elif model == 'grok1':
+    elif model == "grok1":
         d_model = 6144
         model_intermediate_size = 32768
         num_layers = 64
     else:
-        raise ValueError(f'Unsupported Mixtral model {model}')
+        raise ValueError(f"Unsupported Mixtral model {model}")
     num_total_experts = 8
     top_k = 2
     # tp_size = 2
@@ -155,21 +157,21 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
                     for num_warps in num_warps_range:
                         for num_stages in num_stage_range:
                             for waves_per_eu in waves_per_eu_range:
-                                for (matrix_instr_nonkdim
-                                     ) in matrix_instr_nonkdim_range:
+                                for matrix_instr_nonkdim in matrix_instr_nonkdim_range:
                                     for kpack in kpack_range:
-                                        full_configs.append({
-                                            "BLOCK_SIZE_M": block_size_m,
-                                            "BLOCK_SIZE_N": block_size_n,
-                                            "BLOCK_SIZE_K": block_size_k,
-                                            "GROUP_SIZE_M": group_size_m,
-                                            "num_warps": num_warps,
-                                            "num_stages": num_stages,
-                                            "waves_per_eu": waves_per_eu,
-                                            "matrix_instr_nonkdim":
-                                            matrix_instr_nonkdim,
-                                            "kpack": kpack,
-                                        })
+                                        full_configs.append(
+                                            {
+                                                "BLOCK_SIZE_M": block_size_m,
+                                                "BLOCK_SIZE_N": block_size_n,
+                                                "BLOCK_SIZE_K": block_size_k,
+                                                "GROUP_SIZE_M": group_size_m,
+                                                "num_warps": num_warps,
+                                                "num_stages": num_stages,
+                                                "waves_per_eu": waves_per_eu,
+                                                "matrix_instr_nonkdim": matrix_instr_nonkdim,
+                                                "kpack": kpack,
+                                            }
+                                        )
 
     M1 = bs * 2
     N1 = model_intermediate_size * 2 // tp_size
@@ -183,13 +185,15 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
 
     configs = union_of_list_of_dicts(prune_configs_1, prune_configs_2)
 
-    print(f"{bs=} || {len(full_configs)=} | {len(prune_configs_1)=} | \
-            {len(prune_configs_2)=} | {len(configs)=}")
+    print(
+        f"{bs=} || {len(full_configs)=} | {len(prune_configs_1)=} | \
+            {len(prune_configs_2)=} | {len(configs)=}"
+    )
 
     best_config = None
     best_time_us = 1e20
 
-    print(f'{tp_size=} {bs=}')
+    print(f"{tp_size=} {bs=}")
 
     for config in tqdm(configs):
         # warmup
@@ -234,17 +238,20 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
                 best_time_us = kernel_dur_us
 
                 tqdm.write(
-                    f'{kernel_dur_us=:.1f} {model_dur_ms=:.1f}'
-                    f' {bs=} {tp_size=} {top_k=} {num_total_experts=} '
-                    f'{d_model=} {model_intermediate_size=} {num_layers=}')
+                    f"{kernel_dur_us=:.1f} {model_dur_ms=:.1f}"
+                    f" {bs=} {tp_size=} {top_k=} {num_total_experts=} "
+                    f"{d_model=} {model_intermediate_size=} {num_layers=}"
+                )
 
     print("best_time_us", best_time_us)
     print("best_config", best_config)
 
     # holds Dict[str, Dict[str, int]]
-    filename = get_config_file_name(num_total_experts,
-                                    model_intermediate_size // tp_size,
-                                    "float8" if dtype == "float8" else None)
+    filename = get_config_file_name(
+        num_total_experts,
+        model_intermediate_size // tp_size,
+        "float8" if dtype == "float8" else None,
+    )
     print(f"writing config to file {filename}")
     existing_content = {}
     if os.path.exists(filename):
@@ -256,9 +263,18 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
         f.write("\n")
 
 
-def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,
-               top_k: int, tp_size: int, model_intermediate_size: int, method,
-               config, dtype: str) -> float:
+def run_timing(
+    num_calls: int,
+    bs: int,
+    d_model: int,
+    num_total_experts: int,
+    top_k: int,
+    tp_size: int,
+    model_intermediate_size: int,
+    method,
+    config,
+    dtype: str,
+) -> float:
     shard_intermediate_size = model_intermediate_size // tp_size
 
     hidden_states = torch.rand(
@@ -268,13 +284,13 @@ def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,
     )
 
     w1 = torch.rand(
-        (num_total_experts, 2 * shard_intermediate_size, d_model+padding_size),
+        (num_total_experts, 2 * shard_intermediate_size, d_model + padding_size),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
 
     w2 = torch.rand(
-        (num_total_experts, d_model, shard_intermediate_size+padding_size),
+        (num_total_experts, d_model, shard_intermediate_size + padding_size),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -287,24 +303,23 @@ def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,
     if dtype == "float8":
         w1 = w1.to(torch.float8_e4m3fnuz)
         w2 = w2.to(torch.float8_e4m3fnuz)
-        w1_scale = torch.ones(num_total_experts,
-                              device=hidden_states.device,
-                              dtype=torch.float32)
-        w2_scale = torch.ones(num_total_experts,
-                              device=hidden_states.device,
-                              dtype=torch.float32)
-        a1_scale = torch.ones(1,
-                              device=hidden_states.device,
-                              dtype=torch.float32)
-        a2_scale = torch.ones(1,
-                              device=hidden_states.device,
-                              dtype=torch.float32)
+        w1_scale = torch.ones(
+            num_total_experts, device=hidden_states.device, dtype=torch.float32
+        )
+        w2_scale = torch.ones(
+            num_total_experts, device=hidden_states.device, dtype=torch.float32
+        )
+        a1_scale = torch.ones(1, device=hidden_states.device, dtype=torch.float32)
+        a2_scale = torch.ones(1, device=hidden_states.device, dtype=torch.float32)
 
-    gating_output = F.softmax(torch.rand(
-        (num_calls, bs, num_total_experts),
-        device=hidden_states.device,
-        dtype=torch.float32,
-    ),dim=-1)
+    gating_output = F.softmax(
+        torch.rand(
+            (num_calls, bs, num_total_experts),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        ),
+        dim=-1,
+    )
 
     ##################################
 
@@ -338,26 +353,25 @@ def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        prog='benchmark_mixtral_moe',
-        description='Benchmark and tune the fused_moe kernel',
+        prog="benchmark_mixtral_moe",
+        description="Benchmark and tune the fused_moe kernel",
     )
     parser.add_argument(
-        '--dtype',
+        "--dtype",
         type=str,
-        default='auto',
-        choices=['float8', 'float16'],
-        help='Data type used for fused_moe kernel computations',
+        default="auto",
+        choices=["float8", "float16"],
+        help="Data type used for fused_moe kernel computations",
     )
-    parser.add_argument('--model',
-                        type=str,
-                        default='8x7B',
-                        choices=['8x7B', '8x22B', 'grok1'],
-                        help='The Mixtral model to benchmark')
-    parser.add_argument('--tp-size',
-                        type=int,
-                        default=2,
-                        help='Tensor paralleli size')
-    parser.add_argument('-b', '--batches', type=str)
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="8x7B",
+        choices=["8x7B", "8x22B", "grok1"],
+        help="The Mixtral model to benchmark",
+    )
+    parser.add_argument("--tp-size", type=int, default=2, help="Tensor paralleli size")
+    parser.add_argument("-b", "--batches", type=str)
 
     args = parser.parse_args()
 
