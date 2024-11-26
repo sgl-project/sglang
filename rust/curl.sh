@@ -3,5 +3,5 @@ curl -X POST http://127.0.0.1:30000/generate -H "Content-Type: application/json"
     "sampling_params": {
       "temperature": 0
     },
-    "uid": "byron"
+    "user": "James"
   }'

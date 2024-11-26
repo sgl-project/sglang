@@ -92,7 +92,7 @@ struct Args {
 
     #[arg(long, default_value_t = false, help = "Enable verbose logging")]
     verbose: bool,
-    
+
     #[arg(
         long,
         default_value_t = false,

@@ -124,6 +124,7 @@ class RouterArgs:
             f"--{prefix}verbose",
             action="store_true",
             help="Enable verbose logging",
+        )
         
         # Fairness control configuration
         parser.add_argument(
