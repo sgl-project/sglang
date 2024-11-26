@@ -21,8 +21,9 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.utils import is_hip, print_warning_once
+from vllm.utils import print_warning_once
 
+from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.ep_moe.kernels import (
     grouped_gemm_triton,
     post_reorder_triton_kernel,
@@ -31,6 +32,7 @@ from sglang.srt.layers.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
 )
 from sglang.srt.layers.fused_moe_triton.fused_moe import fused_topk, grouped_topk
+from sglang.srt.utils import is_hip
 
 logger = init_logger(__name__)
 
@@ -164,9 +166,7 @@ class EPMoE(torch.nn.Module):
         self.topk_group = topk_group
 
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod(
-                quant_config
-            )
+            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
             self.enable_fp8 = False
             self.activation_scheme = None
         else:
@@ -447,6 +447,7 @@ class EPMoE(torch.nn.Module):
                 param_data[expert_id] = loaded_weight
 
 
+@register_custom_op("sglang_unquantized_ep_moe")
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
     def create_weights(
         self,
