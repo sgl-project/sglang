@@ -88,7 +88,12 @@ pub enum Router {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
-        _eviction_thread: Option<thread::JoinHandle<()>>,
+        // 2D matrix of (user_id, worker_url) -> counter
+        // Initialize with C for all pairs
+        fairness_counter: Arc<Mutex<HashMap<String, HashMap<String, i32>>>>,
+        fairness_fill_size: usize,
+        enable_fairness: bool,
+        _eviction_thread: Option<thread::JoinHandle<()>>, // Store thread handle
     },
 }
 
@@ -102,6 +107,8 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        enable_fairness: bool,
+        fairness_fill_size: usize,
     },
 }
 
@@ -126,6 +133,15 @@ fn get_text_from_request(body: &Bytes, route: &str) -> String {
 
     return "".to_string();
 }
+
+fn get_uid_from_body(body: &Bytes) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json.get("user").cloned())
+        .and_then(|uid| uid.as_str().map(String::from))
+        .unwrap_or_else(|| "default_uid".to_string())
+}
+
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Self {
         match policy_config {
@@ -140,6 +156,8 @@ impl Router {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                enable_fairness,
+                fairness_fill_size,
             } => {
                 let mut running_queue = HashMap::new();
                 for url in &worker_urls {
@@ -182,6 +200,8 @@ impl Router {
                     tree.lock().unwrap().insert(&"".to_string(), url);
                 }
 
+                let fairness_counter = Arc::new(Mutex::new(HashMap::new()));
+
                 Router::CacheAware {
                     worker_urls,
                     tree,
@@ -190,6 +210,9 @@ impl Router {
                     cache_threshold,
                     balance_abs_threshold,
                     balance_rel_threshold,
+                    fairness_counter,
+                    enable_fairness,
+                    fairness_fill_size,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -246,11 +269,12 @@ impl Router {
                 cache_threshold,
                 balance_abs_threshold,
                 balance_rel_threshold,
+                fairness_counter,
+                fairness_fill_size,
+                enable_fairness,
                 ..
             } => {
-                // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
-
-                let tree = tree.lock().unwrap();
+                let mut tree = tree.lock().unwrap();
                 let mut running_queue = running_queue.lock().unwrap();
 
                 // Get current load statistics
@@ -263,32 +287,136 @@ impl Router {
                 let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
                     && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
 
-                let selected_url = if is_imbalanced {
-                    // Log load balancing trigger and current queue state
-                    info!(
-                        "Load balancing triggered due to workload imbalance:\n\
-                        Max load: {}, Min load: {}\n\
-                        Current running queue: {:?}",
-                        max_load, min_load, running_queue
-                    );
 
-                    // Use shortest queue routing when load is imbalanced
-                    running_queue
-                        .iter()
-                        .min_by_key(|(_url, &count)| count)
-                        .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls[0].clone())
-                } else {
-                    // Use cache-aware routing when load is balanced
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
-                    let matched_rate =
-                        matched_text.chars().count() as f32 / text.chars().count() as f32;
 
-                    if matched_rate > *cache_threshold {
-                        matched_worker.to_string()
-                    } else {
-                        tree.get_smallest_tenant()
+                let selected_url = if *enable_fairness {
+
+                    let user_id = get_uid_from_body(&body);
+
+                    let mut fairness_counter = fairness_counter.lock().unwrap();
+            
+                    // Initialize counter for new user
+                    if !fairness_counter.contains_key(&user_id) {
+                        let mut worker_counters = HashMap::new();
+                        for worker_url in worker_urls.iter() {
+                            worker_counters.insert(worker_url.clone(), *fairness_fill_size as i32);
+                        }
+                        fairness_counter.insert(user_id.to_string(), worker_counters.clone());
+                        
+                        println!(
+                            "[FAIRNESS] New user initialized. user_id: {}, initial_counters: {:?}",
+                            user_id, worker_counters
+                        );
                     }
+            
+                    let mut prefix_map: HashMap<String, String> = HashMap::new();
+                    for worker_url in worker_urls.iter() {
+                        let prefix = tree.prefix_match_tenant(&text, worker_url);
+                        prefix_map.insert(worker_url.clone(), prefix);
+                    }
+            
+                    let mut sorted_workers: Vec<_> = prefix_map.into_iter().collect();
+                    sorted_workers.sort_by(|(_url1, prefix1), (_url2, prefix2)| {
+                        prefix2.len().cmp(&prefix1.len())
+                    });
+            
+                    let mut selected = None;
+            
+                    loop {
+                        // Try to find worker with highest prefix match with available counters
+                        for (worker_url, prefix) in &sorted_workers {
+                            if let Some(worker_counters) = fairness_counter.get_mut(&user_id) {
+                                if let Some(&count) = worker_counters.get(worker_url) {
+                                    let deduction = text.chars().count();
+                                    if count > 0 {
+                                        selected = Some(worker_url.clone());
+                                        let new_count = count.saturating_sub(deduction as i32);
+                                        worker_counters.insert(worker_url.clone(), new_count);
+                                        
+                                        println!(
+                                            "[FAIRNESS] Worker selected. user_id: {}, worker: {}, prefix_len: {}, prev_count: {}, deduction: {}, new_count: {}",
+                                            user_id, worker_url, prefix.len(), count, deduction, new_count
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+            
+                        // Refill counters if no available worker found
+                        if selected.is_none() {
+                            if let Some(worker_counters) = fairness_counter.get_mut(&user_id) {
+                                println!(
+                                    "[FAIRNESS] Refilling counters. user_id: {}, previous_counters: {:?}",
+                                    user_id, worker_counters
+                                );
+                                
+                                for worker_url in worker_urls.iter() {
+                                    if let Some(&count) = worker_counters.get(worker_url) {
+                                        let new_count = count + *fairness_fill_size as i32;
+                                        worker_counters.insert(worker_url.clone(), new_count);
+                                        
+                                        println!(
+                                            "[FAIRNESS] Worker refilled. user_id: {}, worker: {}, prev_count: {}, fill_size: {}, new_count: {}",
+                                            user_id, worker_url, count, fairness_fill_size, new_count
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+            
+                    let selected_worker = selected.unwrap_or_else(|| {
+                        println!(
+                            "[FAIRNESS] WARNING: Fallback to default worker. user_id: {}, worker: {}",
+                            user_id, &worker_urls[0]
+                        );
+                        worker_urls[0].clone()
+                    });
+            
+                    // Log final counter state
+                    if let Some(worker_counters) = fairness_counter.get(&user_id) {
+                        println!(
+                            "[FAIRNESS] Request complete. user_id: {}, selected_worker: {}, final_counters: {:?}",
+                            user_id, selected_worker, worker_counters
+                        );
+                    }
+            
+                    selected_worker
+                } else {
+
+                    let selected_url = if is_imbalanced {
+                        // Log load balancing trigger and current queue state
+                        info!(
+                            "Load balancing triggered due to workload imbalance:\n\
+                            Max load: {}, Min load: {}\n\
+                            Current running queue: {:?}",
+                            max_load, min_load, running_queue
+                        );
+    
+                        // Use shortest queue routing when load is imbalanced
+                        running_queue
+                            .iter()
+                            .min_by_key(|(_url, &count)| count)
+                            .map(|(url, _)| url.clone())
+                            .unwrap_or_else(|| worker_urls[0].clone())
+                    } else {
+                        // Use cache-aware routing when load is balanced
+                        let (matched_text, matched_worker) = tree.prefix_match(&text);
+                        let matched_rate =
+                            matched_text.chars().count() as f32 / text.chars().count() as f32;
+    
+                        if matched_rate > *cache_threshold {
+                            matched_worker.to_string()
+                        } else {
+                            tree.get_smallest_tenant()
+                        }
+                    };
+
+
+                    selected_url
                 };
 
                 // Update queues and tree

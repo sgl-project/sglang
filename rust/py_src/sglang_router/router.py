@@ -28,6 +28,10 @@ class Router:
             routing. Default: 60
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         verbose: Enable verbose logging. Default: False
+        enable_fairness: Enable token-based fairness control for request distribution. Only used
+            with CacheAware policy. Default: False
+        fairness_fill_size: Initial/Refill token allocation size for fairness control when fairness is enabled.
+            Only used when enable_fairness is True. Default: 1024
     """
 
     def __init__(
@@ -42,6 +46,8 @@ class Router:
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
         verbose: bool = False,
+        enable_fairness: bool = False,
+        fairness_fill_size: int = 1024,
     ):
         self._router = _Router(
             worker_urls=worker_urls,
@@ -54,6 +60,8 @@ class Router:
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
             verbose=verbose,
+            enable_fairness=enable_fairness,
+            fairness_fill_size=fairness_fill_size,
         )
 
     def start(self) -> None:
