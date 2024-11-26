@@ -262,8 +262,9 @@ class ModelRunner:
 
     def get_model_config_params(self):
         sig = inspect.signature(VllmModelConfig.__init__)
+        model = self.server_args.gguf_file if self.server_args.load_format == "gguf" else self.server_args.model_path
         params = {
-            "model": self.server_args.model_path,
+            "model": model,
             "quantization": self.server_args.quantization,
             "tokenizer": None,
             "tokenizer_mode": None,
@@ -293,7 +294,6 @@ class ModelRunner:
                 self.server_args.dtype = "float16"
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
-
         # Prepare the vllm model config
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,

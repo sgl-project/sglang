@@ -255,6 +255,7 @@ class LlamaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -302,7 +303,7 @@ class LlamaForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.torchao_config = global_server_args_dict["torchao_config"]
         self.model = LlamaModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 

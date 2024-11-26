@@ -16,6 +16,7 @@
 import contextlib
 import os
 import warnings
+from pathlib import Path
 from typing import Dict, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
@@ -27,6 +28,9 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
+from sglang.srt.utils import get_gguf_file_if_exist
 
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
@@ -60,15 +64,29 @@ def get_config(
     trust_remote_code: bool,
     revision: Optional[str] = None,
     model_override_args: Optional[dict] = None,
+    **kwargs,
 ):
+    gguf_file = get_gguf_file_if_exist(model)
+    if gguf_file is not None:
+        kwargs["gguf_file"] = gguf_file
+
     config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision
+        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
     if model_override_args:
         config.update(model_override_args)
+
+    # Special architecture mapping check for GGUF models
+    if gguf_file is not None:
+        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+            raise RuntimeError(
+                f"Can't get gguf config for {config.model_type}.")
+        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+        config.update({"architectures": [model_type]})
+
     return config
 
 
@@ -108,7 +126,6 @@ def get_context_length(config):
 # A fast LLaMA tokenizer with the pre-processed `tokenizer.json` file.
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
-
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -122,6 +139,10 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+
+    gguf_file = get_gguf_file_if_exist(tokenizer_name)
+    if gguf_file is not None:
+        kwargs["gguf_file"] = gguf_file
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(

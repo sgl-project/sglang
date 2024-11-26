@@ -22,6 +22,7 @@ from typing import List, Optional
 
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
+    get_gguf_file_if_exist,
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
@@ -136,6 +137,9 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
 
+    # GGUF
+    gguf_file: Optional[str] = None
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -204,6 +208,13 @@ class ServerArgs:
                 "Overlap schedule is disabled."
             )
 
+        # GGUF
+        if self.load_format == "auto" or self.load_format == "gguf":
+            self.gguf_file = get_gguf_file_if_exist(self.model_path)
+            if self.gguf_file is not None:
+                self.quantization = self.load_format = "gguf"
+
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
@@ -243,7 +254,7 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy"],
+            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -253,7 +264,8 @@ class ServerArgs:
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling.",
+            "which is mainly for profiling."
+            '"gguf" will load the weights in the gguf format. ',
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -293,6 +305,7 @@ class ServerArgs:
                 "gptq_marlin",
                 "awq_marlin",
                 "bitsandbytes",
+                "gguf",
             ],
             help="The quantization method.",
         )

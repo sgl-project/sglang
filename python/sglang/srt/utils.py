@@ -32,6 +32,7 @@ import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
