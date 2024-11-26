@@ -526,7 +526,7 @@ class Scheduler:
         recv_req: TokenizedGenerateReqInput,
     ):
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
-            # Check if input_embeds is present and create dummy input_ids
+            # Create a new request
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -542,6 +542,7 @@ class Scheduler:
                 input_embeds=recv_req.input_embeds,
             )
             req.tokenizer = self.tokenizer
+
             if recv_req.session_id is not None:
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_id} does not exist"
@@ -549,7 +550,7 @@ class Scheduler:
                 self.waiting_queue.append(req)
                 return
         else:
-            # Handle sessions
+            # Create a new request from a previsou session
             session = self.sessions[recv_req.session_id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
