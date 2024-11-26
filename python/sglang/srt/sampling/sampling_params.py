@@ -28,6 +28,7 @@ class SamplingParams:
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,
+        top_n_sigma: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
@@ -44,6 +45,7 @@ class SamplingParams:
         self.top_p = top_p
         self.top_k = top_k
         self.min_p = min_p
+        self.top_n_sigma = top_n_sigma
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
@@ -78,6 +80,8 @@ class SamplingParams:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
+        if self.top_n_sigma < 0.0:
+            raise ValueError(f"top_n_sigma must be non-negative, got {self.top_n_sigma}.")
         if self.top_k < -1 or self.top_k == 0:
             raise ValueError(
                 f"top_k must be -1 (disable), or at least 1, " f"got {self.top_k}."

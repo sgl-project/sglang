@@ -272,6 +272,8 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     temperature: float = 0.7
     top_p: float = 1.0
+    top_k: int = -1
+    top_n_sigma: float = 0.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -282,6 +284,7 @@ class ChatCompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    min_p: float = 0.0
 
 
 class ChatMessage(BaseModel):
