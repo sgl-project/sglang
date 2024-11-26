@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
@@ -25,7 +23,7 @@ from http import HTTPStatus
 from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 try:
@@ -71,6 +69,7 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +100,7 @@ def create_error_response(
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ):
     error = ErrorResponse(message=message, type=err_type, code=status_code.value)
-    return JSONResponse(content=error.model_dump(), status_code=error.code)
+    return ORJSONResponse(content=error.model_dump(), status_code=error.code)
 
 
 def create_streaming_error_response(
@@ -117,7 +116,9 @@ def create_streaming_error_response(
 def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
     global chat_template_name
 
-    logger.info(f"Use chat template: {chat_template_arg}")
+    logger.info(
+        f"Use chat template for the OpenAI-compatible API server: {chat_template_arg}"
+    )
     if not chat_template_exists(chat_template_arg):
         if not os.path.exists(chat_template_arg):
             raise RuntimeError(
@@ -300,13 +301,20 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             if not isinstance(ret, list):
                 ret = [ret]
             if end_point == "/v1/chat/completions":
-                responses = v1_chat_generate_response(request, ret, to_file=True)
+                responses = v1_chat_generate_response(
+                    request,
+                    ret,
+                    to_file=True,
+                    cache_report=tokenizer_manager.server_args.enable_cache_report,
+                )
             else:
                 responses = v1_generate_response(
                     request, ret, tokenizer_manager, to_file=True
                 )
 
         except Exception as e:
+            logger.error(f"error: {get_exception_traceback()}")
+            responses = []
             error_json = {
                 "id": f"batch_req_{uuid.uuid4()}",
                 "custom_id": request_data.get("custom_id"),
@@ -356,7 +364,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
         }
 
     except Exception as e:
-        logger.error("error in SGLang:", e)
+        logger.error(f"error: {e}")
         # Update batch status to "failed"
         retrieve_batch = batch_storage[batch_id]
         retrieve_batch.status = "failed"
@@ -462,35 +470,36 @@ async def v1_retrieve_file_content(file_id: str):
 def v1_generate_request(
     all_requests: List[CompletionRequest], request_ids: List[str] = None
 ):
+    if len(all_requests) > 1:
+        first_prompt_type = type(all_requests[0].prompt)
+        for request in all_requests:
+            assert (
+                type(request.prompt) is first_prompt_type
+            ), "All prompts must be of the same type in file input settings"
+            if request.n > 1:
+                raise ValueError(
+                    "Parallel sampling is not supported for completions from files"
+                )
+
     prompts = []
     sampling_params_list = []
     return_logprobs = []
     logprob_start_lens = []
     top_logprobs_nums = []
 
-    # NOTE: with openai API, the prompt's logprobs are always not computed
-    first_prompt_type = type(all_requests[0].prompt)
     for request in all_requests:
-        assert (
-            type(request.prompt) is first_prompt_type
-        ), "All prompts must be of the same type in file input settings"
-        if len(all_requests) > 1 and request.n > 1:
-            raise ValueError(
-                "Parallel sampling is not supported for completions from files"
-            )
+        # NOTE: with openai API, the prompt's logprobs are always not computed
         if request.echo and request.logprobs:
             logger.warning(
                 "Echo is not compatible with logprobs. "
-                "To compute logprobs of input prompt, please use SGLang /request API."
+                "To compute logprobs of input prompt, please use the native /generate API."
             )
 
-    for request in all_requests:
         prompts.append(request.prompt)
-        return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
-        logprob_start_lens.append(-1)
-        top_logprobs_nums.append(
-            request.logprobs if request.logprobs is not None else 0
-        )
+        if request.echo and request.logprobs:
+            current_logprob_start_len = 0
+        else:
+            current_logprob_start_len = -1
         sampling_params_list.append(
             {
                 "temperature": request.temperature,
@@ -505,22 +514,28 @@ def v1_generate_request(
                 "regex": request.regex,
                 "json_schema": request.json_schema,
                 "n": request.n,
+                "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
+                "skip_special_tokens": request.skip_special_tokens,
             }
+        )
+        return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
+        logprob_start_lens.append(current_logprob_start_len)
+        top_logprobs_nums.append(
+            request.logprobs if request.logprobs is not None else 0
         )
 
     if len(all_requests) == 1:
-        prompt = prompts[0]
-        sampling_params_list = sampling_params_list[0]
-        logprob_start_lens = logprob_start_lens[0]
-        return_logprobs = return_logprobs[0]
-        top_logprobs_nums = top_logprobs_nums[0]
-        if isinstance(prompt, str) or isinstance(prompt[0], str):
-            prompt_kwargs = {"text": prompt}
+        if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
+            prompt_kwargs = {"text": prompts[0]}
         else:
-            prompt_kwargs = {"input_ids": prompt}
+            prompt_kwargs = {"input_ids": prompts[0]}
+        sampling_params_list = sampling_params_list[0]
+        return_logprobs = return_logprobs[0]
+        logprob_start_lens = logprob_start_lens[0]
+        top_logprobs_nums = top_logprobs_nums[0]
     else:
-        if isinstance(prompts[0], str):
+        if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}
@@ -536,9 +551,7 @@ def v1_generate_request(
         rid=request_ids,
     )
 
-    if len(all_requests) == 1:
-        return adapted_request, all_requests[0]
-    return adapted_request, all_requests
+    return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
 def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
@@ -573,7 +586,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
         if isinstance(request, list) and request[idx].echo:
             echo = True
             text = request[idx].prompt + text
-        if (not isinstance(request, list)) and echo:
+        if echo and not isinstance(request, list):
             prompt_index = idx // request.n
             text = prompts[prompt_index] + text
 
@@ -599,16 +612,19 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
         else:
             logprobs = None
 
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+
         if to_file:
             # to make the choise data json serializable
             choice_data = {
                 "index": 0,
                 "text": text,
                 "logprobs": logprobs,
-                "finish_reason": (
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                "finish_reason": (finish_reason["type"] if finish_reason else ""),
+                "matched_stop": (
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             }
         else:
@@ -616,10 +632,11 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 index=idx,
                 text=text,
                 logprobs=logprobs,
-                finish_reason=(
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                finish_reason=(finish_reason["type"] if finish_reason else ""),
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             )
 
@@ -683,7 +700,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ):
-                    index = content["index"]
+                    index = content.get("index", 0)
 
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
@@ -749,14 +766,16 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
                     delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
+                    finish_reason = content["meta_info"]["finish_reason"]
                     choice_data = CompletionResponseStreamChoice(
                         index=index,
                         text=delta,
                         logprobs=logprobs,
-                        finish_reason=(
-                            content["meta_info"]["finish_reason"]["type"]
-                            if content["meta_info"]["finish_reason"]
-                            else ""
+                        finish_reason=(finish_reason["type"] if finish_reason else ""),
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if finish_reason and "matched" in finish_reason
+                            else None
                         ),
                     )
                     chunk = CompletionStreamResponse(
@@ -908,6 +927,9 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "no_stop_trim": request.no_stop_trim,
+            "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
@@ -916,19 +938,18 @@ def v1_chat_generate_request(
         sampling_params_list.append(sampling_params)
 
         image_data_list.append(image_data)
-        modalities_list.extend(modalities)
+        modalities_list.append(modalities)
     if len(all_requests) == 1:
-        input_ids = input_ids[0]
-        if isinstance(input_ids, str):
-            prompt_kwargs = {"text": input_ids}
+        if isinstance(input_ids[0], str):
+            prompt_kwargs = {"text": input_ids[0]}
         else:
-            prompt_kwargs = {"input_ids": input_ids}
+            prompt_kwargs = {"input_ids": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
-        image_data = image_data_list[0]
+        image_data_list = image_data_list[0]
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
-        modalities_list = modalities_list[:1]
+        modalities_list = modalities_list[0]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -937,7 +958,7 @@ def v1_chat_generate_request(
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
-        image_data=image_data,
+        image_data=image_data_list,
         sampling_params=sampling_params_list,
         return_logprob=return_logprobs,
         logprob_start_len=logprob_start_lens,
@@ -947,12 +968,11 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
     )
-    if len(all_requests) == 1:
-        return adapted_request, all_requests[0]
-    return adapted_request, all_requests
+
+    return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
-def v1_chat_generate_response(request, ret, to_file=False):
+def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
     choices = []
 
     for idx, ret_item in enumerate(ret):
@@ -967,11 +987,15 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
             )
             token_logprobs = []
-            for token, logprob in zip(logprobs.tokens, logprobs.token_logprobs):
+            for token_idx, (token, logprob) in enumerate(
+                zip(logprobs.tokens, logprobs.token_logprobs)
+            ):
                 token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
                 if logprobs.top_logprobs:
-                    for top_token, top_logprob in logprobs.top_logprobs[0].items():
+                    for top_token, top_logprob in logprobs.top_logprobs[
+                        token_idx
+                    ].items():
                         top_token_bytes = list(top_token.encode("utf-8"))
                         top_logprobs.append(
                             TopLogprob(
@@ -993,16 +1017,19 @@ def v1_chat_generate_response(request, ret, to_file=False):
         else:
             choice_logprobs = None
 
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
                 "index": 0,
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": choice_logprobs,
-                "finish_reason": (
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                "finish_reason": (finish_reason["type"] if finish_reason else ""),
+                "matched_stop": (
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             }
         else:
@@ -1010,10 +1037,11 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 index=idx,
                 message=ChatMessage(role="assistant", content=ret_item["text"]),
                 logprobs=choice_logprobs,
-                finish_reason=(
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                finish_reason=(finish_reason["type"] if finish_reason else ""),
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             )
 
@@ -1049,6 +1077,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
             ret[i]["meta_info"]["prompt_tokens"] for i in range(0, len(ret), request.n)
         )
         completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
+        cached_tokens = sum(item["meta_info"].get("cached_tokens", 0) for item in ret)
         response = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
@@ -1057,6 +1086,9 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=(
+                    {"cached_tokens": cached_tokens} if cache_report else None
+                ),
             ),
         )
         return response
@@ -1079,7 +1111,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ):
-                    index = content["index"]
+                    index = content.get("index", 0)
 
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
@@ -1132,16 +1164,21 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     else:
                         choice_logprobs = None
 
+                    finish_reason = content["meta_info"]["finish_reason"]
+
                     if is_first:
                         # First chunk with role
                         is_first = False
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant"),
+                            delta=DeltaMessage(role="assistant", content=""),
                             finish_reason=(
-                                content["meta_info"]["finish_reason"]["type"]
-                                if content["meta_info"]["finish_reason"]
-                                else ""
+                                finish_reason["type"] if finish_reason else ""
+                            ),
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
                             ),
                             logprobs=choice_logprobs,
                         )
@@ -1158,10 +1195,11 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
                         delta=DeltaMessage(content=delta),
-                        finish_reason=(
-                            content["meta_info"]["finish_reason"]["type"]
-                            if content["meta_info"]["finish_reason"]
-                            else ""
+                        finish_reason=(finish_reason["type"] if finish_reason else ""),
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if finish_reason and "matched" in finish_reason
+                            else None
                         ),
                         logprobs=choice_logprobs,
                     )
@@ -1222,7 +1260,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_chat_generate_response(request, ret)
+    response = v1_chat_generate_response(
+        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
+    )
 
     return response
 
@@ -1246,7 +1286,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
-        if isinstance(prompts[0], str) or isinstance(propmt[0][0], str):
+        if isinstance(prompts[0], str) or isinstance(propmts[0][0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}

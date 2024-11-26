@@ -20,10 +20,10 @@ jobs:
           github-token: ${{secrets.GITHUB_TOKEN}}
           script: |
             const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
-            
+
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
             console.log(`Owner: ${owner}, Repo: ${repo}`);
-            
+
             async function fetchIssues(page = 1) {
               console.log(`Fetching issues for ${owner}/${repo}, page ${page}`);
               return await github.rest.issues.listForRepo({
@@ -36,23 +36,23 @@ jobs:
                 page: page
               });
             }
-            
+
             async function processIssues() {
               console.log('Starting to process issues');
               console.log(`Repository: ${owner}/${repo}`);
-              
+
               let page = 1;
               let hasMoreIssues = true;
               while (hasMoreIssues) {
                 try {
                   const issues = await fetchIssues(page);
                   console.log(`Fetched ${issues.data.length} issues on page ${page}`);
-                  
+
                   if (issues.data.length === 0) {
                     hasMoreIssues = false;
                     break;
                   }
-                  
+
                   for (const issue of issues.data) {
                     if (new Date(issue.updated_at) < sixtyDaysAgo) {
                       try {
@@ -87,5 +87,5 @@ jobs:
               }
               console.log('Finished processing issues');
             }
-            
+
             await processIssues();

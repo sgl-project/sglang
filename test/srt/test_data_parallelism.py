@@ -1,5 +1,8 @@
+import time
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
@@ -25,7 +28,7 @@ class TestDataParallelism(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -37,7 +40,37 @@ class TestDataParallelism(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        self.assertGreaterEqual(metrics["score"], 0.65)
+
+    def test_update_weight(self):
+        response = requests.post(
+            self.base_url + "/update_weights",
+            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+        )
+
+        # check if the response is 200
+        assert response.status_code == 200
+
+        # pause a few seconds then send again
+        time.sleep(5)
+
+        response = requests.post(
+            self.base_url + "/update_weights",
+            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+        )
+
+        # check if the response is 200
+        assert response.status_code == 200
+
+    def test_get_memory_pool_size(self):
+        # use `get_server_info` instead since `get_memory_pool_size` is merged into `get_server_info`
+        response = requests.get(self.base_url + "/get_server_info")
+        assert response.status_code == 200
+
+        time.sleep(5)
+
+        response = requests.get(self.base_url + "/get_server_info")
+        assert response.status_code == 200
 
 
 if __name__ == "__main__":

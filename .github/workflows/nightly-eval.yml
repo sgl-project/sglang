@@ -24,12 +24,17 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
+          pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
 
-      - name: Nightly gsm8k Accuracy
-        timeout-minutes: 60
+      - name: Test gsm8k
+        timeout-minutes: 120
         run: |
           cd test/srt
           python3 test_nightly_gsm8k_eval.py
+
+      - name: Test human eval
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 test_nightly_human_eval.py

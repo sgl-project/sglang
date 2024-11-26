@@ -208,7 +208,7 @@ if __name__ == "__main__":
         model_override_args["image_token_index"] = 64002
 
     if args.num_frames == 32:
-        model_override_args["rope_scaling"] = {"factor": 2.0, "type": "linear"}
+        model_override_args["rope_scaling"] = {"factor": 2.0, "rope_type": "linear"}
         model_override_args["max_sequence_length"] = 4096 * 2
         model_override_args["tokenizer_model_max_length"] = 4096 * 2
     elif args.num_frames < 32:
@@ -223,7 +223,6 @@ if __name__ == "__main__":
         model_path=args.model_path,  # "liuhaotian/llava-v1.6-vicuna-7b",
         tokenizer_path=tokenizer_path,
         port=cur_port,
-        additional_ports=[cur_port + 1, cur_port + 2, cur_port + 3, cur_port + 4],
         json_model_override_args=json.dumps(model_override_args),
         tp_size=1,
     )

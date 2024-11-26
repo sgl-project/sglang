@@ -1,27 +1,23 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
-from vllm.config import CacheConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -33,7 +29,7 @@ class LlamaForSequenceClassification(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -53,24 +49,20 @@ class LlamaForSequenceClassification(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        scores = self.score(hidden_states)
+        assert (
+            get_embedding
+        ), "LlamaForSequenceClassification is only used for embedding"
 
-        return self.pooler(scores, forward_batch)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
+        scores = self.score(last_token_hidden)
+
+        return EmbeddingPoolerOutput(scores)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if "classification_head" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            elif "lm_head" in name:
-                continue
-            else:
-                LlamaForCausalLM.load_weights(self, [(name, loaded_weight)])
+        return LlamaForCausalLM.load_weights(self, weights)
 
 
 class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassification):
@@ -92,7 +84,7 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__(config, quant_config, cache_config)
         self.weights = self.Weights(config.hidden_size, self.num_labels)
@@ -123,17 +115,7 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
         return EmbeddingPoolerOutput(scores)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if "classification_head" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            elif "lm_head" in name:
-                continue
-            else:
-                LlamaForCausalLM.load_weights(self, [(name, loaded_weight)])
+        return super().load_weights(weights)
 
 
 EntryClass = [

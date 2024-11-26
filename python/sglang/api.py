@@ -33,11 +33,21 @@ def function(
 
 
 def Runtime(*args, **kwargs):
-    # Avoid importing unnecessary dependency
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+    # Avoid importing unnecessary dependency
     from sglang.srt.server import Runtime
 
     return Runtime(*args, **kwargs)
+
+
+def Engine(*args, **kwargs):
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+    # Avoid importing unnecessary dependency
+    from sglang.srt.server import Engine
+
+    return Engine(*args, **kwargs)
 
 
 def set_default_backend(backend: BaseBackend):
@@ -48,19 +58,28 @@ def flush_cache(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return False
+
+    # If backend is Runtime
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
     return backend.flush_cache()
 
 
-def get_server_args(backend: Optional[BaseBackend] = None):
+def get_server_info(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return None
-    return backend.get_server_args()
+
+    # If backend is Runtime
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
+    return backend.get_server_info()
 
 
 def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    min_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
@@ -80,7 +99,7 @@ def gen(
     regex: Optional[str] = None,
     json_schema: Optional[str] = None,
 ):
-    """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
+    """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
 
     if choices:
         return SglSelect(
@@ -100,6 +119,7 @@ def gen(
     return SglGen(
         name,
         max_tokens,
+        min_tokens,
         stop,
         stop_token_ids,
         temperature,
@@ -139,6 +159,7 @@ def gen_int(
     return SglGen(
         name,
         max_tokens,
+        None,
         stop,
         stop_token_ids,
         temperature,
@@ -177,6 +198,7 @@ def gen_string(
     return SglGen(
         name,
         max_tokens,
+        None,
         stop,
         stop_token_ids,
         temperature,

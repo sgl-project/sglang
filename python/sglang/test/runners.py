@@ -1,17 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 import json
 import multiprocessing as mp
@@ -58,6 +57,28 @@ def get_top_logprobs(logits, k):
     return logprobs
 
 
+def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import is_sentence_transformer_model
+
+    if is_sentence_transformer_model(model_path):
+        model = SentenceTransformer(
+            model_path,
+            model_kwargs={"torch_dtype": torch_dtype},
+        )
+    else:  # if no pre-trained sentence-transformers model
+        from sentence_transformers import models
+
+        word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        pooling_model = models.Pooling(
+            word_embedding_model.get_word_embedding_dimension(),
+            pooling_mode="lasttoken",
+        )
+        model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+
+    return model.cuda()
+
+
 @dataclass
 class ModelOutput:
     output_strs: List[str] = None
@@ -102,8 +123,10 @@ class HFRunner:
         return False
 
     def start_model_process(self, in_queue, out_queue, model_path, torch_dtype):
-        self.tokenizer = get_tokenizer(model_path, torch_dtype=torch.dtype)
+        # Apply model-specific patches
+        monkey_patch_gemma2_sdpa()
 
+        # Load the model and tokenizer
         if self.model_type == "generation":
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_path,
@@ -112,12 +135,9 @@ class HFRunner:
                 low_cpu_mem_usage=True,
             ).cuda()
         elif self.model_type == "embedding":
-            from sentence_transformers import SentenceTransformer
-
-            self.model = SentenceTransformer(
-                model_path,
-                model_kwargs={"torch_dtype": torch_dtype},
-            ).cuda()
+            self.model = _get_sentence_transformer_embedding_model(
+                model_path, torch_dtype
+            )
         elif self.model_type == "reward":
             from transformers import AutoModelForSequenceClassification
 
@@ -128,7 +148,9 @@ class HFRunner:
             ).cuda()
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
+        self.tokenizer = get_tokenizer(model_path, torch_dtype=torch.dtype)
 
+        # Run forward
         while True:
             prompts, max_new_tokens, lora_paths = in_queue.get()
             if lora_paths is not None:
@@ -269,6 +291,7 @@ class SRTRunner:
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
         )
+        self.tokenizer = get_tokenizer(model_path)
 
     def forward(
         self,
@@ -362,7 +385,7 @@ class SRTRunner:
                 return ModelOutput(embed_logits=logits)
             else:
                 scores = [x["embedding"][0] for x in response]
-                return ModelOutput(scores=logits)
+                return ModelOutput(scores=scores)
 
     def __enter__(self):
         return self
@@ -370,3 +393,18 @@ class SRTRunner:
     def __exit__(self, exc_type, exc_value, traceback):
         self.runtime.shutdown()
         del self.runtime
+
+
+def monkey_patch_gemma2_sdpa():
+    """
+    Use sdpa by default to fix the OOM issue.
+    Revert this commit:
+    https://github.com/huggingface/transformers/commit/975b988bfe6e7ebb47390cd9a1556c6888804883#diff-5f76eac6f18f4b491521314c318a9692318feb4d19228e9576cce7bde4240834R660
+    """
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2PreTrainedModel
+
+    def _check_and_enable_sdpa(config, hard_check_only: bool = False):
+        config._attn_implementation = "sdpa"
+        return config
+
+    setattr(Gemma2PreTrainedModel, "_check_and_enable_sdpa", _check_and_enable_sdpa)

@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 Memory-efficient attention for prefill.
 It supporst page size = 1.
@@ -24,7 +22,9 @@ import torch
 import triton
 import triton.language as tl
 
-CUDA_CAPABILITY = torch.cuda.get_device_capability()
+is_cuda_available = torch.cuda.is_available()
+if is_cuda_available:
+    CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
 @triton.jit
@@ -48,6 +48,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     Lk: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
@@ -76,7 +77,9 @@ def _fwd_kernel(
     mask_d = offs_d < Lk
 
     q = tl.load(
-        Q + off_q, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d), other=0.0
+        Q + off_q,
+        mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :]),
+        other=0.0,
     )
 
     k_ptrs = K + off_k
@@ -89,7 +92,12 @@ def _fwd_kernel(
 
     block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
 
-    for start_n in range(0, block_mask * (start_m + 1) * BLOCK_M, BLOCK_N):
+    end_n = (
+        cur_batch_seq_len
+        if not IS_CAUSAL
+        else tl.minimum((start_m + 1) * BLOCK_M, cur_batch_seq_len)
+    )
+    for start_n in range(0, block_mask * end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = tl.load(
@@ -102,7 +110,18 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         qk *= sm_scale
-        qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+
+        if IS_CAUSAL:
+            qk += tl.where(
+                (start_n + offs_n[None, :] < cur_batch_seq_len)
+                & (offs_m[:, None] >= (start_n + offs_n[None, :])),
+                0,
+                float("-inf"),
+            )
+        else:
+            qk += tl.where(
+                (start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf")
+            )
 
         # -- compute m_ij, p, l_ij
         m_ij = tl.max(qk, 1)
@@ -144,8 +163,10 @@ def _fwd_kernel(
     )
 
 
-def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
-    if CUDA_CAPABILITY[0] >= 8:
+def context_attention_fwd(
+    q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True
+):
+    if is_cuda_available and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
     else:
         BLOCK = 64
@@ -179,6 +200,7 @@ def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
         BLOCK_M=BLOCK,
         BLOCK_DMODEL=triton.next_power_of_2(Lk),
         BLOCK_N=BLOCK,
+        IS_CAUSAL=is_causal,
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,

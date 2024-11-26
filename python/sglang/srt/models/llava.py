@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Inference-only LLaVa model compatible with HuggingFace weights."""
 
 import math
@@ -31,7 +29,6 @@ from transformers import (
     SiglipVisionModel,
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.config import CacheConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -160,9 +157,6 @@ class LlavaBaseForCausalLM(nn.Module):
                 ]
                 image_sizes = [
                     image_inputs[i].image_sizes for i in range(bs) if need_vision[i]
-                ]
-                image_offsets = [
-                    image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
                 ]
 
                 ########## Encode Image ########
@@ -349,7 +343,7 @@ class LlavaBaseForCausalLM(nn.Module):
 
                 # Fill in the placeholder for the image
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-                prefix_lens_cpu = forward_batch.extend_prefix_lens.cpu().numpy()
+                prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
@@ -359,7 +353,7 @@ class LlavaBaseForCausalLM(nn.Module):
                     prefix_len = prefix_lens_cpu[i]
 
                     # Multiple images
-                    for j, image_offset in enumerate(image_offsets[i]):
+                    for j, image_offset in enumerate(image_inputs[i].image_offsets):
                         if image_offset < prefix_len:
                             continue
 
@@ -450,7 +444,7 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -472,7 +466,7 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -505,7 +499,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 

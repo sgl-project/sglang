@@ -25,7 +25,7 @@ class TestMLA(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -37,7 +37,7 @@ class TestMLA(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.5
+        self.assertGreater(metrics["score"], 0.5)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -49,7 +49,7 @@ class TestMLA(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.8
+        self.assertGreater(metrics["score"], 0.8)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ REGEX_STR = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 @dataclasses.dataclass
 class SglSamplingParams:
     max_new_tokens: int = 128
+    min_new_tokens: int = 0
     stop: Union[str, List[str]] = ()
     stop_token_ids: Optional[List[int]] = ()
     temperature: float = 1.0
@@ -39,6 +40,7 @@ class SglSamplingParams:
     def clone(self):
         return SglSamplingParams(
             self.max_new_tokens,
+            self.min_new_tokens,
             self.stop,
             self.stop_token_ids,
             self.temperature,
@@ -113,6 +115,7 @@ class SglSamplingParams:
     def to_srt_kwargs(self):
         return {
             "max_new_tokens": self.max_new_tokens,
+            "min_new_tokens": self.min_new_tokens,
             "stop": self.stop,
             "stop_token_ids": self.stop_token_ids,
             "temperature": self.temperature,
@@ -150,8 +153,8 @@ class SglFunction:
         self,
         *args,
         max_new_tokens: int = 128,
-        stop: Union[str, List[str]] = [],
-        stop_token_ids: Optional[List[int]] = [],
+        stop: Optional[Union[str, List[str]]] = None,
+        stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -165,9 +168,16 @@ class SglFunction:
         return_text_in_logprobs: Optional[bool] = None,
         stream: bool = False,
         backend=None,
+        use_thread: bool = True,
         **kwargs,
     ):
         from sglang.lang.interpreter import run_program
+
+        # avoid using [] as the default arg: https://nikos7am.com/posts/mutable-default-arguments/
+        if stop is None:
+            stop = []
+        if stop_token_ids is None:
+            stop_token_ids = []
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
@@ -186,15 +196,23 @@ class SglFunction:
             return_text_in_logprobs=return_text_in_logprobs,
         )
         backend = backend or global_config.default_backend
-        return run_program(self, backend, args, kwargs, default_sampling_para, stream)
+        return run_program(
+            self,
+            backend,
+            args,
+            kwargs,
+            default_sampling_para,
+            stream,
+            use_thread=use_thread,
+        )
 
     def run_batch(
         self,
         batch_kwargs,
         *,
         max_new_tokens: int = 128,
-        stop: Union[str, List[str]] = (),
-        stop_token_ids: Optional[List[int]] = [],
+        stop: Optional[Union[str, List[str]]] = None,
+        stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -211,6 +229,11 @@ class SglFunction:
         progress_bar: bool = False,
     ):
         from sglang.lang.interpreter import run_program_batch
+
+        if stop is None:
+            stop = []
+        if stop_token_ids is None:
+            stop_token_ids = []
 
         assert isinstance(batch_kwargs, (list, tuple))
         if len(batch_kwargs) == 0:
@@ -413,6 +436,7 @@ class SglGen(SglExpr):
         self,
         name: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
+        min_new_tokens: Optional[int] = None,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: Optional[float] = None,
@@ -430,11 +454,12 @@ class SglGen(SglExpr):
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
     ):
-        """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
+        """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
         super().__init__()
         self.name = name
         self.sampling_params = SglSamplingParams(
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             stop=stop,
             stop_token_ids=stop_token_ids,
             temperature=temperature,

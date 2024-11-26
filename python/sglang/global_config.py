@@ -14,12 +14,17 @@ class GlobalConfig:
         self.default_backend = None
 
         # Runtime constants: New generation token ratio estimation
-        self.init_new_token_ratio = 0.7
-        self.base_min_new_token_ratio = 0.1
-        self.new_token_ratio_decay = 0.001
+        self.default_init_new_token_ratio = float(
+            os.environ.get("SGLANG_INIT_NEW_TOKEN_RATIO", 0.7)
+        )
+        self.default_min_new_token_ratio_factor = float(
+            os.environ.get("SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR", 0.14)
+        )
+        self.default_new_token_ratio_decay_steps = float(
+            os.environ.get("SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS", 600)
+        )
 
         # Runtime constants: others
-        self.num_continue_decode_steps = 10
         self.retract_decode_steps = 20
         self.flashinfer_workspace_size = os.environ.get(
             "FLASHINFER_WORKSPACE_SIZE", 384 * 1024 * 1024

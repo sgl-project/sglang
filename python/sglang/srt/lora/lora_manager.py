@@ -1,22 +1,21 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 # Integrates "S-LoRA: Serving Thousands of Concurrent LoRA Adapters"
 # and "Punica: Multi-Tenant LoRA Serving"
 
-
+import logging
 import re
 
 import torch
@@ -24,11 +23,46 @@ import torch
 from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_hip, replace_submodule
+from sglang.srt.utils import is_flashinfer_available, replace_submodule
 
-# ROCm: flashinfer available later
-if not is_hip():
+logger = logging.getLogger(__name__)
+
+if is_flashinfer_available():
     from flashinfer import SegmentGEMMWrapper
+
+
+def get_module_name(name):
+    # Fallback solution of mapping from config module name to module name in model class.
+    # Please check if it aligns with your base model.
+    # Please implement the function in the model class if it is not.
+    # You can reference this function in llama.py.
+    params_mapping = {
+        "q_proj": "qkv_proj",
+        "k_proj": "qkv_proj",
+        "v_proj": "qkv_proj",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+    }
+    return params_mapping.get(name, name)
+
+
+def get_hidden_dim(module_name, config):
+    # Fallback solution of get_hidden_dim for different modules
+    # Please check if it aligns with your base model.
+    # Please implement the function in the model class if it is not.
+    # You can reference this function in llama.py.
+    if module_name in ["q_proj", "o_proj", "qkv_proj"]:
+        return config.hidden_size, config.hidden_size
+    elif module_name in ["kv_proj"]:
+        return config.hidden_size, config.hidden_size // (
+            config.num_attention_heads // config.num_key_value_heads
+        )
+    elif module_name == "gate_up_proj":
+        return config.hidden_size, config.intermediate_size
+    elif module_name == "down_proj":
+        return config.intermediate_size, config.hidden_size
+    else:
+        raise NotImplementedError()
 
 
 def get_stacked_name(name):
@@ -103,12 +137,20 @@ class LoRAManager:
             self.origin_target_modules = set(self.origin_target_modules) | set(
                 self.configs[name].target_modules
             )
-        self.target_modules = set(
-            [
+        if hasattr(self.base_model, "get_module_name"):
+            self.target_modules = {
                 self.base_model.get_module_name(module)
                 for module in self.origin_target_modules
-            ]
-        )
+            }
+        else:
+            logger.warning(
+                "WARNING: get_module_name() is not defined, "
+                "which is used to map config module name to model implementation module name."
+                "Use the default one, but please check if it is correct for your model."
+            )
+            self.target_modules = {
+                get_module_name(module) for module in self.origin_target_modules
+            }
         self.target_weights = set(
             [get_stacked_name(module) for module in self.origin_target_modules]
         )
@@ -146,7 +188,15 @@ class LoRAManager:
         num_layer = self.base_hf_config.num_hidden_layers
         for module_A, module_B in self.target_weights:
             # init A tensor, column_major=True
-            hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
+            if hasattr(self.base_model, "get_hidden_dim"):
+                hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
+            else:
+                logger.warning(
+                    "WARNING: get_hidden_dim() is not defined, "
+                    "which is used to get the hidden dim for different lora modules"
+                    "Use the default one, but please check if it is correct for your model."
+                )
+                hidden_dim_A, _ = get_hidden_dim(module_A, self.base_hf_config)
             c = self.loras[-1].get_stacked_multiply(module_A)
             if module_A not in self.A_buffer:
                 self.A_buffer[module_A] = [
@@ -162,7 +212,15 @@ class LoRAManager:
                     for i in range(num_layer)
                 ]
             # init B tensor, column_major=True
-            _, hidden_dim_B = self.base_model.get_hidden_dim(module_B)
+            if hasattr(self.base_model, "get_hidden_dim"):
+                _, hidden_dim_B = self.base_model.get_hidden_dim(module_B)
+            else:
+                logger.warning(
+                    "WARNING: get_hidden_dim() is not defined, "
+                    "which is used to get the hidden dim for different lora modules"
+                    "Use the default one, but please check if it is correct for your model."
+                )
+                _, hidden_dim_B = get_hidden_dim(module_B, self.base_hf_config)
             c = self.loras[-1].get_stacked_multiply(module_B)
             if module_B not in self.B_buffer:
                 self.B_buffer[module_B] = [
@@ -212,18 +270,24 @@ class LoRAManager:
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
         i = 0
+        j = len(self.active_uids)
         evictable_uids = list(self.active_uids)
         for uid in cur_uids:
             if uid not in self.active_uids:
-                while i < len(evictable_uids) and evictable_uids[i] in cur_uids:
-                    i += 1
-                if i < len(evictable_uids):
+                if j < self.max_loras_per_batch:
+                    index = j
+                    j += 1
+                else:
+                    while i < len(evictable_uids) and evictable_uids[i] in cur_uids:
+                        i += 1
+                    assert i < len(evictable_uids)
                     self.active_uids.remove(evictable_uids[i])
                     self.buffer_id.pop(evictable_uids[i])
-                self.load_lora(uid, i)
+                    index = i
+                    i += 1
+                self.load_lora(uid, index)
                 self.active_uids.add(uid)
-                self.buffer_id[uid] = i
-                i += 1
+                self.buffer_id[uid] = index
 
         if cur_uids == set([None]):
             return
@@ -233,8 +297,11 @@ class LoRAManager:
         seg_lens = (
             forward_batch.extend_seq_lens
             if forward_batch.forward_mode.is_extend()
-            else torch.ones(bs)
+            else torch.ones(bs, device="cuda")
         )
+        # FIXME: reuse the data rather than recompute
+        seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.buffer_id[lora_path]
@@ -248,7 +315,7 @@ class LoRAManager:
                     self.A_buffer[weight_name][layer_id],
                     self.B_buffer[weight_name][layer_id],
                     bs,
-                    seg_lens,
+                    seg_indptr,
                     weight_indices,
                 )
             else:
@@ -257,6 +324,6 @@ class LoRAManager:
                     self.B_buffer["q_proj"][layer_id],
                     self.B_buffer["kv_proj"][layer_id],
                     bs,
-                    seg_lens,
+                    seg_indptr,
                     weight_indices,
                 )

@@ -2,10 +2,13 @@
 
 import argparse
 import asyncio
+import copy
 import os
+import random
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional
@@ -20,16 +23,20 @@ from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.utils import kill_child_process
+from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
-DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Meta-Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Meta-Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
@@ -37,7 +44,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 
 def is_in_ci():
     """Return whether it is in CI runner."""
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return os.getenv("SGLANG_IS_IN_CI", "false").lower() == "true"
 
 
 if is_in_ci():
@@ -85,7 +92,7 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
 
 
 def call_generate_outlines(
-    prompt, temperature, max_tokens, stop=[], regex=None, n=1, url=None
+    prompt, temperature, max_tokens, stop=None, regex=None, n=1, url=None
 ):
     assert url is not None
 
@@ -400,7 +407,7 @@ def popen_launch_server(
     api_key: Optional[str] = None,
     other_args: tuple = (),
     env: Optional[dict] = None,
-    return_stdout_stderr: bool = False,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -423,8 +430,8 @@ def popen_launch_server(
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=return_stdout_stderr[0],
+            stderr=return_stdout_stderr[1],
             env=env,
             text=True,
         )
@@ -432,18 +439,22 @@ def popen_launch_server(
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {api_key}",
-            }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
-            if response.status_code == 200:
-                return process
-        except requests.RequestException:
-            pass
-        time.sleep(10)
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                )
+                if response.status_code == 200:
+                    return process
+            except requests.RequestException:
+                pass
+            time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
@@ -493,7 +504,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             )
             assert ret_code == 0
         except TimeoutError:
-            kill_child_process(process.pid)
+            kill_child_process(process.pid, include_self=True)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
@@ -514,7 +525,17 @@ def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
 
-def run_bench_serving(model, num_prompts, request_rate, other_server_args):
+def run_bench_serving(
+    model,
+    num_prompts,
+    request_rate,
+    other_server_args,
+    dataset_name="random",
+    random_input_len=4096,
+    random_output_len=2048,
+    disable_stream=False,
+    need_warmup=False,
+):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -530,39 +551,44 @@ def run_bench_serving(model, num_prompts, request_rate, other_server_args):
         base_url=base_url,
         host=None,
         port=None,
-        dataset_name="random",
+        dataset_name=dataset_name,
         dataset_path="",
         model=None,
         tokenizer=None,
         num_prompts=num_prompts,
         sharegpt_output_len=None,
-        random_input_len=4096,
-        random_output_len=2048,
+        random_input_len=random_input_len,
+        random_output_len=random_output_len,
         random_range_ratio=0.0,
         request_rate=request_rate,
         multi=None,
         seed=0,
         output_file=None,
         disable_tqdm=False,
-        disable_stream=False,
+        disable_stream=disable_stream,
         disable_ignore_eos=False,
         extra_request_body=None,
+        profile=None,
     )
 
     try:
+        if need_warmup:
+            warmup_args = copy.deepcopy(args)
+            warmup_args.num_prompts = 16
+            run_benchmark(warmup_args)
         res = run_benchmark(args)
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     assert res["completed"] == num_prompts
     return res
 
 
-def run_bench_latency(model, other_args):
+def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_latency",
+        "sglang.bench_one_batch",
         "--model-path",
         model,
         "--batch-size",
@@ -585,7 +611,7 @@ def run_bench_latency(model, other_args):
         lastline = output.split("\n")[-3]
         output_throughput = float(lastline.split(" ")[-2])
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     return output_throughput
 
@@ -622,3 +648,156 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
         rouge_l_scores.append(fmeasure)
 
     return rouge_l_scores
+
+
+STDERR_FILENAME = "stderr.txt"
+STDOUT_FILENAME = "stdout.txt"
+
+
+def read_output(output_lines):
+    """Print the output in real time with another thread."""
+    while not os.path.exists(STDERR_FILENAME):
+        time.sleep(1)
+
+    pt = 0
+    while pt >= 0:
+        if pt > 0 and not os.path.exists(STDERR_FILENAME):
+            break
+        lines = open(STDERR_FILENAME).readlines()
+        for line in lines[pt:]:
+            print(line, end="", flush=True)
+            output_lines.append(line)
+            pt += 1
+        time.sleep(0.1)
+
+
+def run_and_check_memory_leak(
+    workload_func,
+    disable_radix_cache,
+    enable_mixed_chunk,
+    disable_overlap,
+    chunked_prefill_size,
+):
+    other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
+    if disable_radix_cache:
+        other_args += ["--disable-radix-cache"]
+    if enable_mixed_chunk:
+        other_args += ["--enable-mixed-chunk"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
+
+    model = DEFAULT_MODEL_NAME_FOR_TEST
+    port = random.randint(4000, 5000)
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Create files and launch the server
+    stdout = open(STDOUT_FILENAME, "w")
+    stderr = open(STDERR_FILENAME, "w")
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        return_stdout_stderr=(stdout, stderr),
+    )
+
+    # Launch a thread to stream the output
+    output_lines = []
+    t = threading.Thread(target=read_output, args=(output_lines,))
+    t.start()
+
+    # Run the workload
+    workload_func(base_url, model)
+
+    # Clean up everything
+    kill_child_process(process.pid, include_self=True)
+    kill_child_process(process.pid, include_self=True)
+    stdout.close()
+    stderr.close()
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
+    t.join()
+
+    # Assert success
+    has_new_server = False
+    has_leak = False
+    for line in output_lines:
+        if "The server is fired" in line:
+            has_new_server = True
+        if "leak" in line:
+            has_leak = True
+
+    assert has_new_server
+    assert not has_leak
+
+
+def run_mmlu_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    disable_overlap=False,
+    chunked_prefill_size=32,
+):
+    def workload_func(base_url, model):
+        # Run the eval
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=128,
+            num_threads=128,
+        )
+
+        try:
+            metrics = run_eval(args)
+            assert metrics["score"] >= 0.65, f"{metrics=}"
+        finally:
+            pass
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        disable_overlap,
+        chunked_prefill_size,
+    )
+
+
+def run_mulit_request_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    enable_overlap=False,
+    chunked_prefill_size=32,
+):
+
+    def workload_func(base_url, model):
+        def run_one(_):
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+
+            response = requests.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                    },
+                },
+            )
+            ret = response.json()
+
+        with ThreadPoolExecutor(2) as executor:
+            list(executor.map(run_one, list(range(4))))
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        enable_overlap,
+        chunked_prefill_size,
+    )

@@ -30,22 +30,22 @@ def poignancy_event_prompt(persona_name, persona_iss, event):
 @sgl.function
 def generate_event_triple(s, persona_name, action):
     s += """Task: Turn the input into (subject, predicate, object).
-Input: Sam Johnson is eating breakfast. 
-Output: (Dolores Murphy, eat, breakfast) 
---- 
+Input: Sam Johnson is eating breakfast.
+Output: (Dolores Murphy, eat, breakfast)
+---
 Input: Joon Park is brewing coffee.
 Output: (Joon Park, brew, coffee)
 ---
-Input: Jane Cook is sleeping. 
+Input: Jane Cook is sleeping.
 Output: (Jane Cook, is, sleep)
 ---
-Input: Michael Bernstein is writing email on a computer. 
+Input: Michael Bernstein is writing email on a computer.
 Output: (Michael Bernstein, write, email)
 ---
-Input: Percy Liang is teaching students in a classroom. 
+Input: Percy Liang is teaching students in a classroom.
 Output: (Percy Liang, teach, students)
 ---
-Input: Merrie Morris is running on a treadmill. 
+Input: Merrie Morris is running on a treadmill.
 Output: (Merrie Morris, run, treadmill)
 ---"""
     s += persona_name + "is" + action + ".\n"
@@ -56,22 +56,22 @@ Output: (Merrie Morris, run, treadmill)
 def generate_event_triple_prompt(persona_name, action):
     s = ""
     s += """Task: Turn the input into (subject, predicate, object).
-Input: Sam Johnson is eating breakfast. 
-Output: (Dolores Murphy, eat, breakfast) 
---- 
+Input: Sam Johnson is eating breakfast.
+Output: (Dolores Murphy, eat, breakfast)
+---
 Input: Joon Park is brewing coffee.
 Output: (Joon Park, brew, coffee)
 ---
-Input: Jane Cook is sleeping. 
+Input: Jane Cook is sleeping.
 Output: (Jane Cook, is, sleep)
 ---
-Input: Michael Bernstein is writing email on a computer. 
+Input: Michael Bernstein is writing email on a computer.
 Output: (Michael Bernstein, write, email)
 ---
-Input: Percy Liang is teaching students in a classroom. 
+Input: Percy Liang is teaching students in a classroom.
 Output: (Percy Liang, teach, students)
 ---
-Input: Merrie Morris is running on a treadmill. 
+Input: Merrie Morris is running on a treadmill.
 Output: (Merrie Morris, run, treadmill)
 ---"""
     s += persona_name + "is" + action + ".\n"
@@ -107,9 +107,9 @@ def action_location_sector(
     current_action,
     next_action,
 ):
-    s += """Task -- choose an appropriate area  from the area options for a task at hand. 
+    s += """Task -- choose an appropriate area  from the area options for a task at hand.
 Sam Kim lives in {Sam Kim's house} that has Sam Kim's room, bathroom, kitchen.
-Sam Kim is currently in {Sam Kim's house} that has Sam Kim's room, bathroom, kitchen. 
+Sam Kim is currently in {Sam Kim's house} that has Sam Kim's room, bathroom, kitchen.
 Area options: {Sam Kim's house, The Rose and Crown Pub, Hobbs Cafe, Oak Hill College, Johnson Park, Harvey Oak Supply Store, The Willows Market and Pharmacy}.
 * Stay in the current area if the activity can be done there. Only go out if the activity needs to take place in another place.
 * Must be one of the "Area options," verbatim.
@@ -117,7 +117,7 @@ For taking a walk, Sam Kim should go to the following area: {Johnson Park}
 ---
 Jane Anderson lives in {Oak Hill College Student Dormatory} that has Jane Anderson's room.
 Jane Anderson is currently in {Oak Hill College} that has a classroom, library
-Area options: {Oak Hill College Student Dormatory, The Rose and Crown Pub, Hobbs Cafe, Oak Hill College, Johnson Park, Harvey Oak Supply Store, The Willows Market and Pharmacy}. 
+Area options: {Oak Hill College Student Dormatory, The Rose and Crown Pub, Hobbs Cafe, Oak Hill College, Johnson Park, Harvey Oak Supply Store, The Willows Market and Pharmacy}.
 * Stay in the current area if the activity can be done there. Only go out if the activity needs to take place in another place.
 * Must be one of the "Area options," verbatim.
 For eating dinner, Jane Anderson should go to the following area: {Hobbs Cafe}
@@ -167,9 +167,9 @@ def action_location_sector_prompt(
     next_action,
 ):
     s = ""
-    s += """Task -- choose an appropriate area  from the area options for a task at hand. 
+    s += """Task -- choose an appropriate area  from the area options for a task at hand.
 Sam Kim lives in {Sam Kim's house} that has Sam Kim's room, bathroom, kitchen.
-Sam Kim is currently in {Sam Kim's house} that has Sam Kim's room, bathroom, kitchen. 
+Sam Kim is currently in {Sam Kim's house} that has Sam Kim's room, bathroom, kitchen.
 Area options: {Sam Kim's house, The Rose and Crown Pub, Hobbs Cafe, Oak Hill College, Johnson Park, Harvey Oak Supply Store, The Willows Market and Pharmacy}.
 * Stay in the current area if the activity can be done there. Only go out if the activity needs to take place in another place.
 * Must be one of the "Area options," verbatim.
@@ -177,7 +177,7 @@ For taking a walk, Sam Kim should go to the following area: {Johnson Park}
 ---
 Jane Anderson lives in {Oak Hill College Student Dormatory} that has Jane Anderson's room.
 Jane Anderson is currently in {Oak Hill College} that has a classroom, library
-Area options: {Oak Hill College Student Dormatory, The Rose and Crown Pub, Hobbs Cafe, Oak Hill College, Johnson Park, Harvey Oak Supply Store, The Willows Market and Pharmacy}. 
+Area options: {Oak Hill College Student Dormatory, The Rose and Crown Pub, Hobbs Cafe, Oak Hill College, Johnson Park, Harvey Oak Supply Store, The Willows Market and Pharmacy}.
 * Stay in the current area if the activity can be done there. Only go out if the activity needs to take place in another place.
 * Must be one of the "Area options," verbatim.
 For eating dinner, Jane Anderson should go to the following area: {Hobbs Cafe}
@@ -226,7 +226,7 @@ Stay in the current area if the activity can be done there. Never go into other 
 For cooking, Jane Anderson should go to the following area in Jane Anderson's house:
 Answer: {kitchen}
 ---
-Tom Watson is in common room in Tom Watson's apartment. 
+Tom Watson is in common room in Tom Watson's apartment.
 Tom Watson is going to Hobbs Cafe that has the following areas: {cafe}
 Stay in the current area if the activity can be done there. Never go into other people's rooms unless necessary.
 For getting coffee, Tom Watson should go to the following area in Hobbs Cafe:
@@ -240,7 +240,7 @@ Answer: {cafe}
         + target_sector_areas
         + "}\n"
     )
-    s += """* Stay in the current area if the activity can be done there. 
+    s += """* Stay in the current area if the activity can be done there.
 * NEVER go into other people's rooms unless necessary."""
     s += (
         persona_name
@@ -268,7 +268,7 @@ Stay in the current area if the activity can be done there. Never go into other 
 For cooking, Jane Anderson should go to the following area in Jane Anderson's house:
 Answer: {kitchen}
 ---
-Tom Watson is in common room in Tom Watson's apartment. 
+Tom Watson is in common room in Tom Watson's apartment.
 Tom Watson is going to Hobbs Cafe that has the following areas: {cafe}
 Stay in the current area if the activity can be done there. Never go into other people's rooms unless necessary.
 For getting coffee, Tom Watson should go to the following area in Hobbs Cafe:
@@ -282,7 +282,7 @@ Answer: {cafe}
         + target_sector_areas
         + "}\n"
     )
-    s += """* Stay in the current area if the activity can be done there. 
+    s += """* Stay in the current area if the activity can be done there.
 * NEVER go into other people's rooms unless necessary."""
     s += (
         persona_name

@@ -1,30 +1,29 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
+
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import CacheConfig, LoRAConfig
+from vllm.config import LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 
 # from vllm.model_executor.layers.rotary_embedding import GemmaRotaryEmbedding
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import GeluAndMul
@@ -37,7 +36,9 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -97,7 +98,7 @@ class Gemma2MLP(nn.Module):
 class Gemma2Attention(nn.Module):
     def __init__(
         self,
-        layer_idx: int,
+        layer_id: int,
         config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
@@ -105,11 +106,11 @@ class Gemma2Attention(nn.Module):
         head_dim: int,
         max_position_embeddings: int,
         rope_theta: float,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
+        self.layer_id = layer_id
         self.config = config
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -156,13 +157,13 @@ class Gemma2Attention(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        use_sliding_window = layer_idx % 2 == 0 and hasattr(config, "sliding_window")
+        use_sliding_window = layer_id % 2 == 0 and hasattr(config, "sliding_window")
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            layer_id=layer_idx,
+            layer_id=layer_id,
             logit_cap=self.config.attn_logit_softcapping,
             sliding_window_size=(
                 get_attention_sliding_window_size(config)
@@ -188,15 +189,15 @@ class Gemma2Attention(nn.Module):
 class Gemma2DecoderLayer(nn.Module):
     def __init__(
         self,
-        layer_idx: int,
+        layer_id: int,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma2Attention(
-            layer_idx=layer_idx,
+            layer_id=layer_id,
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -257,7 +258,7 @@ class Gemma2Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -267,11 +268,15 @@ class Gemma2Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList(
-            [
-                Gemma2DecoderLayer(layer_idx, config, cache_config, quant_config)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Gemma2DecoderLayer(
+                layer_id=idx,
+                config=config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+            ),
+            prefix="",
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -332,11 +337,12 @@ class Gemma2ForCausalLM(nn.Module):
     # Gemma does not apply LoRA to the embedding layer.
     embedding_modules = {}
     embedding_padding_modules = []
+    supports_lora = True
 
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ) -> None:

@@ -48,9 +48,13 @@ def run_eval(args):
     # Select backend
     set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
-    # Read data
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
+    if args.data_path is None:
+        # Read data
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        filename = download_and_cache_file(url)
+    else:
+        filename = args.data_path
+
     lines = list(read_jsonl(filename))
 
     # Construct prompts
@@ -76,7 +80,9 @@ def run_eval(args):
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
         s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+            "answer",
+            max_tokens=args.max_new_tokens,
+            stop=["Question", "Assistant:", "<|separator|>"],
         )
 
     #####################################
@@ -129,8 +135,9 @@ def run_eval(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
+    parser.add_argument("--data-path", type=str)
     parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)

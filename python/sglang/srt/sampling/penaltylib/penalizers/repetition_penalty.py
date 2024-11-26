@@ -1,8 +1,8 @@
-import typing
+from typing import List
 
 import torch
 
-from ..orchestrator import _BatchedPenalizer, _TokenIDs
+from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer, _TokenIDs
 
 
 class BatchedRepetitionPenalizer(_BatchedPenalizer):
@@ -44,9 +44,6 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
         )
 
     def _teardown(self):
-        del self.repetition_penalties
-        del self.cumulated_repetition_penalties
-
         self.repetition_penalties = None
         self.cumulated_repetition_penalties = None
 
@@ -65,9 +62,7 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             logits * self.cumulated_repetition_penalties,
         )
 
-    def _filter(
-        self, indices_to_keep: typing.List[int], indices_tensor_to_keep: torch.Tensor
-    ):
+    def _filter(self, indices_to_keep: List[int], indices_tensor_to_keep: torch.Tensor):
         self.repetition_penalties = self.repetition_penalties[indices_tensor_to_keep]
         self.cumulated_repetition_penalties = self.cumulated_repetition_penalties[
             indices_tensor_to_keep

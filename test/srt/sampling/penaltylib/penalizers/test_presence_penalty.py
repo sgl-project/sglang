@@ -1,5 +1,5 @@
-import typing
 import unittest
+from typing import List
 
 import torch
 
@@ -76,7 +76,7 @@ class BaseBatchedPresencePenalizerTest(BaseBatchedPenalizerTest):
             ],
         )
 
-    def create_test_subjects(self) -> typing.List[Subject]:
+    def create_test_subjects(self) -> List[Subject]:
         self.enabled = self._create_subject(presence_penalty=self.presence_penalty)
         self.disabled = self._create_subject(presence_penalty=0.0)
 

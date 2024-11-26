@@ -4,7 +4,7 @@
 python3 download_images.py
 ```
 
-image benchmark source: https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild 
+image benchmark source: https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild
 
 ### Other Dependency
 ```
@@ -17,7 +17,7 @@ pip3 install "torch>=2.1.2" "transformers>=4.36" pillow
 ### Benchmark sglang
 Launch a server
 ```
-python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --port 30000
+python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --port 30000
 ```
 
 Run benchmark
