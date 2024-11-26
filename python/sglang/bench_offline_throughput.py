@@ -28,7 +28,7 @@ from sglang.bench_serving import (
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Runtime, start_profile_sync, stop_profile_sync
+from sglang.srt.server import Runtime, start_profile, stop_profile
 from sglang.srt.server_args import ServerArgs
 
 
@@ -204,12 +204,12 @@ def throughput_test_once(
 
     st = time.perf_counter()
     if profile:
-        start_profile_sync()
+        start_profile()
 
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
 
     if profile:
-        stop_profile_sync()
+        stop_profile()
         monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
 
     latency = time.perf_counter() - st
