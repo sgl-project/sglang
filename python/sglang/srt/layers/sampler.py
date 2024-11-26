@@ -55,11 +55,14 @@ class Sampler(nn.Module):
                 max_logit = torch.max(logits, dim=-1, keepdim=True).values
                 sigma = torch.std(logits, dim=-1, keepdim=True)
                 # Create mask and enable only for the requests that have top_n_sigma > 0
-                mask = (sampling_info.top_n_sigmas.view(-1, 1) <= 0) | \
-                       (logits >= max_logit - sampling_info.top_n_sigmas.view(-1, 1) * sigma)
+                mask = (sampling_info.top_n_sigmas.view(-1, 1) <= 0) | (
+                    logits >= max_logit - sampling_info.top_n_sigmas.view(-1, 1) * sigma
+                )
 
                 # Apply mask
-                logits = torch.where(mask, logits, torch.tensor(float('-inf')).to(logits.device))
+                logits = torch.where(
+                    mask, logits, torch.tensor(float("-inf")).to(logits.device)
+                )
 
             probs = torch.softmax(logits, dim=-1)
             logits = None
