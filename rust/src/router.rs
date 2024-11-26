@@ -3,6 +3,7 @@ use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, TryStreamExt};
+use log::{debug, info};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -171,11 +172,11 @@ impl Router {
 
                         // Print the process queue
                         let locked_processed_queue = processed_queue_clone.lock().unwrap();
-                        println!("Processed Queue: {:?}", locked_processed_queue);
+                        info!("Processed Queue: {:?}", locked_processed_queue);
 
                         // Print the running queue
                         let locked_running_queue = running_queue_clone.lock().unwrap();
-                        println!("Running Queue: {:?}", locked_running_queue);
+                        info!("Running Queue: {:?}", locked_running_queue);
                     }
                 });
 
@@ -266,7 +267,7 @@ impl Router {
 
                 let selected_url = if is_imbalanced {
                     // Log load balancing trigger and current queue state
-                    println!(
+                    info!(
                         "Load balancing triggered due to workload imbalance:\n\
                         Max load: {}, Min load: {}\n\
                         Current running queue: {:?}",
@@ -368,8 +369,7 @@ impl Router {
                                 let mut locked_queue = running_queue.lock().unwrap();
                                 let count = locked_queue.get_mut(&worker_url).unwrap();
                                 *count = count.saturating_sub(1);
-                                // print
-                                // println!("streaming is done!!")
+                                debug!("streaming is done!!")
                             }
                         }),
                 )

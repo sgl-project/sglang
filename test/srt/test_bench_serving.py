@@ -36,7 +36,9 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(res["output_throughput"], 950)
+            # There is a regression with torch 2.5
+            # This number was 950 for torch 2.4
+            self.assertGreater(res["output_throughput"], 800)
 
     def test_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
