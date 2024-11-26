@@ -188,6 +188,9 @@ class LogitsProcessor(nn.Module):
             torch.tanh(last_logits, out=last_logits)
             last_logits.mul_(self.config.final_logit_softcapping)
 
+        if hasattr(self.config, "logits_scaling"):
+            last_logits.div_(self.config.logits_scaling)
+
         # Return only last_logits if logprob is not requested
         if not logits_metadata.return_logprob:
             return LogitsProcessorOutput(
