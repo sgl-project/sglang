@@ -18,7 +18,6 @@ from sglang.test.test_utils import (
 mp.set_start_method("spawn", force=True)
 
 
-
 class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
     def init_process(cls, rank, world_size, base_url, model_name):
@@ -30,7 +29,9 @@ class TestParameterUpdateGroup(unittest.TestCase):
             # Rank 0: 加载HF模型
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
             os.environ["NCCL_NVLS_ENABLE"] = "0"
-            hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="bfloat16").to("cuda:0")
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype="bfloat16"
+            ).to("cuda:0")
             group = init_custom_process_group(
                 backend="nccl",
                 init_method="tcp://localhost:65500",
@@ -47,9 +48,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
             print(f"rank: {rank}, param_name: {param_name}, shape: {shape}")
             dtype = str(param.dtype).split(".")[-1]
             print(f"[Rank 0] Parameter shape: {shape}, dtype: {dtype}")
-            torch.distributed.broadcast(
-                param, src=0, group=group
-            )
+            torch.distributed.broadcast(param, src=0, group=group)
             del hf_model
             gc.collect()
             torch.cuda.empty_cache()
@@ -102,5 +101,3 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

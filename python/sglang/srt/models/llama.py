@@ -357,15 +357,7 @@ class LlamaForCausalLM(nn.Module):
         return params_mapping.get(name, name)
 
     def get_module_name_from_weight_name(self, name):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
-            ("gate_up_proj", "gate_proj", 0, 2),
-            ("gate_up_proj", "up_proj", 1, 2),
-        ]
-        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
+        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:
                 return (
                     name.replace(weight_name, param_name)[: -len(".weight")],
@@ -378,6 +370,14 @@ class LlamaForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
 
         params_dict = dict(self.named_parameters())
 
@@ -397,7 +397,7 @@ class LlamaForCausalLM(nn.Module):
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
-            for param_name, weight_name, shard_id in self.stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)

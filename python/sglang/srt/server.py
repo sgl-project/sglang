@@ -197,17 +197,6 @@ async def stop_profile():
     )
 
 
-@app.get("/get_max_total_num_tokens")
-async def get_max_total_num_tokens():
-    try:
-        return {"max_total_num_tokens": _get_max_total_num_tokens()}
-
-    except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
-
-
 @app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
 async def get_memory_pool_size():
     """Get the memory pool size in number of tokens"""
@@ -272,7 +261,13 @@ async def get_parameter_by_name(obj: GetParameterByNameReqInput, request: Reques
     """Get model parameter by name."""
     try:
         ret = await tokenizer_manager.get_parameter_by_name(obj, request)
-        return ORJSONResponse(ret, status_code=200)
+        if ret is None:
+            return ORJSONResponse(
+                {"error": {"message": "Get parameter by name failed"}},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        else:
+            return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
@@ -343,6 +338,20 @@ async def init_parameter_update_group_request(
     """Handle an init parameter update group request."""
     try:
         ret = await tokenizer_manager.init_parameter_update_group(obj, request)
+        return ret
+    except ValueError as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+@time_func_latency
+async def get_parameter_by_name_request(
+    obj: GetParameterByNameReqInput, request: Request
+):
+    """Handle a get parameter by name request."""
+    try:
+        ret = await tokenizer_manager.get_parameter_by_name(obj, request)
         return ret
     except ValueError as e:
         return ORJSONResponse(
@@ -1120,3 +1129,8 @@ class Engine:
         return loop.run_until_complete(
             update_parameter_from_distributed_request(obj, None)
         )
+
+    def get_parameter_by_name(self, name, truncate_size=100):
+        obj = GetParameterByNameReqInput(name=name, truncate_size=truncate_size)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(get_parameter_by_name_request(obj, None))

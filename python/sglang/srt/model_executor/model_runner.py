@@ -551,76 +551,95 @@ class ModelRunner:
     def get_parameter_by_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
-        """
-        Get the parameter from model weights by its name.
-        Args:
-            name: parameter name. The name will be mapped to the actual parameter name in the engine.
-            truncate_size: maximum number of elements to return
-
-        Returns:
-            If found, return the first truncate_size elements of the parameter as a list; otherwise, return None.
-        """
         try:
-            # 先检查是否需要映射参数名
+            # 1. 获取参数和映射信息
             mapped_name = name
             mapped_shard_id = None
-            for param_name, weight_name, shard_id in getattr(
-                self.model, "stacked_params_mapping", []
-            ):
+            for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
                 if weight_name in name:
-                    logger.info(f"Inquire parameter {name} is mapped to {param_name}")
                     mapped_name = name.replace(weight_name, param_name)
                     mapped_shard_id = shard_id
                     break
 
-            # 查找参数
+            # 2. 获取参数字典
             params_dict = dict(self.model.named_parameters())
-            if mapped_name in params_dict:
-                param = params_dict[mapped_name]
-                if mapped_shard_id is not None:
-                    # 处理分片参数
-                    # 1. 获取weight_loader
-                    weight_loader = getattr(param, "weight_loader", None)
-                    if weight_loader is None:
-                        logger.warning(
-                            f"Parameter {name} is sharded but has no weight_loader"
-                        )
-                        return None
+            if mapped_name not in params_dict:
+                logger.warning(f"Parameter {name} (mapped to {mapped_name}) not found")
+                return None
 
-                    # 2. 创建临时tensor用于加载完整权重
-                    full_shape = (
-                        param.full_shape
-                        if hasattr(param, "full_shape")
-                        else param.shape
-                    )
-                    temp_weight = torch.empty(
-                        full_shape, dtype=param.dtype, device=param.device
-                    )
+            param = params_dict[mapped_name]
+            weight = param.data
 
-                    # 3. 使用weight_loader加载完整权重
-                    try:
-                        weight_loader(temp_weight, param, mapped_shard_id)
-                    except Exception as e:
-                        logger.error(f"Failed to load sharded weight for {name}: {e}")
-                        return None
+            # 3. 如果是TP>1的情况，需要在不同GPU间gather权重
+            if self.tp_size > 1:
+                # 确定切分维度和是否需要gather
+                gather_dim = None
+                need_gather = True
 
-                    # 4. 转换并截断
-                    return (
-                        temp_weight.cpu()
-                        .to(torch.float32)
-                        .numpy()
-                        .tolist()[:truncate_size]
-                    )
+                if "qkv_proj.weight" in mapped_name:
+                    # QKV投影在输出维度上切分
+                    gather_dim = 0
+                elif "o_proj.weight" in mapped_name:
+                    # O投影在输入维度上切分
+                    gather_dim = 1
+                elif "gate_up_proj.weight" in mapped_name:
+                    # gate_up投影在输出维度上切分
+                    gather_dim = 0
+                elif "down_proj.weight" in mapped_name:
+                    # down投影在输入维度上切分
+                    gather_dim = 1
+                elif any(x in mapped_name.lower() for x in ["norm", "embed", "bias"]):
+                    # LayerNorm、嵌入层和偏置项不需要gather
+                    need_gather = False
                 else:
-                    # 非分片参数直接返回
-                    return (
-                        param.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+                    logger.warning(f"Unknown parameter type for TP: {mapped_name}")
+                    need_gather = False
+
+                if need_gather:
+                    # 获取当前切片的形状
+                    shard_shape = list(weight.shape)
+
+                    # 计算完整权重的形状
+                    full_shape = shard_shape.copy()
+                    full_shape[gather_dim] *= self.tp_size
+
+                    # 在每个GPU上创建相同大小的tensor列表
+                    gathered_list = [
+                        torch.empty(
+                            shard_shape, dtype=weight.dtype, device=weight.device
+                        )
+                        for _ in range(self.tp_size)
+                    ]
+
+                    print(f"[Rank {self.tp_rank}] Before barrier")
+                    # 添加同步点
+                    tp_group = get_tp_group()
+                    torch.distributed.barrier(group=tp_group)
+                    print(f"[Rank {self.tp_rank}] After barrier")
+
+                    print(
+                        f"[Rank {self.tp_rank}] Before all_gather: weight shape={weight.shape}, "
+                        f"mean={weight.mean():.6f}, std={weight.std():.6f}"
                     )
 
-            logger.warning(
-                f"Parameter {name} (mapped to {mapped_name}) not found in model."
-            )
-            return None
+                    # 收集所有GPU上的权重
+                    torch.distributed.all_gather(gathered_list, weight, group=tp_group)
+
+                    print(
+                        f"[Rank {self.tp_rank}] After all_gather: gathered shapes="
+                        f"{[t.shape for t in gathered_list]}"
+                    )
+
+                    # 在指定维度上拼接所有分片
+                    weight = torch.cat(gathered_list, dim=gather_dim)
+
+                    print(
+                        f"[Rank {self.tp_rank}] After cat: weight shape={weight.shape}, "
+                        f"mean={weight.mean():.6f}, std={weight.std():.6f}"
+                    )
+
+            # 4. 转换格式并截断
+            return weight.cpu().to(torch.float32).tolist()[:truncate_size]
 
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
