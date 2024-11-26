@@ -92,6 +92,7 @@ class BenchArgs:
     )
     graph_filename: str = "out.png"
     mps:Tuple[int] = (100,)
+    prefill_mode:str = "prefill"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -117,6 +118,9 @@ class BenchArgs:
         parser.add_argument("--graph-sql", type=str, default=BenchArgs.graph_sql)
         parser.add_argument(
             "--graph-filename", type=str, default=BenchArgs.graph_filename
+        )
+        parser.add_argument(
+            "--prefill-mode", type=str, default=BenchArgs.prefill_mode
         )
 
     @classmethod
@@ -241,6 +245,24 @@ def extend(reqs, model_runner):
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
+@torch.inference_mode()
+def split_prefill_forward(reqs, model_runner):
+    batch = ScheduleBatch.init_new(
+        reqs=reqs,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        token_to_kv_pool=model_runner.token_to_kv_pool,
+        tree_cache=None,
+        model_config=model_runner.model_config,
+    )
+    batch.prepare_for_extend()
+    batch.prepare_for_split_prefill()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    for _ in range(35): 
+        logits_output = model_runner.forward(forward_batch)
+    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    return next_token_ids, logits_output.next_token_logits, batch
+
 
 @torch.inference_mode()
 def decode(input_token_ids, batch, model_runner):
@@ -305,7 +327,7 @@ def synchronize(device):
 
 
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device, tp_size, tp_rank, warm_up, mps
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device, tp_size, tp_rank, warm_up, mps, split_prefill
 ):
     print("===============================")
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -331,7 +353,10 @@ def latency_test_run_once(
     # Prefill
     synchronize(device)
     tic = time.time()
-    next_token_ids, _, batch = extend(reqs, model_runner)
+    if split_prefill:
+        next_token_ids, _, batch = split_prefill_forward(reqs, model_runner)
+    else:
+        next_token_ids, _, batch = extend(reqs, model_runner)
     synchronize(device)
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
@@ -378,9 +403,10 @@ def latency_test_run_once(
     mem = torch.cuda.max_memory_allocated()
 
     if tp_rank == 0 and not warm_up:
-        with open(f"/home/ykchen/sglang/res/breakdown_mps_colocation_{mps}.csv","a+") as f:
+        with open(f"/home/ykchen/sglang/res/sglang_prefill.csv","a+") as f:
             writer = csv.writer(f)
-            writer.writerow([tp_size, batch_size, input_len, '%.2f'%(prefill_latency * 1000), '%.2f'%(prefill_latency/32*1000), '%.2f'%(med_decode_latency*1000), mem])
+            # writer.writerow([tp_size, batch_size, input_len, '%.2f'%(prefill_latency * 1000), '%.2f'%(prefill_latency/32*1000), '%.2f'%(med_decode_latency*1000), mem])
+            writer.writerow([batch_size, input_len, '%.2f'%(prefill_latency * 1000)])
 
 
     return measurement_results
@@ -417,7 +443,8 @@ def latency_test(
         server_args.tp_size,
         tp_rank,
         True,
-        bench_args.mps[0]
+        bench_args.mps[0],
+        bench_args.prefill_mode == "split"
     )
     rank_print("Benchmark ...")
 
@@ -439,7 +466,8 @@ def latency_test(
             server_args.tp_size,
             tp_rank,
             False,
-            bench_args.mps[0]
+            bench_args.mps[0],
+            bench_args.prefill_mode == "split"
         )
         if ret is not None:
             result_list.append(ret)
