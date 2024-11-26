@@ -26,13 +26,13 @@ class Session:
         self.reqs: List[Req] = []
 
     def create_req(self, req: TokenizedGenerateReqInput, tokenizer):
-        # renew session id
-        self.session_id = uuid.uuid4().hex
         if req.session_rid is not None:
             while len(self.reqs) > 0:
                 if self.reqs[-1].rid == req.session_rid:
                     break
                 self.reqs = self.reqs[:-1]
+        else:
+            self.reqs = []
         if len(self.reqs) > 0:
             input_ids = (
                 self.reqs[-1].origin_input_ids
@@ -58,4 +58,4 @@ class Session:
             )
         else:
             self.reqs.append(new_req)
-        return new_req, self.session_id
+        return new_req

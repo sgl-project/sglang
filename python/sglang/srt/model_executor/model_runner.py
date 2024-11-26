@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     is_hip,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
+    set_cpu_offload_max_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,9 @@ class ModelRunner:
             }
         )
 
-        # Init componnets
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+
+        # Init components
         min_per_gpu_memory = self.init_torch_distributed()
         self.sampler = Sampler()
         self.load_model()
@@ -176,14 +179,15 @@ class ModelRunner:
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
         # Init torch distributed
+        torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
-            torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
         # ToDO(liangan1):Just use gloo to bypass the initilization fail
         # Need to use xccl for xpu backend in the future
         elif self.device == "xpu":
-            torch.xpu.set_device(self.gpu_id)
             backend = "gloo"
+        elif self.device == "hpu":
+            backend = "hccl"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
@@ -238,15 +242,17 @@ class ModelRunner:
             )
             return get_model(vllm_config=vllm_config)
         except ImportError:
-            return get_model(
-                model_config=self.vllm_model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-                parallel_config=None,
-                scheduler_config=None,
-                lora_config=None,
-                cache_config=None,
-            )
+            pass
+
+        return get_model(
+            model_config=self.vllm_model_config,
+            load_config=self.load_config,
+            device_config=DeviceConfig(self.device),
+            parallel_config=None,
+            scheduler_config=None,
+            lora_config=None,
+            cache_config=None,
+        )
 
     def get_model_config_params(self):
         sig = inspect.signature(VllmModelConfig.__init__)
@@ -600,9 +606,17 @@ class ModelRunner:
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
-            return self.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
-            )
+            if forward_batch.input_embeds is None:
+                return self.model.forward(
+                    forward_batch.input_ids, forward_batch.positions, forward_batch
+                )
+            else:
+                return self.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    input_embeds=forward_batch.input_embeds.bfloat16(),
+                )
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(

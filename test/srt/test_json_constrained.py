@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestJSONConstrained(unittest.TestCase):
+class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -36,7 +36,12 @@ class TestJSONConstrained(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=300,
-            other_args=["--max-running-requests", "10"],
+            other_args=[
+                "--max-running-requests",
+                "10",
+                "--grammar-backend",
+                "outlines",
+            ],
         )
 
     @classmethod
@@ -119,6 +124,34 @@ class TestJSONConstrained(unittest.TestCase):
 
         with ThreadPoolExecutor(len(json_schemas)) as executor:
             list(executor.map(self.run_decode, json_schemas))
+
+
+class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.json_schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "population": {"type": "integer"},
+                },
+                "required": ["name", "population"],
+            }
+        )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=[
+                "--max-running-requests",
+                "10",
+                "--grammar-backend",
+                "xgrammar",
+            ],
+        )
 
 
 if __name__ == "__main__":
