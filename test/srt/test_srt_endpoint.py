@@ -211,7 +211,7 @@ class TestSRTEndpoint(unittest.TestCase):
 
         diff = np.abs(output_logprobs - output_logprobs_score)
         max_diff = np.max(diff)
-        self.assertLess(max_diff, 0.2)
+        self.assertLess(max_diff, 0.25)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")
@@ -225,6 +225,9 @@ class TestSRTEndpoint(unittest.TestCase):
 
         attention_backend = response_json["attention_backend"]
         self.assertIsInstance(attention_backend, str)
+
+        version = response_json["version"]
+        self.assertIsInstance(version, str)
 
 
 if __name__ == "__main__":

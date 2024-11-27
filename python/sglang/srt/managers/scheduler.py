@@ -71,8 +71,10 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    get_bool_env_var,
     get_zmq_socket,
     kill_parent_process,
+    set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
 )
@@ -81,7 +83,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 # Test retract decode
-test_retract = os.getenv("SGLANG_TEST_RETRACT", "false") == "true"
+test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
 
 
 class Scheduler:
@@ -525,14 +527,23 @@ class Scheduler:
         recv_req: TokenizedGenerateReqInput,
     ):
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
+            # Create a new request
+            if recv_req.input_embeds is not None:
+                # Generate fake input_ids based on the length of input_embeds
+                seq_length = len(recv_req.input_embeds)
+                fake_input_ids = [1] * seq_length
+                recv_req.input_ids = fake_input_ids
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 lora_path=recv_req.lora_path,
+                input_embeds=recv_req.input_embeds,
             )
             req.tokenizer = self.tokenizer
+
             if recv_req.session_id is not None:
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_id} does not exist"
@@ -540,23 +551,22 @@ class Scheduler:
                 self.waiting_queue.append(req)
                 return
         else:
-            # Handle sessions
+            # Create a new request from a previsou session
             session = self.sessions[recv_req.session_id]
-            req, new_session_id = session.create_req(recv_req, self.tokenizer)
-            del self.sessions[recv_req.session_id]
-            self.sessions[new_session_id] = session
+            req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.waiting_queue.append(req)
                 return
 
         # Image inputs
         if recv_req.image_inputs is not None:
-            req.image_inputs = ImageInputs.from_dict(
+            image_inputs = ImageInputs.from_dict(
                 recv_req.image_inputs, self.model_config.vocab_size
             )
             req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids_unpadded, req.image_inputs
+                req.origin_input_ids, image_inputs
             )
+            req.extend_image_inputs(image_inputs, self.model_config.vocab_size)
 
             if len(req.origin_input_ids) > self.max_req_input_len:
                 req.finished_reason = FINISH_ABORT(
@@ -1188,7 +1198,6 @@ class Scheduler:
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
             output_no_stop_trim = []
-            output_session_ids = []
         else:  # embedding or reward model
             output_embeddings = []
 
@@ -1216,7 +1225,6 @@ class Scheduler:
                         req.sampling_params.spaces_between_special_tokens
                     )
                     output_no_stop_trim.append(req.sampling_params.no_stop_trim)
-                    output_session_ids.append(req.session_id)
 
                     meta_info = {
                         "prompt_tokens": len(req.origin_input_ids),
@@ -1267,7 +1275,6 @@ class Scheduler:
                         output_meta_info,
                         output_finished_reason,
                         output_no_stop_trim,
-                        output_session_ids,
                     )
                 )
             else:  # embedding or reward model
@@ -1398,6 +1405,10 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # set cpu affinity to this gpu process
+    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "DP_RANK" in os.environ:
         dp_rank = int(os.environ["DP_RANK"])

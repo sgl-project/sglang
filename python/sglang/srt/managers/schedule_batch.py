@@ -31,6 +31,7 @@ import dataclasses
 import logging
 from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -167,6 +168,30 @@ class ImageInputs:
 
         return ret
 
+    def merge(self, other, vocab_size):
+        assert self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
+        self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
+        self.image_hashes += other.image_hashes
+
+        self.pad_values = [
+            (self.image_hashes) % vocab_size,
+            (self.image_hashes >> 16) % vocab_size,
+            (self.image_hashes >> 32) % vocab_size,
+            (self.image_hashes >> 64) % vocab_size,
+        ]
+
+        optional_args = [
+            "image_sizes",
+            "image_offsets",
+            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
+            "aspect_ratio_ids",
+            "aspect_ratio_mask",
+            "image_grid_thws",
+        ]
+        for arg in optional_args:
+            if getattr(self, arg, None) is not None:
+                setattr(self, arg, getattr(self, arg) + getattr(other, arg))
+
 
 class Req:
     """The input and output status of a request."""
@@ -177,13 +202,19 @@ class Req:
         origin_input_text: str,
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
+        origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
+        input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
-        self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
+        self.origin_input_ids_unpadded = (
+            origin_input_ids_unpadded
+            if origin_input_ids_unpadded
+            else origin_input_ids  # Before image padding
+        )
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
@@ -191,6 +222,7 @@ class Req:
 
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.input_embeds = input_embeds
 
         # Memory pool info
         self.req_pool_idx = None
@@ -257,6 +289,12 @@ class Req:
 
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
+
+    def extend_image_inputs(self, image_inputs, vocab_size):
+        if self.image_inputs is None:
+            self.image_inputs = image_inputs
+        else:
+            self.image_inputs.merge(image_inputs, vocab_size)
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -448,6 +486,7 @@ class ScheduleBatch:
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
+    input_embeds: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     # The output locations of the KV cache
@@ -631,6 +670,9 @@ class ScheduleBatch:
         req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
+        input_embeds = []
+
+        pt = 0
         for i, req in enumerate(reqs):
             already_computed = (
                 req.extend_logprob_start_len + 1 + req.cached_tokens
@@ -648,6 +690,11 @@ class ScheduleBatch:
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+
+            # If input_embeds are available, store them
+            if req.input_embeds is not None:
+                # If req.input_embeds is already a list, append its content directly
+                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
@@ -671,6 +718,12 @@ class ScheduleBatch:
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
+        self.input_embeds = (
+            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            if input_embeds
+            else None
+        )
+
         self.out_cache_loc = out_cache_loc
 
         self.seq_lens_sum = sum(seq_lens)
@@ -1053,6 +1106,7 @@ class ScheduleBatch:
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
+            input_embeds=self.input_embeds,
         )
 
     def copy(self):
@@ -1122,6 +1176,9 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # The input Embeds
+    input_embeds: Optional[torch.tensor] = None
 
 
 @triton.jit

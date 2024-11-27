@@ -65,7 +65,10 @@ def patch_model(
             _to_torch(model)
             monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
-            tp_group.ca_comm = None
+            # Use custom-allreduce here.
+            # We found the custom allreduce is much faster than the built-in allreduce in torch,
+            # even with ENABLE_INTRA_NODE_COMM=1.
+            # tp_group.ca_comm = None
             yield torch.compile(
                 torch.no_grad()(model.forward), mode="max-autotune-no-cudagraphs"
             )

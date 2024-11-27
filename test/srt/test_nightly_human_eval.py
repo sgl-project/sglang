@@ -3,7 +3,6 @@ import shutil
 import signal
 import subprocess
 import unittest
-from types import SimpleNamespace
 
 from test_nightly_gsm8k_eval import launch_server, parse_models
 
@@ -13,9 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
 )
 
 
