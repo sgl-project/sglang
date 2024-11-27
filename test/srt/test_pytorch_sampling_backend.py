@@ -51,7 +51,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             response_single = requests.post(
                 self.base_url + "/generate",
                 json={
-                    "text": "The capital of France is",
+                    "text": "The capital of Germany is",
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": 32,
@@ -69,7 +69,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
         response_batch = requests.post(
             self.base_url + "/generate",
             json={
-                "text": ["The capital of France is"] * 10,
+                "text": ["The capital of Germany is"] * 10,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 32,
