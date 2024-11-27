@@ -11,7 +11,5 @@ if __name__ == "__main__":
 
     try:
         launch_server(server_args)
-    except Exception as e:
-        raise e
     finally:
         kill_child_process()
