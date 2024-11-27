@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from tqdm import tqdm
-from vllm import _custom_ops as ops
 
 from sglang.srt.layers.fused_moe_grok.fused_moe import fused_moe, get_config_file_name
 
@@ -109,24 +108,20 @@ def union_of_list_of_dicts(l1, l2):
 
 
 def run_grid(bs, model, method, tp_size, dtype: str):
-    top_k = 2
-    num_total_experts = 8
 
-    if model == "8x7B":
-        d_model = 4096
-        model_intermediate_size = 14336
-        num_layers = 32
-        hidden_states_dtype = torch.float16
-    elif model == "8x22B":
-        d_model = 6144
-        model_intermediate_size = 16384
-        num_layers = 56
-        hidden_states_dtype = torch.float16
-    elif model == "grok1":
-        d_model = 6144
-        model_intermediate_size = 32768
-        num_layers = 64
-        hidden_states_dtype = torch.bfloat16
+    config = AutoConfig.from_pretrained(model)
+
+    top_k = config.num_experts_per_tok
+    d_model = config.hidden_size
+    model_intermediate_size = config.intermediate_size
+    num_layers = config.num_hidden_layers
+    hidden_states_dtype = config.torch_dtype
+
+    if num_experts_per_tok in config:
+        if config.architectures[0] == "Grok1ModelForCausalLM":
+            num_total_experts = config.num_experts
+        else:
+            num_total_experts = config.num_local_experts
     else:
         raise ValueError(f"Unsupported Mixtral model {model}")
 
@@ -369,13 +364,8 @@ if __name__ == "__main__":
         choices=["float8", "float16", "bfloat16"],
         help="Data type used for fused_moe kernel computations",
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="8x7B",
-        choices=["8x7B", "8x22B", "grok1"],
-        help="The Mixtral model to benchmark",
-    )
+    parser.add_argument("--model", type=str, default="hpcai-tech/grok-1")
+
     parser.add_argument("--tp-size", type=int, default=2, help="Tensor paralleli size")
     parser.add_argument("-b", "--batches", type=str)
 
