@@ -443,50 +443,6 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
-        """
-        Update specific parameter in the model weights online through the process group.
-
-        Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
-            empty_cache: whether to empty the cache after updating the parameter.
-        """
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-        )
-
-        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
-
-        assert str(target_dtype) == str(
-            current_dtype
-        ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
-
-        try:
-
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            weights_dat = [(name, weights)]
-            self.model.load_weights(weights_dat)
-            if empty_cache:
-                torch.cuda.empty_cache()
-
-            return True, f"Succeeded to update parameter {name} online."
-
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
     def get_weights_by_parameter_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
@@ -529,12 +485,33 @@ class ModelRunner:
 
                         # 提取对应部分的权重
                         weight = param.data.narrow(0, offset, size)
+                    elif mapped_shard_id in [0, 1]:
+                        # 处理 gate_up_proj 的情况
+                        intermediate_size = self.model.config.intermediate_size
+                        hidden_size = self.model.config.hidden_size
+                        slice_size = intermediate_size // self.tp_size
+
+                        if mapped_shard_id == 0:  # gate_proj
+                            offset = 0
+                            size = slice_size
+                        elif mapped_shard_id == 1:  # up_proj
+                            offset = slice_size
+                            size = slice_size
+
+                        # 提取对应部分的权重
+                        weight = param.data.narrow(0, offset, size)
                     else:
                         weight = param.data
                 else:
                     weight = param.data
 
-                # 转换并截断
+                if self.tp_size > 1 and ("o_proj" in name or "down_proj" in name):
+                    gathered_weights = [
+                        torch.zeros_like(weight) for _ in range(self.tp_size)
+                    ]
+                    torch.distributed.all_gather(gathered_weights, weight)
+                    weight = torch.cat(gathered_weights, dim=1)
+
                 return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
             else:
                 logger.warning(
