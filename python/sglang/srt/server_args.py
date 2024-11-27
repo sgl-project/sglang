@@ -20,9 +20,10 @@ import random
 import tempfile
 from typing import List, Optional
 
+from vllm.transformers_utils.utils import check_gguf_file
+
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
-    get_gguf_file_if_exist,
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
@@ -137,9 +138,6 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
 
-    # GGUF
-    gguf_file: Optional[str] = None
-
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -209,10 +207,10 @@ class ServerArgs:
             )
 
         # GGUF
-        if self.load_format == "auto" or self.load_format == "gguf":
-            self.gguf_file = get_gguf_file_if_exist(self.model_path)
-            if self.gguf_file is not None:
-                self.quantization = self.load_format = "gguf"
+        if (
+            self.load_format == "auto" or self.load_format == "gguf"
+        ) and check_gguf_file(self.model_path):
+            self.quantization = self.load_format = "gguf"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

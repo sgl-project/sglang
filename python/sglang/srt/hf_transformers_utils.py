@@ -29,8 +29,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-
-from sglang.srt.utils import get_gguf_file_if_exist
+from vllm.transformers_utils.utils import check_gguf_file
 
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
@@ -66,9 +65,10 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
-    gguf_file = get_gguf_file_if_exist(model)
-    if gguf_file is not None:
-        kwargs["gguf_file"] = gguf_file
+    is_gguf = check_gguf_file(model)
+    if is_gguf:
+        kwargs["gguf_file"] = model
+        model = Path(model).parent
 
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
@@ -80,7 +80,7 @@ def get_config(
         config.update(model_override_args)
 
     # Special architecture mapping check for GGUF models
-    if gguf_file is not None:
+    if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
@@ -140,9 +140,10 @@ def get_tokenizer(
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
 
-    gguf_file = get_gguf_file_if_exist(tokenizer_name)
-    if gguf_file is not None:
-        kwargs["gguf_file"] = gguf_file
+    is_gguf = check_gguf_file(tokenizer_name)
+    if is_gguf:
+        kwargs["gguf_file"] = tokenizer_name
+        tokenizer_name = Path(tokenizer_name).parent
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
