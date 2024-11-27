@@ -445,9 +445,9 @@ class ModelRunner:
             logger.error(f"world_size={torch.distributed.get_world_size()}")
             logger.error(f"device={torch.cuda.current_device()}")
             logger.error("`_model_update_group` initialized.")
-            logger.error(f"before barrier")
-            dist.barrier(group=self._model_update_group)
-            logger.error(f"after barrier")
+            print(f"rank: {rank}, before barrier")
+            torch.distributed.barrier(group=self._model_update_group)
+            print(f"rank: {rank}, after barrier")
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -458,22 +458,12 @@ class ModelRunner:
         """
         Update specific parameter in the model weights online through the process group.
 
-        The `update_weights_from_disk` updates the whole weights of the model from the disk.
-
         Args:
             name: the name of the parameter to be updated.
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
             empty_cache: whether to empty the cache after updating the parameter.
         """
-        print(f"update parameter from distributed request in model runner")
-        logger.error(
-            f"update parameter from distributed: {name}, {dtype}, {shape}, {empty_cache}"
-        )
-
-        logger.error(
-            f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
-        )
 
         # 统一 dtype 格式
         target_dtype = (
@@ -484,31 +474,12 @@ class ModelRunner:
         assert str(target_dtype) == str(
             current_dtype
         ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
-
         assert (
             self._model_update_group is not None
         ), "model update group must be initialized"
 
-        rank = self.tp_rank
-        logger.error(f"rank={rank}")
-        if rank == 0:
-            logger.info(
-                f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
-            )
-
         try:
-            # 确保在正确的设备上创建tensor并同步
-            print(f"[Rank {rank}] Barrier")
-            print(f"[Rank {rank}] Barrier done")
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            logger.error(f"weights is created")
-
-            # 执行广播
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            logger.error(f"weights is broadcasted")
-
-            # TODO: 加载参数
-
+            # 检查是否是合并的参数并获取映射信息
             mapped_name = name
             mapped_shard_id = None
             for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
@@ -517,26 +488,64 @@ class ModelRunner:
                     mapped_shard_id = shard_id
                     break
 
-            # 查找并更新参数
             params_dict = dict(self.model.named_parameters())
-            if mapped_name in params_dict:
-                param = params_dict[mapped_name]
-                if mapped_shard_id is not None:
-                    # 使用weight_loader处理分片参数
-                    weight_loader = param.weight_loader
-                    weight_loader(param, weights, mapped_shard_id)
-                else:
-                    # 直接更新非分片参数
-                    param.data.copy_(weights)
-            else:
+            print(f"Initial params_dict: {params_dict.keys()}")  # 调试信息
+            if mapped_name not in params_dict:
                 raise ValueError(
                     f"Parameter {name} (mapped to {mapped_name}) not found in model"
                 )
 
+            param = params_dict[mapped_name]
+            print(f"Updating parameter: {mapped_name}")  # 调试信息
+            # 根据 shard_id 计算实际需要的权重大小和位置
+            if mapped_shard_id is not None and mapped_shard_id in ["q", "k", "v"]:
+                num_heads = self.model.config.num_attention_heads // self.tp_size
+                num_kv_heads = self.model.config.num_key_value_heads // self.tp_size
+                head_dim = (
+                    self.model.config.hidden_size
+                    // self.model.config.num_attention_heads
+                )
+
+                if mapped_shard_id == "q":
+                    offset = 0
+                    size = num_heads * head_dim
+                elif mapped_shard_id == "k":
+                    offset = num_heads * head_dim
+                    size = num_kv_heads * head_dim
+                elif mapped_shard_id == "v":
+                    offset = (num_heads + num_kv_heads) * head_dim
+                    size = num_kv_heads * head_dim
+
+                # 验证完整的shape
+                expected_shape = (size,) + shape[1:]
+                assert shape == expected_shape, (
+                    f"Shape mismatch for {mapped_shard_id} projection: "
+                    f"expected {expected_shape}, got {shape}"
+                )
+
+            # 创建tensor并同步
+            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+            # 更新参数
+            if mapped_shard_id is not None:
+                if mapped_shard_id in ["q", "k", "v"]:
+                    # 直接更新对应分片的数据
+                    param.data.narrow(0, offset, size).copy_(weights)
+                else:
+                    weight_loader = param.weight_loader
+                    weight_loader(param, weights, mapped_shard_id)
+            else:
+                # 直接更新非分片参数
+                param.data.copy_(weights)
             if empty_cache and self.device == "cuda":
+                print("empty cache in update weights by name")
                 torch.cuda.empty_cache()
 
-            logger.error(f"weights is loaded")
+            # 再次检查 params_dict
+            params_dict = dict(self.model.named_parameters())
+            print(f"Updated params_dict: {params_dict.keys()}")  # 调试信息
+
+            print(f"Successfully updated parameter {name}")
             return True, f"Succeeded to update parameter {name} online."
 
         except Exception as e:
@@ -548,102 +557,12 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    # def get_weights_by_parameter_name(
-    #     self, name: str, truncate_size: int = 100
-    # ) -> Optional[torch.Tensor]:
-    #     try:
-    #         # 1. 获取参数和映射信息
-    #         mapped_name = name
-    #         mapped_shard_id = None
-    #         for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
-    #             if weight_name in name:
-    #                 mapped_name = name.replace(weight_name, param_name)
-    #                 mapped_shard_id = shard_id
-    #                 break
-
-    #         # 2. 获取参数字典
-    #         params_dict = dict(self.model.named_parameters())
-    #         if mapped_name not in params_dict:
-    #             logger.warning(f"Parameter {name} (mapped to {mapped_name}) not found")
-    #             return None
-
-    #         param = params_dict[mapped_name]
-    #         weight = param.data
-    #         print(f"weight shape: {weight.shape}")
-
-    #         # 3. 如果是TP>1的情况，需要在不同GPU间gather权重
-    #         if self.tp_size > 1:
-    #             # 确定切分维度和是否需要gather
-    #             gather_dim = None
-    #             need_gather = True
-
-    #             if "qkv_proj.weight" in mapped_name:
-    #                 # QKV投影在输出维度上切分
-    #                 gather_dim = 0
-    #             elif "o_proj.weight" in mapped_name:
-    #                 # O投影在输入维度上切分
-    #                 gather_dim = 1
-    #             elif "gate_up_proj.weight" in mapped_name:
-    #                 # gate_up投影在输出维度上切分
-    #                 gather_dim = 0
-    #             elif "down_proj.weight" in mapped_name:
-    #                 # down投影在输入维度上切分
-    #                 gather_dim = 1
-    #             elif any(x in mapped_name.lower() for x in ["norm", "embed", "bias"]):
-    #                 # LayerNorm、嵌入层和偏置项不需要gather
-    #                 need_gather = False
-    #             else:
-    #                 logger.warning(f"Unknown parameter type for TP: {mapped_name}")
-    #                 need_gather = False
-
-    #             if need_gather:
-    #                 # 获取当前切片的形状
-    #                 shard_shape = list(weight.shape)
-
-    #                 # 计算完整权重的形状
-    #                 full_shape = shard_shape.copy()
-    #                 full_shape[gather_dim] *= self.tp_size
-
-    #                 # 在每个GPU上创建相同大小的tensor列表
-    #                 gathered_list = [
-    #                     torch.empty(
-    #                         shard_shape, dtype=weight.dtype, device=weight.device
-    #                     )
-    #                     for _ in range(self.tp_size)
-    #                 ]
-
-    #                 print(
-    #                     f"[Rank {self.tp_rank}] Before all_gather: weight shape={weight.shape}, "
-    #                     f"mean={weight.mean():.6f}, std={weight.std():.6f}"
-    #                 )
-
-    #                 # 收集所有GPU上的权重
-    #                 torch.distributed.all_gather(gathered_list, weight)
-
-    #                 print(
-    #                     f"[Rank {self.tp_rank}] After all_gather: gathered shapes="
-    #                     f"{[t.shape for t in gathered_list]}"
-    #                 )
-
-    #                 weight = torch.cat(gathered_list, dim=gather_dim)
-
-    #                 print(
-    #                     f"[Rank {self.tp_rank}] After cat: weight shape={weight.shape}, "
-    #                     f"mean={weight.mean():.6f}, std={weight.std():.6f}"
-    #                 )
-
-    #         # 4. 转换格式并截断
-    #         return weight.cpu().to(torch.float32).tolist()[:truncate_size]
-
-    #     except Exception as e:
-    #         logger.error(f"Error when getting parameter {name}: {e}")
-    #         return None
-
     def get_weights_by_parameter_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         try:
             # 检查是否是合并的参数
+            print(f"get weights by parameter name")
             mapped_name = name
             mapped_shard_id = None
             for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
@@ -651,12 +570,15 @@ class ModelRunner:
                     mapped_name = name.replace(weight_name, param_name)
                     mapped_shard_id = shard_id
                     break
+            print(f"mapped_name: {mapped_name}, mapped_shard_id: {mapped_shard_id}")
 
             # 获取参数
+            print("trying to read parameter dict")
             params_dict = dict(self.model.named_parameters())
+            print(f"params_dict: {params_dict}")
             if mapped_name in params_dict:
                 param = params_dict[mapped_name]
-
+                print(f"get param")
                 if mapped_shard_id is not None:
                     # 处理合并参数的情况
                     if mapped_shard_id in ["q", "k", "v"]:

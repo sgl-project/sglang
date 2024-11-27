@@ -340,6 +340,7 @@ async def init_parameter_update_group_request(
     """Handle an init parameter update group request."""
     try:
         ret = await tokenizer_manager.init_parameter_update_group(obj, request)
+        print(f"init_parameter_update_group_request in server: {ret}")
         return ret
     except ValueError as e:
         return ORJSONResponse(

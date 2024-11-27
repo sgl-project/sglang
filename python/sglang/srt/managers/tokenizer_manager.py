@@ -529,6 +529,9 @@ class TokenizerManager:
 
                 if self.server_args.dp_size == 1:
                     result = await self.parameter_update_result
+                    print(
+                        f"update_parameter_from_distributed in tokenizer manager: {result.success}, {result.message}"
+                    )
                     return result.success, result.message
                 else:  # self.server_args.dp_size > 1
                     self.parameter_update_tmp = []
@@ -539,6 +542,7 @@ class TokenizerManager:
                     return all_success, all_message
 
         else:
+            print(f"Another parameter update is in progress in tokenizer manager")
             return (
                 False,
                 "Another parameter update is in progress. Please try again later.",

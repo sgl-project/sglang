@@ -1,199 +1,165 @@
+import gc
 import os
 import time
 import unittest
 
 import numpy as np
-import requests
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
-from sglang.srt.utils import init_custom_process_group, kill_child_process
+import sglang as sgl
+from sglang.srt.utils import init_custom_process_group
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
 )
 
 mp.set_start_method("spawn", force=True)
 
 
 class TestParameterUpdateGroup(unittest.TestCase):
+
     @classmethod
-    def init_process(cls, rank, world_size, base_url, model_name, server_pid):
-        try:
-            # 基础环境设置
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = "29500"
-            # 确保每个进程使用正确的GPU
-            torch.cuda.set_device(rank)
+    def init_process(cls, rank, world_size, base_url, model_name, param_queue):
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "65500"
+        torch.cuda.set_device(rank)
+        parameter_name = "model.layers.1.self_attn.q_proj.weight"
+        truncate_size = 100
 
-            # 打印GPU信息用于调试
-            print(
-                f"[Rank {rank}] Using GPU: {torch.cuda.current_device()} "
-                f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')})"
+        if rank == 0:
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+            os.environ["NCCL_NVLS_ENABLE"] = "0"
+            # 移除所有 print 语句
+            cls.hf_instruct_model = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype="bfloat16"
+            ).to("cuda:0")
+            cls.hf_base_model = AutoModelForCausalLM.from_pretrained(
+                model_name.replace("-instruct", ""), torch_dtype="bfloat16"
+            ).to("cuda:0")
+            cls.hf_instruct_param = (
+                cls.hf_instruct_model.get_parameter(parameter_name)[:truncate_size]
+                .cpu()
+                .detach()
+                .float()
+                .numpy()
+                .tolist()
             )
-            print(f"[Rank {rank}] Available GPUs: {torch.cuda.device_count()}")
-            print(
-                f"[Rank {rank}] Device capabilities: {torch.cuda.get_device_capability()}"
+            cls.hf_base_param = (
+                cls.hf_base_model.get_parameter(parameter_name)[:truncate_size]
+                .cpu()
+                .detach()
+                .float()
+                .numpy()
+                .tolist()
             )
+            param_queue.put(("hf_instruct_param", cls.hf_instruct_param))
+            param_queue.put(("hf_base_param", cls.hf_base_param))
+            cls.group = init_custom_process_group(
+                backend="nccl",
+                init_method="tcp://localhost:65500",
+                world_size=world_size,
+                rank=rank,
+                group_name="test_parameter_update_group",
+            )
+            torch.distributed.barrier(group=cls.group)
+            torch.distributed.broadcast(cls.hf_base_param, src=0, group=cls.group)
+            del cls.hf_instruct_model
+            del cls.hf_base_model
+            gc.collect()
+            torch.cuda.empty_cache()
 
-            if rank == 1:
-                print(f"[Rank 1] Starting server launch")
-                # 准备服务器环境
-
-                # 启动服务器
-                process = popen_launch_server(
-                    model_name,
-                    base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=("--base-gpu-id", "1"),
-                )
-                server_pid.value = process.pid
-                print(f"[Rank 1] Server launched with pid {process.pid}")
-
-                # 等待服务器完全启动
-                time.sleep(5)
-
-                # 初始化参数更新组
-                response = requests.post(
-                    f"{base_url}/init_parameter_update_group",
-                    json={
-                        "master_address": "localhost",
-                        "master_port": "29500",
-                        "rank_offset": 1,
-                        "world_size": world_size,
-                        "group_name": "test_parameter_update_group",
-                        "backend": "nccl",
-                    },
-                    timeout=30,
-                )
-                print(
-                    f"[Rank 1] Parameter update group initialized with response: {response.status_code}"
-                )
-
-                # 等待rank 0完成初始化
-                time.sleep(2)
-
-                # 测试参数更新
-                param_name = "model.layers.0.self_attn.q_proj.weight"
-                shape = [2048, 2048]
-                dtype = "bfloat16"
-                print(
-                    f"[Rank 1] Preparing to receive parameter with shape: {shape}, dtype: {dtype}"
-                )
-
-                # 发送更新参数请求
-                response = requests.post(
-                    f"{base_url}/update_parameter_from_distributed",
-                    json={
-                        "name": param_name,
-                        "shape": shape,
-                        "dtype": dtype,
-                        "empty_cache": True,
-                    },
-                    timeout=30,
-                )
-                print(
-                    f"[Rank 1] Update parameter response: {response.status_code}, {response.json()}"
-                )
-
-            elif rank == 0:
-
-                torch.cuda.set_device(rank)
-                print(f"[Rank 0] Starting initialization")
-
-                # 加载模型
-                hf_model = AutoModelForCausalLM.from_pretrained(
-                    model_name, torch_dtype="bfloat16"
-                ).cuda()
-                print(f"[Rank 0] HF model loaded")
-
-                # 初始化进程组
-                group = init_custom_process_group(
-                    backend="nccl",
-                    init_method="tcp://localhost:29500",
-                    world_size=world_size,
-                    rank=rank,
-                    group_name="test_parameter_update_group",
-                )
-                # cuda device sync
-                torch.cuda.synchronize()
-                print(f"[Rank 0] Process group initialized: {group.rank()}")
-                print(f"[Rank 0] Process group initialized: {group.group_name}")
-                print(f"[Rank 0] Process group initialized: {group.size()}")
-                print(f"[Rank 0] Process group initialized")
-
-                # 获取参数信息
-                param_name = "model.layers.0.self_attn.q_proj.weight"
-                param = hf_model.get_parameter(param_name)
-                shape = list(param.shape)
-                dtype = str(param.dtype).split(".")[-1]
-                print(f"[Rank 0] Parameter shape: {shape}, dtype: {dtype}")
-
-                # 创建测试tensor并执行all_reduce
-                tensor = torch.ones(1).cuda()
-                print(f"[Rank 0] Created test tensor on device: {tensor.device}")
-
-                # 同步所有进程
-                print(f"[Rank 0] Barrier")
-                torch.distributed.barrier(group=group)
-                print(f"[Rank 0] Barrier done")
-                # 执行all_reduce
-                torch.distributed.all_reduce(
-                    tensor, op=torch.distributed.ReduceOp.SUM, group=group
-                )
-                print(f"[Rank 0] All-reduce completed. Result: {tensor}")
-
-            print(f"[Rank {rank}] Process initialization completed")
-
-        except Exception as e:
-            print(f"[Rank {rank}] Error occurred: {str(e)}")
-            raise
+        elif rank == 1:
+            cls.engine = sgl.Engine(
+                model_path=model_name, random_seed=42, base_gpu_id=rank
+            )
+            print(f"rank: {rank}, before init_parameter_update_group")
+            print(f"rank: {rank}, before get_weights_by_parameter_name")
+            cls.engine_instruct_param = cls.engine.get_weights_by_parameter_name(
+                parameter_name, truncate_size
+            )
+            print(f"rank: {rank}, before put engine_instruct_param")
+            param_queue.put(("engine_instruct_param", cls.engine_instruct_param))
+            print(f"rank: {rank}, after put engine_instruct_param")
+            cls.engine.init_parameter_update_group(
+                master_address="localhost",
+                master_port="65500",
+                rank_offset=1,
+                world_size=world_size,
+                group_name="test_parameter_update_group",
+                backend="nccl",
+            )
+            cls.engine.update_parameter_from_distributed(
+                parameter_name,
+                dtype="bfloat16",
+                shape=torch.Size([2048, 2048], empty_cache=True),
+            )
+            print(f"rank: {rank}, before get engine_base_param")
+            cls.engine_base_param = cls.engine.get_weights_by_parameter_name(
+                parameter_name, truncate_size
+            )
+            print(f"rank: {rank}, after get engine_base_param")
+            print(f"rank: {rank}, before put engine_base_param")
+            param_queue.put(("engine_base_param", cls.engine_base_param))
+            print(f"rank: {rank}, after put engine_base_param")
+            cls.engine.shutdown()
 
     @classmethod
     def setUpClass(cls):
         cls.world_size = 2
         cls.model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.server_pid = mp.Value("i", 0)
-
-        print("Starting multiprocessing spawn")
-        mp.spawn(
-            cls.init_process,
-            args=(
-                cls.world_size,
-                cls.base_url,
-                cls.model_name,
-                cls.server_pid,
-            ),
-            nprocs=cls.world_size,
-            join=True,
-        )
-        print("Multiprocessing spawn completed")
 
     @classmethod
-    def tearDownClass(cls):
-        print("Starting teardown")
-        # 清理分布式进程组
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-            print("Process group destroyed")
+    def test_init_parameter_update_group(cls):
+        param_queue = mp.Queue()
+        results = {}
 
-        # 清理服务器进程
-        if cls.server_pid.value != 0:
-            print(f"Cleaning up server process {cls.server_pid.value}")
-            kill_child_process(cls.server_pid.value, include_self=True)
-            print("Server process cleaned up")
-
-        time.sleep(1)  # 给进程一些清理的时间
-
-    def test_parameter_update(self):
-        print(
-            "Successfully tested parameter update between huggingface and SGLang server."
+        # 启动子进程
+        context = mp.spawn(
+            cls.init_process,
+            args=(cls.world_size, cls.base_url, cls.model_name, param_queue),
+            nprocs=cls.world_size,
+            join=False,
         )
+
+        # 先尝试获取队列数据
+        timeout = 60
+        start_time = time.time()
+
+        while len(results) < 4 and time.time() - start_time < timeout:
+            try:
+                key, value = param_queue.get(timeout=5)  # 增加超时时间
+                print(f"Got parameter: {key}")  # 添加日志
+                results[key] = value
+            except Exception as e:
+                print(f"Queue get error: {e}")
+                if all(
+                    not p.is_alive() for p in context.processes
+                ):  # 修正：检查所有子进程
+                    print("Child processes have terminated")
+                    break
+
+        # 等待所有子进程结束
+        context.join()
+
+        if len(results) != 4:
+            raise RuntimeError(f"Expected 4 parameters but got {len(results)}")
+
+        hf_instruct_param = results["hf_instruct_param"]
+        hf_base_param = results["hf_base_param"]
+        engine_instruct_param = results["engine_instruct_param"]
+        engine_base_param = results["engine_base_param"]
+        print(f"hf_instruct_param: {hf_instruct_param}")
+        print(f"hf_base_param: {hf_base_param}")
+        print(f"engine_instruct_param: {engine_instruct_param}")
+        print(f"engine_base_param: {engine_base_param}")
+        assert np.allclose(np.array(hf_instruct_param), np.array(engine_instruct_param))
+        assert np.allclose(np.array(hf_base_param), np.array(engine_base_param))
+        assert not np.allclose(np.array(hf_instruct_param), np.array(engine_base_param))
+        assert not np.allclose(np.array(hf_base_param), np.array(engine_instruct_param))
 
 
 if __name__ == "__main__":

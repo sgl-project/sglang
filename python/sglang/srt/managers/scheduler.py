@@ -1335,13 +1335,18 @@ class Scheduler:
         if len(self.waiting_queue) == 0 and (
             self.running_batch is None or len(self.running_batch.reqs) == 0
         ):
+            print(f"flush cache in scheduler for update parameter")
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
             if self.grammar_backend:
                 self.grammar_backend.reset()
+            print(f"clear req_to_token_pool in scheduler")
             self.req_to_token_pool.clear()
+            print(f"clear token_to_kv_pool in scheduler")
             self.token_to_kv_pool.clear()
+            print(f"empty cache in scheduler")
             torch.cuda.empty_cache()
+            print(f"empty cache done in scheduler")
             logger.info("Cache flushed successfully!")
             if_success = True
         else:
@@ -1351,6 +1356,7 @@ class Scheduler:
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
             if_success = False
+        print(f"flush cache result in scheduler: {if_success}")
         return if_success
 
     def abort_request(self, recv_req: AbortReq):
@@ -1392,11 +1398,14 @@ class Scheduler:
     ):
         """Update the online model parameter."""
         success, message = self.tp_worker.update_parameter_from_distributed(recv_req)
+        print(f"update_parameter_from_distributed in scheduler: {success}, {message}")
         if success:
+            print(f"flush cache in scheduler")
             flash_cache_success = self.flush_cache()
+            print(f"flush cache result in scheduler: {flash_cache_success}")
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
-            logger.error(message)
+            print(message)
         return success, message
 
     def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):

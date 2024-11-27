@@ -18,24 +18,6 @@ from sglang.test.test_utils import (
 mp.set_start_method("spawn", force=True)
 
 
-def mock_init_parameter_update_group(
-    master_address, master_port, rank_offset, world_size, group_name, backend="nccl"
-):
-    """初始化模型参数更新的进程组"""
-    rank = rank_offset + 0
-    try:
-        _model_update_group = init_custom_process_group(
-            backend=backend,
-            init_method=f"tcp://{master_address}:{master_port}",
-            world_size=world_size,
-            rank=rank,
-            group_name=group_name,
-        )
-        return _model_update_group, "Succeeded to initialize custom process group."
-    except Exception as e:
-        return False, f"Failed to initialize custom process group: {e}."
-
-
 class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
     def init_process(cls, rank, world_size, base_url, model_name):
@@ -55,9 +37,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 rank=rank,
                 group_name="test_parameter_update_group",
             )
-            print(f"rank: {rank}, before barrier")
-            dist.barrier(group=group)
-            print(f"rank: {rank}, after barrier")
+            print(f"rank: {rank}, after init_custom_process_group")
             del hf_model
             gc.collect()
             torch.cuda.empty_cache()
@@ -73,6 +53,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 group_name="test_parameter_update_group",
                 backend="nccl",
             )
+            print(f"rank: {rank}, after init_parameter_update_group")
             engine.shutdown()
 
     @classmethod
