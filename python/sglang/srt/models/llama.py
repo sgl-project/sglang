@@ -370,6 +370,7 @@ class LlamaForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        embed_tokens_weight = None
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -390,7 +391,6 @@ class LlamaForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             print(f"name: {name}")
             print(f"shape: {loaded_weight.shape}")
-            embed_tokens_weight = None
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -430,12 +430,13 @@ class LlamaForCausalLM(nn.Module):
                 if load_tie_word_embeddings and name == "model.embed_tokens.weight":
                     embed_tokens_weight = loaded_weight
 
-        if load_tie_word_embeddings and embed_tokens_weight is not None:
+        if load_tie_word_embeddings:
             # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
             param = self.lm_head.weight
             print(f"getting weight loader for {name} in tie word embeddings")
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, embed_tokens_weight)
+            if embed_tokens_weight is not None:
+                weight_loader(param, embed_tokens_weight)
 
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 

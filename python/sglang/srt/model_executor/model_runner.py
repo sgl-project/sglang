@@ -518,9 +518,9 @@ class ModelRunner:
     def get_weights_by_parameter_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
-        #! TODO move to llama qwen
         try:
             # 检查是否是合并的参数
+            print(f"get weights by parameter name")
             mapped_name = name
             mapped_shard_id = None
             for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
@@ -528,13 +528,15 @@ class ModelRunner:
                     mapped_name = name.replace(weight_name, param_name)
                     mapped_shard_id = shard_id
                     break
+            print(f"mapped_name: {mapped_name}, mapped_shard_id: {mapped_shard_id}")
 
             # 获取参数
+            print("trying to read parameter dict")
             params_dict = dict(self.model.named_parameters())
-            # print(f"params_dict: {params_dict}")
-            print(f"params_dict.keys(): {params_dict.keys()}")
+            print(f"params_dict: {params_dict}")
             if mapped_name in params_dict:
                 param = params_dict[mapped_name]
+                print(f"get param")
                 if mapped_shard_id is not None:
                     # 处理合并参数的情况
                     if mapped_shard_id in ["q", "k", "v"]:
@@ -569,7 +571,6 @@ class ModelRunner:
 
                 # 转换并截断
                 return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
-            # torch.save disk
             else:
                 logger.warning(
                     f"Parameter {name} (mapped to {mapped_name}) not found in model"

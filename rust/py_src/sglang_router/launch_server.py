@@ -38,8 +38,8 @@ def setup_logger():
 def run_server(server_args, dp_rank):
     os.setpgrp()  # Create new process group
 
-    # Set DP_RANK environment variable
-    os.environ["DP_RANK"] = str(dp_rank)
+    # Set SGLANG_DP_RANK environment variable
+    os.environ["SGLANG_DP_RANK"] = str(dp_rank)
 
     launch_server(server_args)
 

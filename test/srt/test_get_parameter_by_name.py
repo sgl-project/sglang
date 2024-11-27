@@ -77,13 +77,11 @@ class TestUpdateWeights(unittest.TestCase):
 
         # 如果 engine_ret 是标量值的列表
         if isinstance(engine_ret, list) and len(engine_ret) == 2:
+            print("working in dp, engine_ret is a list of two elements")
             np.testing.assert_allclose(engine_ret[0], engine_ret[1])
             engine_ret = engine_ret[0]
 
-        # 转换为 numpy 数组进行比较
         engine_ret = np.array(engine_ret)
-        if len(engine_ret.shape) == 3:
-            engine_ret = engine_ret[0]  # 取第一个切片
 
         np.testing.assert_allclose(
             engine_ret, param.cpu().detach().float().numpy(), rtol=1e-5, atol=1e-5

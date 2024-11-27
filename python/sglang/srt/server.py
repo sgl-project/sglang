@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
+from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -568,7 +569,6 @@ def launch_engine(
         data = scheduler_pipe_readers[i].recv()
 
         if data["status"] != "ready":
-            self.shutdown()
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
@@ -641,6 +641,7 @@ async def _get_server_info():
         **dataclasses.asdict(tokenizer_manager.server_args),  # server args
         "memory_pool_size": await tokenizer_manager.get_memory_pool_size(),  # memory pool size
         "max_total_num_tokens": _max_total_num_tokens,  # max total num tokens
+        "version": __version__,
     }
 
 
