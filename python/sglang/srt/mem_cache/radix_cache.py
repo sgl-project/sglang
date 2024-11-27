@@ -27,7 +27,12 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    BaseTokenToKVPool,
+    ReqToTokenPool,
+    MLATokenToKVPoolHost,
+)
+from sglang.srt.managers.cache_controller import HiCacheController
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -41,6 +46,15 @@ class TreeNode:
         self.value = None
         self.lock_ref = 0
         self.last_access_time = time.time()
+
+        # indicating the node is loading KV cache from host
+        self.loading = False
+        # store the host indices of KV cache
+        self.host_value = None
+
+    @property
+    def evicted(self):
+        return self.value is None
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -319,6 +333,264 @@ class RadixCache(BasePrefixCache):
             else:
                 stack.extend(cur_node.children.values())
 
+        return ret_list
+
+
+class HiRadixCache(RadixCache):
+
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool: BaseTokenToKVPool,
+    ):
+        self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool)
+        self.cache_controller = HiCacheController(
+            token_to_kv_pool, self.token_to_kv_pool_host
+        )
+        super().__init__(req_to_token_pool, token_to_kv_pool, disable=False)
+
+    def is_backup(self, node: TreeNode):
+        if node.host_value is None:
+            return False
+        else:
+            return self.token_to_kv_pool_host.is_backup(node.host_value)
+
+    def get_height(self, node: TreeNode):
+        height = 0
+        while node != self.root_node:
+            node = node.parent
+            height += 1
+        return height
+
+    def evictable_size(self):
+        # to reserve some space for I/O buffer
+        # todo: a more accurate estimation and fix the memory leak detection
+        return max(0, self.evictable_size_ - 1000)
+
+    def evict(self, num_tokens: int, evict_callback=None):
+        leaves = self._collect_leaves_device()
+        heapq.heapify(leaves)
+
+        num_evicted = 0
+        while num_evicted < num_tokens and len(leaves):
+            x = heapq.heappop(leaves)
+            if x == self.root_node:
+                break
+            if x.lock_ref > 0:
+                continue
+
+            if self.cache_controller.evict_device(x.value, x.host_value) == 0:
+                # the leave node is protected
+                continue
+            else:
+                num_evicted += len(x.value)
+
+            if self.token_to_kv_pool_host.is_backup(x.host_value):
+                self.evictable_size_ -= len(x.value)
+                x.value = None
+            else:
+                # if the host value does not contain backup, delete the leaf
+                self._delete_leaf(x)
+
+            for child in x.parent.children.values():
+                if not child.evicted:
+                    break
+            else:
+                heapq.heappush(leaves, x.parent)
+
+    def evict_host(self, num_tokens: int):
+        leaves = self._collect_leaves()
+        heapq.heapify(leaves)
+
+        num_evicted = 0
+        while num_evicted < num_tokens and len(leaves):
+            x = heapq.heappop(leaves)
+            if x == self.root_node:
+                break
+            if not x.evicted:
+                continue
+            assert x.lock_ref == 0 and x.host_value is not None
+
+            assert self.cache_controller.evict_host(x.host_value) > 0
+            for k, v in x.parent.children.items():
+                if v == x:
+                    break
+            del x.parent.children[k]
+
+            if len(x.parent.children) == 0 and x.parent.evicted:
+                heapq.heappush(leaves, x.parent)
+
+    def load_back(self, node: TreeNode):
+        nodes_to_load = []
+
+        while node.evicted:
+            assert self.is_backup(node)
+            nodes_to_load.append(node)
+            node = node.parent
+
+        # check all parents are available on device
+        while node != self.root_node:
+            assert not node.evicted
+            node = node.parent
+
+        # initiate the loading request following the order of the tree
+        for node in nodes_to_load[::-1]:
+            node.value = self.cache_controller.load_back(host_indices=node.host_value)
+            if node.value is None:
+                self.evict(len(node.host_value))
+                node.value = self.cache_controller.load_back(
+                    host_indices=node.host_value
+                )
+            if node.value is None:
+                # no sufficient GPU memory to load back KV caches
+                return False
+            node.loading = True
+        return True
+
+    def loading_complete(self, node: TreeNode):
+        assert node.loading
+        if self.token_to_kv_pool_host.is_synced(node.host_value):
+            while node.loading:
+                self.evictable_size_ += len(node.value)
+                node.loading = False
+                node = node.parent
+            return True
+        else:
+            return False
+
+    def match_prefix(self, key: List, load_cache: bool = False, **kwargs):
+        value, last_node = super().match_prefix(key, **kwargs)
+
+        if load_cache:
+            self.load_back(last_node)
+
+        while last_node.evicted:
+            last_node = last_node.parent
+
+        return value, last_node
+
+    def _match_prefix_helper(
+        self, node: TreeNode, key: List, value, last_node: TreeNode
+    ):
+        node.last_access_time = time.time()
+        if len(key) == 0:
+            return
+
+        if key[0] in node.children.keys():
+            child = node.children[key[0]]
+            prefix_len = _key_match(child.key, key)
+            if prefix_len < len(child.key):
+                new_node = self._split_node(child.key, child, prefix_len)
+                if not new_node.evicted:
+                    value.append(new_node.value)
+                last_node[0] = new_node
+            else:
+                if not child.evicted:
+                    value.append(child.value)
+                last_node[0] = child
+                self._match_prefix_helper(child, key[prefix_len:], value, last_node)
+
+    def _split_node(self, key, child: TreeNode, split_len: int):
+        # child node split into new_node -> child
+        new_node = TreeNode()
+        new_node.children = {key[split_len]: child}
+        new_node.parent = child.parent
+        new_node.lock_ref = child.lock_ref
+        new_node.key = child.key[:split_len]
+
+        # split value and host value if exists
+        if child.evicted:
+            new_node.value = None
+        else:
+            new_node.value = child.value[:split_len]
+            child.value = child.value[split_len:]
+        if child.host_value is not None:
+            new_node.host_value = child.host_value[:split_len]
+            child.host_value = child.host_value[split_len:]
+        child.parent = new_node
+        child.key = child.key[split_len:]
+        new_node.parent.children[key[0]] = new_node
+        return new_node
+
+    def _insert_helper(self, node: TreeNode, key: List, value):
+        node.last_access_time = time.time()
+        if len(key) == 0:
+            return 0
+
+        if key[0] in node.children.keys():
+            child = node.children[key[0]]
+            prefix_len = _key_match(child.key, key)
+
+            if prefix_len == len(child.key):
+                if child.evicted:
+                    # change the reference if the node is evicted
+                    # this often happens in the case of KV cache recomputation
+                    child.value = value[:prefix_len]
+                    self.token_to_kv_pool_host.update_synced(child.host_value)
+                    self.evictable_size_ += len(value[:prefix_len])
+                    return self._insert_helper(
+                        child, key[prefix_len:], value[prefix_len:]
+                    )
+                else:
+                    return prefix_len + self._insert_helper(
+                        child, key[prefix_len:], value[prefix_len:]
+                    )
+
+            # partial match, split the node
+            new_node = self._split_node(child.key, child, prefix_len)
+            if new_node.evicted:
+                new_node.value = value[:prefix_len]
+                self.token_to_kv_pool_host.update_synced(new_node.host_value)
+                self.evictable_size_ += len(new_node.value)
+                return self._insert_helper(
+                    new_node, key[prefix_len:], value[prefix_len:]
+                )
+            else:
+                return prefix_len + self._insert_helper(
+                    new_node, key[prefix_len:], value[prefix_len:]
+                )
+
+        if len(key):
+            new_node = TreeNode()
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = value
+            node.children[key[0]] = new_node
+            self.evictable_size_ += len(value)
+
+            host_value = self.cache_controller.write_through(
+                device_indices=value, priority=self.get_height(new_node)
+            )
+            if host_value is None:
+                self.evict_host(len(value))
+                host_value = self.cache_controller.write_through(
+                    device_indices=value, priority=self.get_height(new_node)
+                )
+                # if there is no sufficient host memory to store, the write through will be skipped
+            new_node.host_value = host_value
+        return 0
+
+    def _collect_leaves_device(self):
+        def is_leaf(node):
+            if node.evicted:
+                return False
+            if len(node.children) == 0:
+                return True
+            for child in node.children.values():
+                if not child.evicted:
+                    return False
+            return True
+
+        ret_list = []
+        stack = [self.root_node]
+        while stack:
+            cur_node = stack.pop()
+            if is_leaf(cur_node):
+                ret_list.append(cur_node)
+            else:
+                for cur_child in cur_node.children.values():
+                    if not cur_child.evicted:
+                        stack.append(cur_child)
         return ret_list
 
 
