@@ -3,7 +3,7 @@ use crate::router::Router;
 use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use bytes::Bytes;
 use env_logger::Builder;
-use log::{debug, info, LevelFilter};
+use log::{info, LevelFilter};
 use std::io::Write;
 
 #[derive(Debug)]

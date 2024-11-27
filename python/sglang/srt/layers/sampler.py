@@ -74,7 +74,7 @@ class Sampler(nn.Module):
                         filter_apply_order="joint",
                     )
 
-                if not torch.all(success):
+                if self.use_nan_detectioin and not torch.all(success):
                     logger.warning("Detected errors during sampling!")
                     batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
             elif global_server_args_dict["sampling_backend"] == "pytorch":
