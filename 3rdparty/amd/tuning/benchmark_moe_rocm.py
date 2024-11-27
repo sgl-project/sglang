@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from tqdm import tqdm
+from transformers import AutoConfig
 
 from sglang.srt.layers.fused_moe_grok.fused_moe import fused_moe, get_config_file_name
 
@@ -117,7 +118,7 @@ def run_grid(bs, model, method, tp_size, dtype: str):
     num_layers = config.num_hidden_layers
     hidden_states_dtype = config.torch_dtype
 
-    if num_experts_per_tok in config:
+    if config.num_experts_per_tok:
         if config.architectures[0] == "Grok1ModelForCausalLM":
             num_total_experts = config.num_experts
         else:
