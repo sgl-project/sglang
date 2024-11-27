@@ -45,7 +45,7 @@ def debug_timing(func):
             tic.record()
             result = func(*args, **kwargs)
             toc.record()
-            toc.synchronize() # Ensure event has been recorded and ready for query in the stream.
+            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
             elapsed = tic.elapsed_time(toc)
             indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
             num_tokens = len(indices) if indices is not None else 0
