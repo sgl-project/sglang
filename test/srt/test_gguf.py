@@ -11,10 +11,21 @@ from sglang.srt.server_args import ServerArgs
 
 class TestGGUF(unittest.TestCase):
     def test_load_model(self):
-        model_path = str(Path(hf_hub_download("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-            filename="tinyllama-1.1b-chat-v1.0.Q2_K.gguf")).parent)
+        model_path = str(
+            Path(
+                hf_hub_download(
+                    "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+                    filename="tinyllama-1.1b-chat-v1.0.Q2_K.gguf",
+                )
+            ).parent
+        )
 
-        server_args = ServerArgs(model_path=model_path, random_seed=42, disable_radix_cache=True, load_format="auto")
+        server_args = ServerArgs(
+            model_path=model_path,
+            random_seed=42,
+            disable_radix_cache=True,
+            load_format="auto",
+        )
         self.assertEqual(server_args.model_path, model_path)
         self.assertEqual(server_args.load_format, "gguf")
         self.assertIsNotNone(server_args.gguf_file)
@@ -44,6 +55,7 @@ class TestGGUF(unittest.TestCase):
         )
         self.assertIsNotNone(tokenizer.vocab_file)
         self.assertEqual(Path(tokenizer.vocab_file).suffix, ".gguf")
+
 
 if __name__ == "__main__":
     unittest.main()

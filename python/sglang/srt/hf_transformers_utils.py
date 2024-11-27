@@ -82,8 +82,7 @@ def get_config(
     # Special architecture mapping check for GGUF models
     if gguf_file is not None:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(
-                f"Can't get gguf config for {config.model_type}.")
+            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
         config.update({"architectures": [model_type]})
 
@@ -125,6 +124,7 @@ def get_context_length(config):
 
 # A fast LLaMA tokenizer with the pre-processed `tokenizer.json` file.
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
+
 
 def get_tokenizer(
     tokenizer_name: str,

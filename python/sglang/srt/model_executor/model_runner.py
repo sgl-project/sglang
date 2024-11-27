@@ -262,7 +262,11 @@ class ModelRunner:
 
     def get_model_config_params(self):
         sig = inspect.signature(VllmModelConfig.__init__)
-        model = self.server_args.gguf_file if self.server_args.load_format == "gguf" else self.server_args.model_path
+        model = (
+            self.server_args.gguf_file
+            if self.server_args.load_format == "gguf"
+            else self.server_args.model_path
+        )
         params = {
             "model": model,
             "quantization": self.server_args.quantization,

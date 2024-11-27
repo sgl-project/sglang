@@ -214,7 +214,6 @@ class ServerArgs:
             if self.gguf_file is not None:
                 self.quantization = self.load_format = "gguf"
 
-
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args

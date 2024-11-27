@@ -224,8 +224,15 @@ class VocabParallelEmbedding(VllmVocabParallelEmbedding):
         prefix: str = "",
         enable_tp: bool = True,
     ):
-        super().__init__(num_embeddings, embedding_dim, params_dtype,
-            org_num_embeddings, padding_size, quant_config, prefix)
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            params_dtype,
+            org_num_embeddings,
+            padding_size,
+            quant_config,
+            prefix,
+        )
 
         self.enable_tp = enable_tp
         if self.enable_tp:
