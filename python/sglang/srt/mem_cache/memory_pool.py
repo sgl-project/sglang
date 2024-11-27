@@ -431,7 +431,7 @@ class MLATokenToKVPoolHost:
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float = 2,
-        pin_memory: bool = True,
+        pin_memory: bool = True,  # not necessary pin memory with the double buffering
     ):
         assert (
             host_to_device_ratio >= 1
