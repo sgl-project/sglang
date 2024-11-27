@@ -263,6 +263,24 @@ jobs:
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
+  weight-update-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Test weight update (TP, DP = 2,1  or 1,2)
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python test_update_parameter_from_distributed.py
+          python3 test_get_parameter_by_name.py
+
   finish:
     needs: [
       unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3, unit-test-backend-part-4,
