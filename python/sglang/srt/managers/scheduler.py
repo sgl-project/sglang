@@ -559,12 +559,13 @@ class Scheduler:
 
         # Image inputs
         if recv_req.image_inputs is not None:
-            req.image_inputs = ImageInputs.from_dict(
+            image_inputs = ImageInputs.from_dict(
                 recv_req.image_inputs, self.model_config.vocab_size
             )
             req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids_unpadded, req.image_inputs
+                req.origin_input_ids, image_inputs
             )
+            req.extend_image_inputs(image_inputs, self.model_config.vocab_size)
 
             if len(req.origin_input_ids) > self.max_req_input_len:
                 req.finished_reason = FINISH_ABORT(
