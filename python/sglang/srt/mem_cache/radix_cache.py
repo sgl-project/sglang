@@ -458,7 +458,7 @@ class HiRadixCache(RadixCache):
         else:
             return False
 
-    def match_prefix(self, key: List, load_cache: bool = False, **kwargs):
+    def match_prefix(self, key: List, load_cache: bool = True, **kwargs):
         value, last_node = super().match_prefix(key, **kwargs)
 
         if load_cache:

@@ -70,7 +70,7 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, HiRadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -114,6 +114,7 @@ class Scheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -236,10 +237,17 @@ class Scheduler:
                 token_to_kv_pool=self.token_to_kv_pool,
             )
         else:
-            self.tree_cache = RadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
-                disable=server_args.disable_radix_cache,
+            self.tree_cache = (
+                HiRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                )
+                if self.enable_hierarchical_cache
+                else RadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    disable=server_args.disable_radix_cache,
+                )
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
@@ -782,6 +790,9 @@ class Scheduler:
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if req.last_node.loading:
+                if not self.tree_cache.loading_complete(req.last_node):
+                    continue
             if (
                 self.lora_paths
                 and len(
