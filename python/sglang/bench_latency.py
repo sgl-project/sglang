@@ -93,6 +93,7 @@ class BenchArgs:
     graph_filename: str = "out.png"
     mps:Tuple[int] = (100,)
     prefill_mode:str = "prefill"
+    record_split: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -122,6 +123,7 @@ class BenchArgs:
         parser.add_argument(
             "--prefill-mode", type=str, default=BenchArgs.prefill_mode
         )
+        parser.add_argument("--record-split", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -245,6 +247,29 @@ def extend(reqs, model_runner):
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
+
+@torch.inference_mode()
+def split_prefill_forward_record_split(reqs, model_runner):
+    dur = torch.tensor(35)
+    batch = ScheduleBatch.init_new(
+        reqs=reqs,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        token_to_kv_pool=model_runner.token_to_kv_pool,
+        tree_cache=None,
+        model_config=model_runner.model_config,
+    )
+    batch.prepare_for_extend()
+    batch.prepare_for_split_prefill()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    for split_idx in range(35):
+        tic = time()  
+        logits_output = model_runner.forward(forward_batch)
+        ted = time()
+        dur[split_idx] = (ted-tic) * 1000
+    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    return next_token_ids, logits_output.next_token_logits, batch, dur
+
 @torch.inference_mode()
 def split_prefill_forward(reqs, model_runner):
     batch = ScheduleBatch.init_new(
@@ -258,7 +283,7 @@ def split_prefill_forward(reqs, model_runner):
     batch.prepare_for_split_prefill()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    for _ in range(35): 
+    for _ in range(35):
         logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -327,7 +352,7 @@ def synchronize(device):
 
 
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device, tp_size, tp_rank, warm_up, mps, split_prefill
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device, tp_size, tp_rank, warm_up, mps, split_prefill, record_split
 ):
     print("===============================")
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -354,7 +379,10 @@ def latency_test_run_once(
     synchronize(device)
     tic = time.time()
     if split_prefill:
-        next_token_ids, _, batch = split_prefill_forward(reqs, model_runner)
+        if record_split:
+            next_token_ids, _, batch, dur = split_prefill_forward_record_split(reqs, model_runner)
+        else:
+            next_token_ids, _, batch = split_prefill_forward(reqs, model_runner)
     else:
         next_token_ids, _, batch = extend(reqs, model_runner)
     synchronize(device)
@@ -402,11 +430,19 @@ def latency_test_run_once(
 
     mem = torch.cuda.max_memory_allocated()
 
-    if tp_rank == 0 and not warm_up:
-        with open(f"/home/ykchen/sglang/res/sglang_prefill.csv","a+") as f:
+    if tp_rank == 0 and not warm_up and not record_split:
+        with open(f"/home/ykchen/sglang/res/split_prefill.csv","a+") as f:
             writer = csv.writer(f)
             # writer.writerow([tp_size, batch_size, input_len, '%.2f'%(prefill_latency * 1000), '%.2f'%(prefill_latency/32*1000), '%.2f'%(med_decode_latency*1000), mem])
             writer.writerow([batch_size, input_len, '%.2f'%(prefill_latency * 1000)])
+
+    if tp_rank == 0 and not warm_up and record_split:
+        with open(f"/home/ykchen/sglang/res/prefill_split_record.csv","a+") as f:
+            writer = csv.writer(f)
+            row = [split_prefill, batch_size, input_len]
+            for t in dur:
+                row.append('%.2f'%t)
+            writer.writerow(row)
 
 
     return measurement_results
