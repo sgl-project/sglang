@@ -517,6 +517,11 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
+    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+
+    setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
+
 
 vllm_all_gather_backup = None
 
