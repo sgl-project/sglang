@@ -422,7 +422,7 @@ class Phi3SmallForCausalLM(nn.Module):
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head.weight, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
 
         else:

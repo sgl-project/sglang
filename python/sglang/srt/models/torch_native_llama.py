@@ -413,7 +413,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def get_hidden_dim(self, module_name):

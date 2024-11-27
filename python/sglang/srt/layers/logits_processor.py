@@ -23,6 +23,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
@@ -163,7 +164,7 @@ class LogitsProcessor(nn.Module):
         self,
         input_ids,
         hidden_states,
-        weight,
+        lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
     ):
         if isinstance(logits_metadata, ForwardBatch):
@@ -178,6 +179,7 @@ class LogitsProcessor(nn.Module):
             last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             last_hidden = hidden_states[last_index]
 
+        weight = lm_head.weight if hasattr(lm_head, "weight") else lm_head.qweight
         last_logits = torch.matmul(last_hidden, weight.T)
         if self.do_tensor_parallel_all_gather:
             last_logits = tensor_model_parallel_all_gather(last_logits)
