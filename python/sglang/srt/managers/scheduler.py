@@ -71,10 +71,9 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
-    get_bool_env_var,
     get_zmq_socket,
+    gpu_proc_affinity,
     kill_parent_process,
-    set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
 )
@@ -83,7 +82,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 # Test retract decode
-test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
+test_retract = os.getenv("SGLANG_TEST_RETRACT", "false").lower() == "true"
 
 
 class Scheduler:
@@ -1406,8 +1405,7 @@ def run_scheduler_process(
     pipe_writer,
 ):
     # set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+    gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
     # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "DP_RANK" in os.environ:

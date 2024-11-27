@@ -72,7 +72,7 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
-    if get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
+    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
         return False
     return torch.cuda.is_available() and not is_hip()
 
@@ -626,7 +626,7 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
@@ -931,7 +931,7 @@ def get_nvgpu_memory_capacity():
 
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
-    return get_bool_env_var("SGLANG_IS_IN_CI")
+    return os.getenv("SGLANG_IS_IN_CI", "false").lower() == "true"
 
 
 def get_device_name(device_id: int = 0) -> str:
@@ -990,7 +990,7 @@ def direct_register_custom_op(
         my_lib._register_fake(op_name, fake_impl)
 
 
-def set_gpu_proc_affinity(
+def gpu_proc_affinity(
     tp_size: int,
     nnodes: int,
     gpu_id: int,
@@ -1022,8 +1022,3 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
