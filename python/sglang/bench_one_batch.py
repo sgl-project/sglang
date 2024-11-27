@@ -469,4 +469,5 @@ if __name__ == "__main__":
     except Exception as e:
         raise e
     finally:
-        kill_child_process()
+        if server_args.tp_size != 1:
+            kill_child_process()
