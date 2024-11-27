@@ -25,8 +25,6 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
-    GetMemPoolSizeReqOutput,
-    UpdateWeightReqOutput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -173,7 +171,6 @@ class DetokenizerManager:
                     output_strs=output_strs,
                     meta_info=recv_obj.meta_info,
                     finished_reason=recv_obj.finished_reason,
-                    session_ids=recv_obj.session_ids,
                 )
             )
 

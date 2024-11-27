@@ -15,6 +15,7 @@
 
 import base64
 import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -71,7 +72,7 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
-    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return torch.cuda.is_available() and not is_hip()
 
@@ -516,6 +517,11 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
+    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+
+    setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
+
 
 vllm_all_gather_backup = None
 
@@ -625,7 +631,7 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if "SGLANG_USE_MODELSCOPE" in os.environ:
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
@@ -930,7 +936,7 @@ def get_nvgpu_memory_capacity():
 
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
 def get_device_name(device_id: int = 0) -> str:
@@ -987,3 +993,42 @@ def direct_register_custom_op(
     my_lib.impl(op_name, op_func, "CUDA")
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
+
+
+def set_gpu_proc_affinity(
+    tp_size: int,
+    nnodes: int,
+    gpu_id: int,
+):
+    # current process
+    pid = os.getpid()
+    p = psutil.Process(pid)
+
+    tp_size_per_node = tp_size // nnodes
+
+    # total physical cores
+    total_pcores = psutil.cpu_count(logical=False)
+    # physical cores per TP (N.B. more Cores than GPUs on node)
+    num_cores_bind = total_pcores // tp_size_per_node
+
+    # able to handle multiple DP per node
+    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
+    end_cpu_id = start_cpu_id + num_cores_bind
+
+    if psutil.cpu_count() != psutil.cpu_count(logical=False):
+        # HT on
+        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
+    else:
+        # HT off
+        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+
+    # set cpu_affinity to current process
+    p.cpu_affinity(bind_cpu_ids)
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")

@@ -170,7 +170,10 @@ class SamplingBatchInfo:
 
         for i, grammar in enumerate(self.grammars):
             if grammar is not None:
-                grammar.fill_vocab_mask(self.vocab_mask, i)
+                try:
+                    grammar.fill_vocab_mask(self.vocab_mask, i)
+                except RuntimeError:
+                    continue
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)

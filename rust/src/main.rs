@@ -1,8 +1,7 @@
-// src/main.rs
 use clap::Parser;
 use clap::ValueEnum;
 
-use sglang_router_rs::{router::PolicyConfig, server};
+use sglang_router_rs::{router::PolicyConfig, server, server::ServerConfig};
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum PolicyType {
@@ -42,7 +41,7 @@ struct Args {
         help = "Load balancing policy to use for request distribution:\n\
               - random: Randomly select workers\n\
               - round_robin: Distribute requests in round-robin fashion\n\
-              - cache_aware: Distribute requests in cache-aware fashion\n"
+              - cache_aware: Distribute requests based on cache state and load balance\n"
     )]
     policy: PolicyType,
 
@@ -57,12 +56,21 @@ struct Args {
 
     #[arg(
         long,
-        default_value_t = 1.0,
+        default_value_t = 32,
         requires = "policy",
         required_if_eq("policy", "cache_aware"),
-        help = "Probability of using cache-aware routing (0.0-1.0). Default 1.0 for full cache-aware routing, suitable for perfectly divided prefix workloads. For uneven workloads, use a lower value to better distribute requests"
+        help = "Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 32"
     )]
-    cache_routing_prob: f32,
+    balance_abs_threshold: usize,
+
+    #[arg(
+        long,
+        default_value_t = 1.0001,
+        requires = "policy",
+        required_if_eq("policy", "cache_aware"),
+        help = "Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001"
+    )]
+    balance_rel_threshold: f32,
 
     #[arg(
         long,
@@ -81,6 +89,9 @@ struct Args {
         help = "Maximum size of the approximation tree for cache-aware routing. Default: 2^24"
     )]
     max_tree_size: usize,
+
+    #[arg(long, default_value_t = false, help = "Enable verbose logging")]
+    verbose: bool,
 }
 
 impl Args {
@@ -90,7 +101,8 @@ impl Args {
             PolicyType::RoundRobin => PolicyConfig::RoundRobinConfig,
             PolicyType::CacheAware => PolicyConfig::CacheAwareConfig {
                 cache_threshold: self.cache_threshold,
-                cache_routing_prob: self.cache_routing_prob,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_tree_size: self.max_tree_size,
             },
@@ -102,5 +114,12 @@ impl Args {
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let policy_config = args.get_policy_config();
-    server::startup(args.host, args.port, args.worker_urls, policy_config).await
+    server::startup(ServerConfig {
+        host: args.host,
+        port: args.port,
+        worker_urls: args.worker_urls,
+        policy_config,
+        verbose: args.verbose,
+    })
+    .await
 }

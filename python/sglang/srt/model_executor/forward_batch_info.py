@@ -130,6 +130,9 @@ class ForwardBatch:
     # For LoRA
     lora_paths: Optional[List[str]] = None
 
+    # For input embeddings
+    input_embeds: Optional[torch.tensor] = None
+
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -231,6 +234,7 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
+            input_embeds=batch.input_embeds,
         )
 
         if ret.global_num_tokens is not None:

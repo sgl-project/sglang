@@ -26,13 +26,13 @@ class Session:
         self.reqs: List[Req] = []
 
     def create_req(self, req: TokenizedGenerateReqInput, tokenizer):
-        # renew session id
-        self.session_id = uuid.uuid4().hex
         if req.session_rid is not None:
             while len(self.reqs) > 0:
                 if self.reqs[-1].rid == req.session_rid:
                     break
                 self.reqs = self.reqs[:-1]
+        else:
+            self.reqs = []
         if len(self.reqs) > 0:
             input_ids = (
                 self.reqs[-1].origin_input_ids
@@ -41,16 +41,27 @@ class Session:
                 ]
                 + req.input_ids
             )
+            input_ids_unpadded = (
+                self.reqs[-1].origin_input_ids_unpadded
+                + self.reqs[-1].output_ids[
+                    : self.reqs[-1].sampling_params.max_new_tokens
+                ]
+                + req.input_ids
+            )
         else:
             input_ids = req.input_ids
+            input_ids_unpadded = req.input_ids
         new_req = Req(
-            req.rid,
-            None,
-            input_ids,
-            req.sampling_params,
+            rid=req.rid,
+            origin_input_text=None,
+            origin_input_ids=input_ids,
+            origin_input_ids_unpadded=input_ids_unpadded,
+            sampling_params=req.sampling_params,
             lora_path=req.lora_path,
             session_id=self.session_id,
         )
+        if len(self.reqs) > 0:
+            new_req.image_inputs = self.reqs[-1].image_inputs
         new_req.tokenizer = tokenizer
         if req.session_rid is not None and len(self.reqs) == 0:
             new_req.finished_reason = FINISH_ABORT(
@@ -58,4 +69,4 @@ class Session:
             )
         else:
             self.reqs.append(new_req)
-        return new_req, self.session_id
+        return new_req
