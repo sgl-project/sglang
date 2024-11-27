@@ -72,7 +72,7 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
-    if get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE"):
+    if get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return torch.cuda.is_available() and not is_hip()
 
@@ -990,7 +990,7 @@ def direct_register_custom_op(
         my_lib._register_fake(op_name, fake_impl)
 
 
-def gpu_proc_affinity(
+def set_gpu_proc_affinity(
     tp_size: int,
     nnodes: int,
     gpu_id: int,
@@ -1024,8 +1024,6 @@ def gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
-def get_bool_env_var(name: str) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return False
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
     return value.lower() in ("true", "1")
