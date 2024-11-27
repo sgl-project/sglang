@@ -66,13 +66,7 @@ class TestUpdateWeights(unittest.TestCase):
 
     @classmethod
     def assert_update_weights_all_close(cls, param_name, truncate_size):
-        print(
-            f"shape: {cls.hf_model.get_parameter(param_name).shape}, truncate_size: {truncate_size}"
-        )
         param = cls.hf_model.get_parameter(param_name)[:truncate_size]
-        print(
-            f"param_name: {param_name}, shape: {list(param.shape)}, dtype: {str(param.dtype).split('.')[-1]}"
-        )
         engine_ret = cls.engine.get_weights_by_parameter_name(param_name, truncate_size)
 
         # 如果 engine_ret 是标量值的列表
@@ -130,7 +124,6 @@ class TestUpdateWeights(unittest.TestCase):
             cls.init_engine_and_server(*test_suit)
             for param_name in parameters:
                 cls.assert_update_weights_all_close(param_name, 100)
-                print(f"test {test_suit} {param_name}")
             cls.close_engine_and_server()
 
 

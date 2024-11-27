@@ -25,7 +25,6 @@ import uuid
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
-import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -510,11 +509,8 @@ class TokenizerManager:
         obj: UpdateParameterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        print(f"update parameter from distributed request in tokenizer manager")
         if self.to_create_loop:
             self.create_handle_loop()
-        torch.cuda.synchronize()
-        print("test 1")
         if not self.model_update_lock.locked():
 
             async with self.model_update_lock:
@@ -526,16 +522,11 @@ class TokenizerManager:
                     # We can use a read-write lock as a better fix.
                     await asyncio.sleep(0.01)
 
-                torch.cuda.synchronize()
-                print("test 2")
                 self.send_to_scheduler.send_pyobj(obj)
                 self.parameter_update_result = asyncio.Future()
 
                 if self.server_args.dp_size == 1:
                     result = await self.parameter_update_result
-                    print(
-                        f"update_parameter_from_distributed in tokenizer manager: {result.success}, {result.message}"
-                    )
                     return result.success, result.message
                 else:  # self.server_args.dp_size > 1
                     self.parameter_update_tmp = []
@@ -546,7 +537,9 @@ class TokenizerManager:
                     return all_success, all_message
 
         else:
-            print(f"Another parameter update is in progress in tokenizer manager")
+            logger.error(
+                f"Another parameter update is in progress in tokenizer manager"
+            )
             return (
                 False,
                 "Another parameter update is in progress. Please try again later.",

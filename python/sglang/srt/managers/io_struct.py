@@ -21,8 +21,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 
-import torch
-
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -411,7 +409,7 @@ class GetParameterByNameReqInput:
 
 @dataclass
 class GetParameterByNameReqOutput:
-    parameter: Optional[torch.Tensor]
+    parameter: list
 
 
 @dataclass

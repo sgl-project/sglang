@@ -180,7 +180,6 @@ class TpModelWorker:
     def update_parameter_from_distributed(
         self, recv_req: UpdateParameterFromDistributedReqInput
     ):
-        print(f"update parameter from distributed request in tp worker")
         success, message = self.model_runner.update_parameter_from_distributed(
             recv_req.name, recv_req.dtype, recv_req.shape, recv_req.empty_cache
         )

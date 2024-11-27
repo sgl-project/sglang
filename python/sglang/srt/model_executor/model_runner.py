@@ -410,8 +410,8 @@ class ModelRunner:
     ):
         """Initialize the Torch process group for model parameter updates.
 
-        `_model_update_group` is used in the RLHF workflow, where rank 0 is the actor model in the training engine,
-        and the inference engine is used for rollout.
+        `_model_update_group` is used in the RLHF workflow, where rank 0 is the actor model in
+        the training engine, and the other ranks are the inference engine, which is used for rollout.
 
         In the RLHF workflow, the training engine updates the model weights/parameters online,
         and broadcasts them to the inference engine through the `_model_update_group` process group.
@@ -436,20 +436,7 @@ class ModelRunner:
                 rank=rank,
                 group_name=group_name,
             )
-            logger.error(
-                f"self._model_update_group.rank={self._model_update_group.rank()}"
-            )
-            logger.error(
-                f"self._model_update_group.group_name={self._model_update_group.group_name}"
-            )
-            logger.error(f"world_size={torch.distributed.get_world_size()}")
-            logger.error(f"device={torch.cuda.current_device()}")
-            logger.error("`_model_update_group` initialized.")
-            print(f"rank: {rank}, before barrier")
-            torch.cuda.synchronize()
-            torch.distributed.barrier(group=self._model_update_group)
-            torch.cuda.synchronize()
-            print(f"rank: {rank}, after barrier")
+
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -466,44 +453,29 @@ class ModelRunner:
             shape: the shape of the parameter to be updated.
             empty_cache: whether to empty the cache after updating the parameter.
         """
-        torch.cuda.synchronize()
-        print(f"name: {name}")
-        # 统一 dtype 格式
         target_dtype = (
             dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
         )
-        print(f"target_dtype: {target_dtype}")
-        torch.cuda.synchronize()
+
         current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
-        print(f"current_dtype: {current_dtype}")
-        torch.cuda.synchronize()
+
         assert str(target_dtype) == str(
             current_dtype
         ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
         assert (
             self._model_update_group is not None
         ), "model update group must be initialized"
-        print(f"self._model_update_group is not None")
-        torch.cuda.synchronize()
 
         try:
-            print(f"try to create weights")
+
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            print(weights.shape)
-            print(weights.dtype)
-            print(f"try to broadcast weights")
+
             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            torch.cuda.synchronize()
-            print(f"try to load weights")
-            print(f"name: {name}")
-            print(f"weights.shape: {weights.shape}")
             weights_dat = [(name, weights)]
             self.model.load_weights(weights_dat)
-            print(f"try to empty cache")
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            if empty_cache:
+                torch.cuda.empty_cache()
 
-            print(f"Successfully updated parameter {name}")
             return True, f"Succeeded to update parameter {name} online."
 
         except Exception as e:
@@ -520,7 +492,6 @@ class ModelRunner:
     ) -> Optional[torch.Tensor]:
         try:
             # 检查是否是合并的参数
-            print(f"get weights by parameter name")
             mapped_name = name
             mapped_shard_id = None
             for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
@@ -528,15 +499,9 @@ class ModelRunner:
                     mapped_name = name.replace(weight_name, param_name)
                     mapped_shard_id = shard_id
                     break
-            print(f"mapped_name: {mapped_name}, mapped_shard_id: {mapped_shard_id}")
-
-            # 获取参数
-            print("trying to read parameter dict")
             params_dict = dict(self.model.named_parameters())
-            print(f"params_dict: {params_dict}")
             if mapped_name in params_dict:
                 param = params_dict[mapped_name]
-                print(f"get param")
                 if mapped_shard_id is not None:
                     # 处理合并参数的情况
                     if mapped_shard_id in ["q", "k", "v"]:

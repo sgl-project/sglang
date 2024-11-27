@@ -77,7 +77,6 @@ class TestParameterUpdateGroup(unittest.TestCase):
             torch.cuda.synchronize()
             print(f"rank: {rank}, try to barrier")
             torch.cuda.synchronize()
-            torch.distributed.barrier(group=cls.group)
             print(f"rank: {rank}, try to broadcast hf_instruct_param")
             torch.cuda.synchronize()
             torch.distributed.broadcast(

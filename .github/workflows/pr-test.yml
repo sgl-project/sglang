@@ -278,7 +278,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python test_update_parameter_from_distributed.py
+          python3 test_update_parameter_from_distributed.py
           python3 test_get_parameter_by_name.py
 
   finish:
