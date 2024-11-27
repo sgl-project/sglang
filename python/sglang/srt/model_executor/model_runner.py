@@ -446,7 +446,9 @@ class ModelRunner:
             logger.error(f"device={torch.cuda.current_device()}")
             logger.error("`_model_update_group` initialized.")
             print(f"rank: {rank}, before barrier")
+            torch.cuda.synchronize()
             torch.distributed.barrier(group=self._model_update_group)
+            torch.cuda.synchronize()
             print(f"rank: {rank}, after barrier")
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
@@ -464,86 +466,42 @@ class ModelRunner:
             shape: the shape of the parameter to be updated.
             empty_cache: whether to empty the cache after updating the parameter.
         """
-
+        torch.cuda.synchronize()
+        print(f"name: {name}")
         # 统一 dtype 格式
         target_dtype = (
             dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
         )
+        print(f"target_dtype: {target_dtype}")
+        torch.cuda.synchronize()
         current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
-
+        print(f"current_dtype: {current_dtype}")
+        torch.cuda.synchronize()
         assert str(target_dtype) == str(
             current_dtype
         ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
         assert (
             self._model_update_group is not None
         ), "model update group must be initialized"
+        print(f"self._model_update_group is not None")
+        torch.cuda.synchronize()
 
         try:
-            # 检查是否是合并的参数并获取映射信息
-            mapped_name = name
-            mapped_shard_id = None
-            for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
-                if weight_name in name:
-                    mapped_name = name.replace(weight_name, param_name)
-                    mapped_shard_id = shard_id
-                    break
-
-            params_dict = dict(self.model.named_parameters())
-            print(f"Initial params_dict: {params_dict.keys()}")  # 调试信息
-            if mapped_name not in params_dict:
-                raise ValueError(
-                    f"Parameter {name} (mapped to {mapped_name}) not found in model"
-                )
-
-            param = params_dict[mapped_name]
-            print(f"Updating parameter: {mapped_name}")  # 调试信息
-            # 根据 shard_id 计算实际需要的权重大小和位置
-            if mapped_shard_id is not None and mapped_shard_id in ["q", "k", "v"]:
-                num_heads = self.model.config.num_attention_heads // self.tp_size
-                num_kv_heads = self.model.config.num_key_value_heads // self.tp_size
-                head_dim = (
-                    self.model.config.hidden_size
-                    // self.model.config.num_attention_heads
-                )
-
-                if mapped_shard_id == "q":
-                    offset = 0
-                    size = num_heads * head_dim
-                elif mapped_shard_id == "k":
-                    offset = num_heads * head_dim
-                    size = num_kv_heads * head_dim
-                elif mapped_shard_id == "v":
-                    offset = (num_heads + num_kv_heads) * head_dim
-                    size = num_kv_heads * head_dim
-
-                # 验证完整的shape
-                expected_shape = (size,) + shape[1:]
-                assert shape == expected_shape, (
-                    f"Shape mismatch for {mapped_shard_id} projection: "
-                    f"expected {expected_shape}, got {shape}"
-                )
-
-            # 创建tensor并同步
+            print(f"try to create weights")
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+            print(weights.shape)
+            print(weights.dtype)
+            print(f"try to broadcast weights")
             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            # 更新参数
-            if mapped_shard_id is not None:
-                if mapped_shard_id in ["q", "k", "v"]:
-                    # 直接更新对应分片的数据
-                    param.data.narrow(0, offset, size).copy_(weights)
-                else:
-                    weight_loader = param.weight_loader
-                    weight_loader(param, weights, mapped_shard_id)
-            else:
-                # 直接更新非分片参数
-                param.data.copy_(weights)
-            if empty_cache and self.device == "cuda":
-                print("empty cache in update weights by name")
-                torch.cuda.empty_cache()
-
-            # 再次检查 params_dict
-            params_dict = dict(self.model.named_parameters())
-            print(f"Updated params_dict: {params_dict.keys()}")  # 调试信息
+            torch.cuda.synchronize()
+            print(f"try to load weights")
+            print(f"name: {name}")
+            print(f"weights.shape: {weights.shape}")
+            weights_dat = [(name, weights)]
+            self.model.load_weights(weights_dat)
+            print(f"try to empty cache")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
             print(f"Successfully updated parameter {name}")
             return True, f"Succeeded to update parameter {name} online."
@@ -560,9 +518,9 @@ class ModelRunner:
     def get_weights_by_parameter_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
+        #! TODO move to llama qwen
         try:
             # 检查是否是合并的参数
-            print(f"get weights by parameter name")
             mapped_name = name
             mapped_shard_id = None
             for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
@@ -570,15 +528,11 @@ class ModelRunner:
                     mapped_name = name.replace(weight_name, param_name)
                     mapped_shard_id = shard_id
                     break
-            print(f"mapped_name: {mapped_name}, mapped_shard_id: {mapped_shard_id}")
 
             # 获取参数
-            print("trying to read parameter dict")
             params_dict = dict(self.model.named_parameters())
-            print(f"params_dict: {params_dict}")
             if mapped_name in params_dict:
                 param = params_dict[mapped_name]
-                print(f"get param")
                 if mapped_shard_id is not None:
                     # 处理合并参数的情况
                     if mapped_shard_id in ["q", "k", "v"]:
@@ -613,6 +567,7 @@ class ModelRunner:
 
                 # 转换并截断
                 return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+            # torch.save disk
             else:
                 logger.warning(
                     f"Parameter {name} (mapped to {mapped_name}) not found in model"

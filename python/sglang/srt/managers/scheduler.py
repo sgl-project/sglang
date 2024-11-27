@@ -1397,6 +1397,8 @@ class Scheduler:
         self, recv_req: UpdateParameterFromDistributedReqInput
     ):
         """Update the online model parameter."""
+        torch.cuda.synchronize()
+        print(f"try to update parameter from distributed in scheduler")
         success, message = self.tp_worker.update_parameter_from_distributed(recv_req)
         print(f"update_parameter_from_distributed in scheduler: {success}, {message}")
         if success:

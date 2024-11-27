@@ -368,6 +368,8 @@ async def update_parameter_from_distributed_request(
 ):
     """Handle an update parameter from distributed request."""
     try:
+        torch.cuda.synchronize()
+        print(f"try to update parameter from distributed in server")
         ret = await tokenizer_manager.update_parameter_from_distributed(obj, request)
         return ret
     except ValueError as e:
@@ -1120,15 +1122,20 @@ class Engine:
         return loop.run_until_complete(init_parameter_update_group_request(obj, None))
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
+        print(f"update parameter from distributed request in engine before synchronize")
+        torch.cuda.synchronize()
+        print(f"update parameter from distributed request in engine after synchronize")
         obj = UpdateParameterFromDistributedReqInput(
             name=name,
             dtype=dtype,
             shape=shape,
             empty_cache=empty_cache,
         )
-
-        loop = asyncio.get_event_loop()
+        torch.cuda.synchronize()
         print(f"update parameter from distributed request in engine")
+        loop = asyncio.get_event_loop()
+        torch.cuda.synchronize()
+        print(f"try to update parameter from distributed request in engine")
         return loop.run_until_complete(
             update_parameter_from_distributed_request(obj, None)
         )
