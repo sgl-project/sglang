@@ -72,28 +72,6 @@ class TransferBuffer:
         except queue.Empty:
             return None
 
-    # def add_revoke(self, host_indices):
-    #     self.revoke_list.append(host_indices)
-    #     logger.info(f"revoke added: {len(host_indices)}")
-
-    # def check_revoke(self, operation: CacheOperation):
-    #     matched_revoke = []
-    #     for idx, revoked in enumerate(self.revoke_list):
-    #         mask = torch.tensor([True] * len(operation.host_indices), dtype=torch.bool)
-    #         for i in range(len(operation.host_indices) - len(revoked) + 1):
-    #             if torch.equal(operation.host_indices[i : i + len(revoked)], revoked):
-    #                 mask[i : i + len(revoked)] = False
-    #                 operation.host_indices = operation.host_indices[mask]
-    #                 operation.device_indices = operation.device_indices[mask]
-    #                 matched_revoke.append(idx)
-    #                 logger.info(f"revoke matched: {len(revoked)}")
-    #                 break
-
-    #     self.revoke_list = [
-    #         r for idx, r in enumerate(self.revoke_list) if idx not in matched_revoke
-    #     ]
-    #     return operation
-
 
 class RevokableQueue(PriorityQueue):
     def revoke(self, host_indices):
@@ -175,11 +153,6 @@ class HiCacheController:
                 try:
                     operation = self.write_queue.get(timeout=1)
                     self.mem_pool_host.protect_write(operation.host_indices)
-                    # with self.mem_pool_host.lock:
-                    #     operation = self.write_buffer.check_revoke(operation)
-                    #     if len(operation.host_indices) == 0:
-                    #         continue
-                    #     self.mem_pool_host.protect_write(operation.host_indices)
                     operation.data = self.mem_pool_device.get_flat_data(
                         operation.device_indices
                     )
