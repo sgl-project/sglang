@@ -388,6 +388,9 @@ class LlamaForCausalLM(nn.Module):
         )
 
         for name, loaded_weight in weights:
+            print(f"name: {name}")
+            print(f"shape: {loaded_weight.shape}")
+            embed_tokens_weight = None
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -400,10 +403,14 @@ class LlamaForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                print(f"getting weight loader for {name} in stacked params mapping")
+                print(f"weight_name before replace: {weight_name}")
                 name = name.replace(weight_name, param_name)
+                print(f"name after replace: {name}")
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                print(f"getting weight loader for {name}")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -416,15 +423,17 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
                 param = params_dict[name]
+                print(f"getting default weight loader for {name}")
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
                 if load_tie_word_embeddings and name == "model.embed_tokens.weight":
                     embed_tokens_weight = loaded_weight
 
-        if load_tie_word_embeddings:
+        if load_tie_word_embeddings and embed_tokens_weight is not None:
             # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
             param = self.lm_head.weight
+            print(f"getting weight loader for {name} in tie word embeddings")
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, embed_tokens_weight)
 

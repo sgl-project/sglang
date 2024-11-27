@@ -531,6 +531,8 @@ class ModelRunner:
 
             # 获取参数
             params_dict = dict(self.model.named_parameters())
+            # print(f"params_dict: {params_dict}")
+            print(f"params_dict.keys(): {params_dict.keys()}")
             if mapped_name in params_dict:
                 param = params_dict[mapped_name]
                 if mapped_shard_id is not None:

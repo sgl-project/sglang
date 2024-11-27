@@ -33,11 +33,14 @@ class TestParameterUpdateGroup(unittest.TestCase):
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
             os.environ["NCCL_NVLS_ENABLE"] = "0"
             # 移除所有 print 语句
+            print(f"model_name: {model_name}")
             cls.hf_instruct_model = AutoModelForCausalLM.from_pretrained(
                 model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
+            base_model_name = model_name.replace("-Instruct", "")
+            print(f"base_model name: {base_model_name}")
             cls.hf_base_model = AutoModelForCausalLM.from_pretrained(
-                model_name.replace("-instruct", ""), torch_dtype="bfloat16"
+                base_model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
             cls.hf_instruct_param = (
                 cls.hf_instruct_model.get_parameter(parameter_name)[:truncate_size]
@@ -55,6 +58,11 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 .numpy()
                 .tolist()
             )
+            # print(f"hf_instruct_param: {cls.hf_instruct_param}")
+            assert not np.allclose(
+                np.array(cls.hf_instruct_param), np.array(cls.hf_base_param)
+            )
+            # print(f"hf_base_param: {cls.hf_base_param}")
             param_queue.put(("hf_instruct_param", cls.hf_instruct_param))
             param_queue.put(("hf_base_param", cls.hf_base_param))
             torch.cuda.synchronize()
@@ -177,6 +185,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
         engine_base_param = results["engine_base_param"]
         assert np.allclose(np.array(hf_instruct_param), np.array(engine_instruct_param))
         assert np.allclose(np.array(hf_base_param), np.array(engine_base_param))
+        assert not np.allclose(np.array(hf_instruct_param), np.array(hf_base_param))
         assert not np.allclose(np.array(hf_instruct_param), np.array(engine_base_param))
         assert not np.allclose(np.array(hf_base_param), np.array(engine_instruct_param))
 
