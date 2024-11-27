@@ -41,17 +41,16 @@ def fused_moe_sglang_api(x, w1, w2, input_gating, topk, w1_scale, w2_scale, a1_s
             a2_scale=a2_scale,
         )
 
-# 基准测试函数
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=['batch_size'],  # 作为x轴的参数名
-        x_vals=list(range(1, 513)),  # batch_size的不同值
-        line_arg='provider',  # 对应图中不同线条的参数名
-        line_vals=['vllm fused moe', 'sglang fused moe',],  # line_arg的可能值
-        line_names=["vllm fused moe", 'sglang fused moe',],  # 线条的标签名称
-        styles=[('blue', '-'), ('green', '-'),],  # 线条样式
-        ylabel="Time (ms)",  # y轴的标签名称
-        plot_name="fused-moe-performance",  # 图表的名称，同时用作保存图表的文件名
+        x_names=['batch_size'], 
+        x_vals=list(range(1, 513)),
+        line_arg='provider',
+        line_vals=['vllm fused moe', 'sglang fused moe',],
+        line_names=["vllm fused moe", 'sglang fused moe',],
+        styles=[('blue', '-'), ('green', '-'),],
+        ylabel="Time (ms)",
+        plot_name="fused-moe-performance", 
         args={},
     )
 )
