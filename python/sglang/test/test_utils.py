@@ -22,9 +22,9 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import get_bool_env_var, kill_child_process
 from sglang.test.run_eval import run_eval
-from sglang.utils import get_bool_env_var, get_exception_traceback
+from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
