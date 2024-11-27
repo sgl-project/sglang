@@ -49,7 +49,13 @@ class LlavaBaseForCausalLM(nn.Module):
         image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
 
         # hardcode for spatial_unpad + anyres
-        image_aspect_ratio = "anyres" if len(image_sizes) == 1 else "pad"
+        if image_inputs.modalities is not None and (
+            "multi-images" in image_inputs.modalities
+            or "video" in image_inputs.modalities
+        ):
+            image_aspect_ratio = "pad"
+        else:
+            image_aspect_ratio = "anyres"
         offset_list = []
         for image_s in image_sizes:
             if len(image_sizes) > 16:
