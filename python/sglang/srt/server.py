@@ -86,6 +86,7 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
+from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +538,7 @@ async def _get_server_info():
         **dataclasses.asdict(tokenizer_manager.server_args),  # server args
         "memory_pool_size": await tokenizer_manager.get_memory_pool_size(),  # memory pool size
         "max_total_num_tokens": _max_total_num_tokens,  # max total num tokens
+        "version": __version__,
     }
 
 
