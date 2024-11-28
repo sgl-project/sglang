@@ -243,14 +243,14 @@ def extend(reqs, model_runner):
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output = model_runner.forward(forward_batch)
+    logits_output, dur = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
-    return next_token_ids, logits_output.next_token_logits, batch
+    return next_token_ids, logits_output.next_token_logits, batch, dur
 
 
 @torch.inference_mode()
 def split_prefill_forward_record_split(reqs, model_runner):
-    dur = torch.tensor(35)
+    dur = torch.empty(35)
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -263,9 +263,10 @@ def split_prefill_forward_record_split(reqs, model_runner):
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     for split_idx in range(35):
-        tic = time()  
+        tic = time.time()  
         logits_output = model_runner.forward(forward_batch)
-        ted = time()
+        torch.cuda.synchronize()
+        ted = time.time()
         dur[split_idx] = (ted-tic) * 1000
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch, dur
@@ -295,7 +296,7 @@ def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output = model_runner.forward(forward_batch)
+    logits_output,_ = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
@@ -384,7 +385,7 @@ def latency_test_run_once(
         else:
             next_token_ids, _, batch = split_prefill_forward(reqs, model_runner)
     else:
-        next_token_ids, _, batch = extend(reqs, model_runner)
+        next_token_ids, _, batch, dur = extend(reqs, model_runner)
     synchronize(device)
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
@@ -440,8 +441,8 @@ def latency_test_run_once(
         with open(f"/home/ykchen/sglang/res/prefill_split_record.csv","a+") as f:
             writer = csv.writer(f)
             row = [split_prefill, batch_size, input_len]
-            for t in dur:
-                row.append('%.2f'%t)
+            for i in range(len(dur)):
+                row.append('%.2f'%(dur[i]))
             writer.writerow(row)
 
 
@@ -480,7 +481,8 @@ def latency_test(
         tp_rank,
         True,
         bench_args.mps[0],
-        bench_args.prefill_mode == "split"
+        bench_args.prefill_mode == "split",
+        bench_args.record_split
     )
     rank_print("Benchmark ...")
 
@@ -503,7 +505,8 @@ def latency_test(
             tp_rank,
             False,
             bench_args.mps[0],
-            bench_args.prefill_mode == "split"
+            bench_args.prefill_mode == "split",
+            bench_args.record_split
         )
         if ret is not None:
             result_list.append(ret)

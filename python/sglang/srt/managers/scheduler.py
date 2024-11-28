@@ -58,6 +58,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    SplitPrefillAdder,
     SchedulePolicy,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -709,6 +710,110 @@ class Scheduler:
             self.running_batch = None
         else:
             new_batch.decoding_reqs = None
+
+        return new_batch
+    
+    def get_new_batch_split_prefill(self) -> Optional[ScheduleBatch]:
+        # Handle the cases where prefill is not allowed
+        if (
+            self.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.current_inflight_req is None:
+            return None
+
+        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
+        if running_bs >= self.max_running_requests:
+            self.batch_is_full = True
+            return None
+
+        # Get priority queue
+        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+
+        # Prefill policy
+        num_mixed_running = running_bs if self.is_mixed_chunk else 0
+        adder = SplitPrefillAdder(
+            self.tree_cache,
+            self.running_batch,
+            self.new_token_ratio,
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            num_mixed_running,
+        )
+
+        # Get requests from the waiting queue to a new prefill batch
+        for req in self.waiting_queue:
+            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+                self.batch_is_full = True
+                break
+
+            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            res = adder.add_one_req(req)
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    self.batch_is_full = True
+                break
+
+        # Update waiting queue
+        can_run_list = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+
+        # Print stats
+        if self.tp_rank == 0:
+            if isinstance(self.tree_cache, RadixCache):
+                self.tree_cache_metrics["total"] += (
+                    adder.log_input_tokens + adder.log_hit_tokens
+                ) / 10**9
+                self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
+                tree_cache_hit_rate = (
+                    self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
+                )
+            else:
+                tree_cache_hit_rate = 0.0
+
+            num_used = self.max_total_num_tokens - (
+                self.token_to_kv_pool.available_size()
+                + self.tree_cache.evictable_size()
+            )
+
+            if num_mixed_running > 0:
+                logger.info(
+                    f"Prefill batch"
+                    f"(mixed #running-req: {num_mixed_running}). "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                    f"#queue-req: {len(self.waiting_queue)}"
+                )
+            else:
+                logger.info(
+                    f"Prefill batch. "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                    f"#running-req: {running_bs}, "
+                    f"#queue-req: {len(self.waiting_queue)}"
+                )
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+        )
+        new_batch.prepare_for_extend()
+        new_batch.prepare_for_split_prefill()
+
+        new_batch.decoding_reqs = None
 
         return new_batch
     

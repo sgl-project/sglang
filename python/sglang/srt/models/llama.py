@@ -44,6 +44,8 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+import time
+
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -271,22 +273,35 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ):
+        dur = torch.empty(35)
         if input_embeds is None:
+            tic = time.time()
             hidden_states = self.embed_tokens(input_ids)
+            torch.cuda.synchronize()
+            ted = time.time()
+            dur[0] = (ted-tic) * 1000
         else:
             hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
+            tic = time.time()
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
+            torch.cuda.synchronize()
+            ted = time.time()
+            dur[i + 1] = (ted-tic) * 1000
+        tic = time.time()
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        torch.cuda.synchronize()
+        ted = time.time()
+        dur[33] = (ted-tic) * 1000
+        return hidden_states, dur
 
 
 class LlamaForCausalLM(nn.Module):
@@ -311,11 +326,16 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> LogitsProcessorOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
+    ):
+        hidden_states, dur = self.model(input_ids, positions, forward_batch, input_embeds)
+        tic = time.time()
+        res = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
+        torch.cuda.synchronize()
+        ted = time.time()
+        dur[34] = (ted-tic) * 1000
+        return res,dur
     
     @torch.no_grad()
     def forward_split_prefill(
