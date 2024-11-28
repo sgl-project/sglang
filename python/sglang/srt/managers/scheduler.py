@@ -579,6 +579,8 @@ class Scheduler:
                     "Image request length is longer than the KV cache pool size or "
                     "the max context length aborting because you cannot truncate the image embeds"
                 )
+                req.image_inputs = None
+                req.origin_input_ids = [0]
                 req.sampling_params.max_new_tokens = 0
                 self.waiting_queue.append(req)
                 return
@@ -1350,13 +1352,15 @@ class Scheduler:
 
         if to_del is not None:
             del self.waiting_queue[to_del]
+            logger.debug(f"Abort queued request. {req.rid=}")
+            return
 
         # Delete requests in the running batch
         if self.running_batch:
             for req in self.running_batch.reqs:
                 if req.rid == recv_req.rid and not req.finished():
-                    req.finished_reason = FINISH_ABORT()
-                    self.tree_cache.cache_finished_req(req)
+                    logger.debug(f"Abort running request. {req.rid=}")
+                    req.to_abort = True
                     break
 
     def update_weights(self, recv_req: UpdateWeightReqInput):

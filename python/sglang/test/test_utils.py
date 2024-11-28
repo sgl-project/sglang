@@ -677,8 +677,14 @@ def run_and_check_memory_leak(
     enable_mixed_chunk,
     disable_overlap,
     chunked_prefill_size,
+    assert_has_abort,
 ):
-    other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
+    other_args = [
+        "--chunked-prefill-size",
+        str(chunked_prefill_size),
+        "--log-level",
+        "debug",
+    ]
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:
@@ -723,14 +729,19 @@ def run_and_check_memory_leak(
     # Assert success
     has_new_server = False
     has_leak = False
+    has_abort = False
     for line in output_lines:
         if "The server is fired" in line:
             has_new_server = True
         if "leak" in line:
             has_leak = True
+        if "Abort" in line:
+            has_abort = True
 
     assert has_new_server
     assert not has_leak
+    if assert_has_abort:
+        assert has_abort
 
 
 def run_mmlu_test(
@@ -761,6 +772,7 @@ def run_mmlu_test(
         enable_mixed_chunk,
         disable_overlap,
         chunked_prefill_size,
+        assert_has_abort=False,
     )
 
 
@@ -800,4 +812,5 @@ def run_mulit_request_test(
         enable_mixed_chunk,
         enable_overlap,
         chunked_prefill_size,
+        assert_has_abort=False,
     )
