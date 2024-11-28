@@ -199,6 +199,10 @@ class ServerArgs:
                 "Overlap schedule is disabled."
             )
 
+        # Model-specific changes
+        if "Qwen2-VL-" in self.model_path:
+            self.disable_overlap_schedule = True
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
