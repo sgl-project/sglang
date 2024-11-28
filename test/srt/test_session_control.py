@@ -301,6 +301,8 @@ class TestSessionControlVision(unittest.TestCase):
         assert response["meta_info"]["finish_reason"]["type"] == "abort"
 
         # 2. not use session control
+        requests.post(self.base_url + "/flush_cache")
+
         input_ids_first_req = None
         input_ids = []
         outputs_normal = []
