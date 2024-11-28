@@ -467,14 +467,8 @@ class ModelRunner:
 
         try:
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            torch.cuda.synchronize()
-            print(f"broadcast weights and get: {name}")
             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            torch.cuda.synchronize()
-            print(f"get weights done: {name}")
-            print(f"update from distributed: {name}")
             self.model.load_weights([(name, weights)])
-            print(f"update from distributed done: {name}")
             if empty_cache:
                 torch.cuda.empty_cache()
 
