@@ -256,10 +256,15 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            ret.extend_num_tokens = batch.extend_num_tokens
-            ret.positions, ret.extend_start_loc = compute_position_triton(
-                ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
-            )
+            if model_runner.server_args.attention_backend != "torch_native":
+                ret.extend_num_tokens = batch.extend_num_tokens
+                ret.positions, ret.extend_start_loc = compute_position_triton(
+                    ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
+                )
+            else:
+                ret.positions, ret.extend_start_loc = compute_position_torch(
+                    ret.extend_prefix_lens, ret.extend_seq_lens
+                )
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
