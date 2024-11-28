@@ -4,7 +4,7 @@ import sys
 
 from sglang.srt.server import launch_server
 from sglang.srt.server_args import prepare_server_args
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 
 if __name__ == "__main__":
     server_args = prepare_server_args(sys.argv[1:])
@@ -12,4 +12,4 @@ if __name__ == "__main__":
     try:
         launch_server(server_args)
     finally:
-        kill_child_process()
+        kill_process_tree(os.getpid(), include_parent=False)

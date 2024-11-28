@@ -6,7 +6,7 @@ python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -30,7 +30,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(
