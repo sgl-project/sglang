@@ -22,11 +22,7 @@ class TestTorchNativeAttnBackend(unittest.TestCase):
     def test_latency(self):
         output_throughput = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST,
-            [
-                "--attention-backend",
-                "torch_native",
-                "--disable-cuda-graph"
-            ],
+            ["--attention-backend", "torch_native", "--disable-cuda-graph"],
         )
 
         if is_in_ci():
@@ -39,8 +35,7 @@ class TestTorchNativeAttnBackend(unittest.TestCase):
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend",
-                        "torch_native", "--disable-cuda-graph"],
+            other_args=["--attention-backend", "torch_native", "--disable-cuda-graph"],
         )
 
         try:

@@ -758,7 +758,7 @@ class ScheduleBatch:
             for i in range(bs):
                 self.req_to_token_pool.write(
                     (self.req_pool_indices[i], slice(pre_lens[i], self.seq_lens[i])),
-                    self.out_cache_loc[pt : pt + self.extend_lens[i]]
+                    self.out_cache_loc[pt : pt + self.extend_lens[i]],
                 )
                 pt += self.extend_lens[i]
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)

@@ -25,7 +25,8 @@ class TestTorchTP(unittest.TestCase):
             [
                 "--tp",
                 "2",
-                "--attention-backend", "torch_native",
+                "--attention-backend",
+                "torch_native",
                 "--disable-cuda-graph",
             ],
         )

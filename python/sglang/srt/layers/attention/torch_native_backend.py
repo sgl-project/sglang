@@ -114,11 +114,16 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out = scaled_dot_product_attention(
-                per_req_query.unsqueeze(0),
-                per_req_key.unsqueeze(0),
-                per_req_value.unsqueeze(0),
-                enable_gqa=True).squeeze(0).movedim(query.dim() - 2, 0)
+            per_req_out = (
+                scaled_dot_product_attention(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=True,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
             output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
         return output
@@ -170,11 +175,16 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out = scaled_dot_product_attention(
-                per_req_query.unsqueeze(0),
-                per_req_key.unsqueeze(0),
-                per_req_value.unsqueeze(0),
-                enable_gqa=True).squeeze(0).movedim(query.dim() - 2, 0)
+            per_req_out = (
+                scaled_dot_product_attention(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=True,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
             output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
 
@@ -184,8 +194,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
     ):
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
@@ -217,8 +226,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 

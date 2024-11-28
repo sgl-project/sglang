@@ -182,9 +182,13 @@ class ServerArgs:
 
         # Choose kernel backends
         if self.attention_backend is None:
-            self.attention_backend = "flashinfer" if is_flashinfer_available() else "triton"
+            self.attention_backend = (
+                "flashinfer" if is_flashinfer_available() else "triton"
+            )
         if self.sampling_backend is None:
-            self.sampling_backend = "flashinfer" if is_flashinfer_available() else "pytorch"
+            self.sampling_backend = (
+                "flashinfer" if is_flashinfer_available() else "pytorch"
+            )
 
         # Others
         if self.enable_dp_attention:
