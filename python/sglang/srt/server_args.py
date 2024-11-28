@@ -144,7 +144,7 @@ class ServerArgs:
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
-        if self.chunked_prefill_size <= 0:
+        if self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             # Disable chunked prefill
             self.chunked_prefill_size = None
 
