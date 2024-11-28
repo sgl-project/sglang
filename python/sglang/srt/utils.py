@@ -944,6 +944,12 @@ def get_device_name(device_id: int = 0) -> str:
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 
 
+# Some backends use pytorch version < 2.4.0 which doesn't
+# support `torch.library.custom_op`.
+def supports_custom_op() -> bool:
+    return hasattr(torch.library, "custom_op")
+
+
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
