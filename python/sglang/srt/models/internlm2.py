@@ -270,7 +270,7 @@ class InternLM2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.output.weight, forward_batch
+            input_ids, hidden_states, self.output, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
