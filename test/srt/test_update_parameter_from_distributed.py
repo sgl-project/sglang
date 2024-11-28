@@ -26,6 +26,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
         param_queue,
         truncate_size,
         state_dict_key_to_shape,
+        tp_size,
     ):
         torch.cuda.set_device(rank)
         parameters = [
@@ -58,18 +59,18 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 print(f"get parameter {parameter_name} in hf instruct model")
                 cls.hf_instruct_params.append(
                     cls.hf_instruct_model.get_parameter(parameter_name)[:truncate_size]
-                .cpu()
-                .detach()
-                .float()
-                .numpy()
+                    .cpu()
+                    .detach()
+                    .float()
+                    .numpy()
                     .tolist()
                 )
                 print(f"get parameter {parameter_name} in hf base model")
                 cls.hf_base_params.append(
                     cls.hf_base_model.get_parameter(parameter_name)[:truncate_size]
-                .cpu()
-                .detach()
-                .float()
+                    .cpu()
+                    .detach()
+                    .float()
                     .numpy()
                     .tolist()
                 )
@@ -86,7 +87,9 @@ class TestParameterUpdateGroup(unittest.TestCase):
             for parameter_name in state_dict_key_to_shape.keys():
                 print(f"broadcast parameter {parameter_name} in hf base model")
                 torch.distributed.broadcast(
-                    cls.hf_base_model.get_parameter(parameter_name), src=0, group=cls.group
+                    cls.hf_base_model.get_parameter(parameter_name),
+                    src=0,
+                    group=cls.group,
                 )
             del cls.hf_instruct_model
             del cls.hf_base_model
@@ -98,6 +101,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
                 random_seed=42,
                 base_gpu_id=rank,
+                tp_size=tp_size,
             )
             cls.engine_instruct_params = []
             for parameter_name in parameters:
@@ -129,6 +133,9 @@ class TestParameterUpdateGroup(unittest.TestCase):
             print("after all the parameters are updated")
             cls.engine_base_params = []
             for parameter_name in parameters:
+                print(
+                    f"get parameter in engine base model after update: {parameter_name}"
+                )
                 cls.engine_base_params.append(
                     cls.engine.get_weights_by_parameter_name(
                         parameter_name, truncate_size
@@ -139,6 +146,11 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
+        cls.test_suits = [1]
+
+        if torch.cuda.device_count() >= 4:
+            cls.test_suits.append(2)
         model = AutoModelForCausalLM.from_pretrained(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST, torch_dtype="bfloat16"
         ).to("cuda:0")
@@ -147,7 +159,6 @@ class TestParameterUpdateGroup(unittest.TestCase):
         cls.state_dict_key_to_shape = {
             key: state_dict[key].shape for key in state_dict_keys
         }
-        cls.world_size = 2
         del model
         gc.collect()
         torch.cuda.empty_cache()
@@ -155,50 +166,63 @@ class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
     def test_init_parameter_update_group(cls):
         truncate_size = 10
-        param_queue = mp.Queue()
-        results = {}
 
-        # 启动子进程
-        context = mp.spawn(
-            cls.init_process,
-            # pass in parameter rather than get it from cls
-            args=(
-                cls.world_size,
-                param_queue,
-                truncate_size,
-                cls.state_dict_key_to_shape,
-            ),
-            nprocs=cls.world_size,
-            join=False,
-        )
+        for tp_size in cls.test_suits:
+            print(f"test tp_size: {tp_size}")
+            param_queue = mp.Queue()  # 每次迭代创建新的队列
+            results = {}
 
-        while len(results) < 4:
-            try:
-                key, value = param_queue.get(timeout=5)  # 增加超时时间
-                print(f"Got parameter: {key}")  # 添加日志
-                results[key] = value
-            except Exception as e:
-                print(f"Queue get error: {e}")
-                if all(
-                    not p.is_alive() for p in context.processes
-                ):  # 修正：检查所有子进程
-                    print("Child processes have terminated")
-                    break
+            context = mp.spawn(
+                cls.init_process,
+                args=(
+                    1 + tp_size,
+                    param_queue,
+                    truncate_size,
+                    cls.state_dict_key_to_shape,
+                    tp_size,
+                ),
+                nprocs=2,
+                join=False,
+            )
 
-        # 等待所有子进程结束
-        context.join()
+            while len(results) < 4:
+                try:
+                    key, value = param_queue.get(timeout=5)
+                    print(f"Got parameter: {key}")
+                    results[key] = value
+                except Exception as e:
+                    print(f"Queue get error: {e}")
+                    if all(not p.is_alive() for p in context.processes):
+                        print("Child processes have terminated")
+                        break
 
-        if len(results) != 4:
-            raise RuntimeError(f"Expected 4 parameters but got {len(results)}")
+            context.join()
 
-        hf_instruct_params = results["hf_instruct_params"]
-        hf_base_params = results["hf_base_params"]
-        engine_instruct_params = results["engine_instruct_params"]
-        engine_base_params = results["engine_base_params"]
-        for i in range(len(hf_instruct_params)):
-            assert np.allclose(np.array(hf_instruct_params[i]), np.array(engine_instruct_params[i]))
-            assert np.allclose(np.array(hf_base_params[i]), np.array(engine_base_params[i]))
-            assert not np.allclose(np.array(hf_instruct_params[i]), np.array(hf_base_params[i]))
+            if len(results) != 4:
+                raise RuntimeError(f"Expected 4 parameters but got {len(results)}")
+
+            hf_instruct_params = results["hf_instruct_params"]
+            hf_base_params = results["hf_base_params"]
+            engine_instruct_params = results["engine_instruct_params"]
+            engine_base_params = results["engine_base_params"]
+
+            for i in range(len(hf_instruct_params)):
+                assert np.allclose(
+                    np.array(hf_instruct_params[i]), np.array(engine_instruct_params[i])
+                )
+                assert np.allclose(
+                    np.array(hf_base_params[i]), np.array(engine_base_params[i])
+                )
+                assert not np.allclose(
+                    np.array(hf_instruct_params[i]), np.array(hf_base_params[i])
+                )
+
+            del context
+            param_queue.close()
+            param_queue.join_thread()
+            gc.collect()
+            torch.cuda.empty_cache()
+            time.sleep(2)
 
 
 if __name__ == "__main__":
