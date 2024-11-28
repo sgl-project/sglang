@@ -144,7 +144,7 @@ class ServerArgs:
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
-        if self.chunked_prefill_size <= 0:
+        if self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             # Disable chunked prefill
             self.chunked_prefill_size = None
 
@@ -198,10 +198,6 @@ class ServerArgs:
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap schedule is disabled."
             )
-
-        # Model-specific changes
-        if "Qwen2-VL-" in self.model_path:
-            self.disable_overlap_schedule = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
