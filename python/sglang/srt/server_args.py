@@ -171,9 +171,8 @@ class ServerArgs:
             gpu_mem = get_nvgpu_memory_capacity()
 
         # If the GPU memory is less than 25GB (like GTX 4090) and the user hasn't manually specified the chunked prefill size, we reduce its default value by a factor of 4.
-        if gpu_mem < 25000:
-            if self.chunked_prefill_size == 8192:
-               self.chunked_prefill_size //= 4  # make it 2048
+        if gpu_mem < 25000 and self.chunked_prefill_size == 8192:
+            self.chunked_prefill_size //= 4  # make it 2048
             logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
 
         # Choose kernel backends
