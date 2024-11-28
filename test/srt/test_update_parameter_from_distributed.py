@@ -122,23 +122,27 @@ class TestParameterUpdateGroup(unittest.TestCase):
             # 广播参数
             torch.cuda.synchronize()
 
-            print(f"rank {rank} broadcast parameter")
-
+            print(f"begin to broadcast parameter in rank {rank}")
+            time_begin_broadcast = time.time()
             for parameter_name in state_dict_key_to_shape.keys():
                 torch.cuda.synchronize()
-                time_begin = time.time()
+                time_begin_single_broadcast = time.time()
                 torch.distributed.broadcast(
                     cls.hf_base_model.get_parameter(parameter_name),
                     src=0,
                     group=cls.group,
                 )
                 torch.cuda.synchronize()
-                time_end = time.time()
+                time_end_single_broadcast = time.time()
                 print(
-                    f"rank {rank} broadcast {parameter_name} time: {time_end - time_begin:.3f}s"
+                    f"rank {rank} broadcast {parameter_name} time: {time_end_single_broadcast - time_begin_single_broadcast:.3f}s"
                 )
 
             torch.cuda.synchronize()
+            time_end_broadcast = time.time()
+            print(
+                f"rank {rank} broadcast parameter time: {time_end_broadcast - time_begin_broadcast:.3f}s"
+            )
 
             del cls.hf_instruct_model
             del cls.hf_base_model
@@ -198,11 +202,13 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
             # 更新分布式参数
             torch.cuda.synchronize()
-            time_begin = time.time()
-            print(f"rank {rank} update parameter from distributed")
+            time_begin_fully_update = time.time()
+            print(
+                f"start to update model_name {model_name} rank {rank} parameter from distributed"
+            )
             for parameter_name in state_dict_key_to_shape.keys():
                 torch.cuda.synchronize()
-                time_begin = time.time()
+                time_begin_single_update = time.time()
                 cls.engine.update_parameter_from_distributed(
                     parameter_name,
                     dtype=torch.bfloat16,
@@ -210,12 +216,15 @@ class TestParameterUpdateGroup(unittest.TestCase):
                     empty_cache=True,
                 )
                 torch.cuda.synchronize()
-                time_end = time.time()
+                time_end_single_update = time.time()
                 print(
-                    f"rank {rank} update {parameter_name} from distributed time: {time_end - time_begin:.3f}s"
+                    f"model_name {model_name} rank {rank} update {parameter_name} {state_dict_key_to_shape[parameter_name]} from distributed time: {time_end_single_update - time_begin_single_update:.3f}s"
                 )
-
             torch.cuda.synchronize()
+            time_end_fully_update = time.time()
+            print(
+                f"fully update model_name {model_name} rank {rank} parameter from distributed time: {time_end_fully_update - time_begin_fully_update:.3f}s"
+            )
             # 获取 base 参数
             time_begin = time.time()
             cls.engine_base_params = []

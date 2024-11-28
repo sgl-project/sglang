@@ -455,6 +455,8 @@ class ModelRunner:
             shape: the shape of the parameter to be updated.
             empty_cache: whether to empty the cache after updating the parameter.
         """
+        torch.cuda.synchronize()
+        time_begin_sync = time.time()
         target_dtype = (
             dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
         )
@@ -467,28 +469,16 @@ class ModelRunner:
         ), "model update group must be initialized"
 
         try:
-            # torch.cuda.synchronize()
-            # time_begin = time.time()
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            # torch.cuda.synchronize()
-            # time_end = time.time()
-            # print(f"rank {self.tp_rank} {name} create weights time: {time_end - time_begin:.3f}s")
-            # time_begin = time.time()
             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            # torch.cuda.synchronize()
-            # time_end = time.time()
-            # print(f"rank {self.tp_rank} {name} broadcast weights time: {time_end - time_begin:.3f}s")
-            torch.cuda.synchronize()
-            time_begin = time.time()
             self.model.load_weights([(name, weights)])
-            torch.cuda.synchronize()
-            time_end = time.time()
-            print(
-                f"rank {self.tp_rank} {name} load weights time: {time_end - time_begin:.3f}s"
-            )
             if empty_cache:
                 torch.cuda.empty_cache()
-
+            torch.cuda.synchronize()
+            time_end_sync = time.time()
+            print(
+                f"ModelRunner update {name} time: {time_end_sync - time_begin_sync:.3f}s"
+            )
             return True, f"Succeeded to update parameter {name} online."
 
         except Exception as e:
