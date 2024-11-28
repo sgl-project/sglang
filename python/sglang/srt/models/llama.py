@@ -369,7 +369,7 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         return len(params_dict)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], if_print=False):
         embed_tokens_weight = None
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -389,6 +389,8 @@ class LlamaForCausalLM(nn.Module):
         )
 
         for name, loaded_weight in weights:
+            if if_print:
+                print(f"load weights: {name}")
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -400,6 +402,8 @@ class LlamaForCausalLM(nn.Module):
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
+                    if if_print:
+                        print(f"skip weight {weight_name} not in {name}")
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
@@ -407,6 +411,8 @@ class LlamaForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if if_print:
+                    print(f"load weight after weight_loader: {name}")
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -418,6 +424,8 @@ class LlamaForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                if if_print:
+                    print(f"load weight after default_weight_loader: {name}")
                 weight_loader(param, loaded_weight)
 
                 if load_tie_word_embeddings and name == "model.embed_tokens.weight":
@@ -428,6 +436,8 @@ class LlamaForCausalLM(nn.Module):
             param = self.lm_head.weight
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             if embed_tokens_weight is not None:
+                if if_print:
+                    print(f"load weight after load_tie_word_embeddings: {name}")
                 weight_loader(param, embed_tokens_weight)
 
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))

@@ -24,11 +24,24 @@ class TestParameterUpdateGroup(unittest.TestCase):
         rank,
         world_size,
         param_queue,
-        parameter_name,
         truncate_size,
         state_dict_key_to_shape,
     ):
         torch.cuda.set_device(rank)
+        parameters = [
+            "model.embed_tokens.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.2.self_attn.k_proj.weight",
+            "model.layers.3.self_attn.v_proj.weight",
+            "model.layers.4.self_attn.o_proj.weight",
+            "model.layers.5.mlp.gate_proj.weight",
+            "model.layers.6.mlp.up_proj.weight",
+            "model.layers.7.mlp.down_proj.weight",
+            "model.layers.8.post_attention_layernorm.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ]
         if rank == 0:
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
             os.environ["NCCL_NVLS_ENABLE"] = "0"
@@ -39,27 +52,30 @@ class TestParameterUpdateGroup(unittest.TestCase):
             cls.hf_base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
-            cls.hf_instruct_param = (
-                cls.hf_instruct_model.get_parameter(parameter_name)[:truncate_size]
+            cls.hf_instruct_params = []
+            cls.hf_base_params = []
+            for parameter_name in parameters:
+                print(f"get parameter {parameter_name} in hf instruct model")
+                cls.hf_instruct_params.append(
+                    cls.hf_instruct_model.get_parameter(parameter_name)[:truncate_size]
                 .cpu()
                 .detach()
                 .float()
                 .numpy()
-                .tolist()
-            )
-            cls.hf_base_param = (
-                cls.hf_base_model.get_parameter(parameter_name)[:truncate_size]
+                    .tolist()
+                )
+                print(f"get parameter {parameter_name} in hf base model")
+                cls.hf_base_params.append(
+                    cls.hf_base_model.get_parameter(parameter_name)[:truncate_size]
                 .cpu()
                 .detach()
                 .float()
-                .numpy()
-                .tolist()
-            )
-            assert not np.allclose(
-                np.array(cls.hf_instruct_param), np.array(cls.hf_base_param)
-            )
-            param_queue.put(("hf_instruct_param", cls.hf_instruct_param))
-            param_queue.put(("hf_base_param", cls.hf_base_param))
+                    .numpy()
+                    .tolist()
+                )
+
+            param_queue.put(("hf_instruct_params", cls.hf_instruct_params))
+            param_queue.put(("hf_base_params", cls.hf_base_params))
             cls.group = init_custom_process_group(
                 backend="nccl",
                 init_method="tcp://localhost:65500",
@@ -67,9 +83,11 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 rank=rank,
                 group_name="test_parameter_update_group",
             )
-            torch.distributed.broadcast(
-                cls.hf_base_model.get_parameter(parameter_name), src=0, group=cls.group
-            )
+            for parameter_name in state_dict_key_to_shape.keys():
+                print(f"broadcast parameter {parameter_name} in hf base model")
+                torch.distributed.broadcast(
+                    cls.hf_base_model.get_parameter(parameter_name), src=0, group=cls.group
+                )
             del cls.hf_instruct_model
             del cls.hf_base_model
             gc.collect()
@@ -81,13 +99,16 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 random_seed=42,
                 base_gpu_id=rank,
             )
-            cls.engine_instruct_param = cls.engine.get_weights_by_parameter_name(
-                parameter_name, truncate_size
-            )
-            torch.cuda.synchronize()
-            param_queue.put(("engine_instruct_param", cls.engine_instruct_param))
-            torch.cuda.synchronize()
-            print("init parameter update group")
+            cls.engine_instruct_params = []
+            for parameter_name in parameters:
+                print(f"get parameter in engine instruct model: {parameter_name}")
+                cls.engine_instruct_params.append(
+                    cls.engine.get_weights_by_parameter_name(
+                        parameter_name, truncate_size
+                    )
+                )
+            param_queue.put(("engine_instruct_params", cls.engine_instruct_params))
+
             cls.engine.init_parameter_update_group(
                 master_address="localhost",
                 master_port="65500",
@@ -96,24 +117,24 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 group_name="test_parameter_update_group",
                 backend="nccl",
             )
-            torch.cuda.synchronize()
-            print("init parameter update group done")
-            torch.cuda.synchronize()
-            print(f"update parameter from distributed {parameter_name} bfloat16")
-            torch.cuda.synchronize()
-            print(f"{state_dict_key_to_shape[parameter_name]}")
-            cls.engine.update_parameter_from_distributed(
-                parameter_name,
-                dtype="bfloat16",
-                shape=state_dict_key_to_shape[parameter_name],
-                empty_cache=True,
-            )
-            torch.cuda.synchronize()
-            print("update parameter from distributed done")
-            cls.engine_base_param = cls.engine.get_weights_by_parameter_name(
-                parameter_name, truncate_size
-            )
-            param_queue.put(("engine_base_param", cls.engine_base_param))
+            for parameter_name in state_dict_key_to_shape.keys():
+                print(f"update parameter from distributed: {parameter_name}")
+                cls.engine.update_parameter_from_distributed(
+                    parameter_name,
+                    dtype="bfloat16",
+                    shape=state_dict_key_to_shape[parameter_name],
+                    empty_cache=True,
+                )
+
+            print("after all the parameters are updated")
+            cls.engine_base_params = []
+            for parameter_name in parameters:
+                cls.engine_base_params.append(
+                    cls.engine.get_weights_by_parameter_name(
+                        parameter_name, truncate_size
+                    )
+                )
+            param_queue.put(("engine_base_params", cls.engine_base_params))
             cls.engine.shutdown()
 
     @classmethod
@@ -133,9 +154,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
     @classmethod
     def test_init_parameter_update_group(cls):
-        parameter_name = list(cls.state_dict_key_to_shape.keys())[0]
-        print(f"parameter_name: {parameter_name}")
-        truncate_size = 100
+        truncate_size = 10
         param_queue = mp.Queue()
         results = {}
 
@@ -146,7 +165,6 @@ class TestParameterUpdateGroup(unittest.TestCase):
             args=(
                 cls.world_size,
                 param_queue,
-                parameter_name,
                 truncate_size,
                 cls.state_dict_key_to_shape,
             ),
@@ -154,11 +172,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
             join=False,
         )
 
-        # 先尝试获取队列数据
-        timeout = 60
-        start_time = time.time()
-
-        while len(results) < 4 and time.time() - start_time < timeout:
+        while len(results) < 4:
             try:
                 key, value = param_queue.get(timeout=5)  # 增加超时时间
                 print(f"Got parameter: {key}")  # 添加日志
@@ -177,19 +191,14 @@ class TestParameterUpdateGroup(unittest.TestCase):
         if len(results) != 4:
             raise RuntimeError(f"Expected 4 parameters but got {len(results)}")
 
-        hf_instruct_param = np.array(results["hf_instruct_param"])
-        hf_base_param = np.array(results["hf_base_param"])
-        engine_instruct_param = np.array(results["engine_instruct_param"])
-        engine_base_param = np.array(results["engine_base_param"])
-        print(f"hf_instruct_param: {hf_instruct_param.shape}")
-        print(f"engine_instruct_param: {engine_instruct_param.shape}")
-        print(f"hf_base_param: {hf_base_param.shape}")
-        print(f"engine_base_param: {engine_base_param.shape}")
-        assert np.allclose(hf_instruct_param, engine_instruct_param)
-        assert np.allclose(hf_base_param, engine_base_param)
-        assert not np.allclose(hf_instruct_param, hf_base_param)
-        assert not np.allclose(hf_instruct_param, engine_base_param)
-        assert not np.allclose(hf_base_param, engine_instruct_param)
+        hf_instruct_params = results["hf_instruct_params"]
+        hf_base_params = results["hf_base_params"]
+        engine_instruct_params = results["engine_instruct_params"]
+        engine_base_params = results["engine_base_params"]
+        for i in range(len(hf_instruct_params)):
+            assert np.allclose(np.array(hf_instruct_params[i]), np.array(engine_instruct_params[i]))
+            assert np.allclose(np.array(hf_base_params[i]), np.array(engine_base_params[i]))
+            assert not np.allclose(np.array(hf_instruct_params[i]), np.array(hf_base_params[i]))
 
 
 if __name__ == "__main__":
