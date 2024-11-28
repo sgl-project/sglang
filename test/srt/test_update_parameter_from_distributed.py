@@ -5,6 +5,7 @@ import unittest
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
@@ -33,7 +34,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
     ):
         torch.cuda.set_device(rank)
         parameters = [
-            "model.embed_tokens.weight",
+            # "model.embed_tokens.weight",
             "model.layers.0.input_layernorm.weight",
             "model.layers.1.self_attn.q_proj.weight",
             "model.layers.2.self_attn.k_proj.weight",
@@ -118,13 +119,18 @@ class TestParameterUpdateGroup(unittest.TestCase):
             torch.cuda.synchronize()
             time_end = time.time()
             print(f"rank {rank} init process group time: {time_end - time_begin:.3f}s")
-
-            # 广播参数
             torch.cuda.synchronize()
-
+            time_begin = time.time()
+            print(f"rank {rank} before barrier")
+            dist.barrier(group=cls.group)
+            print(f"rank {rank} after barrier")
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(f"rank {rank} barrier time: {time_end - time_begin:.3f}s")
+            torch.cuda.synchronize()
             print(f"begin to broadcast parameter in rank {rank}")
             time_begin_broadcast = time.time()
-            for parameter_name in state_dict_key_to_shape.keys():
+            for parameter_name in list(state_dict_key_to_shape.keys())[1:]:
                 torch.cuda.synchronize()
                 time_begin_single_broadcast = time.time()
                 torch.distributed.broadcast(
@@ -206,7 +212,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
             print(
                 f"start to update model_name {model_name} rank {rank} parameter from distributed"
             )
-            for parameter_name in state_dict_key_to_shape.keys():
+            for parameter_name in list(state_dict_key_to_shape.keys())[1:]:
                 torch.cuda.synchronize()
                 time_begin_single_update = time.time()
                 cls.engine.update_parameter_from_distributed(

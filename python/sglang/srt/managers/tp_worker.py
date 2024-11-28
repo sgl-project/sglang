@@ -15,9 +15,11 @@
 
 import logging
 import threading
-from typing import Optional
-import torch
 import time
+from typing import Optional
+
+import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (

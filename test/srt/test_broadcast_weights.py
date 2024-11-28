@@ -4,6 +4,7 @@ import time
 import unittest
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
@@ -24,6 +25,13 @@ class TestParameterUpdateLatency(unittest.TestCase):
     ):
         torch.cuda.set_device(rank)
         print(f"Testing model: {model_name}")
+        sync_group = init_custom_process_group(
+            backend="nccl",
+            init_method="tcp://localhost:65501",
+            world_size=world_size,
+            rank=rank,
+            group_name="sync_group",
+        )
 
         if rank == 0:
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
@@ -44,6 +52,9 @@ class TestParameterUpdateLatency(unittest.TestCase):
             print(f"Rank {rank} init process group time: {time_end - time_begin:.3f}s")
 
             # 广播参数
+            print(f"Rank {rank} before barrier")
+            dist.barrier(group=sync_group)
+            print(f"Rank {rank} after barrier")
             torch.cuda.synchronize()
             time_begin_broadcast = time.time()
             for name, shape in state_dict_key_to_shape.items():
@@ -96,6 +107,9 @@ class TestParameterUpdateLatency(unittest.TestCase):
             )
 
             # 更新参数并测量时间
+            print(f"Rank {rank} before barrier")
+            dist.barrier(group=sync_group)
+            print(f"Rank {rank} after barrier")
             torch.cuda.synchronize()
             time_begin_update = time.time()
             for name, shape in state_dict_key_to_shape.items():

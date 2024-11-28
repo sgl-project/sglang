@@ -1155,7 +1155,6 @@ class Engine:
             update_parameter_from_distributed_request(obj, None)
         )
 
-
     def get_weights_by_parameter_name(self, name, truncate_size=100):
         obj = GetParameterByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()

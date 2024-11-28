@@ -13,7 +13,6 @@
 # ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
-import torch
 import asyncio
 import copy
 import dataclasses
@@ -26,6 +25,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -514,7 +514,7 @@ class TokenizerManager:
         time_begin = time.time()
         if self.to_create_loop:
             self.create_handle_loop()
-        
+
         if not self.model_update_lock.locked():
             async with self.model_update_lock:
                 self.send_to_scheduler.send_pyobj(obj)
