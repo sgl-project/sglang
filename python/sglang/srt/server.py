@@ -378,7 +378,14 @@ async def update_parameter_from_distributed_request(
 ):
     """Handle an update parameter from distributed request."""
     try:
+        torch.cuda.synchronize()
+        time_begin = time.time()
         ret = await tokenizer_manager.update_parameter_from_distributed(obj, request)
+        torch.cuda.synchronize()
+        time_end = time.time()
+        print(
+            f"In server time function update parameter from distributed time: {obj.name} {obj.shape} {time_end - time_begin:.3f}s"
+        )
         return ret
     except ValueError as e:
         return ORJSONResponse(
@@ -1130,6 +1137,8 @@ class Engine:
         return loop.run_until_complete(init_parameter_update_group_request(obj, None))
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
+        torch.cuda.synchronize()
+        time_begin = time.time()
         obj = UpdateParameterFromDistributedReqInput(
             name=name,
             dtype=dtype,
@@ -1137,9 +1146,15 @@ class Engine:
             empty_cache=empty_cache,
         )
         loop = asyncio.get_event_loop()
+        torch.cuda.synchronize()
+        time_end = time.time()
+        print(
+            f"In server: update parameter from distributed time: {obj.name} {obj.shape} {time_end - time_begin:.3f}s"
+        )
         return loop.run_until_complete(
             update_parameter_from_distributed_request(obj, None)
         )
+
 
     def get_weights_by_parameter_name(self, name, truncate_size=100):
         obj = GetParameterByNameReqInput(name=name, truncate_size=truncate_size)

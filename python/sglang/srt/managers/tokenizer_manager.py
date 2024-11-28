@@ -13,6 +13,7 @@
 # ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
+import torch
 import asyncio
 import copy
 import dataclasses
@@ -509,24 +510,23 @@ class TokenizerManager:
         obj: UpdateParameterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ):
+        torch.cuda.synchronize()
+        time_begin = time.time()
         if self.to_create_loop:
             self.create_handle_loop()
+        
         if not self.model_update_lock.locked():
-
             async with self.model_update_lock:
-                # wait for the previous update requests to finish
-                for i in range(3):
-                    while len(self.rid_to_state) > 0:
-                        await asyncio.sleep(0.001)
-                    # FIXME: We add some sleep here to avoid some race conditions.
-                    # We can use a read-write lock as a better fix.
-                    await asyncio.sleep(0.01)
-
                 self.send_to_scheduler.send_pyobj(obj)
                 self.parameter_update_result = asyncio.Future()
 
                 if self.server_args.dp_size == 1:
                     result = await self.parameter_update_result
+                    torch.cuda.synchronize()
+                    time_end = time.time()
+                    print(
+                        f"In tokenizer manager: update parameter from distributed time: {obj.name} {obj.shape} {time_end - time_begin:.3f}s"
+                    )
                     return result.success, result.message
                 else:  # self.server_args.dp_size > 1
                     self.parameter_update_tmp = []
@@ -535,7 +535,6 @@ class TokenizerManager:
                     all_message = [r.message for r in result]
                     all_message = " | ".join(all_message)
                     return all_success, all_message
-
         else:
             logger.error(
                 f"Another parameter update is in progress in tokenizer manager"
