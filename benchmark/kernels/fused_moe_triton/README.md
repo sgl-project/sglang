@@ -1,14 +1,46 @@
-## benchmark kernels
+## Benchmark Kernels
 
-- `tuning_fused_moe_triton.py`: tuning the `fused_moe_triton` kernel. It's adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py , and add support for qwen2-57b tuning.
+This directory contains benchmarking tools for MoE (Mixture of Experts) kernels.
 
-For example, to tune the `Qwen/Qwen2-57B-A14B-Instruct-FP8` model's `fused_moe_triton` fp8_w8a8 kernel with TP4, run:
+### Tuning Tool
 
+- `tuning_fused_moe_triton.py`: A tool for tuning the `fused_moe_triton` kernel. Adapted from [vllm's benchmark_moe.py](https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py), with added support for various model architectures.
+
+Example usage:
 ```bash
-python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py --model Qwen/Qwen2-57B-A14B-Instruct-FP8 --tp-size 4 --dtype fp8_w8a8 --tune
+# Tune Qwen2-57B with FP8 and TP=4
+python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --model Qwen/Qwen2-57B-A14B-Instruct-FP8 \
+    --tp-size 4 \
+    --dtype fp8_w8a8 \
+    --tune
+
+# Tune Mixtral-8x7B with default settings
+python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+    --tune
 ```
 
-And you can get `E=64,N=640,device_name=NVIDIA_GeForce_RTX_4090,dtype=fp8_w8a8.json` in current directory, then you can put it in `sglang/srt/layers/fused_moe_triton/configs/` and use it in `sglang`.
+After tuning, a configuration file (e.g., `E=64,N=640,device_name=NVIDIA_GeForce_RTX_4090,dtype=fp8_w8a8.json`) will be generated in the current directory. You can move this file to `sglang/srt/layers/fused_moe_triton/configs/` to use it in `sglang`.
 
-- `benchmark_qwen2_57b_vllm_vs_sglang_fused_moe_triton.py`: benchmark the `Qwen/Qwen2-57B-A14B-Instruct-FP8` model's `fused_moe_triton` fp8_w8a8 kernel with vllm and sglang.
+### Performance Comparison Tool
+
+- `benchmark_vllm_vs_sglang_fused_moe_triton.py`: A tool for comparing the performance of fused MoE kernels between vllm and sglang implementations. Supports various model architectures and data types.
+
+Example usage:
+```bash
+# Compare with default settings (Mixtral model)
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py
+
+# Compare with FP8 mode for Qwen2-57B
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+    --model Qwen/Qwen2-57B-A14B-Instruct-FP8 \
+    --use-fp8
+
+# Compare with custom TP size
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+    --tp-size 4
+```
+
+The benchmark results will be saved as plots and data files in the specified output directory (default: `./configs/benchmark_ops/vllm_sglang_fused_moe/`).
 
