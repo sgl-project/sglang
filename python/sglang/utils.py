@@ -348,9 +348,9 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 
 def terminate_process(process):
-    from sglang.srt.utils import kill_child_process
+    from sglang.srt.utils import kill_process_tree
 
-    kill_child_process(process.pid, include_self=True)
+    kill_process_tree(process.pid)
 
 
 def print_highlight(html_content: str):

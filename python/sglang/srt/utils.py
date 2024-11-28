@@ -443,26 +443,14 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
-def kill_parent_process():
-    """Kill the parent process and all children of the parent process."""
-    current_process = psutil.Process()
-    parent_process = current_process.parent()
-    kill_child_process(
-        parent_process.pid, include_self=True, skip_pid=current_process.pid
-    )
-    try:
-        current_process.kill()
-    except psutil.NoSuchProcess:
-        pass
-
-
-def kill_child_process(pid=None, include_self=False, skip_pid=None):
-    """Kill the process and all its children process."""
-    if pid is None:
-        pid = os.getpid()
+def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
+    """Kill the process and all its child processes."""
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
 
     try:
-        itself = psutil.Process(pid)
+        itself = psutil.Process(parent_pid)
     except psutil.NoSuchProcess:
         return
 
@@ -475,13 +463,13 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
         except psutil.NoSuchProcess:
             pass
 
-    if include_self:
+    if include_parent:
         try:
             itself.kill()
 
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGINT)
+            itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
 
