@@ -15,6 +15,7 @@
 
 import logging
 import os
+import signal
 import threading
 import time
 import warnings
@@ -23,6 +24,7 @@ from concurrent import futures
 from types import SimpleNamespace
 from typing import List, Optional
 
+import psutil
 import torch
 import zmq
 
@@ -73,7 +75,6 @@ from sglang.srt.utils import (
     crash_on_warnings,
     get_bool_env_var,
     get_zmq_socket,
-    kill_parent_process,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
@@ -312,6 +313,7 @@ class Scheduler:
         self.watchdog_timeout = server_args.watchdog_timeout
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
+        self.parent_process = psutil.Process().parent()
 
         # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
@@ -355,7 +357,7 @@ class Scheduler:
                     self.watchdog_last_time = time.time()
             time.sleep(self.watchdog_timeout / 2)
 
-        kill_parent_process()
+        self.parent_process.send_signal(signal.SIGQUIT)
 
     @torch.no_grad()
     def event_loop_normal(self):
@@ -1419,6 +1421,7 @@ def run_scheduler_process(
         configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
 
     suppress_other_loggers()
+    parent_process = psutil.Process().parent()
 
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
@@ -1432,4 +1435,4 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
-        kill_parent_process()
+        parent_process.send_signal(signal.SIGQUIT)

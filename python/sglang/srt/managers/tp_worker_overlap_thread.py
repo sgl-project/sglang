@@ -15,10 +15,12 @@
 
 import dataclasses
 import logging
+import signal
 import threading
 from queue import Queue
 from typing import Optional
 
+import psutil
 import torch
 
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
@@ -72,6 +74,7 @@ class TpModelWorkerClient:
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
+        self.parent_process = psutil.Process().parent()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -95,7 +98,7 @@ class TpModelWorkerClient:
         except Exception:
             traceback = get_exception_traceback()
             logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
-            kill_parent_process()
+            self.parent_process.send_signal(signal.SIGQUIT)
 
     @torch.no_grad()
     def forward_thread_func_(self):
