@@ -171,6 +171,10 @@ class Scheduler:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
+        if self.model_config.is_multimodal:
+            self.enable_overlap = False
+            logger.info("Overlap scheduler is disabled for multimodal models.")
+
         if self.enable_overlap:
             self.disable_jump_forward = True
 
