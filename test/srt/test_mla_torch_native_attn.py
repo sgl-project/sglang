@@ -20,8 +20,14 @@ class TestMLA(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp", "2", "--trust-remote-code",
-                        "--attention-backend", "torch_native", "--disable-cuda-graph"],
+            other_args=[
+                "--tp",
+                "2",
+                "--trust-remote-code",
+                "--attention-backend",
+                "torch_native",
+                "--disable-cuda-graph",
+            ],
         )
 
     @classmethod
