@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import pkgutil
+import time
 from functools import lru_cache
 from tokenize import tabsize
 from typing import Any, Optional, Type, Union
@@ -466,9 +467,25 @@ class ModelRunner:
         ), "model update group must be initialized"
 
         try:
+            # torch.cuda.synchronize()
+            # time_begin = time.time()
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+            # torch.cuda.synchronize()
+            # time_end = time.time()
+            # print(f"rank {self.tp_rank} {name} create weights time: {time_end - time_begin:.3f}s")
+            # time_begin = time.time()
             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+            # torch.cuda.synchronize()
+            # time_end = time.time()
+            # print(f"rank {self.tp_rank} {name} broadcast weights time: {time_end - time_begin:.3f}s")
+            torch.cuda.synchronize()
+            time_begin = time.time()
             self.model.load_weights([(name, weights)])
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(
+                f"rank {self.tp_rank} {name} load weights time: {time_end - time_begin:.3f}s"
+            )
             if empty_cache:
                 torch.cuda.empty_cache()
 

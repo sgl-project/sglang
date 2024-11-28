@@ -46,18 +46,39 @@ class TestParameterUpdateGroup(unittest.TestCase):
             "model.norm.weight",
             "lm_head.weight",
         ]
+        print(f"testing model: {model_name}")
+        print(f"testing tp size: {tp_size}")
         if rank == 0:
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
             os.environ["NCCL_NVLS_ENABLE"] = "0"
+
+            # 加载 instruct 模型
+            torch.cuda.synchronize()
+            time_begin = time.time()
             cls.hf_instruct_model = AutoModelForCausalLM.from_pretrained(
                 model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(f"rank {rank} load instruct model time: {time_end - time_begin:.3f}s")
+
+            # 加载 base 模型
+            torch.cuda.synchronize()
+            time_begin = time.time()
             base_model_name = model_name.replace("-Instruct", "")
             cls.hf_base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(f"rank {rank} load base model time: {time_end - time_begin:.3f}s")
+
             cls.hf_instruct_params = []
             cls.hf_base_params = []
+
+            # 获取参数
+            torch.cuda.synchronize()
+            time_begin = time.time()
             print(f"get parameter in hf instruct model and base model")
             for parameter_name in parameters:
                 cls.hf_instruct_params.append(
@@ -76,9 +97,16 @@ class TestParameterUpdateGroup(unittest.TestCase):
                     .numpy()
                     .tolist()
                 )
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(f"rank {rank} get parameters time: {time_end - time_begin:.3f}s")
 
             param_queue.put(("hf_instruct_params", cls.hf_instruct_params))
             param_queue.put(("hf_base_params", cls.hf_base_params))
+
+            # 初始化进程组
+            torch.cuda.synchronize()
+            time_begin = time.time()
             print(f"rank {rank} init custom process group")
             cls.group = init_custom_process_group(
                 backend="nccl",
@@ -87,29 +115,53 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 rank=rank,
                 group_name="test_parameter_update_group",
             )
-            start_time = time.time()
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(f"rank {rank} init process group time: {time_end - time_begin:.3f}s")
+
+            # 广播参数
+            torch.cuda.synchronize()
+
             print(f"rank {rank} broadcast parameter")
+
             for parameter_name in state_dict_key_to_shape.keys():
+                torch.cuda.synchronize()
+                time_begin = time.time()
                 torch.distributed.broadcast(
                     cls.hf_base_model.get_parameter(parameter_name),
                     src=0,
                     group=cls.group,
                 )
-            end_time = time.time()
-            print(f"rank {rank} broadcast parameter time: {end_time - start_time}")
+                torch.cuda.synchronize()
+                time_end = time.time()
+                print(
+                    f"rank {rank} broadcast {parameter_name} time: {time_end - time_begin:.3f}s"
+                )
+
+            torch.cuda.synchronize()
+
             del cls.hf_instruct_model
             del cls.hf_base_model
             gc.collect()
             torch.cuda.empty_cache()
 
         elif rank == 1:
+            # 初始化引擎
+            torch.cuda.synchronize()
+            time_begin = time.time()
             cls.engine = sgl.Engine(
                 model_path=model_name,
                 random_seed=42,
                 base_gpu_id=rank,
                 tp_size=tp_size,
             )
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(f"rank {rank} init engine time: {time_end - time_begin:.3f}s")
 
+            # 获取 instruct 参数
+            torch.cuda.synchronize()
+            time_begin = time.time()
             cls.engine_instruct_params = []
             print(f"rank {rank} get parameter in engine instruct model")
             for parameter_name in parameters:
@@ -118,7 +170,17 @@ class TestParameterUpdateGroup(unittest.TestCase):
                         parameter_name, truncate_size
                     )
                 )
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(
+                f"rank {rank} get instruct parameters time: {time_end - time_begin:.3f}s"
+            )
+
             param_queue.put(("engine_instruct_params", cls.engine_instruct_params))
+
+            # 初始化参数更新组
+            torch.cuda.synchronize()
+            time_begin = time.time()
             print(f"rank {rank} init parameter update group")
             cls.engine.init_parameter_update_group(
                 master_address="localhost",
@@ -128,20 +190,34 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 group_name="test_parameter_update_group",
                 backend="nccl",
             )
-            start_time = time.time()
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(
+                f"rank {rank} init parameter update group time: {time_end - time_begin:.3f}s"
+            )
+
+            # 更新分布式参数
+            torch.cuda.synchronize()
+            time_begin = time.time()
             print(f"rank {rank} update parameter from distributed")
             for parameter_name in state_dict_key_to_shape.keys():
+                torch.cuda.synchronize()
+                time_begin = time.time()
                 cls.engine.update_parameter_from_distributed(
                     parameter_name,
-                    dtype="bfloat16",
+                    dtype=torch.bfloat16,
                     shape=state_dict_key_to_shape[parameter_name],
                     empty_cache=True,
                 )
-            end_time = time.time()
-            print(
-                f"rank {rank} update parameter from distributed time: {end_time - start_time}"
-            )
+                torch.cuda.synchronize()
+                time_end = time.time()
+                print(
+                    f"rank {rank} update {parameter_name} from distributed time: {time_end - time_begin:.3f}s"
+                )
 
+            torch.cuda.synchronize()
+            # 获取 base 参数
+            time_begin = time.time()
             cls.engine_base_params = []
             print(f"rank {rank} get parameter in engine base model")
             for parameter_name in parameters:
@@ -150,6 +226,10 @@ class TestParameterUpdateGroup(unittest.TestCase):
                         parameter_name, truncate_size
                     )
                 )
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(f"rank {rank} get base parameters time: {time_end - time_begin:.3f}s")
+
             param_queue.put(("engine_base_params", cls.engine_base_params))
             print(f"rank {rank} shutdown engine")
             cls.engine.shutdown()
@@ -169,6 +249,8 @@ class TestParameterUpdateGroup(unittest.TestCase):
         # 初始化每个模型的 state_dict_key_to_shape
         cls.model_state_dict_shapes = {}
         for model_name in cls.model_names:
+            torch.cuda.synchronize()
+            time_begin = time.time()
             model = AutoModelForCausalLM.from_pretrained(
                 model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
@@ -180,6 +262,11 @@ class TestParameterUpdateGroup(unittest.TestCase):
             del model
             gc.collect()
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            time_end = time.time()
+            print(
+                f"Initialize state dict shapes for {model_name} time: {time_end - time_begin:.3f}s"
+            )
             time.sleep(2)
 
     @classmethod
@@ -195,6 +282,8 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 param_queue = mp.Queue()
                 results = {}
 
+                torch.cuda.synchronize()
+                time_begin = time.time()
                 context = mp.spawn(
                     cls.init_process,
                     args=(
@@ -218,6 +307,9 @@ class TestParameterUpdateGroup(unittest.TestCase):
                             break
 
                 context.join()
+                torch.cuda.synchronize()
+                time_end = time.time()
+                print(f"Total spawn and join time: {time_end - time_begin:.3f}s")
 
                 if len(results) != 4:
                     raise RuntimeError(f"Expected 4 parameters but got {len(results)}")
