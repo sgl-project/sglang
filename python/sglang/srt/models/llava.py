@@ -350,7 +350,6 @@ class LlavaBaseForCausalLM(nn.Module):
                 # Fill in the placeholder for the image
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
                 prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-                pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
                         continue
@@ -363,7 +362,7 @@ class LlavaBaseForCausalLM(nn.Module):
                         if image_offset < prefix_len:
                             continue
 
-                        tmp_image_feature = image_features[pt][j]
+                        tmp_image_feature = image_features[i][j]
                         pad_len = tmp_image_feature.shape[0]
 
                         left_idx = start_idx + (image_offset - prefix_len)
@@ -376,7 +375,6 @@ class LlavaBaseForCausalLM(nn.Module):
                             print(
                                 f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
                             )
-                    pt += 1
 
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
