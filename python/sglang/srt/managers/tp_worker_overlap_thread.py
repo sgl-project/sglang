@@ -27,7 +27,6 @@ from sglang.srt.managers.io_struct import UpdateWeightReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_parent_process
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
