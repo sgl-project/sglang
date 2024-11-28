@@ -529,12 +529,33 @@ class ModelRunner:
 
                         # 提取对应部分的权重
                         weight = param.data.narrow(0, offset, size)
+                    elif mapped_shard_id in [0, 1]:
+                        # 处理 gate_up_proj 的情况
+                        intermediate_size = self.model.config.intermediate_size
+                        hidden_size = self.model.config.hidden_size
+                        slice_size = intermediate_size // self.tp_size
+
+                        if mapped_shard_id == 0:  # gate_proj
+                            offset = 0
+                            size = slice_size
+                        elif mapped_shard_id == 1:  # up_proj
+                            offset = slice_size
+                            size = slice_size
+
+                        # 提取对应部分的权重
+                        weight = param.data.narrow(0, offset, size)
                     else:
                         weight = param.data
                 else:
                     weight = param.data
 
-                # 转换并截断
+                if self.tp_size > 1 and ("o_proj" in name or "down_proj" in name):
+                    gathered_weights = [
+                        torch.zeros_like(weight) for _ in range(self.tp_size)
+                    ]
+                    torch.distributed.all_gather(gathered_weights, weight)
+                    weight = torch.cat(gathered_weights, dim=1)
+
                 return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
             else:
                 logger.warning(
