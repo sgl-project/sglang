@@ -19,6 +19,20 @@ class TestTorchTP(unittest.TestCase):
         if is_in_ci():
             assert output_throughput > 0, f"{output_throughput=}"
 
+    def test_llama_with_torch_native_attn_backend(self):
+        output_throughput = run_bench_one_batch(
+            "meta-llama/Meta-Llama-3-8B",
+            [
+                "--tp",
+                "2",
+                "--attention-backend", "torch_native",
+                "--disable-cuda-graph",
+            ],
+        )
+
+        if is_in_ci():
+            assert output_throughput > 0, f"{output_throughput=}"
+
 
 if __name__ == "__main__":
     unittest.main()
