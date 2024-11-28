@@ -57,7 +57,7 @@ class LlavaBaseForCausalLM(nn.Module):
         else:
             image_aspect_ratio = "anyres"
         offset_list = []
-        for image_s in image_sizes:
+        for image_idx, image_s in enumerate(image_sizes):
             if len(image_sizes) > 16:
                 # 2x2 pooling with stride 2
                 new_image_feature_len = (
@@ -92,10 +92,6 @@ class LlavaBaseForCausalLM(nn.Module):
                         new_w = int(new_w // times)
                 new_image_feature_len += new_h * (new_w + 1)
 
-            pad_ids = pad_values * (
-                (new_image_feature_len + len(pad_values)) // len(pad_values)
-            )
-            # print("calculated new_image_feature_len: ", new_image_feature_len)
             try:
                 offset = input_ids.index(self.config.image_token_index)
             except ValueError:
@@ -103,7 +99,7 @@ class LlavaBaseForCausalLM(nn.Module):
             # old_len + pad_len - 1, because we need to remove image_token_id
             input_ids = (
                 input_ids[:offset]
-                + pad_ids[:new_image_feature_len]
+                + [pad_values[image_idx]] * new_image_feature_len
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)
