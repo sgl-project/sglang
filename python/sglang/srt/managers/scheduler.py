@@ -1352,12 +1352,14 @@ class Scheduler:
 
         if to_del is not None:
             del self.waiting_queue[to_del]
+            logger.debug(f"Abort queued request. {req.rid=}")
             return
 
         # Delete requests in the running batch
         if self.running_batch:
             for req in self.running_batch.reqs:
                 if req.rid == recv_req.rid and not req.finished():
+                    logger.debug(f"Abort running request. {req.rid=}")
                     req.to_abort = True
                     break
 
