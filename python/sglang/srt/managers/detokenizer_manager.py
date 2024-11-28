@@ -202,5 +202,5 @@ def run_detokenizer_process(
         manager.event_loop()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"DataParallelController hit an exception: {traceback}")
+        logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
