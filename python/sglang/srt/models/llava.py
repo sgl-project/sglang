@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Inference-only LLaVa model compatible with HuggingFace weights."""
 
 import math
@@ -51,9 +49,15 @@ class LlavaBaseForCausalLM(nn.Module):
         image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
 
         # hardcode for spatial_unpad + anyres
-        image_aspect_ratio = "anyres" if len(image_sizes) == 1 else "pad"
+        if image_inputs.modalities is not None and (
+            "multi-images" in image_inputs.modalities
+            or "video" in image_inputs.modalities
+        ):
+            image_aspect_ratio = "pad"
+        else:
+            image_aspect_ratio = "anyres"
         offset_list = []
-        for image_s in image_sizes:
+        for image_idx, image_s in enumerate(image_sizes):
             if len(image_sizes) > 16:
                 # 2x2 pooling with stride 2
                 new_image_feature_len = (
@@ -88,10 +92,6 @@ class LlavaBaseForCausalLM(nn.Module):
                         new_w = int(new_w // times)
                 new_image_feature_len += new_h * (new_w + 1)
 
-            pad_ids = pad_values * (
-                (new_image_feature_len + len(pad_values)) // len(pad_values)
-            )
-            # print("calculated new_image_feature_len: ", new_image_feature_len)
             try:
                 offset = input_ids.index(self.config.image_token_index)
             except ValueError:
@@ -99,7 +99,7 @@ class LlavaBaseForCausalLM(nn.Module):
             # old_len + pad_len - 1, because we need to remove image_token_id
             input_ids = (
                 input_ids[:offset]
-                + pad_ids[:new_image_feature_len]
+                + [pad_values[image_idx]] * new_image_feature_len
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)
@@ -345,7 +345,7 @@ class LlavaBaseForCausalLM(nn.Module):
 
                 # Fill in the placeholder for the image
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-                prefix_lens_cpu = forward_batch.extend_prefix_lens.cpu().numpy()
+                prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:

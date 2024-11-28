@@ -1,5 +1,5 @@
 # Frontend: Structured Generation Language (SGLang)
-The frontend language can be used with local models or API models. It is an alternative to the OpenAI API. You may found it easier to use for complex prompting workflow.
+The frontend language can be used with local models or API models. It is an alternative to the OpenAI API. You may find it easier to use for complex prompting workflow.
 
 ## Quick Start
 The example below shows how to use SGLang to answer a multi-turn question.

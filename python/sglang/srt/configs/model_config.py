@@ -1,27 +1,26 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 import json
 import logging
-import os
 from enum import IntEnum, auto
 from typing import List, Optional
 
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +59,9 @@ class ModelConfig:
 
         # Derive context length
         derived_context_len = get_context_length(self.hf_text_config)
-        allow_long_context = os.environ.get(
-            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", None
-        )
-
         if context_length is not None:
             if context_length > derived_context_len:
-                if allow_long_context:
+                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."

@@ -1,27 +1,28 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Constrained decoding with outlines backend."""
 
 import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
+import interegular
 import torch
 from outlines.fsm.guide import RegexGuide
+from outlines.fsm.json_schema import build_regex_from_schema
 from outlines.models.transformers import TransformerTokenizer
+from pydantic import BaseModel
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -30,26 +31,6 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
 logger = logging.getLogger(__name__)
-
-
-try:
-    from outlines.fsm.json_schema import build_regex_from_object
-except ImportError:
-    # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
-    # which only accepts string schema as input.
-    from outlines.fsm.json_schema import build_regex_from_schema
-    from pydantic import BaseModel
-
-    def build_regex_from_object(
-        object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
-    ):
-        if isinstance(object, type(BaseModel)):
-            schema = json.dumps(object.model_json_schema())
-        elif isinstance(object, Dict):
-            schema = json.dumps(object)
-        else:
-            schema = object
-        return build_regex_from_schema(schema, whitespace_pattern)
 
 
 class OutlinesGrammar(BaseGrammarObject):
@@ -98,9 +79,22 @@ class OutlinesGrammar(BaseGrammarObject):
     ):
         self.state = next_state
 
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        tokens = torch.tensor(
+            self.guide.get_next_instruction(self.state).tokens, dtype=torch.int64
+        ).to(vocab_mask.device, non_blocking=True)
+        vocab_mask = vocab_mask[idx]
         vocab_mask.fill_(1)
-        vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
+        vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
+        logits.masked_fill_(vocab_mask, float("-inf"))
 
     def copy(self):
         return OutlinesGrammar(self.guide, self.jump_forward_map)
@@ -147,19 +141,36 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                     key_string,
                     whitespace_pattern=self.whitespace_pattern,
                 )
-            except NotImplementedError as e:
+            except (NotImplementedError, json.decoder.JSONDecodeError) as e:
                 logger.warning(
-                    f"skip invalid json schema: json_schema={key_string}, {e=}"
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
-                return None, key_string
+                return None
         elif key_type == "regex":
             regex = key_string
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-        guide = RegexGuide(regex, self.outlines_tokenizer)
+        try:
+            guide = RegexGuide(regex, self.outlines_tokenizer)
+        except interegular.patterns.InvalidSyntax as e:
+            logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
+            return None
+
         if self.allow_jump_forward:
             jump_forward_map = OutlinesJumpForwardMap(regex)
         else:
             jump_forward_map = None
         return OutlinesGrammar(guide, jump_forward_map)
+
+
+def build_regex_from_object(
+    object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
+):
+    if isinstance(object, type(BaseModel)):
+        schema = json.dumps(object.model_json_schema())
+    elif isinstance(object, Dict):
+        schema = json.dumps(object)
+    else:
+        schema = object
+    return build_regex_from_schema(schema, whitespace_pattern)

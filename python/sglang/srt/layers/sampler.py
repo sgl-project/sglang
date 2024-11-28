@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import Union
 
 import torch
@@ -8,7 +7,7 @@ from torch import nn
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import crash_on_warnings, is_flashinfer_available
 
 if is_flashinfer_available():
     from flashinfer.sampling import (
@@ -19,17 +18,13 @@ if is_flashinfer_available():
     )
 
 
-# Crash on warning if we are running CI tests
-crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
-
-
 logger = logging.getLogger(__name__)
 
 
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_nan_detectioin = not global_server_args_dict["disable_nan_detection"]
+        self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
 
     def forward(
         self,
@@ -46,7 +41,8 @@ class Sampler(nn.Module):
             logits = torch.where(
                 torch.isnan(logits), torch.full_like(logits, -1e5), logits
             )
-            exit(1) if crash_on_warning else None
+            if crash_on_warnings():
+                raise ValueError("Detected errors during sampling! NaN in the logits.")
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
@@ -78,7 +74,7 @@ class Sampler(nn.Module):
                         filter_apply_order="joint",
                     )
 
-                if not torch.all(success):
+                if self.use_nan_detectioin and not torch.all(success):
                     logger.warning("Detected errors during sampling!")
                     batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
             elif global_server_args_dict["sampling_backend"] == "pytorch":

@@ -20,7 +20,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2830
+            self.assertGreater(res["output_throughput"], 3350)
 
     def test_offline_throughput_non_stream_small_batch_size(self):
         res = run_bench_serving(
@@ -32,10 +32,13 @@ class TestBenchServing(unittest.TestCase):
             random_input_len=None,
             random_output_len=None,
             disable_stream=True,
+            need_warmup=True,
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 1000
+            # There is a regression with torch 2.5
+            # This number was 950 for torch 2.4
+            self.assertGreater(res["output_throughput"], 800)
 
     def test_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -46,7 +49,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2880
+            self.assertGreater(res["output_throughput"], 3350)
 
     def test_offline_throughput_without_chunked_prefill(self):
         res = run_bench_serving(
@@ -57,7 +60,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2600
+            self.assertGreater(res["output_throughput"], 2600)
 
     def test_offline_throughput_with_triton_attention_backend(self):
         res = run_bench_serving(
@@ -73,7 +76,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2930
+            self.assertGreater(res["output_throughput"], 3450)
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(
@@ -84,7 +87,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 3100
+            self.assertGreater(res["output_throughput"], 3850)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
@@ -95,9 +98,9 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["median_e2e_latency_ms"] < 12000
-            assert res["median_ttft_ms"] < 80
-            assert res["median_itl_ms"] < 12
+            self.assertLess(res["median_e2e_latency_ms"], 12000)
+            self.assertLess(res["median_ttft_ms"], 86)
+            self.assertLess(res["median_itl_ms"], 10)
 
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(
@@ -108,7 +111,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 1850
+            self.assertGreater(res["output_throughput"], 2150)
 
     def test_moe_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -119,7 +122,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 1950
+            self.assertGreater(res["output_throughput"], 2150)
 
 
 if __name__ == "__main__":

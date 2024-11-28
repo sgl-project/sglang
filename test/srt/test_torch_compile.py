@@ -1,9 +1,10 @@
+import time
 import unittest
 from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -27,7 +28,7 @@ class TestTorchCompile(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -39,7 +40,7 @@ class TestTorchCompile(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        self.assertGreaterEqual(metrics["score"], 0.65)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -49,24 +50,24 @@ class TestTorchCompile(unittest.TestCase):
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
                 },
-                "ignore_eos": True,
             },
         )
         return response.json()
 
     def test_throughput(self):
-        import time
+        # Warmup
+        res = self.run_decode(16)
 
         max_tokens = 256
-
         tic = time.time()
         res = self.run_decode(max_tokens)
         tok = time.time()
-        print(res["text"])
+        print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        assert throughput >= 152
+        self.assertGreaterEqual(throughput, 152)
 
 
 if __name__ == "__main__":

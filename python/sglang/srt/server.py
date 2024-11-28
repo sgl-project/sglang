@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 The entry point of inference server.
 SRT = SGLang Runtime.
@@ -25,6 +23,8 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import signal
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -50,8 +50,10 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    OpenSessionReqInput,
     UpdateWeightReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -79,13 +81,14 @@ from sglang.srt.utils import (
     configure_logger,
     delete_directory,
     is_port_available,
-    kill_child_process,
+    kill_process_tree,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
+from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +105,7 @@ app.add_middleware(
 )
 
 tokenizer_manager: TokenizerManager = None
+_max_total_num_tokens = None
 
 ##### Native API endpoints #####
 
@@ -139,15 +143,21 @@ async def get_model_info():
     """Get the model information."""
     result = {
         "model_path": tokenizer_manager.model_path,
+        "tokenizer_path": tokenizer_manager.server_args.tokenizer_path,
         "is_generation": tokenizer_manager.is_generation,
     }
     return result
 
 
-@app.get("/get_server_args")
-async def get_server_args():
-    """Get the server arguments."""
-    return dataclasses.asdict(tokenizer_manager.server_args)
+@app.get("/get_server_info")
+async def get_server_info():
+    try:
+        return await _get_server_info()
+
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 @app.post("/flush_cache")
@@ -161,9 +171,19 @@ async def flush_cache():
     )
 
 
+def start_profile():
+    """Start profiling."""
+    tokenizer_manager.start_profile()
+
+
+def stop_profile():
+    """Stop profiling."""
+    tokenizer_manager.stop_profile()
+
+
 @app.get("/start_profile")
 @app.post("/start_profile")
-async def start_profile():
+async def start_profile_async():
     """Start profiling."""
     tokenizer_manager.start_profile()
     return Response(
@@ -174,26 +194,13 @@ async def start_profile():
 
 @app.get("/stop_profile")
 @app.post("/stop_profile")
-async def stop_profile():
+async def stop_profile_async():
     """Stop profiling."""
     tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
-
-
-@app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
-async def get_memory_pool_size():
-    """Get the memory pool size in number of tokens"""
-    try:
-        ret = await tokenizer_manager.get_memory_pool_size()
-
-        return ret
-    except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
 
 
 @app.post("/update_weights")
@@ -211,6 +218,30 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         return ORJSONResponse(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.api_route("/open_session", methods=["GET", "POST"])
+async def open_session(obj: OpenSessionReqInput, request: Request):
+    """Open a session, and return its unique session id."""
+    try:
+        session_id = await tokenizer_manager.open_session(obj, request)
+        return session_id
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+@app.api_route("/close_session", methods=["GET", "POST"])
+async def close_session(obj: CloseSessionReqInput, request: Request):
+    """Close the session"""
+    try:
+        await tokenizer_manager.close_session(obj, request)
+        return Response(status_code=200)
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 
 
@@ -365,6 +396,7 @@ def launch_engine(
     """
 
     global tokenizer_manager
+    global _max_total_num_tokens
 
     # Configure global environment
     configure_logger(server_args)
@@ -391,7 +423,7 @@ def launch_engine(
         )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
-            gpu_id = tp_rank % tp_size_per_node
+            gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
@@ -430,9 +462,19 @@ def launch_engine(
     if server_args.chat_template:
         load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
-    # Wait for model to finish loading
+    # Wait for model to finish loading & get max token nums
+    scheduler_info = []
     for i in range(len(scheduler_pipe_readers)):
-        scheduler_pipe_readers[i].recv()
+        data = scheduler_pipe_readers[i].recv()
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_info.append(data)
+
+    # Assume all schedulers have same max_total_num_tokens
+    _max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
 
 
 def launch_server(
@@ -493,6 +535,15 @@ def launch_server(
         t.join()
 
 
+async def _get_server_info():
+    return {
+        **dataclasses.asdict(tokenizer_manager.server_args),  # server args
+        "memory_pool_size": await tokenizer_manager.get_memory_pool_size(),  # memory pool size
+        "max_total_num_tokens": _max_total_num_tokens,  # max total num tokens
+        "version": __version__,
+    }
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -523,6 +574,15 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
+    # Register the signal handler.
+    # The child processes will send SIGQUIT to this process when any error happens
+    # This process then clean up the whole process tree
+    def sigquit_handler(signum, frame):
+        kill_process_tree(os.getpid())
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
+
+    # Set mp start method
     mp.set_start_method("spawn", force=True)
 
 
@@ -549,7 +609,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid())
         return
 
     model_info = res.json()
@@ -582,7 +642,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid())
         return
 
     # logger.info(f"{res.json()=}")
@@ -651,7 +711,7 @@ class Runtime:
 
     def shutdown(self):
         if self.pid is not None:
-            kill_child_process(self.pid, include_self=True)
+            kill_process_tree(self.pid)
             self.pid = None
 
     def cache_prefix(self, prefix: str):
@@ -734,6 +794,17 @@ class Runtime:
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
+    async def get_server_info(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.url}/get_server_info") as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_data = await response.json()
+                    raise RuntimeError(
+                        f"Failed to get server info. {error_data['error']['message']}"
+                    )
+
     def __del__(self):
         self.shutdown()
 
@@ -768,7 +839,7 @@ class Engine:
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
         prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Dict] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -864,7 +935,7 @@ class Engine:
             return ret
 
     def shutdown(self):
-        kill_child_process()
+        kill_process_tree(os.getpid(), include_parent=False)
 
     def get_tokenizer(self):
         global tokenizer_manager
@@ -883,3 +954,6 @@ class Engine:
         # get the current event loop
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
+
+    async def get_server_info(self):
+        return await _get_server_info()

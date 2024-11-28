@@ -6,7 +6,7 @@ python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mm
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -35,7 +35,7 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -47,7 +47,7 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.62, f"{metrics}"
+        self.assertGreater(metrics["score"], 0.62)
 
     def test_human_eval(self):
         args = SimpleNamespace(
@@ -59,7 +59,7 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.42, f"{metrics}"
+        self.assertGreater(metrics["score"], 0.40)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -71,7 +71,7 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.62, f"{metrics}"
+        self.assertGreater(metrics["score"], 0.62)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -28,7 +28,7 @@ class TestDataParallelism(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -40,7 +40,7 @@ class TestDataParallelism(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        self.assertGreaterEqual(metrics["score"], 0.65)
 
     def test_update_weight(self):
         response = requests.post(
@@ -63,12 +63,13 @@ class TestDataParallelism(unittest.TestCase):
         assert response.status_code == 200
 
     def test_get_memory_pool_size(self):
-        response = requests.get(self.base_url + "/get_memory_pool_size")
+        # use `get_server_info` instead since `get_memory_pool_size` is merged into `get_server_info`
+        response = requests.get(self.base_url + "/get_server_info")
         assert response.status_code == 200
 
         time.sleep(5)
 
-        response = requests.get(self.base_url + "/get_memory_pool_size")
+        response = requests.get(self.base_url + "/get_server_info")
         assert response.status_code == 200
 
 

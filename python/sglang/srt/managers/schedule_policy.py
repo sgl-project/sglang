@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Request scheduler policy"""
 
 import os
@@ -302,7 +300,11 @@ class PrefillAdder:
             if (
                 self.rem_chunk_tokens is None
                 or input_tokens <= self.rem_chunk_tokens
-                or (req.return_logprob and req.normalized_prompt_logprob is None)
+                or (
+                    req.return_logprob
+                    and req.normalized_prompt_logprob is None
+                    and req.logprob_start_len != len(req.origin_input_ids) - 1
+                )
             ):
                 # Non-chunked prefill
                 self.can_run_list.append(req)

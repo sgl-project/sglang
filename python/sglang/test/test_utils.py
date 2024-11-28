@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import copy
 import os
 import random
 import subprocess
@@ -21,15 +22,16 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import get_bool_env_var, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
@@ -42,7 +44,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 
 def is_in_ci():
     """Return whether it is in CI runner."""
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
 if is_in_ci():
@@ -437,18 +439,22 @@ def popen_launch_server(
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {api_key}",
-            }
-            response = requests.get(f"{base_url}/health_generate", headers=headers)
-            if response.status_code == 200:
-                return process
-        except requests.RequestException:
-            pass
-        time.sleep(10)
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                )
+                if response.status_code == 200:
+                    return process
+            except requests.RequestException:
+                pass
+            time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
@@ -498,7 +504,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             )
             assert ret_code == 0
         except TimeoutError:
-            kill_child_process(process.pid, include_self=True)
+            kill_process_tree(process.pid)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
@@ -528,6 +534,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    need_warmup=False,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -561,22 +568,27 @@ def run_bench_serving(
         disable_stream=disable_stream,
         disable_ignore_eos=False,
         extra_request_body=None,
+        profile=None,
     )
 
     try:
+        if need_warmup:
+            warmup_args = copy.deepcopy(args)
+            warmup_args.num_prompts = 16
+            run_benchmark(warmup_args)
         res = run_benchmark(args)
     finally:
-        kill_child_process(process.pid, include_self=True)
+        kill_process_tree(process.pid)
 
     assert res["completed"] == num_prompts
     return res
 
 
-def run_bench_latency(model, other_args):
+def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_latency",
+        "sglang.bench_one_batch",
         "--model-path",
         model,
         "--batch-size",
@@ -599,7 +611,7 @@ def run_bench_latency(model, other_args):
         lastline = output.split("\n")[-3]
         output_throughput = float(lastline.split(" ")[-2])
     finally:
-        kill_child_process(process.pid, include_self=True)
+        kill_process_tree(process.pid)
 
     return output_throughput
 
@@ -663,16 +675,22 @@ def run_and_check_memory_leak(
     workload_func,
     disable_radix_cache,
     enable_mixed_chunk,
-    enable_overlap,
+    disable_overlap,
     chunked_prefill_size,
+    assert_has_abort,
 ):
-    other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
+    other_args = [
+        "--chunked-prefill-size",
+        str(chunked_prefill_size),
+        "--log-level",
+        "debug",
+    ]
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:
         other_args += ["--enable-mixed-chunk"]
-    if enable_overlap:
-        other_args += ["--enable-overlap-scheduler"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)
@@ -698,8 +716,8 @@ def run_and_check_memory_leak(
     workload_func(base_url, model)
 
     # Clean up everything
-    kill_child_process(process.pid, include_self=True)
-    kill_child_process(process.pid, include_self=True)
+    kill_process_tree(process.pid)
+    kill_process_tree(process.pid)
     stdout.close()
     stderr.close()
     if os.path.exists(STDOUT_FILENAME):
@@ -711,20 +729,25 @@ def run_and_check_memory_leak(
     # Assert success
     has_new_server = False
     has_leak = False
+    has_abort = False
     for line in output_lines:
         if "The server is fired" in line:
             has_new_server = True
         if "leak" in line:
             has_leak = True
+        if "Abort" in line:
+            has_abort = True
 
     assert has_new_server
     assert not has_leak
+    if assert_has_abort:
+        assert has_abort
 
 
 def run_mmlu_test(
     disable_radix_cache=False,
     enable_mixed_chunk=False,
-    enable_overlap=False,
+    disable_overlap=False,
     chunked_prefill_size=32,
 ):
     def workload_func(base_url, model):
@@ -739,8 +762,7 @@ def run_mmlu_test(
 
         try:
             metrics = run_eval(args)
-            print(f"{metrics=}")
-            assert metrics["score"] >= 0.65
+            assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass
 
@@ -748,8 +770,9 @@ def run_mmlu_test(
         workload_func,
         disable_radix_cache,
         enable_mixed_chunk,
-        enable_overlap,
+        disable_overlap,
         chunked_prefill_size,
+        assert_has_abort=False,
     )
 
 
@@ -789,4 +812,5 @@ def run_mulit_request_test(
         enable_mixed_chunk,
         enable_overlap,
         chunked_prefill_size,
+        assert_has_abort=False,
     )

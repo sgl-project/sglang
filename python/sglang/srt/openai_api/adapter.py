@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
@@ -516,8 +514,9 @@ def v1_generate_request(
                 "regex": request.regex,
                 "json_schema": request.json_schema,
                 "n": request.n,
-                "ignore_eos": request.ignore_eos,
                 "no_stop_trim": request.no_stop_trim,
+                "ignore_eos": request.ignore_eos,
+                "skip_special_tokens": request.skip_special_tokens,
             }
         )
         return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
@@ -928,7 +927,9 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
@@ -986,11 +987,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
             )
             token_logprobs = []
-            for token, logprob in zip(logprobs.tokens, logprobs.token_logprobs):
+            for token_idx, (token, logprob) in enumerate(
+                zip(logprobs.tokens, logprobs.token_logprobs)
+            ):
                 token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
                 if logprobs.top_logprobs:
-                    for top_token, top_logprob in logprobs.top_logprobs[0].items():
+                    for top_token, top_logprob in logprobs.top_logprobs[
+                        token_idx
+                    ].items():
                         top_token_bytes = list(top_token.encode("utf-8"))
                         top_logprobs.append(
                             TopLogprob(
@@ -1166,7 +1171,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         is_first = False
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant"),
+                            delta=DeltaMessage(role="assistant", content=""),
                             finish_reason=(
                                 finish_reason["type"] if finish_reason else ""
                             ),
@@ -1281,7 +1286,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
-        if isinstance(prompts[0], str) or isinstance(propmts[0][0], str):
+        if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}

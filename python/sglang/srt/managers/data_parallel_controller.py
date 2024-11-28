@@ -1,24 +1,25 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import logging
 import multiprocessing as mp
+import signal
+import threading
 from enum import Enum, auto
 
+import psutil
 import zmq
 
 from sglang.srt.managers.io_struct import (
@@ -27,12 +28,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    configure_logger,
-    get_zmq_socket,
-    kill_parent_process,
-    suppress_other_loggers,
-)
+from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -80,20 +76,62 @@ class DataParallelController:
 
         # Start data parallel workers
         base_gpu_id = 0
-        self.workers = []
+        self.workers = [None] * server_args.dp_size
+
+        threads = []
+        sockets = []
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
+            tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
 
-            send_to = self.launch_tensor_parallel_group(
-                server_args,
-                tmp_port_args,
-                base_gpu_id,
-                dp_rank,
-            )
+            if server_args.enable_dp_attention:
+                # Data parallelism resues the tensor parallelism group,
+                # so all dp ranks should use the same nccl port.
+                tmp_port_args.nccl_port = port_args.nccl_port
+            else:
+                # This port is checked free in PortArgs.init_new.
+                # We hold it first so that the next dp worker gets a different port
+                sockets.append(bind_port(tmp_port_args.nccl_port))
 
-            self.workers.append(send_to)
-            base_gpu_id += server_args.tp_size
+            # Create a thread for each worker
+            thread = threading.Thread(
+                target=self.launch_worker_func,
+                args=(server_args, tmp_port_args, base_gpu_id, dp_rank),
+            )
+            threads.append(thread)
+            base_gpu_id += 1 if server_args.enable_dp_attention else server_args.tp_size
+
+        # Free all sockets before starting the threads to launch TP workers
+        for sock in sockets:
+            sock.close()
+
+        # Start all threads
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def launch_worker_func(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        base_gpu_id: int,
+        dp_rank: int,
+    ):
+        logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
+
+        launch_func_ = (
+            self.launch_tensor_parallel_process
+            if server_args.enable_dp_attention
+            else self.launch_tensor_parallel_group
+        )
+        self.workers[dp_rank] = launch_func_(
+            server_args,
+            port_args,
+            base_gpu_id,
+            dp_rank,
+        )
 
     def launch_tensor_parallel_group(
         self,
@@ -112,7 +150,7 @@ class DataParallelController:
         )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
-            gpu_id = base_gpu_id + tp_rank % tp_size_per_node
+            gpu_id = server_args.base_gpu_id + base_gpu_id + tp_rank % tp_size_per_node
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
@@ -125,9 +163,36 @@ class DataParallelController:
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
 
-        # Wait for model to finish loading
+        # Wait for model to finish loading and get max token nums
+        scheduler_info = []
         for i in range(len(scheduler_pipe_readers)):
-            scheduler_pipe_readers[i].recv()
+            scheduler_info.append(scheduler_pipe_readers[i].recv())
+
+        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
+
+        return send_to
+
+    def launch_tensor_parallel_process(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        base_gpu_id: int,
+        dp_rank: int,
+    ):
+        reader, writer = mp.Pipe(duplex=False)
+        gpu_id = base_gpu_id
+        tp_rank = dp_rank
+        proc = mp.Process(
+            target=run_scheduler_process,
+            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
+        )
+        proc.start()
+        send_to = get_zmq_socket(
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
+
+        scheduler_info = reader.recv()
+        self.max_total_num_tokens = scheduler_info["max_total_num_tokens"]
 
         return send_to
 
@@ -166,13 +231,15 @@ def run_data_parallel_controller_process(
     pipe_writer,
 ):
     configure_logger(server_args)
-    suppress_other_loggers()
+    parent_process = psutil.Process().parent()
 
     try:
         controller = DataParallelController(server_args, port_args)
-        pipe_writer.send("ready")
+        pipe_writer.send(
+            {"status": "ready", "max_total_num_tokens": controller.max_total_num_tokens}
+        )
         controller.event_loop()
     except Exception:
-        msg = get_exception_traceback()
-        logger.error(msg)
-        kill_parent_process()
+        traceback = get_exception_traceback()
+        logger.error(f"DataParallelController hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)

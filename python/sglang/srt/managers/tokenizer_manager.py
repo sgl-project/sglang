@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
@@ -23,6 +21,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
@@ -42,11 +41,14 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    CloseSessionReqInput,
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
     GetMemPoolSizeReq,
     GetMemPoolSizeReqOutput,
+    OpenSessionReqInput,
+    OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -56,7 +58,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_child_process
+from sglang.srt.utils import get_zmq_socket, kill_process_tree
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -146,6 +148,9 @@ class TokenizerManager:
         self.model_update_lock = asyncio.Lock()
         self.model_update_result = None
 
+        # For session info
+        self.session_futures = {}  # session_id -> asyncio event
+
         # Others
         self.gracefully_exit = False
 
@@ -196,8 +201,18 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
         # Tokenize
+        input_embeds = None
         input_text = obj.text
-        if obj.input_ids is None:
+        if obj.input_embeds is not None:
+            if not self.server_args.disable_radix_cache:
+                raise ValueError(
+                    "input_embeds is provided while disable_radix_cache is False. "
+                    "Please add `--disable-radix-cach` when you launch the server "
+                    "if you want to use input_embeds as inputs."
+                )
+            input_embeds = obj.input_embeds
+            input_ids = obj.input_ids
+        elif obj.input_ids is None:
             input_ids = self.tokenizer.encode(input_text)
         else:
             input_ids = obj.input_ids
@@ -211,8 +226,10 @@ class TokenizerManager:
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
+            session_id = obj.session[0] if obj.session else None
+            session_rid = obj.session[1] if obj.session else None
 
-        if len(input_ids) >= self.context_len:
+        if obj.input_ids is not None and len(input_ids) >= self.context_len:
             raise ValueError(
                 f"The input ({len(input_ids)} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
@@ -235,7 +252,10 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                obj.lora_path,
+                lora_path=obj.lora_path,
+                input_embeds=input_embeds,
+                session_id=session_id,
+                session_rid=session_rid,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -451,6 +471,26 @@ class TokenizerManager:
         else:
             return False, "Another update is in progress. Please try again later."
 
+    async def open_session(
+        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+    ):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        session_id = uuid.uuid4().hex
+        obj.session_id = session_id
+        self.send_to_scheduler.send_pyobj(obj)
+        self.session_futures[session_id] = asyncio.Future()
+        session_id = await self.session_futures[session_id]
+        del self.session_futures[session_id]
+        return session_id
+
+    async def close_session(
+        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+    ):
+        assert not self.to_create_loop, "close session should not be the first request"
+        await self.send_to_scheduler.send_pyobj(obj)
+
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
@@ -492,7 +532,7 @@ class TokenizerManager:
             else:
                 break
 
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
     async def handle_loop(self):
@@ -520,6 +560,11 @@ class TokenizerManager:
                     # set future if the all results are received
                     if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
                         self.mem_pool_size.set_result(self.mem_pool_size_tmp)
+                continue
+            elif isinstance(recv_obj, OpenSessionReqOutput):
+                self.session_futures[recv_obj.session_id].set_result(
+                    recv_obj.session_id
+                )
                 continue
 
             assert isinstance(

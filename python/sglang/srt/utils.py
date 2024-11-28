@@ -1,22 +1,21 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Common utilities."""
 
 import base64
 import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -27,12 +26,13 @@ import resource
 import shutil
 import signal
 import socket
+import subprocess
 import tempfile
 import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import psutil
@@ -45,6 +45,8 @@ from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from starlette.routing import Mount
 from torch import nn
+from torch.func import functional_call
+from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
     FileCacheManager,
@@ -70,6 +72,8 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
+    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
+        return False
     return torch.cuda.is_available() and not is_hip()
 
 
@@ -187,6 +191,94 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
         free_gpu_memory = tensor.item()
 
     return free_gpu_memory / (1 << 30)
+
+
+def is_pin_memory_available() -> bool:
+    return torch.cuda.is_available()
+
+
+_CPU_OFFLOAD_BYTES = 0
+_CPU_OFFLOAD_MAX_BYTES = 0
+
+
+def set_cpu_offload_max_bytes(max_bytes: int) -> None:
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    _CPU_OFFLOAD_BYTES = 0
+    _CPU_OFFLOAD_MAX_BYTES = max_bytes
+
+
+def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+    device = next(module.parameters()).device
+
+    if device == torch.device("cpu"):
+        return module
+
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+        return module
+
+    pin_memory = is_pin_memory_available()
+    # offload parameters to CPU
+    # use pin_memory if possible, which helps cudagraph capture speed
+    offloaded_parameters = False
+    for p in module.parameters():
+        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+            # we use per-parameter offloading
+            # one module might have some parameters offloaded and some not
+            break
+
+        # `torch.empty_like` does not support `pin_memory` argument
+        cpu_data = torch.empty_strided(
+            size=p.data.size(),
+            stride=p.data.stride(),
+            dtype=p.data.dtype,
+            layout=p.data.layout,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        cpu_data.copy_(p.data)
+        p.data = cpu_data
+        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
+        offloaded_parameters = True
+
+    if offloaded_parameters:
+        original_forward = module.forward
+
+        def forward(*args, **kwargs):
+            module.forward = original_forward
+            device_state = {
+                # here we blindly call `to(device)`
+                # if the parameter is already on the device, it will be a no-op
+                k: v.to(device, non_blocking=True)
+                for k, v in module.state_dict().items()
+            }
+            output = functional_call(module, device_state, args=args, kwargs=kwargs)
+            module.forward = forward
+            return output
+
+        module.forward = forward
+
+    return module
+
+
+class LayerFn(Protocol):
+
+    def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
+
+
+def make_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+) -> Tuple[int, int, torch.nn.ModuleList]:
+    """Make a list of layers with the given layer function"""
+    modules = torch.nn.ModuleList(
+        [
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=f"{prefix}.{idx}"))
+            for idx in range(num_hidden_layers)
+        ]
+    )
+    return modules
 
 
 def set_random_seed(seed: int) -> None:
@@ -329,6 +421,7 @@ def suppress_other_loggers():
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.ERROR)
+    logging.getLogger("vllm.model_executor.model_loader.loader").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -350,26 +443,14 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
-def kill_parent_process():
-    """Kill the parent process and all children of the parent process."""
-    current_process = psutil.Process()
-    parent_process = current_process.parent()
-    kill_child_process(
-        parent_process.pid, include_self=True, skip_pid=current_process.pid
-    )
-    try:
-        current_process.kill()
-    except psutil.NoSuchProcess:
-        pass
-
-
-def kill_child_process(pid=None, include_self=False, skip_pid=None):
-    """Kill the process and all its children process."""
-    if pid is None:
-        pid = os.getpid()
+def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
+    """Kill the process and all its child processes."""
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
 
     try:
-        itself = psutil.Process(pid)
+        itself = psutil.Process(parent_pid)
     except psutil.NoSuchProcess:
         return
 
@@ -382,15 +463,36 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
         except psutil.NoSuchProcess:
             pass
 
-    if include_self:
+    if include_parent:
         try:
             itself.kill()
 
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGINT)
+            itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
+
+
+def monkey_patch_vllm_model_config():
+    from vllm.config import ModelConfig
+
+    if not hasattr(ModelConfig, "_resolve_task"):
+        return
+
+    def _resolve_task(
+        self,
+        task_option,
+        hf_config,
+    ):
+        supported_tasks = {
+            "generate": True,
+            "embedding": False,
+        }
+        selected_task = "generate"
+        return supported_tasks, selected_task
+
+    setattr(ModelConfig, "_resolve_task", _resolve_task)
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
@@ -403,56 +505,10 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
+    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
-def monkey_patch_vllm_dummy_weight_loader():
-    """
-    Monkey patch the dummy weight loader in vllm to call process_weights_after_loading.
-    """
-
-    from vllm.model_executor.model_loader.loader import (
-        CacheConfig,
-        DeviceConfig,
-        DummyModelLoader,
-        LoRAConfig,
-        ModelConfig,
-        ParallelConfig,
-        SchedulerConfig,
-        _initialize_model,
-        initialize_dummy_weights,
-        nn,
-        set_default_torch_dtype,
-    )
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-        lora_config: Optional[LoRAConfig],
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
-        cache_config: CacheConfig,
-    ) -> nn.Module:
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    lora_config,
-                    cache_config,
-                )
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-        return model.eval()
-
-    setattr(DummyModelLoader, "load_model", load_model)
+    setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
 vllm_all_gather_backup = None
@@ -563,7 +619,7 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if "SGLANG_USE_MODELSCOPE" in os.environ:
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
@@ -791,3 +847,176 @@ def add_prometheus_middleware(app):
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
+
+
+def bind_port(port):
+    """Bind to a specific port, assuming it's available."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
+    sock.bind(("", port))
+    sock.listen(1)
+    return sock
+
+
+def get_amdgpu_memory_capacity():
+    try:
+        # Run rocm-smi and capture the output
+        result = subprocess.run(
+            ["rocm-smi --showmeminfo vram | grep 'Total Memory' | awk '{print $NF}'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem) / 1024 / 1024
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
+        )
+
+
+def get_nvgpu_memory_capacity():
+    try:
+        # Run nvidia-smi and capture the output
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
+        )
+
+
+def crash_on_warnings():
+    # Crash on warning if we are running CI tests
+    return get_bool_env_var("SGLANG_IS_IN_CI")
+
+
+def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda.get_device_name(device_id)
+
+    if hasattr(torch, "hip") and torch.hip.is_available():
+        return torch.hip.get_device_name(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_name(device_id)
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return torch.hpu.get_device_name(device_id)
+
+
+sglang_lib = Library("sglang", "FRAGMENT")  # noqa
+
+
+def direct_register_custom_op(
+    op_name: str,
+    op_func: Callable,
+    mutates_args: List[str],
+    fake_impl: Optional[Callable] = None,
+    target_lib: Optional[Library] = None,
+):
+    """
+    `torch.library.custom_op` can have significant overhead because it
+    needs to consider complicated dispatching logic. This function
+    directly registers a custom op and dispatches it to the CUDA backend.
+    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
+    for more details.
+
+    By default, the custom op is registered to the vLLM library. If you
+    want to register it to a different library, you can pass the library
+    object to the `target_lib` argument.
+
+    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
+    library object. If you want to bind the operator to a different library,
+    make sure the library object is alive when the operator is used.
+    """
+    import torch.library
+
+    if hasattr(torch.library, "infer_schema"):
+        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    else:
+        # for pytorch 2.4
+        import torch._custom_op.impl
+
+        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+
+    my_lib = target_lib or sglang_lib
+    my_lib.define(op_name + schema_str)
+    my_lib.impl(op_name, op_func, "CUDA")
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)
+
+
+def set_gpu_proc_affinity(
+    tp_size: int,
+    nnodes: int,
+    gpu_id: int,
+):
+    # current process
+    pid = os.getpid()
+    p = psutil.Process(pid)
+
+    tp_size_per_node = tp_size // nnodes
+
+    # total physical cores
+    total_pcores = psutil.cpu_count(logical=False)
+    # physical cores per TP (N.B. more Cores than GPUs on node)
+    num_cores_bind = total_pcores // tp_size_per_node
+
+    # able to handle multiple DP per node
+    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
+    end_cpu_id = start_cpu_id + num_cores_bind
+
+    if psutil.cpu_count() != psutil.cpu_count(logical=False):
+        # HT on
+        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
+    else:
+        # HT off
+        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+
+    # set cpu_affinity to current process
+    p.cpu_affinity(bind_cpu_ids)
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")

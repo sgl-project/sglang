@@ -1,25 +1,25 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import dataclasses
 import logging
+import signal
 from collections import OrderedDict
 from typing import List, Union
 
+import psutil
 import zmq
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -27,12 +27,10 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
-    GetMemPoolSizeReqOutput,
-    UpdateWeightReqOutput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, get_zmq_socket, kill_parent_process
+from sglang.srt.utils import configure_logger, get_zmq_socket
 from sglang.utils import find_printable_text, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -100,20 +98,6 @@ class DetokenizerManager:
 
             if isinstance(recv_obj, BatchEmbeddingOut):
                 # If it is embedding model, no detokenization is needed.
-                self.send_to_tokenizer.send_pyobj(
-                    BatchEmbeddingOut(
-                        rids=recv_obj.rids,
-                        embeddings=recv_obj.embeddings,
-                        meta_info=recv_obj.meta_info,
-                        finished_reason=recv_obj.finished_reason,
-                    )
-                )
-                continue
-            elif isinstance(recv_obj, UpdateWeightReqOutput):
-                # If it is a weight update request, no detokenization is needed.
-                self.send_to_tokenizer.send_pyobj(recv_obj)
-                continue
-            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
             else:
@@ -211,11 +195,12 @@ def run_detokenizer_process(
     port_args: PortArgs,
 ):
     configure_logger(server_args)
+    parent_process = psutil.Process().parent()
 
     try:
         manager = DetokenizerManager(server_args, port_args)
         manager.event_loop()
     except Exception:
-        msg = get_exception_traceback()
-        logger.error(msg)
-        kill_parent_process()
+        traceback = get_exception_traceback()
+        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)

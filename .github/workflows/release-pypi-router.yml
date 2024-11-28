@@ -3,6 +3,11 @@
 name: Release SGLang Router to PyPI
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - rust/pyproject.toml
   workflow_dispatch:
 
 jobs:
