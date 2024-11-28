@@ -231,6 +231,7 @@ class Req:
         self.tokenizer = None
         self.finished_reason = None
         self.stream = False
+        self.to_abort = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -366,6 +367,10 @@ class Req:
 
     def check_finished(self):
         if self.finished():
+            return
+
+        if self.to_abort:
+            self.finished_reason = FINISH_ABORT()
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
