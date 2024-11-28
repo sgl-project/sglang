@@ -1,7 +1,3 @@
-"""
-python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_prefill_without_radix_cache
-"""
-
 import multiprocessing
 import time
 import unittest
