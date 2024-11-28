@@ -67,6 +67,10 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+def is_hpu() -> bool:
+    return hasattr(torch, "hpu") and torch.hpu.is_available()
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.

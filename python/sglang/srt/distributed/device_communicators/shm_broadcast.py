@@ -467,7 +467,7 @@ class MessageQueue:
         group_world_size = dist.get_world_size(pg)
         global_ranks = dist.get_process_group_ranks(pg)
 
-        from vllm.distributed.parallel_state import in_the_same_node_as
+        from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
         status = in_the_same_node_as(pg, source_rank=writer_rank)
         same_node_ranks = [i for i, s in enumerate(status) if s]

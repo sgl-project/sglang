@@ -1,16 +1,17 @@
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from vllm.platforms import current_platform
 
-if current_platform.is_hpu():
+from sglang.srt.utils import is_hpu
+
+if is_hpu():
     import habana_frameworks.torch as htorch  # noqa: F401
 
 
 class HpuCommunicator:
 
     def __init__(self, group: ProcessGroup):
-        if not current_platform.is_hpu():
+        if not is_hpu():
             self.disabled = True
             return
         self.disabled = False

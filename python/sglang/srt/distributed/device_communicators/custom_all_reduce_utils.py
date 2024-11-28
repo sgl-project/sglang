@@ -214,7 +214,7 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         envs.VLLM_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    from vllm.distributed.parallel_state import get_world_group
+    from sglang.srt.distributed.parallel_state import get_world_group
 
     if (not is_distributed or get_world_group().local_rank == 0) and (
         not os.path.exists(path)

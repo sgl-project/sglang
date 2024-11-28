@@ -10,15 +10,18 @@ import torch.library
 # import vllm.envs as envs
 from vllm.platforms import current_platform
 
+from sglang.srt.utils import is_hpu
+
 # from vllm.scalar_type import ScalarType
 
 logger = logging.getLogger(__name__)
 
-if not current_platform.is_tpu() and not current_platform.is_hpu():
+# if not current_platform.is_tpu() and not current_platform.is_hpu():
+if not current_platform.is_tpu() and not is_hpu():
     try:
         import custom_ar
     except ImportError as e:
-        logger.warning("Failed to import from vllm._C with %r", e)
+        logger.warning("Failed to import from custom_ar with %r", e)
 
 """
 if current_platform.is_rocm():
