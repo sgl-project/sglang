@@ -454,12 +454,13 @@ class ModelRunner:
             shape: the shape of the parameter to be updated.
             empty_cache: whether to empty the cache after updating the parameter.
         """
+        print(f"update parameter from distributed: {name} {dtype} {shape}")
         target_dtype = (
             dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
         )
-
+        print(f"target_dtype: {target_dtype}")
         current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
-
+        print(f"current_dtype: {current_dtype}")
         assert str(target_dtype) == str(
             current_dtype
         ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
@@ -468,11 +469,19 @@ class ModelRunner:
         ), "model update group must be initialized"
 
         try:
-
+            print(f"create weights: {shape} {target_dtype} {self.device}")
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-
+            print(
+                f"broadcast weights: {weights.shape} {weights.dtype} {weights.device}"
+            )
+            torch.cuda.synchronize()
+            print("broadcast weights init")
             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+            print("broadcast weights done")
             self.model.load_weights([(name, weights)])
+            print(
+                f"load weights: {name} {weights.shape} {weights.dtype} {weights.device}"
+            )
             if empty_cache:
                 torch.cuda.empty_cache()
 
