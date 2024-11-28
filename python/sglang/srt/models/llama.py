@@ -432,6 +432,66 @@ class LlamaForCausalLM(nn.Module):
 
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
+    def get_weights_by_parameter_name(
+        self, name: str, truncate_size: int = 100, tp_size: int = 1
+    ) -> Optional[torch.Tensor]:
+        try:
+            mapped_name = name
+            mapped_shard_id = None
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                if weight_name in name:
+                    mapped_name = name.replace(weight_name, param_name)
+                    mapped_shard_id = shard_id
+                    break
+            params_dict = dict(self.named_parameters())
+            if mapped_name in params_dict:
+                param = params_dict[mapped_name]
+                if mapped_shard_id is not None:
+                    if mapped_shard_id in ["q", "k", "v"]:
+                        num_heads = self.config.num_attention_heads // tp_size
+                        num_kv_heads = self.config.num_key_value_heads // tp_size
+                        head_dim = (
+                            self.config.hidden_size // self.config.num_attention_heads
+                        )
+                        if mapped_shard_id == "q":
+                            offset = 0
+                            size = num_heads * head_dim
+                        elif mapped_shard_id == "k":
+                            offset = num_heads * head_dim
+                            size = num_kv_heads * head_dim
+                        elif mapped_shard_id == "v":
+                            offset = (num_heads + num_kv_heads) * head_dim
+                            size = num_kv_heads * head_dim
+                        weight = param.data.narrow(0, offset, size)
+                    elif mapped_shard_id in [0, 1]:
+                        intermediate_size = self.config.intermediate_size
+                        hidden_size = self.config.hidden_size
+                        slice_size = intermediate_size // tp_size
+                        if mapped_shard_id == 0:  # gate_proj
+                            offset = 0
+                            size = slice_size
+                        elif mapped_shard_id == 1:  # up_proj
+                            offset = slice_size
+                            size = slice_size
+
+                        weight = param.data.narrow(0, offset, size)
+                    else:
+                        weight = param.data
+                else:
+                    weight = param.data
+                if tp_size > 1 and ("o_proj" in name or "down_proj" in name):
+                    gathered_weights = [
+                        torch.zeros_like(weight) for _ in range(tp_size)
+                    ]
+                    torch.distributed.all_gather(gathered_weights, weight)
+                    weight = torch.cat(gathered_weights, dim=1)
+                return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+            else:
+                return None
+
+        except Exception as e:
+            return None
+
 
 class Phi3ForCausalLM(LlamaForCausalLM):
     pass

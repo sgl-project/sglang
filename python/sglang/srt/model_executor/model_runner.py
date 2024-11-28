@@ -21,6 +21,7 @@ import json
 import logging
 import pkgutil
 from functools import lru_cache
+from tokenize import tabsize
 from typing import Any, Optional, Type, Union
 
 import torch
@@ -491,78 +492,9 @@ class ModelRunner:
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         try:
-            # 检查是否是合并的参数
-            mapped_name = name
-            mapped_shard_id = None
-            for param_name, weight_name, shard_id in self.model.stacked_params_mapping:
-                if weight_name in name:
-                    mapped_name = name.replace(weight_name, param_name)
-                    mapped_shard_id = shard_id
-                    break
-            params_dict = dict(self.model.named_parameters())
-            if mapped_name in params_dict:
-                param = params_dict[mapped_name]
-                if mapped_shard_id is not None:
-                    # 处理合并参数的情况
-                    if mapped_shard_id in ["q", "k", "v"]:
-                        # 计算在qkv_proj中的偏移和大小
-                        num_heads = (
-                            self.model.config.num_attention_heads // self.tp_size
-                        )
-                        num_kv_heads = (
-                            self.model.config.num_key_value_heads // self.tp_size
-                        )
-                        head_dim = (
-                            self.model.config.hidden_size
-                            // self.model.config.num_attention_heads
-                        )
-
-                        if mapped_shard_id == "q":
-                            offset = 0
-                            size = num_heads * head_dim
-                        elif mapped_shard_id == "k":
-                            offset = num_heads * head_dim
-                            size = num_kv_heads * head_dim
-                        elif mapped_shard_id == "v":
-                            offset = (num_heads + num_kv_heads) * head_dim
-                            size = num_kv_heads * head_dim
-
-                        # 提取对应部分的权重
-                        weight = param.data.narrow(0, offset, size)
-                    elif mapped_shard_id in [0, 1]:
-                        # 处理 gate_up_proj 的情况
-                        intermediate_size = self.model.config.intermediate_size
-                        hidden_size = self.model.config.hidden_size
-                        slice_size = intermediate_size // self.tp_size
-
-                        if mapped_shard_id == 0:  # gate_proj
-                            offset = 0
-                            size = slice_size
-                        elif mapped_shard_id == 1:  # up_proj
-                            offset = slice_size
-                            size = slice_size
-
-                        # 提取对应部分的权重
-                        weight = param.data.narrow(0, offset, size)
-                    else:
-                        weight = param.data
-                else:
-                    weight = param.data
-
-                if self.tp_size > 1 and ("o_proj" in name or "down_proj" in name):
-                    gathered_weights = [
-                        torch.zeros_like(weight) for _ in range(self.tp_size)
-                    ]
-                    torch.distributed.all_gather(gathered_weights, weight)
-                    weight = torch.cat(gathered_weights, dim=1)
-
-                return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
-            else:
-                logger.warning(
-                    f"Parameter {name} (mapped to {mapped_name}) not found in model"
-                )
-                return None
-
+            return self.model.get_weights_by_parameter_name(
+                name, truncate_size, tp_size=self.tp_size
+            )
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None

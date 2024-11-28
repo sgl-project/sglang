@@ -32,13 +32,10 @@ class TestParameterUpdateGroup(unittest.TestCase):
         if rank == 0:
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
             os.environ["NCCL_NVLS_ENABLE"] = "0"
-            # 移除所有 print 语句
-            print(f"model_name: {model_name}")
             cls.hf_instruct_model = AutoModelForCausalLM.from_pretrained(
                 model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
             base_model_name = model_name.replace("-Instruct", "")
-            print(f"base_model name: {base_model_name}")
             cls.hf_base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
@@ -58,14 +55,11 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 .numpy()
                 .tolist()
             )
-            # print(f"hf_instruct_param: {cls.hf_instruct_param}")
             assert not np.allclose(
                 np.array(cls.hf_instruct_param), np.array(cls.hf_base_param)
             )
-            # print(f"hf_base_param: {cls.hf_base_param}")
             param_queue.put(("hf_instruct_param", cls.hf_instruct_param))
             param_queue.put(("hf_base_param", cls.hf_base_param))
-            torch.cuda.synchronize()
             cls.group = init_custom_process_group(
                 backend="nccl",
                 init_method="tcp://localhost:65500",
@@ -73,38 +67,23 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 rank=rank,
                 group_name="test_parameter_update_group",
             )
-            print(cls.hf_instruct_model.get_parameter(parameter_name).shape)
-            torch.cuda.synchronize()
-            print(f"rank: {rank}, try to barrier")
-            torch.cuda.synchronize()
-            print(f"rank: {rank}, try to broadcast hf_instruct_param")
-            torch.cuda.synchronize()
             torch.distributed.broadcast(
                 cls.hf_base_model.get_parameter(parameter_name), src=0, group=cls.group
             )
-            print(f"rank: {rank}, try to del hf_instruct_model")
             del cls.hf_instruct_model
-            print(f"rank: {rank}, try to del hf_base_model")
             del cls.hf_base_model
-            print(f"rank: {rank}, try to gc")
             gc.collect()
-            print(f"rank: {rank}, try to empty cache")
             torch.cuda.empty_cache()
 
         elif rank == 1:
             cls.engine = sgl.Engine(
                 model_path=model_name, random_seed=42, base_gpu_id=rank
             )
-            print(f"rank: {rank}, before init_parameter_update_group")
-            print(f"rank: {rank}, before get_weights_by_parameter_name")
             cls.engine_instruct_param = cls.engine.get_weights_by_parameter_name(
                 parameter_name, truncate_size
             )
             torch.cuda.synchronize()
-            print(f"rank: {rank}, before put engine_instruct_param")
             param_queue.put(("engine_instruct_param", cls.engine_instruct_param))
-            print(f"rank: {rank}, after put engine_instruct_param")
-            torch.cuda.synchronize()
             cls.engine.init_parameter_update_group(
                 master_address="localhost",
                 master_port="65500",
@@ -113,27 +92,16 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 group_name="test_parameter_update_group",
                 backend="nccl",
             )
-            torch.cuda.synchronize()
-            print(f"rank: {rank}, before update_parameter_from_distributed")
-            torch.cuda.synchronize()
-            print(f"rank: {rank}, try to update_parameter_from_distributed")
             cls.engine.update_parameter_from_distributed(
                 parameter_name,
                 dtype="bfloat16",
                 shape=torch.Size([2048, 2048]),
                 empty_cache=True,
             )
-            print(f"rank: {rank}, after update_parameter_from_distributed")
-            torch.cuda.synchronize()
-            print(f"rank: {rank}, before get engine_base_param")
             cls.engine_base_param = cls.engine.get_weights_by_parameter_name(
                 parameter_name, truncate_size
             )
-            print(f"rank: {rank}, after get engine_base_param")
-            torch.cuda.synchronize()
-            print(f"rank: {rank}, before put engine_base_param")
             param_queue.put(("engine_base_param", cls.engine_base_param))
-            print(f"rank: {rank}, after put engine_base_param")
             cls.engine.shutdown()
 
     @classmethod
