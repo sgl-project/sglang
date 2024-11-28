@@ -28,6 +28,17 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 
 Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
 
+Note: To AMD ROCm system with Instinct/MI GPUs, do following instead:
+
+```
+# Use the last release branch
+git clone -b v0.3.6.post2 https://github.com/sgl-project/sglang.git
+cd sglang
+
+pip install --upgrade pip
+pip install -e "python[all_hip]"
+```
+
 ## Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
