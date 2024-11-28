@@ -472,8 +472,7 @@ class ModelRunner:
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
 
             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            weights_dat = [(name, weights)]
-            self.model.load_weights(weights_dat)
+            self.model.load_weights([(name, weights)])
             if empty_cache:
                 torch.cuda.empty_cache()
 
