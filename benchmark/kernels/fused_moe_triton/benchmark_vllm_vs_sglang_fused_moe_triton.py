@@ -83,8 +83,8 @@ def fused_moe_sglang_api(x, w1, w2, input_gating, topk, use_fp8_w8a8=False, w1_s
         x_names=['batch_size'], 
         x_vals=list(range(1, 513)),
         line_arg='provider',
-        line_vals=['vllm fused moe', 'sglang fused moe',],
-        line_names=["vllm fused moe", 'sglang fused moe',],
+        line_vals=['vllm_fused_moe_triton', 'sglang_fused_moe_triton',],
+        line_names=["vllm_fused_moe_triton", 'sglang_fused_moe_triton',],
         styles=[('blue', '-'), ('green', '-'),],
         ylabel="Time (ms)",
         plot_name="fused-moe-performance", 
@@ -123,7 +123,7 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
     input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
 
     # Warmup
-    api_func = fused_moe_vllm_api if provider == 'vllm fused moe' else fused_moe_sglang_api
+    api_func = fused_moe_vllm_api if provider == 'vllm_fused_moe_triton' else fused_moe_sglang_api
     for _ in range(10):
         y = api_func(x, w1, w2, input_gating, topk, use_fp8_w8a8=use_fp8,
                     w1_scale=w1_scale, w2_scale=w2_scale, 
