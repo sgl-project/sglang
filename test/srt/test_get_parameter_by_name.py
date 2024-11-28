@@ -96,6 +96,7 @@ class TestUpdateWeights(unittest.TestCase):
     @staticmethod
     def _process_return(ret):
         if isinstance(ret, list) and len(ret) == 2:
+            print(f"running assert_allclose on data parallel")
             np.testing.assert_allclose(ret[0], ret[1])
             return np.array(ret[0])
         return np.array(ret)
