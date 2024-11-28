@@ -467,13 +467,6 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
         return
 
     children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
 
     if include_self:
         try:
@@ -482,6 +475,14 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGINT)
+        except psutil.NoSuchProcess:
+            pass
+
+    for child in children:
+        if child.pid == skip_pid:
+            continue
+        try:
+            child.kill()
         except psutil.NoSuchProcess:
             pass
 

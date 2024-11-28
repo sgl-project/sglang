@@ -244,6 +244,6 @@ def run_data_parallel_controller_process(
         )
         controller.event_loop()
     except Exception:
-        msg = get_exception_traceback()
-        logger.error(msg)
+        traceback = get_exception_traceback()
+        logger.error(f"DataParallelController hit an exception: {traceback}")
         kill_parent_process()

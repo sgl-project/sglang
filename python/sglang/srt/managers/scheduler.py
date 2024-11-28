@@ -1430,6 +1430,6 @@ def run_scheduler_process(
         else:
             scheduler.event_loop_normal()
     except Exception:
-        msg = get_exception_traceback()
-        logger.error(msg)
+        traceback = get_exception_traceback()
+        logger.error(f"Scheduler hit an exception: {traceback}")
         kill_parent_process()

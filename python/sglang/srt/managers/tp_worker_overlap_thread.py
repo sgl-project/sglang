@@ -25,6 +25,8 @@ from sglang.srt.managers.io_struct import UpdateWeightReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_parent_process
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +89,13 @@ class TpModelWorkerClient:
         )
 
     def forward_thread_func(self):
-        with torch.cuda.stream(self.forward_stream):
-            self.forward_thread_func_()
+        try:
+            with torch.cuda.stream(self.forward_stream):
+                self.forward_thread_func_()
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
+            kill_parent_process()
 
     @torch.no_grad()
     def forward_thread_func_(self):
