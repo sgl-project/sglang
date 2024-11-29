@@ -28,15 +28,12 @@ import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
-import torch
-
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
 import orjson
 import requests
-import torch.distributed as dist
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -378,14 +375,7 @@ async def update_parameter_from_distributed_request(
 ):
     """Handle an update parameter from distributed request."""
     try:
-        torch.cuda.synchronize()
-        time_begin = time.time()
         ret = await tokenizer_manager.update_parameter_from_distributed(obj, request)
-        torch.cuda.synchronize()
-        time_end = time.time()
-        print(
-            f"In server time function update parameter from distributed time: {obj.name} {obj.shape} {time_end - time_begin:.3f}s"
-        )
         return ret
     except ValueError as e:
         return ORJSONResponse(
@@ -1137,8 +1127,6 @@ class Engine:
         return loop.run_until_complete(init_parameter_update_group_request(obj, None))
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
-        torch.cuda.synchronize()
-        time_begin = time.time()
         obj = UpdateParameterFromDistributedReqInput(
             name=name,
             dtype=dtype,
@@ -1146,11 +1134,6 @@ class Engine:
             empty_cache=empty_cache,
         )
         loop = asyncio.get_event_loop()
-        torch.cuda.synchronize()
-        time_end = time.time()
-        print(
-            f"In server: update parameter from distributed time: {obj.name} {obj.shape} {time_end - time_begin:.3f}s"
-        )
         return loop.run_until_complete(
             update_parameter_from_distributed_request(obj, None)
         )

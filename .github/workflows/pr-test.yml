@@ -274,11 +274,11 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
 
-      - name: Test weight update (TP, DP = 2,1  or 1,2)
+      - name: Test weight update
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 test_update_parameter_from_distributed.py
+          python3 test_sgl_update_parameter_from_distributed_dp.py
           python3 test_get_parameter_by_name.py
 
   finish:

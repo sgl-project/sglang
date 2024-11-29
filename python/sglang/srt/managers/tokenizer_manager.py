@@ -510,8 +510,6 @@ class TokenizerManager:
         obj: UpdateParameterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        torch.cuda.synchronize()
-        time_begin = time.time()
         if self.to_create_loop:
             self.create_handle_loop()
 
@@ -522,11 +520,6 @@ class TokenizerManager:
 
                 if self.server_args.dp_size == 1:
                     result = await self.parameter_update_result
-                    torch.cuda.synchronize()
-                    time_end = time.time()
-                    print(
-                        f"In tokenizer manager: update parameter from distributed time: {obj.name} {obj.shape} {time_end - time_begin:.3f}s"
-                    )
                     return result.success, result.message
                 else:  # self.server_args.dp_size > 1
                     self.parameter_update_tmp = []

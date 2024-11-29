@@ -15,10 +15,7 @@
 
 import logging
 import threading
-import time
 from typing import Optional
-
-import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -183,15 +180,8 @@ class TpModelWorker:
     def update_parameter_from_distributed(
         self, recv_req: UpdateParameterFromDistributedReqInput
     ):
-        torch.cuda.synchronize()
-        time_begin = time.time()
         success, message = self.model_runner.update_parameter_from_distributed(
             recv_req.name, recv_req.dtype, recv_req.shape, recv_req.empty_cache
-        )
-        torch.cuda.synchronize()
-        time_end = time.time()
-        print(
-            f"In tp worker: update parameter from distributed time: {recv_req.name} {recv_req.shape} {time_end - time_begin:.3f}s"
         )
         return success, message
 

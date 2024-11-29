@@ -431,8 +431,6 @@ class ModelRunner:
         )
 
         try:
-            torch.cuda.synchronize()
-            time_begin = time.time()
             self._model_update_group = init_custom_process_group(
                 backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
@@ -440,14 +438,7 @@ class ModelRunner:
                 rank=rank,
                 group_name=group_name,
             )
-            print(f"Rank {rank} before barrier")
             dist.barrier(group=self._model_update_group)
-            print(f"Rank {rank} after barrier")
-            torch.cuda.synchronize()
-            time_end = time.time()
-            print(
-                f"ModelRunner init parameter update group time: {time_end - time_begin:.3f}s"
-            )
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -464,8 +455,6 @@ class ModelRunner:
             shape: the shape of the parameter to be updated.
             empty_cache: whether to empty the cache after updating the parameter.
         """
-        torch.cuda.synchronize()
-        time_begin_sync = time.time()
         target_dtype = (
             dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
         )
@@ -483,11 +472,6 @@ class ModelRunner:
             self.model.load_weights([(name, weights)])
             if empty_cache:
                 torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            time_end_sync = time.time()
-            print(
-                f"ModelRunner update {name} time: {time_end_sync - time_begin_sync:.3f}s"
-            )
             return True, f"Succeeded to update parameter {name} online."
 
         except Exception as e:

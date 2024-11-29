@@ -522,14 +522,7 @@ class Scheduler:
                     InitParameterUpdateGroupReqOutput(success, message)
                 )
             elif isinstance(recv_req, UpdateParameterFromDistributedReqInput):
-                torch.cuda.synchronize()
-                time_begin = time.time()
                 success, message = self.update_parameter_from_distributed(recv_req)
-                torch.cuda.synchronize()
-                time_end = time.time()
-                print(
-                    f"In scheduler process_input_requests: update parameter from distributed time: {recv_req.name} {recv_req.shape} {time_end - time_begin:.3f}s"
-                )
                 self.send_to_tokenizer.send_pyobj(
                     UpdateParameterFromDistributedReqOutput(success, message)
                 )
@@ -1400,19 +1393,12 @@ class Scheduler:
         self, recv_req: UpdateParameterFromDistributedReqInput
     ):
         """Update the online model parameter."""
-        torch.cuda.synchronize()
-        time_begin = time.time()
         success, message = self.tp_worker.update_parameter_from_distributed(recv_req)
         if success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        torch.cuda.synchronize()
-        time_end = time.time()
-        print(
-            f"In scheduler: update parameter from distributed time: {recv_req.name} {recv_req.shape} {time_end - time_begin:.3f}s"
-        )
         return success, message
 
     def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
