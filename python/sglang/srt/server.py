@@ -930,5 +930,11 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
 
+    def start_profile(self):
+        tokenizer_manager.start_profile()
+
+    def stop_profile(self):
+        tokenizer_manager.stop_profile()
+
     async def get_server_info(self):
         return await _get_server_info()
