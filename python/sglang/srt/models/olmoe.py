@@ -48,6 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import make_layers
 
 
 class OlmoeMoE(nn.Module):
@@ -261,11 +262,13 @@ class OlmoeModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList(
-            [
-                OlmoeDecoderLayer(config, layer_id, quant_config=quant_config)
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: OlmoeDecoderLayer(
+                config=config,
+                quant_config=quant_config,
+                layer_id=idx,
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, eps=1e-5)
 
