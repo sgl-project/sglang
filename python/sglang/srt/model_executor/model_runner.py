@@ -20,10 +20,13 @@ import inspect
 import json
 import logging
 import pkgutil
+import time
 from functools import lru_cache
-from typing import Optional, Type
+from tokenize import tabsize
+from typing import Any, Optional, Type, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
@@ -58,6 +61,7 @@ from sglang.srt.utils import (
     crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
+    init_custom_process_group,
     is_hip,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
@@ -316,8 +320,8 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-    def update_weights(self, model_path: str, load_format: str):
-        """Update weights in-place."""
+    def update_weights_from_disk(self, model_path: str, load_format: str):
+        """Update engine weights online from disk."""
         from vllm.model_executor.model_loader.loader import (
             DefaultModelLoader,
             device_loading_context,
@@ -326,7 +330,7 @@ class ModelRunner:
         from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
         logger.info(
-            f"Update weights begin. "
+            f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
@@ -396,6 +400,105 @@ class ModelRunner:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def init_parameter_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        """Initialize the Torch process group for model parameter updates.
+
+        `_model_update_group` is used in the RLHF workflow, where rank 0 is the actor model in
+        the training engine, and the other ranks are the inference engine, which is used for rollout.
+
+        In the RLHF workflow, the training engine updates the model weights/parameters online,
+        and broadcasts them to the inference engine through the `_model_update_group` process group.
+        """
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        rank = rank_offset + self.tp_rank
+
+        logger.info(
+            f"init custom process group: master_address={master_address}, master_port={master_port}, "
+            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        try:
+            self._model_update_group = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_address}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+            )
+            dist.barrier(group=self._model_update_group, device_ids=[rank])
+            return True, "Succeeded to initialize custom process group."
+        except Exception as e:
+            message = f"Failed to initialize custom process group: {e}."
+            logger.error(message)
+            return False, message
+
+    def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
+        """
+        Update specific parameter in the model weights online through the process group.
+
+        Args:
+            name: the name of the parameter to be updated.
+            dtype: the data type of the parameter to be updated.
+            shape: the shape of the parameter to be updated.
+            empty_cache: whether to empty the cache after updating the parameter.
+        """
+        target_dtype = (
+            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        )
+        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
+        assert str(target_dtype) == str(
+            current_dtype
+        ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
+        assert (
+            self._model_update_group is not None
+        ), "model update group must be initialized"
+
+        try:
+            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+            self.model.load_weights([(name, weights)])
+            if empty_cache:
+                torch.cuda.empty_cache()
+            return True, f"Succeeded to update parameter {name} online."
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def get_weights_by_parameter_name(
+        self, name: str, truncate_size: int = 100
+    ) -> Optional[torch.Tensor]:
+        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
+
+        Only used for unit test with an unoptimized performance.
+        For optimized performance, please use torch.save and torch.load.
+        """
+        # TODO: (chenyang) Add support for Qwen models.
+        try:
+            return self.model.get_weights_by_parameter_name(
+                name, truncate_size, tp_size=self.tp_size
+            )
+        except Exception as e:
+            logger.error(f"Error when getting parameter {name}: {e}")
+            return None
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

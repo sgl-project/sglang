@@ -352,7 +352,7 @@ class FlushCacheReq:
 
 
 @dataclass
-class UpdateWeightReqInput:
+class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -360,9 +360,56 @@ class UpdateWeightReqInput:
 
 
 @dataclass
-class UpdateWeightReqOutput:
+class UpdateWeightFromDiskReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class UpdateParameterFromDistributedReqInput:
+    name: str
+    dtype: str
+    shape: List[int]
+    empty_cache: bool
+
+
+@dataclass
+class UpdateParameterFromDistributedReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class InitParameterUpdateGroupReqInput:
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The rank offset
+    rank_offset: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str
+    # The backend
+    backend: str = "nccl"
+
+
+@dataclass
+class InitParameterUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class GetParameterByNameReqInput:
+    name: str
+    truncate_size: int = 100
+
+
+@dataclass
+class GetParameterByNameReqOutput:
+    parameter: list
 
 
 @dataclass

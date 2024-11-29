@@ -18,6 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
   unit-test-frontend:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
@@ -127,6 +128,13 @@ jobs:
           python3 test_mla.py
           python3 test_mla_fp8.py
           python3 test_dp_attention.py
+
+      - name: Test online weight update
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 test_update_parameters_from_distributed.py
+          python3 test_get_parameter_by_name.py
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -262,6 +270,7 @@ jobs:
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
+
 
   finish:
     needs: [
