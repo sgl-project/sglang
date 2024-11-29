@@ -1,8 +1,11 @@
 # reference: VLLM 0.6.4.post1
+import ipaddress
 import logging
 import os
 import pickle
+import socket
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -11,15 +14,83 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-import vllm.envs as envs
 from torch.distributed import ProcessGroup
-from vllm.utils import get_ip, get_open_port, is_valid_ipv6_address
 from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
-VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
+# SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
+SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
+    os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
+)
 
 logger = logging.getLogger(__name__)
+
+
+def get_ip() -> str:
+    # VLLM_HOST_IP env can be ignore
+    host_ip = os.getenv("VLLM_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
+
+    # IP is not set, try to get it from the network interface
+
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    warnings.warn(
+        "Failed to get the IP address, using 0.0.0.0 by default."
+        "The value can be set by the environment variable"
+        " SGLANG_HOST_IP or HOST_IP.",
+        stacklevel=2,
+    )
+    return "0.0.0.0"
+
+
+def get_open_port() -> int:
+
+    port = os.getenv("SGLANG_PORT")
+    if port is not None:
+        while True:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    return port
+            except OSError:
+                port += 1  # Increment port number if already in use
+                logger.info("Port %d is already in use, trying port %d", port - 1, port)
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ValueError:
+        return False
 
 
 class ShmRingBuffer:
@@ -343,11 +414,11 @@ class MessageQueue:
                     # if we wait for a long time, we should warn the user
                     if (
                         time.monotonic() - start_time
-                        > VLLM_RINGBUFFER_WARNING_INTERVAL * n_warning
+                        > SGLANG_RINGBUFFER_WARNING_INTERVAL * n_warning
                     ):
                         logger.warning(
                             "No available block found in %s second. ",
-                            VLLM_RINGBUFFER_WARNING_INTERVAL,
+                            SGLANG_RINGBUFFER_WARNING_INTERVAL,
                         )
                         n_warning += 1
 

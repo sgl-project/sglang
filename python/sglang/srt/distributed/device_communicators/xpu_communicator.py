@@ -1,13 +1,14 @@
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from vllm.platforms import current_platform
+
+from sglang.srt.utils import is_xpu
 
 
 class XpuCommunicator:
 
     def __init__(self, group: ProcessGroup):
-        if not current_platform.is_xpu():
+        if not is_xpu():
             self.disabled = True
             return
         self.disabled = False

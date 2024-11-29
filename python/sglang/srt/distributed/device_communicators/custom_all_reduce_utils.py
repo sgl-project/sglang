@@ -7,17 +7,29 @@ import pickle
 import subprocess
 import sys
 import tempfile
+from functools import lru_cache
 from itertools import product
 from typing import Dict, List, Optional, Sequence
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import vllm.envs as envs
-from vllm.utils import cuda_device_count_stateless, update_environment_variables
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+from sglang.srt.utils import cuda_device_count_stateless
 
 logger = logging.getLogger(__name__)
+
+
+def update_environment_variables(envs: Dict[str, str]):
+    for k, v in envs.items():
+        if k in os.environ and os.environ[k] != v:
+            logger.warning(
+                "Overwriting environment variable %s " "from '%s' to '%s'",
+                k,
+                os.environ[k],
+                v,
+            )
+        os.environ[k] = v
 
 
 def producer(
@@ -129,7 +141,7 @@ def can_actually_p2p(
     processes for testing all pairs of GPUs in batch. The trick is to reset
     the device after each test (which is not available in PyTorch).
     """  # noqa
-    cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     # pass the CUDA_VISIBLE_DEVICES to the child process
     # to make sure they see the same set of GPUs
 
@@ -207,12 +219,15 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     is_distributed = dist.is_initialized()
 
     num_dev = cuda_device_count_stateless()
-    cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if cuda_visible_devices is None:
         cuda_visible_devices = ",".join(str(i) for i in range(num_dev))
 
+    # VLLM_CACHE_ROOT -> SGLANG_CACHE_ROOT
+    # "~/.cache/vllm" -> "~/.cache/sglang"
+    SGLANG_CACHE_ROOT = os.path.expanduser("~/.cache/sglang")
     path = os.path.join(
-        envs.VLLM_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
+        SGLANG_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
     from sglang.srt.distributed.parallel_state import get_world_group

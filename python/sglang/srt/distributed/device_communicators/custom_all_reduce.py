@@ -1,15 +1,16 @@
 # reference: VLLM 0.6.4.post1
 import ctypes
 import logging
+import os
 from contextlib import contextmanager
-from typing import List, Optional, Union
+from functools import wraps
+from typing import Callable, List, Optional, TypeVar, Union
 
+import pynvml
 import torch
 import torch.distributed as dist
-import vllm.envs as envs
 from torch.distributed import ProcessGroup
-from vllm.platforms import current_platform
-from vllm.utils import cuda_device_count_stateless
+from typing_extensions import ParamSpec
 
 from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
@@ -17,6 +18,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     gpu_p2p_access_check,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.utils import cuda_device_count_stateless, is_cuda
 
 try:
     ops.meta_size()
@@ -28,11 +30,53 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    @wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        pynvml.nvmlInit()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            pynvml.nvmlShutdown()
+
+    return wrapper
+
+
+@with_nvml_context
+def is_full_nvlink(cls, physical_device_ids: List[int]) -> bool:
+    """
+    query if the set of gpus are fully connected by nvlink (1 hop)
+    """
+    handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+    for i, handle in enumerate(handles):
+        for j, peer_handle in enumerate(handles):
+            if i < j:
+                try:
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return False
+                except pynvml.NVMLError:
+                    logger.exception(
+                        "NVLink detection failed. This is normal if your"
+                        " machine has no NVLink equipped."
+                    )
+                    return False
+    return True
+
+
 def _can_p2p(rank: int, world_size: int) -> bool:
+    # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
+    SGLANG_SKIP_P2P_CHECK = os.getenv("VLLM_SKIP_P2P_CHECK", "0") == "1"
     for i in range(world_size):
         if i == rank:
             continue
-        if envs.VLLM_SKIP_P2P_CHECK:
+        if SGLANG_SKIP_P2P_CHECK:
             logger.info("Skipping P2P check and trusting the driver's P2P report.")
             return torch.cuda.can_device_access_peer(rank, i)
         if not gpu_p2p_access_check(rank, i):
@@ -114,7 +158,7 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
         if cuda_visible_devices:
             device_ids = list(map(int, cuda_visible_devices.split(",")))
         else:
@@ -131,11 +175,9 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        assert current_platform.is_cuda()
-        from vllm.platforms.cuda import CudaPlatform
+        assert is_cuda()
 
-        cuda_platform: CudaPlatform = current_platform
-        full_nvlink = cuda_platform.is_full_nvlink(physical_device_ids)
+        full_nvlink = is_full_nvlink(physical_device_ids)
         if world_size > 2 and not full_nvlink:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"

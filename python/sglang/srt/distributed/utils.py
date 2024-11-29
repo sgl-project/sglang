@@ -5,13 +5,13 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
 import logging
+import os
 import pickle
 import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 import torch
-import vllm.envs as envs
 from torch.distributed import TCPStore
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,8 @@ def get_pp_indices(
     If the number of layers is not divisible by the number of partitions,
     the last partition will have the remaining layers.
     """
-    partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+    # partition_list_str can be set to None in sglang
+    partition_list_str = os.getenv("VLLM_PP_LAYER_PARTITION", None)
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

@@ -23,6 +23,7 @@ If you only need to use the distributed environment without model/pipeline
 import contextlib
 import gc
 import logging
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -34,11 +35,13 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-import vllm.envs as envs
 from torch.distributed import Backend, ProcessGroup
-from vllm.platforms import current_platform
 
-from sglang.srt.utils import direct_register_custom_op, supports_custom_op
+from sglang.srt.utils import (
+    direct_register_custom_op,
+    is_cuda_alike,
+    supports_custom_op,
+)
 
 
 @dataclass
@@ -207,7 +210,7 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        if current_platform.is_cuda_alike():
+        if is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         else:
             self.device = torch.device("cpu")
@@ -1005,7 +1008,7 @@ def init_distributed_environment(
         # local rank not set, this usually happens in single-node
         # setting, where we can use rank as local rank
         if distributed_init_method == "env://":
-            local_rank = envs.LOCAL_RANK
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         else:
             local_rank = rank
     global _WORLD

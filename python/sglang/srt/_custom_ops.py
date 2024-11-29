@@ -8,17 +8,13 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 import torch.library
 
-# import vllm.envs as envs
-from vllm.platforms import current_platform
-
 from sglang.srt.utils import is_hpu
 
 # from vllm.scalar_type import ScalarType
 
 logger = logging.getLogger(__name__)
 
-# if not current_platform.is_tpu() and not current_platform.is_hpu():
-if not current_platform.is_tpu() and not is_hpu():
+if not is_hpu():
     try:
         import custom_ar
     except ImportError as e:

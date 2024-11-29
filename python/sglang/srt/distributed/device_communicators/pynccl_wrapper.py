@@ -22,15 +22,43 @@
 
 import ctypes
 import logging
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
 from torch.distributed import ReduceOp
-from vllm.utils import find_nccl_library
 
 logger = logging.getLogger(__name__)
+
+
+def find_nccl_library() -> str:
+    """
+    We either use the library file specified by the `VLLM_NCCL_SO_PATH`
+    environment variable, or we find the library file brought by PyTorch.
+    After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
+    found by `ctypes` automatically.
+    """
+
+    # so_file can be set to None in sglang
+    so_file = os.environ.get("VLLM_NCCL_SO_PATH", None)
+
+    # manually load the nccl library
+    if so_file:
+        logger.info(
+            "Found nccl from environment variable VLLM_NCCL_SO_PATH=%s", so_file
+        )
+    else:
+        if torch.version.cuda is not None:
+            so_file = "libnccl.so.2"
+        elif torch.version.hip is not None:
+            so_file = "librccl.so.1"
+        else:
+            raise ValueError("NCCL only supports CUDA and ROCm backends.")
+        logger.info("Found nccl from library %s", so_file)
+    return so_file
+
 
 # === export types and functions from nccl to Python ===
 # for the original nccl definition, please check
