@@ -316,7 +316,7 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-    def update_weights(self, model_path: str, load_format: str):
+    def update_weights_from_disk(self, model_path: str, load_format: str):
         """Update weights in-place."""
         from vllm.model_executor.model_loader.loader import (
             DefaultModelLoader,

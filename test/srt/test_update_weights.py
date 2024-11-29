@@ -47,9 +47,9 @@ class TestUpdateWeights(unittest.TestCase):
         print(json.dumps(response.json()))
         return model_path
 
-    def run_update_weights(self, model_path):
+    def run_update_weights_from_disk(self, model_path):
         response = requests.post(
-            self.base_url + "/update_weights",
+            self.base_url + "/update_weights_from_disk",
             json={
                 "model_path": model_path,
             },
@@ -58,14 +58,14 @@ class TestUpdateWeights(unittest.TestCase):
         print(json.dumps(response.json()))
         return ret
 
-    def test_update_weights(self):
+    def test_update_weights_from_disk(self):
         origin_model_path = self.get_model_info()
         print(f"origin_model_path: {origin_model_path}")
         origin_response = self.run_decode()
 
         # update weights
         new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
-        ret = self.run_update_weights(new_model_path)
+        ret = self.run_update_weights_from_disk(new_model_path)
         assert ret["success"]
 
         updated_model_path = self.get_model_info()
@@ -77,7 +77,7 @@ class TestUpdateWeights(unittest.TestCase):
         assert origin_response[:32] != updated_response[:32]
 
         # update weights back
-        ret = self.run_update_weights(origin_model_path)
+        ret = self.run_update_weights_from_disk(origin_model_path)
         assert ret["success"]
 
         updated_model_path = self.get_model_info()
@@ -86,14 +86,14 @@ class TestUpdateWeights(unittest.TestCase):
         updated_response = self.run_decode()
         assert origin_response[:32] == updated_response[:32]
 
-    def test_update_weights_unexist_model(self):
+    def test_update_weights_from_disk_unexist_model(self):
         origin_model_path = self.get_model_info()
         print(f"origin_model_path: {origin_model_path}")
         origin_response = self.run_decode()
 
         # update weights
         new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "wrong")
-        ret = self.run_update_weights(new_model_path)
+        ret = self.run_update_weights_from_disk(new_model_path)
         assert not ret["success"]
 
         updated_model_path = self.get_model_info()
