@@ -568,15 +568,17 @@ class Scheduler:
             )
             req.extend_image_inputs(image_inputs)
 
-            if len(req.origin_input_ids) > self.max_req_input_len:
-                req.finished_reason = FINISH_ABORT(
-                    "Image request length is longer than the KV cache pool size or "
-                    "the max context length. "
-                    "Abort this request because you cannot truncate the image embeds"
+            if len(req.origin_input_ids) >= self.max_req_input_len:
+                logger.error(
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}. "
                 )
-                req.image_inputs = None
                 req.origin_input_ids = [0]
+                req.image_inputs = None
                 req.sampling_params.max_new_tokens = 0
+                req.finished_reason = FINISH_ABORT(
+                    "Multimodal prompt is too long. Check server logs for details."
+                )
                 self.waiting_queue.append(req)
                 return
 
