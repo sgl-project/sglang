@@ -428,9 +428,6 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    if api_key:
-        command += ["--api-key", api_key]
-
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,

@@ -205,19 +205,6 @@ async def stop_profile_async():
     )
 
 
-@app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
-async def get_memory_pool_size():
-    """Get the memory pool size in number of tokens"""
-    try:
-        ret = await tokenizer_manager.get_memory_pool_size()
-
-        return ret
-    except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
-
-
 @app.post("/update_weights_from_disk")
 @time_func_latency
 async def update_weights_from_disk(obj: UpdateWeightFromDistReqInput, request: Request):
