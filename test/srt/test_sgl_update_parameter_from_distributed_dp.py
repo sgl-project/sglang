@@ -98,6 +98,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 rank=rank,
                 group_name="test_parameter_update_group",
             )
+            dist.barrier(group=cls.group, device_ids=[rank])
             torch.cuda.synchronize()
             time_begin_broadcast = time.time()
             for parameter_name in state_dict_key_to_shape.keys():
@@ -349,7 +350,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                             ), f"sgl_dp_two_instruct_params rank {i} is not close"
 
                     time_limit = (
-                        3 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 4
+                        1 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 2
                     )
 
                     assert (
