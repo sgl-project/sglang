@@ -171,7 +171,9 @@ class ServerArgs:
             gpu_mem = get_nvgpu_memory_capacity()
 
         if gpu_mem < 25000:
-            logger.warning("Your GPU has less than 25GB memory. You may want to set a smaller --chunked-prefill-size (e.g., 512) to improve performance.")
+            logger.warning(
+                "Your GPU has less than 25GB memory. You may want to set a smaller --chunked-prefill-size (e.g., 512) to improve performance."
+            )
 
         # Choose kernel backends
         if not is_flashinfer_available():
