@@ -1,3 +1,4 @@
+# reference: VLLM 0.6.4.post1
 """This file is a pure Python wrapper for the cudart library.
 It avoids the need to compile a separate shared library, and is
 convenient for use when we just need to call a few functions.

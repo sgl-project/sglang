@@ -1,3 +1,4 @@
+# reference: VLLM 0.6.4.post1
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup

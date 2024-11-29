@@ -1,3 +1,4 @@
+# reference: VLLM 0.6.4.post1
 from typing import Any, Dict, Optional, Union
 
 import torch
