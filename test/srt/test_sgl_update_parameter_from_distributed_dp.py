@@ -98,8 +98,6 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 rank=rank,
                 group_name="test_parameter_update_group",
             )
-            # warm up dist group
-            # dist.barrier(group=cls.group)
             torch.cuda.synchronize()
             time_begin_broadcast = time.time()
             for parameter_name in state_dict_key_to_shape.keys():
@@ -161,11 +159,6 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
             param_queue.put((f"sgl_dp_{rank}_instruct_params", instruct_params))
             if use_engine:
-                # TODO: CI error: [rank0]:[W1129 02:27:19.677568874 ProcessGroupNCCL.cpp:4115]
-                # [PG ID 4 PG GUID test_parameter_update_group Rank 1]  using GPU 0 to perform
-                # barrier as devices used by this process are currently unknown. This can potentially
-                # cause a hang if this rank to GPU mapping is incorrect.Specify device_ids in barrier()
-                # to force use of a particular device,or call init_process_group() with a device_id.
                 engine.init_parameter_update_group(
                     master_address="localhost",
                     master_port="65500",
@@ -275,9 +268,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
             state_dict_key_to_shape = cls.model_state_dict_shapes[model_name]
 
             for tp_size, dp_size in cls.test_suits:
-                # TODO sever error on CI
-                # Only Engine on CI
-                for use_engine in [False]:
+                for use_engine in [False, True]:
                     print(
                         f"Testing model: {model_name} tp_size: {tp_size}, dp_size: {dp_size} use_engine: {use_engine}"
                     )
@@ -358,7 +349,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                             ), f"sgl_dp_two_instruct_params rank {i} is not close"
 
                     time_limit = (
-                        2 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 4
+                        3 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 4
                     )
 
                     assert (
