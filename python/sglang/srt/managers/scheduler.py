@@ -38,8 +38,6 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
-    GetMemPoolSizeReq,
-    GetMemPoolSizeReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -521,10 +519,6 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(OpenSessionReqOutput(session_id))
             elif isinstance(recv_req, CloseSessionReqInput):
                 self.close_session(recv_req)
-            elif isinstance(recv_req, GetMemPoolSizeReq):
-                self.send_to_tokenizer.send_pyobj(
-                    GetMemPoolSizeReqOutput(self.max_total_num_tokens)
-                )
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 

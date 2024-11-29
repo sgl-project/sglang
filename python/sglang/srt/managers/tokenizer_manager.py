@@ -45,8 +45,6 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
-    GetMemPoolSizeReq,
-    GetMemPoolSizeReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -406,25 +404,6 @@ class TokenizerManager:
         req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
 
-    async def get_memory_pool_size(self):
-        if self.to_create_loop:
-            self.create_handle_loop()
-
-        req = GetMemPoolSizeReq()
-
-        self.send_to_scheduler.send_pyobj(req)
-        self.mem_pool_size = asyncio.Future()
-
-        # FIXME: Each request should have its own future instead of using `self.mem_pool_size`.
-        if self.server_args.dp_size == 1:
-            res = await self.mem_pool_size
-            return res.size
-        else:  # self.server_args.dp_size > 1
-            self.mem_pool_size_tmp = []
-            res = await self.mem_pool_size
-            ret = [r.size for r in res]
-            return ret
-
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -551,15 +530,6 @@ class TokenizerManager:
                     # set future if the all results are recevied
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
-                continue
-            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
-                if self.server_args.dp_size == 1:
-                    self.mem_pool_size.set_result(recv_obj)
-                else:  # self.sever_args.dp_size > 1
-                    self.mem_pool_size_tmp.append(recv_obj)
-                    # set future if the all results are received
-                    if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
-                        self.mem_pool_size.set_result(self.mem_pool_size_tmp)
                 continue
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
