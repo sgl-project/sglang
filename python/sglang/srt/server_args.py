@@ -169,10 +169,11 @@ class ServerArgs:
             gpu_mem = get_amdgpu_memory_capacity()
         else:
             gpu_mem = get_nvgpu_memory_capacity()
+
         if gpu_mem < 25000:
-            self.chunked_prefill_size //= 4  # make it 2048
-            self.cuda_graph_max_bs = 4
-            logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
+            logger.warning(
+                "Your GPU has less than 25GB memory. You may want to set a smaller --chunked-prefill-size (e.g., 512) to improve performance."
+            )
 
         # Choose kernel backends
         if not is_flashinfer_available():
