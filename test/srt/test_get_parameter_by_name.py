@@ -20,7 +20,7 @@ class TestUpdateWeights(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST.replace("6157", "6000")
+        cls.base_url = DEFAULT_URL_FOR_TEST.replace("2157", "1999")
         cls.hf_model = AutoModelForCausalLM.from_pretrained(
             cls.model, torch_dtype="bfloat16"
         ).to("cuda:0")
