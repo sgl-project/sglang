@@ -15,6 +15,7 @@
 
 import logging
 import os
+import signal
 import threading
 import time
 import warnings
@@ -23,6 +24,7 @@ from concurrent import futures
 from types import SimpleNamespace
 from typing import List, Optional
 
+import psutil
 import torch
 import zmq
 
@@ -79,7 +81,6 @@ from sglang.srt.utils import (
     crash_on_warnings,
     get_bool_env_var,
     get_zmq_socket,
-    kill_parent_process,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
@@ -175,6 +176,10 @@ class Scheduler:
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
+
+        if self.model_config.is_multimodal:
+            self.enable_overlap = False
+            logger.info("Overlap scheduler is disabled for multimodal models.")
 
         if self.enable_overlap:
             self.disable_jump_forward = True
@@ -318,6 +323,7 @@ class Scheduler:
         self.watchdog_timeout = server_args.watchdog_timeout
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
+        self.parent_process = psutil.Process().parent()
 
         # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
@@ -361,7 +367,7 @@ class Scheduler:
                     self.watchdog_last_time = time.time()
             time.sleep(self.watchdog_timeout / 2)
 
-        kill_parent_process()
+        self.parent_process.send_signal(signal.SIGQUIT)
 
     @torch.no_grad()
     def event_loop_normal(self):
@@ -594,6 +600,8 @@ class Scheduler:
                     "Image request length is longer than the KV cache pool size or "
                     "the max context length aborting because you cannot truncate the image embeds"
                 )
+                req.image_inputs = None
+                req.origin_input_ids = [0]
                 req.sampling_params.max_new_tokens = 0
                 self.waiting_queue.append(req)
                 return
@@ -1365,13 +1373,15 @@ class Scheduler:
 
         if to_del is not None:
             del self.waiting_queue[to_del]
+            logger.debug(f"Abort queued request. {req.rid=}")
+            return
 
         # Delete requests in the running batch
         if self.running_batch:
             for req in self.running_batch.reqs:
                 if req.rid == recv_req.rid and not req.finished():
-                    req.finished_reason = FINISH_ABORT()
-                    self.tree_cache.cache_finished_req(req)
+                    logger.debug(f"Abort running request. {req.rid=}")
+                    req.to_abort = True
                     break
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
@@ -1461,6 +1471,7 @@ def run_scheduler_process(
         configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
 
     suppress_other_loggers()
+    parent_process = psutil.Process().parent()
 
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
@@ -1472,6 +1483,6 @@ def run_scheduler_process(
         else:
             scheduler.event_loop_normal()
     except Exception:
-        msg = get_exception_traceback()
-        logger.error(msg)
-        kill_parent_process()
+        traceback = get_exception_traceback()
+        logger.error(f"Scheduler hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)

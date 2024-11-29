@@ -500,7 +500,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         return num_image_tokens
 
     # Use grid_t * grid_w * grid_h to pad tokens for each image
-    # and replaced padding by unique image hash
+    # add replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         image_grid_thws = image_inputs.image_grid_thws
         pad_values = image_inputs.pad_values

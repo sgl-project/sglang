@@ -145,15 +145,17 @@ class ImageInputs:
         # Use image hash as fake token_ids, which is then used for prefix matching
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
-            image_hashes=hash(tuple(obj["image_hashes"])),
+            image_hashes=obj["image_hashes"],
         )
-        image_hash = ret.image_hashes
-        ret.pad_values = [
-            (image_hash) % vocab_size,
-            (image_hash >> 16) % vocab_size,
-            (image_hash >> 32) % vocab_size,
-            (image_hash >> 64) % vocab_size,
-        ]
+        if not isinstance(ret.image_hashes, list):
+            ret.pad_values = [
+                (ret.image_hashes) % vocab_size,
+                (ret.image_hashes >> 16) % vocab_size,
+                (ret.image_hashes >> 32) % vocab_size,
+                (ret.image_hashes >> 64) % vocab_size,
+            ]
+        else:
+            ret.pad_values = [x % vocab_size for x in ret.image_hashes]
 
         optional_args = [
             "image_sizes",
@@ -171,14 +173,18 @@ class ImageInputs:
     def merge(self, other, vocab_size):
         assert self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
         self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
-        self.image_hashes += other.image_hashes
 
-        self.pad_values = [
-            (self.image_hashes) % vocab_size,
-            (self.image_hashes >> 16) % vocab_size,
-            (self.image_hashes >> 32) % vocab_size,
-            (self.image_hashes >> 64) % vocab_size,
-        ]
+        if isinstance(self.image_hashes, list) and isinstance(other.image_hashes, list):
+            self.image_hashes += other.image_hashes
+            self.pad_values = [x % vocab_size for x in self.image_hashes]
+        else:
+            self.image_hashes = hash(tuple(self.image_hashes, other.image_hashes))
+            self.pad_values = [
+                (self.image_hashes) % vocab_size,
+                (self.image_hashes >> 16) % vocab_size,
+                (self.image_hashes >> 32) % vocab_size,
+                (self.image_hashes >> 64) % vocab_size,
+            ]
 
         optional_args = [
             "image_sizes",
@@ -231,6 +237,7 @@ class Req:
         self.tokenizer = None
         self.finished_reason = None
         self.stream = False
+        self.to_abort = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -366,6 +373,10 @@ class Req:
 
     def check_finished(self):
         if self.finished():
+            return
+
+        if self.to_abort:
+            self.finished_reason = FINISH_ABORT()
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
