@@ -147,7 +147,7 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
 
     if use_fp8:
-        init_dtype = torch.float16
+        init_dtype = dtype
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
         )
