@@ -46,17 +46,11 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
-    GetParameterByNameReqInput,
-    GetParameterByNameReqOutput,
-    InitParameterUpdateGroupReqInput,
-    InitParameterUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateParameterFromDistributedReqInput,
-    UpdateParameterFromDistributedReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
 )
@@ -533,9 +527,6 @@ class TokenizerManager:
                 BatchEmbeddingOut,
                 BatchTokenIDOut,
                 UpdateWeightFromDiskReqOutput,
-                UpdateParameterFromDistributedReqOutput,
-                GetParameterByNameReqOutput,
-                InitParameterUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
@@ -546,43 +537,6 @@ class TokenizerManager:
                     # set future if the all results are recevied
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
-                continue
-            elif isinstance(recv_obj, UpdateParameterFromDistributedReqOutput):
-                if self.server_args.dp_size == 1:
-                    self.parameter_update_result.set_result(recv_obj)
-                else:  # self.server_args.dp_size > 1
-                    self.parameter_update_tmp.append(recv_obj)
-                    # set future if the all results are recevied
-                    if len(self.parameter_update_tmp) == self.server_args.dp_size:
-                        self.parameter_update_result.set_result(
-                            self.parameter_update_tmp
-                        )
-                continue
-            elif isinstance(recv_obj, GetParameterByNameReqOutput):
-                if self.server_args.dp_size == 1:
-                    self.get_weights_by_parameter_name_result.set_result(recv_obj)
-                else:
-                    self.get_weights_by_parameter_name_tmp.append(recv_obj)
-                    if (
-                        len(self.get_weights_by_parameter_name_tmp)
-                        == self.server_args.dp_size
-                    ):
-                        self.get_weights_by_parameter_name_result.set_result(
-                            self.get_weights_by_parameter_name_tmp
-                        )
-                continue
-            elif isinstance(recv_obj, InitParameterUpdateGroupReqOutput):
-                if self.server_args.dp_size == 1:
-                    self.init_parameter_update_group_result.set_result(recv_obj)
-                else:
-                    self.init_parameter_update_group_tmp.append(recv_obj)
-                    if (
-                        len(self.init_parameter_update_group_tmp)
-                        == self.server_args.dp_size
-                    ):
-                        self.init_parameter_update_group_result.set_result(
-                            self.init_parameter_update_group_tmp
-                        )
                 continue
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(

@@ -23,12 +23,7 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.managers.io_struct import (
-    GetParameterByNameReqInput,
-    InitParameterUpdateGroupReqInput,
-    UpdateParameterFromDistributedReqInput,
-    UpdateWeightFromDiskReqInput,
-)
+from sglang.srt.managers.io_struct import UpdateWeightFromDiskReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
