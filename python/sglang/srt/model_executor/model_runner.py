@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     is_hip,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
+    set_cpu_offload_max_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,8 @@ class ModelRunner:
                 "enable_dp_attention": server_args.enable_dp_attention,
             }
         )
+
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Init components
         min_per_gpu_memory = self.init_torch_distributed()
