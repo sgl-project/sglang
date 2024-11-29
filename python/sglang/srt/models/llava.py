@@ -134,7 +134,6 @@ class LlavaBaseForCausalLM(nn.Module):
         image_inputs = forward_batch.image_inputs
 
         if forward_batch.forward_mode.is_extend():
-            bs = forward_batch.batch_size
             # Got List[List[str]] extend it to List[str]
             # The length of the List should be equal to batch size
             modalities_list = []
@@ -142,7 +141,7 @@ class LlavaBaseForCausalLM(nn.Module):
             for im in image_inputs:
                 if im and im.modalities is not None:
                     modalities_list.extend(im.modalities)
-                if im and im.image_offsets is not None:
+                if im and im.image_offsets:
                     max_image_offset.append(max(im.image_offsets))
                 else:
                     max_image_offset.append(-1)
@@ -159,6 +158,7 @@ class LlavaBaseForCausalLM(nn.Module):
             need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
+                bs = forward_batch.batch_size
                 pixel_values = [
                     image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
                 ]
