@@ -1,4 +1,4 @@
-# reference: VLLM 0.6.4.post1
+# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/device_communicators/shm_broadcast.py
 import ipaddress
 import logging
 import os

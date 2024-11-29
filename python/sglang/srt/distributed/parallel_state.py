@@ -1,4 +1,5 @@
-# reference: VLLM 0.6.4.post1
+# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/parallel_state.py
+
 # Copyright 2023 The vLLM team.
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
@@ -388,10 +389,6 @@ class GroupCoordinator:
         if not supports_custom_op():
             self._all_reduce_in_place(input_)
             return input_
-
-        if self.tpu_communicator is not None and not self.tpu_communicator.disabled:
-            # TPU handles Dynamo with its own logic.
-            return self.tpu_communicator.all_reduce(input_)
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
