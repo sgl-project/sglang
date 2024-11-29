@@ -25,6 +25,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -45,13 +46,19 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
+    GetParameterByNameReqInput,
+    GetParameterByNameReqOutput,
+    InitParameterUpdateGroupReqInput,
+    InitParameterUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
+    UpdateParameterFromDistributedReqInput,
+    UpdateParameterFromDistributedReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -405,8 +412,10 @@ class TokenizerManager:
         req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
 
-    async def update_weights(
-        self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
+    async def update_weights_from_disk(
+        self,
+        obj: UpdateWeightFromDiskReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         if self.to_create_loop:
             self.create_handle_loop()
@@ -520,10 +529,16 @@ class TokenizerManager:
 
         while True:
             recv_obj: Union[
-                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
+                BatchStrOut,
+                BatchEmbeddingOut,
+                BatchTokenIDOut,
+                UpdateWeightFromDiskReqOutput,
+                UpdateParameterFromDistributedReqOutput,
+                GetParameterByNameReqOutput,
+                InitParameterUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
-            if isinstance(recv_obj, UpdateWeightReqOutput):
+            if isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
@@ -531,6 +546,43 @@ class TokenizerManager:
                     # set future if the all results are recevied
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
+                continue
+            elif isinstance(recv_obj, UpdateParameterFromDistributedReqOutput):
+                if self.server_args.dp_size == 1:
+                    self.parameter_update_result.set_result(recv_obj)
+                else:  # self.server_args.dp_size > 1
+                    self.parameter_update_tmp.append(recv_obj)
+                    # set future if the all results are recevied
+                    if len(self.parameter_update_tmp) == self.server_args.dp_size:
+                        self.parameter_update_result.set_result(
+                            self.parameter_update_tmp
+                        )
+                continue
+            elif isinstance(recv_obj, GetParameterByNameReqOutput):
+                if self.server_args.dp_size == 1:
+                    self.get_weights_by_parameter_name_result.set_result(recv_obj)
+                else:
+                    self.get_weights_by_parameter_name_tmp.append(recv_obj)
+                    if (
+                        len(self.get_weights_by_parameter_name_tmp)
+                        == self.server_args.dp_size
+                    ):
+                        self.get_weights_by_parameter_name_result.set_result(
+                            self.get_weights_by_parameter_name_tmp
+                        )
+                continue
+            elif isinstance(recv_obj, InitParameterUpdateGroupReqOutput):
+                if self.server_args.dp_size == 1:
+                    self.init_parameter_update_group_result.set_result(recv_obj)
+                else:
+                    self.init_parameter_update_group_tmp.append(recv_obj)
+                    if (
+                        len(self.init_parameter_update_group_tmp)
+                        == self.server_args.dp_size
+                    ):
+                        self.init_parameter_update_group_result.set_result(
+                            self.init_parameter_update_group_tmp
+                        )
                 continue
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(

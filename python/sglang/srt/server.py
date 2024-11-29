@@ -52,8 +52,11 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetParameterByNameReqInput,
+    InitParameterUpdateGroupReqInput,
     OpenSessionReqInput,
-    UpdateWeightReqInput,
+    UpdateParameterFromDistributedReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -79,6 +82,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     delete_directory,
+    init_custom_process_group,
     is_port_available,
     kill_process_tree,
     maybe_set_triton_cache_manager,
@@ -192,11 +196,11 @@ async def stop_profile_async():
     )
 
 
-@app.post("/update_weights")
+@app.post("/update_weights_from_disk")
 @time_func_latency
-async def update_weights(obj: UpdateWeightReqInput, request: Request):
-    """Update the weights inplace without re-launching the server."""
-    success, message = await tokenizer_manager.update_weights(obj, request)
+async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
+    """Update the weights from disk inplace without re-launching the server."""
+    success, message = await tokenizer_manager.update_weights_from_disk(obj, request)
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(
@@ -207,6 +211,54 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         return ORJSONResponse(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.post("/init_parameter_update_group")
+async def init_parameter_update_group(
+    obj: InitParameterUpdateGroupReqInput, request: Request
+):
+    """Initialize the parameter update group."""
+    success, message = await tokenizer_manager.init_parameter_update_group(obj, request)
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_parameter_from_distributed")
+async def update_parameter_from_distributed(
+    obj: UpdateParameterFromDistributedReqInput, request: Request
+):
+    """Update model parameter from distributed online."""
+    success, message = await tokenizer_manager.update_parameter_from_distributed(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.api_route("/get_weights_by_parameter_name", methods=["GET", "POST"])
+async def get_weights_by_parameter_name(
+    obj: GetParameterByNameReqInput, request: Request
+):
+    """Get model parameter by name."""
+    try:
+        ret = await tokenizer_manager.get_weights_by_parameter_name(obj, request)
+        if ret is None:
+            return ORJSONResponse(
+                {"error": {"message": "Get parameter by name failed"}},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        else:
+            return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 
 
@@ -267,6 +319,53 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return ORJSONResponse(
                 {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
             )
+
+
+@time_func_latency
+async def init_parameter_update_group_request(
+    obj: InitParameterUpdateGroupReqInput, request: Request
+):
+    """Handle an init parameter update group request."""
+    try:
+        ret = await tokenizer_manager.init_parameter_update_group(obj, request)
+        return ret
+    except ValueError as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+@time_func_latency
+async def get_weights_by_parameter_name_request(
+    obj: GetParameterByNameReqInput, request: Request
+):
+    """Handle a get parameter by name request."""
+    try:
+        ret = await tokenizer_manager.get_weights_by_parameter_name(obj, request)
+        return ret
+    except ValueError as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+@time_func_latency
+async def update_parameter_from_distributed_request(
+    obj: UpdateParameterFromDistributedReqInput, request: Request
+):
+    """Handle an update parameter from distributed request."""
+    try:
+        ret = await tokenizer_manager.update_parameter_from_distributed(obj, request)
+        return ret
+    except ValueError as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+# fastapi implicitly converts json in the request to obj (dataclass)
+app.post("/generate")(generate_request)
+app.put("/generate")(generate_request)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -938,3 +1037,92 @@ class Engine:
 
     async def get_server_info(self):
         return await _get_server_info()
+
+    def generate(
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
+    ):
+        obj = GenerateReqInput(
+            text=prompt,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            lora_path=lora_path,
+            stream=stream,
+        )
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        ret = loop.run_until_complete(generate_request(obj, None))
+
+        if stream is True:
+
+            def generator_wrapper():
+                offset = 0
+                loop = asyncio.get_event_loop()
+                generator = ret.body_iterator
+                while True:
+                    chunk = loop.run_until_complete(generator.__anext__())
+
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+
+            # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
+            # however, it allows to wrap the generator as a subfunction and return
+            return generator_wrapper()
+        else:
+            return ret
+
+    def init_parameter_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str = "nccl",
+    ):
+        obj = InitParameterUpdateGroupReqInput(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+        )
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(init_parameter_update_group_request(obj, None))
+
+    def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
+        obj = UpdateParameterFromDistributedReqInput(
+            name=name,
+            dtype=dtype,
+            shape=shape,
+            empty_cache=empty_cache,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            update_parameter_from_distributed_request(obj, None)
+        )
+
+    def get_weights_by_parameter_name(self, name, truncate_size=100):
+        obj = GetParameterByNameReqInput(name=name, truncate_size=truncate_size)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(get_weights_by_parameter_name_request(obj, None))
