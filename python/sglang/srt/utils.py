@@ -1073,6 +1073,7 @@ def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> 
     return r
 
 
+# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/utils.py
 def cuda_device_count_stateless() -> int:
     """Get number of CUDA devices, caching based on the value of
     CUDA_VISIBLE_DEVICES at the time of call.
@@ -1083,4 +1084,4 @@ def cuda_device_count_stateless() -> int:
 
     # This can be removed and simply replaced with torch.cuda.get_device_count
     # after https://github.com/pytorch/pytorch/pull/122815 is released.
-    return _cuda_device_count_stateless(envs.CUDA_VISIBLE_DEVICES)
+    return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
