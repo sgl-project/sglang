@@ -49,8 +49,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateParameterFromDistributedReqInput,
     UpdateParameterFromDistributedReqOutput,
-    UpdateWeightFromDistReqInput,
-    UpdateWeightFromDistReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -510,10 +510,10 @@ class Scheduler:
                 self.flush_cache()
             elif isinstance(recv_req, AbortReq):
                 self.abort_request(recv_req)
-            elif isinstance(recv_req, UpdateWeightFromDistReqInput):
+            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
                 success, message = self.update_weights_from_disk(recv_req)
                 self.send_to_tokenizer.send_pyobj(
-                    UpdateWeightFromDistReqOutput(success, message)
+                    UpdateWeightFromDiskReqOutput(success, message)
                 )
             elif isinstance(recv_req, GetParameterByNameReqInput):
                 parameter = self.get_weights_by_parameter_name(recv_req)
@@ -1382,7 +1382,7 @@ class Scheduler:
                     req.to_abort = True
                     break
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:

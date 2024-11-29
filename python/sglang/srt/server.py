@@ -56,7 +56,7 @@ from sglang.srt.managers.io_struct import (
     InitParameterUpdateGroupReqInput,
     OpenSessionReqInput,
     UpdateParameterFromDistributedReqInput,
-    UpdateWeightFromDistReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -198,7 +198,7 @@ async def stop_profile_async():
 
 @app.post("/update_weights_from_disk")
 @time_func_latency
-async def update_weights_from_disk(obj: UpdateWeightFromDistReqInput, request: Request):
+async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights_from_disk(obj, request)
     content = {"success": success, "message": message}

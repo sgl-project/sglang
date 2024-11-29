@@ -23,7 +23,7 @@ from sglang.srt.managers.io_struct import (
     GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
     UpdateParameterFromDistributedReqInput,
-    UpdateWeightFromDistReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -160,7 +160,7 @@ class TpModelWorker:
         embeddings = logits_output.embeddings
         return embeddings
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path, recv_req.load_format
         )

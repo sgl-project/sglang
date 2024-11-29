@@ -19,25 +19,6 @@ concurrency:
 
 jobs:
 
-
-  weight-update-test-2-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 2-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-
-      - name: Test weight update
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_sgl_update_parameter_from_distributed_dp.py
-          python3 test_get_parameter_by_name.py
-
   unit-test-frontend:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
@@ -147,6 +128,13 @@ jobs:
           python3 test_mla.py
           python3 test_mla_fp8.py
           python3 test_dp_attention.py
+
+      - name: Test online weight update
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 test_update_parameters_from_distributed.py
+          python3 test_get_parameter_by_name.py
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

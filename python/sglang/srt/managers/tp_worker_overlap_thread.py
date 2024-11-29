@@ -27,7 +27,7 @@ from sglang.srt.managers.io_struct import (
     GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
     UpdateParameterFromDistributedReqInput,
-    UpdateWeightFromDistReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -209,7 +209,7 @@ class TpModelWorkerClient:
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
 

@@ -486,6 +486,12 @@ class ModelRunner:
     def get_weights_by_parameter_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
+        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
+
+        Only used for unit test with an unoptimized performance.
+        For optimized performance, please use torch.save and torch.load.
+        """
+        # TODO: (chenyang) Add support for Qwen models.
         try:
             return self.model.get_weights_by_parameter_name(
                 name, truncate_size, tp_size=self.tp_size

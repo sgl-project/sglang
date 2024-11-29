@@ -352,7 +352,7 @@ class FlushCacheReq:
 
 
 @dataclass
-class UpdateWeightFromDistReqInput:
+class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -360,7 +360,7 @@ class UpdateWeightFromDistReqInput:
 
 
 @dataclass
-class UpdateWeightFromDistReqOutput:
+class UpdateWeightFromDiskReqOutput:
     success: bool
     message: str
 

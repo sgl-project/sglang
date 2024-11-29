@@ -57,8 +57,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateParameterFromDistributedReqInput,
     UpdateParameterFromDistributedReqOutput,
-    UpdateWeightFromDistReqInput,
-    UpdateWeightFromDistReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -414,7 +414,7 @@ class TokenizerManager:
 
     async def update_weights_from_disk(
         self,
-        obj: UpdateWeightFromDistReqInput,
+        obj: UpdateWeightFromDiskReqInput,
         request: Optional[fastapi.Request] = None,
     ):
         if self.to_create_loop:
@@ -606,13 +606,13 @@ class TokenizerManager:
                 BatchStrOut,
                 BatchEmbeddingOut,
                 BatchTokenIDOut,
-                UpdateWeightFromDistReqOutput,
+                UpdateWeightFromDiskReqOutput,
                 UpdateParameterFromDistributedReqOutput,
                 GetParameterByNameReqOutput,
                 InitParameterUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
-            if isinstance(recv_obj, UpdateWeightFromDistReqOutput):
+            if isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
