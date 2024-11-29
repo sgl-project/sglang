@@ -597,13 +597,15 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             image_grid_thw: Tensor `(n_images, 3)` of image 3D grid in LLM.
                 `None` if no images are passed.
         """
+        if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
+            positions = forward_batch.mrope_positions
+
         image_inputs = None
         if forward_batch.image_inputs is not None:
             image_inputs = [
                 img for img in forward_batch.image_inputs if img is not None
             ]
-        if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
-            positions = forward_batch.mrope_positions
+
         if (
             forward_batch.forward_mode.is_decode()
             or image_inputs is None

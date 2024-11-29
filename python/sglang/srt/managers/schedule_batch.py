@@ -124,7 +124,7 @@ class FINISH_ABORT(BaseFinishReason):
 class ImageInputs:
     """The image related inputs."""
 
-    pixel_values: torch.Tensor
+    pixel_values: Union[torch.Tensor, np.array]
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
@@ -132,7 +132,7 @@ class ImageInputs:
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
-    image_embeds: Optional[List[torch.Tensor]] = None
+    # Llava related
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
 
@@ -141,21 +141,17 @@ class ImageInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
-    def from_dict(obj, vocab_size):
-        # Use image hash as fake token_ids, which is then used for prefix matching
+    def from_dict(obj: dict):
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
             image_hashes=obj["image_hashes"],
         )
-        if not isinstance(ret.image_hashes, list):
-            ret.pad_values = [
-                (ret.image_hashes) % vocab_size,
-                (ret.image_hashes >> 16) % vocab_size,
-                (ret.image_hashes >> 32) % vocab_size,
-                (ret.image_hashes >> 64) % vocab_size,
-            ]
-        else:
-            ret.pad_values = [x % vocab_size for x in ret.image_hashes]
+
+        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
+        # Please note that if the `input_ids` is later used in the model forward,
+        # you also need to clamp the values within the range of [0, vocab_size) to avoid illegal
+        # cuda memory access.
+        ret.pad_values = [x % (1 << 30) for x in ret.image_hashes]
 
         optional_args = [
             "image_sizes",
@@ -170,21 +166,16 @@ class ImageInputs:
 
         return ret
 
-    def merge(self, other, vocab_size):
+    def merge(self, other):
         assert self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
         self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
 
-        if isinstance(self.image_hashes, list) and isinstance(other.image_hashes, list):
-            self.image_hashes += other.image_hashes
-            self.pad_values = [x % vocab_size for x in self.image_hashes]
-        else:
-            self.image_hashes = hash(tuple(self.image_hashes, other.image_hashes))
-            self.pad_values = [
-                (self.image_hashes) % vocab_size,
-                (self.image_hashes >> 16) % vocab_size,
-                (self.image_hashes >> 32) % vocab_size,
-                (self.image_hashes >> 64) % vocab_size,
-            ]
+        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
+        # Please note that if the `input_ids` is later used in the model forward,
+        # you also need to clamp the values within the range of [0, vocab_size) to avoid illegal
+        # cuda memory access.
+        self.image_hashes += other.image_hashes
+        self.pad_values = [x % (1 << 30) for x in self.image_hashes]
 
         optional_args = [
             "image_sizes",
@@ -297,11 +288,11 @@ class Req:
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
 
-    def extend_image_inputs(self, image_inputs, vocab_size):
+    def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
             self.image_inputs = image_inputs
         else:
-            self.image_inputs.merge(image_inputs, vocab_size)
+            self.image_inputs.merge(image_inputs)
 
     # whether request reached finished condition
     def finished(self) -> bool:
