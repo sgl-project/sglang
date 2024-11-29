@@ -274,34 +274,57 @@ class LlamaModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ):
-        dur = torch.empty(35)
         if input_embeds is None:
-            tic = time.time()
             hidden_states = self.embed_tokens(input_ids)
-            torch.cuda.synchronize()
-            ted = time.time()
-            dur[0] = (ted-tic) * 1000
         else:
             hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            tic = time.time()
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
-            torch.cuda.synchronize()
-            ted = time.time()
-            dur[i + 1] = (ted-tic) * 1000
-        tic = time.time()
         hidden_states, _ = self.norm(hidden_states, residual)
-        torch.cuda.synchronize()
-        ted = time.time()
-        dur[33] = (ted-tic) * 1000
-        return hidden_states, dur
+        return hidden_states
+    
+    # def forward(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    #     input_embeds: torch.Tensor = None,
+    # ):
+    #     dur = torch.empty(35)
+    #     if input_embeds is None:
+    #         tic = time.time()
+    #         hidden_states = self.embed_tokens(input_ids)
+    #         torch.cuda.synchronize()
+    #         ted = time.time()
+    #         dur[0] = (ted-tic) * 1000
+    #     else:
+    #         hidden_states = input_embeds
+    #     residual = None
+    #     for i in range(len(self.layers)):
+    #         layer = self.layers[i]
+    #         tic = time.time()
+    #         hidden_states, residual = layer(
+    #             positions,
+    #             hidden_states,
+    #             forward_batch,
+    #             residual,
+    #         )
+    #         torch.cuda.synchronize()
+    #         ted = time.time()
+    #         dur[i + 1] = (ted-tic) * 1000
+    #     tic = time.time()
+    #     hidden_states, _ = self.norm(hidden_states, residual)
+    #     torch.cuda.synchronize()
+    #     ted = time.time()
+    #     dur[33] = (ted-tic) * 1000
+    #     return hidden_states, dur
 
 
 class LlamaForCausalLM(nn.Module):
@@ -319,6 +342,24 @@ class LlamaForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
+    # @torch.no_grad()
+    # def forward(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    #     input_embeds: torch.Tensor = None,
+    # ):
+    #     hidden_states, dur = self.model(input_ids, positions, forward_batch, input_embeds)
+    #     tic = time.time()
+    #     res = self.logits_processor(
+    #         input_ids, hidden_states, self.lm_head.weight, forward_batch
+    #     )
+    #     torch.cuda.synchronize()
+    #     ted = time.time()
+    #     dur[34] = (ted-tic) * 1000
+    #     return res,dur
+    
     @torch.no_grad()
     def forward(
         self,
@@ -327,15 +368,11 @@ class LlamaForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ):
-        hidden_states, dur = self.model(input_ids, positions, forward_batch, input_embeds)
-        tic = time.time()
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         res = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
-        torch.cuda.synchronize()
-        ted = time.time()
-        dur[34] = (ted-tic) * 1000
-        return res,dur
+        return res
     
     @torch.no_grad()
     def forward_split_prefill(

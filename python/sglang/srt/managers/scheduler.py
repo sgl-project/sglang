@@ -735,9 +735,7 @@ class Scheduler:
             self.running_batch,
             self.new_token_ratio,
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
-            self.max_prefill_tokens,
-            self.chunked_prefill_size,
-            num_mixed_running,
+            self.max_prefill_tokens
         )
 
         # Get requests from the waiting queue to a new prefill batch
@@ -828,9 +826,8 @@ class Scheduler:
             self.split_prefill_batch = None
             # add new request
         if not self.split_prefill_batch or self.split_prefill_batch.is_empty():
-            batch = self.get_new_batch_prefill()
+            batch = self.get_new_batch_split_prefill()
             if batch and not batch.is_empty():
-                batch.prepare_for_split_prefill()
                 self.split_prefill_batch = batch
 
     def update_running_batch(self):

@@ -109,6 +109,7 @@ class SchedulePolicy:
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
+    DECODE_SLO_LIMIT = auto() # Stop add req to meet decode SLO
     OTHER = auto()  # Other reasons to stop adding requests
 
 
@@ -327,19 +328,14 @@ class SplitPrefillAdder:
         new_token_ratio: float,
         rem_total_tokens: int,
         rem_input_tokens: int,
-        rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
     ):
         self.tree_cache = tree_cache
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        self.rem_total_tokens = rem_total_tokens - mixed_with_decode_tokens
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
-        self.rem_chunk_tokens = rem_chunk_tokens
-        if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= mixed_with_decode_tokens
-
-        self.cur_rem_tokens = rem_total_tokens - mixed_with_decode_tokens
+        self.rem_total_tokens = rem_total_tokens
+        input_tokens_limit_by_decode = self._get_max_prefill_seqlen()
+        self.rem_input_tokens = min(rem_input_tokens, input_tokens_limit_by_decode)
+        self.cur_rem_tokens = rem_total_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -359,14 +355,16 @@ class SplitPrefillAdder:
                     for r in running_batch.reqs
                 ]
             )
+        
+
+    def _get_max_prefill_seqlen(self):
+        return 4096
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        if self.rem_input_tokens <= 0 or (
-            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
-        ):
+        if self.rem_input_tokens <= 0:
             return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
@@ -377,8 +375,6 @@ class SplitPrefillAdder:
         self.rem_total_tokens -= extend_input_len + max_new_tokens
         self.cur_rem_tokens -= extend_input_len
         self.rem_input_tokens -= extend_input_len
-        if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
@@ -437,26 +433,16 @@ class SplitPrefillAdder:
             if cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
                 return AddReqResult.NO_TOKEN
             tokens_freed += tokens_occupied
+        
+        if req.extend_input_len > self.rem_input_tokens and len(self.can_run_list) != 0:
+            return AddReqResult.OTHER
 
-        if (
-            self.rem_chunk_tokens is None
-            or req.extend_input_len <= self.rem_chunk_tokens
-        ):
-            self.can_run_list.append(req)
-            self._prefill_one_req(
-                0,
-                req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
-            )
-        else:
-            # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
-            req.extend_input_len = trunc_len
-            req.fill_ids = req.fill_ids[:trunc_len]
-            self.can_run_list.append(req)
-            self.new_inflight_req = req
-            self._prefill_one_req(0, trunc_len, 0)
-
+        self.can_run_list.append(req)
+        self._prefill_one_req(
+            0,
+            req.extend_input_len,
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+        )
         return self.budget_state()
 
     def add_one_req(self, req: Req):

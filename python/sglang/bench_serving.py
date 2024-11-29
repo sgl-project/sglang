@@ -415,6 +415,15 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
     return filename
 
+def sample_synthesis_requests(
+        num_requests: int,
+        input_length: int) -> List[Tuple[str, int, int]]:
+    sample_results: List[Tuple[str, int, int]] = []
+    for _ in range(num_requests):
+        sample_results.append(("abcdefghijklmn"*input_length,input_length, 32))
+    return sample_results
+    
+
 
 def sample_sharegpt_requests(
     dataset_path: str,
@@ -956,6 +965,10 @@ def run_benchmark(args_: argparse.Namespace):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
         )
+    elif args.dataset_name == "synthesis":
+        input_requests = sample_synthesis_requests(
+            num_requests=args.num_prompts, input_length=512
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -1029,7 +1042,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random"],
+        choices=["sharegpt", "random", "synthesis"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
