@@ -23,7 +23,12 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.managers.io_struct import UpdateWeightReqInput
+from sglang.srt.managers.io_struct import (
+    GetParameterByNameReqInput,
+    InitParameterUpdateGroupReqInput,
+    UpdateParameterFromDistributedReqInput,
+    UpdateWeightFromDistReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
@@ -204,9 +209,22 @@ class TpModelWorkerClient:
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
-    def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.worker.update_weights(recv_req)
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
+        success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
+
+    def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
+        success, message = self.worker.init_parameter_update_group(recv_req)
+        return success, message
+
+    def update_parameter_from_distributed(
+        self, recv_req: UpdateParameterFromDistributedReqInput
+    ):
+        success, message = self.worker.update_parameter_from_distributed(recv_req)
+        return success, message
+
+    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
+        return self.worker.get_weights_by_parameter_name(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

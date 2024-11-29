@@ -18,6 +18,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
+
+  weight-update-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Test weight update
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_sgl_update_parameter_from_distributed_dp.py
+          python3 test_get_parameter_by_name.py
+
   unit-test-frontend:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
@@ -262,6 +282,7 @@ jobs:
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
+
 
   finish:
     needs: [

@@ -19,7 +19,12 @@ from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.io_struct import UpdateWeightReqInput
+from sglang.srt.managers.io_struct import (
+    GetParameterByNameReqInput,
+    InitParameterUpdateGroupReqInput,
+    UpdateParameterFromDistributedReqInput,
+    UpdateWeightFromDistReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -155,8 +160,33 @@ class TpModelWorker:
         embeddings = logits_output.embeddings
         return embeddings
 
-    def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.model_runner.update_weights(
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
+        success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path, recv_req.load_format
         )
         return success, message
+
+    def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
+        success, message = self.model_runner.init_parameter_update_group(
+            recv_req.master_address,
+            recv_req.master_port,
+            recv_req.rank_offset,
+            recv_req.world_size,
+            recv_req.group_name,
+            recv_req.backend,
+        )
+        return success, message
+
+    def update_parameter_from_distributed(
+        self, recv_req: UpdateParameterFromDistributedReqInput
+    ):
+        success, message = self.model_runner.update_parameter_from_distributed(
+            recv_req.name, recv_req.dtype, recv_req.shape, recv_req.empty_cache
+        )
+        return success, message
+
+    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
+        parameter = self.model_runner.get_weights_by_parameter_name(
+            recv_req.name, recv_req.truncate_size
+        )
+        return parameter
