@@ -216,7 +216,7 @@ class TokenizerManager:
             input_ids = obj.input_ids
 
         if self.is_generation:
-            image_inputs = await self.image_processor.process_images_async(
+            image_inputs: Dict = await self.image_processor.process_images_async(
                 obj.image_data, input_text or input_ids, obj
             )
             if image_inputs and "input_ids" in image_inputs:
