@@ -23,7 +23,10 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.managers.io_struct import UpdateWeightFromDiskReqInput
+from sglang.srt.managers.io_struct import (
+    GetParameterByNameReqInput,
+    UpdateWeightFromDiskReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
@@ -207,6 +210,9 @@ class TpModelWorkerClient:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
+
+    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
+        return self.worker.get_weights_by_parameter_name(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

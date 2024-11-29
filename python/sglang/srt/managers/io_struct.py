@@ -389,3 +389,14 @@ class CloseSessionReqInput:
 @dataclass
 class OpenSessionReqOutput:
     session_id: str
+
+
+@dataclass
+class GetParameterByNameReqInput:
+    name: str
+    truncate_size: int = 100
+
+
+@dataclass
+class GetParameterByNameReqOutput:
+    parameter: list

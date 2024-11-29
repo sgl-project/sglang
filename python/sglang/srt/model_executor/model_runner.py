@@ -397,6 +397,28 @@ class ModelRunner:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    def get_weights_by_parameter_name(
+        self, name: str, truncate_size: int = 100
+    ) -> Optional[torch.Tensor]:
+        """Get the weights of a parameter by its name. Simmilar to `model.get_parameter` for huggingface models.
+
+        Used only for testing the correctness of the `update_weights_from_distributed` API.
+        A better way to get the weights is to use torch.save and torch.load.
+
+        Args:
+            name: The name of the parameter.
+            truncate_size: The maximum number of elements to return.
+        """
+        # TODO(chenyang): add qwen2 support
+
+        try:
+            return self.model.get_weights_by_parameter_name(
+                name, truncate_size, tp_size=self.tp_size
+            )
+        except Exception as e:
+            logger.error(f"Error when getting parameter {name}: {e}")
+            return None
+
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
