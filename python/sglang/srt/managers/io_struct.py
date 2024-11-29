@@ -377,16 +377,6 @@ class ProfileReq(Enum):
 
 
 @dataclass
-class GetMemPoolSizeReq:
-    pass
-
-
-@dataclass
-class GetMemPoolSizeReqOutput:
-    size: int
-
-
-@dataclass
 class OpenSessionReqInput:
     capacity_of_str_len: int
 
