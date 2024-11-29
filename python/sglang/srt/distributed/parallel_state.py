@@ -179,7 +179,6 @@ class GroupCoordinator:
         torch_distributed_backend: Union[str, Backend],
         use_pynccl: bool,
         use_custom_allreduce: bool,
-        use_tpu_communicator: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
@@ -218,7 +217,6 @@ class GroupCoordinator:
 
         self.use_pynccl = use_pynccl
         self.use_custom_allreduce = use_custom_allreduce
-        self.use_tpu_communicator = use_tpu_communicator
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
 
@@ -244,14 +242,6 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
             )
-
-        from sglang.srt.distributed.device_communicators.tpu_communicator import (
-            TpuCommunicator,
-        )
-
-        self.tpu_communicator: Optional[TpuCommunicator] = None
-        if use_tpu_communicator and self.world_size > 1:
-            self.tpu_communicator = TpuCommunicator(group=self.cpu_group)
 
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
@@ -431,11 +421,6 @@ class GroupCoordinator:
         assert (
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-
-        # For TPUs, use TPU communicator.
-        tpu_comm = self.tpu_communicator
-        if tpu_comm is not None and not tpu_comm.disabled:
-            return tpu_comm.all_gather(input_, dim)
 
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
@@ -886,7 +871,6 @@ def init_world_group(
         torch_distributed_backend=backend,
         use_pynccl=False,
         use_custom_allreduce=False,
-        use_tpu_communicator=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         group_name="world",
@@ -909,7 +893,6 @@ def init_model_parallel_group(
         torch_distributed_backend=backend,
         use_pynccl=True,
         use_custom_allreduce=use_custom_allreduce,
-        use_tpu_communicator=True,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
