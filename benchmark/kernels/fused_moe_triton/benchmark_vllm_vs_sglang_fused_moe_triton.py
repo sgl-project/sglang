@@ -39,7 +39,7 @@ def get_model_config(model_name: str, tp_size: int):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     else:
-        # Default: Mixtral
+        # Default: Mixtral, Grok1, etc.
         E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size

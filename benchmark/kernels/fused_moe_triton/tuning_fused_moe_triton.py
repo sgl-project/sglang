@@ -92,7 +92,7 @@ def benchmark_config(
         input_gating.copy_(gating_output[i])
 
     def run():
-        from vllm.model_executor.layers.fused_moe import override_config
+        from sglang.srt.layers.fused_moe_triton.fused_moe import override_config
 
         with override_config(config):
             fused_moe(
