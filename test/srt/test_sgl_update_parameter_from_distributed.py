@@ -55,187 +55,231 @@ class TestParameterUpdateGroup(unittest.TestCase):
         ]
 
         if rank == 0:
-            os.environ["NCCL_CUMEM_ENABLE"] = "0"
-            os.environ["NCCL_NVLS_ENABLE"] = "0"
-
-            cls.hf_instruct_model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype="bfloat16"
-            ).to("cuda:0")
-            base_model_name = model_name.replace("-Instruct", "")
-            cls.hf_base_model = AutoModelForCausalLM.from_pretrained(
-                base_model_name, torch_dtype="bfloat16"
-            ).to("cuda:0")
-
-            cls.hf_instruct_params = []
-            cls.hf_base_params = []
-
-            print(f"get parameter in hf instruct model and base model")
-            for parameter_name in parameters:
-                cls.hf_instruct_params.append(
-                    cls.hf_instruct_model.get_parameter(parameter_name)[:truncate_size]
-                    .cpu()
-                    .detach()
-                    .float()
-                    .numpy()
-                    .tolist()
-                )
-                cls.hf_base_params.append(
-                    cls.hf_base_model.get_parameter(parameter_name)[:truncate_size]
-                    .cpu()
-                    .detach()
-                    .float()
-                    .numpy()
-                    .tolist()
-                )
-
-            param_queue.put(("hf_instruct_params", cls.hf_instruct_params))
-            param_queue.put(("hf_base_params", cls.hf_base_params))
-            print(f"rank {rank} world_size: {world_size} tp_size: {tp_size}")
-            cls.group = init_custom_process_group(
-                backend="nccl",
-                init_method="tcp://localhost:65500",
-                world_size=world_size,
-                rank=rank,
-                group_name="test_parameter_update_group",
+            cls._init_hf_process(
+                rank,
+                world_size,
+                param_queue,
+                truncate_size,
+                parameters,
+                model_name,
+                state_dict_key_to_shape,
+                tp_size,
             )
-            # warm up dist group
-            dist.barrier(group=cls.group)
-            torch.cuda.synchronize()
-            time_begin_broadcast = time.time()
-            for parameter_name in state_dict_key_to_shape.keys():
-                torch.distributed.broadcast(
-                    cls.hf_base_model.get_parameter(parameter_name),
-                    src=0,
-                    group=cls.group,
-                )
-            torch.cuda.synchronize()
-            time_end_broadcast = time.time()
-            broadcast_time = time_end_broadcast - time_begin_broadcast
-            print(f"rank {rank} broadcast parameter time: {broadcast_time:.3f}s")
-            param_queue.put(("broadcast_time", broadcast_time))
-
-            del cls.hf_instruct_model
-            del cls.hf_base_model
-            gc.collect()
-            torch.cuda.empty_cache()
         elif rank in [1, 2]:
-            torch.cuda.set_device(rank)
-            torch.cuda.synchronize()
-            base_gpu_id = 1 if rank == 1 else 1 + tp_size
+            cls._init_sgl_process(
+                rank,
+                world_size,
+                param_queue,
+                truncate_size,
+                parameters,
+                model_name,
+                state_dict_key_to_shape,
+                tp_size,
+                use_engine,
+            )
+
+    @classmethod
+    def _init_hf_process(
+        cls,
+        rank,
+        world_size,
+        param_queue,
+        truncate_size,
+        parameters,
+        model_name,
+        state_dict_key_to_shape,
+        tp_size,
+    ):
+        torch.cuda.set_device(rank)
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+        os.environ["NCCL_NVLS_ENABLE"] = "0"
+
+        cls.hf_instruct_model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype="bfloat16"
+        ).to("cuda:0")
+        base_model_name = model_name.replace("-Instruct", "")
+        cls.hf_base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name, torch_dtype="bfloat16"
+        ).to("cuda:0")
+
+        cls.hf_instruct_params = []
+        cls.hf_base_params = []
+
+        print(f"get parameter in hf instruct model and base model")
+        for parameter_name in parameters:
+            cls.hf_instruct_params.append(
+                cls.hf_instruct_model.get_parameter(parameter_name)[:truncate_size]
+                .cpu()
+                .detach()
+                .float()
+                .numpy()
+                .tolist()
+            )
+            cls.hf_base_params.append(
+                cls.hf_base_model.get_parameter(parameter_name)[:truncate_size]
+                .cpu()
+                .detach()
+                .float()
+                .numpy()
+                .tolist()
+            )
+
+        param_queue.put(("hf_instruct_params", cls.hf_instruct_params))
+        param_queue.put(("hf_base_params", cls.hf_base_params))
+        print(f"rank {rank} world_size: {world_size} tp_size: {tp_size}")
+        cls.group = init_custom_process_group(
+            backend="nccl",
+            init_method="tcp://localhost:65500",
+            world_size=world_size,
+            rank=rank,
+            group_name="test_parameter_update_group",
+        )
+        # warm up dist group
+        dist.barrier(group=cls.group)
+        torch.cuda.synchronize()
+        time_begin_broadcast = time.time()
+        for parameter_name in state_dict_key_to_shape.keys():
+            torch.distributed.broadcast(
+                cls.hf_base_model.get_parameter(parameter_name),
+                src=0,
+                group=cls.group,
+            )
+        torch.cuda.synchronize()
+        time_end_broadcast = time.time()
+        broadcast_time = time_end_broadcast - time_begin_broadcast
+        print(f"rank {rank} broadcast parameter time: {broadcast_time:.3f}s")
+        param_queue.put(("broadcast_time", broadcast_time))
+
+        del cls.hf_instruct_model
+        del cls.hf_base_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @classmethod
+    def _init_sgl_process(
+        cls,
+        rank,
+        world_size,
+        param_queue,
+        truncate_size,
+        parameters,
+        model_name,
+        state_dict_key_to_shape,
+        tp_size,
+        use_engine,
+    ):
+        torch.cuda.set_device(rank)
+        torch.cuda.synchronize()
+        base_gpu_id = 1 if rank == 1 else 1 + tp_size
+        if use_engine:
+            engine = sgl.Engine(
+                model_path=model_name,
+                random_seed=42,
+                base_gpu_id=base_gpu_id,
+                tp_size=tp_size,
+            )
+        else:
+            if rank == 1:
+                url = DEFAULT_URL_FOR_TEST
+            else:
+                url = DEFAULT_URL_FOR_TEST.replace("2157", "2159")
+            process = popen_launch_server(
+                model_name,
+                url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=(
+                    "--base-gpu-id",
+                    str(base_gpu_id),
+                    "--tp-size",
+                    str(tp_size),
+                ),
+            )
+        torch.cuda.synchronize()
+        if not use_engine:
+            print(f"rank {rank} url: {url}")
+        instruct_params = []
+        for parameter_name in parameters:
+            instruct_params.append(
+                engine.get_weights_by_parameter_name(parameter_name, truncate_size)
+                if use_engine
+                else requests.get(
+                    f"{url}/get_weights_by_parameter_name",
+                    json={"name": parameter_name, "truncate_size": truncate_size},
+                ).json()
+            )
+
+        param_queue.put((f"sgl_dp_{rank}_instruct_params", instruct_params))
+        if use_engine:
+            # TODO: CI error: [rank0]:[W1129 02:27:19.677568874 ProcessGroupNCCL.cpp:4115]
+            # [PG ID 4 PG GUID test_parameter_update_group Rank 1]  using GPU 0 to perform
+            # barrier as devices used by this process are currently unknown. This can potentially
+            # cause a hang if this rank to GPU mapping is incorrect.Specify device_ids in barrier()
+            # to force use of a particular device,or call init_process_group() with a device_id.
+            engine.init_parameter_update_group(
+                master_address="localhost",
+                master_port="65500",
+                rank_offset=base_gpu_id,
+                world_size=world_size,
+                group_name="test_parameter_update_group",
+                backend="nccl",
+            )
+        else:
+            requests.post(
+                f"{url}/init_parameter_update_group",
+                json={
+                    "master_address": "localhost",
+                    "master_port": "65500",
+                    "rank_offset": base_gpu_id,
+                    "world_size": world_size,
+                    "group_name": "test_parameter_update_group",
+                    "backend": "nccl",
+                },
+            )
+        torch.cuda.synchronize()
+        time_begin_update = time.time()
+        for parameter_name in state_dict_key_to_shape.keys():
             if use_engine:
-                engine = sgl.Engine(
-                    model_path=model_name,
-                    random_seed=42,
-                    base_gpu_id=base_gpu_id,
-                    tp_size=tp_size,
+                engine.update_parameter_from_distributed(
+                    parameter_name,
+                    dtype=torch.bfloat16,
+                    shape=state_dict_key_to_shape[parameter_name],
+                    empty_cache=True,
                 )
             else:
-                if rank == 1:
-                    url = DEFAULT_URL_FOR_TEST
-                else:
-                    url = DEFAULT_URL_FOR_TEST.replace("2157", "2159")
-                process = popen_launch_server(
-                    model_name,
-                    url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=(
-                        "--base-gpu-id",
-                        str(base_gpu_id),
-                        "--tp-size",
-                        str(tp_size),
-                    ),
+                requests.post(
+                    f"{url}/update_parameter_from_distributed",
+                    json={
+                        "name": parameter_name,
+                        "dtype": "bfloat16",
+                        "shape": state_dict_key_to_shape[parameter_name],
+                        "empty_cache": True,
+                    },
                 )
-            torch.cuda.synchronize()
-            if not use_engine:
-                print(f"rank {rank} url: {url}")
-            instruct_params = []
-            for parameter_name in parameters:
-                instruct_params.append(
+        torch.cuda.synchronize()
+        time_end_update = time.time()
+        update_time = time_end_update - time_begin_update
+        print(
+            f"fully update model_name {model_name} rank {rank} parameter from distributed time: {update_time:.3f}s"
+        )
+        param_queue.put((f"update_sgl_dp_{rank}_time", update_time))
+        base_params = []
+        for parameter_name in parameters:
+            if use_engine:
+                base_params.append(
                     engine.get_weights_by_parameter_name(parameter_name, truncate_size)
-                    if use_engine
-                    else requests.get(
+                )
+            else:
+                base_params.append(
+                    requests.get(
                         f"{url}/get_weights_by_parameter_name",
                         json={"name": parameter_name, "truncate_size": truncate_size},
                     ).json()
                 )
-
-            param_queue.put((f"sgl_dp_{rank}_instruct_params", instruct_params))
-            if use_engine:
-                # TODO: CI error: [rank0]:[W1129 02:27:19.677568874 ProcessGroupNCCL.cpp:4115]
-                # [PG ID 4 PG GUID test_parameter_update_group Rank 1]  using GPU 0 to perform
-                # barrier as devices used by this process are currently unknown. This can potentially
-                # cause a hang if this rank to GPU mapping is incorrect.Specify device_ids in barrier()
-                # to force use of a particular device,or call init_process_group() with a device_id.
-                engine.init_parameter_update_group(
-                    master_address="localhost",
-                    master_port="65500",
-                    rank_offset=base_gpu_id,
-                    world_size=world_size,
-                    group_name="test_parameter_update_group",
-                    backend="nccl",
-                )
-            else:
-                requests.post(
-                    f"{url}/init_parameter_update_group",
-                    json={
-                        "master_address": "localhost",
-                        "master_port": "65500",
-                        "rank_offset": base_gpu_id,
-                        "world_size": world_size,
-                        "group_name": "test_parameter_update_group",
-                        "backend": "nccl",
-                    },
-                )
-            torch.cuda.synchronize()
-            time_begin_update = time.time()
-            for parameter_name in state_dict_key_to_shape.keys():
-                if use_engine:
-                    engine.update_parameter_from_distributed(
-                        parameter_name,
-                        dtype=torch.bfloat16,
-                        shape=state_dict_key_to_shape[parameter_name],
-                        empty_cache=True,
-                    )
-                else:
-                    requests.post(
-                        f"{url}/update_parameter_from_distributed",
-                        json={
-                            "name": parameter_name,
-                            "dtype": "bfloat16",
-                            "shape": state_dict_key_to_shape[parameter_name],
-                            "empty_cache": True,
-                        },
-                    )
-            torch.cuda.synchronize()
-            time_end_update = time.time()
-            update_time = time_end_update - time_begin_update
-            print(
-                f"fully update model_name {model_name} rank {rank} parameter from distributed time: {update_time:.3f}s"
-            )
-            param_queue.put((f"update_sgl_dp_{rank}_time", update_time))
-            base_params = []
-            for parameter_name in parameters:
-                if use_engine:
-                    base_params.append(
-                        engine.get_weights_by_parameter_name(
-                            parameter_name, truncate_size
-                        )
-                    )
-                else:
-                    base_params.append(
-                        requests.get(
-                            f"{url}/get_weights_by_parameter_name",
-                            json={
-                                "name": parameter_name,
-                                "truncate_size": truncate_size,
-                            },
-                        ).json()
-                    )
-            param_queue.put((f"sgl_dp_{rank}_base_params", base_params))
-            if use_engine:
-                engine.shutdown()
-            else:
-                terminate_process(process)
+        param_queue.put((f"sgl_dp_{rank}_base_params", base_params))
+        if use_engine:
+            engine.shutdown()
+        else:
+            terminate_process(process)
 
     @classmethod
     def setUpClass(cls):
