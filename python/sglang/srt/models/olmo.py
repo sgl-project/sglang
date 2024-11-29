@@ -38,7 +38,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import make_layers
 
 
 class OlmoAttention(nn.Module):
@@ -221,13 +220,11 @@ class OlmoModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
-        self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: OlmoDecoderLayer(
-                layer_id=idx,
-                config=config,
-                quant_config=quant_config,
-            ),
+        self.layers = nn.ModuleList(
+            [
+                OlmoDecoderLayer(config, layer_id, quant_config)
+                for layer_id in range(config.num_hidden_layers)
+            ]
         )
         self.norm = nn.LayerNorm(
             config.hidden_size, elementwise_affine=False, bias=False
