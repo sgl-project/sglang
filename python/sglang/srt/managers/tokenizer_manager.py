@@ -65,7 +65,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_child_process
+from sglang.srt.utils import get_zmq_socket, kill_process_tree
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -615,7 +615,7 @@ class TokenizerManager:
             else:
                 break
 
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
     async def handle_loop(self):

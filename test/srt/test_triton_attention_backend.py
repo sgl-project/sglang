@@ -6,7 +6,7 @@ python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mml
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -54,7 +54,7 @@ class TestTritonAttnBackend(unittest.TestCase):
             metrics = run_eval(args)
             self.assertGreaterEqual(metrics["score"], 0.65)
         finally:
-            kill_child_process(process.pid, include_self=True)
+            kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":

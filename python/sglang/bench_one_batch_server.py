@@ -15,6 +15,7 @@ import dataclasses
 import itertools
 import json
 import multiprocessing
+import os
 import time
 from typing import Tuple
 
@@ -23,7 +24,7 @@ import requests
 
 from sglang.srt.server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 
 
 @dataclasses.dataclass
@@ -69,7 +70,7 @@ def launch_server_internal(server_args):
     except Exception as e:
         raise e
     finally:
-        kill_child_process()
+        kill_process_tree(os.getpid(), include_parent=False)
 
 
 def launch_server_process(server_args: ServerArgs):
@@ -175,7 +176,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             )
     finally:
         if proc:
-            kill_child_process(proc.pid, include_self=True)
+            kill_process_tree(proc.pid)
 
     print(f"\nResults are saved to {bench_args.result_filename}")
 

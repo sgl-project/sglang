@@ -56,6 +56,7 @@ ALL_OTHER_MODELS = [
     ModelCase("THUDM/glm-4-9b-chat"),
     ModelCase("openai-community/gpt2"),
     ModelCase("microsoft/Phi-3-small-8k-instruct"),
+    ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
 ]
 
 TORCH_DTYPES = [torch.float16]
