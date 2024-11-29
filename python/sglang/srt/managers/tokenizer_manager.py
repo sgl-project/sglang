@@ -46,8 +46,6 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
-    GetMemPoolSizeReq,
-    GetMemPoolSizeReqOutput,
     GetParameterByNameReqInput,
     GetParameterByNameReqOutput,
     InitParameterUpdateGroupReqInput,
@@ -225,7 +223,7 @@ class TokenizerManager:
             input_ids = obj.input_ids
 
         if self.is_generation:
-            image_inputs = await self.image_processor.process_images_async(
+            image_inputs: Dict = await self.image_processor.process_images_async(
                 obj.image_data, input_text or input_ids, obj
             )
             if image_inputs and "input_ids" in image_inputs:
@@ -412,25 +410,6 @@ class TokenizerManager:
     def stop_profile(self):
         req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
-
-    async def get_memory_pool_size(self):
-        if self.to_create_loop:
-            self.create_handle_loop()
-
-        req = GetMemPoolSizeReq()
-
-        self.send_to_scheduler.send_pyobj(req)
-        self.mem_pool_size = asyncio.Future()
-
-        # FIXME: Each request should have its own future instead of using `self.mem_pool_size`.
-        if self.server_args.dp_size == 1:
-            res = await self.mem_pool_size
-            return res.size
-        else:  # self.server_args.dp_size > 1
-            self.mem_pool_size_tmp = []
-            res = await self.mem_pool_size
-            ret = [r.size for r in res]
-            return ret
 
     async def update_weights_from_disk(
         self,
@@ -677,15 +656,6 @@ class TokenizerManager:
                         self.init_parameter_update_group_result.set_result(
                             self.init_parameter_update_group_tmp
                         )
-                continue
-            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
-                if self.server_args.dp_size == 1:
-                    self.mem_pool_size.set_result(recv_obj)
-                else:  # self.sever_args.dp_size > 1
-                    self.mem_pool_size_tmp.append(recv_obj)
-                    # set future if the all results are received
-                    if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
-                        self.mem_pool_size.set_result(self.mem_pool_size_tmp)
                 continue
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(

@@ -21,14 +21,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from sglang.api import Engine
 from sglang.bench_serving import (
     get_dataset,
     get_tokenizer,
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Runtime, start_profile, stop_profile
+from sglang.srt.server import Engine, Runtime
 from sglang.srt.server_args import ServerArgs
 
 
@@ -204,12 +203,12 @@ def throughput_test_once(
 
     st = time.perf_counter()
     if profile:
-        start_profile()
+        backend.start_profile()
 
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
 
     if profile:
-        stop_profile()
+        backend.stop_profile()
         monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
 
     latency = time.perf_counter() - st
