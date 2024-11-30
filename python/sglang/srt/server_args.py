@@ -58,7 +58,7 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = 8192
+    chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
@@ -128,7 +128,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
-    cuda_graph_max_bs: int = 160
+    cuda_graph_max_bs: Optional[int] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -144,14 +144,15 @@ class ServerArgs:
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
-        if self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
-            # Disable chunked prefill
-            self.chunked_prefill_size = None
-
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        # Mem fraction depends on the tensor parallelism size
+        if is_hip():
+            gpu_mem = get_amdgpu_memory_capacity()
+        else:
+            gpu_mem = get_nvgpu_memory_capacity()
+
+        # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
@@ -164,18 +165,21 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        # Adjust for GPUs with small memory capacities
-        if is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        else:
-            gpu_mem = get_nvgpu_memory_capacity()
+        # Set chunked prefill size, which depends on the gpu memory capacity
+        if self.chunked_prefill_size is None:
+            if gpu_mem < 25_000:
+                self.chunked_prefill_size = 2048
+            else:
+                self.chunked_prefill_size = 8192
 
-        if gpu_mem < 25000:
-            logger.warning(
-                "Your GPU has less than 25GB memory. You may want to set a smaller --chunked-prefill-size (e.g., 512) to improve performance."
-            )
+        # Set cuda graph max batch size
+        if self.cuda_graph_max_bs is None:
+            if gpu_mem < 25_000:
+                self.cuda_graph_max_bs = 8
+            else:
+                self.cuda_graph_max_bs = 160
 
-        # Choose kernel backends
+        # Set kernel backends
         if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
