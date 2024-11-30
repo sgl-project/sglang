@@ -129,12 +129,6 @@ jobs:
           python3 test_dp_attention.py
 
 
-      - name: Test online weight update
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 test_get_parameter_by_name.py
-
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
@@ -248,6 +242,13 @@ jobs:
         run: |
           cd test/srt
           python3 test_eval_accuracy_large.py
+
+
+      - name: Test online weight update
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_get_parameter_by_name.py
 
   accuracy-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
