@@ -20,8 +20,7 @@ import random
 import tempfile
 from typing import List, Optional
 
-from vllm.transformers_utils.utils import check_gguf_file
-
+from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_nvgpu_memory_capacity,

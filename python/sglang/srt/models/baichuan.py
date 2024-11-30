@@ -338,11 +338,12 @@ class BaiChuanBaseForCausalLM(nn.Module):
 
         self.quant_config = quant_config
         self.model = BaiChuanModel(config, position_embedding, quant_config)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
-        )
         if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size, config.hidden_size, quant_config=quant_config
+            )
         self.logits_processor = LogitsProcessor(config)
 
     def forward(

@@ -12,9 +12,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding as VllmVocabParallelEmbedding,
-)
 from vllm.model_executor.parameter import BasevLLMParameter
 
 from sglang.srt.layers.quantization.base_config import (
@@ -174,7 +171,7 @@ def get_masked_input_and_mask(
     return input_, ~vocab_mask
 
 
-class VocabParallelEmbedding(VllmVocabParallelEmbedding):
+class VocabParallelEmbedding(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
 
     Adapted from torch.nn.Embedding, note that we pad the vocabulary size to
@@ -224,15 +221,8 @@ class VocabParallelEmbedding(VllmVocabParallelEmbedding):
         prefix: str = "",
         enable_tp: bool = True,
     ):
-        super().__init__(
-            num_embeddings,
-            embedding_dim,
-            params_dtype,
-            org_num_embeddings,
-            padding_size,
-            quant_config,
-            prefix,
-        )
+        super().__init__()
+        self.quant_config = quant_config
 
         self.enable_tp = enable_tp
         if self.enable_tp:

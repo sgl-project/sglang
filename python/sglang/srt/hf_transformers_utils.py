@@ -29,7 +29,6 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-from vllm.transformers_utils.utils import check_gguf_file
 
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
@@ -217,3 +216,16 @@ def attach_additional_stop_token_ids(tokenizer):
         )
     else:
         tokenizer.additional_stop_token_ids = None
+
+
+def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
+    """Check if the file is a GGUF model."""
+    model = Path(model)
+    if not model.is_file():
+        return False
+    elif model.suffix == ".gguf":
+        return True
+
+    with open(model, "rb") as f:
+        header = f.read(4)
+    return header == b"GGUF"
