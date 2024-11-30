@@ -10,7 +10,6 @@ import torch.library
 
 from sglang.srt.utils import is_hpu
 
-# from vllm.scalar_type import ScalarType
 
 logger = logging.getLogger(__name__)
 
