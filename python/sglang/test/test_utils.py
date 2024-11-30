@@ -567,6 +567,7 @@ def run_bench_serving(
         disable_tqdm=False,
         disable_stream=disable_stream,
         disable_ignore_eos=False,
+        lora_name=None,
         extra_request_body=None,
         profile=None,
     )
