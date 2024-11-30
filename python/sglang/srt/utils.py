@@ -30,7 +30,6 @@ import subprocess
 import tempfile
 import time
 import warnings
-from datetime import timedelta
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
