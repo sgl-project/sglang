@@ -242,7 +242,7 @@ async def update_parameter_from_distributed(
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
-async def get_weights_by_name(obj: GetWeighsByNameReqInput, request: Request):
+async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
         ret = await tokenizer_manager.get_weights_by_name(obj, request)

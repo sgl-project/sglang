@@ -133,7 +133,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 test_update_parameters_from_distributed.py
+          python3 test_update_weights_from_distributed.py
           python3 test_get_parameter_by_name.py
 
   performance-test-1-gpu-part-1:
