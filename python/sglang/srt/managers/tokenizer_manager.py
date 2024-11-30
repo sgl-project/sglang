@@ -48,8 +48,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
-    InitParameterUpdateGroupReqInput,
-    InitParameterUpdateGroupReqOutput,
+    InitWeightUpdateGroupReqInput,
+    InitWeightUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -460,9 +460,9 @@ class TokenizerManager:
         else:
             return False, "Another update is in progress. Please try again later."
 
-    async def init_parameter_update_group(
+    async def init_weight_update_group(
         self,
-        obj: InitParameterUpdateGroupReqInput,
+        obj: InitWeightUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> bool:
         if self.to_create_loop:
@@ -472,7 +472,7 @@ class TokenizerManager:
             obj.backend = "nccl"
         self.send_to_scheduler.send_pyobj(obj)
 
-        self.init_parameter_update_group_result = asyncio.Future()
+        self.init_weight_update_group_result = asyncio.Future()
 
         assert self.server_args.dp_size == 1, (
             "Only support dp_size == 1 when launching the server. "
@@ -480,7 +480,7 @@ class TokenizerManager:
             "launch multi server / engine and init parameter update group "
             "on each server / engine like our unit test."
         )
-        result = await self.init_parameter_update_group_result
+        result = await self.init_weight_update_group_result
         return result.success, result.message
 
     async def update_parameter_from_distributed(
@@ -607,7 +607,7 @@ class TokenizerManager:
                 UpdateWeightFromDiskReqOutput,
                 UpdateParameterFromDistributedReqOutput,
                 GetWeightsByNameReqOutput,
-                InitParameterUpdateGroupReqOutput,
+                InitWeightUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
@@ -640,17 +640,17 @@ class TokenizerManager:
                             self.get_weights_by_name_tmp
                         )
                 continue
-            elif isinstance(recv_obj, InitParameterUpdateGroupReqOutput):
+            elif isinstance(recv_obj, InitWeightUpdateGroupReqOutput):
                 if self.server_args.dp_size == 1:
-                    self.init_parameter_update_group_result.set_result(recv_obj)
+                    self.init_weight_update_group_result.set_result(recv_obj)
                 else:
-                    self.init_parameter_update_group_tmp.append(recv_obj)
+                    self.init_weight_update_group_tmp.append(recv_obj)
                     if (
-                        len(self.init_parameter_update_group_tmp)
+                        len(self.init_weight_update_group_tmp)
                         == self.server_args.dp_size
                     ):
-                        self.init_parameter_update_group_result.set_result(
-                            self.init_parameter_update_group_tmp
+                        self.init_weight_update_group_result.set_result(
+                            self.init_weight_update_group_tmp
                         )
                 continue
             elif isinstance(recv_obj, OpenSessionReqOutput):

@@ -25,7 +25,7 @@ import torch
 
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
-    InitParameterUpdateGroupReqInput,
+    InitWeightUpdateGroupReqInput,
     UpdateParameterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
 )
@@ -213,8 +213,8 @@ class TpModelWorkerClient:
         success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
 
-    def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
-        success, message = self.worker.init_parameter_update_group(recv_req)
+    def init_weight_update_group(self, recv_req: InitWeightUpdateGroupReqInput):
+        success, message = self.worker.init_weight_update_group(recv_req)
         return success, message
 
     def update_parameter_from_distributed(

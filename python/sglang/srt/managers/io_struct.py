@@ -380,7 +380,7 @@ class UpdateParameterFromDistributedReqOutput:
 
 
 @dataclass
-class InitParameterUpdateGroupReqInput:
+class InitWeightUpdateGroupReqInput:
     # The master address
     master_address: str
     # The master port
@@ -396,7 +396,7 @@ class InitParameterUpdateGroupReqInput:
 
 
 @dataclass
-class InitParameterUpdateGroupReqOutput:
+class InitWeightUpdateGroupReqOutput:
     success: bool
     message: str
 

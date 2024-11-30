@@ -21,7 +21,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
-    InitParameterUpdateGroupReqInput,
+    InitWeightUpdateGroupReqInput,
     UpdateParameterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
 )
@@ -166,8 +166,8 @@ class TpModelWorker:
         )
         return success, message
 
-    def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
-        success, message = self.model_runner.init_parameter_update_group(
+    def init_weight_update_group(self, recv_req: InitWeightUpdateGroupReqInput):
+        success, message = self.model_runner.init_weight_update_group(
             recv_req.master_address,
             recv_req.master_port,
             recv_req.rank_offset,

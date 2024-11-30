@@ -53,7 +53,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
-    InitParameterUpdateGroupReqInput,
+    InitWeightUpdateGroupReqInput,
     OpenSessionReqInput,
     UpdateParameterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
@@ -213,12 +213,12 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         )
 
 
-@app.post("/init_parameter_update_group")
-async def init_parameter_update_group(
-    obj: InitParameterUpdateGroupReqInput, request: Request
+@app.post("/init_weight_update_group")
+async def init_weight_update_group(
+    obj: InitWeightUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    success, message = await tokenizer_manager.init_parameter_update_group(obj, request)
+    success, message = await tokenizer_manager.init_weight_update_group(obj, request)
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -242,7 +242,7 @@ async def update_parameter_from_distributed(
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
-async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+async def get_weights_by_name(obj: GetWeighsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
         ret = await tokenizer_manager.get_weights_by_name(obj, request)
@@ -319,12 +319,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
 
 @time_func_latency
-async def init_parameter_update_group_request(
-    obj: InitParameterUpdateGroupReqInput, request: Request
+async def init_weight_update_group_request(
+    obj: InitWeightUpdateGroupReqInput, request: Request
 ):
     """Handle an init parameter update group request."""
     try:
-        ret = await tokenizer_manager.init_parameter_update_group(obj, request)
+        ret = await tokenizer_manager.init_weight_update_group(obj, request)
         return ret
     except ValueError as e:
         return ORJSONResponse(
@@ -1084,7 +1084,7 @@ class Engine:
         else:
             return ret
 
-    def init_parameter_update_group(
+    def init_weight_update_group(
         self,
         master_address: str,
         master_port: int,
@@ -1093,7 +1093,7 @@ class Engine:
         group_name: str,
         backend: str = "nccl",
     ):
-        obj = InitParameterUpdateGroupReqInput(
+        obj = InitWeightUpdateGroupReqInput(
             master_address=master_address,
             master_port=master_port,
             rank_offset=rank_offset,
@@ -1103,7 +1103,7 @@ class Engine:
         )
 
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(init_parameter_update_group_request(obj, None))
+        return loop.run_until_complete(init_weight_update_group_request(obj, None))
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
         obj = UpdateParameterFromDistributedReqInput(

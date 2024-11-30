@@ -40,8 +40,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
-    InitParameterUpdateGroupReqInput,
-    InitParameterUpdateGroupReqOutput,
+    InitWeightUpdateGroupReqInput,
+    InitWeightUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -520,10 +520,10 @@ class Scheduler:
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
-            elif isinstance(recv_req, InitParameterUpdateGroupReqInput):
-                success, message = self.init_parameter_update_group(recv_req)
+            elif isinstance(recv_req, InitWeightUpdateGroupReqInput):
+                success, message = self.init_weight_update_group(recv_req)
                 self.send_to_tokenizer.send_pyobj(
-                    InitParameterUpdateGroupReqOutput(success, message)
+                    InitWeightUpdateGroupReqOutput(success, message)
                 )
             elif isinstance(recv_req, UpdateParameterFromDistributedReqInput):
                 success, message = self.update_parameter_from_distributed(recv_req)
@@ -1392,9 +1392,9 @@ class Scheduler:
             logger.error(message)
         return success, message
 
-    def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
+    def init_weight_update_group(self, recv_req: InitWeightUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
-        success, message = self.tp_worker.init_parameter_update_group(recv_req)
+        success, message = self.tp_worker.init_weight_update_group(recv_req)
         return success, message
 
     def update_parameter_from_distributed(

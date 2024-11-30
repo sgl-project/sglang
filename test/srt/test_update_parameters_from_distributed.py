@@ -160,7 +160,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
             param_queue.put((f"sgl_dp_{rank}_instruct_params", instruct_params))
             if use_engine:
-                engine.init_parameter_update_group(
+                engine.init_weight_update_group(
                     master_address="localhost",
                     master_port="65500",
                     rank_offset=base_gpu_id,
@@ -170,7 +170,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 )
             else:
                 requests.post(
-                    f"{url}/init_parameter_update_group",
+                    f"{url}/init_weight_update_group",
                     json={
                         "master_address": "localhost",
                         "master_port": "65500",
@@ -260,7 +260,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
             torch.cuda.empty_cache()
 
     @classmethod
-    def test_init_parameter_update_group(cls):
+    def test_init_weight_update_group(cls):
         truncate_size = 10
 
         for model_name in cls.model_names:

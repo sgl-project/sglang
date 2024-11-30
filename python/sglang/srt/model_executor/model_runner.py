@@ -404,7 +404,7 @@ class ModelRunner:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
-    def init_parameter_update_group(
+    def init_weight_update_group(
         self,
         master_address,
         master_port,
