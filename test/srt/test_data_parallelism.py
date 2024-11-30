@@ -44,7 +44,7 @@ class TestDataParallelism(unittest.TestCase):
 
     def test_update_weight(self):
         response = requests.post(
-            self.base_url + "/update_weights",
+            self.base_url + "/update_weights_from_disk",
             json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
         )
 
@@ -55,7 +55,7 @@ class TestDataParallelism(unittest.TestCase):
         time.sleep(5)
 
         response = requests.post(
-            self.base_url + "/update_weights",
+            self.base_url + "/update_weights_from_disk",
             json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
         )
 
