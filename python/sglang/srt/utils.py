@@ -38,7 +38,6 @@ import numpy as np
 import psutil
 import requests
 import torch
-import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
