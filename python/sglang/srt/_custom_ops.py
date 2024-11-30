@@ -10,7 +10,6 @@ import torch.library
 
 from sglang.srt.utils import is_hpu
 
-
 logger = logging.getLogger(__name__)
 
 if not is_hpu():
