@@ -474,16 +474,14 @@ class TokenizerManager:
 
         self.init_parameter_update_group_result = asyncio.Future()
 
-        if self.server_args.dp_size == 1:
-            result = await self.init_parameter_update_group_result
-            return result.success, result.message
-        else:
-            self.init_parameter_update_group_tmp = []
-            result = await self.init_parameter_update_group_result
-            all_success = all([r.success for r in result])
-            all_message = [r.message for r in result]
-            all_message = " | ".join(all_message)
-            return all_success, all_message
+        assert self.server_args.dp_size == 1, (
+            "Only support dp_size == 1 when launching the server. "
+            "For weight broadcast to multi dp replicas, you should "
+            "launch multi server / engine and init parameter update group "
+            "on each server / engine like our unit test."
+        )
+        result = await self.init_parameter_update_group_result
+        return result.success, result.message
 
     async def update_parameter_from_distributed(
         self,
