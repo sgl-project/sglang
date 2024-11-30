@@ -283,7 +283,11 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if lm_head.quant_config and lm_head.quant_config.get_name() == "gguf":
+        if (
+            hasattr(lm_head, "quant_config")
+            and lm_head.quant_config
+            and lm_head.quant_config.get_name() == "gguf"
+        ):
             logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
         else:
             logits = torch.matmul(hidden_states, lm_head.weight.T)
