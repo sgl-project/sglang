@@ -129,6 +129,7 @@ class ImageInputs:
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
+    image_pad_len: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None
