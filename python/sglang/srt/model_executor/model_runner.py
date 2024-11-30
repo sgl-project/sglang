@@ -20,10 +20,13 @@ import inspect
 import json
 import logging
 import pkgutil
+import time
 from functools import lru_cache
-from typing import Optional, Type
+from tokenize import tabsize
+from typing import Any, Optional, Type, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
@@ -319,8 +322,8 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-    def update_weights(self, model_path: str, load_format: str):
-        """Update weights in-place."""
+    def update_weights_from_disk(self, model_path: str, load_format: str):
+        """Update engine weights online from disk."""
         from vllm.model_executor.model_loader.loader import (
             DefaultModelLoader,
             device_loading_context,
@@ -329,7 +332,7 @@ class ModelRunner:
         from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
         logger.info(
-            f"Update weights begin. "
+            f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
