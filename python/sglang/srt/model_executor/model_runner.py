@@ -61,7 +61,6 @@ from sglang.srt.utils import (
     crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
-    init_custom_process_group,
     is_hip,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,

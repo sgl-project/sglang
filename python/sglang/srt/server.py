@@ -79,7 +79,6 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     delete_directory,
-    init_custom_process_group,
     is_port_available,
     kill_process_tree,
     maybe_set_triton_cache_manager,
