@@ -366,6 +366,17 @@ class UpdateWeightFromDiskReqOutput:
 
 
 @dataclass
+class GetWeightsByNameReqInput:
+    name: str
+    truncate_size: int = 100
+
+
+@dataclass
+class GetWeightsByNameReqOutput:
+    parameter: list
+
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str
