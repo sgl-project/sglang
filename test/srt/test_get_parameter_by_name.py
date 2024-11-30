@@ -26,34 +26,30 @@ class TestUpdateWeights(unittest.TestCase):
         ).to("cuda:0")
 
     @classmethod
-    def init_engine_and_server(cls, engine_tp, server_tp, engine_dp, server_dp):
+    def init_backend(cls, backend, dp, tp):
         cls.engine = None
         cls.process = None
-        cls.engine_dp = engine_dp
-        cls.server_dp = server_dp
-        cls.engine_tp = engine_tp
-        cls.server_tp = server_tp
-        if engine_dp != 0:
+        cls.backend = backend
+        cls.dp = dp
+        cls.tp = tp
+        if backend == "Engine":
             cls.engine = sgl.Engine(
                 model_path=cls.model,
                 random_seed=42,
-                tp_size=engine_tp,
-                dp_size=engine_dp,
-                base_gpu_id=0,
+                tp_size=tp,
+                dp_size=dp,
                 mem_fraction_static=0.85,
             )
-        if server_dp != 0:
+        else:
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=(
-                    "--base-gpu-id",
-                    str(engine_dp * engine_tp),
                     "--tp-size",
-                    str(server_tp),
+                    str(tp),
                     "--dp-size",
-                    str(server_dp),
+                    str(dp),
                 ),
             )
 
@@ -73,17 +69,17 @@ class TestUpdateWeights(unittest.TestCase):
     @classmethod
     def assert_update_weights_all_close(cls, param_name, truncate_size):
         print(
-            f"param_name: {param_name}, engine_dp: {cls.engine_dp}, server_dp: {cls.server_dp}, engine_tp: {cls.engine_tp}, server_tp: {cls.server_tp}"
+            f"param_name: {param_name}, backend: {cls.backend}, dp: {cls.dp}, tp: {cls.tp}"
         )
         param = cls.hf_model.get_parameter(param_name)[:truncate_size]
         param_np = param.cpu().detach().float().numpy()
 
-        if cls.engine:
+        if cls.backend == "Engine":
             engine_ret = cls.engine.get_weights_by_name(param_name, truncate_size)
             engine_ret = cls._process_return(engine_ret)
             np.testing.assert_allclose(engine_ret, param_np, rtol=1e-5, atol=1e-5)
 
-        if cls.process:
+        if cls.backend == "Runtime":
             runtime_ret = requests.get(
                 f"{cls.base_url}/get_weights_by_name",
                 json={"name": param_name, "truncate_size": truncate_size},
@@ -101,14 +97,14 @@ class TestUpdateWeights(unittest.TestCase):
 
     @classmethod
     def test_update_weights_unexist_model(cls):
-        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
-        test_suits = [(1, 1, 1, 1), (2, 0, 1, 0), (0, 2, 0, 1)]
+        test_suits = [("Engine", 1, 1), ("Runtime", 1, 1)]
+
+        if torch.cuda.device_count() >= 2:
+            test_suits.append(("Engine", 1, 2))
+            test_suits.append(("Runtime", 2, 1))
 
         if torch.cuda.device_count() >= 4:
-            test_suits.extend([(2, 2, 1, 1), (1, 1, 2, 2)])
-
-        if torch.cuda.device_count() >= 8:
-            test_suits.append((2, 2, 2, 2))
+            test_suits.extend([("Engine", 2, 2), ("Runtime", 2, 2)])
 
         parameters = [
             "model.embed_tokens.weight",
@@ -126,7 +122,7 @@ class TestUpdateWeights(unittest.TestCase):
         ]
 
         for test_suit in test_suits:
-            cls.init_engine_and_server(*test_suit)
+            cls.init_backend(*test_suit)
             for param_name in parameters:
                 cls.assert_update_weights_all_close(param_name, 100)
             cls.close_engine_and_server()
