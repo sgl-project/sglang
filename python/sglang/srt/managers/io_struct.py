@@ -352,7 +352,7 @@ class FlushCacheReq:
 
 
 @dataclass
-class UpdateWeightReqInput:
+class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -360,7 +360,7 @@ class UpdateWeightReqInput:
 
 
 @dataclass
-class UpdateWeightReqOutput:
+class UpdateWeightFromDiskReqOutput:
     success: bool
     message: str
 
@@ -374,16 +374,6 @@ class AbortReq:
 class ProfileReq(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
-
-
-@dataclass
-class GetMemPoolSizeReq:
-    pass
-
-
-@dataclass
-class GetMemPoolSizeReqOutput:
-    size: int
 
 
 @dataclass

@@ -220,9 +220,6 @@ class TestSRTEndpoint(unittest.TestCase):
         max_total_num_tokens = response_json["max_total_num_tokens"]
         self.assertIsInstance(max_total_num_tokens, int)
 
-        memory_pool_size = response_json["memory_pool_size"]
-        self.assertIsInstance(memory_pool_size, int)
-
         attention_backend = response_json["attention_backend"]
         self.assertIsInstance(attention_backend, str)
 

@@ -20,10 +20,13 @@ import inspect
 import json
 import logging
 import pkgutil
+import time
 from functools import lru_cache
-from typing import Optional, Type
+from tokenize import tabsize
+from typing import Any, Optional, Type, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
@@ -118,7 +121,7 @@ class ModelRunner:
             logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
-            server_args.chunked_prefill_size = None
+            server_args.chunked_prefill_size = -1
             self.mem_fraction_static *= 0.95
             # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
             if self.model_config.hf_config.architectures == [
@@ -148,12 +151,14 @@ class ModelRunner:
 
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
-        # Init components
+        # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        # Load the model
         self.sampler = Sampler()
         self.load_model()
 
-        # Apply torch TP if model supports it
+        # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
@@ -161,6 +166,7 @@ class ModelRunner:
         else:
             self.torch_tp_applied = False
 
+        # Init memory pool and attention backends
         if server_args.lora_paths is not None:
             self.init_lora_manager()
         self.init_memory_pool(
@@ -316,8 +322,8 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-    def update_weights(self, model_path: str, load_format: str):
-        """Update weights in-place."""
+    def update_weights_from_disk(self, model_path: str, load_format: str):
+        """Update engine weights online from disk."""
         from vllm.model_executor.model_loader.loader import (
             DefaultModelLoader,
             device_loading_context,
@@ -326,7 +332,7 @@ class ModelRunner:
         from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
         logger.info(
-            f"Update weights begin. "
+            f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
