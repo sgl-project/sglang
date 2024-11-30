@@ -25,7 +25,6 @@ class TestUpdateWeights(unittest.TestCase):
             cls.model, torch_dtype="bfloat16"
         ).to("cuda:0")
 
-    @classmethod
     def init_backend(cls, backend, dp, tp):
         cls.engine = None
         cls.process = None
@@ -53,7 +52,6 @@ class TestUpdateWeights(unittest.TestCase):
                 ),
             )
 
-    @classmethod
     def close_engine_and_server(cls):
         if cls.engine:
             cls.engine.shutdown()
@@ -66,7 +64,6 @@ class TestUpdateWeights(unittest.TestCase):
         gc.collect()
         torch.cuda.empty_cache()
 
-    @classmethod
     def assert_update_weights_all_close(cls, param_name, truncate_size):
         print(
             f"param_name: {param_name}, backend: {cls.backend}, dp: {cls.dp}, tp: {cls.tp}"
@@ -95,7 +92,6 @@ class TestUpdateWeights(unittest.TestCase):
             return np.array(ret[0])
         return np.array(ret)
 
-    @classmethod
     def test_update_weights_unexist_model(cls):
         test_suits = [("Engine", 1, 1), ("Runtime", 1, 1)]
 

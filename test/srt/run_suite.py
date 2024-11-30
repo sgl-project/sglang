@@ -38,6 +38,7 @@ suites = {
         "test_update_weights_from_disk.py",
         "test_vision_openai_server.py",
         "test_session_control.py",
+        "test_get_parameter_by_name.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True

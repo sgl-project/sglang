@@ -26,7 +26,6 @@ from tokenize import tabsize
 from typing import Any, Optional, Type, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
