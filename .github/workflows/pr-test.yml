@@ -129,12 +129,11 @@ jobs:
           python3 test_mla_fp8.py
           python3 test_dp_attention.py
 
-      - name: Test online weight update
-        timeout-minutes: 30
+      - name: Test update weights from distributed
+        timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_update_weights_from_distributed.py
-          python3 test_get_parameter_by_name.py
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -249,6 +248,13 @@ jobs:
         run: |
           cd test/srt
           python3 test_eval_accuracy_large.py
+
+
+      - name: Test get parameter by name
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_get_parameter_by_name.py
 
   accuracy-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
