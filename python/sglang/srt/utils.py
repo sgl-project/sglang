@@ -574,6 +574,29 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
         setattr(GroupCoordinator, "all_gather", all_gather)
 
 
+def monkey_patch_vllm_gguf_config():
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig,
+        GGUFEmbeddingMethod,
+        GGUFLinearMethod,
+    )
+
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+    def get_quant_method_with_embedding_replaced(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional["QuantizeMethodBase"]:
+        if isinstance(layer, LinearBase):
+            return GGUFLinearMethod(self)
+        elif isinstance(layer, VocabParallelEmbedding):
+            # patch to own VocabParallelEmbedding
+            return GGUFEmbeddingMethod(self)
+        return None
+
+    setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
+
+
 def maybe_set_triton_cache_manager() -> None:
     """Set environment variable to tell Triton to use a
     custom cache manager"""
