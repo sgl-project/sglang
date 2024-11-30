@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -44,6 +45,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import make_layers
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaMLP(nn.Module):
@@ -495,6 +498,9 @@ class LlamaForCausalLM(nn.Module):
                 return None
 
         except Exception as e:
+            logger.error(
+                f"Error getting weights by name {name} in LlamaForCausalLM: {e}"
+            )
             return None
 
 
