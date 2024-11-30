@@ -305,11 +305,6 @@ async def get_weights_by_parameter_name_request(
         )
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
-app.post("/generate")(generate_request)
-app.put("/generate")(generate_request)
-
-
 @app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):

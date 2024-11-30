@@ -1371,7 +1371,7 @@ class Scheduler:
                     break
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        """In-place update of the weights."""
+        """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
             flash_cache_success = self.flush_cache()
