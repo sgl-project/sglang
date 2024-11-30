@@ -270,8 +270,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             )
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
-app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
 
 
@@ -944,54 +942,3 @@ class Engine:
 
     async def get_server_info(self):
         return await _get_server_info()
-
-    def generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        stream: bool = False,
-    ):
-        obj = GenerateReqInput(
-            text=prompt,
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            lora_path=lora_path,
-            stream=stream,
-        )
-
-        # get the current event loop
-        loop = asyncio.get_event_loop()
-        ret = loop.run_until_complete(generate_request(obj, None))
-
-        if stream is True:
-
-            def generator_wrapper():
-                offset = 0
-                loop = asyncio.get_event_loop()
-                generator = ret.body_iterator
-                while True:
-                    chunk = loop.run_until_complete(generator.__anext__())
-
-                    if chunk.startswith(STREAM_END_SYMBOL):
-                        break
-                    else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
-                        data["text"] = data["text"][offset:]
-                        offset += len(data["text"])
-                        yield data
-
-            # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
-            # however, it allows to wrap the generator as a subfunction and return
-            return generator_wrapper()
-        else:
-            return ret
