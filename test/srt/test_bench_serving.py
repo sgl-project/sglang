@@ -6,6 +6,7 @@ from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     is_in_ci,
     run_bench_serving,
+    write_github_step_summary,
 )
 
 
@@ -20,6 +21,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_default\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             self.assertGreater(res["output_throughput"], 3350)
 
     def test_offline_throughput_non_stream_small_batch_size(self):
@@ -36,6 +41,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_non_stream_small_batch_size\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             # There is a regression with torch 2.5
             # This number was 950 for torch 2.4
             self.assertGreater(res["output_throughput"], 800)
@@ -49,6 +58,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_without_radix_cache\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             self.assertGreater(res["output_throughput"], 3350)
 
     def test_offline_throughput_without_chunked_prefill(self):
@@ -60,6 +73,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_without_chunked_prefill\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             self.assertGreater(res["output_throughput"], 2600)
 
     def test_offline_throughput_with_triton_attention_backend(self):
@@ -76,6 +93,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_with_triton_attention_backend\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             self.assertGreater(res["output_throughput"], 3450)
 
     def test_offline_throughput_default_fp8(self):
@@ -87,6 +108,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_default_fp8\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             self.assertGreater(res["output_throughput"], 3850)
 
     def test_online_latency_default(self):
@@ -98,6 +123,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_online_latency_default\n"
+                f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} token/s\n'
+            )
             self.assertLess(res["median_e2e_latency_ms"], 12000)
             self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
@@ -111,6 +140,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_moe_offline_throughput_default\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             self.assertGreater(res["output_throughput"], 2150)
 
     def test_moe_offline_throughput_without_radix_cache(self):
@@ -122,6 +155,10 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
+            write_github_step_summary(
+                f"### test_moe_offline_throughput_without_radix_cache\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
             self.assertGreater(res["output_throughput"], 2150)
 
 
