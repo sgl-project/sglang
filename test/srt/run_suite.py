@@ -15,6 +15,7 @@ suites = {
         "test_double_sparsity.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
+        "test_gguf.py",
         "test_input_embeddings.py",
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
@@ -38,7 +39,6 @@ suites = {
         "test_update_weights.py",
         "test_vision_openai_server.py",
         "test_session_control.py",
-        "test_gguf.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
