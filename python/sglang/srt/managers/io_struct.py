@@ -366,13 +366,13 @@ class UpdateWeightFromDiskReqOutput:
 
 
 @dataclass
-class GetParameterByNameReqInput:
+class GetWeightsByNameReqInput:
     name: str
     truncate_size: int = 100
 
 
 @dataclass
-class GetParameterByNameReqOutput:
+class GetWeightsByNameReqOutput:
     parameter: list
 
 

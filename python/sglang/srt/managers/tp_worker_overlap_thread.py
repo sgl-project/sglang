@@ -24,7 +24,7 @@ import psutil
 import torch
 
 from sglang.srt.managers.io_struct import (
-    GetParameterByNameReqInput,
+    GetWeightsByNameReqInput,
     UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -211,8 +211,8 @@ class TpModelWorkerClient:
         success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
 
-    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
-        return self.worker.get_weights_by_parameter_name(recv_req)
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        return self.worker.get_weights_by_name(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

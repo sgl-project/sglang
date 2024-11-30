@@ -20,7 +20,7 @@ from typing import Optional
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
-    GetParameterByNameReqInput,
+    GetWeightsByNameReqInput,
     UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
@@ -164,8 +164,8 @@ class TpModelWorker:
         )
         return success, message
 
-    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
-        parameter = self.model_runner.get_weights_by_parameter_name(
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        parameter = self.model_runner.get_weights_by_name(
             recv_req.name, recv_req.truncate_size
         )
         return parameter
