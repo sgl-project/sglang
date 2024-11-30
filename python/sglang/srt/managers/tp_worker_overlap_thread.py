@@ -24,7 +24,7 @@ import psutil
 import torch
 
 from sglang.srt.managers.io_struct import (
-    GetParameterByNameReqInput,
+    GetWeightsByNameReqInput,
     InitParameterUpdateGroupReqInput,
     UpdateParameterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
@@ -223,8 +223,8 @@ class TpModelWorkerClient:
         success, message = self.worker.update_parameter_from_distributed(recv_req)
         return success, message
 
-    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
-        return self.worker.get_weights_by_parameter_name(recv_req)
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        return self.worker.get_weights_by_name(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

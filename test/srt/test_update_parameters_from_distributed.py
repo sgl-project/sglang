@@ -150,10 +150,10 @@ class TestParameterUpdateGroup(unittest.TestCase):
             instruct_params = []
             for parameter_name in parameters:
                 instruct_params.append(
-                    engine.get_weights_by_parameter_name(parameter_name, truncate_size)
+                    engine.get_weights_by_name(parameter_name, truncate_size)
                     if use_engine
                     else requests.get(
-                        f"{url}/get_weights_by_parameter_name",
+                        f"{url}/get_weights_by_name",
                         json={"name": parameter_name, "truncate_size": truncate_size},
                     ).json()
                 )
@@ -211,14 +211,12 @@ class TestParameterUpdateGroup(unittest.TestCase):
             for parameter_name in parameters:
                 if use_engine:
                     base_params.append(
-                        engine.get_weights_by_parameter_name(
-                            parameter_name, truncate_size
-                        )
+                        engine.get_weights_by_name(parameter_name, truncate_size)
                     )
                 else:
                     base_params.append(
                         requests.get(
-                            f"{url}/get_weights_by_parameter_name",
+                            f"{url}/get_weights_by_name",
                             json={
                                 "name": parameter_name,
                                 "truncate_size": truncate_size,

@@ -432,7 +432,7 @@ class LlamaForCausalLM(nn.Module):
 
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
-    def get_weights_by_parameter_name(
+    def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
     ) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.

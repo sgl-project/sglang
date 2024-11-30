@@ -38,8 +38,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
-    GetParameterByNameReqInput,
-    GetParameterByNameReqOutput,
+    GetWeightsByNameReqInput,
+    GetWeightsByNameReqOutput,
     InitParameterUpdateGroupReqInput,
     InitParameterUpdateGroupReqOutput,
     OpenSessionReqInput,
@@ -517,11 +517,9 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightFromDiskReqOutput(success, message)
                 )
-            elif isinstance(recv_req, GetParameterByNameReqInput):
-                parameter = self.get_weights_by_parameter_name(recv_req)
-                self.send_to_tokenizer.send_pyobj(
-                    GetParameterByNameReqOutput(parameter)
-                )
+            elif isinstance(recv_req, GetWeightsByNameReqInput):
+                parameter = self.get_weights_by_name(recv_req)
+                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, InitParameterUpdateGroupReqInput):
                 success, message = self.init_parameter_update_group(recv_req)
                 self.send_to_tokenizer.send_pyobj(
@@ -1411,8 +1409,8 @@ class Scheduler:
             logger.error(message)
         return success, message
 
-    def get_weights_by_parameter_name(self, recv_req: GetParameterByNameReqInput):
-        parameter = self.tp_worker.get_weights_by_parameter_name(recv_req)
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        parameter = self.tp_worker.get_weights_by_name(recv_req)
         return parameter
 
     def start_profile(self) -> None:

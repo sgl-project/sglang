@@ -79,15 +79,13 @@ class TestUpdateWeights(unittest.TestCase):
         param_np = param.cpu().detach().float().numpy()
 
         if cls.engine:
-            engine_ret = cls.engine.get_weights_by_parameter_name(
-                param_name, truncate_size
-            )
+            engine_ret = cls.engine.get_weights_by_name(param_name, truncate_size)
             engine_ret = cls._process_return(engine_ret)
             np.testing.assert_allclose(engine_ret, param_np, rtol=1e-5, atol=1e-5)
 
         if cls.process:
             runtime_ret = requests.get(
-                f"{cls.base_url}/get_weights_by_parameter_name",
+                f"{cls.base_url}/get_weights_by_name",
                 json={"name": param_name, "truncate_size": truncate_size},
             ).json()
             runtime_ret = cls._process_return(runtime_ret)

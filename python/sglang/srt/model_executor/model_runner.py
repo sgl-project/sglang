@@ -486,7 +486,7 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def get_weights_by_parameter_name(
+    def get_weights_by_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
@@ -496,7 +496,7 @@ class ModelRunner:
         """
         # TODO: (chenyang) Add support for Qwen models.
         try:
-            return self.model.get_weights_by_parameter_name(
+            return self.model.get_weights_by_name(
                 name, truncate_size, tp_size=self.tp_size
             )
         except Exception as e:
