@@ -668,7 +668,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head.weight, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -685,8 +685,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

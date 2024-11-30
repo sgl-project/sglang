@@ -23,6 +23,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
@@ -163,7 +164,7 @@ class LogitsProcessor(nn.Module):
         self,
         input_ids,
         hidden_states,
-        weight,
+        lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
     ):
         if isinstance(logits_metadata, ForwardBatch):
@@ -178,7 +179,7 @@ class LogitsProcessor(nn.Module):
             last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             last_hidden = hidden_states[last_index]
 
-        last_logits = torch.matmul(last_hidden, weight.T)
+        last_logits = self._get_logits(last_hidden, lm_head)
         if self.do_tensor_parallel_all_gather:
             last_logits = tensor_model_parallel_all_gather(last_logits)
         last_logits = last_logits[:, : self.config.vocab_size].float()
@@ -229,7 +230,7 @@ class LogitsProcessor(nn.Module):
 
                 # Compute the logits and logprobs for all required tokens
                 states = torch.cat(states, dim=0)
-                all_logits = torch.matmul(states, weight.T)
+                all_logits = self._get_logits(states, lm_head)
                 if self.do_tensor_parallel_all_gather:
                     all_logits = tensor_model_parallel_all_gather(all_logits)
                 all_logits = all_logits[:, : self.config.vocab_size].float()
@@ -275,6 +276,19 @@ class LogitsProcessor(nn.Module):
                     input_top_logprobs=input_top_logprobs,
                     output_top_logprobs=output_top_logprobs,
                 )
+
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if hasattr(lm_head, "weight"):
+            logits = torch.matmul(hidden_states, lm_head.weight.T)
+        else:
+            # GGUF models
+            logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
+        return logits
 
 
 def test():
