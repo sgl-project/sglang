@@ -255,6 +255,8 @@ class Scheduler:
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
+        if self.chunked_prefill_size <= 0:  # -1 means disable
+            self.chunked_prefill_size = None
         self.being_chunked_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
