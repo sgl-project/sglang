@@ -20,15 +20,15 @@ from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
-    os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
+    os.environ.get("SGLANG_RINGBUFFER_WARNING_INTERVAL", "60")
 )
 
 logger = logging.getLogger(__name__)
 
 
 def get_ip() -> str:
-    # VLLM_HOST_IP env can be ignore
-    host_ip = os.getenv("VLLM_HOST_IP", "") or os.getenv("HOST_IP", "")
+    # SGLANG_HOST_IP env can be ignore
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
     if host_ip:
         return host_ip
 
@@ -470,11 +470,11 @@ class MessageQueue:
                     # if we wait for a long time, we should warn the user
                     if (
                         time.monotonic() - start_time
-                        > VLLM_RINGBUFFER_WARNING_INTERVAL * n_warning
+                        > SGLANG_RINGBUFFER_WARNING_INTERVAL * n_warning
                     ):
                         logger.warning(
                             "No available block found in %s second. ",
-                            VLLM_RINGBUFFER_WARNING_INTERVAL,
+                            SGLANG_RINGBUFFER_WARNING_INTERVAL,
                         )
                         n_warning += 1
 

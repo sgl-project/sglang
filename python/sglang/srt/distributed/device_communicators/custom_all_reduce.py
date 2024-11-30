@@ -72,7 +72,7 @@ def is_full_nvlink(cls, physical_device_ids: List[int]) -> bool:
 
 def _can_p2p(rank: int, world_size: int) -> bool:
     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
-    SGLANG_SKIP_P2P_CHECK = os.getenv("VLLM_SKIP_P2P_CHECK", "0") == "1"
+    SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
     for i in range(world_size):
         if i == rank:
             continue

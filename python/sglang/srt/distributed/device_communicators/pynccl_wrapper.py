@@ -18,7 +18,7 @@
 # recompilation of the code every time we want to switch between different
 # versions. This current implementation, with a **pure** Python wrapper, is
 # more flexible. We can easily switch between different versions of NCCL by
-# changing the environment variable `VLLM_NCCL_SO_PATH`, or the `so_file`
+# changing the environment variable `SGLANG_NCCL_SO_PATH`, or the `so_file`
 # variable in the code.
 
 import ctypes
@@ -36,19 +36,19 @@ logger = logging.getLogger(__name__)
 
 def find_nccl_library() -> str:
     """
-    We either use the library file specified by the `VLLM_NCCL_SO_PATH`
+    We either use the library file specified by the `SGLANG_NCCL_SO_PATH`
     environment variable, or we find the library file brought by PyTorch.
     After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
     found by `ctypes` automatically.
     """
 
     # so_file can be set to None in sglang
-    so_file = os.environ.get("VLLM_NCCL_SO_PATH", None)
+    so_file = os.environ.get("SGLANG_NCCL_SO_PATH", None)
 
     # manually load the nccl library
     if so_file:
         logger.info(
-            "Found nccl from environment variable VLLM_NCCL_SO_PATH=%s", so_file
+            "Found nccl from environment variable SGLANG_NCCL_SO_PATH=%s", so_file
         )
     else:
         if torch.version.cuda is not None:
@@ -249,7 +249,7 @@ class NCCLLibrary:
                 "Otherwise, the nccl library might not exist, be corrupted "
                 "or it does not support the current platform %s."
                 "If you already have the library, please set the "
-                "environment variable VLLM_NCCL_SO_PATH"
+                "environment variable SGLANG_NCCL_SO_PATH"
                 " to point to the correct nccl library path.",
                 so_file,
                 platform.platform(),

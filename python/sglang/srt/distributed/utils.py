@@ -67,7 +67,7 @@ def get_pp_indices(
     the last partition will have the remaining layers.
     """
     # partition_list_str can be set to None in sglang
-    partition_list_str = os.getenv("VLLM_PP_LAYER_PARTITION", None)
+    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]
