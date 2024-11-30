@@ -6,6 +6,7 @@ from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     is_in_ci,
     run_bench_serving,
+    write_github_step_summary,
 )
 
 
@@ -21,6 +22,9 @@ class TestBenchServing(unittest.TestCase):
 
         if is_in_ci():
             self.assertGreater(res["output_throughput"], 3350)
+            write_github_step_summary(
+                f'test_offline_throughput_default: {res["output_throughput"]}'
+            )
 
     def test_offline_throughput_non_stream_small_batch_size(self):
         res = run_bench_serving(

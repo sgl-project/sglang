@@ -816,3 +816,8 @@ def run_mulit_request_test(
         chunked_prefill_size,
         assert_has_abort=False,
     )
+
+
+def write_github_step_summary(content):
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+        f.write(content)
