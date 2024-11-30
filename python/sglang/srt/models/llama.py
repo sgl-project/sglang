@@ -422,7 +422,6 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
     def get_weights_by_name(
