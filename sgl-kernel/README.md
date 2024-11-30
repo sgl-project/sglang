@@ -1,3 +1,3 @@
-# sgl-kernel
+# SGL Kernel
 
 Kernel Library for SGLang
