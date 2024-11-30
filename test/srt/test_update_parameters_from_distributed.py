@@ -349,8 +349,10 @@ class TestParameterUpdateGroup(unittest.TestCase):
                                 np.array(sgl_dp_two_instruct_params[i]),
                             ), f"sgl_dp_two_instruct_params rank {i} is not close"
 
+                    # Time limit for broadcast and update on CI is 3 / 6
+                    # On local H100, it's 1 / 2
                     time_limit = (
-                        1 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 2
+                        3 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 6
                     )
 
                     assert (
