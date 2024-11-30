@@ -269,9 +269,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             )
 
 
-app.put("/generate")(generate_request)
-
-
 @app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
