@@ -167,7 +167,7 @@ class TpModelWorkerClient:
 
             self.output_queue.put((logits_output, next_token_ids.tolist()))
 
-    def resulve_batch_result(self, bid: int):
+    def resolve_batch_result(self, bid: int):
         logits_output, next_token_ids = self.output_queue.get()
         if self.has_inflight_batch:
             # Wait until the batch is launched
