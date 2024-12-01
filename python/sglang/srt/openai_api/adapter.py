@@ -521,7 +521,7 @@ def v1_generate_request(
                 "skip_special_tokens": request.skip_special_tokens,
             }
         )
-        return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
+        return_logprobs.append(request.logprobs is not None)
         logprob_start_lens.append(current_logprob_start_len)
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
