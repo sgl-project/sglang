@@ -1126,7 +1126,7 @@ def should_use_tensor_cores(
     Returns:
         bool: Whether to use tensor cores
     """
-    # Try to environment variable and dtype-based logic first
+    # Try to use environment variable and dtype-based logic first
     env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
     if env_override is not None:
         return env_override.lower() == "true"
