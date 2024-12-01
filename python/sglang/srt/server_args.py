@@ -190,6 +190,12 @@ class ServerArgs:
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
+        if self.attention_backend == "torch_native":
+            logger.info(
+                "Cuda graph is disabled because of using torch native attention backend"
+            )
+            self.disable_cuda_graph = True
+
         # Others
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
