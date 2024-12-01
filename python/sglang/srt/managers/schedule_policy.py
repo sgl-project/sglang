@@ -231,6 +231,9 @@ class PrefillAdder:
                             break
                     self.req_states.insert(i, (tokens_left, tokens_occupied))
 
+        if len(self.can_run_list) != 0:
+            return AddReqResult.OTHER
+
         if self.req_states is None:
             self.req_states = []
             add_req_state(req)
