@@ -336,15 +336,14 @@ class MixtralForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -355,15 +354,7 @@ class MixtralForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
 
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Skip loading kv_scale from ckpts towards new design.
-                    if name.endswith(".kv_scale") and name not in params_dict:
-                        continue
-
                     name = name.replace(weight_name, param_name)
-
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -375,9 +366,6 @@ class MixtralForCausalLM(nn.Module):
                     )
                     break
                 else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
                     # Skip loading kv_scale from ckpts towards new design.
                     if name.endswith(".kv_scale") and name not in params_dict:
                         continue
