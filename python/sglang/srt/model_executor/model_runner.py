@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     is_hip,
+    monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
@@ -297,6 +298,8 @@ class ModelRunner:
             download_dir=self.server_args.download_dir,
         )
         monkey_patch_vllm_model_config()
+        if self.server_args.load_format == "gguf":
+            monkey_patch_vllm_gguf_config()
         self.vllm_model_config = VllmModelConfig(**self.get_model_config_params())
         if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
