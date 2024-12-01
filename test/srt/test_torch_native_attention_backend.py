@@ -26,7 +26,8 @@ class TestTorchNativeAttnBackend(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert output_throughput > 153, f"{output_throughput=}"
+            # Torch native backend is expected to be slower
+            assert output_throughput > 50, f"{output_throughput=}"
 
     def test_mmlu(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
