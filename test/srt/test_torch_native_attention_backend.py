@@ -36,7 +36,7 @@ class TestTorchNativeAttnBackend(unittest.TestCase):
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend", "torch_native", "--disable-cuda-graph"],
+            other_args=["--attention-backend", "torch_native"],
         )
 
         try:
