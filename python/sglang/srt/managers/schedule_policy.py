@@ -142,7 +142,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
-        self.new_inflight_req = None
+        self.new_being_chunked_req = None
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
 
@@ -182,7 +182,7 @@ class PrefillAdder:
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
 
-    def add_inflight_req(self, req: Req):
+    def add_being_chunked_req(self, req: Req):
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -275,7 +275,7 @@ class PrefillAdder:
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_inflight_req = req
+            self.new_being_chunked_req = req
             self._prefill_one_req(0, trunc_len, 0)
 
         return self.budget_state()
@@ -329,7 +329,7 @@ class PrefillAdder:
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
                 self.can_run_list.append(req)
-                self.new_inflight_req = req
+                self.new_being_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(prefix_len, trunc_len, 0)
 
