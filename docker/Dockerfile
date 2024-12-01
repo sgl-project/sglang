@@ -23,31 +23,32 @@ RUN pip3 install datamodel_code_generator
 
 WORKDIR /sgl-workspace
 
+ARG CUDA_VERSION
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && cd sglang \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python3 -m pip --no-cache-dir install -e "python[srt]"; \
+         if [ "$CUDA_VERSION" = "12.1.1" ]; then \
+           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu121/torch2.4/flashinfer/; \
+         elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
+           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/; \
+         elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
+           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu118/torch2.4/flashinfer/; \
+         else \
+           echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
+         fi; \
        else \
-         python3 -m pip --no-cache-dir install -e "python[all]"; \
+         if [ "$CUDA_VERSION" = "12.1.1" ]; then \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu121/torch2.4/flashinfer/; \
+         elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/; \
+         elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu118/torch2.4/flashinfer/; \
+         else \
+           echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
+         fi; \
        fi
 
-ARG CUDA_VERSION
-RUN if [ "$CUDA_VERSION" = "12.1.1" ]; then \
-        export CUDA_IDENTIFIER=cu121 && \
-        python3 -m pip --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/; \
-    elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
-        export CUDA_IDENTIFIER=cu124 && \
-        python3 -m pip --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu124/torch2.4/; \
-    elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
-        export CUDA_IDENTIFIER=cu118 && \
-        python3 -m pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu118 && \
-        python3 -m pip --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.4/; \
-    else \
-        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
-    fi
-
 RUN python3 -m pip cache purge
-
 
 ENV DEBIAN_FRONTEND=interactive

@@ -47,6 +47,7 @@ import itertools
 import json
 import logging
 import multiprocessing
+import os
 import time
 from typing import Tuple
 
@@ -62,11 +63,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    configure_logger,
-    kill_child_process,
-    suppress_other_loggers,
-)
+from sglang.srt.utils import configure_logger, kill_process_tree, suppress_other_loggers
 
 
 @dataclasses.dataclass
@@ -466,7 +463,6 @@ if __name__ == "__main__":
 
     try:
         main(server_args, bench_args)
-    except Exception as e:
-        raise e
     finally:
-        kill_child_process()
+        if server_args.tp_size != 1:
+            kill_process_tree(os.getpid(), include_parent=False)

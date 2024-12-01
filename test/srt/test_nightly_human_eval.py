@@ -3,19 +3,16 @@ import shutil
 import signal
 import subprocess
 import unittest
-from types import SimpleNamespace
 
 from test_nightly_gsm8k_eval import launch_server, parse_models
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
 )
 
 
@@ -35,9 +32,9 @@ class TestEvalAccuracyLarge(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.process:
-            kill_child_process(cls.process.pid)
+            kill_process_tree(cls.process.pid)
         if cls.eval_process:
-            kill_child_process(cls.eval_process.pid)
+            kill_process_tree(cls.eval_process.pid)
 
     def run_evalplus(self, model):
         print("Delete evalplus results")

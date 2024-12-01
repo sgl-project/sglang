@@ -166,6 +166,7 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     json_schema: Optional[str] = None

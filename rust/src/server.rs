@@ -2,6 +2,9 @@ use crate::router::PolicyConfig;
 use crate::router::Router;
 use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use bytes::Bytes;
+use env_logger::Builder;
+use log::{info, LevelFilter};
+use std::io::Write;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -125,23 +128,49 @@ async fn v1_completions(
         .await
 }
 
-pub async fn startup(
-    host: String,
-    port: u16,
-    worker_urls: Vec<String>,
-    policy_config: PolicyConfig,
-) -> std::io::Result<()> {
-    println!("Starting server on {}:{}", host, port);
-    println!("Worker URLs: {:?}", worker_urls);
-    println!("Policy Config: {:?}", policy_config);
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub worker_urls: Vec<String>,
+    pub policy_config: PolicyConfig,
+    pub verbose: bool,
+}
 
-    // Create client once with configuration
+pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
+    Builder::new()
+        .format(|buf, record| {
+            use chrono::Local;
+            writeln!(
+                buf,
+                "[Router (Rust)] {} - {} - {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .filter(
+            None,
+            if config.verbose {
+                LevelFilter::Debug
+            } else {
+                LevelFilter::Info
+            },
+        )
+        .init();
+
+    info!("Starting server on {}:{}", config.host, config.port);
+    info!("Worker URLs: {:?}", config.worker_urls);
+    info!("Policy Config: {:?}", config.policy_config);
+
     let client = reqwest::Client::builder()
         .build()
         .expect("Failed to create HTTP client");
 
-    // Store both worker_urls and client in AppState
-    let app_state = web::Data::new(AppState::new(worker_urls, client, policy_config));
+    let app_state = web::Data::new(AppState::new(
+        config.worker_urls,
+        client,
+        config.policy_config,
+    ));
 
     HttpServer::new(move || {
         App::new()
@@ -155,7 +184,7 @@ pub async fn startup(
             .service(health_generate)
             .service(get_server_info)
     })
-    .bind((host, port))?
+    .bind((config.host, config.port))?
     .run()
     .await
 }

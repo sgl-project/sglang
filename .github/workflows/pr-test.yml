@@ -50,7 +50,7 @@ jobs:
         timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 0 --range-end 5
+          python3 run_suite.py --suite minimal --range-begin 0 --range-end 6
 
   unit-test-backend-part-2:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -67,7 +67,7 @@ jobs:
         timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 5 --range-end 14
+          python3 run_suite.py --suite minimal --range-begin 6 --range-end 15
 
   unit-test-backend-part-3:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -84,7 +84,7 @@ jobs:
         timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 14 --range-end 21
+          python3 run_suite.py --suite minimal --range-begin 15 --range-end 24
 
   unit-test-backend-part-4:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -101,7 +101,7 @@ jobs:
         timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 21
+          python3 run_suite.py --suite minimal --range-begin 24
 
   unit-test-backend-2-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -127,6 +127,7 @@ jobs:
           python3 test_mla.py
           python3 test_mla_fp8.py
           python3 test_dp_attention.py
+
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -241,6 +242,7 @@ jobs:
         run: |
           cd test/srt
           python3 test_eval_accuracy_large.py
+
 
   accuracy-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

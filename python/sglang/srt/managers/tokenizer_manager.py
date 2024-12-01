@@ -25,6 +25,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -45,20 +46,20 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
-    GetMemPoolSizeReq,
-    GetMemPoolSizeReqOutput,
+    GetWeightsByNameReqInput,
+    GetWeightsByNameReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_child_process
+from sglang.srt.utils import get_zmq_socket, kill_process_tree
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -201,14 +202,25 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
         # Tokenize
+        input_embeds = None
         input_text = obj.text
-        if obj.input_ids is None:
+        if obj.input_embeds is not None:
+            if not self.server_args.disable_radix_cache:
+                raise ValueError(
+                    "input_embeds is provided while disable_radix_cache is False. "
+                    "Please add `--disable-radix-cach` when you launch the server "
+                    "if you want to use input_embeds as inputs."
+                )
+            input_embeds = obj.input_embeds
+            input_ids = obj.input_ids
+        elif obj.input_ids is None:
             input_ids = self.tokenizer.encode(input_text)
         else:
             input_ids = obj.input_ids
 
         if self.is_generation:
-            image_inputs = await self.image_processor.process_images_async(
+            # TODO: also support getting embeddings for multimodal models
+            image_inputs: Dict = await self.image_processor.process_images_async(
                 obj.image_data, input_text or input_ids, obj
             )
             if image_inputs and "input_ids" in image_inputs:
@@ -216,10 +228,10 @@ class TokenizerManager:
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
-            session_id = obj.session_id
-            session_rid = obj.session_rid
+            session_id = obj.session[0] if obj.session else None
+            session_rid = obj.session[1] if obj.session else None
 
-        if len(input_ids) >= self.context_len:
+        if obj.input_ids is not None and len(input_ids) >= self.context_len:
             raise ValueError(
                 f"The input ({len(input_ids)} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
@@ -242,7 +254,8 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                obj.lora_path,
+                lora_path=obj.lora_path,
+                input_embeds=input_embeds,
                 session_id=session_id,
                 session_rid=session_rid,
             )
@@ -395,27 +408,10 @@ class TokenizerManager:
         req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
 
-    async def get_memory_pool_size(self):
-        if self.to_create_loop:
-            self.create_handle_loop()
-
-        req = GetMemPoolSizeReq()
-
-        self.send_to_scheduler.send_pyobj(req)
-        self.mem_pool_size = asyncio.Future()
-
-        # FIXME: Each request should have its own future instead of using `self.mem_pool_size`.
-        if self.server_args.dp_size == 1:
-            res = await self.mem_pool_size
-            return res.size
-        else:  # self.server_args.dp_size > 1
-            self.mem_pool_size_tmp = []
-            res = await self.mem_pool_size
-            ret = [r.size for r in res]
-            return ret
-
-    async def update_weights(
-        self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
+    async def update_weights_from_disk(
+        self,
+        obj: UpdateWeightFromDiskReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         if self.to_create_loop:
             self.create_handle_loop()
@@ -459,6 +455,23 @@ class TokenizerManager:
 
         else:
             return False, "Another update is in progress. Please try again later."
+
+    async def get_weights_by_name(
+        self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
+    ):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        self.send_to_scheduler.send_pyobj(obj)
+        self.get_weights_by_name_result = asyncio.Future()
+        if self.server_args.dp_size == 1:
+            result = await self.get_weights_by_name_result
+            return result.parameter
+        else:
+            self.get_weights_by_name_tmp = []
+            result = await self.get_weights_by_name_result
+            all_parameters = [r.parameter for r in result]
+            return all_parameters
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
@@ -521,7 +534,7 @@ class TokenizerManager:
             else:
                 break
 
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
     async def handle_loop(self):
@@ -529,10 +542,14 @@ class TokenizerManager:
 
         while True:
             recv_obj: Union[
-                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
+                BatchStrOut,
+                BatchEmbeddingOut,
+                BatchTokenIDOut,
+                UpdateWeightFromDiskReqOutput,
+                GetWeightsByNameReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
-            if isinstance(recv_obj, UpdateWeightReqOutput):
+            if isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
@@ -541,14 +558,15 @@ class TokenizerManager:
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
                 continue
-            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
+            elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 if self.server_args.dp_size == 1:
-                    self.mem_pool_size.set_result(recv_obj)
-                else:  # self.sever_args.dp_size > 1
-                    self.mem_pool_size_tmp.append(recv_obj)
-                    # set future if the all results are received
-                    if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
-                        self.mem_pool_size.set_result(self.mem_pool_size_tmp)
+                    self.get_weights_by_name_result.set_result(recv_obj)
+                else:
+                    self.get_weights_by_name_tmp.append(recv_obj)
+                    if len(self.get_weights_by_name_tmp) == self.server_args.dp_size:
+                        self.get_weights_by_name_result.set_result(
+                            self.get_weights_by_name_tmp
+                        )
                 continue
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
@@ -570,13 +588,11 @@ class TokenizerManager:
                     out_dict = {
                         "text": recv_obj.output_strs[i],
                         "meta_info": recv_obj.meta_info[i],
-                        "session_id": recv_obj.session_ids[i],
                     }
                 elif isinstance(recv_obj, BatchTokenIDOut):
                     out_dict = {
                         "token_ids": recv_obj.output_ids[i],
                         "meta_info": recv_obj.meta_info[i],
-                        "session_id": recv_obj.session_ids[i],
                     }
                 else:
                     assert isinstance(recv_obj, BatchEmbeddingOut)
