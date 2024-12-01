@@ -26,7 +26,6 @@ class TestMLA(unittest.TestCase):
                 "--trust-remote-code",
                 "--attention-backend",
                 "torch_native",
-                "--disable-cuda-graph",
             ],
         )
 
