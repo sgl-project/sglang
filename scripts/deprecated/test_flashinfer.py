@@ -4,7 +4,6 @@ from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
 )
-from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
 from sglang.srt.layers.attention.triton_ops.extend_attention import (
