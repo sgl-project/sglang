@@ -25,6 +25,7 @@ from interegular import InvalidSyntax
 from outlines.caching import cache as disk_cache
 
 try:
+    # outlines >= 0.1.0
     from outlines_core.fsm.outlines_core_rs import FSMInfo
     from outlines_core.fsm.regex import make_byte_level_fsm, make_deterministic_fsm
 except ImportError:
