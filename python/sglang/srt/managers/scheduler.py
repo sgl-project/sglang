@@ -1058,7 +1058,7 @@ class Scheduler:
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
-                    # chunked reqs' prefill is not finished
+                    # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
         self.stream_output(batch.reqs)
