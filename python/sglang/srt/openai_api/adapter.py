@@ -599,7 +599,6 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
             logprobs = True
         elif (not isinstance(request, list)) and request.logprobs is not None:
             logprobs = True
-        print(f"{logprobs=}")
         if logprobs:
             if echo:
                 input_token_logprobs = ret_item["meta_info"]["input_token_logprobs"]
