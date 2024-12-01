@@ -71,6 +71,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -84,6 +87,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_lens: [num_seqs]
             extend_prefix_lens: [num_seqs]
             extend_seq_lens: [num_seqs]
+            scaling: float or None
+            enable_gqa: bool
+            causal: bool
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -100,12 +106,21 @@ class TorchNativeAttnBackend(AttentionBackend):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
 
-            seq_len_q = extend_seq_lens[seq_idx]
+            extend_seq_len_q = extend_seq_lens[seq_idx]
+            prefill_seq_len_q = extend_prefix_lens[seq_idx]
+
             seq_len_kv = seq_lens[seq_idx]
-            end_q = start_q + seq_len_q
+            end_q = start_q + extend_seq_len_q
             end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
+            per_req_query_redudant = torch.empty(
+                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                dtype=per_req_query.dtype,
+                device=per_req_query.device,
+            )
+
+            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -114,17 +129,19 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out = (
+            per_req_out_redudant = (
                 scaled_dot_product_attention(
-                    per_req_query.unsqueeze(0),
+                    per_req_query_redudant.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    enable_gqa=True,
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
                 )
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -137,6 +154,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -148,6 +168,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             req_to_token: [max_num_reqs, max_context_len]
             req_pool_indices: [num_seqs]
             seq_lens: [num_seqs]
+            scaling: float or None
+            enable_gqa: bool
+            causal: bool
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -180,7 +203,9 @@ class TorchNativeAttnBackend(AttentionBackend):
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    enable_gqa=True,
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
                 )
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
@@ -202,6 +227,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             layer, forward_batch.out_cache_loc, k, v
         )
 
+        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
@@ -215,6 +242,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
+            scaling=layer.scaling,
+            enable_gqa=use_gqa,
+            causal=not layer.is_cross_attention,
         )
         return o
 
@@ -234,6 +264,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             layer, forward_batch.out_cache_loc, k, v
         )
 
+        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
@@ -245,6 +277,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
+            scaling=layer.scaling,
+            enable_gqa=use_gqa,
+            causal=False,
         )
 
         return o
