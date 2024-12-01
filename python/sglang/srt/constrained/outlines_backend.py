@@ -152,10 +152,11 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             raise ValueError(f"Invalid key_type: {key_type}")
 
         try:
-            # Prior to outlines 0.1.1, the RegexGuide class did not include the from_regex function.
             if hasattr(RegexGuide, "from_regex"):
+                # outlines >= 0.1.1
                 guide = RegexGuide.from_regex(regex, self.outlines_tokenizer)
             else:
+                # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
             logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
