@@ -966,7 +966,7 @@ class MllamaForConditionalGeneration(nn.Module):
             skip_cross_attention=skip_cross_attention,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.lm_head, forward_batch
+            input_ids, hidden_states, self.language_model.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
