@@ -1,5 +1,4 @@
 #include <torch/extension.h>
-#include <vector>
 
 torch::Tensor warp_reduce_cuda(torch::Tensor input);
 
