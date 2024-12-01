@@ -258,7 +258,6 @@ class LlamaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -306,12 +305,7 @@ class LlamaForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.torchao_config = global_server_args_dict["torchao_config"]
         self.model = LlamaModel(config, quant_config=quant_config)
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.stacked_params_mapping = [
@@ -335,7 +329,7 @@ class LlamaForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head.weight, forward_batch
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -379,6 +373,7 @@ class LlamaForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        embed_tokens_weight = None
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -389,6 +384,12 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+
+        load_tie_word_embeddings = (
+            hasattr(self.config, "tie_word_embeddings")
+            and self.config.tie_word_embeddings
+            and "lm_head.weight" in params_dict
+        )
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -421,6 +422,16 @@ class LlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+                if load_tie_word_embeddings and name == "model.embed_tokens.weight":
+                    embed_tokens_weight = loaded_weight
+
+        if load_tie_word_embeddings:
+            # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
+            param = self.lm_head.weight
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if embed_tokens_weight is not None:
+                weight_loader(param, embed_tokens_weight)
 
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
