@@ -464,10 +464,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
-            256,
+            self.qk_nope_head_dim + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
+            v_head_dim=self.v_head_dim,
         )
 
         self.w_kc = None
@@ -510,22 +511,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv_a = self.kv_a_layernorm(kv_a.contiguous())
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe
-        q = torch.nn.functional.pad(q, [0, 256 - self.qk_head_dim], value=0).view(
-            -1, self.num_local_heads * 256
-        )
-        k = torch.nn.functional.pad(k, [0, 256 - self.qk_head_dim], value=0).view(
-            -1, self.num_local_heads * 256
-        )
-        v = torch.nn.functional.pad(v, [0, 256 - self.v_head_dim], value=0).view(
-            -1, self.num_local_heads * 256
-        )
+
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
         latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
@@ -533,11 +527,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
-
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        attn_output = attn_output.view(-1, self.num_local_heads, 256)[
-            ..., : self.v_head_dim
-        ].reshape(-1, self.num_local_heads * self.v_head_dim)
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
 
