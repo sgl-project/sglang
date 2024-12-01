@@ -20,7 +20,6 @@ import random
 import tempfile
 from typing import List, Optional
 
-from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -205,12 +204,6 @@ class ServerArgs:
                 "Overlap schedule is disabled."
             )
 
-        # GGUF
-        if (
-            self.load_format == "auto" or self.load_format == "gguf"
-        ) and check_gguf_file(self.model_path):
-            self.quantization = self.load_format = "gguf"
-
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
@@ -250,7 +243,7 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
+            choices=["auto", "pt", "safetensors", "npcache", "dummy"],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -260,8 +253,7 @@ class ServerArgs:
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. ',
+            "which is mainly for profiling.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -301,7 +293,6 @@ class ServerArgs:
                 "gptq_marlin",
                 "awq_marlin",
                 "bitsandbytes",
-                "gguf",
             ],
             help="The quantization method.",
         )

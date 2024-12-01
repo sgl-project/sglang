@@ -339,7 +339,7 @@ class CohereForCausalLM(nn.Module):
             forward_batch,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens, forward_batch
+            input_ids, hidden_states, self.model.embed_tokens.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

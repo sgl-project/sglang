@@ -222,7 +222,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
     ):
         super().__init__()
-        self.quant_config = quant_config
 
         self.enable_tp = enable_tp
         if self.enable_tp:

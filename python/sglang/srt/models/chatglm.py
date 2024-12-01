@@ -378,7 +378,7 @@ class ChatGLMForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
