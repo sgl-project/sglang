@@ -20,6 +20,7 @@ import random
 import tempfile
 from typing import List, Optional
 
+from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -58,7 +59,7 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = 8192
+    chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
@@ -128,7 +129,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
-    cuda_graph_max_bs: int = 160
+    cuda_graph_max_bs: Optional[int] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -144,14 +145,15 @@ class ServerArgs:
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
-        if self.chunked_prefill_size <= 0:
-            # Disable chunked prefill
-            self.chunked_prefill_size = None
-
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        # Mem fraction depends on the tensor parallelism size
+        if is_hip():
+            gpu_mem = get_amdgpu_memory_capacity()
+        else:
+            gpu_mem = get_nvgpu_memory_capacity()
+
+        # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
@@ -164,17 +166,21 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        # Adjust for GPUs with small memory capacities
-        if is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        else:
-            gpu_mem = get_nvgpu_memory_capacity()
-        if gpu_mem < 25000:
-            self.chunked_prefill_size //= 4  # make it 2048
-            self.cuda_graph_max_bs = 4
-            logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
+        # Set chunked prefill size, which depends on the gpu memory capacity
+        if self.chunked_prefill_size is None:
+            if gpu_mem < 25_000:
+                self.chunked_prefill_size = 2048
+            else:
+                self.chunked_prefill_size = 8192
 
-        # Choose kernel backends
+        # Set cuda graph max batch size
+        if self.cuda_graph_max_bs is None:
+            if gpu_mem < 25_000:
+                self.cuda_graph_max_bs = 8
+            else:
+                self.cuda_graph_max_bs = 160
+
+        # Set kernel backends
         if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
@@ -198,6 +204,12 @@ class ServerArgs:
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap schedule is disabled."
             )
+
+        # GGUF
+        if (
+            self.load_format == "auto" or self.load_format == "gguf"
+        ) and check_gguf_file(self.model_path):
+            self.quantization = self.load_format = "gguf"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -238,7 +250,7 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy"],
+            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -248,7 +260,8 @@ class ServerArgs:
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling.",
+            "which is mainly for profiling."
+            '"gguf" will load the weights in the gguf format. ',
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -288,6 +301,7 @@ class ServerArgs:
                 "gptq_marlin",
                 "awq_marlin",
                 "bitsandbytes",
+                "gguf",
             ],
             help="The quantization method.",
         )

@@ -9,7 +9,7 @@ import unittest
 import requests
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,7 +29,7 @@ class TestSessionControl(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_session_control(self):
         chunks = [
@@ -191,7 +191,7 @@ class TestSessionControlVision(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_session_control(self):
         text_chunks = [
@@ -301,6 +301,8 @@ class TestSessionControlVision(unittest.TestCase):
         assert response["meta_info"]["finish_reason"]["type"] == "abort"
 
         # 2. not use session control
+        requests.post(self.base_url + "/flush_cache")
+
         input_ids_first_req = None
         input_ids = []
         outputs_normal = []

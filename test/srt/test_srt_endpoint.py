@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,7 +29,7 @@ class TestSRTEndpoint(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def run_decode(
         self,
@@ -219,9 +219,6 @@ class TestSRTEndpoint(unittest.TestCase):
 
         max_total_num_tokens = response_json["max_total_num_tokens"]
         self.assertIsInstance(max_total_num_tokens, int)
-
-        memory_pool_size = response_json["memory_pool_size"]
-        self.assertIsInstance(memory_pool_size, int)
 
         attention_backend = response_json["attention_backend"]
         self.assertIsInstance(attention_backend, str)

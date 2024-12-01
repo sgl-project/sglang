@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     is_hip,
+    monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
@@ -118,7 +119,7 @@ class ModelRunner:
             logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
-            server_args.chunked_prefill_size = None
+            server_args.chunked_prefill_size = -1
             self.mem_fraction_static *= 0.95
             # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
             if self.model_config.hf_config.architectures == [
@@ -148,12 +149,14 @@ class ModelRunner:
 
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
-        # Init components
+        # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        # Load the model
         self.sampler = Sampler()
         self.load_model()
 
-        # Apply torch TP if model supports it
+        # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
@@ -161,6 +164,7 @@ class ModelRunner:
         else:
             self.torch_tp_applied = False
 
+        # Init memory pool and attention backends
         if server_args.lora_paths is not None:
             self.init_lora_manager()
         self.init_memory_pool(
@@ -294,6 +298,8 @@ class ModelRunner:
             download_dir=self.server_args.download_dir,
         )
         monkey_patch_vllm_model_config()
+        if self.server_args.load_format == "gguf":
+            monkey_patch_vllm_gguf_config()
         self.vllm_model_config = VllmModelConfig(**self.get_model_config_params())
         if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
@@ -316,8 +322,8 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-    def update_weights(self, model_path: str, load_format: str):
-        """Update weights in-place."""
+    def update_weights_from_disk(self, model_path: str, load_format: str):
+        """Update engine weights online from disk."""
         from vllm.model_executor.model_loader.loader import (
             DefaultModelLoader,
             device_loading_context,
@@ -326,7 +332,7 @@ class ModelRunner:
         from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
         logger.info(
-            f"Update weights begin. "
+            f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
@@ -396,6 +402,23 @@ class ModelRunner:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100
+    ) -> Optional[torch.Tensor]:
+        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
+
+        Only used for unit test with an unoptimized performance.
+        For optimized performance, please use torch.save and torch.load.
+        """
+        # TODO: (chenyang) Add support for Qwen models.
+        try:
+            return self.model.get_weights_by_name(
+                name, truncate_size, tp_size=self.tp_size
+            )
+        except Exception as e:
+            logger.error(f"Error when getting parameter {name}: {e}")
+            return None
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
