@@ -35,9 +35,12 @@ jobs:
           cd test/lang
           python3 run_suite.py --suite minimal
 
-  unit-test-backend-part-1:
+  unit-test-backend-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
+    strategy:
+      matrix:
+        range: [0-6, 6-16, 16-24, 24-30, 30-100]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -50,60 +53,12 @@ jobs:
         timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 0 --range-end 6
+          RANGE=${{ matrix.range }}
+          range_begin=${RANGE%-*}
+          range_end=${RANGE#*-}
+          python3 run_suite.py --suite minimal --range-begin ${range_begin} --range-end ${range_end}
 
-  unit-test-backend-part-2:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 25
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 6 --range-end 15
-
-  unit-test-backend-part-3:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 25
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 15 --range-end 24
-
-  unit-test-backend-part-4:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 25
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 24
-
-  unit-test-backend-2-gpu-part-1:
+  unit-test-backend-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
     steps:
@@ -267,8 +222,7 @@ jobs:
 
   finish:
     needs: [
-      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3, unit-test-backend-part-4,
-      unit-test-backend-2-gpu-part-1,
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]
