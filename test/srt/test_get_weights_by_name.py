@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 from sglang.utils import terminate_process
 
 
-class TestGetParameterByName(unittest.TestCase):
+class TestGetWeightsByName(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

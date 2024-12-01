@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import make_layers
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +434,17 @@ class LlamaForCausalLM(nn.Module):
         For optimized performance, please use torch.save and torch.load.
         """
         try:
+            if name == "lm_head.weight" and self.config.tie_word_embeddings:
+                logger.info(
+                    "word embedding is tied for this model, return embed_tokens.weight as lm_head.weight."
+                )
+                return (
+                    self.model.embed_tokens.weight.cpu()
+                    .to(torch.float32)
+                    .numpy()
+                    .tolist()[:truncate_size]
+                )
+
             mapped_name = name
             mapped_shard_id = None
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
@@ -441,54 +453,48 @@ class LlamaForCausalLM(nn.Module):
                     mapped_shard_id = shard_id
                     break
             params_dict = dict(self.named_parameters())
-            if mapped_name in params_dict:
-                param = params_dict[mapped_name]
-                if mapped_shard_id is not None:
-                    if mapped_shard_id in ["q", "k", "v"]:
-                        num_heads = self.config.num_attention_heads // tp_size
-                        num_kv_heads = self.config.num_key_value_heads // tp_size
-                        head_dim = (
-                            self.config.hidden_size // self.config.num_attention_heads
-                        )
-                        if mapped_shard_id == "q":
-                            offset = 0
-                            size = num_heads * head_dim
-                        elif mapped_shard_id == "k":
-                            offset = num_heads * head_dim
-                            size = num_kv_heads * head_dim
-                        elif mapped_shard_id == "v":
-                            offset = (num_heads + num_kv_heads) * head_dim
-                            size = num_kv_heads * head_dim
-                        weight = param.data.narrow(0, offset, size)
-                    elif mapped_shard_id in [0, 1]:
-                        intermediate_size = self.config.intermediate_size
-                        hidden_size = self.config.hidden_size
-                        slice_size = intermediate_size // tp_size
-                        if mapped_shard_id == 0:  # gate_proj
-                            offset = 0
-                            size = slice_size
-                        elif mapped_shard_id == 1:  # up_proj
-                            offset = slice_size
-                            size = slice_size
+            param = params_dict[mapped_name]
+            if mapped_shard_id is not None:
+                if mapped_shard_id in ["q", "k", "v"]:
+                    num_heads = self.config.num_attention_heads // tp_size
+                    num_kv_heads = self.config.num_key_value_heads // tp_size
+                    head_dim = (
+                        self.config.hidden_size // self.config.num_attention_heads
+                    )
+                    if mapped_shard_id == "q":
+                        offset = 0
+                        size = num_heads * head_dim
+                    elif mapped_shard_id == "k":
+                        offset = num_heads * head_dim
+                        size = num_kv_heads * head_dim
+                    elif mapped_shard_id == "v":
+                        offset = (num_heads + num_kv_heads) * head_dim
+                        size = num_kv_heads * head_dim
+                    weight = param.data.narrow(0, offset, size)
+                elif mapped_shard_id in [0, 1]:
+                    intermediate_size = self.config.intermediate_size
+                    slice_size = intermediate_size // tp_size
+                    if mapped_shard_id == 0:  # gate_proj
+                        offset = 0
+                        size = slice_size
+                    elif mapped_shard_id == 1:  # up_proj
+                        offset = slice_size
+                        size = slice_size
 
-                        weight = param.data.narrow(0, offset, size)
-                    else:
-                        weight = param.data
+                    weight = param.data.narrow(0, offset, size)
                 else:
                     weight = param.data
-                if tp_size > 1 and ("o_proj" in name or "down_proj" in name):
-                    gathered_weights = [
-                        torch.zeros_like(weight) for _ in range(tp_size)
-                    ]
-                    torch.distributed.all_gather(gathered_weights, weight)
-                    weight = torch.cat(gathered_weights, dim=1)
-                return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
             else:
-                return None
+                weight = param.data
+            if tp_size > 1 and ("o_proj" in name or "down_proj" in name):
+                gathered_weights = [torch.zeros_like(weight) for _ in range(tp_size)]
+                torch.distributed.all_gather(gathered_weights, weight)
+                weight = torch.cat(gathered_weights, dim=1)
+            return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
 
-        except Exception as e:
+        except Exception:
             logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {e}"
+                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
             )
             return None
 
