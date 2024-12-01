@@ -1110,7 +1110,7 @@ def cuda_device_count_stateless() -> int:
     return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
 
 
-def should_use_tensor_cores(
+def should_use_tensor_core(
     kv_cache_dtype: torch.dtype,
     num_attention_heads: int,
     num_kv_heads: int,

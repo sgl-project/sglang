@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
-from sglang.srt.utils import should_use_tensor_cores
+from sglang.srt.utils import should_use_tensor_core
 
 flashinfer_prefill_wrapper = None
 flashinfer_decode_wrapper = None
@@ -196,7 +196,7 @@ def test_batch_decode_with_paged_kv_cache(
 
 
 def init_flashinfer(num_attention_heads, num_kv_heads):
-    use_tensor_cores = should_use_tensor_cores(
+    use_tensor_cores = should_use_tensor_core(
         torch.half, num_attention_heads, num_kv_heads
     )
 

@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
     get_bool_env_var,
     is_flashinfer_available,
-    should_use_tensor_cores,
+    should_use_tensor_core,
 )
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
-        self.decode_use_tensor_cores = should_use_tensor_cores(
+        self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
             // model_runner.tp_size,
