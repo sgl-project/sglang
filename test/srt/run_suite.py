@@ -36,7 +36,7 @@ suites = {
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",
-        "test_update_weights.py",
+        "test_update_weights_from_disk.py",
         "test_vision_openai_server.py",
         "test_session_control.py",
         "test_get_parameter_by_name.py",
