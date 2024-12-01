@@ -1132,6 +1132,7 @@ def should_use_tensor_cores(
         return env_override.lower() == "true"
 
     # Try to use _grouped_size_compiled_for_decode_kernels if available
+    # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
     try:
         from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
