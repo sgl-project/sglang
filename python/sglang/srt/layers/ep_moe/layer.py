@@ -59,7 +59,7 @@ class GroupedGemmRunner(torch.nn.Module):
         weight_column_major: bool,
         seg_indptr: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
-        enable_fp8: bool = False,
+        use_fp8_w8a8: bool = False,
         scale_a: torch.Tensor = None,
         scale_b: torch.Tensor = None,
     ):
@@ -85,7 +85,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 weight_column_major,
                 seg_indptr,
                 weight_indices,
-                enable_fp8,
+                use_fp8_w8a8,
                 scale_a,
                 scale_b,
             )
@@ -141,13 +141,13 @@ class EPMoE(torch.nn.Module):
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
-            self.enable_fp8 = False
+            self.use_fp8_w8a8 = False
             self.activation_scheme = None
         else:
             self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
                 quant_config
             )
-            self.enable_fp8 = True
+            self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
 
@@ -186,7 +186,7 @@ class EPMoE(torch.nn.Module):
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
             device=hidden_states.device,
-            dtype=self.fp8_dtype if self.enable_fp8 else hidden_states.dtype,
+            dtype=self.fp8_dtype if self.use_fp8_w8a8 else hidden_states.dtype,
         )
         if self.activation_scheme == "dynamic":
             max_value = (
@@ -232,7 +232,7 @@ class EPMoE(torch.nn.Module):
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
-            enable_fp8=self.enable_fp8,
+            use_fp8_w8a8=self.use_fp8_w8a8,
             scale_a=self.w13_input_scale,
             scale_b=self.w13_weight_scale,
         )
@@ -242,7 +242,7 @@ class EPMoE(torch.nn.Module):
             gateup_output.shape[0],
             gateup_output.shape[1] // 2,
             device=gateup_output.device,
-            dtype=self.fp8_dtype if self.enable_fp8 else hidden_states.dtype,
+            dtype=self.fp8_dtype if self.use_fp8_w8a8 else hidden_states.dtype,
         )
         if self.w2_input_scale is None:
             self.w2_input_scale = torch.ones(
@@ -276,7 +276,7 @@ class EPMoE(torch.nn.Module):
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
-            enable_fp8=self.enable_fp8,
+            use_fp8_w8a8=self.use_fp8_w8a8,
             scale_a=self.w2_input_scale,
             scale_b=self.w2_weight_scale,
         )
