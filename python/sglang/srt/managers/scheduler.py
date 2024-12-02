@@ -77,6 +77,8 @@ from sglang.srt.utils import (
 )
 from sglang.utils import get_exception_traceback
 
+MAX_SPLIT_PREFILL_SEQLEN = 8192
+
 logger = logging.getLogger(__name__)
 
 # Crash on warning if we are running CI tests
@@ -338,20 +340,58 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             self.update_split_prefill_batch()
+            self.update_running_batch()
 
             if not self.running_batch and not self.split_prefill_batch:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
                 continue
-            self.update_running_batch()
+
+            # process decode batch
             if self.running_batch and not self.running_batch.is_empty():
                 result = self.run_batch(self.running_batch)
                 self.process_batch_result(self.running_batch, result)
-            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
-                result = self.run_batch(self.split_prefill_batch)
-                if self.split_prefill_batch.split_prefill_finished:
-                    self.process_batch_result(self.split_prefill_batch, result)
 
+            # process prefill batch
+            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
+                for _ in range(max(1, MAX_SPLIT_PREFILL_SEQLEN // self.split_prefill_batch.split_prefill_seqlen)):
+                    result = self.run_batch(self.split_prefill_batch)
+                    if self.split_prefill_batch.split_prefill_finished:
+                        self.process_batch_result(self.split_prefill_batch, result)
+                        break
+
+    @torch.inference_mode()
+    def event_loop_pdmux_overlap(self):
+        decode_result_queue = deque()
+        prefill_result_queue = deque()
+        self.last_prefill_batch = None
+        self.last_decode_batch = None
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            self.update_split_prefill_batch()
+            self.update_running_batch()
+
+            if self.split_prefill_batch is None and self.running_batch is None and self.last_prefill_batch is None and self.last_decode_batch is None:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+                continue
+            if self.running_batch and not self.running_batch.is_empty():
+                decode_result = self.run_batch(self.running_batch)
+                decode_result_queue.append((self.running_batch.copy(), decode_result))
+            if self.last_decode_batch and not self.last_decode_batch.is_empty():
+                tmp_batch, tmp_result = decode_result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
+                prefill_result = self.run_batch(self.split_prefill_batch)
+                if self.split_prefill_batch.split_prefill_finished:
+                    prefill_result_queue.append((self.split_prefill_batch.copy(), prefill_result))
+            if self.last_prefill_batch and not self.last_prefill_batch.is_empty():
+                tmp_batch, tmp_result = prefill_result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            self.last_prefill_batch = self.split_prefill_batch
+            self.last_decode_batch = self.running_batch
 
 
     def recv_requests(self):
@@ -810,6 +850,7 @@ class Scheduler:
         )
         new_batch.prepare_for_extend()
         new_batch.prepare_for_split_prefill()
+        new_batch.split_prefill_seqlen = adder.log_input_tokens
 
         new_batch.decoding_reqs = None
 
@@ -824,7 +865,7 @@ class Scheduler:
             else:
                 self.running_batch = self.split_prefill_batch
             self.split_prefill_batch = None
-            # add new request
+        # add new request
         if not self.split_prefill_batch or self.split_prefill_batch.is_empty():
             batch = self.get_new_batch_split_prefill()
             if batch and not batch.is_empty():
@@ -1284,12 +1325,16 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send("ready")
-        if server_args.enable_overlap_schedule:
-            scheduler.event_loop_overlap()
-        elif server_args.pd_policy == "pdmux":
-            scheduler.event_loop_pdmux()
+        if server_args.pd_policy == "pdmux":
+            if server_args.enable_overlap_schedule:
+                scheduler.event_loop_pdmux_overlap()
+            else:
+                scheduler.event_loop_pdmux()
         else:
-            scheduler.event_loop_normal()
+            if server_args.enable_overlap_schedule:
+                scheduler.event_loop_overlap() 
+            else:
+                scheduler.event_loop_normal()
     except Exception:
         msg = get_exception_traceback()
         logger.error(msg)

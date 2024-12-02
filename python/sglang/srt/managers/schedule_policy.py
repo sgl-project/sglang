@@ -358,14 +358,14 @@ class SplitPrefillAdder:
         
 
     def _get_max_prefill_seqlen(self):
-        return 4096
+        return 819200
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
-            return AddReqResult.OTHER
+            return AddReqResult.DECODE_SLO_LIMIT
 
         return AddReqResult.CONTINUE
 
@@ -435,7 +435,7 @@ class SplitPrefillAdder:
             tokens_freed += tokens_occupied
         
         if req.extend_input_len > self.rem_input_tokens and len(self.can_run_list) != 0:
-            return AddReqResult.OTHER
+            return AddReqResult.DECODE_SLO_LIMIT
 
         self.can_run_list.append(req)
         self._prefill_one_req(
