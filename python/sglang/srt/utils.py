@@ -902,7 +902,7 @@ def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
         result = subprocess.run(
-            ["rocm-smi --showmeminfo vram | grep 'Total Memory' | awk '{print $NF}'"],
+            ["rocminfo | grep 'gfx94' -A 100 | grep 'Pool 1' -A 5 |  grep 'Size:' | awk '{print $2}'"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=True,
@@ -913,9 +913,8 @@ def get_amdgpu_memory_capacity():
 
         # Parse the output to extract memory values in MiB
         memory_values = [
-            float(mem) / 1024 / 1024
+            float(mem.split('(')[0].strip()) / 1024
             for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
         ]
 
         if not memory_values:
