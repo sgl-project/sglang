@@ -20,7 +20,14 @@ class TestEpMoE(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp", "2", "--trust-remote-code", "--enable-ep-moe"],
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--ep-size",
+                "2",
+                "--enable-ep-moe",
+            ],
         )
 
     @classmethod
@@ -62,9 +69,11 @@ class TestEpMoEFP8(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--trust-remote-code",
                 "--tp",
                 "2",
-                "--trust-remote-code",
+                "--ep-size",
+                "2",
                 "--enable-ep-moe",
                 "--quantization",
                 "fp8",
