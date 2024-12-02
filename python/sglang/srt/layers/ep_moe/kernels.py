@@ -64,10 +64,9 @@ def pre_reorder_triton_kernel(
     end_expert_id,
     topk,
     hidden_size,
+    BLOCK_SIZE: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
-
-    BLOCK_SIZE: tl.constexpr = 512
 
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk
@@ -101,11 +100,11 @@ def silu_and_mul_triton_kernel(
     scales,
     start_expert_id,
     end_expert_id,
+    BLOCK_SIZE: tl.constexpr,
 ):
     InDtype = gateup_output.dtype.element_ty
     OutDtype = down_input.dtype.element_ty
 
-    BLOCK_SIZE: tl.constexpr = 512
     half_hidden_size = hidden_size // 2
 
     pid = tl.program_id(0)
@@ -149,10 +148,9 @@ def post_reorder_triton_kernel(
     end_expert_id,
     topk,
     hidden_size,
+    BLOCK_SIZE: tl.constexpr,
 ):
     InDtype = down_output_ptr.dtype.element_ty
-
-    BLOCK_SIZE: tl.constexpr = 512
 
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk

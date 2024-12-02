@@ -211,6 +211,7 @@ class EPMoE(torch.nn.Module):
             self.end_expert_id,
             self.top_k,
             hidden_states.shape[1],
+            BLOCK_SIZE=512,
         )
 
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
@@ -261,6 +262,7 @@ class EPMoE(torch.nn.Module):
             self.w2_input_scale,
             self.start_expert_id,
             self.end_expert_id,
+            BLOCK_SIZE=512,
         )
 
         # GroupGemm-1
@@ -295,6 +297,7 @@ class EPMoE(torch.nn.Module):
             self.end_expert_id,
             self.top_k,
             hidden_states.size(1),
+            BLOCK_SIZE=512,
         )
         return output
 
