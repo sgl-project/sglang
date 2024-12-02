@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
@@ -218,6 +218,7 @@ def grouped_gemm_triton_kernel(
     seg_indptr,
     weight_indices,
     m_num_tiles_indptr,
+    use_fp8_w8a8,
     scale_a,
     scale_b,
     BLOCK_SIZE_M: tl.constexpr,
@@ -271,7 +272,7 @@ def grouped_gemm_triton_kernel(
         a_ptr += BLOCK_SIZE_K
         b_ptr += BLOCK_SIZE_K
 
-    if scale_a is not None and scale_b is not None:
+    if use_fp8_w8a8:
         scale_a_value = tl.load(scale_a + expert_id)
         scale_b_value = tl.load(scale_b + expert_id)
         accumulator *= scale_a_value * scale_b_value
@@ -303,12 +304,12 @@ def grouped_gemm_triton(
     weight_column_major: bool,
     seg_indptr: Optional[torch.Tensor] = None,
     weight_indices: Optional[torch.Tensor] = None,
-    enable_fp8: bool = False,
+    use_fp8_w8a8: bool = False,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
 ):
     assert weight_column_major == True  # TODO: more
-    if enable_fp8:
+    if use_fp8_w8a8:
         assert scale_a is not None and scale_b is not None
 
     BLOCK_SIZE_M = 128
@@ -333,6 +334,7 @@ def grouped_gemm_triton(
         seg_indptr,
         weight_indices,
         m_num_tiles_indptr,
+        use_fp8_w8a8,
         scale_a,
         scale_b,
         BLOCK_SIZE_M,
