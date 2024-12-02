@@ -1,3 +1,4 @@
+import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -7,21 +8,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    all_close_1d,
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
 )
-from vllm.model_executor.utils import set_weight_attrs
-from vllm.utils import print_warning_once
 
 from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.ep_moe.kernels import (
@@ -32,9 +24,14 @@ from sglang.srt.layers.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
 )
 from sglang.srt.layers.fused_moe_triton.fused_moe import fused_topk, grouped_topk
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.fused_moe_triton.layer import FusedMoEMethodBase
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.utils import is_hip, set_weight_attrs
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -82,25 +79,6 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
             )
-        # else:
-        #     assert weight_column_major == True
-        #     for bs in range(batch_size):
-        #         start_offset = seg_indptr[bs]
-        #         end_offset = seg_indptr[bs + 1]
-        #         if (end_offset - start_offset) <= 0:
-        #             continue
-        #         if enable_fp8:
-        #             c[start_offset:end_offset], _ = torch._scaled_mm(
-        #                 a[start_offset:end_offset],
-        #                 b[bs].T,
-        #                 out_dtype=c.dtype,
-        #                 scale_a=scale_a[bs],
-        #                 scale_b=scale_b[bs],
-        #             )
-        #         else:
-        #             c[start_offset:end_offset] = torch.matmul(
-        #                 a[start_offset:end_offset], b[bs].T
-        #             )
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(
@@ -664,35 +642,12 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         # MoE kernels require single activation scale and single weight
         # scale for w13 per expert.
         else:
-            # Fp8 moe kernels require a single activation scale.
-            # We take the max of all the scales in case they differ.
             if self.quant_config.activation_scheme == "static":
                 if layer.w13_input_scale is None or layer.w2_input_scale is None:
                     raise ValueError(
                         "QuantConfig has static quantization, but found "
                         "activation scales are None."
                     )
-                if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
-                    layer.w2_input_scale
-                ):
-                    print_warning_once(
-                        "Found input_scales that are not equal for "
-                        "fp8 MoE layer. Using the maximum across experts "
-                        "for each layer. "
-                    )
-                # layer.w13_input_scale = torch.nn.Parameter(
-                #     layer.w13_input_scale.max().repeat(layer.num_experts_per_partition),
-                #     requires_grad=False)
-                # layer.w2_input_scale = torch.nn.Parameter(
-                #     layer.w2_input_scale.max().repeat(layer.num_experts_per_partition),
-                #     requires_grad=False)
-
-                layer.w13_input_scale = torch.nn.Parameter(
-                    layer.w13_input_scale, requires_grad=False
-                )
-                layer.w2_input_scale = torch.nn.Parameter(
-                    layer.w2_input_scale, requires_grad=False
-                )
 
             # If rocm, normalize the weights and scales to e4m3fnuz
             if is_hip():

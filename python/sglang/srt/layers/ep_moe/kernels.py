@@ -1,11 +1,11 @@
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
-from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -41,11 +41,10 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
 
-    #
     compute_seg_indptr_triton_kernel[(num_experts,)](
         reorder_topk_ids, seg_indptr, topk_ids.numel()
     )
-    #
+
     BLOCK_SIZE = 512
     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
     compute_src2dst_triton_kernel[grid](
@@ -247,7 +246,6 @@ def grouped_gemm_triton_kernel(
     n_range_start = pid_n * BLOCK_SIZE_N
     n_range_end = min(n_range_start + BLOCK_SIZE_N, N)
 
-    #
     offs_am = tl.arange(0, BLOCK_SIZE_M)
     offs_bn = tl.arange(0, BLOCK_SIZE_N)
 
