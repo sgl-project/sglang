@@ -67,7 +67,7 @@ class TestGetWeightsByName(unittest.TestCase):
             terminate_process(self.process)
 
     def assert_tie_word_embeddings(self, truncate_size):
-        print(f"assert_tie_word_embeddings")
+        print("assert_tie_word_embeddings")
         if self.backend == "Engine":
             backend_ret = _process_return(
                 self.engine.get_weights_by_name("lm_head.weight", truncate_size)
@@ -79,7 +79,7 @@ class TestGetWeightsByName(unittest.TestCase):
                     json={"name": "lm_head.weight", "truncate_size": truncate_size},
                 ).json()
             )
-        print(f"assert_tie_word_embeddings of hf and backend")
+        print("assert_tie_word_embeddings of hf and backend")
         assert np.allclose(
             self.hf_model.get_parameter("model.embed_tokens.weight")
             .cpu()
