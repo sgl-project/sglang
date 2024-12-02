@@ -7,8 +7,6 @@ from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import make_layers
 
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -27,6 +25,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers
 
 
 @torch.jit.script
@@ -235,7 +235,6 @@ class Phi3SmallDecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -286,7 +285,6 @@ class Phi3SmallModel(nn.Module):
         super().__init__()
 
         self.config = config
-        cache_config = None
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
@@ -294,7 +292,7 @@ class Phi3SmallModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Phi3SmallDecoderLayer(
-                config, int(prefix.split(".")[-1]), cache_config, quant_config
+                config, int(prefix.split(".")[-1]), quant_config
             ),
             prefix=f"{prefix}.layers",
         )
@@ -339,7 +337,6 @@ class Phi3SmallForCausalLM(nn.Module):
         self,
         config: Phi3Config,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ):
 
         super().__init__()
