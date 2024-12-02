@@ -75,6 +75,8 @@ def get_config(
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
+        # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
+        setattr(config, "_name_or_path", model)
     if model_override_args:
         config.update(model_override_args)
 
