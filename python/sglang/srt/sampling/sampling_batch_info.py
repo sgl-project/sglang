@@ -30,6 +30,7 @@ class SamplingBatchInfo:
 
     # Dispatch in CUDA graph
     need_min_p_sampling: bool
+    need_top_n_sigma_sampling: bool
 
     # Bias Tensors
     vocab_size: int
@@ -81,6 +82,9 @@ class SamplingBatchInfo:
             min_ps=min_ps,
             top_n_sigmas=top_n_sigmas,
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            need_top_n_sigma_sampling=any(
+                r.sampling_params.top_n_sigma > 0 for r in reqs
+            ),
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             vocab_size=vocab_size,
             device=device,

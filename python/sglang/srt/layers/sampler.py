@@ -51,17 +51,9 @@ class Sampler(nn.Module):
             # Post process logits
             logits.div_(sampling_info.temperatures)
 
-            if any(sampling_info.top_n_sigmas > 0):
-                max_logit = torch.max(logits, dim=-1, keepdim=True).values
-                sigma = torch.std(logits, dim=-1, keepdim=True)
-                # Create mask and enable only for the requests that have top_n_sigma > 0
-                mask = (sampling_info.top_n_sigmas.view(-1, 1) <= 0) | (
-                    logits >= max_logit - sampling_info.top_n_sigmas.view(-1, 1) * sigma
-                )
-
-                # Apply mask
-                logits = torch.where(
-                    mask, logits, torch.tensor(float("-inf")).to(logits.device)
+            if sampling_info.need_top_n_sigma_sampling:
+                logits = apply_top_n_sigma_to_logits_torch(
+                    logits, sampling_info.top_n_sigmas
                 )
 
             probs = torch.softmax(logits, dim=-1)
@@ -127,3 +119,16 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     sampled_index = torch.multinomial(probs_sort, num_samples=1)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def apply_top_n_sigma_to_logits_torch(logits: torch.Tensor, top_n_sigmas: torch.Tensor):
+    max_logit = torch.max(logits, dim=-1, keepdim=True).values
+    sigma = torch.std(logits, dim=-1, keepdim=True)
+    # Create mask and enable only for the requests that have top_n_sigma > 0
+    mask = (top_n_sigmas.view(-1, 1) <= 0) | (
+        logits >= max_logit - top_n_sigmas.view(-1, 1) * sigma
+    )
+
+    # Apply mask
+    logits = torch.where(mask, logits, torch.tensor(float("-inf")).to(logits.device))
+    return logits
