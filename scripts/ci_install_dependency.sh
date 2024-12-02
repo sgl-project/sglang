@@ -19,3 +19,6 @@ pip install cutex
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
+
+# For router
+pip install sglang-router

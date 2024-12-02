@@ -41,6 +41,13 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
+   :caption: Native Router
+
+   router/router.ipynb
+
+
+.. toctree::
+   :maxdepth: 1
    :caption: References
 
    references/supported_models.md
