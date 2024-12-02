@@ -25,6 +25,7 @@ import torch
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
+    get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
@@ -155,6 +156,8 @@ class ServerArgs:
             gpu_mem = get_amdgpu_memory_capacity()
         elif torch.cuda.is_available():
             gpu_mem = get_nvgpu_memory_capacity()
+        elif self.device == "hpu":
+            gpu_mem = get_hpu_memory_capacity()
         else:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
@@ -187,6 +190,10 @@ class ServerArgs:
                 self.cuda_graph_max_bs = 160
 
         # Choose kernel backends
+        if self.device == "hpu":
+            self.attention_backend = "torch_native"
+            self.sampling_backend = "pytorch"
+
         if self.attention_backend is None:
             self.attention_backend = (
                 "flashinfer" if is_flashinfer_available() else "triton"

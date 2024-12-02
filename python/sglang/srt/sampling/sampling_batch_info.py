@@ -225,7 +225,8 @@ class SamplingBatchInfo:
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            setattr(self, item, torch.concat([self_val, other_val]))
+            merged_val = torch.concat([self_val.cpu(), other_val.cpu()])
+            setattr(self, item, merged_val.to("hpu"))
 
         self.is_all_greedy = self.is_all_greedy and other.is_all_greedy
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
