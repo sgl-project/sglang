@@ -218,16 +218,6 @@ class ModelRunner:
         )
         self.tp_group = get_tp_group()
 
-        # Currently, there is a bug with mulit-node tensor parallelsim + padded cuda graph,
-        # so we disable padding in cuda graph.
-        if self.device == "cuda" and not all(
-            in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)
-        ):
-            self.server_args.disable_cuda_graph_padding = True
-            logger.info(
-                "Setting disable_cuda_graph_padding to True because of multi-node tensor parallelism."
-            )
-
         # Check memory for tensor parallelism
         if self.tp_size > 1:
             local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
