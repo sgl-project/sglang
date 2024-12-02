@@ -903,7 +903,9 @@ def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
         result = subprocess.run(
-            ["rocminfo | grep 'gfx94' -A 100 | grep 'Pool 1' -A 5 |  grep 'Size:' | awk '{print $2}'"],
+            [
+                "rocminfo | grep 'gfx94' -A 100 | grep 'Pool 1' -A 5 |  grep 'Size:' | awk '{print $2}'"
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=True,
