@@ -48,6 +48,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -55,6 +57,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -456,6 +460,48 @@ class TokenizerManager:
         else:
             return False, "Another update is in progress. Please try again later."
 
+    async def init_weights_update_group(
+        self,
+        obj: InitWeightsUpdateGroupReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> bool:
+        if self.to_create_loop:
+            self.create_handle_loop()
+        self.send_to_scheduler.send_pyobj(obj)
+
+        self.init_weights_update_group_result = asyncio.Future()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for init parameter update group"
+        result = await self.init_weights_update_group_result
+        return result.success, result.message
+
+    async def update_weights_from_distributed(
+        self,
+        obj: UpdateWeightsFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        if not self.model_update_lock.locked():
+            async with self.model_update_lock:
+                self.send_to_scheduler.send_pyobj(obj)
+                self.parameter_update_result = asyncio.Future()
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be for update weights from distributed"
+                result = await self.parameter_update_result
+                return result.success, result.message
+        else:
+            logger.error(
+                f"Another parameter update is in progress in tokenizer manager"
+            )
+            return (
+                False,
+                "Another parameter update is in progress. Please try again later.",
+            )
+
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -546,7 +592,9 @@ class TokenizerManager:
                 BatchEmbeddingOut,
                 BatchTokenIDOut,
                 UpdateWeightFromDiskReqOutput,
+                UpdateWeightsFromDistributedReqOutput,
                 GetWeightsByNameReqOutput,
+                InitWeightsUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
@@ -558,6 +606,12 @@ class TokenizerManager:
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
                 continue
+            elif isinstance(recv_obj, UpdateWeightsFromDistributedReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for update weights from distributed"
+                self.parameter_update_result.set_result(recv_obj)
+                continue
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 if self.server_args.dp_size == 1:
                     self.get_weights_by_name_result.set_result(recv_obj)
@@ -567,6 +621,12 @@ class TokenizerManager:
                         self.get_weights_by_name_result.set_result(
                             self.get_weights_by_name_tmp
                         )
+                continue
+            elif isinstance(recv_obj, InitWeightsUpdateGroupReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for init parameter update group"
+                self.init_weights_update_group_result.set_result(recv_obj)
                 continue
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
