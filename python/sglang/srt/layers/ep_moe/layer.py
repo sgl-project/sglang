@@ -10,10 +10,6 @@ from vllm.distributed import (
 )
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    normalize_e4m3fn_to_e4m3fnuz,
-    per_tensor_dequantize,
-)
 
 from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.ep_moe.kernels import (
@@ -562,7 +558,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
 
         # WEIGHT_SCALES
         # Allocate 2 scales for w1 and w3 respectively.
-        # They will be combined to a single scale after weight loading.
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(num_experts_per_partition, 2, dtype=torch.float32),
             requires_grad=False,
@@ -619,8 +614,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
-            # Re-initialize w13_scale because we directly quantize
-            # merged w13 weights and generate a single scaling factor.
             layer.w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     layer.num_experts_per_partition,
@@ -651,58 +644,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                         "QuantConfig has static quantization, but found "
                         "activation scales are None."
                     )
-
-            # If rocm, normalize the weights and scales to e4m3fnuz
-            if is_hip():
-                # Normalize the weights and scales
-                w13_weight, w13_weight_scale, w13_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
-                    )
-                )
-                w2_weight, w2_weight_scale, w2_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
-                    )
-                )
-                # Reset the parameter
-                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-                layer.w13_weight_scale = torch.nn.Parameter(
-                    w13_weight_scale, requires_grad=False
-                )
-                if w13_input_scale is not None:
-                    layer.w13_input_scale = torch.nn.Parameter(
-                        w13_input_scale, requires_grad=False
-                    )
-                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-                layer.w2_weight_scale = torch.nn.Parameter(
-                    w2_weight_scale, requires_grad=False
-                )
-                if w2_input_scale is not None:
-                    layer.w2_input_scale = torch.nn.Parameter(
-                        w2_input_scale, requires_grad=False
-                    )
-
-            # Fp8 moe kernel needs single weight scale for w13 per expert.
-            # We take the max then dequant and requant each expert.
-            assert layer.w13_weight_scale is not None
-            shard_size = layer.intermediate_size
-            max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.num_experts_per_partition):
-                start = 0
-                for shard_id in range(2):
-                    dq_weight = per_tensor_dequantize(
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        layer.w13_weight_scale[expert_id][shard_id],
-                    )
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    )
-                    start += shard_size
-
-            layer.w13_weight_scale = torch.nn.Parameter(
-                max_w13_scales, requires_grad=False
-            )
             return
 
     def apply(
