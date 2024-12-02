@@ -25,7 +25,27 @@ setup(
                 ],
                 "cxx": ["-O3"],
             },
-        )
+        ),
+        CUDAExtension(
+            "sgl_kernel.ops.vllm_reduce_cuda",
+            [
+                "src/sgl-kernel/csrc/vllm_reduce.cc",
+                "src/sgl-kernel/csrc/vllm_reduce_kernel.cu",
+            ],
+            extra_compile_args={
+                "nvcc": [
+                    "-O3",
+                    "-Xcompiler",
+                    "-fPIC",
+                    "-gencode=arch=compute_75,code=sm_75",
+                    "-gencode=arch=compute_80,code=sm_80",
+                    "-gencode=arch=compute_89,code=sm_89",
+                    "-gencode=arch=compute_90,code=sm_90",
+                ],
+                "cxx": ["-O3"],
+            },
+            extra_link_args=["-lcuda"],
+        ),
     ],
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch"],

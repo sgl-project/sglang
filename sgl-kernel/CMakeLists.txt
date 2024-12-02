@@ -45,3 +45,22 @@ target_link_libraries(warp_reduce PRIVATE
 set_target_properties(warp_reduce PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
+
+add_library(vllm_reduce SHARED
+    src/sgl-kernel/csrc/vllm_reduce.cc
+    src/sgl-kernel/csrc/vllm_reduce_kernel.cu
+)
+
+target_include_directories(vllm_reduce PRIVATE
+    ${CUDA_INCLUDE_DIRS}
+    ${TORCH_INCLUDE_DIRS}
+)
+
+target_link_libraries(vllm_reduce PRIVATE
+    ${TORCH_LIBRARIES}
+    ${PYTHON_LIBRARIES}
+)
+
+set_target_properties(vllm_reduce PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
