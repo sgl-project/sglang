@@ -29,7 +29,6 @@ class Gemma2ForSequenceClassification(nn.Module):
         self,
         config: Gemma2Config,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
