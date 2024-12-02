@@ -121,13 +121,10 @@ class Qwen2VLConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.rope_scaling = rope_scaling
 
-        # NOTE: the following section from original transformers config
-        # for Qwen2-VL is commented out to address rope config loading issue
-        #
-        # if self.rope_scaling is not None and "type" in self.rope_scaling:
-        #     if self.rope_scaling["type"] == "mrope":
-        #         self.rope_scaling["type"] = "default"
-        #     self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        # rope_config_validation(self)
+        # NOTE(HandH1998): This is necessary for configuring the `rope_type`` of qwen2vl models after removing dependencies on vllm.
+        if self.rope_scaling is not None and "type" in self.rope_scaling:
+            if self.rope_scaling["type"] == "mrope":
+                self.rope_scaling["type"] = "default"
+            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)

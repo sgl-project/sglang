@@ -30,12 +30,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from vllm.config import CacheConfig, MultiModalConfig
 from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import QuickGELU
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
@@ -49,6 +47,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 
 logger = init_logger(__name__)
@@ -536,7 +535,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     def __init__(
         self,
         config: Qwen2VLConfig,
-        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()

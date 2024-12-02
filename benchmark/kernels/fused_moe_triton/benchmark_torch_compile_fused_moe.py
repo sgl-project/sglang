@@ -2,10 +2,10 @@ import argparse
 
 import torch
 import triton
+from torch.nn import functional as F
 from transformers import AutoConfig
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
-from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe as fused_moe_sglang
+from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe as fused_moe_triton
 
 
 def get_model_config(model_name: str, tp_size: int):
@@ -45,7 +45,56 @@ def get_model_config(model_name: str, tp_size: int):
     return shape_configs
 
 
-def fused_moe_vllm_api(
+def fused_topk_native(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    M, _ = hidden_states.shape
+    topk_weights = torch.empty(
+        M, topk, dtype=torch.float32, device=hidden_states.device
+    )
+    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+    topk_weights = F.softmax(gating_output.float(), dim=-1)
+    topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights, topk_ids
+
+
+@torch.compile
+def fused_moe_torch(
+    x,
+    w1,
+    w2,
+    input_gating,
+    topk,
+    use_fp8_w8a8=False,
+    w1_scale=None,
+    w2_scale=None,
+    a1_scale=None,
+    a2_scale=None,
+) -> torch.Tensor:
+    assert not use_fp8_w8a8, "Not supported"
+
+    topk_weights, topk_ids = fused_topk_native(
+        hidden_states=x,
+        gating_output=input_gating,
+        topk=topk,
+        renormalize=True,
+    )
+    w13_weights = w1[topk_ids]
+    w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
+    w2_weights = w2[topk_ids]
+    x1 = F.gelu(torch.einsum("ti,taoi -> tao", x, w1_weights))
+    x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
+    expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
+    return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
+
+
+def fused_moe_torch_compile(
     x,
     w1,
     w2,
@@ -57,14 +106,12 @@ def fused_moe_vllm_api(
     a1_scale=None,
     a2_scale=None,
 ):
-    return fused_moe_vllm(
+    return fused_moe_torch(
         x,
         w1,
         w2,
         input_gating,
         topk,
-        renormalize=True,
-        inplace=True,
         use_fp8_w8a8=use_fp8_w8a8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -85,7 +132,7 @@ def fused_moe_sglang_api(
     a1_scale=None,
     a2_scale=None,
 ):
-    return fused_moe_sglang(
+    return fused_moe_triton(
         x,
         w1,
         w2,
@@ -104,15 +151,15 @@ def fused_moe_sglang_api(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=list(range(1, 513)),
+        x_vals=list(range(1, 5)),
         line_arg="provider",
         line_vals=[
-            "vllm_fused_moe_triton",
-            "sglang_fused_moe_triton",
+            "fused_moe_triton",
+            "fused_moe_torch_compile",
         ],
         line_names=[
-            "vllm_fused_moe_triton",
-            "sglang_fused_moe_triton",
+            "fused_moe_triton",
+            "fused_moe_torch_compile",
         ],
         styles=[
             ("blue", "-"),
@@ -162,8 +209,8 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
 
     # Warmup
     api_func = (
-        fused_moe_vllm_api
-        if provider == "vllm_fused_moe_triton"
+        fused_moe_torch_compile
+        if provider == "fused_moe_torch_compile"
         else fused_moe_sglang_api
     )
     for _ in range(10):
@@ -210,7 +257,7 @@ def main():
     parser.add_argument(
         "--save-path",
         type=str,
-        default="./configs/benchmark_ops/vllm_sglang_fused_moe/",
+        default="./configs/benchmark_ops/fused_moe_torch_compile/",
     )
     args = parser.parse_args()
 
