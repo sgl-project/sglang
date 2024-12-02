@@ -358,7 +358,7 @@ class SplitPrefillAdder:
         
 
     def _get_max_prefill_seqlen(self):
-        return 819200
+        return 8192
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:

@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
+import csv
+
 import aiohttp
 import numpy as np
 import requests
@@ -609,6 +611,15 @@ def calculate_metrics(
         else:
             output_lens.append(0)
             retokenized_output_lens.append(0)
+    
+    with open(f"/home/ykchen/sglang/res/scheduler_metrics.csv", "a+") as f:
+        writer = csv.writer(f)
+        row = ['%.2f'%(np.mean(ttfts or 0)* 1000), '%.2f'%(np.percentile(ttfts or 0, 99) * 1000), '%.2f'%(np.mean(tpots or 0) * 1000), '%.2f'%(np.percentile(tpots or 0, 99) * 1000), '%.2f'%(np.mean(e2e_latencies) * 1000)]
+        for i in range(len(ttfts)):
+            row.append('%.2f'%(ttfts[i] * 1000))
+        for i in range(len(tpots)):
+            row.append('%.2f'%(tpots[i] * 1000))
+        writer.writerow(row)
 
     if completed == 0:
         warnings.warn(
