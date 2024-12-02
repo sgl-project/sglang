@@ -1153,6 +1153,14 @@ class Scheduler:
                 + 1 : len(req.fill_ids)
                 - req.last_update_decode_tokens
             ]
+
+            # Clip the padded hash values from image tokens.
+            # Otherwise, it will lead to detokenization errors.
+            input_token_ids = [
+                x if x < self.model_config.vocab_size - 1 else 0
+                for x in input_token_ids
+            ]
+
             req.input_token_logprobs = list(zip(input_token_logprobs, input_token_ids))
 
             if (
