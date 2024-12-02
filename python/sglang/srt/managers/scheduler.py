@@ -40,6 +40,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -47,6 +49,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -512,6 +516,19 @@ class Scheduler:
                 success, message = self.update_weights_from_disk(recv_req)
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightFromDiskReqOutput(success, message)
+                )
+            elif isinstance(recv_req, GetWeightsByNameReqInput):
+                parameter = self.get_weights_by_name(recv_req)
+                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
+                success, message = self.init_weights_update_group(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    InitWeightsUpdateGroupReqOutput(success, message)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+                success, message = self.update_weights_from_distributed(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightsFromDistributedReqOutput(success, message)
                 )
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
@@ -1153,6 +1170,14 @@ class Scheduler:
                 + 1 : len(req.fill_ids)
                 - req.last_update_decode_tokens
             ]
+
+            # Clip the padded hash values from image tokens.
+            # Otherwise, it will lead to detokenization errors.
+            input_token_ids = [
+                x if x < self.model_config.vocab_size - 1 else 0
+                for x in input_token_ids
+            ]
+
             req.input_token_logprobs = list(zip(input_token_logprobs, input_token_ids))
 
             if (
@@ -1371,6 +1396,23 @@ class Scheduler:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        return success, message
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        """Initialize the online model parameter update group."""
+        success, message = self.tp_worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        """Update the online model parameter."""
+        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
