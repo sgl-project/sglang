@@ -397,10 +397,13 @@ class Phi3SmallForCausalLM(nn.Module):
 
     def compute_logits(
         self,
+        input_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         sampling_metadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        logits = self.logits_processor(
+            input_ids, self.lm_head, hidden_states, sampling_metadata
+        )
         if self.dummy_token_indices is not None and logits is not None:
             logits.index_fill_(-1, self.dummy_token_indices, -torch.inf)
         return logits
@@ -422,7 +425,7 @@ class Phi3SmallForCausalLM(nn.Module):
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head.weight, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
 
         else:

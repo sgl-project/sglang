@@ -131,6 +131,7 @@ class LlavaImageProcessor(BaseImageProcessor):
         if not image_data:
             return None
 
+        modalities = request_obj.modalities or ["image"]
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
             self.hf_config.image_grid_pinpoints
@@ -139,9 +140,12 @@ class LlavaImageProcessor(BaseImageProcessor):
             else None
         )
 
+        if isinstance(image_data, str):
+            image_data = [image_data]
+
         if isinstance(image_data, list) and len(image_data) > 0:
-            # Multiple images
-            if len(image_data) > 1:
+            if "multi-images" in modalities or "video" in modalities:
+                # Multiple images
                 aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
                 pixel_values, image_hashes, image_sizes = [], [], []
                 res = []
@@ -166,13 +170,6 @@ class LlavaImageProcessor(BaseImageProcessor):
                 )
                 image_hashes = [image_hash]
                 image_sizes = [image_size]
-        elif isinstance(image_data, str):
-            # A single image
-            pixel_values, image_hash, image_size = await self._process_single_image(
-                image_data, aspect_ratio, grid_pinpoints
-            )
-            image_hashes = [image_hash]
-            image_sizes = [image_size]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
 
@@ -341,7 +338,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             "pixel_values": pixel_values,
             "image_hashes": image_hashes,
             "image_sizes": image_sizes,
-            "modalities": request_obj.modalities,
+            "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": image_grid_thws,
         }
 

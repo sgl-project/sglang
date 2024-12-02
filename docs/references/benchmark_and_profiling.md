@@ -56,3 +56,22 @@ with nvtx.annotate("description", color="color"):
 ## Other tips
 
 1. You can benchmark a model using dummy weights by only providing the config.json file. This allows for quick testing of model variants without training. To do so, add `--load-format dummy` to the above commands and then you only need a correct `config.json` under the checkpoint folder.
+
+## Profile with PyTorch Profiler
+- To profile a server
+```bash
+# set trace path
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+# start server
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
+
+python -m sglang.bench_serving --backend sglang --model-path meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile
+```
+
+Traces can be visualized using https://ui.perfetto.dev/.
+
+- To profile offline
+```bash
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
+```

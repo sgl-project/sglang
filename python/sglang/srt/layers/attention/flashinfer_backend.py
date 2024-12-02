@@ -18,7 +18,7 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import get_bool_env_var, is_flashinfer_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -47,8 +47,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Parse constants
         if "SGLANG_FLASHINFER_USE_TENSOR_CORE" in os.environ:
-            self.decode_use_tensor_cores = (
-                os.environ["SGLANG_FLASHINFER_USE_TENSOR_CORE"].lower() == "true"
+            self.decode_use_tensor_cores = get_bool_env_var(
+                "SGLANG_FLASHINFER_USE_TENSOR_CORE"
             )
         else:
             if not _grouped_size_compiled_for_decode_kernels(

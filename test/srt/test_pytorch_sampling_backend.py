@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -27,7 +27,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -51,7 +51,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             response_single = requests.post(
                 self.base_url + "/generate",
                 json={
-                    "text": "The capital of France is",
+                    "text": "The capital of Germany is",
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": 32,
@@ -69,7 +69,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
         response_batch = requests.post(
             self.base_url + "/generate",
             json={
-                "text": ["The capital of France is"] * 10,
+                "text": ["The capital of Germany is"] * 10,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 32,

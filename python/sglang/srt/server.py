@@ -23,6 +23,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import signal
 import threading
 import time
 from http import HTTPStatus
@@ -51,8 +52,9 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetWeightsByNameReqInput,
     OpenSessionReqInput,
-    UpdateWeightReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -79,19 +81,20 @@ from sglang.srt.utils import (
     configure_logger,
     delete_directory,
     is_port_available,
-    kill_child_process,
+    kill_process_tree,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
+from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-
+# Fast API
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -102,7 +105,7 @@ app.add_middleware(
 )
 
 tokenizer_manager: TokenizerManager = None
-_max_total_num_tokens = None
+scheduler_info: Dict = None
 
 ##### Native API endpoints #####
 
@@ -170,7 +173,7 @@ async def flush_cache():
 
 @app.get("/start_profile")
 @app.post("/start_profile")
-async def start_profile():
+async def start_profile_async():
     """Start profiling."""
     tokenizer_manager.start_profile()
     return Response(
@@ -181,7 +184,7 @@ async def start_profile():
 
 @app.get("/stop_profile")
 @app.post("/stop_profile")
-async def stop_profile():
+async def stop_profile_async():
     """Stop profiling."""
     tokenizer_manager.stop_profile()
     return Response(
@@ -190,11 +193,11 @@ async def stop_profile():
     )
 
 
-@app.post("/update_weights")
+@app.post("/update_weights_from_disk")
 @time_func_latency
-async def update_weights(obj: UpdateWeightReqInput, request: Request):
-    """Update the weights inplace without re-launching the server."""
-    success, message = await tokenizer_manager.update_weights(obj, request)
+async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
+    """Update the weights from disk inplace without re-launching the server."""
+    success, message = await tokenizer_manager.update_weights_from_disk(obj, request)
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(
@@ -205,6 +208,24 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         return ORJSONResponse(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.api_route("/get_weights_by_name", methods=["GET", "POST"])
+async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+    """Get model parameter by name."""
+    try:
+        ret = await tokenizer_manager.get_weights_by_name(obj, request)
+        if ret is None:
+            return ORJSONResponse(
+                {"error": {"message": "Get parameter by name failed"}},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        else:
+            return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 
 
@@ -232,6 +253,8 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         )
 
 
+# fastapi implicitly converts json in the request to obj (dataclass)
+@app.api_route("/generate", methods=["POST", "PUT"])
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
@@ -265,11 +288,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             )
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
-app.post("/generate")(generate_request)
-app.put("/generate")(generate_request)
+@time_func_latency
+async def get_weights_by_name_request(obj: GetWeightsByNameReqInput, request: Request):
+    """Handle a get parameter by name request."""
+    try:
+        ret = await tokenizer_manager.get_weights_by_name(obj, request)
+        return ret
+    except ValueError as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
+@app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
@@ -282,10 +313,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         )
 
 
-app.post("/encode")(encode_request)
-app.put("/encode")(encode_request)
-
-
+@app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
@@ -296,10 +324,6 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
-
-
-app.post("/classify")(classify_request)
-app.put("/classify")(classify_request)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -379,11 +403,11 @@ def launch_engine(
     server_args: ServerArgs,
 ):
     """
-    Launch the Tokenizer Manager in the main process, the Scheduler in a subprocess, and the Detokenizer Manager in another subprocess.
+    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
 
     global tokenizer_manager
-    global _max_total_num_tokens
+    global scheduler_info
 
     # Configure global environment
     configure_logger(server_args)
@@ -449,20 +473,19 @@ def launch_engine(
     if server_args.chat_template:
         load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
-    # Wait for model to finish loading & get max token nums
-    scheduler_info = []
+    # Wait for model to finish loading
+    scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
         data = scheduler_pipe_readers[i].recv()
 
         if data["status"] != "ready":
-            self.shutdown()
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
-        scheduler_info.append(data)
+        scheduler_infos.append(data)
 
     # Assume all schedulers have same max_total_num_tokens
-    _max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
+    scheduler_info = scheduler_infos[0]
 
 
 def launch_server(
@@ -476,12 +499,12 @@ def launch_server(
 
     1. HTTP server: A FastAPI server that routes requests to the engine.
     2. SRT engine:
-        1. Tokenizer Manager: Tokenizes the requests and sends them to the scheduler.
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
         2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. Detokenizer Manager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server and Tokenizer Manager both run in the main process.
+    1. The HTTP server and TokenizerManager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
     launch_engine(server_args=server_args)
@@ -490,7 +513,7 @@ def launch_server(
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
 
-    # add prometheus middleware
+    # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
@@ -502,7 +525,7 @@ def launch_server(
     t.start()
 
     try:
-        # Listen for HTTP requests
+        # Update logging configs
         LOGGING_CONFIG["formatters"]["default"][
             "fmt"
         ] = "[%(asctime)s] %(levelprefix)s %(message)s"
@@ -511,6 +534,8 @@ def launch_server(
             "fmt"
         ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+        # Listen for HTTP requests
         uvicorn.run(
             app,
             host=server_args.host,
@@ -526,8 +551,8 @@ def launch_server(
 async def _get_server_info():
     return {
         **dataclasses.asdict(tokenizer_manager.server_args),  # server args
-        "memory_pool_size": await tokenizer_manager.get_memory_pool_size(),  # memory pool size
-        "max_total_num_tokens": _max_total_num_tokens,  # max total num tokens
+        **scheduler_info,
+        "version": __version__,
     }
 
 
@@ -561,6 +586,15 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
+    # Register the signal handler.
+    # The child processes will send SIGQUIT to this process when any error happens
+    # This process then clean up the whole process tree
+    def sigquit_handler(signum, frame):
+        kill_process_tree(os.getpid())
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
+
+    # Set mp start method
     mp.set_start_method("spawn", force=True)
 
 
@@ -587,7 +621,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid())
         return
 
     model_info = res.json()
@@ -620,9 +654,10 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid())
         return
 
+    # Debug print
     # logger.info(f"{res.json()=}")
 
     logger.info("The server is fired up and ready to roll!")
@@ -689,7 +724,7 @@ class Runtime:
 
     def shutdown(self):
         if self.pid is not None:
-            kill_child_process(self.pid, include_self=True)
+            kill_process_tree(self.pid)
             self.pid = None
 
     def cache_prefix(self, prefix: str):
@@ -799,18 +834,11 @@ class Engine:
     launching the HTTP server adds unnecessary complexity or overhead,
     """
 
-    def __init__(self, *args, **kwargs):
-
+    def __init__(self, log_level: str = "error", *args, **kwargs):
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
 
-        # runtime server default log level is log
-        # offline engine works in scripts, so we set it to error
-
-        if "log_level" not in kwargs:
-            kwargs["log_level"] = "error"
-
-        server_args = ServerArgs(*args, **kwargs)
+        server_args = ServerArgs(*args, log_level=log_level, **kwargs)
         launch_engine(server_args=server_args)
 
     def generate(
@@ -913,7 +941,7 @@ class Engine:
             return ret
 
     def shutdown(self):
-        kill_child_process()
+        kill_process_tree(os.getpid(), include_parent=False)
 
     def get_tokenizer(self):
         global tokenizer_manager
@@ -933,5 +961,16 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
 
+    def start_profile(self):
+        tokenizer_manager.start_profile()
+
+    def stop_profile(self):
+        tokenizer_manager.stop_profile()
+
     async def get_server_info(self):
         return await _get_server_info()
+
+    def get_weights_by_name(self, name, truncate_size=100):
+        obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(get_weights_by_name_request(obj, None))

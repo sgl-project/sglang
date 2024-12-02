@@ -1,14 +1,13 @@
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use rand::distributions::{Alphanumeric, DistString};
-use rand::thread_rng;
-use std::cmp::min;
+use log::info;
+
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::thread;
+
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -247,6 +246,7 @@ impl Tree {
         }
     }
 
+    #[allow(unused_assignments)]
     pub fn prefix_match(&self, text: &str) -> (String, String) {
         let mut curr = Arc::clone(&self.root);
         let mut curr_idx = 0;
@@ -316,6 +316,7 @@ impl Tree {
         (ret_text, tenant)
     }
 
+    #[allow(unused_assignments)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
         let mut curr = Arc::clone(&self.root);
         let mut curr_idx = 0;
@@ -434,9 +435,9 @@ impl Tree {
             }
         }
 
-        println!("Before eviction - Used size per tenant:");
+        info!("Before eviction - Used size per tenant:");
         for (tenant, size) in &used_size_per_tenant {
-            println!("Tenant: {}, Size: {}", tenant, size);
+            info!("Tenant: {}, Size: {}", tenant, size);
         }
 
         // Process eviction
@@ -490,9 +491,9 @@ impl Tree {
             }
         }
 
-        println!("\nAfter eviction - Used size per tenant:");
+        info!("After eviction - Used size per tenant:");
         for (tenant, size) in &used_size_per_tenant {
-            println!("Tenant: {}, Size: {}", tenant, size);
+            info!("Tenant: {}, Size: {}", tenant, size);
         }
     }
 
@@ -631,9 +632,12 @@ impl Tree {
 //  Unit tests
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
+    use rand::distributions::Alphanumeric;
+    use rand::distributions::DistString;
+    use rand::thread_rng;
     use rand::Rng;
+    use std::thread;
+    use std::time::Instant;
 
     use super::*;
 
@@ -655,7 +659,7 @@ mod tests {
         assert_eq!(
             tree.get_smallest_tenant(),
             "tenant2",
-            "Expected tenant2 to be smallest with 3 characters"
+            "Expected tenant2 to be smallest with 3 characters."
         );
 
         // Insert overlapping data for tenant3 and tenant4 to test equal counts
@@ -1025,7 +1029,7 @@ mod tests {
             let text = prefix[i];
 
             let handle = thread::spawn(move || {
-                let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
+                let (_matched_text, _matched_tenant) = tree_clone.prefix_match(text);
             });
 
             handles.push(handle);
@@ -1168,7 +1172,7 @@ mod tests {
         let prefixes = vec!["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
 
         // Insert strings with shared prefixes
-        for i in 0..100 {
+        for _i in 0..100 {
             for (j, prefix) in prefixes.iter().enumerate() {
                 let random_suffix = random_string(10);
                 let text = format!("{}{}", prefix, random_suffix);
@@ -1233,7 +1237,7 @@ mod tests {
                         // Perform match operation
                         let random_len = rng.gen_range(3..10);
                         let search_str = format!("{}{}", prefix, random_string(random_len));
-                        let (matched, _) = tree.prefix_match(&search_str);
+                        let (_matched, _) = tree.prefix_match(&search_str);
                     } else {
                         // Perform insert operation
                         let random_len = rng.gen_range(5..15);
