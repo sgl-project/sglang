@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchCompile(unittest.TestCase):
+class TestTorchCompileMoe(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
@@ -23,7 +23,7 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "1"],
+            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "4"],
         )
 
     @classmethod

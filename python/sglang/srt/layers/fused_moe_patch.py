@@ -118,7 +118,8 @@ def fused_moe_forward_native(
     w13_weights = layer.w13_weight[topk_ids]
     w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     w2_weights = layer.w2_weight[topk_ids]
-    x1 = F.silu(torch.einsum("ti,taoi -> tao", x, w1_weights))
+    x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
+    x1 = F.silu(x1)
     x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
     return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
