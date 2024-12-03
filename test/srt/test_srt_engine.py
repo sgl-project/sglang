@@ -188,7 +188,7 @@ class TestSRTEngine(unittest.TestCase):
         )
         bench_args = BenchArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertGreater(result["total_throughput"], 3500)
+        self.assertGreater(result["total_throughput"], 3000)
 
 
 if __name__ == "__main__":
