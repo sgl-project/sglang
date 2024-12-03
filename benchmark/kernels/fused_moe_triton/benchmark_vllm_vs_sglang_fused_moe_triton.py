@@ -8,15 +8,10 @@ from torch.nn import init
 from torch.nn.parameter import Parameter
 from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    get_moe_configs as get_moe_configs_vllm,
-)
 from vllm.utils import FlexibleArgumentParser
 
 from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe as fused_moe_sglang
-from sglang.srt.layers.fused_moe_triton.fused_moe import (
-    get_moe_configs as get_moe_configs_sglang,
-)
+from sglang.srt.layers.fused_moe_triton.fused_moe_splitk import fused_moe as fused_moe_splitk
 
 
 def get_model_config(model_name: str, tp_size: int):
@@ -110,6 +105,34 @@ def fused_moe_sglang_api(
     )
 
 
+def fused_moe_sglang_splitk_api(
+    x,
+    w1,
+    w2,
+    input_gating,
+    topk,
+    use_fp8_w8a8=False,
+    w1_scale=None,
+    w2_scale=None,
+    a1_scale=None,
+    a2_scale=None,
+):
+    return fused_moe_splitk(
+        x,
+        w1,
+        w2,
+        input_gating,
+        topk,
+        renormalize=True,
+        inplace=True,
+        use_fp8_w8a8=use_fp8_w8a8,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+    )
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
@@ -118,14 +141,17 @@ def fused_moe_sglang_api(
         line_vals=[
             "vllm_fused_moe_triton",
             "sglang_fused_moe_triton",
+            "sglang_fused_moe_splitk_triton",
         ],
         line_names=[
             "vllm_fused_moe_triton",
             "sglang_fused_moe_triton",
+            "sglang_fused_moe_splitk_triton",
         ],
         styles=[
             ("blue", "-"),
             ("green", "-"),
+            ("red", "-"),
         ],
         ylabel="Time (ms)",
         plot_name="fused-moe-performance",
@@ -170,11 +196,13 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
     input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
 
     # Warmup
-    api_func = (
-        fused_moe_vllm_api
-        if provider == "vllm_fused_moe_triton"
-        else fused_moe_sglang_api
-    )
+    if provider == "vllm_fused_moe_triton":
+        api_func = fused_moe_vllm_api
+    elif provider == "sglang_fused_moe_triton":
+        api_func = fused_moe_sglang_api
+    else:  # sglang_fused_moe_splitk_triton
+        api_func = fused_moe_sglang_splitk_api
+
     for _ in range(10):
         y = api_func(
             x,

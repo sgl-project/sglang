@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import os
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -20,7 +21,10 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import set_weight_attrs
 
 if torch.cuda.is_available() or torch.hip.is_available():
-    from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
+    if os.environ.get("SGLANG_FUSED_MOE_BACKEND") == "GEMM_SPLITK":
+        from sglang.srt.layers.fused_moe_triton.fused_moe_splitk import fused_experts
+    else:
+        from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
 else:
     fused_experts = None  # type: ignore
 
@@ -514,10 +518,16 @@ class FusedMoE(torch.nn.Module):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ):
-        from sglang.srt.layers.fused_moe_triton.fused_moe import (
-            fused_topk,
+        if os.environ.get("SGLANG_FUSED_MOE_BACKEND") == "GEMM_SPLITK":
+            from sglang.srt.layers.fused_moe_triton.fused_moe_splitk import (
+                fused_topk,
+                grouped_topk,
+            )
+        else:
+            from sglang.srt.layers.fused_moe_triton.fused_moe import (
+                fused_topk,
             grouped_topk,
-        )
+            )
 
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:

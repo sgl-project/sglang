@@ -23,6 +23,8 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
 
 After tuning, a configuration file (e.g., `E=64,N=640,device_name=NVIDIA_GeForce_RTX_4090,dtype=fp8_w8a8.json`) will be generated in the current directory. You can move this file to `sglang/srt/layers/fused_moe_triton/configs/` to use it in `sglang`.
 
+- `tuning_fused_moe_triton_splitk.py`: A tool for tuning the `fused_moe_triton_splitk` kernel. It is the same as `tuning_fused_moe_triton.py`, but the json file generated has a suffix `splitk` which is used by the `fused_moe_triton_splitk` kernel.
+
 ### Performance Comparison Tool
 
 - `benchmark_vllm_vs_sglang_fused_moe_triton.py`: A tool for comparing the performance of fused MoE kernels between vllm and sglang implementations. Supports various model architectures and data types.

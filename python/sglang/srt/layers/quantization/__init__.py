@@ -67,7 +67,10 @@ def fp8_moe_apply(
 ) -> torch.Tensor:
     """Enhanced apply method for FP8 MoE."""
     from sglang.srt.layers.fused_moe_triton import FusedMoE
-    from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
+    if os.environ.get("SGLANG_FUSED_MOE_BACKEND") == "GEMM_SPLITK":
+        from sglang.srt.layers.fused_moe_triton.fused_moe_splitk import fused_experts
+    else:
+        from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
 
     # Expert selection
     topk_weights, topk_ids = FusedMoE.select_experts(
