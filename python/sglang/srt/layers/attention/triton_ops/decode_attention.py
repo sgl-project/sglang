@@ -275,10 +275,10 @@ def _decode_softmax_reducev_fwd(
 def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
+    V_Buffer,
     sm_scale,
     Req_to_tokens,
     B_req_idx,
-    B_Start_Loc,
     B_Seqlen,
     Att_Out,
     stride_req_to_tokens_b,
@@ -286,23 +286,27 @@ def _fwd_grouped_kernel_stage1(
     stride_qh,
     stride_buf_kbs,
     stride_buf_kh,
-    att_stride_h,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
     SPLIT_K: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
+    Lv: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_k_id = tl.program_id(2)
-
-    reduce_dtype = Att_Out.dtype.element_ty
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -313,35 +317,37 @@ def _fwd_grouped_kernel_stage1(
     mask_h = mask_h & (cur_head < q_head_num)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
-    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
 
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
-    q = tl.load(
-        Q + offs_q, mask=(mask_h[:, None]) & (offs_d[None, :] < Lk), other=0.0
-    ).to(reduce_dtype)
+    q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (offs_d[None, :] < Lk), other=0.0)
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         off_qpe = (
             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
         )
-        qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0).to(reduce_dtype)
+        qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0)
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, SPLIT_K)
     split_k_start = kv_len_per_split * split_k_id
     split_k_end = tl.minimum(split_k_start + kv_len_per_split, cur_batch_seq_len)
 
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
     for start_n in range(split_k_start, split_k_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        k_loc = tl.load(
+        kv_loc = tl.load(
             Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n,
             mask=offs_n < split_k_end,
             other=0,
         )
         offs_buf_k = (
-            k_loc[None, :] * stride_buf_kbs
+            kv_loc[None, :] * stride_buf_kbs
             + cur_kv_head * stride_buf_kh
             + offs_d[:, None]
         )
@@ -349,11 +355,11 @@ def _fwd_grouped_kernel_stage1(
             K_Buffer + offs_buf_k,
             mask=(offs_n[None, :] < split_k_end) & (offs_d[:, None] < Lk),
             other=0.0,
-        ).to(reduce_dtype)
+        )
         qk = tl.dot(q, k)
         if BLOCK_DPE > 0:
             offs_buf_kpe = (
-                k_loc[None, :] * stride_buf_kbs
+                kv_loc[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
                 + offs_dpe[:, None]
             )
@@ -361,116 +367,111 @@ def _fwd_grouped_kernel_stage1(
                 K_Buffer + offs_buf_kpe,
                 mask=offs_n[None, :] < split_k_end,
                 other=0.0,
-            ).to(reduce_dtype)
+            )
             qk += tl.dot(qpe, kpe)
         qk *= sm_scale
 
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        offs_o = cur_head[:, None] * att_stride_h + (
-            cur_batch_in_all_start_index + offs_n[None, :]
+        qk = tl.where(
+            mask_h[:, None] & (offs_n[None, :] < split_k_end), qk, float("-inf")
         )
 
-        tl.store(
-            Att_Out + offs_o,
-            qk,
-            mask=mask_h[:, None] & (offs_n[None, :] < split_k_end),
+        offs_buf_v = (
+            kv_loc[:, None] * stride_buf_vbs
+            + cur_kv_head * stride_buf_vh
+            + offs_dv[None, :]
         )
+        v = tl.load(
+            V_Buffer + offs_buf_v,
+            mask=(offs_n[:, None] < split_k_end) & (offs_dv[None, :] < Lv),
+            other=0.0,
+        )
+
+        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        acc *= re_scale[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+        e_max = n_e_max
+
+    offs_mid_o = (
+        cur_batch * stride_mid_ob
+        + cur_head[:, None] * stride_mid_oh
+        + split_k_id * stride_mid_os
+        + offs_dv[None, :]
+    )
+
+    tl.store(
+        Att_Out + offs_mid_o,
+        acc / e_sum[:, None],
+        mask=mask_h[:, None],
+    )
+
+    offs_mid_o_1 = (
+        cur_batch * stride_mid_ob
+        + cur_head * stride_mid_oh
+        + split_k_id * stride_mid_os
+        + BLOCK_DV
+    )
+
+    tl.store(
+        Att_Out + offs_mid_o_1,
+        e_max + tl.log(e_sum),
+        mask=mask_h,
+    )
 
 
 @triton.jit
 def _fwd_grouped_kernel_stage2(
-    logits,
-    V_Buffer,
-    Out,
-    Req_to_tokens,
-    B_req_idx,
-    B_Start_Loc,
-    B_Seqlen,
-    stride_logic_h,
-    stride_buf_vbs,
-    stride_buf_vh,
+    Mid_O,
+    O,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
     stride_obs,
     stride_oh,
-    stride_req_to_token_b,
-    kv_group_num: tl.constexpr,
-    q_head_num: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    Lv: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
-    cur_head_id = tl.program_id(1)
-    cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+    cur_head = tl.program_id(1)
 
-    if BLOCK_H < kv_group_num:
-        VALID_BLOCK_H: tl.constexpr = BLOCK_H
-    else:
-        VALID_BLOCK_H: tl.constexpr = kv_group_num
-    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
-    mask_h = mask_h & (cur_head < q_head_num)
+    offs_d = tl.arange(0, BLOCK_DV)
 
-    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
-    cur_batch_start_loc = tl.load(B_Start_Loc + cur_batch)
-    cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + BLOCK_DV
 
-    offs_buf_v = cur_kv_head * stride_buf_vh + offs_d[None, :]
-    v_ptrs = V_Buffer + offs_buf_v
+    for split_k_id in range(0, SPLIT_K):
+        tv = tl.load(Mid_O + offs_v + split_k_id * stride_mid_os)
+        tlogic = tl.load(Mid_O + offs_logic + split_k_id * stride_mid_os)
+        n_e_max = tl.maximum(tlogic, e_max)
 
-    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
-    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_H, BLOCK_DMODEL], dtype=tl.float32)
-
-    for start_n in range(0, cur_batch_seq_len, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        v_index = tl.load(
-            Req_to_tokens
-            + cur_batch_req_idx * stride_req_to_token_b
-            + (start_n + offs_n),
-            mask=(start_n + offs_n) < cur_batch_seq_len,
-            other=0,
-        )
-
-        offs_qk = cur_head[:, None] * stride_logic_h + (
-            cur_batch_start_loc + start_n + offs_n[None, :]
-        )
-
-        qk = tl.load(
-            logits + offs_qk,
-            mask=mask_h[:, None] & (start_n + offs_n[None, :] < cur_batch_seq_len),
-            other=float("-inf"),
-        )
-
-        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         old_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
-        e_sum = e_sum * old_scale + tl.sum(p, 1)
-        v = tl.load(
-            v_ptrs + v_index[:, None] * stride_buf_vbs, mask=(offs_d[None, :] < Lv)
-        )
-        p = p.to(v.dtype)
-        acc = acc * old_scale[:, None] + tl.dot(p, v)
+        acc *= old_scale
+        exp_logic = tl.exp(tlogic - n_e_max)
+        acc += exp_logic * tv
+
+        e_sum = e_sum * old_scale + exp_logic
         e_max = n_e_max
 
-    acc = acc / e_sum[:, None]
-    off_o = cur_batch * stride_obs + cur_head[:, None] * stride_oh + offs_d[None, :]
-    out_ptrs = Out + off_o
-    tl.store(out_ptrs, acc, mask=(mask_h[:, None]) & (offs_d[None, :] < Lv))
+    tl.store(O + cur_batch * stride_obs + cur_head * stride_oh + offs_d, acc / e_sum)
 
 
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
+    v_buffer,
     att_out,
     Req_to_tokens,
     B_req_idx,
-    B_Start_Loc,
     B_Seqlen,
     max_len_in_batch,
     sm_scale,
@@ -478,6 +479,7 @@ def _decode_grouped_att_m_fwd(
 ):
     BLOCK = 64
     Lk = k_buffer.shape[-1]
+    Lv = v_buffer.shape[-1]
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -488,19 +490,18 @@ def _decode_grouped_att_m_fwd(
     else:
         BLOCK_DMODEL = triton.next_power_of_2(Lk)
         BLOCK_DPE = 0
+    BLOCK_DV = triton.next_power_of_2(Lv)
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    BLOCK_H = max(16, min(64, triton.next_power_of_2(kv_group_num)))
+    BLOCK_H = 16
     SPLIT_K = 8
     grid = (
         batch,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
         SPLIT_K,
     )
-
-    num_warps = 4
 
     extra_kargs = {}
     if is_hip_:
@@ -511,10 +512,10 @@ def _decode_grouped_att_m_fwd(
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
+        v_buffer,
         sm_scale,
         Req_to_tokens,
         B_req_idx,
-        B_Start_Loc,
         B_Seqlen,
         att_out,
         Req_to_tokens.stride(0),
@@ -522,41 +523,39 @@ def _decode_grouped_att_m_fwd(
         q.stride(1),
         k_buffer.stride(0),
         k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
         att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
         kv_group_num=kv_group_num,
         q_head_num=head_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
         BLOCK_H=BLOCK_H,
         SPLIT_K=SPLIT_K,
         logit_cap=logit_cap,
-        num_warps=num_warps,
-        num_stages=1,
+        num_warps=4,
+        num_stages=2,
         Lk=Lk,
+        Lv=Lv,
         **extra_kargs,
     )
 
 
 def _decode_grouped_softmax_reducev_fwd(
     logits,
-    v_buffer,
+    q,
     o,
-    req_to_tokens,
-    b_req_idx,
-    b_start_loc,
-    b_seq_len,
+    v_buffer,
 ):
-    BLOCK = 128
-    batch, head_num = b_seq_len.shape[0], logits.shape[0]
-    kv_group_num = logits.shape[0] // v_buffer.shape[1]
-    BLOCK_H = max(16, min(64, triton.next_power_of_2(kv_group_num)))
-    grid = (batch, triton.cdiv(head_num, min(BLOCK_H, kv_group_num)), 1)
-
-    num_warps = 8
-
+    batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
-    BLOCK_DMODEL = triton.next_power_of_2(Lv)
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    SPLIT_K = 8
 
     extra_kargs = {}
     if is_hip_:
@@ -564,28 +563,19 @@ def _decode_grouped_softmax_reducev_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    grid = (batch, head_num)
     _fwd_grouped_kernel_stage2[grid](
         logits,
-        v_buffer,
         o,
-        req_to_tokens,
-        b_req_idx,
-        b_start_loc,
-        b_seq_len,
         logits.stride(0),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        logits.stride(1),
+        logits.stride(2),
         o.stride(0),
         o.stride(1),
-        req_to_tokens.stride(0),
-        kv_group_num=kv_group_num,
-        q_head_num=head_num,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_N=BLOCK,
-        BLOCK_H=BLOCK_H,
-        Lv=Lv,
-        num_warps=num_warps,
-        num_stages=1,
+        SPLIT_K=SPLIT_K,
+        BLOCK_DV=BLOCK_DV,
+        num_warps=4,
+        num_stages=2,
         **extra_kargs,
     )
 
@@ -644,24 +634,16 @@ def decode_attention_fwd_grouped(
     _decode_grouped_att_m_fwd(
         q,
         k_buffer,
+        v_buffer,
         attn_logits,
         req_to_token,
         b_req_idx,
-        b_start_loc,
         b_seq_len,
         max_len_in_batch,
         sm_scale,
         logit_cap,
     )
-    _decode_grouped_softmax_reducev_fwd(
-        attn_logits,
-        v_buffer,
-        o,
-        req_to_token,
-        b_req_idx,
-        b_start_loc,
-        b_seq_len,
-    )
+    _decode_grouped_softmax_reducev_fwd(attn_logits, q, o, v_buffer)
 
 
 def decode_attention_fwd(
