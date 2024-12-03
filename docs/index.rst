@@ -41,9 +41,9 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Native Router
+   :caption: SGLang Router
 
-   router/router.ipynb
+   router/router.md
 
 
 .. toctree::
