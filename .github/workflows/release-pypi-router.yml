@@ -69,9 +69,10 @@ jobs:
         with:
           path: sglang-repo
 
-      - name: Move rust folder to root and delete sglang-repo
+      - name: Move rust folder to root, copy the license file, and delete sglang-repo
         run: |
           mv sglang-repo/rust/* .
+          mv sglang-repo/LICENSE .
           rm -rf sglang-repo
           ls -alt
 
