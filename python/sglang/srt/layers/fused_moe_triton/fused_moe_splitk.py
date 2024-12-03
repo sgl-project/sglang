@@ -178,7 +178,7 @@ def fused_moe_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
 
 
 def moe_align_block_size(
@@ -592,7 +592,7 @@ direct_register_custom_op(
 )
 
 
-def fused_experts_splitk(
+def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -851,7 +851,7 @@ def fused_moe(
             hidden_states, gating_output, topk, renormalize
         )
 
-    return fused_experts_splitk(
+    return fused_experts(
         hidden_states,
         w1,
         w2,
