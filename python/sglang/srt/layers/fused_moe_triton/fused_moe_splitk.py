@@ -152,7 +152,7 @@ def fused_moe_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * (BLOCK_SIZE_K * SPLIT_K_SIZE)),
             other=0.0,
         )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * ((BLOCK_SIZE_K * SPLIT_K_SIZE)), other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K * SPLIT_K_SIZE), other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -266,7 +266,7 @@ def invoke_fused_moe_kernel(
     else:
         assert A_scale is None
         assert B_scale is None
-
+    
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]), META['SPLIT_K_SIZE']
@@ -681,7 +681,7 @@ def fused_experts_impl(
 
     config = get_config_func(M)
 
-    intermediate_cache1 = torch.empty(
+    intermediate_cache1 = torch.zeros(
         (M, topk_ids.shape[1], N),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -691,7 +691,7 @@ def fused_experts_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache3 = torch.empty(
+    intermediate_cache3 = torch.zeros(
         (M, topk_ids.shape[1], w2.shape[1]),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
