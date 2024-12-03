@@ -31,7 +31,6 @@ from vllm.distributed import (
 # from sglang.srt.layers.fused_moe_triton import FusedMoE
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -50,6 +49,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_flashinfer_available
 
 if is_flashinfer_available():
@@ -191,7 +191,6 @@ class DeepseekV2Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -339,7 +338,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
         use_dp=False,
@@ -570,7 +568,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -601,7 +598,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
                 max_position_embeddings=max_position_embeddings,
-                cache_config=cache_config,
                 quant_config=quant_config,
                 layer_id=layer_id,
                 use_dp=self.enable_dp_attention,
@@ -621,7 +617,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
                 max_position_embeddings=max_position_embeddings,
-                cache_config=cache_config,
                 quant_config=quant_config,
                 layer_id=layer_id,
             )
@@ -687,7 +682,6 @@ class DeepseekV2Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -704,7 +698,6 @@ class DeepseekV2Model(nn.Module):
                 DeepseekV2DecoderLayer(
                     config,
                     layer_id,
-                    cache_config=cache_config,
                     quant_config=quant_config,
                 )
                 for layer_id in range(config.num_hidden_layers)
@@ -735,13 +728,12 @@ class DeepseekV2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = DeepseekV2Model(config, cache_config, quant_config)
+        self.model = DeepseekV2Model(config, quant_config)
         if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,

@@ -50,6 +50,7 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     is_embedding: bool = False
+    revision: Optional[str] = None
 
     # Port
     host: str = "127.0.0.1"
@@ -121,7 +122,7 @@ class ServerArgs:
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
-    disable_disk_cache: bool = False
+    disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_overlap_schedule: bool = False
@@ -158,7 +159,7 @@ class ServerArgs:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.82
+                self.mem_fraction_static = 0.81
             elif self.tp_size >= 4:
                 self.mem_fraction_static = 0.85
             elif self.tp_size >= 2:
@@ -180,15 +181,21 @@ class ServerArgs:
             else:
                 self.cuda_graph_max_bs = 160
 
-        # Set kernel backends
-        if not is_flashinfer_available():
-            self.attention_backend = "triton"
-            self.sampling_backend = "pytorch"
-
+        # Choose kernel backends
         if self.attention_backend is None:
-            self.attention_backend = "flashinfer"
+            self.attention_backend = (
+                "flashinfer" if is_flashinfer_available() else "triton"
+            )
         if self.sampling_backend is None:
-            self.sampling_backend = "flashinfer"
+            self.sampling_backend = (
+                "flashinfer" if is_flashinfer_available() else "pytorch"
+            )
+
+        if self.attention_backend == "torch_native":
+            logger.warning(
+                "Cuda graph is disabled because of using torch native attention backend"
+            )
+            self.disable_cuda_graph = True
 
         # Others
         if self.enable_dp_attention:
@@ -197,12 +204,12 @@ class ServerArgs:
             self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             self.disable_overlap_schedule = True
-            logger.info(
+            logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
-                "Overlap schedule is disabled."
+                "Overlap scheduler is disabled."
             )
 
         # GGUF
@@ -334,6 +341,14 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--revision",
+            type=str,
+            default=None,
+            help="The specific model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
         )
 
         # Memory and scheduling
@@ -586,7 +601,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton"],
+            choices=["flashinfer", "triton", "torch_native"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -627,9 +642,9 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
-            "--disable-disk-cache",
+            "--disable-outlines-disk-cache",
             action="store_true",
-            help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+            help="Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
             "--disable-custom-all-reduce",
@@ -729,6 +744,11 @@ class ServerArgs:
             "--disable-flashinfer-sampling",
             action=DeprecatedAction,
             help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
+        )
+        parser.add_argument(
+            "--disable-disk-cache",
+            action=DeprecatedAction,
+            help="'--disable-disk-cache' is deprecated. Please use '--disable-outlines-disk-cache' instead.",
         )
 
     @classmethod
