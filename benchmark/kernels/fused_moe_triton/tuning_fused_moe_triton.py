@@ -20,7 +20,6 @@ from sglang.srt.layers.fused_moe_triton.fused_moe import (
 )
 
 
-
 class BenchmarkConfig(TypedDict):
     BLOCK_SIZE_M: int
     BLOCK_SIZE_N: int
