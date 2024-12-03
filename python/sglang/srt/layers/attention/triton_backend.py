@@ -59,7 +59,7 @@ class TritonAttnBackend(AttentionBackend):
             total_num_tokens = forward_batch.seq_lens_sum
 
             # TODO: we can split it into two buffers to accelerate read/write in Triton kernel
-            attn_logits = torch.empty(
+            attn_logits = torch.zeros(
                 (
                     forward_batch.batch_size,
                     self.num_head,
@@ -84,7 +84,7 @@ class TritonAttnBackend(AttentionBackend):
         self.cuda_graph_start_loc = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_attn_logits = torch.empty(
+        self.cuda_graph_attn_logits = torch.zeros(
             (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
             dtype=self.reduce_dtype,
             device="cuda",

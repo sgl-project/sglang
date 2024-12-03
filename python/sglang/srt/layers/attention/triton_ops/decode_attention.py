@@ -398,31 +398,34 @@ def _fwd_grouped_kernel_stage1(
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
-    offs_mid_o = (
-        cur_batch * stride_mid_ob
-        + cur_head[:, None] * stride_mid_oh
-        + split_k_id * stride_mid_os
-        + offs_dv[None, :]
-    )
+    need_store = tl.where(split_k_end > split_k_start, 1, 0)
 
-    tl.store(
-        Att_Out + offs_mid_o,
-        acc / e_sum[:, None],
-        mask=mask_h[:, None],
-    )
+    for _ in range(0, need_store, 1):
+        offs_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_k_id * stride_mid_os
+            + offs_dv[None, :]
+        )
 
-    offs_mid_o_1 = (
-        cur_batch * stride_mid_ob
-        + cur_head * stride_mid_oh
-        + split_k_id * stride_mid_os
-        + BLOCK_DV
-    )
+        tl.store(
+            Att_Out + offs_mid_o,
+            acc / e_sum[:, None],
+            mask=mask_h[:, None],
+        )
 
-    tl.store(
-        Att_Out + offs_mid_o_1,
-        e_max + tl.log(e_sum),
-        mask=mask_h,
-    )
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_k_id * stride_mid_os
+            + BLOCK_DV
+        )
+
+        tl.store(
+            Att_Out + offs_mid_o_1,
+            e_max + tl.log(e_sum),
+            mask=mask_h,
+        )
 
 
 @triton.jit
@@ -553,7 +556,7 @@ def _decode_grouped_softmax_reducev_fwd(
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
-    BLOCK_DV = triton.next_power_of_2(Lv)
+    BLOCK_DV = Lv
 
     SPLIT_K = 8
 
