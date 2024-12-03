@@ -221,12 +221,12 @@ def grouped_gemm_triton_kernel(
     use_fp8_w8a8,
     scale_a,
     scale_b,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
     a_stride_0: tl.constexpr,
     b_stride_0: tl.constexpr,
     b_stride_1: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
 ):
     c_dtype = c.dtype.element_ty
 
@@ -312,19 +312,23 @@ def grouped_gemm_triton(
     if use_fp8_w8a8:
         assert scale_a is not None and scale_b is not None
 
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
+    config = {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+    }
 
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
     compute_m_num_tiles_indptr[(1,)](
-        m_num_tiles_indptr, seg_indptr, batch_size, BLOCK_SIZE_M
+        m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
     )
 
-    num_m_tiles = (a.size(0) + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M + batch_size
-    num_n_tiles = (b.size(1) + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    grid = lambda META: (
+        triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
+        triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
+    )
 
-    grouped_gemm_triton_kernel[(num_m_tiles, num_n_tiles)](
+    grouped_gemm_triton_kernel[grid](
         a,
         b,
         c,
@@ -337,11 +341,9 @@ def grouped_gemm_triton(
         use_fp8_w8a8,
         scale_a,
         scale_b,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
         a.stride(0),
         b.stride(0),
         b.stride(1),
+        **config,
     )
     return c
