@@ -111,20 +111,15 @@ class ModelRunner:
             )
 
         if self.is_multimodal:
+            logger.info(
+                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
+            )
+            server_args.chunked_prefill_size = -1
             self.mem_fraction_static *= 0.95
-            if self.model_config.hf_config.architectures == [
-                "MllamaForConditionalGeneration"
-            ]:
-                logger.info("Automatically turn off --chunked-prefill-size for mllama.")
-                server_args.chunked_prefill_size = -1
             # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
             ]:
-                logger.info(
-                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
-                )
-                server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
 
         # Global vars
@@ -627,7 +622,7 @@ class ModelRunner:
         tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
-        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f}s")
+        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
