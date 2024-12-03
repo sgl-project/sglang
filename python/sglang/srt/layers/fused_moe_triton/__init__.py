@@ -1,13 +1,23 @@
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-import sglang.srt.layers.fused_moe_triton.fused_moe  # noqa
-from sglang.srt.layers.fused_moe_triton.fused_moe import (
-    fused_experts,
-    fused_topk,
-    get_config_file_name,
-    grouped_topk,
-)
+if os.environ.get("SGLANG_FUSED_MOE_BACKEND") == "GEMM_SPLITK":
+    import sglang.srt.layers.fused_moe_triton.fused_moe_splitk  # noqa
+    from sglang.srt.layers.fused_moe_triton.fused_moe_splitk import (
+        fused_experts,
+        fused_topk,
+        get_config_file_name,
+        grouped_topk,
+    )
+else:
+    import sglang.srt.layers.fused_moe_triton.fused_moe  # noqa
+    from sglang.srt.layers.fused_moe_triton.fused_moe import (
+        fused_experts,
+        fused_topk,
+        get_config_file_name,
+        grouped_topk,
+    )
 from sglang.srt.layers.fused_moe_triton.layer import (
     FusedMoE,
     FusedMoEMethodBase,

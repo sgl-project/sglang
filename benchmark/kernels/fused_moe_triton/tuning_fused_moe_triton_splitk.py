@@ -11,7 +11,7 @@ import triton
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
-from sglang.srt.layers.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.fused_moe_triton.fused_moe_splitk import (
     fused_moe,
     get_config_dtype_str,
     get_config_file_name,
@@ -19,11 +19,13 @@ from sglang.srt.layers.fused_moe_triton.fused_moe import (
     get_moe_configs,
 )
 
+
 class BenchmarkConfig(TypedDict):
     BLOCK_SIZE_M: int
     BLOCK_SIZE_N: int
     BLOCK_SIZE_K: int
     GROUP_SIZE_M: int
+    SPLIT_K_SIZE: int
     num_warps: int
     num_stages: int
 
@@ -41,7 +43,7 @@ def benchmark_config(
     num_iters: int = 100,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    x = torch.randn(num_tokens, hidden_size, dtype=init_dtype)
     if use_int8_w8a16:
         w1 = torch.randint(
             -127,
@@ -155,21 +157,23 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
     # prune the search space.
     configs: List[BenchmarkConfig] = []
     for num_stages in [2, 3, 4, 5]:
-        for block_m in [16, 32, 64, 128, 256]:
+        for block_m in [16, 32, 64, 128]:
             for block_k in [64, 128, 256]:
-                for block_n in [32, 64, 128, 256]:
-                    for num_warps in [4, 8]:
-                        for group_size in [1, 16, 32, 64]:
-                            configs.append(
-                                {
-                                    "BLOCK_SIZE_M": block_m,
-                                    "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k,
-                                    "GROUP_SIZE_M": group_size,
-                                    "num_warps": num_warps,
-                                    "num_stages": num_stages,
-                                }
-                            )
+                for block_n in [32, 64, 128]:
+                    for splitk_size in [2, 4, 8]:
+                        for num_warps in [4, 8]:
+                            for group_size in [1, 16, 32, 64]:
+                                configs.append(
+                                    {
+                                        "BLOCK_SIZE_M": block_m,
+                                        "BLOCK_SIZE_N": block_n,
+                                        "BLOCK_SIZE_K": block_k,
+                                        "GROUP_SIZE_M": group_size,
+                                        "SPLIT_K_SIZE": splitk_size,
+                                        "num_warps": num_warps,
+                                        "num_stages": num_stages,
+                                    }
+                                )
     return configs
 
 
@@ -272,6 +276,7 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
         "BLOCK_SIZE_N": config["BLOCK_SIZE_N"],
         "BLOCK_SIZE_K": config["BLOCK_SIZE_K"],
         "GROUP_SIZE_M": config["GROUP_SIZE_M"],
+        "SPLIT_K_SIZE": config["SPLIT_K_SIZE"],
         "num_warps": config["num_warps"],
         "num_stages": config["num_stages"],
     }
