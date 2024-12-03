@@ -192,7 +192,7 @@ class ServerArgs:
             )
 
         if self.attention_backend == "torch_native":
-            logger.info(
+            logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
@@ -204,12 +204,12 @@ class ServerArgs:
             self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             self.disable_overlap_schedule = True
-            logger.info(
+            logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
-                "Overlap schedule is disabled."
+                "Overlap scheduler is disabled."
             )
 
         # GGUF
