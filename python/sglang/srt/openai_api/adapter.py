@@ -521,7 +521,7 @@ def v1_generate_request(
                 "skip_special_tokens": request.skip_special_tokens,
             }
         )
-        return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
+        return_logprobs.append(request.logprobs is not None)
         logprob_start_lens.append(current_logprob_start_len)
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
@@ -595,9 +595,9 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
             text = prompts[prompt_index] + text
 
         logprobs = False
-        if isinstance(request, list) and request[idx].logprobs:
+        if isinstance(request, list) and request[idx].logprobs is not None:
             logprobs = True
-        elif (not isinstance(request, list)) and request.logprobs:
+        elif (not isinstance(request, list)) and request.logprobs is not None:
             logprobs = True
         if logprobs:
             if echo:
@@ -739,7 +739,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             # Prepend prompt in response text.
                             text = prompts + text
 
-                    if request.logprobs:
+                    if request.logprobs is not None:
                         # The first chunk and echo is enabled.
                         if not stream_buffer and request.echo:
                             input_token_logprobs = content["meta_info"][
@@ -1279,7 +1279,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     for request in all_requests:
         prompt = request.input
         assert (
-            type(prompt) == first_prompt_type
+            type(prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
         prompts.append(prompt)
 

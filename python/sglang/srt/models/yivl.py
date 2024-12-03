@@ -18,9 +18,9 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel, LlavaConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llava import LlavaLlamaForCausalLM
 
 
@@ -29,9 +29,8 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
-        super().__init__(config, quant_config, cache_config)
+        super().__init__(config, quant_config)
 
         self.multi_modal_projector = YiVLMultiModalProjector(self.config)
         self.vision_tower_subfolder = self.config.mm_vision_tower.replace(

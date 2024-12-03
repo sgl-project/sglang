@@ -31,7 +31,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.loader import DefaultModelLoader
 
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -40,6 +39,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_loader.loader import DefaultModelLoader
 
 
 class BaseLayerWithLoRA(nn.Module):

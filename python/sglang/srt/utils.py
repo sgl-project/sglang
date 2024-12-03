@@ -39,6 +39,7 @@ import numpy as np
 import psutil
 import requests
 import torch
+import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
@@ -429,16 +430,12 @@ def suppress_other_loggers():
     from vllm.logger import logger as vllm_default_logger
 
     vllm_default_logger.setLevel(logging.WARN)
-    logging.getLogger("vllm.config").setLevel(logging.ERROR)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
     logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
         logging.WARN
     )
-    logging.getLogger("vllm.selector").setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.ERROR)
-    logging.getLogger("vllm.model_executor.model_loader.loader").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -489,27 +486,6 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
-
-
-def monkey_patch_vllm_model_config():
-    from vllm.config import ModelConfig
-
-    if not hasattr(ModelConfig, "_resolve_task"):
-        return
-
-    def _resolve_task(
-        self,
-        task_option,
-        hf_config,
-    ):
-        supported_tasks = {
-            "generate": True,
-            "embedding": False,
-        }
-        selected_task = "generate"
-        return supported_tasks, selected_task
-
-    setattr(ModelConfig, "_resolve_task", _resolve_task)
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
@@ -902,7 +878,9 @@ def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
         result = subprocess.run(
-            ["rocm-smi --showmeminfo vram | grep 'Total Memory' | awk '{print $NF}'"],
+            [
+                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=True,
@@ -913,9 +891,8 @@ def get_amdgpu_memory_capacity():
 
         # Parse the output to extract memory values in MiB
         memory_values = [
-            float(mem) / 1024 / 1024
+            float(mem.split("(")[0].strip()) / 1024
             for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
         ]
 
         if not memory_values:
@@ -962,9 +939,86 @@ def get_nvgpu_memory_capacity():
         )
 
 
+# Copy from pytorch and OpenRLHF to allow creating multiple main groups.
+# https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
+# https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
+def init_custom_process_group(
+    backend=None,
+    init_method=None,
+    timeout=None,
+    world_size=-1,
+    rank=-1,
+    store=None,
+    group_name=None,
+    pg_options=None,
+):
+    from torch.distributed.distributed_c10d import (
+        Backend,
+        PrefixStore,
+        _new_process_group_helper,
+        _world,
+        default_pg_timeout,
+        rendezvous,
+    )
+
+    assert (store is None) or (
+        init_method is None
+    ), "Cannot specify both init_method and store."
+
+    if store is not None:
+        assert world_size > 0, "world_size must be positive if using store"
+        assert rank >= 0, "rank must be non-negative if using store"
+    elif init_method is None:
+        init_method = "env://"
+
+    if backend:
+        backend = Backend(backend)
+    else:
+        backend = Backend("undefined")
+
+    if timeout is None:
+        timeout = default_pg_timeout
+
+    # backward compatible API
+    if store is None:
+        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+
+        # Use a PrefixStore to avoid accidental overrides of keys used by
+        # different systems (e.g. RPC) in case the store is multi-tenant.
+        store = PrefixStore(group_name, store)
+
+    # NOTE: The pg_options parameter was renamed into backend_options in PyTorch 2.6.0
+    # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
+    # We need to determine the appropriate parameter name based on PyTorch version
+    pg_options_param_name = (
+        "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+    )
+    pg, _ = _new_process_group_helper(
+        world_size,
+        rank,
+        [],
+        backend,
+        store,
+        group_name=group_name,
+        **{pg_options_param_name: pg_options},
+        timeout=timeout,
+    )
+
+    _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+
+    return pg
+
+
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
     return get_bool_env_var("SGLANG_IS_IN_CI")
+
+
+def print_warning_once(msg: str) -> None:
+    # Set the stacklevel to 2 to print the caller's line info
+    logger.warning(msg, stacklevel=2)
 
 
 def get_device_name(device_id: int = 0) -> str:
@@ -979,6 +1033,33 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
+
+
+def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
+    major, minor = None, None
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(device_id)
+
+    if hasattr(torch, "hip") and torch.hip.is_available():
+        major, minor = torch.cuda.get_device_capability(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
+            "."
+        )
+        major, minor = int(major), int(minor)
+
+    # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
+    # Update this once the support is available.
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        try:
+            major, minor = torch.hpu.get_device_capability(device_id)
+        except Exception as e:
+            raise RuntimeError(
+                f"An error occurred while getting device capability of hpu: {e}."
+            ) from e
+
+    return major, minor
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa

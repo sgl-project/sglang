@@ -25,7 +25,6 @@ import uuid
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
-import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -48,6 +47,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -55,6 +56,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -106,9 +109,12 @@ class TokenizerManager:
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
         )
 
         self.is_generation = self.model_config.is_generation
@@ -333,6 +339,12 @@ class TokenizerManager:
                 rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+            if batch_size > 128:
+                logger.warning(
+                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
+                    "The performance might be better if you just duplicate the requests n times or use "
+                    "many threads to send them one by one with parallel sampling (n > 1)."
+                )
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
@@ -456,6 +468,46 @@ class TokenizerManager:
         else:
             return False, "Another update is in progress. Please try again later."
 
+    async def init_weights_update_group(
+        self,
+        obj: InitWeightsUpdateGroupReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> bool:
+        if self.to_create_loop:
+            self.create_handle_loop()
+        self.send_to_scheduler.send_pyobj(obj)
+
+        self.init_weights_update_group_result = asyncio.Future()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for init parameter update group"
+        result = await self.init_weights_update_group_result
+        return result.success, result.message
+
+    async def update_weights_from_distributed(
+        self,
+        obj: UpdateWeightsFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        if not self.model_update_lock.locked():
+            async with self.model_update_lock:
+                self.send_to_scheduler.send_pyobj(obj)
+                self.parameter_update_result = asyncio.Future()
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be for update weights from distributed"
+                result = await self.parameter_update_result
+                return result.success, result.message
+        else:
+            logger.error("Another parameter update is in progress in tokenizer manager")
+            return (
+                False,
+                "Another parameter update is in progress. Please try again later.",
+            )
+
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -546,10 +598,73 @@ class TokenizerManager:
                 BatchEmbeddingOut,
                 BatchTokenIDOut,
                 UpdateWeightFromDiskReqOutput,
+                UpdateWeightsFromDistributedReqOutput,
                 GetWeightsByNameReqOutput,
+                InitWeightsUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
-            if isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
+            if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
+                for i, rid in enumerate(recv_obj.rids):
+                    state = self.rid_to_state.get(rid, None)
+                    if state is None:
+                        continue
+
+                    recv_obj.meta_info[i]["id"] = rid
+                    if isinstance(recv_obj, BatchStrOut):
+                        out_dict = {
+                            "text": recv_obj.output_strs[i],
+                            "meta_info": recv_obj.meta_info[i],
+                        }
+                    elif isinstance(recv_obj, BatchTokenIDOut):
+                        out_dict = {
+                            "token_ids": recv_obj.output_ids[i],
+                            "meta_info": recv_obj.meta_info[i],
+                        }
+                    else:
+                        assert isinstance(recv_obj, BatchEmbeddingOut)
+                        out_dict = {
+                            "embedding": recv_obj.embeddings[i],
+                            "meta_info": recv_obj.meta_info[i],
+                        }
+                    state.out_list.append(out_dict)
+                    state.finished = recv_obj.finished_reason[i] is not None
+                    state.event.set()
+
+                    if self.enable_metrics:
+                        completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
+
+                        if state.first_token_time is None:
+                            state.first_token_time = time.time()
+                            self.metrics_collector.observe_time_to_first_token(
+                                state.first_token_time - state.created_time
+                            )
+                        else:
+                            if completion_tokens >= 2:
+                                self.metrics_collector.observe_time_per_output_token(
+                                    (time.time() - state.first_token_time)
+                                    / (completion_tokens - 1)
+                                )
+
+                        if state.finished:
+                            self.metrics_collector.inc_prompt_tokens(
+                                recv_obj.meta_info[i]["prompt_tokens"]
+                            )
+                            self.metrics_collector.inc_generation_tokens(
+                                completion_tokens
+                            )
+                            self.metrics_collector.observe_e2e_request_latency(
+                                time.time() - state.created_time
+                            )
+                            if completion_tokens >= 1:
+                                self.metrics_collector.observe_time_per_output_token(
+                                    (time.time() - state.created_time)
+                                    / completion_tokens
+                                )
+            elif isinstance(recv_obj, OpenSessionReqOutput):
+                self.session_futures[recv_obj.session_id].set_result(
+                    recv_obj.session_id
+                )
+            elif isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
@@ -557,7 +672,16 @@ class TokenizerManager:
                     # set future if the all results are recevied
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
-                continue
+            elif isinstance(recv_obj, InitWeightsUpdateGroupReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for init parameter update group"
+                self.init_weights_update_group_result.set_result(recv_obj)
+            elif isinstance(recv_obj, UpdateWeightsFromDistributedReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for update weights from distributed"
+                self.parameter_update_result.set_result(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 if self.server_args.dp_size == 1:
                     self.get_weights_by_name_result.set_result(recv_obj)
@@ -567,70 +691,8 @@ class TokenizerManager:
                         self.get_weights_by_name_result.set_result(
                             self.get_weights_by_name_tmp
                         )
-                continue
-            elif isinstance(recv_obj, OpenSessionReqOutput):
-                self.session_futures[recv_obj.session_id].set_result(
-                    recv_obj.session_id
-                )
-                continue
-
-            assert isinstance(
-                recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
-            ), f"Unexpected obj received: {type(recv_obj)}"
-
-            for i, rid in enumerate(recv_obj.rids):
-                state = self.rid_to_state.get(rid, None)
-                if state is None:
-                    continue
-
-                recv_obj.meta_info[i]["id"] = rid
-                if isinstance(recv_obj, BatchStrOut):
-                    out_dict = {
-                        "text": recv_obj.output_strs[i],
-                        "meta_info": recv_obj.meta_info[i],
-                    }
-                elif isinstance(recv_obj, BatchTokenIDOut):
-                    out_dict = {
-                        "token_ids": recv_obj.output_ids[i],
-                        "meta_info": recv_obj.meta_info[i],
-                    }
-                else:
-                    assert isinstance(recv_obj, BatchEmbeddingOut)
-                    out_dict = {
-                        "embedding": recv_obj.embeddings[i],
-                        "meta_info": recv_obj.meta_info[i],
-                    }
-                state.out_list.append(out_dict)
-                state.finished = recv_obj.finished_reason[i] is not None
-                state.event.set()
-
-                if self.enable_metrics:
-                    completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
-
-                    if state.first_token_time is None:
-                        state.first_token_time = time.time()
-                        self.metrics_collector.observe_time_to_first_token(
-                            state.first_token_time - state.created_time
-                        )
-                    else:
-                        if completion_tokens >= 2:
-                            self.metrics_collector.observe_time_per_output_token(
-                                (time.time() - state.first_token_time)
-                                / (completion_tokens - 1)
-                            )
-
-                    if state.finished:
-                        self.metrics_collector.inc_prompt_tokens(
-                            recv_obj.meta_info[i]["prompt_tokens"]
-                        )
-                        self.metrics_collector.inc_generation_tokens(completion_tokens)
-                        self.metrics_collector.observe_e2e_request_latency(
-                            time.time() - state.created_time
-                        )
-                        if completion_tokens >= 1:
-                            self.metrics_collector.observe_time_per_output_token(
-                                (time.time() - state.created_time) / completion_tokens
-                            )
+            else:
+                raise ValueError(f"Invalid object: {recv_obj=}")
 
     def convert_logprob_style(
         self,
