@@ -16,6 +16,7 @@
 import gc
 import json
 import logging
+import time
 from typing import Optional
 
 import torch
@@ -124,7 +125,7 @@ class ModelRunner:
         # Global vars
         if server_args.show_time_cost:
             enable_show_time_cost()
-        if server_args.disable_disk_cache:
+        if server_args.disable_outlines_disk_cache:
             from outlines.caching import disable_cache
 
             disable_cache()
@@ -618,8 +619,10 @@ class ModelRunner:
         if self.server_args.disable_cuda_graph:
             return
 
+        tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
+        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f}s .")
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")

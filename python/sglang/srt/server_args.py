@@ -122,7 +122,7 @@ class ServerArgs:
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
-    disable_disk_cache: bool = False
+    disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_overlap_schedule: bool = False
@@ -642,9 +642,9 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
-            "--disable-disk-cache",
+            "--disable-outlines-disk-cache",
             action="store_true",
-            help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+            help="Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
             "--disable-custom-all-reduce",
@@ -744,6 +744,11 @@ class ServerArgs:
             "--disable-flashinfer-sampling",
             action=DeprecatedAction,
             help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
+        )
+        parser.add_argument(
+            "--disable-disk-cache",
+            action=DeprecatedAction,
+            help="'--disable-disk-cache' is deprecated. Please use '--disable-outlines-disk-cache' instead.",
         )
 
     @classmethod
