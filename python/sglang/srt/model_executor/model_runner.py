@@ -622,7 +622,7 @@ class ModelRunner:
         tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
-        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f}s")
+        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
