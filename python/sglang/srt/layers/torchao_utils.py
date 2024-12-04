@@ -13,7 +13,7 @@ def apply_torchao_config_to_model_(model: torch.nn.Module, torchao_config: str, 
     Args:
        `model`: a model to be quantized based on torchao_config
        `torchao_config` (str): type of quantization and their arguments we want to use to
-        quantize the module, e.g. int4wo-128 means int4 weight only quantization with group_size
+        quantize the model, e.g. int4wo-128 means int4 weight only quantization with group_size
         128
     """
     # Lazy import to suppress some warnings
@@ -27,11 +27,11 @@ def apply_torchao_config_to_model_(model: torch.nn.Module, torchao_config: str, 
     from torchao.quantization.observer import PerRow, PerTensor
 
     if torchao_config == "" or torchao_config is None:
-        return module
+        return model
     elif "int8wo" in torchao_config:
-        quantize_(module, int8_weight_only(), filter_fn=filter_fn)
+        quantize_(model, int8_weight_only(), filter_fn=filter_fn)
     elif "int8dq" in torchao_config:
-        quantize_(module, int8_dynamic_activation_int8_weight(), filter_fn=filter_fn)
+        quantize_(model, int8_dynamic_activation_int8_weight(), filter_fn=filter_fn)
     elif "int4wo" in torchao_config:
         group_size = int(torchao_config.split("-")[-1])
         assert group_size in [
@@ -40,13 +40,13 @@ def apply_torchao_config_to_model_(model: torch.nn.Module, torchao_config: str, 
             128,
             256,
         ], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
-        quantize_(module, int4_weight_only(group_size=group_size), filter_fn=filter_fn)
+        quantize_(model, int4_weight_only(group_size=group_size), filter_fn=filter_fn)
     elif "fp8wo" in torchao_config:
         from torchao.quantization import float8_weight_only
 
         # this requires newer hardware
         # [rank0]: AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-        quantize_(module, float8_weight_only(), filter_fn=filter_fn)
+        quantize_(model, float8_weight_only(), filter_fn=filter_fn)
     elif "fp8dq" in torchao_config:
         granularity = torchao_config.split("-")[-1]
         GRANULARITY_MAP = {
@@ -57,7 +57,7 @@ def apply_torchao_config_to_model_(model: torch.nn.Module, torchao_config: str, 
             granularity in GRANULARITY_MAP
         ), f"Supported granularity are: {GRANULARITY_MAP.keys()}, got {granularity}"
         quantize_(
-            module,
+            model,
             float8_dynamic_activation_float8_weight(
                 granularity=GRANULARITY_MAP[granularity]
             ),
@@ -66,4 +66,4 @@ def apply_torchao_config_to_model_(model: torch.nn.Module, torchao_config: str, 
     else:
         raise ValueError(f"Unexpected config: {torchao_config}")
 
-    return module
+    return model
