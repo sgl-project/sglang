@@ -1,5 +1,5 @@
 import logging
-from typing import Union
+from typing import Callable, Optional, Union
 
 import torch
 from torch import nn
@@ -25,6 +25,11 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
+        self.custom_logits_processor: Optional[Callable] = None
+
+    def register_logit_processor(self, processor: Callable):
+        """Register a custom logit processor function."""
+        self.custom_logit_processor = processor
 
     def forward(
         self,
@@ -35,6 +40,10 @@ class Sampler(nn.Module):
             logits = logits.next_token_logits
 
         logits = logits.contiguous()
+
+        # Apply custom logit processor if registered
+        if self.custom_logit_processor is not None:
+            logits = self.custom_logit_processor(logits, sampling_info)
 
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")

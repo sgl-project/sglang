@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -46,6 +46,9 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
+    # Custom Parameters
+    custom_params: Optional[List[Dict[str, Any]]] = None
+
     @classmethod
     def from_schedule_batch(
         cls, batch: ScheduleBatch, vocab_size: int, enable_overlap_schedule: bool
@@ -79,6 +82,7 @@ class SamplingBatchInfo:
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             vocab_size=vocab_size,
             device=device,
+            custom_params=[r.sampling_params.custom_params for r in reqs],
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
