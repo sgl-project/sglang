@@ -165,7 +165,13 @@ class DoubleSparseAttnBackend(AttentionBackend):
         return 1
 
     def forward_extend(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -181,9 +187,10 @@ class DoubleSparseAttnBackend(AttentionBackend):
             .expand(k.shape[0], -1, -1),
         )
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v, k_label
-        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v, k_label
+            )
 
         (
             start_loc,
@@ -212,7 +219,13 @@ class DoubleSparseAttnBackend(AttentionBackend):
         return o
 
     def forward_decode(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -242,9 +255,10 @@ class DoubleSparseAttnBackend(AttentionBackend):
             .expand(k.shape[0], -1, -1),
         )
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v, k_label
-        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v, k_label
+            )
 
         # NOTE(Andy) shouldn't be used when max_len_in_batch < heavy_token_num
         #            and set a minimum value for sparse_decode
