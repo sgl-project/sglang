@@ -29,7 +29,7 @@ class Sampler(nn.Module):
 
     def register_logit_processor(self, processor: Callable):
         """Register a custom logit processor function."""
-        self.custom_logit_processor = processor
+        self.custom_logits_processor = processor
 
     def forward(
         self,
@@ -42,8 +42,8 @@ class Sampler(nn.Module):
         logits = logits.contiguous()
 
         # Apply custom logit processor if registered
-        if self.custom_logit_processor is not None:
-            logits = self.custom_logit_processor(logits, sampling_info)
+        if self.custom_logits_processor is not None:
+            logits = self.custom_logits_processor(logits, sampling_info)
 
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
