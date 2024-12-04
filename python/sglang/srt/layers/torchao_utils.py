@@ -7,11 +7,11 @@ from typing import Dict, Set
 import torch
 
 
-def apply_torchao_config_to_model_(module: torch.nn.Module, torchao_config: str, filter_fn=None):
-    """Quantize a Module with torchao quantization specified by torchao_config
+def apply_torchao_config_to_model_(model: torch.nn.Module, torchao_config: str, filter_fn=None):
+    """Quantize a modelwith torchao quantization specified by torchao_config
 
     Args:
-       `module`: a module to be quantized based on torchao_config
+       `model`: a model to be quantized based on torchao_config
        `torchao_config` (str): type of quantization and their arguments we want to use to
         quantize the module, e.g. int4wo-128 means int4 weight only quantization with group_size
         128
@@ -67,51 +67,3 @@ def apply_torchao_config_to_model_(module: torch.nn.Module, torchao_config: str,
         raise ValueError(f"Unexpected config: {torchao_config}")
 
     return module
-
-
-def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
-    """Quantize a Tensor with torchao quantization specified by torchao_config
-
-    Args:
-       `param`: weight parameter of the linear module
-       `torchao_config` (str): type of quantization and their arguments we want to use to
-        quantize the Tensor, e.g. int4wo-128 means int4 weight only quantization with group_size
-        128
-    """
-    with torch.device("meta"):
-        dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
-    dummy_linear.weight = torch.nn.Parameter(param)
-    apply_torchao_config_to_model_(dummy_linear, torchao_config)
-    return dummy_linear.weight
-
-
-def apply_torchao_config_(
-    self: torch.nn.Module,
-    params_dict: Dict[str, torch.Tensor],
-    param_suffixes: Set[str],
-) -> None:
-    """A util function used for quantizing the weight parameters after they are loaded if
-       self.torchao_config is specified
-
-    Args:
-      `self`: the model we want to quantize
-      `params_dict`: dictionary mapping from param_name to the parameter Tensor
-      `param_suffixes`: a set of suffixes, we'll quantize the Tensor matching these suffixes
-
-    Returns:
-       None, the `params_dict` is modified inplace and the weights of `self` model are quantized
-    """
-    if self.torchao_config:
-        for param_suffix in param_suffixes:
-            for name in params_dict:
-                param = params_dict[name]
-                if param_suffix in name and param.ndim == 2:
-                    params_dict[name] = torchao_quantize_param_data(
-                        param, self.torchao_config
-                    )
-        self.load_state_dict(params_dict, assign=True)
-
-# def apply_torchao_config_to_model_(
-#     self: torch.nn.Module
-# ):
-#     torchao_quantize_module_(self, self.torchao_config)
