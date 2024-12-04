@@ -20,6 +20,8 @@ import random
 import tempfile
 from typing import List, Optional
 
+import torch
+
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
@@ -151,8 +153,11 @@ class ServerArgs:
 
         if is_hip():
             gpu_mem = get_amdgpu_memory_capacity()
-        else:
+        elif torch.cuda.is_available():
             gpu_mem = get_nvgpu_memory_capacity()
+        else:
+            # GPU memory is not known yet or no GPU is available.
+            gpu_mem = None
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
@@ -169,14 +174,14 @@ class ServerArgs:
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
-            if gpu_mem < 25_000:
+            if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
             else:
                 self.chunked_prefill_size = 8192
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
-            if gpu_mem < 25_000:
+            if gpu_mem is not None and gpu_mem < 25_000:
                 self.cuda_graph_max_bs = 8
             else:
                 self.cuda_graph_max_bs = 160
