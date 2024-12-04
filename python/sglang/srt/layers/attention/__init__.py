@@ -52,12 +52,13 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(q, k, v, layer, forward_batch)
+            return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         else:
-            return self.forward_extend(q, k, v, layer, forward_batch)
+            return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
 
     def forward_decode(
         self,
@@ -66,6 +67,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
     ):
         """Run a forward for decode."""
         raise NotImplementedError()
@@ -77,6 +79,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
     ):
         """Run a forward for extend."""
         raise NotImplementedError()
