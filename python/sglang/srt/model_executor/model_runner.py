@@ -59,6 +59,8 @@ from sglang.srt.utils import (
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
+from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model_
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +160,11 @@ class ModelRunner:
             self.torch_tp_applied = True
         else:
             self.torch_tp_applied = False
+
+        def filter_fn(module, fqn):
+            return "proj" in fqn
+
+        apply_torchao_config_to_model_(self.model, global_server_args_dict["torchao_config"], filter_fn)
 
         # Init memory pool and attention backends
         if server_args.lora_paths is not None:

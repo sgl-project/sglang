@@ -7,13 +7,13 @@ from typing import Dict, Set
 import torch
 
 
-def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
-    """Quantize a Tensor with torchao quantization specified by torchao_config
+def apply_torchao_config_to_model_(module: torch.nn.Module, torchao_config: str, filter_fn=None):
+    """Quantize a Module with torchao quantization specified by torchao_config
 
     Args:
-       `param`: weight parameter of the linear module
-       `torchao_config`: type of quantization and their arguments we want to use to
-        quantize the Tensor, e.g. int4wo-128 means int4 weight only quantization with group_size
+       `module`: a module to be quantized based on torchao_config
+       `torchao_config` (str): type of quantization and their arguments we want to use to
+        quantize the module, e.g. int4wo-128 means int4 weight only quantization with group_size
         128
     """
     # Lazy import to suppress some warnings
@@ -26,12 +26,12 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
     )
     from torchao.quantization.observer import PerRow, PerTensor
 
-    dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
-    dummy_linear.weight = param
-    if "int8wo" in torchao_config:
-        quantize_(dummy_linear, int8_weight_only())
+    if torchao_config == "" or torchao_config is None:
+        return module
+    elif "int8wo" in torchao_config:
+        quantize_(module, int8_weight_only(), filter_fn=filter_fn)
     elif "int8dq" in torchao_config:
-        quantize_(dummy_linear, int8_dynamic_activation_int8_weight())
+        quantize_(module, int8_dynamic_activation_int8_weight(), filter_fn=filter_fn)
     elif "int4wo" in torchao_config:
         group_size = int(torchao_config.split("-")[-1])
         assert group_size in [
@@ -40,13 +40,13 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
             128,
             256,
         ], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
-        quantize_(dummy_linear, int4_weight_only(group_size=group_size))
+        quantize_(module, int4_weight_only(group_size=group_size), filter_fn=filter_fn)
     elif "fp8wo" in torchao_config:
         from torchao.quantization import float8_weight_only
 
         # this requires newer hardware
         # [rank0]: AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-        quantize_(dummy_linear, float8_weight_only())
+        quantize_(module, float8_weight_only(), filter_fn=filter_fn)
     elif "fp8dq" in torchao_config:
         granularity = torchao_config.split("-")[-1]
         GRANULARITY_MAP = {
@@ -57,14 +57,31 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
             granularity in GRANULARITY_MAP
         ), f"Supported granularity are: {GRANULARITY_MAP.keys()}, got {granularity}"
         quantize_(
-            dummy_linear,
+            module,
             float8_dynamic_activation_float8_weight(
                 granularity=GRANULARITY_MAP[granularity]
             ),
+            filter_fn=filter_fn,
         )
     else:
         raise ValueError(f"Unexpected config: {torchao_config}")
 
+    return module
+
+
+def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
+    """Quantize a Tensor with torchao quantization specified by torchao_config
+
+    Args:
+       `param`: weight parameter of the linear module
+       `torchao_config` (str): type of quantization and their arguments we want to use to
+        quantize the Tensor, e.g. int4wo-128 means int4 weight only quantization with group_size
+        128
+    """
+    with torch.device("meta"):
+        dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
+    dummy_linear.weight = torch.nn.Parameter(param)
+    apply_torchao_config_to_model_(dummy_linear, torchao_config)
     return dummy_linear.weight
 
 
@@ -93,3 +110,8 @@ def apply_torchao_config_(
                         param, self.torchao_config
                     )
         self.load_state_dict(params_dict, assign=True)
+
+# def apply_torchao_config_to_model_(
+#     self: torch.nn.Module
+# ):
+#     torchao_quantize_module_(self, self.torchao_config)
