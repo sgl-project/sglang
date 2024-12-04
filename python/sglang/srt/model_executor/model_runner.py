@@ -60,7 +60,6 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
 )
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model_
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
