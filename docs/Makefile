@@ -19,7 +19,7 @@ compile:
 			echo "Executing $$nb"; \
 			jupyter nbconvert --to notebook --execute --inplace "$$nb" \
 				--ExecutePreprocessor.timeout=600 \
-				--ExecutePreprocessor.kernel_name=python3; \
+				--ExecutePreprocessor.kernel_name=python3 || exit 1; \
 		fi; \
 	done
 
