@@ -7,7 +7,9 @@ from typing import Dict, Set
 import torch
 
 
-def apply_torchao_config_to_model_(model: torch.nn.Module, torchao_config: str, filter_fn=None):
+def apply_torchao_config_to_model_(
+    model: torch.nn.Module, torchao_config: str, filter_fn=None
+):
     """Quantize a modelwith torchao quantization specified by torchao_config
 
     Args:
