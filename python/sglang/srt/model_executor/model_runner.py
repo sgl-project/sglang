@@ -27,7 +27,6 @@ from vllm.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
 )
-from vllm.distributed.parallel_state import in_the_same_node_as
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -38,7 +37,7 @@ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBack
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
-from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model_
+from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
@@ -112,11 +111,13 @@ class ModelRunner:
             )
 
         if self.is_multimodal:
-            logger.info(
-                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
-            )
             server_args.chunked_prefill_size = -1
             self.mem_fraction_static *= 0.95
+            logger.info(
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static} "
+                f"and turn off chunked prefill "
+                f"because this is a multimodal model."
+            )
             # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
@@ -160,11 +161,8 @@ class ModelRunner:
         else:
             self.torch_tp_applied = False
 
-        def filter_fn(module, fqn):
-            return "proj" in fqn
-
-        apply_torchao_config_to_model_(
-            self.model, global_server_args_dict["torchao_config"], filter_fn
+        apply_torchao_config_to_model(
+            self.model, global_server_args_dict["torchao_config"]
         )
 
         # Init memory pool and attention backends
