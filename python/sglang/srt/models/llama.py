@@ -324,6 +324,8 @@ class LlamaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.torchao_config = global_server_args_dict["torchao_config"]
+        self.modelopt_config = global_server_args_dict["modelopt_config"]
         self.model = LlamaModel(config, quant_config=quant_config)
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False

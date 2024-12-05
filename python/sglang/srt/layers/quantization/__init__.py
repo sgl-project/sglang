@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
 from vllm.model_executor.layers.quantization.gptq_marlin_24 import GPTQMarlin24Config
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
+from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
@@ -32,6 +33,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
+    "modelopt": ModelOptFp8Config,
     "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
     "gptq_marlin": GPTQMarlinConfig,
