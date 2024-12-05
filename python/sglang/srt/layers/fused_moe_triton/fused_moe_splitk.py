@@ -108,7 +108,7 @@ def fused_moe_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    total_blocks_k = tl.cdiv(K, BLOCK_SIZE_K*SPLIT_K_SIZE)
+    total_blocks_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K_SIZE)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -116,7 +116,7 @@ def fused_moe_kernel(
     token_mask = offs_token < num_valid_tokens
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = pid_k*BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
@@ -149,10 +149,15 @@ def fused_moe_kernel(
         # K dimension.
         a = tl.load(
             a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * (BLOCK_SIZE_K * SPLIT_K_SIZE)),
+            mask=token_mask[:, None]
+            & (offs_k[None, :] < K - k * (BLOCK_SIZE_K * SPLIT_K_SIZE)),
             other=0.0,
         )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K * SPLIT_K_SIZE), other=0.0)
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K * SPLIT_K_SIZE),
+            other=0.0,
+        )
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -266,10 +271,11 @@ def invoke_fused_moe_kernel(
     else:
         assert A_scale is None
         assert B_scale is None
-    
+
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]), META['SPLIT_K_SIZE']
+        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+        META["SPLIT_K_SIZE"],
     )
 
     fused_moe_kernel[grid](
@@ -330,7 +336,9 @@ def get_moe_configs(E: int, N: int, dtype: Optional[str]) -> Optional[Dict[int, 
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            logger.info("Using configuration from %s for MoE layer(splitk).", config_file_path)
+            logger.info(
+                "Using configuration from %s for MoE layer(splitk).", config_file_path
+            )
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
 
@@ -360,7 +368,7 @@ def get_default_config(
         "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 8,
-        'SPLIT_K_SIZE' : 1,
+        "SPLIT_K_SIZE": 1,
     }
     # A heuristic: fused marlin works faster with this config for small M
     if M <= E or (is_marlin and M <= 32):
@@ -369,7 +377,7 @@ def get_default_config(
             "BLOCK_SIZE_N": 32,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 1,
-            'SPLIT_K_SIZE' : 1,
+            "SPLIT_K_SIZE": 1,
         }
     return config
 
@@ -536,7 +544,7 @@ direct_register_custom_op(
     op_func=inplace_fused_experts_splitk,
     mutates_args=["hidden_states"],
     fake_impl=inplace_fused_experts_fake_splitk,
-)   
+)
 
 
 def outplace_fused_experts_splitk(

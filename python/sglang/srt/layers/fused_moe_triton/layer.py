@@ -526,7 +526,7 @@ class FusedMoE(torch.nn.Module):
         else:
             from sglang.srt.layers.fused_moe_triton.fused_moe import (
                 fused_topk,
-            grouped_topk,
+                grouped_topk,
             )
 
         # DeekSeekv2 uses grouped_top_k
