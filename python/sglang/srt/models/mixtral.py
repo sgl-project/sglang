@@ -21,9 +21,13 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import MixtralConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from sglang.srt.layers.ep_moe.layer import EPMoE
 from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -38,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
@@ -63,6 +68,7 @@ class MixtralMoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = hidden_size
 
         # Gate always runs at half / full precision for now.
@@ -74,14 +80,13 @@ class MixtralMoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-
-        self.experts = FusedMoE(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        self.experts = MoEImpl(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
-            reduce_results=True,
             renormalize=True,
             quant_config=quant_config,
             tp_size=tp_size,
@@ -95,6 +100,8 @@ class MixtralMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(hidden_states, router_logits)
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
 
 
@@ -319,7 +326,8 @@ class MixtralForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
