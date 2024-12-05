@@ -54,6 +54,7 @@ from sglang.srt.models.qwen2 import Qwen2Model
 
 logger = init_logger(__name__)
 
+
 # === Vision Inputs === #
 class OriginalQuickGELUActivation(nn.Module):
     """
@@ -62,6 +63,7 @@ class OriginalQuickGELUActivation(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return input * torch.sigmoid(1.702 * input)
+
 
 class Qwen2VLImageInputs(TypedDict):
     pixel_values: torch.Tensor
@@ -209,40 +211,34 @@ class Qwen2VisionAttention(nn.Module):
         q, k, v = dist_utils.split_tensor_along_last_dim(x, 3)
         batch_size = q.shape[1]
 
-        q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
-                   for x in (q, k, v))
+        q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v))
         if rotary_pos_emb is not None:
             q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
             k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-
         seq_length = q.size(1)
         q, k, v = (rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
-        attention_mask = torch.zeros([1, seq_length, seq_length],
-                                        device=q.device,
-                                        dtype=torch.bool)
+        attention_mask = torch.zeros(
+            [1, seq_length, seq_length], device=q.device, dtype=torch.bool
+        )
         for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i],
-                            cu_seqlens[i - 1]:cu_seqlens[i]] = True
+            attention_mask[
+                ...,
+                cu_seqlens[i - 1] : cu_seqlens[i],
+                cu_seqlens[i - 1] : cu_seqlens[i],
+            ] = True
 
         q = q.squeeze(0)
         k = k.squeeze(0)
         v = v.squeeze(0)
-        output = F.scaled_dot_product_attention(q,
-                                                k,
-                                                v,
-                                                attention_mask,
-                                                dropout_p=0.0)
+        output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
         output = output.unsqueeze(0)
         context_layer = rearrange(output, "b h s d -> b s h d ")
-     
 
-        context_layer = rearrange(context_layer,
-                                  "b s h d -> s b (h d)").contiguous()
+        context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
 
         output, _ = self.proj(context_layer)
         return output
-
 
 
 class Qwen2VisionBlock(nn.Module):
@@ -357,7 +353,9 @@ class Qwen2VisionRotaryEmbedding(nn.Module):
         self.dim = dim
 
     def forward(self, seqlen: int) -> torch.Tensor:
-        inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim))
+        inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim)
+        )
 
         seq = torch.arange(seqlen, device=inv_freq.device, dtype=inv_freq.dtype)
         freqs = torch.outer(seq, inv_freq)
@@ -396,7 +394,6 @@ class Qwen2VisionTransformer(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = embed_dim // num_heads
         self.rotary_pos_emb = Qwen2VisionRotaryEmbedding(head_dim // 2)
-
 
         self.blocks = nn.ModuleList(
             [
