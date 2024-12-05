@@ -14,6 +14,7 @@ class Router:
         policy: Load balancing policy to use. Options:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
+            - PolicyType.UserRoundRobin: Distribute requests in round-robin fashion, but different users
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
@@ -31,7 +32,7 @@ class Router:
         enable_fairness: Enable token-based fairness control for request distribution. Only used
             with CacheAware policy. Default: False
         fairness_fill_size: Initial/Refill token allocation size for fairness control when fairness is enabled.
-            Only used when enable_fairness is True. Default: 1024
+            Only used when enable_fairness is True. Default: 16384
     """
 
     def __init__(
@@ -47,7 +48,7 @@ class Router:
         max_tree_size: int = 2**24,
         verbose: bool = False,
         enable_fairness: bool = False,
-        fairness_fill_size: int = 1024,
+        fairness_fill_size: int = 16384,
     ):
         self._router = _Router(
             worker_urls=worker_urls,

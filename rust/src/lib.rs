@@ -8,6 +8,7 @@ pub mod tree;
 pub enum PolicyType {
     Random,
     RoundRobin,
+    UserRoundRobin,
     CacheAware,
 }
 
@@ -42,7 +43,7 @@ impl Router {
         max_tree_size = 2usize.pow(24),
         verbose = false,
         enable_fairness = false,
-        fairness_fill_size = 1024
+        fairness_fill_size = 16384
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -78,6 +79,7 @@ impl Router {
         let policy_config = match &self.policy {
             PolicyType::Random => router::PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
+            PolicyType::UserRoundRobin => router::PolicyConfig::UserRoundRobinConfig,
             PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,

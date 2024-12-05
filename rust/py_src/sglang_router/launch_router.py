@@ -42,7 +42,7 @@ class RouterArgs:
     
     # Fairness control
     enable_fairness: bool = False
-    fairness_fill_size: int = 1024
+    fairness_fill_size: int = 16384
 
     @staticmethod
     def add_cli_args(
@@ -87,7 +87,7 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware"],
+            choices=["random", "round_robin", "user_round_robin", "cache_aware"],
             help="Load balancing policy to use",
         )
         parser.add_argument(
@@ -173,6 +173,7 @@ def policy_from_str(policy_str: str) -> PolicyType:
     policy_map = {
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
+        "user_round_robin": PolicyType.UserRoundRobin,
         "cache_aware": PolicyType.CacheAware,
     }
     return policy_map[policy_str]

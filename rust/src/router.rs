@@ -2,6 +2,7 @@ use crate::tree::Tree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures_util::{StreamExt, TryStreamExt};
 use log::{debug, info};
 use std::collections::HashMap;
@@ -16,6 +17,10 @@ pub enum Router {
     RoundRobin {
         worker_urls: Vec<String>,
         current_index: AtomicUsize,
+    },
+    UserRoundRobin {
+        worker_urls: Vec<String>,
+        current_index_map: DashMap<String, usize>,
     },
     Random {
         worker_urls: Vec<String>,
@@ -101,6 +106,7 @@ pub enum Router {
 pub enum PolicyConfig {
     RandomConfig,
     RoundRobinConfig,
+    UserRoundRobinConfig,
     CacheAwareConfig {
         cache_threshold: f32,
         balance_abs_threshold: usize,
@@ -150,6 +156,13 @@ impl Router {
                 worker_urls,
                 current_index: std::sync::atomic::AtomicUsize::new(0),
             },
+            PolicyConfig::UserRoundRobinConfig => {
+                let current_index_map = DashMap::new();
+                Router::UserRoundRobin {
+                    worker_urls,
+                    current_index_map,
+                }
+            }
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
                 balance_abs_threshold,
@@ -222,6 +235,7 @@ impl Router {
     pub fn get_first(&self) -> Option<String> {
         match self {
             Router::RoundRobin { worker_urls, .. }
+            | Router::UserRoundRobin { worker_urls, .. }
             | Router::Random { worker_urls }
             | Router::CacheAware { worker_urls, .. } => {
                 if worker_urls.is_empty() {
@@ -255,6 +269,18 @@ impl Router {
                     )
                     .unwrap();
                 worker_urls[idx].clone()
+            }
+
+            Router::UserRoundRobin {
+                worker_urls,
+                current_index_map,
+            } => {
+                let user_id = get_uid_from_body(&body);
+                // if not exist, insert with 0
+                // else, plus 1
+                let mut current_index = current_index_map.entry(user_id).or_insert(0);
+                *current_index = (*current_index + 1) % worker_urls.len();
+                worker_urls[*current_index].clone()
             }
 
             Router::Random { worker_urls } => {

@@ -104,9 +104,9 @@ struct Args {
 
     #[arg(
         long,
-        default_value_t = 1024,
+        default_value_t = 16384,
         requires = "enable_fairness",
-        help = "Initial/Refill token allocation size for fairness control (only used when fairness is enabled). Default: 1024"
+        help = "Initial/Refill token allocation size for fairness control (only used when fairness is enabled). Default: 16384"
     )]
     fairness_fill_size: usize,
 }
