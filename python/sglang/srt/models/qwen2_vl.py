@@ -350,23 +350,19 @@ class Qwen2VisionPatchMerger(nn.Module):
         return out
 
 
-
 class Qwen2VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.theta = theta
         self.dim = dim
-        print("sg vision rotary embedding", dim, theta, inv_freq)
-        #self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen: int) -> torch.Tensor:
         inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim))
-        
+
         seq = torch.arange(seqlen, device=inv_freq.device, dtype=inv_freq.dtype)
         freqs = torch.outer(seq, inv_freq)
-        print("sg vision rotary embedding called", inv_freq.device, inv_freq.dtype)
-        return freqs.to("cuda:0")
+        return freqs
+
 
 class Qwen2VisionTransformer(nn.Module):
 
@@ -400,6 +396,7 @@ class Qwen2VisionTransformer(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = embed_dim // num_heads
         self.rotary_pos_emb = Qwen2VisionRotaryEmbedding(head_dim // 2)
+
 
         self.blocks = nn.ModuleList(
             [
@@ -456,7 +453,7 @@ class Qwen2VisionTransformer(nn.Module):
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size).to(grid_thw.device)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
