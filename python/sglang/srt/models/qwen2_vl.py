@@ -30,10 +30,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from vllm.config import CacheConfig, MultiModalConfig
 from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import QuickGELU
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
@@ -53,7 +55,13 @@ from sglang.srt.models.qwen2 import Qwen2Model
 logger = init_logger(__name__)
 
 # === Vision Inputs === #
+class OriginalQuickGELUActivation(nn.Module):
+    """
+    Applies GELU approximation that is fast but somewhat inaccurate. See: https://github.com/hendrycks/GELUs
+    """
 
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return input * torch.sigmoid(1.702 * input)
 
 class Qwen2VLImageInputs(TypedDict):
     pixel_values: torch.Tensor
@@ -91,7 +99,7 @@ class Qwen2VisionMLP(nn.Module):
         self,
         in_features: int,
         hidden_features: int = None,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Type[nn.Module] = OriginalQuickGELUActivation,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -201,25 +209,40 @@ class Qwen2VisionAttention(nn.Module):
         q, k, v = dist_utils.split_tensor_along_last_dim(x, 3)
         batch_size = q.shape[1]
 
-        q, k, v = [rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)]
+        q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
+                   for x in (q, k, v))
         if rotary_pos_emb is not None:
             q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
             k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = (seq_lens).max().item()
-        q, k, v = [rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v]]
 
-        output = torch.empty_like(q)
-        context_attention_fwd(
-            q, k, v, output, cu_seqlens, seq_lens, max_seqlen, is_causal=False
-        )
+        seq_length = q.size(1)
+        q, k, v = (rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
+        attention_mask = torch.zeros([1, seq_length, seq_length],
+                                        device=q.device,
+                                        dtype=torch.bool)
+        for i in range(1, len(cu_seqlens)):
+            attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i],
+                            cu_seqlens[i - 1]:cu_seqlens[i]] = True
 
-        context_layer = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
-        context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
+        q = q.squeeze(0)
+        k = k.squeeze(0)
+        v = v.squeeze(0)
+        output = F.scaled_dot_product_attention(q,
+                                                k,
+                                                v,
+                                                attention_mask,
+                                                dropout_p=0.0)
+        output = output.unsqueeze(0)
+        context_layer = rearrange(output, "b h s d -> b s h d ")
+     
+
+        context_layer = rearrange(context_layer,
+                                  "b s h d -> s b (h d)").contiguous()
 
         output, _ = self.proj(context_layer)
         return output
+
 
 
 class Qwen2VisionBlock(nn.Module):
@@ -229,7 +252,7 @@ class Qwen2VisionBlock(nn.Module):
         dim: int,
         num_heads: int,
         mlp_ratio: float,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Type[nn.Module] = OriginalQuickGELUActivation,
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -327,40 +350,23 @@ class Qwen2VisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen2VisionRotaryEmbedding(nn.Module):
 
+class Qwen2VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        self.dim = dim
-        self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._freqs_cached = None
-
-    def update_freqs_cache(self, seqlen: int) -> None:
-        if seqlen > self._seq_len_cached:
-            seqlen *= 2
-            self._seq_len_cached = seqlen
-            self.inv_freq = 1.0 / (
-                self.theta
-                ** (
-                    torch.arange(
-                        0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device
-                    )
-                    / self.dim
-                )
-            )
-            seq = torch.arange(
-                seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-            )
-            freqs = torch.outer(seq, self.inv_freq)
-            self._freqs_cached = freqs
+        self.theta = theta
+        self.dim = dim
+        print("sg vision rotary embedding", dim, theta, inv_freq)
+        #self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen: int) -> torch.Tensor:
-        self.update_freqs_cache(seqlen)
-        return self._freqs_cached[:seqlen]
-
+        inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim))
+        
+        seq = torch.arange(seqlen, device=inv_freq.device, dtype=inv_freq.dtype)
+        freqs = torch.outer(seq, inv_freq)
+        print("sg vision rotary embedding called", inv_freq.device, inv_freq.dtype)
+        return freqs.to("cuda:0")
 
 class Qwen2VisionTransformer(nn.Module):
 
@@ -499,7 +505,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         return num_image_tokens
 
     # Use grid_t * grid_w * grid_h to pad tokens for each image
-    # add replaced padding by unique image hash
+    # and replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         image_grid_thws = image_inputs.image_grid_thws
         pad_values = image_inputs.pad_values

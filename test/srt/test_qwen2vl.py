@@ -16,6 +16,14 @@ from pathlib import Path
 
 import torch.nn.functional as F
 
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import ServerArgs, PortArgs
+
 QWEN2_VL_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
 
 
@@ -28,10 +36,6 @@ class RawSGLangTest(unittest.IsolatedAsyncioTestCase):
         self.processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
-
-        # Path to the test PDF
-        self.test_pdf_path = Path(os.path.join(os.path.dirname(__file__), "gnarly_pdfs", "ambiguous.pdf"))
-        self.maxDiff = None
 
     async def test_vision_encoder(self):
         messages = [
@@ -64,20 +68,8 @@ class RawSGLangTest(unittest.IsolatedAsyncioTestCase):
             return_tensors="pt",
         )
 
-        print(self.model.visual)
-
         with torch.no_grad():
             hf_output = self.model.visual(inputs["pixel_values"].to(self.device), grid_thw=inputs["image_grid_thw"].to(self.device))
-
-        print("HF", hf_output, hf_output.shape)
-
-        from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-        from sglang.srt.model_executor.model_runner import ModelRunner
-        from sglang.srt.sampling.sampling_params import SamplingParams
-        from sglang.srt.hf_transformers_utils import get_tokenizer
-        from sglang.srt.server_args import ServerArgs, PortArgs
 
         model_config = ModelConfig(
             QWEN2_VL_MODEL,
@@ -85,7 +77,6 @@ class RawSGLangTest(unittest.IsolatedAsyncioTestCase):
         )
         
         server_args = ServerArgs(model_path=QWEN2_VL_MODEL)
-        # Initialize model runner
         model_runner = ModelRunner(
             model_config=model_config,
             mem_fraction_static=0.8,
@@ -96,11 +87,9 @@ class RawSGLangTest(unittest.IsolatedAsyncioTestCase):
             server_args=server_args,
         )
 
-        print(model_runner.model.visual)
         with torch.no_grad():
             sglang_output = model_runner.model.visual(inputs["pixel_values"].to(self.device), grid_thw=inputs["image_grid_thw"].to(self.device))
 
-        print("SGLANG", sglang_output, sglang_output.shape)
 
         # Convert to float32 for numerical stability if needed
         hf = hf_output.float()
@@ -154,3 +143,5 @@ class RawSGLangTest(unittest.IsolatedAsyncioTestCase):
             # Format the index tuple and values
             idx_str = str(idx)
             print(f"{idx_str:<30}{diff_val:<15.6f}{hf_val:<15.6f}{sg_val:.6f}")
+
+        np.testing.assert_allclose(hf_np, sg_np)
