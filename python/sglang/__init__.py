@@ -66,7 +66,7 @@ from sglang.version import __version__
 
 __all__ += ["__version__"]
 
-# SGL Backends
+# SGLang Backends
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import LazyImport
 

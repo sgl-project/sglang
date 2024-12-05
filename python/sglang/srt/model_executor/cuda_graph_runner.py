@@ -47,7 +47,7 @@ def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
                 if "FusedMoE" in sub.__class__.__name__:
                     if batch_size == 1:
                         # The performance of torch.compile on this layer is not always good when bs > 1,
-                        # so we decide to skip it for now.
+                        # so we decide to only use torch.compile when bs =1
                         sub._forward_method = fused_moe_forward_native
                 else:
                     sub._forward_method = sub.forward_native

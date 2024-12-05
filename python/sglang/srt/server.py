@@ -329,7 +329,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         )
 
 
-@app.api_route("/encode", methods=["POST", "PUT"])
+@app.api_route("/classify", methods=["POST", "PUT"])
 @time_func_latency
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
