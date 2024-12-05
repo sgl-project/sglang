@@ -290,119 +290,72 @@ impl Router {
                 let selected_url = if *enable_fairness {
                     /*
 
-                       1. workers = filter the worker with fairness_counter >0:
-                       2. if (len(workers)==0):refill, go back to step 1
-                       3. else:
-                       4. choose worker with hit rate > threshold
-                       5. if no worker,
-                       6. choose shortest q or shortest tree
+                       1. Iterate all workers to find their match rate
+                       2. Look at the first one, if quantum > 0, send
+                       3. Look at the second one, if quantum > 0, send
+                       4. Look at the remaining, sorted by the queue length, if quantum > 0, send
+                       5. If no send, refill the quantum for all workers
 
                     */
 
                     let user_id = get_uid_from_body(&body);
                     let mut fairness_counter = fairness_counter.lock().unwrap();
 
-                    // Initialize counter for new user if needed
+                    // init counter for new user if needed
                     if !fairness_counter.contains_key(&user_id) {
-                        let mut worker_counters = HashMap::new();
-                        for worker_url in worker_urls.iter() {
-                            worker_counters.insert(worker_url.clone(), *fairness_fill_size as i32);
+                        let mut new_counter = HashMap::new();
+                        for url in worker_urls {
+                            new_counter.insert(url.clone(), *fairness_fill_size as i32);
                         }
-                        fairness_counter.insert(user_id.to_string(), worker_counters.clone());
-
-                        info!(
-                            "[FAIRNESS] New user initialized. user_id: {}, initial_counters: {:?}",
-                            user_id, worker_counters
-                        );
+                        fairness_counter.insert(user_id.clone(), new_counter);
                     }
 
-                    let mut selected_worker = None;
 
-                    // Keep trying until we find a worker
+                    // list: [(url, len, queue_len), ...]
+                    // sort by the len in descending order
+                    let mut url_list = vec![];
+                    for url in worker_urls {
+                        let len = tree.prefix_match_tenant(&text, &url).chars().count();
+                        let queue_len = running_queue.get(url).unwrap_or(&0);
+                        url_list.push((url.clone(), len, *queue_len));
+                    }
+
+                    url_list.sort_by(|a, b| b.1.cmp(&a.1));
+
+                    // sort the items after 2nd item by the queue length in ascending order
+                    if url_list.len() > 2 {
+                        url_list[2..].sort_by_key(|(_, _, queue_len)| *queue_len);
+                    }
+                    
+                    println!("url_list: {:?}", url_list);
+
+                    let user_counter = fairness_counter.get_mut(&user_id).unwrap();
+
+                    let mut ret_url = "placeholder".to_string();
+
                     loop {
-                        // Get available workers with positive counter
-                        let available_workers: Vec<String> =
-                            if let Some(worker_counters) = fairness_counter.get(&user_id) {
-                                worker_counters
-                                    .iter()
-                                    .filter(|(_url, &count)| count > 0)
-                                    .map(|(url, _)| url.clone())
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-
-                        if !available_workers.is_empty() {
-                            // Try to find worker with best cache hit among available workers
-                            let mut best_match_length = 0;
-
-                            for worker_url in &available_workers {
-                                let prefix = tree.prefix_match_tenant(&text, worker_url);
-                                let match_length = prefix.chars().count();
-                                let match_rate = match_length as f32 / text.chars().count() as f32;
-
-                                if match_rate > *cache_threshold && match_length > best_match_length
-                                {
-                                    best_match_length = match_length;
-                                    selected_worker = Some(worker_url.clone());
-                                }
+                        let mut can_break = false;
+                        for (url, len, _) in url_list.iter() {
+                            if *user_counter.get(url).unwrap() > 0 {
+                                *user_counter.get_mut(url).unwrap() -= *len as i32;
+                                ret_url = url.clone();
+                                can_break = true;
+                                break;
                             }
+                        }
 
-                            // If no good cache hit, choose shortest queue
-                            if selected_worker.is_none() {
-                                selected_worker = Some(
-                                    available_workers
-                                        .iter()
-                                        .min_by_key(|url| {
-                                            running_queue.get(*url).unwrap_or(&usize::MAX)
-                                        })
-                                        .cloned()
-                                        .unwrap_or_else(|| tree.get_smallest_tenant()),
-                                );
-                            }
-
+                        if can_break {
                             break;
-                        } else {
-                            // Refill counters and try again
-                            info!(
-                                "[FAIRNESS] No available workers, refilling counters for user_id: {}",
-                                user_id
-                            );
-                            if let Some(worker_counters) = fairness_counter.get_mut(&user_id) {
-                                for worker_url in worker_urls.iter() {
-                                    let current_count = worker_counters
-                                        .get(&worker_url.clone())
-                                        .unwrap_or(&0)
-                                        .to_owned();
-                                    let new_count = current_count + (*fairness_fill_size as i32);
-                                    worker_counters.insert(worker_url.clone(), new_count);
-                                    info!(
-                                        "[FAIRNESS] Worker refilled. user_id: {}, worker: {}, prev_count: {}, added: {}, new_count: {}",
-                                        user_id, worker_url, current_count, fairness_fill_size, new_count
-                                    );
-                                }
-                            }
-                            // Continue loop to try again with refilled counters
                         }
+
+                        // refill the quantum for all workers
+                        for url in worker_urls {
+                            *user_counter.get_mut(url).unwrap() += *fairness_fill_size as i32;
+                        }
+
                     }
 
-                    // Update fairness counter for selected worker
-                    let selected_worker = selected_worker.unwrap();
-                    if let Some(worker_counters) = fairness_counter.get_mut(&user_id) {
-                        let deduction = text.chars().count();
-                        if let Some(count) = worker_counters.get_mut(&selected_worker) {
-                            *count = count.saturating_sub(deduction as i32);
-                            info!(
-                                "[FAIRNESS] Updated counter. user_id: {}, worker: {}, deduction: {}, new_count: {}",
-                                user_id, selected_worker, deduction, *count
-                            );
-                        }
-                    }
-
-                    // Print all counters for debugging
-                    info!("[FAIRNESS] Current counters: {:?}", fairness_counter);
-
-                    selected_worker
+                    ret_url
                 } else {
                     let selected_url = if is_imbalanced {
                         // Log load balancing trigger and current queue state
