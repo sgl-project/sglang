@@ -301,6 +301,7 @@ class LlamaForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.torchao_config = global_server_args_dict["torchao_config"]
+        self.modelopt_config = global_server_args_dict["modelopt_config"]
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
