@@ -30,12 +30,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from vllm.config import CacheConfig, MultiModalConfig
 from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import QuickGELU
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
@@ -49,6 +47,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 
 logger = init_logger(__name__)
@@ -500,7 +499,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         return num_image_tokens
 
     # Use grid_t * grid_w * grid_h to pad tokens for each image
-    # and replaced padding by unique image hash
+    # add replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         image_grid_thws = image_inputs.image_grid_thws
         pad_values = image_inputs.pad_values
@@ -536,7 +535,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     def __init__(
         self,
         config: Qwen2VLConfig,
-        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -597,13 +595,15 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             image_grid_thw: Tensor `(n_images, 3)` of image 3D grid in LLM.
                 `None` if no images are passed.
         """
+        if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
+            positions = forward_batch.mrope_positions
+
         image_inputs = None
         if forward_batch.image_inputs is not None:
             image_inputs = [
                 img for img in forward_batch.image_inputs if img is not None
             ]
-        if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
-            positions = forward_batch.mrope_positions
+
         if (
             forward_batch.forward_mode.is_decode()
             or image_inputs is None
@@ -616,6 +616,11 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
+
+            # Clamp input ids. This is because the input_ids for the image tokens are
+            # filled with the hash values of the image for the prefix matching in the radix attention.
+            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
             inputs_embeds = self.model.embed_tokens(input_ids)
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
@@ -661,7 +666,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head.weight, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -678,8 +683,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

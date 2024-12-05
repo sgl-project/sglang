@@ -9,7 +9,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-# List of packages to check versions for
+# List of packages to check versions
 PACKAGE_LIST = [
     "sglang",
     "flashinfer",
@@ -22,18 +22,24 @@ PACKAGE_LIST = [
     "hf_transfer",
     "huggingface_hub",
     "interegular",
+    "modelscope",
+    "orjson",
+    "outlines",
+    "packaging",
     "psutil",
     "pydantic",
     "multipart",
     "zmq",
+    "torchao",
     "uvicorn",
     "uvloop",
     "vllm",
-    "outlines",
+    "xgrammar",
     "openai",
     "tiktoken",
     "anthropic",
     "litellm",
+    "decord",
 ]
 
 

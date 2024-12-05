@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgl-kernel"
+version = "0.0.2"
+description = "Kernel Library for SGLang"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: C++",
+  "Programming Language :: CUDA",
+]
+dependencies = [
+  "torch",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[tool.setuptools]
+package-dir = {"sgl_kernel" = "src/sgl-kernel"}
+packages = ["sgl_kernel", "sgl_kernel.ops", "sgl_kernel.csrc"]
+
+[tool.wheel]
+exclude = [
+  "dist*",
+  "tests*",
+]

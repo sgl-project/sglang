@@ -22,6 +22,7 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    verbose: bool,
 }
 
 #[pymethods]
@@ -36,7 +37,8 @@ impl Router {
         balance_abs_threshold = 32,
         balance_rel_threshold = 1.0001,
         eviction_interval_secs = 60,
-        max_tree_size = 2usize.pow(24)
+        max_tree_size = 2usize.pow(24),
+        verbose = false
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -48,6 +50,7 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        verbose: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -59,14 +62,11 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            verbose,
         })
     }
 
     fn start(&self) -> PyResult<()> {
-        let host = self.host.clone();
-        let port = self.port;
-        let worker_urls = self.worker_urls.clone();
-
         let policy_config = match &self.policy {
             PolicyType::Random => router::PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
@@ -80,9 +80,15 @@ impl Router {
         };
 
         actix_web::rt::System::new().block_on(async move {
-            server::startup(host, port, worker_urls, policy_config)
-                .await
-                .unwrap();
+            server::startup(server::ServerConfig {
+                host: self.host.clone(),
+                port: self.port,
+                worker_urls: self.worker_urls.clone(),
+                policy_config,
+                verbose: self.verbose,
+            })
+            .await
+            .unwrap();
         });
 
         Ok(())

@@ -93,6 +93,23 @@ TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 TORCHINDU
 #Inference with large improvement on AMD GPU
 TORCHINDUCTOR_FREEZING=1 your_script.sh
 ```
+## 4. Fused MOE kernel
+To maximize moe kernel efficiency, need to use below scripts to find out the best launch configuration
+
+### Key parameters:
+- **--model**: what moe model type to do tuning, it will automatically decide the size of d_model, model_intermediate_size, num_layers
+- **--tp-size**: simulate the whole model run configuration to set the dimension size using tp correctly
+- **--batch**: M dimension size of moe kernel, for prefill moe kernel the value is batch*input_len, for decode moe kernel the value is batch
+- **--dtype**: computation type
+
+```bash
+#Tuning
+#for example, we have one case like this "python3 -m sglang.bench_latency --model dummy_grok1/ --load-format dummy --tokenizer-path Xenova/grok-1-tokenizer --tp 8 --batch-size 32 --input 1024 --output 8 --attention-backend triton --sampling-backend pytorch --quant fp" to run, it defined batch-size 32 input lenth 1024 and output length 8, from "--batch" in moe view point, the prefill batch is 32*1024 = 32768, the decode batch is 32*1(only one output token generated in each run).
+#so we can tune decode moe use below command
+python benchmark_moe_rocm.py --model grok1 --tp-size 8 --dtype float8 --batch "32"
+# and use this command to tune prefill moe
+python benchmark_moe_rocm.py --model grok1 --tp-size 8 --dtype float8 --batch "32768"
+```
 
 ## Reference
 

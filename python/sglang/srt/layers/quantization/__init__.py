@@ -117,10 +117,44 @@ def fp8_get_quant_method(self, layer, prefix):
     return None
 
 
+def gptq_get_quant_method(self, layer, prefix):
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.gptq_marlin import (
+        GPTQMarlinLinearMethod,
+        GPTQMarlinMoEMethod,
+    )
+
+    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+
+    if isinstance(layer, LinearBase):
+        return GPTQMarlinLinearMethod(self)
+    elif isinstance(layer, FusedMoE):
+        return GPTQMarlinMoEMethod(self)
+    return None
+
+
+def awq_get_quant_method(self, layer, prefix):
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.awq_marlin import (
+        AWQMarlinLinearMethod,
+        AWQMoEMethod,
+    )
+
+    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+
+    if isinstance(layer, LinearBase):
+        return AWQMarlinLinearMethod(self)
+    elif isinstance(layer, FusedMoE):
+        return AWQMoEMethod(self)
+    return None
+
+
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
     setattr(Fp8MoEMethod, "apply", fp8_moe_apply)
     setattr(Fp8Config, "get_quant_method", fp8_get_quant_method)
+    setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
+    setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
 
 
 # Apply patches when module is imported

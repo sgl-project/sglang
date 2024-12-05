@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.3.6 -t testImage -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.0 -t v0.4.0-rocm620 -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE="rocm/vllm-dev:20241022"
@@ -33,6 +33,7 @@ RUN python -m pip cache purge
 # Performance environment variable.
 
 ENV HIP_FORCE_DEV_KERNARG=1
+ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV NCCL_MIN_NCHANNELS=112
 
