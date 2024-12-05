@@ -187,6 +187,8 @@ class ServerArgs:
                     self.cuda_graph_max_bs = 8
                 else:
                     self.cuda_graph_max_bs = 80
+            else:
+                self.cuda_graph_max_bs = 160
 
         # Choose kernel backends
         if self.attention_backend is None:
