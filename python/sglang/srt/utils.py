@@ -950,6 +950,7 @@ def get_nvgpu_memory_capacity():
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
         )
 
+
 def get_hpu_memory_capacity():
     try:
         # Run hl-smi and capture the output
