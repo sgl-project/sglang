@@ -19,3 +19,6 @@ pip install cutex
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
+
+# Temporarily disable CUDA graphs for cascade attn debug
+export TORCH_DISABLE_CUDA_GRAPHS=1
