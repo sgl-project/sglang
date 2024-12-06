@@ -27,6 +27,8 @@ from transformers import (
     MistralConfig,
     Qwen2Config,
     SiglipVisionModel,
+    PixtralConfig, 
+    PixtralForCausalLM
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
@@ -530,5 +532,39 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
+class LlavaPixtralForCausalLM(LlavaBaseForCausalLM):
+    def __init__(
+        self,
+        config: LlavaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__()
 
-EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
+        self.config = config
+        self.vision_tower = None
+
+        if getattr(self.config, "vision_config", None) is None:
+            self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
+        
+        if getattr(self.config, "text_config", None) is None:
+            self.config.text_config = PixtralConfig(self.config._name_or_path)
+
+        self.config.vision_config.hidden_size = config.mm_hidden_size
+        self.config.text_config.hidden_size = config.hidden_size
+
+        if getattr(self.config, "projector_hidden_act", None) is None:
+            self.config.projector_hidden_act = "gelu"
+        
+        if getattr(self.config, "image_token_index", None) is None:
+            self.config.image_token_index = 32001
+
+        self.multi_modal_projector = LlavaMultiModalProjector(config)
+        self.language_model = PixtralForCausalLM(config, quant_config=quant_config)
+
+        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
+            self.language_model.model.image_newline = nn.Parameter(
+                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
+            )
+            
+            
+EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM, LlavaPixtralForCausalLM]
