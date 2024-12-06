@@ -47,31 +47,10 @@
   - `python -m sglang.launch_server --model-path internlm/internlm2-7b-reward --is-embedding --trust-remote-code`
 
 ## How to Support a New Model
-There are two ways to support a new model in SGLang:
 
-1. To support a new model in SGLang, you only need to add a single file under [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
+To support a new model in SGLang, you only need to add a single file under [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
 You can learn from existing model implementations and create new files for the new models.
 For most models, you should be able to find a similar model to start with (e.g., starting from Llama).
-2. You can also add your new model to `ModelRegistry.models` before launching the server.
-
-```python
-from sglang.srt.models.registry import ModelRegistry
-from sglang.srt.server import launch_server
-
-# for a single model, you can add it to the registry
-ModelRegistry.models[model_name] = model_class
-
-# for multiple models, you can imitate the import_model_classes() function in sglang/srt/models/registry.py
-@lru_cache()
-def import_new_model_classes():
-    model_arch_name_to_cls = {}
-    ...
-    return model_arch_name_to_cls
-
-ModelRegistry.models.update(import_new_model_classes())
-
-launch_server(server_args)
-```
 
 ### Test the correctness
 
@@ -101,3 +80,30 @@ To port a model from vLLM to SGLang, you can compare these two files [SGLang Lla
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.
   - Add `EntryClass` at the end.
+
+### Registering an external model implementation
+
+In addition to the methods described above, you can also register your new model with the `ModelRegistry` before launching the server. This approach is useful if you want to integrate your model without needing to modify the source code.
+
+Here is how you can do it:
+
+```python
+from sglang.srt.models.registry import ModelRegistry
+from sglang.srt.server import launch_server
+
+# for a single model, you can add it to the registry
+ModelRegistry.models[model_name] = model_class
+
+# for multiple models, you can imitate the import_model_classes() function in sglang/srt/models/registry.py
+from functools import lru_cache
+
+@lru_cache()
+def import_new_model_classes():
+    model_arch_name_to_cls = {}
+    ...
+    return model_arch_name_to_cls
+
+ModelRegistry.models.update(import_new_model_classes())
+
+launch_server(server_args)
+```
