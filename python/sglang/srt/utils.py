@@ -201,6 +201,18 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
 
+    elif device == "hpu":
+        num_gpus = torch.hpu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.hpu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
+                "which may cause useless memory allocation for torch HPU context.",
+            )
+
+        free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
+
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
             torch.device(device, gpu_id)
@@ -939,6 +951,37 @@ def get_nvgpu_memory_capacity():
         )
 
 
+def get_hpu_memory_capacity():
+    try:
+        # Run hl-smi and capture the output
+        result = subprocess.run(
+            ["hl-smi --query | grep 'Total'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "hl-smi not found. Ensure Habana drivers are installed and accessible."
+        )
+
+
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -1060,6 +1103,13 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
             ) from e
 
     return major, minor
+
+
+def get_compiler_backend() -> str:
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return "hpu_backend"
+
+    return "inductor"
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
