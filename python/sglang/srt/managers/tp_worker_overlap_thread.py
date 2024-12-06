@@ -80,6 +80,7 @@ class TpModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
+        self.scheduler_stream = torch.get_device_module(self.device).current_stream()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -191,7 +192,7 @@ class TpModelWorkerClient:
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.
-        torch.get_device_module(self.device).current_stream().synchronize()
+        self.scheduler_stream.synchronize()
 
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
