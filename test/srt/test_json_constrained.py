@@ -13,37 +13,49 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
 
+def setup_class(cls, backend: str, disable_overlap: bool):
+    cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    cls.base_url = DEFAULT_URL_FOR_TEST
+    cls.json_schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "pattern": "^[\\w]+$"},
+                "population": {"type": "integer"},
+            },
+            "required": ["name", "population"],
+        }
+    )
+
+    other_args = [
+        "--max-running-requests",
+        "10",
+        "--grammar-backend",
+        backend,
+    ]
+
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
+
+    cls.process = popen_launch_server(
+        cls.model,
+        cls.base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+    )
+
+
 class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.json_schema = json.dumps(
-            {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "pattern": "^[\\w]+$"},
-                    "population": {"type": "integer"},
-                },
-                "required": ["name", "population"],
-            }
-        )
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=300,
-            other_args=[
-                "--max-running-requests",
-                "10",
-                "--grammar-backend",
-                "outlines",
-            ],
-        )
+        setup_class(cls, backend="outlines", disable_overlap=False)
+        cls.check_jump_forward = False
 
     @classmethod
     def tearDownClass(cls):
@@ -84,11 +96,13 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
         self.assertIsInstance(js_obj["population"], int)
 
         # Make sure jump forward is triggered
-        # NOTE: This is skipped because overlap scheduler does not support jump forward
-        # self.assertGreater(
-        #     ret["meta_info"]["completion_tokens"],
-        #     ret["meta_info"]["completion_tokens_wo_jump_forward"],
-        # )
+        # NOTE: The overlap scheduler does not support jump forward so we only do this test
+        # when --disable-overlap-schedule is set.
+        if self.check_jump_forward:
+            self.assertGreater(
+                ret["meta_info"]["completion_tokens"],
+                ret["meta_info"]["completion_tokens_wo_jump_forward"],
+            )
 
     def test_json_generate(self):
         self.run_decode(json_schema=self.json_schema)
@@ -127,32 +141,18 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
             list(executor.map(self.run_decode, json_schemas))
 
 
+class TestJumpForwardOutlinesBackend(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="outlines", disable_overlap=True)
+        cls.check_jump_forward = True
+
+
 class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.json_schema = json.dumps(
-            {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "population": {"type": "integer"},
-                },
-                "required": ["name", "population"],
-            }
-        )
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=300,
-            other_args=[
-                "--max-running-requests",
-                "10",
-                "--grammar-backend",
-                "xgrammar",
-            ],
-        )
+        setup_class(cls, backend="xgrammar", disable_overlap=False)
+        cls.check_jump_forward = False
 
 
 if __name__ == "__main__":
