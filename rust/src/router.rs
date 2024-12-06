@@ -236,9 +236,9 @@ impl Router {
                 worker_urls.read().unwrap()[idx].clone()
             }
 
-            Router::Random { worker_urls } => {
-                worker_urls.read().unwrap()[rand::random::<usize>() % worker_urls.read().unwrap().len()].clone()
-            }
+            Router::Random { worker_urls } => worker_urls.read().unwrap()
+                [rand::random::<usize>() % worker_urls.read().unwrap().len()]
+            .clone(),
 
             Router::CacheAware {
                 worker_urls,

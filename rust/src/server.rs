@@ -1,6 +1,8 @@
 use crate::router::PolicyConfig;
 use crate::router::Router;
-use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder, put, delete};
+use actix_web::{
+    delete, get, post, put, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
+};
 use bytes::Bytes;
 use env_logger::Builder;
 use log::{info, LevelFilter};
@@ -136,8 +138,10 @@ async fn add_worker(
 ) -> impl Responder {
     let worker_url = match query.get("url") {
         Some(url) => url.to_string(),
-        None => return HttpResponse::BadRequest()
-            .body("Worker URL required. Provide 'url' query parameter"),
+        None => {
+            return HttpResponse::BadRequest()
+                .body("Worker URL required. Provide 'url' query parameter")
+        }
     };
     data.router.add_worker(worker_url);
     HttpResponse::Ok().finish()
