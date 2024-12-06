@@ -130,6 +130,20 @@ class CudaGraphRunner:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+
+        if max(self.capture_bs) > model_runner.req_to_token_pool.size:
+            # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+            # is very samll. We add more values here to make sure we capture the maximum bs.
+            self.capture_bs = list(
+                sorted(
+                    set(
+                        self.capture_bs
+                        + [model_runner.req_to_token_pool.size - 1]
+                        + [model_runner.req_to_token_pool.size]
+                    )
+                )
+            )
+
         self.capture_bs = [
             bs
             for bs in self.capture_bs
