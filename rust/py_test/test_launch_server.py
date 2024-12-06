@@ -158,9 +158,7 @@ class TestEvalAccuracyMini(unittest.TestCase):
         self.other_process.append(worker_process)
         # 2. use /add_worker api to add it the the router
         with requests.Session() as session:
-            response = session.post(
-                f"{self.base_url}/add_worker?url={worker_url}"
-            )
+            response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
             print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(response.status_code, 200)
         # 3. run mmlu
