@@ -90,6 +90,8 @@ def popen_launch_server(
         host,
         "--port",
         port,
+        "--base-gpu-id",
+        "1",
     ]
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
