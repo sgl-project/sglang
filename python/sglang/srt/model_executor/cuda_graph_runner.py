@@ -369,7 +369,6 @@ class CudaGraphRunner:
             seq_lens,
             encoder_lens,
             spec_info,
-            self.model_runner.is_draft_runner,
             forward_batch=forward_batch,
         )
 
@@ -465,7 +464,6 @@ class CudaGraphRunner:
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 next_token_logprobs=next_token_logprobs,
-                next_token_logits_bak=next_token_logits,
                 hidden_states=hidden_states,
             )
             return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
@@ -480,7 +478,6 @@ class CudaGraphRunner:
         else:
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
-                next_token_logits_bak=next_token_logits,
                 hidden_states=hidden_states,
             )
 

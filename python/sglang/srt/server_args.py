@@ -144,15 +144,15 @@ class ServerArgs:
 
     # speculative decoding
     draft_model_path: Optional[str] = None
-    speculative_algorithm: SpeculativeAlgorithm = None
-    num_speculative_steps: int = None
+    speculative_algorithm: Optional[SpeculativeAlgorithm] = None
+    num_speculative_steps: Optional[int] = None
     # should been set as 2^n
-    num_draft_tokens: int = None
+    num_draft_tokens: Optional[int] = None
     # should been set as [1, 2, 4, 8]
-    eagle_topk: int = None
+    eagle_topk: Optional[int] = None
     # should not been set by cli, it is only a placeholder
     # which would be set and used in model_runner
-    draft_runner_cache_size: int = None
+    draft_runner_cache_size: Optional[int] = None
 
     def __post_init__(self):
         # Set missing default values

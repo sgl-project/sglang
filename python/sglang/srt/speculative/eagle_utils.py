@@ -584,7 +584,7 @@ class EagleVerifyInput(SpecVerifyInput):
         return kv_indices, cum_kv_seq_len, kv_last_page_len, qo_indptr
 
     def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
-        predict = torch.argmax(logits_output.next_token_logits_bak, dim=-1)
+        predict = torch.argmax(logits_output.next_token_logits, dim=-1)
         predict = torch.cat(
             [predict, torch.full([1], -1, dtype=torch.long, device="cuda")], dim=-1
         )
@@ -665,7 +665,5 @@ class EagleVerifyInput(SpecVerifyInput):
             draft_input.accept_length = accept_length[unfinished_index]
             draft_input.unfinished_index = unfinished_index
 
-        logits_output.next_token_logits = logits_output.next_token_logits_bak[
-            accept_index
-        ]
+        logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         return draft_input, logits_output, verified_id, finished_extend_len

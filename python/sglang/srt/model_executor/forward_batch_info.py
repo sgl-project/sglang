@@ -298,12 +298,6 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
         )
 
-        if (
-            ret.spec_info is not None
-            and getattr(ret.spec_info, "positions", None) is not None
-        ):
-            ret.positions = ret.spec_info.positions
-
         if ret.global_num_tokens is not None:
             max_len = max(ret.global_num_tokens)
             ret.gathered_buffer = torch.zeros(
@@ -347,6 +341,12 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        if (
+            ret.spec_info is not None
+            and getattr(ret.spec_info, "positions", None) is not None
+        ):
+            ret.positions = ret.spec_info.positions
 
         return ret
 

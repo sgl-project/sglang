@@ -41,9 +41,6 @@ class LogitsProcessorOutput:
     # Used by speculative inference (eagle)
     # The output of transformer layers
     hidden_states: Optional[torch.Tensor] = None
-    # backup of next_token_logits when use cuda graph
-    # id(next_token_logits_bak) == id(next_token_logits)
-    next_token_logits_bak: Optional[torch.Tensor] = None
 
     # The normlaized logprobs of prompts.  shape: [#seq]
     normalized_prompt_logprobs: torch.Tensor = None
@@ -233,7 +230,6 @@ class LogitsProcessor(nn.Module):
                         else None
                     )
                 ),
-                next_token_logits_bak=last_logits,
             )
         else:
             last_logprobs = torch.nn.functional.log_softmax(last_logits, dim=-1)
