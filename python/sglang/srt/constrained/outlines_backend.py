@@ -85,6 +85,10 @@ class OutlinesGrammar(BaseGrammarObject):
     ) -> torch.Tensor:
         return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
 
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask
+
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         tokens = torch.tensor(
             self.guide.get_next_instruction(self.state).tokens, dtype=torch.int64
