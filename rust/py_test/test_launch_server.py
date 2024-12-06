@@ -73,7 +73,7 @@ class TestEvalAccuracyMini(unittest.TestCase):
         cls.process = popen_launch_router(
             cls.model,
             cls.base_url,
-            dp_size=1,
+            dp_size=2,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         )
 
