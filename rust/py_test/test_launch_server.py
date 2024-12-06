@@ -45,6 +45,8 @@ def popen_launch_router(
         port,
         "--dp",
         str(dp_size),  # Convert dp_size to string
+        "--router-eviction-interval",
+        "5",  # frequent eviction for testing
     ]
 
     # Use current environment

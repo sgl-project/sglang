@@ -1,8 +1,6 @@
 use crate::router::PolicyConfig;
 use crate::router::Router;
-use actix_web::{
-    delete, get, post, put, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
-};
+use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use bytes::Bytes;
 use env_logger::Builder;
 use log::{info, LevelFilter};
