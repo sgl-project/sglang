@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 @dataclasses.dataclass
