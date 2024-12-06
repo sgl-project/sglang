@@ -58,6 +58,7 @@ def popen_launch_router(
             try:
                 response = session.get(f"{base_url}/health")
                 if response.status_code == 200:
+                    print(f"Router {base_url} is healthy")
                     return process
             except requests.RequestException:
                 pass
@@ -102,6 +103,7 @@ def popen_launch_server(
             try:
                 response = session.get(f"{base_url}/health")
                 if response.status_code == 200:
+                    print(f"Server {base_url} is healthy")
                     return process
             except requests.RequestException:
                 pass
@@ -129,22 +131,22 @@ class TestEvalAccuracyMini(unittest.TestCase):
         for process in cls.other_process:
             kill_process_tree(process.pid)
 
-    # def test_mmlu(self):
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=64,
-    #         num_threads=32,
-    #         temperature=0.1,
-    #     )
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+            temperature=0.1,
+        )
 
-    #     metrics = run_eval(args)
-    #     score = metrics["score"]
-    #     THRESHOLD = 0.65
-    #     passed = score >= THRESHOLD
-    #     msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
-    #     self.assertGreaterEqual(score, THRESHOLD, msg)
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
 
     def test_add_worker(self):
         # 1. start a worker, and wait until it is healthy
@@ -157,8 +159,9 @@ class TestEvalAccuracyMini(unittest.TestCase):
         # 2. use /add_worker api to add it the the router
         with requests.Session() as session:
             response = session.post(
-                f"{self.base_url}/add_worker", json={"url": worker_url}
+                f"{self.base_url}/add_worker?url={worker_url}"
             )
+            print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(response.status_code, 200)
         # 3. run mmlu
         args = SimpleNamespace(

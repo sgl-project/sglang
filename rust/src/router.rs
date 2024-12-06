@@ -335,7 +335,10 @@ impl Router {
             // For non-streaming requests, get response first
             let response = match res.bytes().await {
                 Ok(body) => HttpResponse::build(status).body(body.to_vec()),
-                Err(_) => HttpResponse::InternalServerError().finish(),
+                Err(e) => {
+                    let error_msg = format!("Failed to get response body: {}", e);
+                    HttpResponse::InternalServerError().body(error_msg)
+                }
             };
 
             // Then decrement running queue counter if using CacheAware
