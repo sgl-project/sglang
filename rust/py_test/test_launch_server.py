@@ -92,7 +92,11 @@ class TestEvalAccuracyMini(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
 
 
 if __name__ == "__main__":
