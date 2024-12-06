@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm import _custom_ops as ops
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -30,6 +31,7 @@ from vllm.distributed import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.ep_moe.layer import EPMoE
 from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -112,12 +114,12 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.experts = FusedMoE(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=True,
@@ -833,7 +835,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -894,7 +897,19 @@ class DeepseekV2ForCausalLM(nn.Module):
         if not global_server_args_dict["disable_mla"]:
             for layer_id in range(self.config.num_hidden_layers):
                 self_attn = self.model.layers[layer_id].self_attn
-                w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
+                if hasattr(self_attn.kv_b_proj, "qweight"):
+                    # AWQ compatible
+                    w = ops.awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                        0,
+                        0,
+                        0,
+                    ).T
+                else:
+                    w = self_attn.kv_b_proj.weight
+                w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)

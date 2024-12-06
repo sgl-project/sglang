@@ -94,6 +94,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # Expert parallelism
+    ep_size: int = 1
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -131,6 +133,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_ep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -184,8 +187,12 @@ class ServerArgs:
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
+            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
             if gpu_mem is not None and gpu_mem < 25_000:
-                self.cuda_graph_max_bs = 8
+                if self.tp_size < 4:
+                    self.cuda_graph_max_bs = 8
+                else:
+                    self.cuda_graph_max_bs = 80
             else:
                 self.cuda_graph_max_bs = 160
 
@@ -222,6 +229,12 @@ class ServerArgs:
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap scheduler is disabled."
+            )
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         # GGUF
@@ -533,6 +546,14 @@ class ServerArgs:
                 "shortest_queue",
             ],
         )
+        # Expert parallelism
+        parser.add_argument(
+            "--expert-parallel-size",
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -689,6 +710,11 @@ class ServerArgs:
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
+            "--enable-ep-moe",
+            action="store_true",
+            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
@@ -767,6 +793,7 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
+        args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
