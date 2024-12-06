@@ -2,6 +2,7 @@ use crate::tree::Tree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures_util::{StreamExt, TryStreamExt};
 use log::{debug, info};
 use std::collections::HashMap;
@@ -16,6 +17,10 @@ pub enum Router {
     RoundRobin {
         worker_urls: Vec<String>,
         current_index: AtomicUsize,
+    },
+    UserRoundRobin {
+        worker_urls: Vec<String>,
+        current_index_map: DashMap<String, usize>,
     },
     Random {
         worker_urls: Vec<String>,
@@ -88,7 +93,12 @@ pub enum Router {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
-        _eviction_thread: Option<thread::JoinHandle<()>>,
+        // 2D matrix of (user_id, worker_url) -> counter
+        // Initialize with C for all pairs
+        fairness_counter: Arc<Mutex<HashMap<String, HashMap<String, i32>>>>,
+        fairness_fill_size: usize,
+        enable_fairness: bool,
+        _eviction_thread: Option<thread::JoinHandle<()>>, // Store thread handle
     },
 }
 
@@ -96,12 +106,15 @@ pub enum Router {
 pub enum PolicyConfig {
     RandomConfig,
     RoundRobinConfig,
+    UserRoundRobinConfig,
     CacheAwareConfig {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        enable_fairness: bool,
+        fairness_fill_size: usize,
     },
 }
 
@@ -126,6 +139,15 @@ fn get_text_from_request(body: &Bytes, route: &str) -> String {
 
     return "".to_string();
 }
+
+fn get_uid_from_body(body: &Bytes) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json.get("user").cloned())
+        .and_then(|uid| uid.as_str().map(String::from))
+        .unwrap_or_else(|| "default_uid".to_string())
+}
+
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Self {
         match policy_config {
@@ -134,12 +156,21 @@ impl Router {
                 worker_urls,
                 current_index: std::sync::atomic::AtomicUsize::new(0),
             },
+            PolicyConfig::UserRoundRobinConfig => {
+                let current_index_map = DashMap::new();
+                Router::UserRoundRobin {
+                    worker_urls,
+                    current_index_map,
+                }
+            }
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
                 balance_abs_threshold,
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                enable_fairness,
+                fairness_fill_size,
             } => {
                 let mut running_queue = HashMap::new();
                 for url in &worker_urls {
@@ -182,6 +213,8 @@ impl Router {
                     tree.lock().unwrap().insert(&"".to_string(), url);
                 }
 
+                let fairness_counter = Arc::new(Mutex::new(HashMap::new()));
+
                 Router::CacheAware {
                     worker_urls,
                     tree,
@@ -190,6 +223,9 @@ impl Router {
                     cache_threshold,
                     balance_abs_threshold,
                     balance_rel_threshold,
+                    fairness_counter,
+                    enable_fairness,
+                    fairness_fill_size,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -199,6 +235,7 @@ impl Router {
     pub fn get_first(&self) -> Option<String> {
         match self {
             Router::RoundRobin { worker_urls, .. }
+            | Router::UserRoundRobin { worker_urls, .. }
             | Router::Random { worker_urls }
             | Router::CacheAware { worker_urls, .. } => {
                 if worker_urls.is_empty() {
@@ -234,6 +271,18 @@ impl Router {
                 worker_urls[idx].clone()
             }
 
+            Router::UserRoundRobin {
+                worker_urls,
+                current_index_map,
+            } => {
+                let user_id = get_uid_from_body(&body);
+                // if not exist, insert with 0
+                // else, plus 1
+                let mut current_index = current_index_map.entry(user_id).or_insert(0);
+                *current_index = (*current_index + 1) % worker_urls.len();
+                worker_urls[*current_index].clone()
+            }
+
             Router::Random { worker_urls } => {
                 worker_urls[rand::random::<usize>() % worker_urls.len()].clone()
             }
@@ -246,11 +295,12 @@ impl Router {
                 cache_threshold,
                 balance_abs_threshold,
                 balance_rel_threshold,
+                fairness_counter,
+                fairness_fill_size,
+                enable_fairness,
                 ..
             } => {
-                // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
-
-                let tree = tree.lock().unwrap();
+                let mut tree = tree.lock().unwrap();
                 let mut running_queue = running_queue.lock().unwrap();
 
                 // Get current load statistics
@@ -263,32 +313,105 @@ impl Router {
                 let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
                     && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
 
-                let selected_url = if is_imbalanced {
-                    // Log load balancing trigger and current queue state
-                    info!(
-                        "Load balancing triggered due to workload imbalance:\n\
-                        Max load: {}, Min load: {}\n\
-                        Current running queue: {:?}",
-                        max_load, min_load, running_queue
-                    );
+                let selected_url = if *enable_fairness {
+                    /*
 
-                    // Use shortest queue routing when load is imbalanced
-                    running_queue
-                        .iter()
-                        .min_by_key(|(_url, &count)| count)
-                        .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls[0].clone())
-                } else {
-                    // Use cache-aware routing when load is balanced
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
-                    let matched_rate =
-                        matched_text.chars().count() as f32 / text.chars().count() as f32;
+                       1. Iterate all workers to find their match rate
+                       2. Look at the first one, if quantum > 0, send
+                       3. Look at the second one, if quantum > 0, send
+                       4. Look at the remaining, sorted by the queue length, if quantum > 0, send
+                       5. If no send, refill the quantum for all workers
 
-                    if matched_rate > *cache_threshold {
-                        matched_worker.to_string()
-                    } else {
-                        tree.get_smallest_tenant()
+                    */
+
+                    let user_id = get_uid_from_body(&body);
+                    let mut fairness_counter = fairness_counter.lock().unwrap();
+
+                    // init counter for new user if needed
+                    if !fairness_counter.contains_key(&user_id) {
+                        let mut new_counter = HashMap::new();
+                        for url in worker_urls {
+                            new_counter.insert(url.clone(), *fairness_fill_size as i32);
+                        }
+                        fairness_counter.insert(user_id.clone(), new_counter);
                     }
+
+
+                    // list: [(url, len, queue_len), ...]
+                    // sort by the len in descending order
+                    let mut url_list = vec![];
+                    for url in worker_urls {
+                        let len = tree.prefix_match_tenant(&text, &url).chars().count();
+                        let queue_len = running_queue.get(url).unwrap_or(&0);
+                        url_list.push((url.clone(), len, *queue_len));
+                    }
+
+                    url_list.sort_by(|a, b| b.1.cmp(&a.1));
+
+                    // sort the items after 2nd item by the queue length in ascending order
+                    if url_list.len() > 2 {
+                        url_list[2..].sort_by_key(|(_, _, queue_len)| *queue_len);
+                    }
+                    
+                    println!("url_list: {:?}", url_list);
+
+                    let user_counter = fairness_counter.get_mut(&user_id).unwrap();
+
+                    let mut ret_url = "placeholder".to_string();
+
+                    loop {
+                        let mut can_break = false;
+                        for (url, len, _) in url_list.iter() {
+                            if *user_counter.get(url).unwrap() > 0 {
+                                *user_counter.get_mut(url).unwrap() -= *len as i32;
+                                ret_url = url.clone();
+                                can_break = true;
+                                break;
+                            }
+                        }
+
+                        if can_break {
+                            break;
+                        }
+
+                        // refill the quantum for all workers
+                        for url in worker_urls {
+                            *user_counter.get_mut(url).unwrap() += *fairness_fill_size as i32;
+                        }
+
+                    }
+
+                    ret_url
+                } else {
+                    let selected_url = if is_imbalanced {
+                        // Log load balancing trigger and current queue state
+                        info!(
+                            "Load balancing triggered due to workload imbalance:\n\
+                            Max load: {}, Min load: {}\n\
+                            Current running queue: {:?}",
+                            max_load, min_load, running_queue
+                        );
+
+                        // Use shortest queue routing when load is imbalanced
+                        running_queue
+                            .iter()
+                            .min_by_key(|(_url, &count)| count)
+                            .map(|(url, _)| url.clone())
+                            .unwrap_or_else(|| worker_urls[0].clone())
+                    } else {
+                        // Use cache-aware routing when load is balanced
+                        let (matched_text, matched_worker) = tree.prefix_match(&text);
+                        let matched_rate =
+                            matched_text.chars().count() as f32 / text.chars().count() as f32;
+
+                        if matched_rate > *cache_threshold {
+                            matched_worker.to_string()
+                        } else {
+                            tree.get_smallest_tenant()
+                        }
+                    };
+
+                    selected_url
                 };
 
                 // Update queues and tree

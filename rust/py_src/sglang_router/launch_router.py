@@ -39,6 +39,10 @@ class RouterArgs:
     eviction_interval: int = 60
     max_tree_size: int = 2**24
     verbose: bool = False
+    
+    # Fairness control
+    enable_fairness: bool = False
+    fairness_fill_size: int = 16384
 
     @staticmethod
     def add_cli_args(
@@ -83,7 +87,7 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware"],
+            choices=["random", "round_robin", "user_round_robin", "cache_aware"],
             help="Load balancing policy to use",
         )
         parser.add_argument(
@@ -121,6 +125,20 @@ class RouterArgs:
             action="store_true",
             help="Enable verbose logging",
         )
+        
+        # Fairness control configuration
+        parser.add_argument(
+            f"--{prefix}enable-fairness",
+            action="store_true",
+            default=RouterArgs.enable_fairness,
+            help="Enable token-based fairness control for request distribution",
+        )
+        parser.add_argument(
+            f"--{prefix}fairness-fill-size",
+            type=int,
+            default=RouterArgs.fairness_fill_size,
+            help="Initial/Refill token allocation size for fairness control (only used when fairness is enabled)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -145,6 +163,8 @@ class RouterArgs:
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             verbose=getattr(args, f"{prefix}verbose", False),
+            enable_fairness=getattr(args, f"{prefix}enable_fairness"),
+            fairness_fill_size=getattr(args, f"{prefix}fairness_fill_size"),
         )
 
 
@@ -153,6 +173,7 @@ def policy_from_str(policy_str: str) -> PolicyType:
     policy_map = {
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
+        "user_round_robin": PolicyType.UserRoundRobin,
         "cache_aware": PolicyType.CacheAware,
     }
     return policy_map[policy_str]
@@ -188,6 +209,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             verbose=router_args.verbose,
+            enable_fairness=router_args.enable_fairness,
+            fairness_fill_size=router_args.fairness_fill_size,
         )
 
         router.start()

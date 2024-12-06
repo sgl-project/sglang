@@ -8,6 +8,7 @@ pub mod tree;
 pub enum PolicyType {
     Random,
     RoundRobin,
+    UserRoundRobin,
     CacheAware,
 }
 
@@ -23,6 +24,8 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     verbose: bool,
+    enable_fairness: bool,
+    fairness_fill_size: usize,
 }
 
 #[pymethods]
@@ -38,7 +41,9 @@ impl Router {
         balance_rel_threshold = 1.0001,
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
-        verbose = false
+        verbose = false,
+        enable_fairness = false,
+        fairness_fill_size = 16384
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -51,6 +56,8 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         verbose: bool,
+        enable_fairness: bool,
+        fairness_fill_size: usize,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -63,6 +70,8 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             verbose,
+            enable_fairness,
+            fairness_fill_size,
         })
     }
 
@@ -70,12 +79,15 @@ impl Router {
         let policy_config = match &self.policy {
             PolicyType::Random => router::PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
+            PolicyType::UserRoundRobin => router::PolicyConfig::UserRoundRobinConfig,
             PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_tree_size: self.max_tree_size,
+                enable_fairness: self.enable_fairness,
+                fairness_fill_size: self.fairness_fill_size,
             },
         };
 
