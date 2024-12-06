@@ -259,6 +259,7 @@ class ModelRunner:
             load_config=self.load_config,
             device_config=DeviceConfig(self.device),
         )
+        self.model_layer = self.model.model.layers[0].self_attn.attn
 
         # Parse other args
         self.sliding_window_size = (
@@ -635,7 +636,7 @@ class ModelRunner:
 
         tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        self.cuda_graph_runner = CudaGraphRunner(self, self.model_layer)
         logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
