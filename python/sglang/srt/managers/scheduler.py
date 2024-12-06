@@ -996,6 +996,7 @@ class Scheduler:
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
+                        req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
@@ -1074,6 +1075,7 @@ class Scheduler:
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
+                req.grammar.finished = req.finished()
 
         if batch.next_batch_sampling_info:
             batch.next_batch_sampling_info.update_regex_vocab_mask()

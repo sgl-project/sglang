@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
 @dataclasses.dataclass
@@ -169,11 +169,8 @@ class SamplingBatchInfo:
         self.apply_mask = type(grammar).apply_vocab_mask  # force to use static method
 
         for i, grammar in enumerate(self.grammars):
-            if grammar is not None:
-                try:
-                    grammar.fill_vocab_mask(self.vocab_mask, i)
-                except RuntimeError:
-                    continue
+            if grammar and not grammar.finished:
+                grammar.fill_vocab_mask(self.vocab_mask, i)
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)

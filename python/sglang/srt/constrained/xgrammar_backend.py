@@ -45,6 +45,7 @@ class XGrammarGrammar(BaseGrammarObject):
         self.matcher = matcher
         self.vocab_size = vocab_size
         self.ctx = ctx
+        self.finished = False
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)

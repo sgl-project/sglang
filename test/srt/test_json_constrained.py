@@ -1,5 +1,6 @@
 """
-python3 -m unittest test_json_constrained.TestJSONConstrained.test_json_generate
+python3 -m unittest test_json_constrained.TestJSONConstrainedOutlinesBackend.test_json_generate
+python3 -m unittest test_json_constrained.TestJSONConstrainedXGrammarBackend.test_json_generate
 """
 
 import json
@@ -11,7 +12,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
 class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.json_schema = json.dumps(
             {
@@ -129,7 +130,7 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
 class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.json_schema = json.dumps(
             {
