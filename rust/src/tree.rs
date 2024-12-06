@@ -24,7 +24,6 @@ struct Node {
 #[derive(Debug)]
 pub struct Tree {
     root: NodeRef,
-    // TODO: Char Count per tenant
     pub tenant_char_count: DashMap<String, usize>,
 }
 
@@ -408,17 +407,9 @@ impl Tree {
     pub fn evict_tenant_data(&self, max_size: usize) {
         // Calculate used size and collect leaves
         let mut stack = vec![Arc::clone(&self.root)];
-        let mut used_size_per_tenant: HashMap<String, usize> = HashMap::new();
         let mut pq = BinaryHeap::new();
 
         while let Some(curr) = stack.pop() {
-            for tenant in curr.tenant_last_access_time.iter() {
-                let size = used_size_per_tenant
-                    .entry(tenant.key().clone())
-                    .or_insert(0);
-                *size += curr.text.read().unwrap().chars().count();
-            }
-
             for child in curr.children.iter() {
                 stack.push(Arc::clone(child.value()));
             }
@@ -436,64 +427,59 @@ impl Tree {
         }
 
         info!("Before eviction - Used size per tenant:");
-        for (tenant, size) in &used_size_per_tenant {
-            info!("Tenant: {}, Size: {}", tenant, size);
+        for entry in self.tenant_char_count.iter() {
+            info!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
 
         // Process eviction
         while let Some(Reverse(entry)) = pq.pop() {
             let EvictionEntry { tenant, node, .. } = entry;
 
-            if let Some(&used_size) = used_size_per_tenant.get(&tenant) {
-                if used_size <= max_size {
+            if let Some(used_size) = self.tenant_char_count.get(&tenant) {
+                if *used_size <= max_size {
                     continue;
                 }
+            }
 
-                // Update used size
-                if let Some(size) = used_size_per_tenant.get_mut(&tenant) {
-                    *size -= node.text.read().unwrap().chars().count();
-                }
-
-                // Decrement  when removing tenant from node
-                if node.tenant_last_access_time.contains_key(&tenant) {
-                    self.tenant_char_count
-                        .entry(tenant.clone())
-                        .and_modify(|count| {
-                            if *count > 0 {
-                                *count -= node.text.read().unwrap().chars().count();
-                            }
-                        });
-                }
-
-                // Remove tenant from node
-                node.tenant_last_access_time.remove(&tenant);
-
-                // Remove empty nodes
-                if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
-                    if let Some(parent) = node.parent.write().unwrap().as_ref() {
-                        let first_char = node.text.read().unwrap().chars().next().unwrap();
-                        parent.children.remove(&first_char);
-                    }
-                }
-
-                // Add parent to queue if it becomes a leaf
-                if let Some(parent) = node.parent.read().unwrap().as_ref() {
-                    if Tree::leaf_of(parent).contains(&tenant) {
-                        if let Some(timestamp) = parent.tenant_last_access_time.get(&tenant) {
-                            pq.push(Reverse(EvictionEntry {
-                                timestamp: *timestamp,
-                                tenant: tenant.clone(),
-                                node: Arc::clone(parent),
-                            }));
+            // Decrement when removing tenant from node
+            if node.tenant_last_access_time.contains_key(&tenant) {
+                self.tenant_char_count
+                    .entry(tenant.clone())
+                    .and_modify(|count| {
+                        if *count > 0 {
+                            *count -= node.text.read().unwrap().chars().count();
                         }
-                    }
+                    });
+            }
+
+            // Remove tenant from node
+            node.tenant_last_access_time.remove(&tenant);
+
+            // Remove empty nodes
+            if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+                if let Some(parent) = node.parent.write().unwrap().as_ref() {
+                    let first_char = node.text.read().unwrap().chars().next().unwrap();
+                    parent.children.remove(&first_char);
                 }
             }
+
+            // Add parent to queue if it becomes a leaf
+            if let Some(parent) = node.parent.read().unwrap().as_ref() {
+                if Tree::leaf_of(parent).contains(&tenant) {
+                    if let Some(timestamp) = parent.tenant_last_access_time.get(&tenant) {
+                        pq.push(Reverse(EvictionEntry {
+                            timestamp: *timestamp,
+                            tenant: tenant.clone(),
+                            node: Arc::clone(parent),
+                        }));
+                    }
+                }
+            };
         }
 
         info!("After eviction - Used size per tenant:");
-        for (tenant, size) in &used_size_per_tenant {
-            info!("Tenant: {}, Size: {}", tenant, size);
+        for entry in self.tenant_char_count.iter() {
+            info!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
     }
 
