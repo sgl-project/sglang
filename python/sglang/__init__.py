@@ -11,7 +11,7 @@ from sglang.api import (
     gen,
     gen_int,
     gen_string,
-    get_server_args,
+    get_server_info,
     image,
     select,
     set_default_backend,
@@ -41,7 +41,7 @@ __all__ = [
     "gen",
     "gen_int",
     "gen_string",
-    "get_server_args",
+    "get_server_info",
     "image",
     "select",
     "set_default_backend",
@@ -66,7 +66,7 @@ from sglang.version import __version__
 
 __all__ += ["__version__"]
 
-# SGL Backends
+# SGLang Backends
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import LazyImport
 

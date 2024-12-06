@@ -9,34 +9,37 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-# List of packages to check versions for
+# List of packages to check versions
 PACKAGE_LIST = [
     "sglang",
     "flashinfer",
     "triton",
     "transformers",
-    "requests",
-    "tqdm",
+    "torchao",
     "numpy",
     "aiohttp",
     "fastapi",
     "hf_transfer",
     "huggingface_hub",
     "interegular",
+    "modelscope",
+    "orjson",
+    "outlines",
     "packaging",
-    "PIL",
     "psutil",
     "pydantic",
+    "multipart",
+    "zmq",
+    "torchao",
     "uvicorn",
     "uvloop",
-    "zmq",
     "vllm",
-    "outlines",
-    "multipart",
+    "xgrammar",
     "openai",
     "tiktoken",
     "anthropic",
     "litellm",
+    "decord",
 ]
 
 

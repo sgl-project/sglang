@@ -1,40 +1,33 @@
 """
-Benchmark the throughput of using the offline LLM engine.
-This script does not launch a server.
+Benchmark the throughput in the offline mode.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
 
 # Usage
 ## Sharegpt dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
 
 ## Random dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random
-
-## Shared prefix dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name generated-shared-prefix
-
-## Sharegpt dataset on runtime backend
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --backend runtime
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024
 """
 
 import argparse
 import dataclasses
 import json
 import logging
+import os
 import random
 import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from sglang.api import Engine
 from sglang.bench_serving import (
     get_dataset,
     get_tokenizer,
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Runtime
+from sglang.srt.server import Engine, Runtime
 from sglang.srt.server_args import ServerArgs
 
 
@@ -59,6 +52,7 @@ class BenchArgs:
     seed: int = 1
     skip_warmup: bool = False
     do_not_exit: bool = False
+    profile: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -163,6 +157,12 @@ class BenchArgs:
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
         )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -176,6 +176,7 @@ def throughput_test_once(
     reqs: List[Tuple[str, int, int]],
     ignore_eos: bool,
     extra_request_body: Dict,
+    profile: bool,
 ):
     measurement_results = {
         "backend": backend_name,
@@ -201,7 +202,15 @@ def throughput_test_once(
     ]
 
     st = time.perf_counter()
+    if profile:
+        backend.start_profile()
+
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+
+    if profile:
+        backend.stop_profile()
+        monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
+
     latency = time.perf_counter() - st
 
     if backend_name == "runtime":
@@ -226,6 +235,41 @@ def throughput_test_once(
     ) / latency
 
     return measurement_results
+
+
+def monitor_trace_file(directory, interval=1):
+
+    print(f"Monitoring {directory} for new trace files...")
+
+    known_files = set(os.listdir(directory))
+
+    while True:
+        flag = False
+        time.sleep(interval)
+        current_files = set(os.listdir(directory))
+
+        new_files = current_files - known_files
+        for new_file in new_files:
+            new_file_path = os.path.join(directory, new_file)
+            print(f"New file detected: {new_file}")
+
+            previous_size = 0
+            while True:
+                try:
+                    current_size = os.path.getsize(new_file_path)
+                except FileNotFoundError:
+                    print(f"File {new_file} is no longer accessible.")
+                    break
+
+                if current_size > previous_size:
+                    previous_size = current_size
+                else:
+                    flag = True
+                    break
+
+                time.sleep(interval)
+        if flag:
+            break
 
 
 def throughput_test(
@@ -275,6 +319,7 @@ def throughput_test(
             reqs=warmup_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
+            profile=False,
         )
 
     logging.info("\nBenchmark...")
@@ -284,6 +329,7 @@ def throughput_test(
         reqs=input_requests,
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
+        profile=bench_args.profile,
     )
 
     if bench_args.result_filename:

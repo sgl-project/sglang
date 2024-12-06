@@ -7,8 +7,6 @@ from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import make_layers
 
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -19,14 +17,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers
 
 
 @torch.jit.script
@@ -235,7 +233,6 @@ class Phi3SmallDecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -286,7 +283,6 @@ class Phi3SmallModel(nn.Module):
         super().__init__()
 
         self.config = config
-        cache_config = None
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
@@ -294,7 +290,7 @@ class Phi3SmallModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Phi3SmallDecoderLayer(
-                config, int(prefix.split(".")[-1]), cache_config, quant_config
+                config, int(prefix.split(".")[-1]), quant_config
             ),
             prefix=f"{prefix}.layers",
         )
@@ -339,7 +335,6 @@ class Phi3SmallForCausalLM(nn.Module):
         self,
         config: Phi3Config,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ):
 
         super().__init__()
@@ -351,7 +346,6 @@ class Phi3SmallForCausalLM(nn.Module):
             quant_config=quant_config,
             prefix="model",
         )
-        self.torchao_config = global_server_args_dict["torchao_config"]
         self.vocab_size = config.vocab_size
         self.mup_width_multiplier = config.mup_width_multiplier
         self.lm_head = ParallelLMHead(
@@ -397,10 +391,13 @@ class Phi3SmallForCausalLM(nn.Module):
 
     def compute_logits(
         self,
+        input_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         sampling_metadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        logits = self.logits_processor(
+            input_ids, self.lm_head, hidden_states, sampling_metadata
+        )
         if self.dummy_token_indices is not None and logits is not None:
             logits.index_fill_(-1, self.dummy_token_indices, -torch.inf)
         return logits
@@ -422,7 +419,7 @@ class Phi3SmallForCausalLM(nn.Module):
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head.weight, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
 
         else:
@@ -440,8 +437,6 @@ class Phi3SmallForCausalLM(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-
-        apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
 EntryClass = Phi3SmallForCausalLM

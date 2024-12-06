@@ -59,7 +59,7 @@ For interactive debugging, you can compare the outputs of huggingface/transforme
 The following two commands should give the same text output and very similar prefill logits.
 
 - Get the reference output by `python3 scripts/playground/reference_hf.py --model [new model]`
-- Get the SGLang output by `python3 -m sglang.bench_latency --correct --model [new model]`
+- Get the SGLang output by `python3 -m sglang.bench_one_batch --correct --model [new model]`
 
 #### Add the model to the test suite
 To make sure the new model is well maintained in the future, it is better to add it to the test suite.
@@ -80,3 +80,30 @@ To port a model from vLLM to SGLang, you can compare these two files [SGLang Lla
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.
   - Add `EntryClass` at the end.
+
+### Registering an external model implementation
+
+In addition to the methods described above, you can also register your new model with the `ModelRegistry` before launching the server. This approach is useful if you want to integrate your model without needing to modify the source code.
+
+Here is how you can do it:
+
+```python
+from sglang.srt.models.registry import ModelRegistry
+from sglang.srt.server import launch_server
+
+# for a single model, you can add it to the registry
+ModelRegistry.models[model_name] = model_class
+
+# for multiple models, you can imitate the import_model_classes() function in sglang/srt/models/registry.py
+from functools import lru_cache
+
+@lru_cache()
+def import_new_model_classes():
+    model_arch_name_to_cls = {}
+    ...
+    return model_arch_name_to_cls
+
+ModelRegistry.models.update(import_new_model_classes())
+
+launch_server(server_args)
+```

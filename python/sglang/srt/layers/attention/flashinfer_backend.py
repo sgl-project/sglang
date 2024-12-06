@@ -7,6 +7,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import os
 from enum import Enum, auto
 from typing import TYPE_CHECKING, List
 
@@ -17,7 +18,11 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_flashinfer_available,
+    should_use_tensor_core,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -30,7 +35,6 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 
 class WrapperDispatch(Enum):
@@ -44,14 +48,15 @@ class FlashInferAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
-        # Parse constants
-        if not _grouped_size_compiled_for_decode_kernels(
-            model_runner.model_config.num_attention_heads // model_runner.tp_size,
-            model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
-        ):
-            self.decode_use_tensor_cores = True
-        else:
-            self.decode_use_tensor_cores = False
+        self.decode_use_tensor_cores = should_use_tensor_core(
+            kv_cache_dtype=model_runner.kv_cache_dtype,
+            num_attention_heads=model_runner.model_config.num_attention_heads
+            // model_runner.tp_size,
+            num_kv_heads=model_runner.model_config.get_num_kv_heads(
+                model_runner.tp_size
+            ),
+        )
+
         self.max_context_len = model_runner.model_config.context_len
 
         assert not (
@@ -216,7 +221,13 @@ class FlashInferAttnBackend(AttentionBackend):
         return 0
 
     def forward_extend(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         prefill_wrapper_paged = self.prefill_wrappers_paged[
             self._get_wrapper_idx(layer)
@@ -232,7 +243,8 @@ class FlashInferAttnBackend(AttentionBackend):
         if not use_ragged:
             if k is not None:
                 assert v is not None
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
             o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -265,12 +277,19 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         decode_wrapper = self.forward_metadata[0][self._get_wrapper_idx(layer)]
         cache_loc = (
@@ -281,7 +300,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if k is not None:
             assert v is not None
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

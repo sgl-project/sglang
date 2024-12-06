@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
@@ -47,20 +45,24 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
-    GetMemPoolSizeReq,
-    GetMemPoolSizeReqOutput,
+    GetWeightsByNameReqInput,
+    GetWeightsByNameReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_child_process
+from sglang.srt.utils import get_zmq_socket, kill_process_tree
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -107,9 +109,12 @@ class TokenizerManager:
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
         )
 
         self.is_generation = self.model_config.is_generation
@@ -203,14 +208,25 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
         # Tokenize
+        input_embeds = None
         input_text = obj.text
-        if obj.input_ids is None:
+        if obj.input_embeds is not None:
+            if not self.server_args.disable_radix_cache:
+                raise ValueError(
+                    "input_embeds is provided while disable_radix_cache is False. "
+                    "Please add `--disable-radix-cach` when you launch the server "
+                    "if you want to use input_embeds as inputs."
+                )
+            input_embeds = obj.input_embeds
+            input_ids = obj.input_ids
+        elif obj.input_ids is None:
             input_ids = self.tokenizer.encode(input_text)
         else:
             input_ids = obj.input_ids
 
         if self.is_generation:
-            image_inputs = await self.image_processor.process_images_async(
+            # TODO: also support getting embeddings for multimodal models
+            image_inputs: Dict = await self.image_processor.process_images_async(
                 obj.image_data, input_text or input_ids, obj
             )
             if image_inputs and "input_ids" in image_inputs:
@@ -218,10 +234,10 @@ class TokenizerManager:
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
-            session_id = obj.session_id
-            session_rid = obj.session_rid
+            session_id = obj.session[0] if obj.session else None
+            session_rid = obj.session[1] if obj.session else None
 
-        if len(input_ids) >= self.context_len:
+        if obj.input_ids is not None and len(input_ids) >= self.context_len:
             raise ValueError(
                 f"The input ({len(input_ids)} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
@@ -244,7 +260,8 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                obj.lora_path,
+                lora_path=obj.lora_path,
+                input_embeds=input_embeds,
                 session_id=session_id,
                 session_rid=session_rid,
             )
@@ -322,6 +339,12 @@ class TokenizerManager:
                 rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+            if batch_size > 128:
+                logger.warning(
+                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
+                    "The performance might be better if you just duplicate the requests n times or use "
+                    "many threads to send them one by one with parallel sampling (n > 1)."
+                )
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
@@ -397,27 +420,10 @@ class TokenizerManager:
         req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
 
-    async def get_memory_pool_size(self):
-        if self.to_create_loop:
-            self.create_handle_loop()
-
-        req = GetMemPoolSizeReq()
-
-        self.send_to_scheduler.send_pyobj(req)
-        self.mem_pool_size = asyncio.Future()
-
-        # FIXME: Each request should have its own future instead of using `self.mem_pool_size`.
-        if self.server_args.dp_size == 1:
-            res = await self.mem_pool_size
-            return res.size
-        else:  # self.server_args.dp_size > 1
-            self.mem_pool_size_tmp = []
-            res = await self.mem_pool_size
-            ret = [r.size for r in res]
-            return ret
-
-    async def update_weights(
-        self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
+    async def update_weights_from_disk(
+        self,
+        obj: UpdateWeightFromDiskReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         if self.to_create_loop:
             self.create_handle_loop()
@@ -461,6 +467,63 @@ class TokenizerManager:
 
         else:
             return False, "Another update is in progress. Please try again later."
+
+    async def init_weights_update_group(
+        self,
+        obj: InitWeightsUpdateGroupReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> bool:
+        if self.to_create_loop:
+            self.create_handle_loop()
+        self.send_to_scheduler.send_pyobj(obj)
+
+        self.init_weights_update_group_result = asyncio.Future()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for init parameter update group"
+        result = await self.init_weights_update_group_result
+        return result.success, result.message
+
+    async def update_weights_from_distributed(
+        self,
+        obj: UpdateWeightsFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        if not self.model_update_lock.locked():
+            async with self.model_update_lock:
+                self.send_to_scheduler.send_pyobj(obj)
+                self.parameter_update_result = asyncio.Future()
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be for update weights from distributed"
+                result = await self.parameter_update_result
+                return result.success, result.message
+        else:
+            logger.error("Another parameter update is in progress in tokenizer manager")
+            return (
+                False,
+                "Another parameter update is in progress. Please try again later.",
+            )
+
+    async def get_weights_by_name(
+        self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
+    ):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        self.send_to_scheduler.send_pyobj(obj)
+        self.get_weights_by_name_result = asyncio.Future()
+        if self.server_args.dp_size == 1:
+            result = await self.get_weights_by_name_result
+            return result.parameter
+        else:
+            self.get_weights_by_name_tmp = []
+            result = await self.get_weights_by_name_result
+            all_parameters = [r.parameter for r in result]
+            return all_parameters
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
@@ -523,7 +586,7 @@ class TokenizerManager:
             else:
                 break
 
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
     async def handle_loop(self):
@@ -531,10 +594,77 @@ class TokenizerManager:
 
         while True:
             recv_obj: Union[
-                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
+                BatchStrOut,
+                BatchEmbeddingOut,
+                BatchTokenIDOut,
+                UpdateWeightFromDiskReqOutput,
+                UpdateWeightsFromDistributedReqOutput,
+                GetWeightsByNameReqOutput,
+                InitWeightsUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
-            if isinstance(recv_obj, UpdateWeightReqOutput):
+            if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
+                for i, rid in enumerate(recv_obj.rids):
+                    state = self.rid_to_state.get(rid, None)
+                    if state is None:
+                        continue
+
+                    recv_obj.meta_info[i]["id"] = rid
+                    if isinstance(recv_obj, BatchStrOut):
+                        out_dict = {
+                            "text": recv_obj.output_strs[i],
+                            "meta_info": recv_obj.meta_info[i],
+                        }
+                    elif isinstance(recv_obj, BatchTokenIDOut):
+                        out_dict = {
+                            "token_ids": recv_obj.output_ids[i],
+                            "meta_info": recv_obj.meta_info[i],
+                        }
+                    else:
+                        assert isinstance(recv_obj, BatchEmbeddingOut)
+                        out_dict = {
+                            "embedding": recv_obj.embeddings[i],
+                            "meta_info": recv_obj.meta_info[i],
+                        }
+                    state.out_list.append(out_dict)
+                    state.finished = recv_obj.finished_reason[i] is not None
+                    state.event.set()
+
+                    if self.enable_metrics:
+                        completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
+
+                        if state.first_token_time is None:
+                            state.first_token_time = time.time()
+                            self.metrics_collector.observe_time_to_first_token(
+                                state.first_token_time - state.created_time
+                            )
+                        else:
+                            if completion_tokens >= 2:
+                                self.metrics_collector.observe_time_per_output_token(
+                                    (time.time() - state.first_token_time)
+                                    / (completion_tokens - 1)
+                                )
+
+                        if state.finished:
+                            self.metrics_collector.inc_prompt_tokens(
+                                recv_obj.meta_info[i]["prompt_tokens"]
+                            )
+                            self.metrics_collector.inc_generation_tokens(
+                                completion_tokens
+                            )
+                            self.metrics_collector.observe_e2e_request_latency(
+                                time.time() - state.created_time
+                            )
+                            if completion_tokens >= 1:
+                                self.metrics_collector.observe_time_per_output_token(
+                                    (time.time() - state.created_time)
+                                    / completion_tokens
+                                )
+            elif isinstance(recv_obj, OpenSessionReqOutput):
+                self.session_futures[recv_obj.session_id].set_result(
+                    recv_obj.session_id
+                )
+            elif isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
@@ -542,81 +672,27 @@ class TokenizerManager:
                     # set future if the all results are recevied
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
-                continue
-            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
+            elif isinstance(recv_obj, InitWeightsUpdateGroupReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for init parameter update group"
+                self.init_weights_update_group_result.set_result(recv_obj)
+            elif isinstance(recv_obj, UpdateWeightsFromDistributedReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for update weights from distributed"
+                self.parameter_update_result.set_result(recv_obj)
+            elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 if self.server_args.dp_size == 1:
-                    self.mem_pool_size.set_result(recv_obj)
-                else:  # self.sever_args.dp_size > 1
-                    self.mem_pool_size_tmp.append(recv_obj)
-                    # set future if the all results are received
-                    if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
-                        self.mem_pool_size.set_result(self.mem_pool_size_tmp)
-                continue
-            elif isinstance(recv_obj, OpenSessionReqOutput):
-                self.session_futures[recv_obj.session_id].set_result(
-                    recv_obj.session_id
-                )
-                continue
-
-            assert isinstance(
-                recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
-            ), f"Unexpected obj received: {type(recv_obj)}"
-
-            for i, rid in enumerate(recv_obj.rids):
-                state = self.rid_to_state.get(rid, None)
-                if state is None:
-                    continue
-
-                recv_obj.meta_info[i]["id"] = rid
-                if isinstance(recv_obj, BatchStrOut):
-                    out_dict = {
-                        "text": recv_obj.output_strs[i],
-                        "meta_info": recv_obj.meta_info[i],
-                        "session_id": recv_obj.session_ids[i],
-                    }
-                elif isinstance(recv_obj, BatchTokenIDOut):
-                    out_dict = {
-                        "token_ids": recv_obj.output_ids[i],
-                        "meta_info": recv_obj.meta_info[i],
-                        "session_id": recv_obj.session_ids[i],
-                    }
+                    self.get_weights_by_name_result.set_result(recv_obj)
                 else:
-                    assert isinstance(recv_obj, BatchEmbeddingOut)
-                    out_dict = {
-                        "embedding": recv_obj.embeddings[i],
-                        "meta_info": recv_obj.meta_info[i],
-                    }
-                state.out_list.append(out_dict)
-                state.finished = recv_obj.finished_reason[i] is not None
-                state.event.set()
-
-                if self.enable_metrics:
-                    completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
-
-                    if state.first_token_time is None:
-                        state.first_token_time = time.time()
-                        self.metrics_collector.observe_time_to_first_token(
-                            state.first_token_time - state.created_time
+                    self.get_weights_by_name_tmp.append(recv_obj)
+                    if len(self.get_weights_by_name_tmp) == self.server_args.dp_size:
+                        self.get_weights_by_name_result.set_result(
+                            self.get_weights_by_name_tmp
                         )
-                    else:
-                        if completion_tokens >= 2:
-                            self.metrics_collector.observe_time_per_output_token(
-                                (time.time() - state.first_token_time)
-                                / (completion_tokens - 1)
-                            )
-
-                    if state.finished:
-                        self.metrics_collector.inc_prompt_tokens(
-                            recv_obj.meta_info[i]["prompt_tokens"]
-                        )
-                        self.metrics_collector.inc_generation_tokens(completion_tokens)
-                        self.metrics_collector.observe_e2e_request_latency(
-                            time.time() - state.created_time
-                        )
-                        if completion_tokens >= 1:
-                            self.metrics_collector.observe_time_per_output_token(
-                                (time.time() - state.created_time) / completion_tokens
-                            )
+            else:
+                raise ValueError(f"Invalid object: {recv_obj=}")
 
     def convert_logprob_style(
         self,

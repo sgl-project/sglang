@@ -1,24 +1,22 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 Usage:
 
 To test a specific model:
 1. Add it to ALL_OTHER_MODELS
 2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others`
-"""
-
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 """
 
 import dataclasses
@@ -58,6 +56,7 @@ ALL_OTHER_MODELS = [
     ModelCase("THUDM/glm-4-9b-chat"),
     ModelCase("openai-community/gpt2"),
     ModelCase("microsoft/Phi-3-small-8k-instruct"),
+    ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
 ]
 
 TORCH_DTYPES = [torch.float16]

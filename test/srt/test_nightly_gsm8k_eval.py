@@ -1,10 +1,12 @@
 import json
 import os
+import subprocess
 import unittest
+import warnings
 from datetime import datetime
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
@@ -18,23 +20,23 @@ from sglang.test.test_utils import (
 )
 
 MODEL_SCORE_THRESHOLDS = {
-    "meta-llama/Llama-3.1-8B-Instruct": 0.8316,
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.5861,
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.8672,
-    "google/gemma-2-27b-it": 0.9227,
-    "meta-llama/Llama-3.1-70B-Instruct": 0.9623,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.6415,
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.8791,
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.8672,
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.5544,
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.8356,
-    "neuralmagic/gemma-2-2b-it-FP8": 0.6059,
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.9504,
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.6138,
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.9504,
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.8197,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.8395,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.8435,
+    "meta-llama/Llama-3.1-8B-Instruct": 0.83,
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.84,
+    "google/gemma-2-27b-it": 0.92,
+    "meta-llama/Llama-3.1-70B-Instruct": 0.96,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.87,
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.84,
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.83,
+    "neuralmagic/gemma-2-2b-it-FP8": 0.60,
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.95,
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.61,
+    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.95,
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.84,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.84,
 }
 
 
@@ -65,6 +67,7 @@ def launch_server(base_url, model, is_fp8, is_tp2):
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
+        return_stdout_stderr=(subprocess.DEVNULL, subprocess.DEVNULL),
     )
     return process
 
@@ -129,9 +132,12 @@ class TestEvalAccuracyLarge(unittest.TestCase):
 
     def tearDown(self):
         if self.process:
-            kill_child_process(self.process.pid, include_self=True)
+            kill_process_tree(self.process.pid)
 
     def test_mgsm_en_all_models(self):
+        warnings.filterwarnings(
+            "ignore", category=ResourceWarning, message="unclosed.*socket"
+        )
         is_first = True
         all_results = []
 

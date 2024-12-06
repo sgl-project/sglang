@@ -1,17 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 import json
 import multiprocessing as mp
@@ -56,6 +55,28 @@ def get_top_logprobs(logits, k):
     del logits
     logprobs, top_indices = torch.topk(logprobs, k=k, dim=-1)
     return logprobs
+
+
+def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import is_sentence_transformer_model
+
+    if is_sentence_transformer_model(model_path):
+        model = SentenceTransformer(
+            model_path,
+            model_kwargs={"torch_dtype": torch_dtype},
+        )
+    else:  # if no pre-trained sentence-transformers model
+        from sentence_transformers import models
+
+        word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        pooling_model = models.Pooling(
+            word_embedding_model.get_word_embedding_dimension(),
+            pooling_mode="lasttoken",
+        )
+        model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+
+    return model.cuda()
 
 
 @dataclass
@@ -114,12 +135,9 @@ class HFRunner:
                 low_cpu_mem_usage=True,
             ).cuda()
         elif self.model_type == "embedding":
-            from sentence_transformers import SentenceTransformer
-
-            self.model = SentenceTransformer(
-                model_path,
-                model_kwargs={"torch_dtype": torch_dtype},
-            ).cuda()
+            self.model = _get_sentence_transformer_embedding_model(
+                model_path, torch_dtype
+            )
         elif self.model_type == "reward":
             from transformers import AutoModelForSequenceClassification
 

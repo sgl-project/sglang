@@ -10,29 +10,37 @@ suites = {
         "models/test_lora.py",
         "models/test_reward_models.py",
         "sampling/penaltylib",
+        "test_abort.py",
         "test_chunked_prefill.py",
         "test_double_sparsity.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
+        "test_get_weights_by_name.py",
+        "test_gguf.py",
+        "test_input_embeddings.py",
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
         "test_metrics.py",
-        "test_non_overlap_scheduler.py",
+        "test_no_chunked_prefill.py",
+        "test_no_overlap_scheduler.py",
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
         "test_retract_decode.py",
         "test_server_args.py",
+        "test_session_control.py",
         "test_skip_tokenizer_init.py",
         "test_srt_engine.py",
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torch_compile_moe.py",
+        "test_torch_native_attention_backend.py",
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",
-        "test_update_weights.py",
+        "test_update_weights_from_disk.py",
         "test_vision_openai_server.py",
+        "test_session_control.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
@@ -84,6 +92,7 @@ if __name__ == "__main__":
 
     files = files[args.range_begin : args.range_end]
 
+    print(f"{args=}")
     print("The running tests are ", files)
 
     exit_code = run_unittest_files(files, args.timeout_per_file)

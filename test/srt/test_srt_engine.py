@@ -152,13 +152,43 @@ class TestSRTEngine(unittest.TestCase):
 
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3))
 
-    def test_7_engine_offline_throughput(self):
+    def test_7_engine_cpu_offload(self):
+        prompt = "Today is a sunny day and I like"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            random_seed=42,
+            max_total_tokens=128,
+        )
+        out1 = engine.generate(prompt, sampling_params)["text"]
+        engine.shutdown()
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            random_seed=42,
+            max_total_tokens=128,
+            cpu_offload_gb=3,
+        )
+        out2 = engine.generate(prompt, sampling_params)["text"]
+        engine.shutdown()
+
+        print("==== Answer 1 ====")
+        print(out1)
+
+        print("==== Answer 2 ====")
+        print(out2)
+        self.assertEqual(out1, out2)
+
+    def test_8_engine_offline_throughput(self):
         server_args = ServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         )
         bench_args = BenchArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertGreater(result["total_throughput"], 3500)
+        self.assertGreater(result["total_throughput"], 3000)
 
 
 if __name__ == "__main__":

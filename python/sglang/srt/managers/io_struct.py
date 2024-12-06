@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 The definition of objects transfered between different
 processes (TokenizerManager, DetokenizerManager, Controller).
@@ -21,7 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -31,8 +29,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can either specify text or input_ids.
+    # The token ids for text; one can specify either text or input_ids
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
@@ -57,14 +57,21 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Session id info for continual prompting
-    session_id: Optional[Union[List[str], str]] = None
-    session_rid: Optional[Union[List[str], str]] = None
+    session: Optional[
+        Union[List[Tuple[str, Optional[str]]], Tuple[str, Optional[str]]]
+    ] = None
 
     def normalize_batch_and_arguments(self):
-        if (self.text is None and self.input_ids is None) or (
-            self.text is not None and self.input_ids is not None
+        if (
+            self.text is None and self.input_ids is None and self.input_embeds is None
+        ) or (
+            self.text is not None
+            and self.input_ids is not None
+            and self.input_embeds is not None
         ):
-            raise ValueError("Either text or input_ids should be provided.")
+            raise ValueError(
+                "Either text, input_ids or input_embeds should be provided."
+            )
 
         # Derive the batch size
         if self.text is not None:
@@ -74,13 +81,21 @@ class GenerateReqInput:
             else:
                 self.is_single = False
                 self.batch_size = len(self.text)
-        else:
+            self.input_embeds = None
+        elif self.input_ids is not None:
             if isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
+            self.input_embeds = None
+        else:
+            if isinstance(self.input_embeds[0][0], float):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.batch_size = len(self.input_embeds)
 
         # Handle parallel sampling
         # When parallel sampling is used, we always treat the input as a batch.
@@ -203,9 +218,11 @@ class TokenizedGenerateReqInput:
 
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model
+    # The input embeds
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
     # Session id info for continual prompting
-    session_id: Optional[int] = None
+    session_id: Optional[str] = None
     session_rid: Optional[str] = None
 
 
@@ -219,6 +236,8 @@ class EmbeddingReqInput:
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
+    # Dummy input embeds for compatibility
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -301,8 +320,6 @@ class BatchTokenIDOut:
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
     no_stop_trim: List[bool]
-    # The updated session unique id
-    session_ids: List[str]
 
 
 @dataclass
@@ -315,8 +332,6 @@ class BatchStrOut:
     meta_info: List[Dict]
     # The finish reason
     finished_reason: List[BaseFinishReason]
-    # The update session unique id
-    session_ids: List[str]
 
 
 @dataclass
@@ -337,7 +352,7 @@ class FlushCacheReq:
 
 
 @dataclass
-class UpdateWeightReqInput:
+class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -345,9 +360,55 @@ class UpdateWeightReqInput:
 
 
 @dataclass
-class UpdateWeightReqOutput:
+class UpdateWeightFromDiskReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class UpdateWeightsFromDistributedReqInput:
+    name: str
+    dtype: str
+    shape: List[int]
+
+
+@dataclass
+class UpdateWeightsFromDistributedReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class InitWeightsUpdateGroupReqInput:
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The rank offset
+    rank_offset: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_update_group"
+    # The backend
+    backend: str = "nccl"
+
+
+@dataclass
+class InitWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class GetWeightsByNameReqInput:
+    name: str
+    truncate_size: int = 100
+
+
+@dataclass
+class GetWeightsByNameReqOutput:
+    parameter: list
 
 
 @dataclass
@@ -359,16 +420,6 @@ class AbortReq:
 class ProfileReq(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
-
-
-@dataclass
-class GetMemPoolSizeReq:
-    pass
-
-
-@dataclass
-class GetMemPoolSizeReqOutput:
-    size: int
 
 
 @dataclass

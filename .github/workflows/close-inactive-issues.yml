@@ -54,6 +54,11 @@ jobs:
                   }
 
                   for (const issue of issues.data) {
+                    // Skip if the issue has 'good first issue' label
+                    if (issue.labels.some(label => label.name === 'good first issue')) {
+                      console.log(`Skipping issue #${issue.number} as it's marked as 'good first issue'`);
+                      continue;
+                    }
                     if (new Date(issue.updated_at) < sixtyDaysAgo) {
                       try {
                         await github.rest.issues.update({

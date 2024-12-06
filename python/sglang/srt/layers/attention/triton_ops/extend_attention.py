@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
@@ -30,6 +28,8 @@ from sglang.srt.utils import is_hip
 is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
+
+is_hip_ = is_hip()
 
 
 @triton.jit
@@ -284,6 +284,9 @@ def extend_attention_fwd(
     elif Lq == 288:
         BLOCK_DMODEL = 256
         BLOCK_DPE = 32
+    elif Lq == 192:
+        BLOCK_DMODEL = 128
+        BLOCK_DPE = 64
     else:
         BLOCK_DMODEL = triton.next_power_of_2(Lq)
         BLOCK_DPE = 0
@@ -313,7 +316,7 @@ def extend_attention_fwd(
     num_stages = 1
 
     extra_kargs = {}
-    if is_hip():
+    if is_hip_:
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](

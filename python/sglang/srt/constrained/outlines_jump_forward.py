@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 Faster constrained decoding with jump forward decoding / compressed finite state machine.
 Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
@@ -25,7 +23,14 @@ from collections import defaultdict
 import interegular
 from interegular import InvalidSyntax
 from outlines.caching import cache as disk_cache
-from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
+
+try:
+    # outlines >= 0.1.0
+    from outlines_core.fsm.outlines_core_rs import FSMInfo
+    from outlines_core.fsm.regex import make_byte_level_fsm, make_deterministic_fsm
+except ImportError:
+    # outlines <= 0.0.46
+    from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 

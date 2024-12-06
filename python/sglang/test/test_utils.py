@@ -22,7 +22,7 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import get_bool_env_var, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
@@ -44,7 +44,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 
 def is_in_ci():
     """Return whether it is in CI runner."""
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
 if is_in_ci():
@@ -424,6 +424,7 @@ def popen_launch_server(
         port,
         *other_args,
     ]
+
     if api_key:
         command += ["--api-key", api_key]
 
@@ -439,18 +440,22 @@ def popen_launch_server(
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {api_key}",
-            }
-            response = requests.get(f"{base_url}/health_generate", headers=headers)
-            if response.status_code == 200:
-                return process
-        except requests.RequestException:
-            pass
-        time.sleep(10)
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                )
+                if response.status_code == 200:
+                    return process
+            except requests.RequestException:
+                pass
+            time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
@@ -500,7 +505,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             )
             assert ret_code == 0
         except TimeoutError:
-            kill_child_process(process.pid, include_self=True)
+            kill_process_tree(process.pid)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
@@ -563,7 +568,9 @@ def run_bench_serving(
         disable_tqdm=False,
         disable_stream=disable_stream,
         disable_ignore_eos=False,
+        lora_name=None,
         extra_request_body=None,
+        profile=None,
     )
 
     try:
@@ -573,17 +580,17 @@ def run_bench_serving(
             run_benchmark(warmup_args)
         res = run_benchmark(args)
     finally:
-        kill_child_process(process.pid, include_self=True)
+        kill_process_tree(process.pid)
 
     assert res["completed"] == num_prompts
     return res
 
 
-def run_bench_latency(model, other_args):
+def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_latency",
+        "sglang.bench_one_batch",
         "--model-path",
         model,
         "--batch-size",
@@ -606,7 +613,7 @@ def run_bench_latency(model, other_args):
         lastline = output.split("\n")[-3]
         output_throughput = float(lastline.split(" ")[-2])
     finally:
-        kill_child_process(process.pid, include_self=True)
+        kill_process_tree(process.pid)
 
     return output_throughput
 
@@ -672,8 +679,14 @@ def run_and_check_memory_leak(
     enable_mixed_chunk,
     disable_overlap,
     chunked_prefill_size,
+    assert_has_abort,
 ):
-    other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
+    other_args = [
+        "--chunked-prefill-size",
+        str(chunked_prefill_size),
+        "--log-level",
+        "debug",
+    ]
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:
@@ -705,8 +718,8 @@ def run_and_check_memory_leak(
     workload_func(base_url, model)
 
     # Clean up everything
-    kill_child_process(process.pid, include_self=True)
-    kill_child_process(process.pid, include_self=True)
+    kill_process_tree(process.pid)
+    kill_process_tree(process.pid)
     stdout.close()
     stderr.close()
     if os.path.exists(STDOUT_FILENAME):
@@ -718,14 +731,19 @@ def run_and_check_memory_leak(
     # Assert success
     has_new_server = False
     has_leak = False
+    has_abort = False
     for line in output_lines:
         if "The server is fired" in line:
             has_new_server = True
         if "leak" in line:
             has_leak = True
+        if "Abort" in line:
+            has_abort = True
 
     assert has_new_server
     assert not has_leak
+    if assert_has_abort:
+        assert has_abort
 
 
 def run_mmlu_test(
@@ -756,6 +774,7 @@ def run_mmlu_test(
         enable_mixed_chunk,
         disable_overlap,
         chunked_prefill_size,
+        assert_has_abort=False,
     )
 
 
@@ -795,4 +814,10 @@ def run_mulit_request_test(
         enable_mixed_chunk,
         enable_overlap,
         chunked_prefill_size,
+        assert_has_abort=False,
     )
+
+
+def write_github_step_summary(content):
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+        f.write(content)

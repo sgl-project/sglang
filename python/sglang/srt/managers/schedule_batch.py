@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 Store information about requests and batches.
 
@@ -33,6 +31,7 @@ import dataclasses
 import logging
 from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -59,6 +58,7 @@ global_server_args_dict = {
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_ep_moe": ServerArgs.enable_ep_moe,
 }
 
 
@@ -125,7 +125,7 @@ class FINISH_ABORT(BaseFinishReason):
 class ImageInputs:
     """The image related inputs."""
 
-    pixel_values: torch.Tensor
+    pixel_values: Union[torch.Tensor, np.array]
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
@@ -133,7 +133,7 @@ class ImageInputs:
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
-    image_embeds: Optional[List[torch.Tensor]] = None
+    # Llava related
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
 
@@ -142,19 +142,17 @@ class ImageInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
-    def from_dict(obj, vocab_size):
-        # Use image hash as fake token_ids, which is then used for prefix matching
+    def from_dict(obj: dict):
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
-            image_hashes=hash(tuple(obj["image_hashes"])),
+            image_hashes=obj["image_hashes"],
         )
-        image_hash = ret.image_hashes
-        ret.pad_values = [
-            (image_hash) % vocab_size,
-            (image_hash >> 16) % vocab_size,
-            (image_hash >> 32) % vocab_size,
-            (image_hash >> 64) % vocab_size,
-        ]
+
+        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
+        # Please note that if the `input_ids` is later used in the model forward,
+        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
+        # errors in cuda kernels. See also llava.py for example.
+        ret.pad_values = [x % (1 << 30) for x in ret.image_hashes]
 
         optional_args = [
             "image_sizes",
@@ -169,6 +167,29 @@ class ImageInputs:
 
         return ret
 
+    def merge(self, other):
+        assert self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
+        self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
+
+        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
+        # Please note that if the `input_ids` is later used in the model forward,
+        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
+        # errors in cuda kernels. See also llava.py for example.
+        self.image_hashes += other.image_hashes
+        self.pad_values = [x % (1 << 30) for x in self.image_hashes]
+
+        optional_args = [
+            "image_sizes",
+            "image_offsets",
+            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
+            "aspect_ratio_ids",
+            "aspect_ratio_mask",
+            "image_grid_thws",
+        ]
+        for arg in optional_args:
+            if getattr(self, arg, None) is not None:
+                setattr(self, arg, getattr(self, arg) + getattr(other, arg))
+
 
 class Req:
     """The input and output status of a request."""
@@ -179,13 +200,19 @@ class Req:
         origin_input_text: str,
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
+        origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
+        input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
-        self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
+        self.origin_input_ids_unpadded = (
+            origin_input_ids_unpadded
+            if origin_input_ids_unpadded
+            else origin_input_ids  # Before image padding
+        )
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
@@ -193,6 +220,7 @@ class Req:
 
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.input_embeds = input_embeds
 
         # Memory pool info
         self.req_pool_idx = None
@@ -201,6 +229,7 @@ class Req:
         self.tokenizer = None
         self.finished_reason = None
         self.stream = False
+        self.to_abort = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -259,6 +288,12 @@ class Req:
 
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
+
+    def extend_image_inputs(self, image_inputs):
+        if self.image_inputs is None:
+            self.image_inputs = image_inputs
+        else:
+            self.image_inputs.merge(image_inputs)
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -330,6 +365,10 @@ class Req:
 
     def check_finished(self):
         if self.finished():
+            return
+
+        if self.to_abort:
+            self.finished_reason = FINISH_ABORT()
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
@@ -439,14 +478,18 @@ class ScheduleBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     tree_cache: BasePrefixCache = None
 
-    # For utility
+    # Batch configs
     model_config: ModelConfig = None
     forward_mode: ForwardMode = None
+    enable_overlap: bool = False
+
+    # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
+    input_embeds: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     # The output locations of the KV cache
@@ -469,6 +512,7 @@ class ScheduleBatch:
     extend_lens: List[int] = None
     extend_num_tokens: int = None
     decoding_reqs: List[Req] = None
+    extend_logprob_start_lens: List[int] = None
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -489,10 +533,11 @@ class ScheduleBatch:
     def init_new(
         cls,
         reqs: List[Req],
-        req_to_token_pool,
-        token_to_kv_pool,
-        tree_cache,
-        model_config,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool: ReqToTokenPool,
+        tree_cache: BasePrefixCache,
+        model_config: ModelConfig,
+        enable_overlap: bool,
     ):
         return cls(
             reqs=reqs,
@@ -500,6 +545,7 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             model_config=model_config,
+            enable_overlap=enable_overlap,
             return_logprob=any(req.return_logprob for req in reqs),
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
@@ -613,7 +659,7 @@ class ScheduleBatch:
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
 
-    def prepare_for_extend(self, enable_overlap_schedule: bool = False):
+    def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         bs = len(self.reqs)
@@ -627,6 +673,9 @@ class ScheduleBatch:
         req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
+        input_embeds = []
+
+        pt = 0
         for i, req in enumerate(reqs):
             already_computed = (
                 req.extend_logprob_start_len + 1 + req.cached_tokens
@@ -644,6 +693,11 @@ class ScheduleBatch:
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+
+            # If input_embeds are available, store them
+            if req.input_embeds is not None:
+                # If req.input_embeds is already a list, append its content directly
+                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
@@ -667,6 +721,12 @@ class ScheduleBatch:
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
+        self.input_embeds = (
+            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            if input_embeds
+            else None
+        )
+
         self.out_cache_loc = out_cache_loc
 
         self.seq_lens_sum = sum(seq_lens)
@@ -684,20 +744,24 @@ class ScheduleBatch:
         extend_lens = torch.tensor(self.extend_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        write_req_to_token_pool_triton[(bs,)](
-            self.req_to_token_pool.req_to_token,
-            self.req_pool_indices,
-            pre_lens,
-            self.seq_lens,
-            extend_lens,
-            self.out_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-        )
-        # The triton kernel is equivalent to the following python code.
-        # self.req_to_token_pool.write(
-        #    (req.req_pool_idx, slice(pre_len, seq_len)),
-        #    out_cache_loc[pt : pt + req.extend_input_len],
-        # )
+        if global_server_args_dict["attention_backend"] != "torch_native":
+            write_req_to_token_pool_triton[(bs,)](
+                self.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                pre_lens,
+                self.seq_lens,
+                extend_lens,
+                self.out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+        else:
+            pt = 0
+            for i in range(bs):
+                self.req_to_token_pool.write(
+                    (self.req_pool_indices[i], slice(pre_lens[i], self.seq_lens[i])),
+                    self.out_cache_loc[pt : pt + self.extend_lens[i]],
+                )
+                pt += self.extend_lens[i]
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
         if self.model_config.is_encoder_decoder:
@@ -707,7 +771,7 @@ class ScheduleBatch:
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
-            enable_overlap_schedule=enable_overlap_schedule,
+            enable_overlap_schedule=self.enable_overlap,
         )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
@@ -724,16 +788,20 @@ class ScheduleBatch:
         self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
-        self.extend_num_tokens += running_bs
+
+        # For overlap scheduler, the output_ids has one step delay
+        delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) - 1
+                len(r.origin_input_ids) + len(r.output_ids) + delta
                 for r in running_batch.reqs
             ]
         )
         self.extend_lens.extend([1] * running_bs)
+        self.extend_num_tokens += running_bs
+        # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
     def check_decode_mem(self):
@@ -897,7 +965,7 @@ class ScheduleBatch:
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
 
-    def prepare_for_decode(self, enable_overlap: bool = False):
+    def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
 
         self.input_ids = self.output_ids
@@ -914,7 +982,7 @@ class ScheduleBatch:
         else:
             locs = self.seq_lens
 
-        if enable_overlap:
+        if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.req_to_token_pool.write(
                 (self.req_pool_indices, locs), self.out_cache_loc
@@ -1045,6 +1113,7 @@ class ScheduleBatch:
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
+            input_embeds=self.input_embeds,
         )
 
     def copy(self):
@@ -1114,6 +1183,9 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # The input Embeds
+    input_embeds: Optional[torch.tensor] = None
 
 
 @triton.jit
