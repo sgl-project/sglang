@@ -128,30 +128,30 @@ class TestLaunchServer(unittest.TestCase):
         for process in cls.other_process:
             kill_process_tree(process.pid)
 
-    # def test_mmlu(self):
-    #     # DP size = 2
-    #     TestLaunchServer.process = popen_launch_router(
-    #         self.model,
-    #         self.base_url,
-    #         dp_size=2,
-    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    #     )
+    def test_mmlu(self):
+        # DP size = 2
+        TestLaunchServer.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=2,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
 
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=64,
-    #         num_threads=32,
-    #         temperature=0.1,
-    #     )
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+            temperature=0.1,
+        )
 
-    #     metrics = run_eval(args)
-    #     score = metrics["score"]
-    #     THRESHOLD = 0.65
-    #     passed = score >= THRESHOLD
-    #     msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
-    #     self.assertGreaterEqual(score, THRESHOLD, msg)
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
 
     def test_add_and_remove_worker(self):
         # DP size = 1
