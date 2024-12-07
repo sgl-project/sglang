@@ -57,7 +57,7 @@ jobs:
           cd rust
           pip install setuptools-rust wheel build
           python3 -m build
-          pip install dist/*.whl
+          pip install --force-reinstall dist/*.whl
       - name: Run e2e test
         run: |
           cd rust/py_test
