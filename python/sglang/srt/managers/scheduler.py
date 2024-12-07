@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 import psutil
+import setproctitle
 import torch
 import zmq
 
@@ -485,12 +486,16 @@ class Scheduler:
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
-            while True:
-                try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
+            if self.last_batch is None:
+                recv_req = self.recv_from_tokenizer.recv_pyobj()
                 recv_reqs.append(recv_req)
+            else:
+                while True:
+                    try:
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_req)
         else:
             recv_reqs = None
 
@@ -1424,6 +1429,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    setproctitle.setproctitle("sglang::scheduler")
     # set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
