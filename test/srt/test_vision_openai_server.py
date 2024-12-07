@@ -444,5 +444,24 @@ class TestMllamaServer(TestOpenAIVisionServer):
         pass
 
 
+class TestPhi3VServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "microsoft/Phi-3-vision-128k-instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "phi-3-vision",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 if __name__ == "__main__":
     unittest.main()
