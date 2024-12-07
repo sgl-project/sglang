@@ -53,50 +53,6 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     return QUANTIZATION_METHODS[quantization]
 
 
-def fp8_moe_apply(
-    self,
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    use_grouped_topk: bool,
-    topk_group: Optional[int] = None,
-    num_expert_group: Optional[int] = None,
-    custom_routing_function: Optional[Callable] = None,
-) -> torch.Tensor:
-    """Enhanced apply method for FP8 MoE."""
-    from sglang.srt.layers.fused_moe_triton import FusedMoE
-    from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
-
-    # Expert selection
-    topk_weights, topk_ids = FusedMoE.select_experts(
-        hidden_states=x,
-        router_logits=router_logits,
-        use_grouped_topk=use_grouped_topk,
-        top_k=top_k,
-        renormalize=renormalize,
-        topk_group=topk_group,
-        num_expert_group=num_expert_group,
-        custom_routing_function=custom_routing_function,
-    )
-
-    # Expert fusion with FP8 quantization
-    return fused_experts(
-        x,
-        layer.w13_weight,
-        layer.w2_weight,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        inplace=True,
-        use_fp8_w8a8=True,
-        w1_scale=layer.w13_weight_scale,
-        w2_scale=layer.w2_weight_scale,
-        a1_scale=layer.w13_input_scale,
-        a2_scale=layer.w2_input_scale,
-    )
-
-
 def fp8_get_quant_method(self, layer, prefix):
     """Enhanced get_quant_method for FP8 config."""
     from vllm.model_executor.layers.linear import LinearBase
@@ -151,7 +107,6 @@ def awq_get_quant_method(self, layer, prefix):
 
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
-    setattr(Fp8MoEMethod, "apply", fp8_moe_apply)
     setattr(Fp8Config, "get_quant_method", fp8_get_quant_method)
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
