@@ -396,4 +396,23 @@ impl Router {
             }
         }
     }
+
+    pub fn remove_worker(&self, worker_url: String) {
+        match self {
+            Router::RoundRobin { worker_urls, .. }
+            | Router::Random { worker_urls }
+            | Router::CacheAware { worker_urls, .. } => {
+                let mut urls = worker_urls.write().unwrap();
+                let index = urls.iter().position(|url| url == &worker_url).unwrap();
+                urls.remove(index);
+                info!("Removed worker: {}", worker_url);
+            }
+        }
+
+        // if cache aware, remove the worker from the tree
+        if let Router::CacheAware { tree, .. } = self {
+            tree.lock().unwrap().remove_tenant(&worker_url);
+            info!("Removed worker from tree: {}", worker_url);
+        }
+    }
 }

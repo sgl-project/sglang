@@ -145,6 +145,19 @@ async fn add_worker(
     HttpResponse::Ok().finish()
 }
 
+#[post("/remove_worker")]
+async fn remove_worker(
+    query: web::Query<HashMap<String, String>>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let worker_url = match query.get("url") {
+        Some(url) => url.to_string(),
+        None => return HttpResponse::BadRequest().finish(),
+    };
+    data.router.remove_worker(worker_url);
+    HttpResponse::Ok().finish()
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -201,6 +214,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(health_generate)
             .service(get_server_info)
             .service(add_worker)
+            .service(remove_worker)
     })
     .bind((config.host, config.port))?
     .run()
