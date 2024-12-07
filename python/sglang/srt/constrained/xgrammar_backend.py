@@ -123,6 +123,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
                 return None
+        elif key_type == "ebnf":
+            try:
+                ctx = self.grammar_compiler.compile_grammar(key_string)
+            except RuntimeError as e:
+                logging.warning(
+                    f"Skip invalid ebnf: ebnf={key_string}, {e=}"
+                )
+                return None
         elif key_type == "regex":
             logger.warning(
                 "regex hasn't been supported by xgrammar yet. This is skipped."
