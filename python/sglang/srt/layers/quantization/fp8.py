@@ -569,7 +569,7 @@ class Fp8MoEMethod:
     ) -> torch.Tensor:
         from sglang.srt.layers.fused_moe_triton import FusedMoE
         from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
-        
+
         # Expert selection
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
