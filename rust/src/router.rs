@@ -3,13 +3,14 @@ use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+use tokio;
 
 #[derive(Debug)]
 pub enum Router {
@@ -385,14 +386,66 @@ impl Router {
         }
     }
 
-    pub fn add_worker(&self, worker_url: String) {
-        match self {
-            Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls }
-            | Router::CacheAware { worker_urls, .. } => {
-                let mut urls = worker_urls.write().unwrap();
-                info!("Added worker: {}", worker_url);
-                urls.push(worker_url);
+    pub async fn add_worker(&self, worker_url: String) -> HttpResponse {
+        let interval_secs = 10; // check every 10 seconds
+        let timeout_secs = 300; // 5 minutes
+
+        let start_time = std::time::Instant::now();
+        let client = reqwest::Client::new();
+
+        loop {
+            if start_time.elapsed() > Duration::from_secs(timeout_secs) {
+                return HttpResponse::InternalServerError().body(format!(
+                    "Timeout {}s waiting for worker {} to become healthy",
+                    timeout_secs, worker_url
+                ));
+            }
+
+            match client.get(&format!("{}/health", worker_url)).send().await {
+                Ok(res) => {
+                    if res.status().is_success() {
+                        match self {
+                            Router::RoundRobin { worker_urls, .. }
+                            | Router::Random { worker_urls }
+                            | Router::CacheAware { worker_urls, .. } => {
+                                info!("Worker {} health check passed", worker_url);
+                                let mut urls = worker_urls.write().unwrap();
+                                if urls.contains(&worker_url) {
+                                    return HttpResponse::BadRequest()
+                                        .body(format!("Worker {} already exists", worker_url));
+                                }
+                                info!("Added worker: {}", worker_url);
+                                urls.push(worker_url.clone());
+                            }
+                        }
+                        return HttpResponse::Ok()
+                            .body(format!("Successfully added worker: {}", worker_url));
+                    } else {
+                        info!(
+                            "Worker {} health check failed with status: {}. The worker might still be starting up.",
+                            worker_url, res.status()
+                        );
+                        // if the url does not have http or https prefix, warn users
+                        if !worker_url.starts_with("http://") && !worker_url.starts_with("https://")
+                        {
+                            warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
+                        }
+
+                        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    info!("Worker {} health check failed: {}", worker_url, e);
+
+                    // if the url does not have http or https prefix, warn users
+                    if !worker_url.starts_with("http://") && !worker_url.starts_with("https://") {
+                        warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
+                    }
+
+                    tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                    continue;
+                }
             }
         }
     }
