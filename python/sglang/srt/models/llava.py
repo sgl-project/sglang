@@ -554,7 +554,7 @@ class LlavaPhi3VForCausalLM(LlavaBaseForCausalLM):
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
         if getattr(self.config, "image_token_index", None) is None:
-            self.config.image_token_index = 32000
+            self.config.image_token_index = 32044
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
         self.language_model = Phi3ForCausalLM(config, quant_config=quant_config)
