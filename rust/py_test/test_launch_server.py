@@ -114,17 +114,12 @@ def popen_launch_server(
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
-class TestEvalAccuracyMini(unittest.TestCase):
+class TestLaunchServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_router(
-            cls.model,
-            cls.base_url,
-            dp_size=1,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        )
+        cls.process = None
         cls.other_process = []
 
     @classmethod
@@ -133,31 +128,46 @@ class TestEvalAccuracyMini(unittest.TestCase):
         for process in cls.other_process:
             kill_process_tree(process.pid)
 
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-            temperature=0.1,
+    # def test_mmlu(self):
+    #     # DP size = 2
+    #     TestLaunchServer.process = popen_launch_router(
+    #         self.model,
+    #         self.base_url,
+    #         dp_size=2,
+    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    #     )
+
+    #     args = SimpleNamespace(
+    #         base_url=self.base_url,
+    #         model=self.model,
+    #         eval_name="mmlu",
+    #         num_examples=64,
+    #         num_threads=32,
+    #         temperature=0.1,
+    #     )
+
+    #     metrics = run_eval(args)
+    #     score = metrics["score"]
+    #     THRESHOLD = 0.65
+    #     passed = score >= THRESHOLD
+    #     msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+    #     self.assertGreaterEqual(score, THRESHOLD, msg)
+
+    def test_add_and_remove_worker(self):
+        # DP size = 1
+        TestLaunchServer.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         )
-
-        metrics = run_eval(args)
-        score = metrics["score"]
-        THRESHOLD = 0.65
-        passed = score >= THRESHOLD
-        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
-        self.assertGreaterEqual(score, THRESHOLD, msg)
-
-    def test_add_worker(self):
         # 1. start a worker, and wait until it is healthy
         port = find_available_port()
         worker_url = f"http://127.0.0.1:{port}"
         worker_process = popen_launch_server(
             self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         )
-        self.other_process.append(worker_process)
+        TestLaunchServer.other_process.append(worker_process)
         # 2. use /add_worker api to add it the the router
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
@@ -172,6 +182,20 @@ class TestEvalAccuracyMini(unittest.TestCase):
             num_threads=32,
             temperature=0.1,
         )
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
+
+        # 4. use /remove_worker api to remove it from the router
+        with requests.Session() as session:
+            response = session.post(f"{self.base_url}/remove_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
+            self.assertEqual(response.status_code, 200)
+
+        # 5. run mmlu again
         metrics = run_eval(args)
         score = metrics["score"]
         THRESHOLD = 0.65
