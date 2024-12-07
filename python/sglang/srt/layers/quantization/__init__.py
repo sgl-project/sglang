@@ -22,7 +22,7 @@ from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -62,7 +62,7 @@ def fp8_get_quant_method(self, layer, prefix):
 
     from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.linear import UnquantizedLinearMethod
-    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
     if isinstance(layer, LinearBase):
         if is_layer_skipped(prefix, self.ignored_layers):
