@@ -20,6 +20,7 @@ def popen_launch_router(
     base_url: str,
     dp_size: int,
     timeout: float,
+    policy: str = "cache_aware",
 ):
     """
     Launch the router server process.
@@ -29,6 +30,7 @@ def popen_launch_router(
         base_url: Server base URL
         dp_size: Data parallel size
         timeout: Server launch timeout
+        policy: Router policy, one of "cache_aware", "round_robin", "random"
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -47,10 +49,9 @@ def popen_launch_router(
         str(dp_size),  # Convert dp_size to string
         "--router-eviction-interval",
         "5",  # frequent eviction for testing
+        "--router-policy",
+        policy,
     ]
-
-    # Use current environment
-    env = None
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
@@ -99,19 +100,8 @@ def popen_launch_server(
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
-    start_time = time.time()
-    with requests.Session() as session:
-        while time.time() - start_time < timeout:
-            try:
-                response = session.get(f"{base_url}/health")
-                if response.status_code == 200:
-                    print(f"Server {base_url} is healthy")
-                    return process
-            except requests.RequestException:
-                pass
-            time.sleep(10)
-
-    raise TimeoutError("Server failed to start within the timeout period.")
+    # intentionally don't wait and defer the job to the router health check
+    return process
 
 
 class TestLaunchServer(unittest.TestCase):
@@ -135,6 +125,7 @@ class TestLaunchServer(unittest.TestCase):
             self.base_url,
             dp_size=2,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="cache_aware",
         )
 
         args = SimpleNamespace(
@@ -160,6 +151,7 @@ class TestLaunchServer(unittest.TestCase):
             self.base_url,
             dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",  # use round robin to make sure every worker processes requests
         )
         # 1. start a worker, and wait until it is healthy
         port = find_available_port()
@@ -168,11 +160,13 @@ class TestLaunchServer(unittest.TestCase):
             self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         )
         TestLaunchServer.other_process.append(worker_process)
-        # 2. use /add_worker api to add it the the router
+
+        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
             print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(response.status_code, 200)
+
         # 3. run mmlu
         args = SimpleNamespace(
             base_url=self.base_url,
