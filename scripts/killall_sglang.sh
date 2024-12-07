@@ -1,9 +1,14 @@
-# Kill all SGLang processes and free the GPU memory.
+#!/bin/bash
 
+# Show current GPU status
 nvidia-smi
-kill -9 $(ps aux | grep 'multiprocessing.spawn' | grep -v 'grep' | awk '{print $2}')
-kill -9 $(ps aux | grep 'sglang.launch_server' | grep -v 'grep' | awk '{print $2}')
-kill -9 $(ps aux | grep 'sglang.bench' | grep -v 'grep' | awk '{print $2}')
 
-# Kill all processes occupying GPU memory, and enable it when needed.
-# kill -9 $(nvidia-smi | sed -n '/Processes:/,$p' | grep "   [0-9]" | awk '{print $5}')
+# Clean SGLang processes
+kill -9 $(ps aux | grep 'multiprocessing.spawn' | grep -v 'grep' | awk '{print $2}') 2>/dev/null
+kill -9 $(ps aux | grep 'sglang.launch_server' | grep -v 'grep' | awk '{print $2}') 2>/dev/null
+kill -9 $(ps aux | grep 'sglang.bench' | grep -v 'grep' | awk '{print $2}') 2>/dev/null
+
+# Clean all GPU processes if any argument is provided
+if [ $# -gt 0 ]; then
+    kill -9 $(nvidia-smi | sed -n '/Processes:/,$p' | grep "   [0-9]" | awk '{print $5}') 2>/dev/null
+fi
