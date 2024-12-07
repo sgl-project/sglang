@@ -127,9 +127,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             try:
                 ctx = self.grammar_compiler.compile_grammar(key_string)
             except RuntimeError as e:
-                logging.warning(
-                    f"Skip invalid ebnf: ebnf={key_string}, {e=}"
-                )
+                logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
                 return None
         elif key_type == "regex":
             logger.warning(

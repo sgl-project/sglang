@@ -113,10 +113,13 @@ class SamplingParams:
                     f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
-        grammars = [self.json_schema, self.regex, self.ebnf]  # since mutually exclusive, only one can be set
+        grammars = [
+            self.json_schema,
+            self.regex,
+            self.ebnf,
+        ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
-
 
     def normalize(self, tokenizer):
         # Process stop strings

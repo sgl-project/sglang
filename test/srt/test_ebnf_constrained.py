@@ -2,8 +2,8 @@ import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-import requests
 import openai
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -77,9 +77,13 @@ class TestEBNFConstrainedXGrammarBackend(unittest.TestCase):
         # We'll perform a basic check to ensure the output starts with "Hello "
         # and that the following characters are alphabetic.
         text = ret["text"].strip()
-        self.assertTrue(text.startswith("Hello "), f"Text does not start with 'Hello ': {text}")
-        name_part = text[len("Hello "):].strip()
-        self.assertRegex(name_part, r"^[A-Za-z]+$", f"Name part is not alphabetic: {name_part}")
+        self.assertTrue(
+            text.startswith("Hello "), f"Text does not start with 'Hello ': {text}"
+        )
+        name_part = text[len("Hello ") :].strip()
+        self.assertRegex(
+            name_part, r"^[A-Za-z]+$", f"Name part is not alphabetic: {name_part}"
+        )
 
     def test_ebnf_generate(self):
         self.run_decode(ebnf=self.__class__.ebnf_grammar)
