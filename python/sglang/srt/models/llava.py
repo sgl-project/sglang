@@ -558,46 +558,11 @@ class LlavaPixtralForCausalLM(LlavaBaseForCausalLM):
             self.config.image_token_index = 32001
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = PixtralForCausalLM(config, quant_config=quant_config)
+        self.language_model = MistralForCausalLM(config, quant_config=quant_config)
 
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
-class LlavaPixtralLargeForCausalLM(LlavaBaseForCausalLM):
-    def __init__(
-        self,
-        config: LlavaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
-
-        self.config = config
-        self.vision_tower = None
-
-        # Initialize vision configuration if not set
-        if getattr(self.config, "vision_config", None) is None:
-            self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
-        
-        # Initialize text configuration for Pixtral Large if not set
-        if getattr(self.config, "text_config", None) is None:
-            self.config.text_config = PixtralVisionConfig(self.config._name_or_path)
-
-        self.config.vision_config.hidden_size = config.mm_hidden_size
-        self.config.text_config.hidden_size = config.hidden_size
-
-        if getattr(self.config, "projector_hidden_act", None) is None:
-            self.config.projector_hidden_act = "gelu"
-        
-        if getattr(self.config, "image_token_index", None) is None:
-            self.config.image_token_index = 32002
-
-        self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = PixtralForCausalLM(config, quant_config=quant_config)
-        
-        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
-            self.language_model.model.image_newline = nn.Parameter(
-                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
-            )            
-            
-EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM, LlavaPixtralForCausalLM, LlavaPixtralLargeForCausalLM]
+         
+EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM, LlavaPixtralForCausalLM]
