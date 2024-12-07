@@ -16,6 +16,8 @@ Memory-efficient attention for decoding.
 It supports page size = 1.
 """
 
+import warnings
+
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_nopad_att1.py
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_softmax_and_reducev.py
@@ -23,6 +25,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_hip
+
+warnings.filterwarnings(
+    "ignore", category=Warning, message="operation scheduled before its operands"
+)
 
 is_hip_ = is_hip()
 
@@ -298,7 +304,7 @@ def _fwd_grouped_kernel_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    SPLIT_K: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -306,7 +312,7 @@ def _fwd_grouped_kernel_stage1(
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
-    split_k_id = tl.program_id(2)
+    split_kv_id = tl.program_id(2)
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -331,80 +337,78 @@ def _fwd_grouped_kernel_stage1(
         )
         qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0)
 
-    kv_len_per_split = tl.cdiv(cur_batch_seq_len, SPLIT_K)
-    split_k_start = kv_len_per_split * split_k_id
-    split_k_end = tl.minimum(split_k_start + kv_len_per_split, cur_batch_seq_len)
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
-    for start_n in range(split_k_start, split_k_end, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        kv_loc = tl.load(
-            Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n,
-            mask=offs_n < split_k_end,
-            other=0,
-        )
-        offs_buf_k = (
-            kv_loc[None, :] * stride_buf_kbs
-            + cur_kv_head * stride_buf_kh
-            + offs_d[:, None]
-        )
-        k = tl.load(
-            K_Buffer + offs_buf_k,
-            mask=(offs_n[None, :] < split_k_end) & (offs_d[:, None] < Lk),
-            other=0.0,
-        )
-        qk = tl.dot(q, k)
-        if BLOCK_DPE > 0:
-            offs_buf_kpe = (
+    if split_kv_end > split_kv_start:
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_loc = tl.load(
+                Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+            offs_buf_k = (
                 kv_loc[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
-                + offs_dpe[:, None]
+                + offs_d[:, None]
             )
-            kpe = tl.load(
-                K_Buffer + offs_buf_kpe,
-                mask=offs_n[None, :] < split_k_end,
+            k = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_n[None, :] < split_kv_end) & (offs_d[:, None] < Lk),
                 other=0.0,
             )
-            qk += tl.dot(qpe, kpe)
-        qk *= sm_scale
+            qk = tl.dot(q, k.to(q.dtype))
+            if BLOCK_DPE > 0:
+                offs_buf_kpe = (
+                    kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_dpe[:, None]
+                )
+                kpe = tl.load(
+                    K_Buffer + offs_buf_kpe,
+                    mask=offs_n[None, :] < split_kv_end,
+                    other=0.0,
+                )
+                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+            qk *= sm_scale
 
-        if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
 
-        qk = tl.where(
-            mask_h[:, None] & (offs_n[None, :] < split_k_end), qk, float("-inf")
-        )
+            qk = tl.where(
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+            )
 
-        offs_buf_v = (
-            kv_loc[:, None] * stride_buf_vbs
-            + cur_kv_head * stride_buf_vh
-            + offs_dv[None, :]
-        )
-        v = tl.load(
-            V_Buffer + offs_buf_v,
-            mask=(offs_n[:, None] < split_k_end) & (offs_dv[None, :] < Lv),
-            other=0.0,
-        )
+            offs_buf_v = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :]
+            )
+            v = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(offs_n[:, None] < split_kv_end) & (offs_dv[None, :] < Lv),
+                other=0.0,
+            )
 
-        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
-        acc *= re_scale[:, None]
-        acc += tl.dot(p.to(v.dtype), v)
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
 
-        e_sum = e_sum * re_scale + tl.sum(p, 1)
-        e_max = n_e_max
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
 
-    need_store = tl.where(split_k_end > split_k_start, 1, 0)
-
-    for _ in range(0, need_store, 1):
         offs_mid_o = (
             cur_batch * stride_mid_ob
             + cur_head[:, None] * stride_mid_oh
-            + split_k_id * stride_mid_os
+            + split_kv_id * stride_mid_os
             + offs_dv[None, :]
         )
 
@@ -417,7 +421,7 @@ def _fwd_grouped_kernel_stage1(
         offs_mid_o_1 = (
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
-            + split_k_id * stride_mid_os
+            + split_kv_id * stride_mid_os
             + BLOCK_DV
         )
 
@@ -437,7 +441,7 @@ def _fwd_grouped_kernel_stage2(
     stride_mid_os,
     stride_obs,
     stride_oh,
-    SPLIT_K: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
@@ -452,9 +456,9 @@ def _fwd_grouped_kernel_stage2(
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + BLOCK_DV
 
-    for split_k_id in range(0, SPLIT_K):
-        tv = tl.load(Mid_O + offs_v + split_k_id * stride_mid_os)
-        tlogic = tl.load(Mid_O + offs_logic + split_k_id * stride_mid_os)
+    for split_kv_id in range(0, NUM_KV_SPLITS):
+        tv = tl.load(Mid_O + offs_v + split_kv_id * stride_mid_os)
+        tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
         n_e_max = tl.maximum(tlogic, e_max)
 
         old_scale = tl.exp(e_max - n_e_max)
@@ -477,6 +481,7 @@ def _decode_grouped_att_m_fwd(
     B_req_idx,
     B_Seqlen,
     max_len_in_batch,
+    num_kv_splits,
     sm_scale,
     logit_cap,
 ):
@@ -499,11 +504,11 @@ def _decode_grouped_att_m_fwd(
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = 16
-    SPLIT_K = 8
+    NUM_KV_SPLITS = num_kv_splits
     grid = (
         batch,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
-        SPLIT_K,
+        NUM_KV_SPLITS,
     )
 
     extra_kargs = {}
@@ -538,7 +543,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
         BLOCK_H=BLOCK_H,
-        SPLIT_K=SPLIT_K,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
         logit_cap=logit_cap,
         num_warps=4,
         num_stages=2,
@@ -553,12 +558,13 @@ def _decode_grouped_softmax_reducev_fwd(
     q,
     o,
     v_buffer,
+    num_kv_splits,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
     BLOCK_DV = Lv
 
-    SPLIT_K = 8
+    NUM_KV_SPLITS = num_kv_splits
 
     extra_kargs = {}
     if is_hip_:
@@ -575,7 +581,7 @@ def _decode_grouped_softmax_reducev_fwd(
         logits.stride(2),
         o.stride(0),
         o.stride(1),
-        SPLIT_K=SPLIT_K,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
         BLOCK_DV=BLOCK_DV,
         num_warps=4,
         num_stages=2,
@@ -631,6 +637,7 @@ def decode_attention_fwd_grouped(
     b_seq_len,
     attn_logits,
     max_len_in_batch,
+    num_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
@@ -643,10 +650,11 @@ def decode_attention_fwd_grouped(
         b_req_idx,
         b_seq_len,
         max_len_in_batch,
+        num_kv_splits,
         sm_scale,
         logit_cap,
     )
-    _decode_grouped_softmax_reducev_fwd(attn_logits, q, o, v_buffer)
+    _decode_grouped_softmax_reducev_fwd(attn_logits, q, o, v_buffer, num_kv_splits)
 
 
 def decode_attention_fwd(
@@ -660,6 +668,7 @@ def decode_attention_fwd(
     b_seq_len,
     attn_logits,
     max_len_in_batch,
+    num_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
@@ -694,6 +703,7 @@ def decode_attention_fwd(
             b_seq_len,
             attn_logits,
             max_len_in_batch,
+            num_kv_splits,
             sm_scale,
             logit_cap,
         )
