@@ -168,7 +168,7 @@ impl Router {
 
                         let locked_tree_clone = tree_clone.lock().unwrap();
                         // Run eviction
-                        locked_tree_clone.evict_tenant_data(max_tree_size);
+                        locked_tree_clone.evict_tenant_by_size(max_tree_size);
 
                         // Print the process queue
                         let locked_processed_queue = processed_queue_clone.lock().unwrap();
