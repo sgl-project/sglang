@@ -20,9 +20,12 @@ import random
 import tempfile
 from typing import List, Optional
 
+import torch
+
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
+    get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
@@ -50,6 +53,7 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     is_embedding: bool = False
+    revision: Optional[str] = None
 
     # Port
     host: str = "127.0.0.1"
@@ -90,6 +94,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # Expert parallelism
+    ep_size: int = 1
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -121,12 +127,13 @@ class ServerArgs:
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
-    disable_disk_cache: bool = False
+    disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_ep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -150,15 +157,20 @@ class ServerArgs:
 
         if is_hip():
             gpu_mem = get_amdgpu_memory_capacity()
-        else:
+        elif torch.cuda.is_available():
             gpu_mem = get_nvgpu_memory_capacity()
+        elif self.device == "hpu":
+            gpu_mem = get_hpu_memory_capacity()
+        else:
+            # GPU memory is not known yet or no GPU is available.
+            gpu_mem = None
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.82
+                self.mem_fraction_static = 0.81
             elif self.tp_size >= 4:
                 self.mem_fraction_static = 0.85
             elif self.tp_size >= 2:
@@ -168,19 +180,27 @@ class ServerArgs:
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
-            if gpu_mem < 25_000:
+            if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
             else:
                 self.chunked_prefill_size = 8192
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
-            if gpu_mem < 25_000:
-                self.cuda_graph_max_bs = 8
+            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
+            if gpu_mem is not None and gpu_mem < 25_000:
+                if self.tp_size < 4:
+                    self.cuda_graph_max_bs = 8
+                else:
+                    self.cuda_graph_max_bs = 80
             else:
                 self.cuda_graph_max_bs = 160
 
         # Choose kernel backends
+        if self.device == "hpu":
+            self.attention_backend = "torch_native"
+            self.sampling_backend = "pytorch"
+
         if self.attention_backend is None:
             self.attention_backend = (
                 "flashinfer" if is_flashinfer_available() else "triton"
@@ -191,7 +211,7 @@ class ServerArgs:
             )
 
         if self.attention_backend == "torch_native":
-            logger.info(
+            logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
@@ -203,12 +223,18 @@ class ServerArgs:
             self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             self.disable_overlap_schedule = True
-            logger.info(
+            logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
-                "Overlap schedule is disabled."
+                "Overlap scheduler is disabled."
+            )
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         # GGUF
@@ -340,6 +366,14 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--revision",
+            type=str,
+            default=None,
+            help="The specific model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
         )
 
         # Memory and scheduling
@@ -512,6 +546,14 @@ class ServerArgs:
                 "shortest_queue",
             ],
         )
+        # Expert parallelism
+        parser.add_argument(
+            "--expert-parallel-size",
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -633,9 +675,9 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
-            "--disable-disk-cache",
+            "--disable-outlines-disk-cache",
             action="store_true",
-            help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+            help="Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
             "--disable-custom-all-reduce",
@@ -666,6 +708,11 @@ class ServerArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+        )
+        parser.add_argument(
+            "--enable-ep-moe",
+            action="store_true",
+            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -736,11 +783,17 @@ class ServerArgs:
             action=DeprecatedAction,
             help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
         )
+        parser.add_argument(
+            "--disable-disk-cache",
+            action=DeprecatedAction,
+            help="'--disable-disk-cache' is deprecated. Please use '--disable-outlines-disk-cache' instead.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
+        args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 

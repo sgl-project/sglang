@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -48,6 +50,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -111,9 +115,6 @@ class Scheduler:
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
 
-        # Session info
-        self.sessions = {}
-
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -144,9 +145,12 @@ class Scheduler:
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
         )
         self.is_generation = self.model_config.is_generation
 
@@ -253,6 +257,10 @@ class Scheduler:
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
+        self.current_stream = torch.get_device_module(self.device).current_stream()
+
+        # Session info
+        self.sessions = {}
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -350,6 +358,7 @@ class Scheduler:
             )
 
     def watchdog_thread(self):
+        """A watch dog thread that will try to kill the server itself if one batch takes too long."""
         self.watchdog_last_forward_ct = 0
         self.watchdog_last_time = time.time()
 
@@ -427,61 +436,6 @@ class Scheduler:
 
             self.last_batch = batch
 
-    def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
-        # Check if other DP workers have running batches
-        if local_batch is None:
-            num_tokens = 0
-        elif local_batch.forward_mode.is_decode():
-            num_tokens = local_batch.batch_size()
-        else:
-            num_tokens = local_batch.extend_num_tokens
-
-        local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
-        global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
-        torch.distributed.all_gather_into_tensor(
-            global_num_tokens,
-            local_num_tokens,
-            group=self.tp_cpu_group,
-        )
-
-        if local_batch is None and global_num_tokens.max().item() > 0:
-            local_batch = self.get_idle_batch()
-
-        if local_batch is not None:
-            local_batch.global_num_tokens = global_num_tokens.tolist()
-
-            # Check forward mode for cuda graph
-            if not self.server_args.disable_cuda_graph:
-                forward_mode_state = torch.tensor(
-                    (
-                        1
-                        if local_batch.forward_mode.is_decode()
-                        or local_batch.forward_mode.is_idle()
-                        else 0
-                    ),
-                    dtype=torch.int32,
-                )
-                torch.distributed.all_reduce(
-                    forward_mode_state,
-                    op=torch.distributed.ReduceOp.MIN,
-                    group=self.tp_cpu_group,
-                )
-                local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
-
-        return local_batch
-
-    def get_idle_batch(self):
-        idle_batch = ScheduleBatch.init_new(
-            [],
-            self.req_to_token_pool,
-            self.token_to_kv_pool,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-        )
-        idle_batch.prepare_for_idle()
-        return idle_batch
-
     def recv_requests(self):
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
@@ -517,6 +471,19 @@ class Scheduler:
                 success, message = self.update_weights_from_disk(recv_req)
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightFromDiskReqOutput(success, message)
+                )
+            elif isinstance(recv_req, GetWeightsByNameReqInput):
+                parameter = self.get_weights_by_name(recv_req)
+                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
+                success, message = self.init_weights_update_group(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    InitWeightsUpdateGroupReqOutput(success, message)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+                success, message = self.update_weights_from_distributed(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightsFromDistributedReqOutput(success, message)
                 )
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
@@ -978,7 +945,7 @@ class Scheduler:
             self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_dummy_first():
             batch.next_batch_sampling_info.update_regex_vocab_mask()
-            torch.cuda.current_stream().synchronize()
+            self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
@@ -1034,13 +1001,14 @@ class Scheduler:
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
+                        req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
             if batch.next_batch_sampling_info:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
-                torch.cuda.current_stream().synchronize()
+                self.current_stream.synchronize()
                 batch.next_batch_sampling_info.sampling_info_done.set()
 
         else:  # embedding or reward model
@@ -1112,10 +1080,11 @@ class Scheduler:
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
+                req.grammar.finished = req.finished()
 
         if batch.next_batch_sampling_info:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
-            torch.cuda.current_stream().synchronize()
+            self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
         self.stream_output(batch.reqs)
@@ -1158,6 +1127,14 @@ class Scheduler:
                 + 1 : len(req.fill_ids)
                 - req.last_update_decode_tokens
             ]
+
+            # Clip the padded hash values from image tokens.
+            # Otherwise, it will lead to detokenization errors.
+            input_token_ids = [
+                x if x < self.model_config.vocab_size - 1 else 0
+                for x in input_token_ids
+            ]
+
             req.input_token_logprobs = list(zip(input_token_logprobs, input_token_ids))
 
             if (
@@ -1305,6 +1282,61 @@ class Scheduler:
                     )
                 )
 
+    def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
+        # Check if other DP workers have running batches
+        if local_batch is None:
+            num_tokens = 0
+        elif local_batch.forward_mode.is_decode():
+            num_tokens = local_batch.batch_size()
+        else:
+            num_tokens = local_batch.extend_num_tokens
+
+        local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
+        global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
+        torch.distributed.all_gather_into_tensor(
+            global_num_tokens,
+            local_num_tokens,
+            group=self.tp_cpu_group,
+        )
+
+        if local_batch is None and global_num_tokens.max().item() > 0:
+            local_batch = self.get_idle_batch()
+
+        if local_batch is not None:
+            local_batch.global_num_tokens = global_num_tokens.tolist()
+
+            # Check forward mode for cuda graph
+            if not self.server_args.disable_cuda_graph:
+                forward_mode_state = torch.tensor(
+                    (
+                        1
+                        if local_batch.forward_mode.is_decode()
+                        or local_batch.forward_mode.is_idle()
+                        else 0
+                    ),
+                    dtype=torch.int32,
+                )
+                torch.distributed.all_reduce(
+                    forward_mode_state,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_cpu_group,
+                )
+                local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
+
+        return local_batch
+
+    def get_idle_batch(self):
+        idle_batch = ScheduleBatch.init_new(
+            [],
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+        )
+        idle_batch.prepare_for_idle()
+        return idle_batch
+
     def move_ready_grammar_requests(self):
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
         num_ready_reqs = 0
@@ -1383,6 +1415,23 @@ class Scheduler:
             logger.error(message)
         return success, message
 
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        """Initialize the online model parameter update group."""
+        success, message = self.tp_worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        """Update the online model parameter."""
+        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        return success, message
+
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return parameter
@@ -1442,6 +1491,10 @@ def run_scheduler_process(
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
         configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
+
+    # set cpu affinity to this gpu process
+    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
     suppress_other_loggers()
     parent_process = psutil.Process().parent()

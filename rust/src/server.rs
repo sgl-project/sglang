@@ -4,6 +4,7 @@ use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Resp
 use bytes::Bytes;
 use env_logger::Builder;
 use log::{info, LevelFilter};
+use std::collections::HashMap;
 use std::io::Write;
 
 #[derive(Debug)]
@@ -128,6 +129,35 @@ async fn v1_completions(
         .await
 }
 
+#[post("/add_worker")]
+async fn add_worker(
+    query: web::Query<HashMap<String, String>>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let worker_url = match query.get("url") {
+        Some(url) => url.to_string(),
+        None => {
+            return HttpResponse::BadRequest()
+                .body("Worker URL required. Provide 'url' query parameter")
+        }
+    };
+    data.router.add_worker(worker_url);
+    HttpResponse::Ok().finish()
+}
+
+#[post("/remove_worker")]
+async fn remove_worker(
+    query: web::Query<HashMap<String, String>>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let worker_url = match query.get("url") {
+        Some(url) => url.to_string(),
+        None => return HttpResponse::BadRequest().finish(),
+    };
+    data.router.remove_worker(worker_url);
+    HttpResponse::Ok().finish()
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -183,6 +213,8 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(health)
             .service(health_generate)
             .service(get_server_info)
+            .service(add_worker)
+            .service(remove_worker)
     })
     .bind((config.host, config.port))?
     .run()

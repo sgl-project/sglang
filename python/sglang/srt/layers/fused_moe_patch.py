@@ -105,20 +105,29 @@ def fused_moe_forward_native(
     num_expert_group: Optional[int] = None,
     custom_routing_function: Optional[Callable] = None,
 ) -> torch.Tensor:
-    assert custom_routing_function is None
-    topk_weights, topk_ids = select_experts_native(
-        hidden_states=x,
-        router_logits=router_logits,
-        use_grouped_topk=use_grouped_topk,
-        top_k=top_k,
-        renormalize=renormalize,
-        topk_group=topk_group,
-        num_expert_group=num_expert_group,
-    )
+
+    if use_grouped_topk:
+        assert num_expert_group is not None and topk_group is not None
+        topk_weights, topk_ids = grouped_topk(
+            x,
+            router_logits,
+            top_k,
+            renormalize,
+            num_expert_group,
+            topk_group,
+        )
+    elif custom_routing_function is None:
+        topk_weights, topk_ids = fused_topk_native(x, router_logits, top_k, renormalize)
+    else:
+        topk_weights, topk_ids = custom_routing_function(
+            x, router_logits, top_k, renormalize
+        )
+
     w13_weights = layer.w13_weight[topk_ids]
     w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     w2_weights = layer.w2_weight[topk_ids]
-    x1 = F.silu(torch.einsum("ti,taoi -> tao", x, w1_weights))
+    x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
+    x1 = F.silu(x1)
     x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
     return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))

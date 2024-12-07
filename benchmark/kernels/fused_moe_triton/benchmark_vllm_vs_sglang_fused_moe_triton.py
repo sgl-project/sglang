@@ -1,22 +1,11 @@
 import argparse
-import numbers
-from typing import Optional
 
 import torch
 import triton
-from torch.nn import init
-from torch.nn.parameter import Parameter
 from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    get_moe_configs as get_moe_configs_vllm,
-)
-from vllm.utils import FlexibleArgumentParser
 
 from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe as fused_moe_sglang
-from sglang.srt.layers.fused_moe_triton.fused_moe import (
-    get_moe_configs as get_moe_configs_sglang,
-)
 
 
 def get_model_config(model_name: str, tp_size: int):
@@ -39,19 +28,21 @@ def get_model_config(model_name: str, tp_size: int):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     else:
-        # Default: Mixtral, Grok1, etc.
+        # Default: Mixtral
         E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
 
-    return {
+    shape_configs = {
         "num_experts": E,
         "topk": topk,
         "hidden_size": config.hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
         "dtype": config.torch_dtype,
     }
+    print(f"{shape_configs=}")
+    return shape_configs
 
 
 def fused_moe_vllm_api(
@@ -133,7 +124,7 @@ def fused_moe_sglang_api(
     )
 )
 def benchmark(batch_size, provider, model_config, use_fp8=False):
-    print(f"benchmark for batch_size={batch_size}")
+    print(f"benchmark {provider} with batch_size={batch_size}")
     torch.set_default_device("cuda")
     torch.cuda.manual_seed_all(0)
 
@@ -210,7 +201,7 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
 
 
 def main():
-    parser = FlexibleArgumentParser()
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
