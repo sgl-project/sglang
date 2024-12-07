@@ -17,11 +17,8 @@ from sglang.test.test_utils import (
 def setup_class(cls, backend: str, disable_overlap: bool):
     cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     cls.base_url = DEFAULT_URL_FOR_TEST
-    # A simple EBNF grammar example:
-    # This grammar expects the model to produce something like: "Hello Alice"
-    # where the name is one or more alphabetic characters.
     cls.ebnf_grammar = r"""
-    root ::= "Hello" " " name
+    root ::= "Hello" " " name ("," " my name is " name)? "." | "Goodbye" "."
     name ::= [A-Za-z]+
     """
 
@@ -43,47 +40,82 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
 
-class TestEBNFConstrainedXGrammarBackend(unittest.TestCase):
+class TestEBNFConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="xgrammar", disable_overlap=False)
+        setup_class(cls, backend="outlines", disable_overlap=False)
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def run_decode(self, ebnf, return_logprob=False, top_logprobs_num=0, n=1):
-        # Send a request that requires EBNF guided output
+    def run_decode(
+        self, ebnf, expected_patterns, prompt, temperature=0.5, max_new_tokens=50, n=1
+    ):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "Generate a greeting:",
+                "text": prompt,
                 "sampling_params": {
-                    "temperature": 0 if n == 1 else 0.5,
-                    "max_new_tokens": 128,
+                    "temperature": temperature,
+                    "max_new_tokens": max_new_tokens,
                     "n": n,
                     "ebnf": ebnf,
                 },
                 "stream": False,
-                "return_logprob": return_logprob,
-                "top_logprobs_num": top_logprobs_num,
+                "return_logprob": False,
+                "top_logprobs_num": 0,
                 "logprob_start_len": 0,
             },
         )
+
         ret = response.json()
         print(json.dumps(ret, indent=2))
 
-        # Validate that the returned text matches the EBNF pattern "Hello <name>"
-        # We'll perform a basic check to ensure the output starts with "Hello "
-        # and that the following characters are alphabetic.
-        text = ret["text"].strip()
-        self.assertTrue(
-            text.startswith("Hello "), f"Text does not start with 'Hello ': {text}"
-        )
-        name_part = text[len("Hello ") :].strip()
-        self.assertRegex(
-            name_part, r"^[A-Za-z]+$", f"Name part is not alphabetic: {name_part}"
-        )
+        if not isinstance(ret, list):
+            self.fail(f"Expected response to be a list, but got {type(ret)}")
+
+        for item in ret:
+            text = item.get("text", "").strip()
+            if not text:
+                self.fail("Generated text is empty.")
+
+            match = False
+            for pattern in expected_patterns:
+                if self.regex_match(text, pattern):
+                    match = True
+                    break
+            if not match:
+                self.fail(f"Text '{text}' does not match any of the allowed patterns.")
+
+    def regex_match(self, text, pattern):
+        import re
+
+        return re.match(pattern, text) is not None
 
     def test_ebnf_generate(self):
-        self.run_decode(ebnf=self.__class__.ebnf_grammar)
+        allowed_patterns = [
+            r"^Hello [A-Za-z]+\.$",
+            r"^Hello [A-Za-z]+, my name is [A-Za-z]+\.$",
+            r"^Goodbye\.$",
+        ]
+        prompt = "Generate a greeting or farewell:"
+
+        self.run_decode(
+            ebnf=self.__class__.ebnf_grammar,
+            expected_patterns=allowed_patterns,
+            prompt=prompt,
+            temperature=0.5,
+            max_new_tokens=20,
+            n=3,
+        )
+
+
+class TestEBNFConstrainedXGrammarBackend(TestEBNFConstrainedOutlinesBackend):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="xgrammar", disable_overlap=False)
+
+
+if __name__ == "__main__":
+    unittest.main()
