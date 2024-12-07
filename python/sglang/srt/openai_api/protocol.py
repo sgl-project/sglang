@@ -173,6 +173,7 @@ class CompletionRequest(BaseModel):
     regex: Optional[str] = None
     min_tokens: int = 0
     repetition_penalty: float = 1.0
+    stop_regex: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
@@ -279,6 +280,7 @@ class ChatCompletionRequest(BaseModel):
     regex: Optional[str] = None
     min_tokens: int = 0
     repetition_penalty: float = 1.0
+    stop_regex: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
