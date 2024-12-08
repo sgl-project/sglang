@@ -606,8 +606,6 @@ class TokenizerManager:
                         "id": rid,
                         "finish_reason": recv_obj.finished_reasons[i],
                         "prompt_tokens": recv_obj.prompt_tokens[i],
-                        "completion_tokens": recv_obj.completion_tokens[i],
-                        "cached_tokens": recv_obj.cached_tokens[i],
                     }
 
                     if getattr(state.obj, "return_logprob", False):
@@ -622,12 +620,20 @@ class TokenizerManager:
                     if isinstance(recv_obj, BatchStrOut):
                         out_dict = {
                             "text": recv_obj.output_strs[i],
-                            "meta_info": meta_info,
+                            "meta_info": {
+                                **meta_info,
+                                "completion_tokens": recv_obj.completion_tokens[i],
+                                "cached_tokens": recv_obj.cached_tokens[i],
+                            },
                         }
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
-                            "meta_info": meta_info,
+                            "meta_info": {
+                                **meta_info,
+                                "completion_tokens": recv_obj.completion_tokens[i],
+                                "cached_tokens": recv_obj.cached_tokens[i],
+                            },
                         }
                     else:
                         assert isinstance(recv_obj, BatchEmbeddingOut)
