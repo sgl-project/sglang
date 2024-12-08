@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 import psutil
+import setproctitle
 import torch
 import zmq
 
@@ -439,12 +440,16 @@ class Scheduler:
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
-            while True:
-                try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
+            if self.last_batch is None:
+                recv_req = self.recv_from_tokenizer.recv_pyobj()
                 recv_reqs.append(recv_req)
+            else:
+                while True:
+                    try:
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_req)
         else:
             recv_reqs = None
 
@@ -1473,6 +1478,8 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    setproctitle.setproctitle("sglang::scheduler")
+
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
