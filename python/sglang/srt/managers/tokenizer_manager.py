@@ -298,7 +298,7 @@ class TokenizerManager:
             if isinstance(obj, GenerateReqInput):
                 out = self.convert_logprob_style(
                     state.out_list[-1],
-                    obj.return_logprob,
+                    False,
                     obj.top_logprobs_num,
                     obj.return_text_in_logprobs,
                 )

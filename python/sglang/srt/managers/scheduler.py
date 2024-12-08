@@ -1035,7 +1035,7 @@ class Scheduler:
                     # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
-        self.stream_output(batch.reqs, skip_stream_req)
+        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         logits_output, next_token_ids, bid = result
@@ -1073,11 +1073,15 @@ class Scheduler:
                 self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
-                req.output_token_logprobs.append(
-                    (next_token_logprobs[i], next_token_id)
-                )
+                req.output_token_logprobs_val.append(next_token_logprobs[i])
+                req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
-                    req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+                    req.output_top_logprobs_val.append(
+                        logits_output.output_top_logprobs_val[i]
+                    )
+                    req.output_top_logprobs_idx.append(
+                        logits_output.output_top_logprobs_idx[i]
+                    )
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
@@ -1089,7 +1093,7 @@ class Scheduler:
             batch.next_batch_sampling_info.sampling_info_done.set()
 
         tic = time.time()
-        self.stream_output(batch.reqs)
+        self.stream_output(batch.reqs, batch.return_logprob)
         print(f"stream_output: {(time.time() - tic) * 1e6:.2f} us")
 
         self.token_to_kv_pool.free_group_end()
@@ -1110,9 +1114,8 @@ class Scheduler:
         output: LogitsProcessorOutput,
     ):
         """Attach logprobs to the return values."""
-        req.output_token_logprobs.append(
-            (output.next_token_logprobs[i], next_token_ids[i])
-        )
+        req.output_token_logprobs_val.append(output.next_token_logprobs[i])
+        req.output_token_logprobs_idx.append(next_token_ids[i])
 
         # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
         num_input_logprobs = req.extend_input_len - req.extend_logprob_start_len
@@ -1120,69 +1123,75 @@ class Scheduler:
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
 
-        if req.input_token_logprobs is None:
-            input_token_logprobs = output.input_token_logprobs[
+        if req.input_token_logprobs_val is None:
+            input_token_logprobs_val = output.input_token_logprobs[
                 pt : pt + num_input_logprobs - 1 - req.last_update_decode_tokens
             ]
-            input_token_ids = req.fill_ids[
+
+            input_token_logprobs_idx = req.fill_ids[
                 len(req.fill_ids)
                 - num_input_logprobs
                 + 1 : len(req.fill_ids)
                 - req.last_update_decode_tokens
             ]
-
             # Clip the padded hash values from image tokens.
             # Otherwise, it will lead to detokenization errors.
-            input_token_ids = [
+            input_token_logprobs_idx = [
                 x if x < self.model_config.vocab_size - 1 else 0
-                for x in input_token_ids
+                for x in input_token_logprobs_idx
             ]
-
-            req.input_token_logprobs = list(zip(input_token_logprobs, input_token_ids))
 
             if (
                 req.logprob_start_len == 0
             ):  # The first token does not have logprob, pad it.
-                req.input_token_logprobs = [
-                    (None, req.fill_ids[0])
-                ] + req.input_token_logprobs
+                input_token_logprobs_val = [None] + input_token_logprobs_val
+                input_token_logprobs_idx = req.fill_ids[0] + input_token_logprobs_idx
+
+            req.input_token_logprobs_val = input_token_logprobs_val
+            req.input_token_logprobs_idx = input_token_logprobs_idx
 
         if req.last_update_decode_tokens != 0:
             # Some decode tokens are re-computed in an extend batch
-            req.output_token_logprobs.extend(
-                list(
-                    zip(
-                        output.input_token_logprobs[
-                            pt
-                            + num_input_logprobs
-                            - 1
-                            - req.last_update_decode_tokens : pt
-                            + num_input_logprobs
-                            - 1
-                        ],
-                        req.fill_ids[
-                            len(req.fill_ids)
-                            - req.last_update_decode_tokens : len(req.fill_ids)
-                        ],
-                    )
-                )
+            req.output_token_logprobs_val.extend(
+                output.input_token_logprobs[
+                    pt
+                    + num_input_logprobs
+                    - 1
+                    - req.last_update_decode_tokens : pt
+                    + num_input_logprobs
+                    - 1
+                ],
+            )
+            req.output_token_logprobs_idx.extend(
+                req.fill_ids[
+                    len(req.fill_ids)
+                    - req.last_update_decode_tokens : len(req.fill_ids)
+                ]
             )
 
         if req.top_logprobs_num > 0:
             if req.input_top_logprobs is None:
-                req.input_top_logprobs = output.input_top_logprobs[i]
+                req.input_top_logprobs_val = output.input_top_logprobs_val[i]
+                req.input_top_logprobs_idx = output.input_top_logprobs_idx[i]
                 if req.logprob_start_len == 0:
-                    req.input_top_logprobs = [None] + req.input_top_logprobs
+                    req.input_top_logprobs_val = [None] + req.input_top_logprobs_val
+                    req.input_top_logprobs_idx = [None] + req.input_top_logprobs_idx
 
             if req.last_update_decode_tokens != 0:
-                req.output_top_logprobs.extend(
-                    output.input_top_logprobs[i][-req.last_update_decode_tokens :]
+                req.output_top_logprobs_val.extend(
+                    output.input_top_logprobs_val[i][-req.last_update_decode_tokens :]
                 )
-            req.output_top_logprobs.append(output.output_top_logprobs[i])
+                req.output_top_logprobs_idx.extend(
+                    output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
+                )
+            req.output_top_logprobs_val.append(output.output_top_logprobs_val[i])
+            req.output_top_logprobs_idx.append(output.output_top_logprobs_idx[i])
 
         return num_input_logprobs
 
-    def stream_output(self, reqs: List[Req], skip_req: Optional[Req] = None):
+    def stream_output(
+        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+    ):
         """Stream the output to detokenizer."""
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -1200,11 +1209,25 @@ class Scheduler:
             completion_tokens = []
             completion_tokens_wo_jump_forward = []
             cached_tokens = []
-            input_token_logprobs = []
-            output_token_logprobs = []
-            input_top_logprobs = []
-            output_top_logprobs = []
-            normalized_prompt_logprob = []
+
+            if return_logprob:
+                input_token_logprobs_val = []
+                input_token_logprobs_idx = []
+                output_token_logprobs_val = []
+                output_token_logprobs_idx = []
+                input_top_logprobs_val = []
+                input_top_logprobs_idx = []
+                output_top_logprobs_val = []
+                output_top_logprobs_idx = []
+                normalized_prompt_logprob = []
+            else:
+                input_token_logprobs_val = input_token_logprobs_idx = (
+                    output_token_logprobs_val
+                ) = output_token_logprobs_idx = input_top_logprobs_val = (
+                    input_top_logprobs_idx
+                ) = output_top_logprobs_val = output_top_logprobs_idx = (
+                    normalized_prompt_logprob
+                ) = None
 
             for req in reqs:
                 if req is skip_req:
@@ -1227,11 +1250,16 @@ class Scheduler:
                         req.sampling_params.spaces_between_special_tokens
                     )
                     no_stop_trim.append(req.sampling_params.no_stop_trim)
-                    if req.return_logprob:
-                        input_token_logprobs.append(req.input_token_logprobs)
-                        output_token_logprobs.append(req.output_token_logprobs)
-                        input_top_logprobs.append(req.input_top_logprobs)
-                        output_top_logprobs.append(req.output_top_logprobs)
+
+                    if return_logprob:
+                        input_token_logprobs_val.append(req.input_token_logprobs_val)
+                        input_token_logprobs_idx.append(req.input_token_logprobs_idx)
+                        output_token_logprobs_val.append(req.output_token_logprobs_val)
+                        output_token_logprobs_idx.append(req.output_token_logprobs_idx)
+                        input_top_logprobs_val.append(req.input_top_logprobs_val)
+                        input_top_logprobs_idx.append(req.input_top_logprobs_idx)
+                        output_top_logprobs_val.append(req.output_top_logprobs_val)
+                        output_top_logprobs_idx.append(req.output_top_logprobs_idx)
                         normalized_prompt_logprob.append(req.normalized_prompt_logprob)
 
             # Send to detokenizer
@@ -1252,10 +1280,14 @@ class Scheduler:
                         completion_tokens,
                         completion_tokens_wo_jump_forward,
                         cached_tokens,
-                        input_token_logprobs,
-                        output_token_logprobs,
-                        input_top_logprobs,
-                        output_top_logprobs,
+                        input_token_logprobs_val,
+                        input_token_logprobs_idx,
+                        output_token_logprobs_val,
+                        output_token_logprobs_idx,
+                        input_top_logprobs_val,
+                        input_top_logprobs_idx,
+                        output_top_logprobs_val,
+                        output_top_logprobs_idx,
                         normalized_prompt_logprob,
                     )
                 )

@@ -328,10 +328,14 @@ class BatchTokenIDOut:
     completion_tokens_wo_jump_forward: List[int]
     cached_tokens: List[int]
     # Logprobs
-    input_token_logprobs: List
-    output_token_logprobs: List
-    input_top_logprobs: List
-    output_top_logprobs: List
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    input_top_logprobs_val: List[List]
+    input_top_logprobs_idx: List[List]
+    output_top_logprobs_val: List[List]
+    output_top_logprobs_idx: List[List]
     normalized_prompt_logprob: List[float]
 
 
