@@ -127,7 +127,7 @@ class DetokenizerManager:
                 read_ids.append(
                     self.trim_eos(
                         s.decode_ids[s.surr_offset :],
-                        recv_obj.finished_reason[i],
+                        recv_obj.finished_reasons[i],
                         recv_obj.no_stop_trim[i],
                     )
                 )
@@ -150,7 +150,7 @@ class DetokenizerManager:
             for i in range(bs):
                 s = self.decode_status[recv_obj.rids[i]]
                 new_text = read_texts[i][len(surr_texts[i]) :]
-                if recv_obj.finished_reason[i] is None:
+                if recv_obj.finished_reasons[i] is None:
                     # Streaming chunk: update the decode status
                     if len(new_text) > 0 and not new_text.endswith("�"):
                         s.decoded_text = s.decoded_text + new_text
@@ -163,7 +163,7 @@ class DetokenizerManager:
                 output_strs.append(
                     self.trim_eos(
                         s.decoded_text + new_text,
-                        recv_obj.finished_reason[i],
+                        recv_obj.finished_reasons[i],
                         recv_obj.no_stop_trim[i],
                     )
                 )
@@ -171,9 +171,9 @@ class DetokenizerManager:
             self.send_to_tokenizer.send_pyobj(
                 BatchStrOut(
                     rids=recv_obj.rids,
+                    finished_reasons=recv_obj.finished_reasons,
                     output_strs=output_strs,
-                    meta_info=recv_obj.meta_info,
-                    finished_reason=recv_obj.finished_reason,
+                    meta_info=[None] * len(recv_obj.rids),
                 )
             )
 

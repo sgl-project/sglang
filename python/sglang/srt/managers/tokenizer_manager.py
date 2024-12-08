@@ -609,6 +609,7 @@ class TokenizerManager:
                     if state is None:
                         continue
 
+                    recv_obj.meta_info[i] = {}
                     recv_obj.meta_info[i]["id"] = rid
                     if isinstance(recv_obj, BatchStrOut):
                         out_dict = {
@@ -627,7 +628,7 @@ class TokenizerManager:
                             "meta_info": recv_obj.meta_info[i],
                         }
                     state.out_list.append(out_dict)
-                    state.finished = recv_obj.finished_reason[i] is not None
+                    state.finished = recv_obj.finished_reasons[i] is not None
                     state.event.set()
 
                     if self.enable_metrics:

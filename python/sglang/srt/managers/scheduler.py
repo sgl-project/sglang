@@ -1088,7 +1088,9 @@ class Scheduler:
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
+        tic = time.time()
         self.stream_output(batch.reqs)
+        print(f"stream_output: {(time.time() - tic) * 1e6:.2f} us")
 
         self.token_to_kv_pool.free_group_end()
 
@@ -1182,18 +1184,27 @@ class Scheduler:
 
     def stream_output(self, reqs: List[Req], skip_req: Optional[Req] = None):
         """Stream the output to detokenizer."""
-        output_rids = []
-        output_meta_info: List[dict] = []
-        output_finished_reason: List[BaseFinishReason] = []
+        rids = []
+        finished_reasons: List[BaseFinishReason] = []
+
         if self.is_generation:
-            output_vids = []
+            vids = []
             decoded_texts = []
-            output_read_ids = []
-            output_read_offsets = []
+            decode_ids_list = []
+            read_offsets = []
             output_ids = []
-            output_skip_special_tokens = []
-            output_spaces_between_special_tokens = []
-            output_no_stop_trim = []
+            skip_special_tokens = []
+            spaces_between_special_tokens = []
+            no_stop_trim = []
+            prompt_tokens = []
+            completion_tokens = []
+            completion_tokens_wo_jump_forward = []
+            cached_tokens = []
+            input_token_logprobs = []
+            output_token_logprobs = []
+            input_top_logprobs = []
+            output_top_logprobs = []
+            normalized_prompt_logprob = []
 
             for req in reqs:
                 if req is skip_req:
@@ -1202,85 +1213,63 @@ class Scheduler:
                 # TODO(lianmin): revisit this for overlap + retract + stream
                 is_stream_iter = len(req.output_ids) % self.stream_interval == 0
                 if req.finished() or (req.stream and is_stream_iter):
-                    output_rids.append(req.rid)
-                    output_finished_reason.append(req.finished_reason)
-                    output_vids.append(req.vid)
+                    rids.append(req.rid)
+                    finished_reasons.append(req.finished_reason)
+                    vids.append(req.vid)
                     decoded_texts.append(req.decoded_text)
-                    read_ids, read_offset = req.init_incremental_detokenize()
-                    output_read_ids.append(read_ids)
-                    output_read_offsets.append(read_offset)
+                    decode_ids, read_offset = req.init_incremental_detokenize()
+                    decode_ids_list.append(decode_ids)
+                    read_offsets.append(read_offset)
                     if self.skip_tokenizer_init:
                         output_ids.append(req.output_ids)
-                    output_skip_special_tokens.append(
-                        req.sampling_params.skip_special_tokens
-                    )
-                    output_spaces_between_special_tokens.append(
+                    skip_special_tokens.append(req.sampling_params.skip_special_tokens)
+                    spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
                     )
-                    output_no_stop_trim.append(req.sampling_params.no_stop_trim)
-
-                    meta_info = {
-                        "prompt_tokens": len(req.origin_input_ids),
-                        "completion_tokens": len(req.output_ids),
-                        "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                        "cached_tokens": req.cached_tokens,
-                        "finish_reason": (
-                            req.finished_reason.to_json()
-                            if req.finished_reason is not None
-                            else None
-                        ),
-                    }
+                    no_stop_trim.append(req.sampling_params.no_stop_trim)
                     if req.return_logprob:
-                        (
-                            meta_info["input_token_logprobs"],
-                            meta_info["output_token_logprobs"],
-                            meta_info["input_top_logprobs"],
-                            meta_info["output_top_logprobs"],
-                            meta_info["normalized_prompt_logprob"],
-                        ) = (
-                            req.input_token_logprobs,
-                            req.output_token_logprobs,
-                            req.input_top_logprobs,
-                            req.output_top_logprobs,
-                            req.normalized_prompt_logprob,
-                        )
-                    output_meta_info.append(meta_info)
+                        input_token_logprobs.append(req.input_token_logprobs)
+                        output_token_logprobs.append(req.output_token_logprobs)
+                        input_top_logprobs.append(req.input_top_logprobs)
+                        output_top_logprobs.append(req.output_top_logprobs)
+                        normalized_prompt_logprob.append(req.normalized_prompt_logprob)
 
             # Send to detokenizer
-            if output_rids:
+            if rids:
                 self.send_to_detokenizer.send_pyobj(
                     BatchTokenIDOut(
-                        output_rids,
-                        output_vids,
+                        rids,
+                        finished_reasons,
+                        vids,
                         decoded_texts,
-                        output_read_ids,
-                        output_read_offsets,
+                        decode_ids_list,
+                        read_offsets,
                         output_ids,
-                        output_skip_special_tokens,
-                        output_spaces_between_special_tokens,
-                        output_meta_info,
-                        output_finished_reason,
-                        output_no_stop_trim,
+                        skip_special_tokens,
+                        spaces_between_special_tokens,
+                        no_stop_trim,
+                        prompt_tokens,
+                        completion_tokens,
+                        completion_tokens_wo_jump_forward,
+                        cached_tokens,
+                        input_token_logprobs,
+                        output_token_logprobs,
+                        input_top_logprobs,
+                        output_top_logprobs,
+                        normalized_prompt_logprob,
                     )
                 )
         else:  # embedding or reward model
-            output_embeddings = []
+            embeddings = []
+            prompt_tokens = []
             for req in reqs:
                 assert req.finished()
-                output_rids.append(req.rid)
-                output_finished_reason.append(req.finished_reason)
-                output_embeddings.append(req.embedding)
-                meta_info = {
-                    "prompt_tokens": len(req.origin_input_ids),
-                }
-                output_meta_info.append(meta_info)
+                rids.append(req.rid)
+                finished_reasons.append(req.finished_reason)
+                embeddings.append(req.embedding)
+                prompt_tokens.append(len(req.origin_input_ids))
             self.send_to_detokenizer.send_pyobj(
-                BatchEmbeddingOut(
-                    output_rids,
-                    output_embeddings,
-                    output_meta_info,
-                    output_finished_reason,
-                )
+                BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
