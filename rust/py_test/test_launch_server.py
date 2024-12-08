@@ -118,7 +118,7 @@ class TestLaunchServer(unittest.TestCase):
         for process in cls.other_process:
             kill_process_tree(process.pid)
 
-    def test_mmlu(self):
+    def test_1_mmlu(self):
         # DP size = 2
         TestLaunchServer.process = popen_launch_router(
             self.model,
@@ -144,7 +144,7 @@ class TestLaunchServer(unittest.TestCase):
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    def test_add_and_remove_worker(self):
+    def test_2_add_and_remove_worker(self):
         # DP size = 1
         TestLaunchServer.process = popen_launch_router(
             self.model,
