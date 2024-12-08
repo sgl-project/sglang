@@ -79,7 +79,7 @@ class DetokenizerManager:
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
-        if no_stop_trim:
+        if no_stop_trim or not finished_reason:
             return output
 
         matched = finished_reason.get("matched", None)
