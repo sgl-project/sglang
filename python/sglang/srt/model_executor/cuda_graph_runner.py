@@ -33,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -111,9 +112,10 @@ def clamp_position(seq_lens):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: "ModelRunner"):
+    def __init__(self, model_runner: "ModelRunner", model_layer: RadixAttention = None):
         # Parse args
         self.model_runner = model_runner
+        self.model_layer = model_layer
         self.graphs = {}
         self.input_buffers = {}
         self.output_buffers = {}
@@ -294,12 +296,15 @@ class CudaGraphRunner:
             gathered_buffer = None
 
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-        )
+        args = {
+            "bs": bs,
+            "req_pool_indices": req_pool_indices,
+            "seq_lens": seq_lens,
+            "encoder_lens": encoder_lens,
+        }
+        if self.model_layer:
+            args["model_layer"] = self.model_layer
+        self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(**args)
 
         # Run and capture
         def run_once():
@@ -373,13 +378,16 @@ class CudaGraphRunner:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
 
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            self.req_pool_indices,
-            self.seq_lens,
-            forward_batch.seq_lens_sum + (bs - raw_bs),
-            self.encoder_lens,
-        )
+        args = {
+            "bs": bs,
+            "req_pool_indices": self.req_pool_indices,
+            "seq_lens": self.seq_lens,
+            "seq_lens_sum": forward_batch.seq_lens_sum + (bs - raw_bs),
+            "encoder_lens": self.encoder_lens,
+        }
+        if self.model_layer:
+            args["model_layer"] = self.model_layer
+        self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(**args)
 
         # Replay
         self.graphs[bs].replay()
