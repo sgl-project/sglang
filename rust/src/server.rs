@@ -20,7 +20,10 @@ impl AppState {
         policy_config: PolicyConfig,
     ) -> Self {
         // Create router based on policy
-        let router = Router::new(worker_urls, policy_config);
+        let router = match Router::new(worker_urls, policy_config) {
+            Ok(router) => router,
+            Err(error) => panic!("Failed to create router: {}", error),
+        };
 
         Self { router, client }
     }
@@ -141,7 +144,11 @@ async fn add_worker(
                 .body("Worker URL required. Provide 'url' query parameter")
         }
     };
-    data.router.add_worker(worker_url).await
+
+    match data.router.add_worker(worker_url).await {
+        Ok(message) => HttpResponse::Ok().body(message),
+        Err(error) => HttpResponse::BadRequest().body(error),
+    }
 }
 
 #[post("/remove_worker")]
@@ -187,19 +194,19 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         )
         .init();
 
-    info!("Starting server on {}:{}", config.host, config.port);
-    info!("Worker URLs: {:?}", config.worker_urls);
-    info!("Policy Config: {:?}", config.policy_config);
-
     let client = reqwest::Client::builder()
         .build()
         .expect("Failed to create HTTP client");
 
     let app_state = web::Data::new(AppState::new(
-        config.worker_urls,
+        config.worker_urls.clone(),
         client,
-        config.policy_config,
+        config.policy_config.clone(),
     ));
+
+    info!("✅ Starting router on {}:{}", config.host, config.port);
+    info!("✅ Serving Worker URLs: {:?}", config.worker_urls);
+    info!("✅ Policy Config: {:?}", config.policy_config);
 
     HttpServer::new(move || {
         App::new()
