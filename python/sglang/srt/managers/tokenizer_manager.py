@@ -646,7 +646,11 @@ class TokenizerManager:
                     state.event.set()
 
                     if self.enable_metrics:
-                        completion_tokens = recv_obj.completion_tokens[i]
+                        completion_tokens = (
+                            recv_obj.completion_tokens[i]
+                            if recv_obj.completion_tokens
+                            else 0
+                        )
 
                         if state.first_token_time is None:
                             state.first_token_time = time.time()
