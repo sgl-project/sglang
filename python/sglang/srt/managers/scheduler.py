@@ -982,7 +982,6 @@ class Scheduler:
                     continue
 
                 if req.is_being_chunked <= 0:
-                    req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
@@ -1065,7 +1064,6 @@ class Scheduler:
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
-            req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
 
@@ -1205,7 +1203,6 @@ class Scheduler:
             no_stop_trim = []
             prompt_tokens = []
             completion_tokens = []
-            completion_tokens_wo_jump_forward = []
             cached_tokens = []
 
             if return_logprob:
@@ -1251,9 +1248,6 @@ class Scheduler:
 
                     prompt_tokens.append(len(req.origin_input_ids))
                     completion_tokens.append(len(req.output_ids))
-                    completion_tokens_wo_jump_forward.append(
-                        req.completion_tokens_wo_jump_forward
-                    )
                     cached_tokens.append(req.cached_tokens)
 
                     if return_logprob:
@@ -1283,7 +1277,6 @@ class Scheduler:
                         no_stop_trim,
                         prompt_tokens,
                         completion_tokens,
-                        completion_tokens_wo_jump_forward,
                         cached_tokens,
                         input_token_logprobs_val,
                         input_token_logprobs_idx,

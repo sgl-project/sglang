@@ -606,9 +606,6 @@ class TokenizerManager:
                         "id": rid,
                         "prompt_tokens": recv_obj.prompt_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
-                        "completion_tokens_wo_jump_forward": recv_obj.completion_tokens_wo_jump_forward[
-                            i
-                        ],
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
 

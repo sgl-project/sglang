@@ -249,10 +249,6 @@ class Req:
         self.read_offset = None
         self.decoded_text = ""
 
-        # The number of decoded tokens for token usage report. Note that
-        # this does not include the jump forward tokens.
-        self.completion_tokens_wo_jump_forward = 0
-
         # For multimodal inputs
         self.image_inputs: Optional[ImageInputs] = None
 

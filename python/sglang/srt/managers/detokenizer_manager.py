@@ -175,7 +175,6 @@ class DetokenizerManager:
                     output_strs=output_strs,
                     prompt_tokens=recv_obj.prompt_tokens,
                     completion_tokens=recv_obj.completion_tokens,
-                    completion_tokens_wo_jump_forward=recv_obj.completion_tokens_wo_jump_forward,
                     cached_tokens=recv_obj.cached_tokens,
                     input_token_logprobs_val=recv_obj.input_token_logprobs_val,
                     input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
