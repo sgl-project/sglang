@@ -1,23 +1,16 @@
-name: Nightly Evaluation
+name: Experiment Runner
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
-  push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
   workflow_dispatch:
 
 concurrency:
-  group: nightly-eval-${{ github.ref }}
+  group: experiment-runner-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  nightly-eval-2-gpu:
+  experiment-runner-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 2-gpu-runner
+    runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -25,16 +18,9 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
-          pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
 
-      - name: Test gsm8k
-        timeout-minutes: 120
+      - name: Test experiment runner
+        timeout-minutes: 10
         run: |
           cd test/srt
-          python3 test_nightly_gsm8k_eval.py
-
-      - name: Test human eval
-        timeout-minutes: 120
-        run: |
-          cd test/srt
-          python3 test_nightly_human_eval.py
+          python3 experiment_runner.py --config configs/sharegpt_config.yaml
