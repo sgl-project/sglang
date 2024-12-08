@@ -445,6 +445,7 @@ class Scheduler:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                recv_reqs.append(recv_req)
         else:
             recv_reqs = None
 
