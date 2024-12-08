@@ -141,8 +141,7 @@ async fn add_worker(
                 .body("Worker URL required. Provide 'url' query parameter")
         }
     };
-    data.router.add_worker(worker_url);
-    HttpResponse::Ok().finish()
+    data.router.add_worker(worker_url).await
 }
 
 #[post("/remove_worker")]
