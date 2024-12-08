@@ -347,8 +347,22 @@ class BatchStrOut:
     finished_reasons: List[BaseFinishReason]
     # The output decoded strings
     output_strs: List[str]
-    # The meta info
-    meta_info: List[Dict]
+
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    completion_tokens_wo_jump_forward: List[int]
+    cached_tokens: List[int]
+    # Logprobs
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    input_top_logprobs_val: List[List]
+    input_top_logprobs_idx: List[List]
+    output_top_logprobs_val: List[List]
+    output_top_logprobs_idx: List[List]
+    normalized_prompt_logprob: List[float]
 
 
 @dataclass

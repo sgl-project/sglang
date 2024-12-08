@@ -515,6 +515,9 @@ class Scheduler:
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
+                return_logprob=recv_req.return_logprob,
+                top_logprobs_num=recv_req.top_logprobs_num,
+                stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
             )
@@ -558,9 +561,6 @@ class Scheduler:
                 return
 
         # Copy more attributes
-        req.return_logprob = recv_req.return_logprob
-        req.top_logprobs_num = recv_req.top_logprobs_num
-        req.stream = recv_req.stream
         req.logprob_start_len = recv_req.logprob_start_len
 
         if req.logprob_start_len == -1:
@@ -1250,6 +1250,13 @@ class Scheduler:
                         req.sampling_params.spaces_between_special_tokens
                     )
                     no_stop_trim.append(req.sampling_params.no_stop_trim)
+
+                    prompt_tokens.append(len(req.origin_input_ids))
+                    completion_tokens.append(len(req.output_ids))
+                    completion_tokens_wo_jump_forward.append(
+                        req.completion_tokens_wo_jump_forward
+                    )
+                    cached_tokens.append(req.cached_tokens)
 
                     if return_logprob:
                         input_token_logprobs_val.append(req.input_token_logprobs_val)

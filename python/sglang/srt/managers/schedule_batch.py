@@ -200,6 +200,9 @@ class Req:
         origin_input_text: str,
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
+        return_logprob: bool = False,
+        top_logprobs_num: int = 0,
+        stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
@@ -230,7 +233,7 @@ class Req:
         self.tokenizer = None
         self.finished_reason = None
         self.to_abort = False
-        self.stream = False
+        self.stream = stream
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -265,21 +268,26 @@ class Req:
         self.is_retracted = False
 
         # Logprobs (arguments)
-        self.return_logprob = False
+        self.return_logprob = return_logprob
         self.logprob_start_len = 0
-        self.top_logprobs_num = 0
+        self.top_logprobs_num = top_logprobs_num
 
         # Logprobs (return value)
         self.normalized_prompt_logprob = None
         self.input_token_logprobs_val = None
         self.input_token_logprobs_idx = None
-        self.output_token_logprobs_val = []
-        self.output_token_logprobs_idx = []
-
         self.input_top_logprobs_val = None
         self.input_top_logprobs_idx = None
-        self.output_top_logprobs_val = []
-        self.output_top_logprobs_idx = []
+
+        if return_logprob:
+            self.output_token_logprobs_val = []
+            self.output_token_logprobs_idx = []
+            self.output_top_logprobs_val = []
+            self.output_top_logprobs_idx = []
+        else:
+            self.output_token_logprobs_val = self.output_token_logprobs_idx = (
+                self.output_top_logprobs_val
+            ) = self.output_top_logprobs_idx = None
 
         # Logprobs (internal values)
         # The tokens is prefilled but need to be considered as decode tokens

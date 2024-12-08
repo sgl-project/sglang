@@ -173,7 +173,19 @@ class DetokenizerManager:
                     rids=recv_obj.rids,
                     finished_reasons=recv_obj.finished_reasons,
                     output_strs=output_strs,
-                    meta_info=[None] * len(recv_obj.rids),
+                    prompt_tokens=recv_obj.prompt_tokens,
+                    completion_tokens=recv_obj.completion_tokens,
+                    completion_tokens_wo_jump_forward=recv_obj.completion_tokens_wo_jump_forward,
+                    cached_tokens=recv_obj.cached_tokens,
+                    input_token_logprobs_val=recv_obj.input_token_logprobs_val,
+                    input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
+                    output_token_logprobs_val=recv_obj.output_token_logprobs_val,
+                    output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
+                    input_top_logprobs_val=recv_obj.input_top_logprobs_val,
+                    input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
+                    output_top_logprobs_val=recv_obj.output_top_logprobs_val,
+                    output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+                    normalized_prompt_logprob=recv_obj.normalized_prompt_logprob,
                 )
             )
 
