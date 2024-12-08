@@ -1232,7 +1232,7 @@ class Scheduler:
                 is_stream_iter = len(req.output_ids) % self.stream_interval == 0
                 if req.finished() or (req.stream and is_stream_iter):
                     rids.append(req.rid)
-                    finished_reasons.append(req.finished_reason)
+                    finished_reasons.append(req.finished_reason.to_json())
                     vids.append(req.vid)
                     decoded_texts.append(req.decoded_text)
                     decode_ids, read_offset = req.init_incremental_detokenize()
@@ -1295,7 +1295,7 @@ class Scheduler:
             for req in reqs:
                 assert req.finished()
                 rids.append(req.rid)
-                finished_reasons.append(req.finished_reason)
+                finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
             self.send_to_detokenizer.send_pyobj(

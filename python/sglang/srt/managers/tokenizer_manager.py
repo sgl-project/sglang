@@ -604,6 +604,7 @@ class TokenizerManager:
 
                     meta_info = {
                         "id": rid,
+                        "finish_reason": recv_obj.finished_reasons[i],
                         "prompt_tokens": recv_obj.prompt_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],

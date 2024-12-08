@@ -343,7 +343,7 @@ class BatchStrOut:
     # The request id
     rids: List[str]
     # The finish reason
-    finished_reasons: List[BaseFinishReason]
+    finished_reasons: List[dict]
     # The output decoded strings
     output_strs: List[str]
 
