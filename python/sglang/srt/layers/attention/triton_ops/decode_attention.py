@@ -19,12 +19,22 @@ It supports page size = 1.
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
+
+import logging
+
 import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_hip
 
 is_hip_ = is_hip()
+
+logger = logging.getLogger(__name__)
+
+# TODO: Remove this when triton>=3.2.0. This issue will not affect performance and accuracy.
+logger.warn(
+    "The following error message 'operation scheduled before its operands' can be ignored."
+)
 
 
 @triton.jit
@@ -166,7 +176,6 @@ def _decode_att_m_fwd(
     Req_to_tokens,
     B_req_idx,
     B_Seqlen,
-    max_len_in_batch,
     num_kv_splits,
     sm_scale,
     logit_cap,
@@ -389,7 +398,6 @@ def _decode_grouped_att_m_fwd(
     Req_to_tokens,
     B_req_idx,
     B_Seqlen,
-    max_len_in_batch,
     num_kv_splits,
     sm_scale,
     logit_cap,
@@ -556,7 +564,6 @@ def decode_attention_fwd_normal(
     b_req_idx,
     b_seq_len,
     attn_logits,
-    max_len_in_batch,
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
@@ -569,7 +576,6 @@ def decode_attention_fwd_normal(
         req_to_token,
         b_req_idx,
         b_seq_len,
-        max_len_in_batch,
         num_kv_splits,
         sm_scale,
         logit_cap,
@@ -586,7 +592,6 @@ def decode_attention_fwd_grouped(
     b_req_idx,
     b_seq_len,
     attn_logits,
-    max_len_in_batch,
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
@@ -599,7 +604,6 @@ def decode_attention_fwd_grouped(
         req_to_token,
         b_req_idx,
         b_seq_len,
-        max_len_in_batch,
         num_kv_splits,
         sm_scale,
         logit_cap,
@@ -614,10 +618,8 @@ def decode_attention_fwd(
     o,
     req_to_token,
     b_req_idx,
-    b_start_loc,
     b_seq_len,
     attn_logits,
-    max_len_in_batch,
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
@@ -636,7 +638,6 @@ def decode_attention_fwd(
             b_req_idx,
             b_seq_len,
             attn_logits,
-            max_len_in_batch,
             num_kv_splits,
             sm_scale,
             logit_cap,
@@ -652,7 +653,6 @@ def decode_attention_fwd(
             b_req_idx,
             b_seq_len,
             attn_logits,
-            max_len_in_batch,
             num_kv_splits,
             sm_scale,
             logit_cap,
