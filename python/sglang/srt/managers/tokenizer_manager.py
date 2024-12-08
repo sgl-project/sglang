@@ -311,6 +311,10 @@ class TokenizerManager:
 
             if obj.stream:
                 yield out
+            else:
+                if request is not None and await request.is_disconnected():
+                    self.abort_request(obj.rid)
+                    raise ValueError(f"Abort request {obj.rid}")
 
     async def _handle_batch_request(
         self,
