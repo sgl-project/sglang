@@ -167,13 +167,6 @@ def main():
         signal.SIGQUIT, lambda sig, frame: cleanup_processes(server_processes)
     )
 
-    for port in worker_ports:
-        if not wait_for_server_health(server_args.host, port):
-            logger.error(f"Server on port {port} failed to become healthy")
-            break
-
-    logger.info("All servers are healthy. Starting router...")
-
     # Update router args with worker URLs
     router_args.worker_urls = [
         f"http://{server_args.host}:{port}" for port in worker_ports
