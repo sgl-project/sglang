@@ -329,7 +329,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         )
 
 
-@app.api_route("/encode", methods=["POST", "PUT"])
+@app.api_route("/classify", methods=["POST", "PUT"])
 @time_func_latency
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
@@ -462,8 +462,8 @@ def launch_engine(
         if server_args.node_rank >= 1:
             # For other nodes, they do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            while True:
-                pass
+            for proc in scheduler_procs:
+                proc.join()
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)

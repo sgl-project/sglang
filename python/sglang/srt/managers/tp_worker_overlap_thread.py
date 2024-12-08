@@ -32,12 +32,13 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_compiler_backend
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
@@ -73,12 +74,13 @@ class TpModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
-        self.forward_stream = torch.cuda.Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
+        self.scheduler_stream = torch.get_device_module(self.device).current_stream()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -97,7 +99,7 @@ class TpModelWorkerClient:
 
     def forward_thread_func(self):
         try:
-            with torch.cuda.stream(self.forward_stream):
+            with torch.get_device_module(self.device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:
             traceback = get_exception_traceback()
@@ -122,7 +124,7 @@ class TpModelWorkerClient:
 
             # Create event
             self.launch_done = threading.Event()
-            copy_done = torch.cuda.Event()
+            copy_done = torch.get_device_module(self.device).Event()
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
@@ -190,7 +192,7 @@ class TpModelWorkerClient:
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.
-        torch.cuda.current_stream().synchronize()
+        self.scheduler_stream.synchronize()
 
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct))

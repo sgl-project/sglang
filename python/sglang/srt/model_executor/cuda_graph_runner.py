@@ -47,7 +47,7 @@ def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
                 if "FusedMoE" in sub.__class__.__name__:
                     if batch_size == 1:
                         # The performance of torch.compile on this layer is not always good when bs > 1,
-                        # so we decide to skip it for now.
+                        # so we decide to only use torch.compile when bs =1
                         sub._forward_method = fused_moe_forward_native
                 else:
                     sub._forward_method = sub.forward_native
@@ -130,6 +130,20 @@ class CudaGraphRunner:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+
+        if max(self.capture_bs) > model_runner.req_to_token_pool.size:
+            # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+            # is very samll. We add more values here to make sure we capture the maximum bs.
+            self.capture_bs = list(
+                sorted(
+                    set(
+                        self.capture_bs
+                        + [model_runner.req_to_token_pool.size - 1]
+                        + [model_runner.req_to_token_pool.size]
+                    )
+                )
+            )
+
         self.capture_bs = [
             bs
             for bs in self.capture_bs
