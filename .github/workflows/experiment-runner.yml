@@ -5,7 +5,7 @@ on:
     inputs:
       script:
         description: "Experiment Runner Script"
-        default: "configs/sharegpt_config.yml"
+        default: "configs/sharegpt_config.yaml"
 
 concurrency:
   group: experiment-runner-${{ github.ref }}
