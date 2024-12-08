@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -103,24 +102,49 @@ def popen_launch_server(
     # intentionally don't wait and defer the job to the router health check
     return process
 
+def terminate_and_wait(process, timeout=60):
+    """Terminate a process and wait until it is terminated.
+    
+    Args:
+        process: subprocess.Popen object
+        timeout: maximum time to wait in seconds
+    
+    Raises:
+        TimeoutError: if process does not terminate within timeout
+    """
+    if process is None:
+        return
+
+    process.terminate()
+    start_time = time.time()
+    
+    while process.poll() is None:
+        print(f"Terminating process {process.pid}")
+        if time.time() - start_time > timeout:
+            raise TimeoutError(f"Process {process.pid} failed to terminate within {timeout}s")
+        time.sleep(1)
+
+    print(f"Process {process.pid} is successfully terminated")
 
 class TestLaunchServer(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = None
-        cls.other_process = []
+    def setUp(self):
+        self.model = DEFAULT_MODEL_NAME_FOR_TEST
+        self.base_url = DEFAULT_URL_FOR_TEST
+        self.process = None
+        self.other_process = []
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        for process in cls.other_process:
-            kill_process_tree(process.pid)
+    def tearDown(self):
+        print("Running tearDown...")
+        if self.process:
+            terminate_and_wait(self.process)
+        for process in self.other_process:
+            terminate_and_wait(process)
+        print("tearDown done")
 
-    def test_mmlu(self):
+    def test_1_mmlu(self):
+        print("Running test_1_mmlu...")
         # DP size = 2
-        TestLaunchServer.process = popen_launch_router(
+        self.process = popen_launch_router(
             self.model,
             self.base_url,
             dp_size=2,
@@ -144,9 +168,10 @@ class TestLaunchServer(unittest.TestCase):
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    def test_add_and_remove_worker(self):
+    def test_2_add_and_remove_worker(self):
+        print("Running test_2_add_and_remove_worker...")
         # DP size = 1
-        TestLaunchServer.process = popen_launch_router(
+        self.process = popen_launch_router(
             self.model,
             self.base_url,
             dp_size=1,
@@ -159,7 +184,7 @@ class TestLaunchServer(unittest.TestCase):
         worker_process = popen_launch_server(
             self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         )
-        TestLaunchServer.other_process.append(worker_process)
+        self.other_process.append(worker_process)
 
         # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
         with requests.Session() as session:
