@@ -58,6 +58,7 @@ global_server_args_dict = {
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_ep_moe": ServerArgs.enable_ep_moe,
 }
 
 
@@ -128,7 +129,6 @@ class ImageInputs:
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
-    image_pad_len: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None

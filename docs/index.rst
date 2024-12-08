@@ -41,6 +41,13 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
+   :caption: SGLang Router
+
+   router/router.md
+
+
+.. toctree::
+   :maxdepth: 1
    :caption: References
 
    references/supported_models.md
