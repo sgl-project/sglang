@@ -400,9 +400,14 @@ class CudaGraphRunner:
                     forward_mode=ForwardMode.DECODE,
                     top_logprobs_nums=forward_batch.top_logprobs_nums,
                 )
-                logits_output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
+                (
+                    logits_output.output_top_logprobs_val,
+                    logits_output.output_top_logprobs_idx,
+                ) = LogitsProcessor.get_top_logprobs(
                     next_token_logprobs, logits_metadata
-                )[1]
+                )[
+                    2:4
+                ]
         else:
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,

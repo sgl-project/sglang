@@ -568,6 +568,7 @@ def run_bench_serving(
         disable_tqdm=False,
         disable_stream=disable_stream,
         disable_ignore_eos=False,
+        return_logprob=False,
         lora_name=None,
         extra_request_body=None,
         profile=None,
@@ -719,13 +720,13 @@ def run_and_check_memory_leak(
 
     # Clean up everything
     kill_process_tree(process.pid)
-    kill_process_tree(process.pid)
     stdout.close()
     stderr.close()
     if os.path.exists(STDOUT_FILENAME):
         os.remove(STDOUT_FILENAME)
     if os.path.exists(STDERR_FILENAME):
         os.remove(STDERR_FILENAME)
+    kill_process_tree(process.pid)
     t.join()
 
     # Assert success
@@ -733,7 +734,7 @@ def run_and_check_memory_leak(
     has_leak = False
     has_abort = False
     for line in output_lines:
-        if "The server is fired" in line:
+        if "Uvicorn running" in line:
             has_new_server = True
         if "leak" in line:
             has_leak = True

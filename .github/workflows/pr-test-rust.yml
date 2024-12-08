@@ -42,7 +42,7 @@ jobs:
 
   e2e-rust:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
+    runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -57,7 +57,7 @@ jobs:
           cd rust
           pip install setuptools-rust wheel build
           python3 -m build
-          pip install dist/*.whl
+          pip install --force-reinstall dist/*.whl
       - name: Run e2e test
         run: |
           cd rust/py_test

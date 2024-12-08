@@ -22,7 +22,7 @@ import signal
 import sys
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import uvloop
@@ -76,6 +76,7 @@ class ReqState:
     out_list: List
     finished: bool
     event: asyncio.Event
+    obj: Any
 
     # For metrics
     created_time: float
@@ -283,7 +284,7 @@ class TokenizerManager:
     ):
         """Wait for the response of one request."""
         event = asyncio.Event()
-        state = ReqState([], False, event, created_time=created_time)
+        state = ReqState([], False, event, obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
 
         while True:
@@ -295,15 +296,7 @@ class TokenizerManager:
                     raise ValueError(f"Abort request {obj.rid}")
                 continue
 
-            if isinstance(obj, GenerateReqInput):
-                out = self.convert_logprob_style(
-                    state.out_list[-1],
-                    obj.return_logprob,
-                    obj.top_logprobs_num,
-                    obj.return_text_in_logprobs,
-                )
-            else:  # isinstance(obj, (EmbeddingReqInput,))
-                out = state.out_list[-1]
+            out = state.out_list[-1]
 
             state.out_list = []
             if state.finished:
@@ -315,7 +308,13 @@ class TokenizerManager:
                 break
 
             state.event.clear()
-            yield out
+
+            if obj.stream:
+                yield out
+            else:
+                if request is not None and await request.is_disconnected():
+                    self.abort_request(obj.rid)
+                    raise ValueError(f"Abort request {obj.rid}")
 
     async def _handle_batch_request(
         self,
@@ -609,29 +608,55 @@ class TokenizerManager:
                     if state is None:
                         continue
 
-                    recv_obj.meta_info[i]["id"] = rid
+                    meta_info = {
+                        "id": rid,
+                        "finish_reason": recv_obj.finished_reasons[i],
+                        "prompt_tokens": recv_obj.prompt_tokens[i],
+                    }
+
+                    if getattr(state.obj, "return_logprob", False):
+                        self.convert_logprob_style(
+                            meta_info,
+                            state.obj.top_logprobs_num,
+                            state.obj.return_text_in_logprobs,
+                            recv_obj,
+                            i,
+                        )
+
                     if isinstance(recv_obj, BatchStrOut):
                         out_dict = {
                             "text": recv_obj.output_strs[i],
-                            "meta_info": recv_obj.meta_info[i],
+                            "meta_info": {
+                                **meta_info,
+                                "completion_tokens": recv_obj.completion_tokens[i],
+                                "cached_tokens": recv_obj.cached_tokens[i],
+                            },
                         }
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
-                            "meta_info": recv_obj.meta_info[i],
+                            "meta_info": {
+                                **meta_info,
+                                "completion_tokens": recv_obj.completion_tokens[i],
+                                "cached_tokens": recv_obj.cached_tokens[i],
+                            },
                         }
                     else:
                         assert isinstance(recv_obj, BatchEmbeddingOut)
                         out_dict = {
                             "embedding": recv_obj.embeddings[i],
-                            "meta_info": recv_obj.meta_info[i],
+                            "meta_info": meta_info,
                         }
                     state.out_list.append(out_dict)
-                    state.finished = recv_obj.finished_reason[i] is not None
+                    state.finished = recv_obj.finished_reasons[i] is not None
                     state.event.set()
 
                     if self.enable_metrics:
-                        completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
+                        completion_tokens = (
+                            recv_obj.completion_tokens[i]
+                            if recv_obj.completion_tokens
+                            else 0
+                        )
 
                         if state.first_token_time is None:
                             state.first_token_time = time.time()
@@ -647,7 +672,7 @@ class TokenizerManager:
 
                         if state.finished:
                             self.metrics_collector.inc_prompt_tokens(
-                                recv_obj.meta_info[i]["prompt_tokens"]
+                                recv_obj.prompt_tokens[i]
                             )
                             self.metrics_collector.inc_generation_tokens(
                                 completion_tokens
@@ -696,57 +721,73 @@ class TokenizerManager:
 
     def convert_logprob_style(
         self,
-        ret: dict,
-        return_logprob: bool,
+        meta_info: dict,
         top_logprobs_num: int,
         return_text_in_logprobs: bool,
+        recv_obj: BatchStrOut,
+        recv_obj_index: int,
     ):
-        if return_logprob:
-            ret["meta_info"]["input_token_logprobs"] = self.detokenize_logprob_tokens(
-                ret["meta_info"]["input_token_logprobs"], return_text_in_logprobs
-            )
-            ret["meta_info"]["output_token_logprobs"] = self.detokenize_logprob_tokens(
-                ret["meta_info"]["output_token_logprobs"], return_text_in_logprobs
-            )
-
-            if top_logprobs_num > 0:
-                ret["meta_info"]["input_top_logprobs"] = (
-                    self.detokenize_top_logprobs_tokens(
-                        ret["meta_info"]["input_top_logprobs"],
-                        return_text_in_logprobs,
-                    )
-                )
-                ret["meta_info"]["output_top_logprobs"] = (
-                    self.detokenize_top_logprobs_tokens(
-                        ret["meta_info"]["output_top_logprobs"], return_text_in_logprobs
-                    )
-                )
-        return ret
-
-    def detokenize_logprob_tokens(
-        self, token_logprobs: List[Tuple[float, int]], decode_to_text: bool
-    ):
-        # TODO(lianmin): This should run on DetokenizerManager
-        if not decode_to_text:
-            return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
-
-        assert self.tokenizer is not None
-        token_ids = [tid for _, tid in token_logprobs]
-        token_texts = self.tokenizer.batch_decode(token_ids)
-        return [
-            (logprob, token_id, token_text)
-            for (logprob, token_id), token_text in zip(token_logprobs, token_texts)
+        meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
+            recv_obj.input_token_logprobs_val[recv_obj_index],
+            recv_obj.input_token_logprobs_idx[recv_obj_index],
+            return_text_in_logprobs,
+        )
+        meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
+            recv_obj.output_token_logprobs_val[recv_obj_index],
+            recv_obj.output_token_logprobs_idx[recv_obj_index],
+            return_text_in_logprobs,
+        )
+        meta_info["normalized_prompt_logprob"] = recv_obj.normalized_prompt_logprob[
+            recv_obj_index
         ]
 
-    def detokenize_top_logprobs_tokens(self, top_logprobs, decode_to_text: bool):
+        if top_logprobs_num > 0:
+            meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+                recv_obj.input_top_logprobs_val[recv_obj_index],
+                recv_obj.input_top_logprobs_idx[recv_obj_index],
+                return_text_in_logprobs,
+            )
+            meta_info["output_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+                recv_obj.output_top_logprobs_val[recv_obj_index],
+                recv_obj.output_top_logprobs_idx[recv_obj_index],
+                return_text_in_logprobs,
+            )
+
+    def detokenize_logprob_tokens(
+        self,
+        token_logprobs_val: List[float],
+        token_logprobs_idx: List[int],
+        decode_to_text: bool,
+    ):
+        if not decode_to_text:
+            return [
+                (logprob, token_id, None)
+                for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
+            ]
+        else:
+            assert self.tokenizer is not None
+            token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+
+    def detokenize_top_logprobs_tokens(
+        self,
+        token_logprobs_val: List[float],
+        token_logprobs_idx: List[int],
+        decode_to_text: bool,
+    ):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
-        for i, token_top_logprobs in enumerate(top_logprobs):
-            if token_top_logprobs:
-                top_logprobs[i] = self.detokenize_logprob_tokens(
-                    token_top_logprobs, decode_to_text
+        ret = []
+        for i in range(len(token_logprobs_val)):
+            if token_logprobs_val[i]:
+                ret.append(
+                    self.detokenize_logprob_tokens(
+                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                    )
                 )
-        return top_logprobs
+            else:
+                ret.append(None)
+        return ret
 
 
 class SignalHandler:

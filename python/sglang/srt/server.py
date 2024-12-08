@@ -462,8 +462,8 @@ def launch_engine(
         if server_args.node_rank >= 1:
             # For other nodes, they do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            while True:
-                pass
+            for proc in scheduler_procs:
+                proc.join()
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)

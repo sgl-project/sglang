@@ -125,7 +125,7 @@ class TestBenchServing(unittest.TestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_default\n"
-                f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} token/s\n'
+                f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
             self.assertLess(res["median_e2e_latency_ms"], 12000)
             self.assertLess(res["median_ttft_ms"], 86)

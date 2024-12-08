@@ -62,10 +62,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_compiler_backend, set_weight_attrs
 
 
-@torch.compile
+@torch.compile(backend=get_compiler_backend())
 def layer_norm_func(hidden_states, weight, variance_epsilon):
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)

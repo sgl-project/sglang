@@ -1,5 +1,9 @@
 # Contributor Guide
 
+# Build SGLang
+
+See [Install SGLang, Method 2: From Source section](../start/install.md).
+
 ## Format Your Code
 Use these commands to format your code and pass CI linting tests.
 
