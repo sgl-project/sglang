@@ -102,13 +102,14 @@ def popen_launch_server(
     # intentionally don't wait and defer the job to the router health check
     return process
 
+
 def terminate_and_wait(process, timeout=60):
     """Terminate a process and wait until it is terminated.
-    
+
     Args:
         process: subprocess.Popen object
         timeout: maximum time to wait in seconds
-    
+
     Raises:
         TimeoutError: if process does not terminate within timeout
     """
@@ -117,14 +118,17 @@ def terminate_and_wait(process, timeout=60):
 
     process.terminate()
     start_time = time.time()
-    
+
     while process.poll() is None:
         print(f"Terminating process {process.pid}")
         if time.time() - start_time > timeout:
-            raise TimeoutError(f"Process {process.pid} failed to terminate within {timeout}s")
+            raise TimeoutError(
+                f"Process {process.pid} failed to terminate within {timeout}s"
+            )
         time.sleep(1)
 
     print(f"Process {process.pid} is successfully terminated")
+
 
 class TestLaunchServer(unittest.TestCase):
     def setUp(self):

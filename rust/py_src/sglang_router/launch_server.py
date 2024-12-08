@@ -5,17 +5,17 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import sys
 import time
 from typing import List
 
 import requests
+from setproctitle import setproctitle
 from sglang_router.launch_router import RouterArgs, launch_router
 
 from sglang.srt.server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
-from setproctitle import setproctitle
-import sys
 
 
 def setup_logger():
@@ -33,11 +33,13 @@ def setup_logger():
 
     return logger
 
+
 logger = setup_logger()
+
 
 # Create new process group
 def run_server(server_args, dp_rank):
-    setproctitle(f"sglang::server") 
+    setproctitle(f"sglang::server")
     # Set SGLANG_DP_RANK environment variable
     os.environ["SGLANG_DP_RANK"] = str(dp_rank)
 
@@ -86,9 +88,11 @@ def find_available_ports(base_port: int, count: int) -> List[int]:
 
     return available_ports
 
+
 def cleanup_processes(processes: List[mp.Process]):
     for process in processes:
         process.terminate()
+
 
 def main():
 
@@ -126,14 +130,18 @@ def main():
         server_processes.append(proc)
 
     signal.signal(signal.SIGINT, lambda sig, frame: cleanup_processes(server_processes))
-    signal.signal(signal.SIGTERM, lambda sig, frame: cleanup_processes(server_processes))
-    signal.signal(signal.SIGQUIT, lambda sig, frame: cleanup_processes(server_processes))
+    signal.signal(
+        signal.SIGTERM, lambda sig, frame: cleanup_processes(server_processes)
+    )
+    signal.signal(
+        signal.SIGQUIT, lambda sig, frame: cleanup_processes(server_processes)
+    )
 
     for port in worker_ports:
         if not wait_for_server_health(server_args.host, port):
             logger.error(f"Server on port {port} failed to become healthy")
             break
-    
+
     logger.info("All servers are healthy. Starting router...")
 
     # Update router args with worker URLs
