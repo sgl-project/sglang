@@ -24,7 +24,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Test experiment runner
-        timeout-minutes: 10
+        timeout-minutes: 120
         run: |
           cd test/srt
           python3 experiment_runner.py --config ${{ inputs.script }}
