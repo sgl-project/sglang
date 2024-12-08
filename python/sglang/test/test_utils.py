@@ -734,7 +734,7 @@ def run_and_check_memory_leak(
     has_leak = False
     has_abort = False
     for line in output_lines:
-        if "The server is fired" in line:
+        if "Uvicorn running" in line:
             has_new_server = True
         if "leak" in line:
             has_leak = True
