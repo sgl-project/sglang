@@ -1092,9 +1092,7 @@ class Scheduler:
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
-        tic = time.time()
         self.stream_output(batch.reqs, batch.return_logprob)
-        print(f"stream_output: {(time.time() - tic) * 1e6:.2f} us")
 
         self.token_to_kv_pool.free_group_end()
 
