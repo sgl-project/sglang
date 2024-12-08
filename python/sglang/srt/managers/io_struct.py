@@ -308,6 +308,9 @@ class TokenizedEmbeddingReqInput:
 class BatchTokenIDOut:
     # The request id
     rids: List[str]
+    # The finish reason
+    finished_reasons: List[BaseFinishReason]
+    # For incremental decoding
     # The version id to sync decode status with in detokenizer_manager
     vids: List[int]
     decoded_texts: List[str]
@@ -315,35 +318,61 @@ class BatchTokenIDOut:
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init`
     output_ids: Optional[List[int]]
+    # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
-    meta_info: List[Dict]
-    finished_reason: List[BaseFinishReason]
     no_stop_trim: List[bool]
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    cached_tokens: List[int]
+    # Logprobs
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    input_top_logprobs_val: List[List]
+    input_top_logprobs_idx: List[List]
+    output_top_logprobs_val: List[List]
+    output_top_logprobs_idx: List[List]
+    normalized_prompt_logprob: List[float]
 
 
 @dataclass
 class BatchStrOut:
     # The request id
     rids: List[str]
+    # The finish reason
+    finished_reasons: List[dict]
     # The output decoded strings
     output_strs: List[str]
-    # The meta info
-    meta_info: List[Dict]
-    # The finish reason
-    finished_reason: List[BaseFinishReason]
+
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    cached_tokens: List[int]
+    # Logprobs
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    input_top_logprobs_val: List[List]
+    input_top_logprobs_idx: List[List]
+    output_top_logprobs_val: List[List]
+    output_top_logprobs_idx: List[List]
+    normalized_prompt_logprob: List[float]
 
 
 @dataclass
 class BatchEmbeddingOut:
     # The request id
     rids: List[str]
+    # The finish reason
+    finished_reasons: List[BaseFinishReason]
     # The output embedding
     embeddings: List[List[float]]
-    # The meta info
-    meta_info: List[Dict]
-    # The finish reason
-    finished_reason: List[BaseFinishReason]
+    # Token counts
+    prompt_tokens: List[int]
 
 
 @dataclass
