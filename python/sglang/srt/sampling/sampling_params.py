@@ -13,7 +13,7 @@
 # ==============================================================================
 """Sampling parameters for text generation."""
 
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
 
@@ -39,6 +39,7 @@ class SamplingParams:
         no_stop_trim: bool = False,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
+        custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -61,6 +62,7 @@ class SamplingParams:
         self.n = n
         self.json_schema = json_schema
         self.no_stop_trim = no_stop_trim
+        self.custom_params = custom_params
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
