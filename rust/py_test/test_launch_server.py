@@ -103,7 +103,7 @@ def popen_launch_server(
     return process
 
 
-def terminate_and_wait(process, timeout=60):
+def terminate_and_wait(process, timeout=300):
     """Terminate a process and wait until it is terminated.
 
     Args:
