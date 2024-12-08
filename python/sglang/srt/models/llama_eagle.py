@@ -1,0 +1,293 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
+# and
+# https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/modeling_llama_kv.py
+"""Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
+
+from typing import Any, Dict, Iterable, Optional, Tuple
+
+import torch
+from torch import nn
+from transformers import LlamaConfig
+from vllm.config import CacheConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.llama import LlamaAttention, LlamaMLP
+
+
+class LlamaDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None and getattr(
+            config, "original_max_position_embeddings", None
+        ):
+            rope_scaling["original_max_position_embeddings"] = (
+                config.original_max_position_embeddings
+            )
+        rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        self.self_attn = LlamaAttention(
+            config=config,
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            rope_is_neox_style=rope_is_neox_style,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
+        self.mlp = LlamaMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Self Attention
+        residual = hidden_states
+
+        if self.layer_id != 0:
+            hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        # Fully Connected
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states, residual
+
+
+class LlamaModel(nn.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+        )
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(
+                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+        # self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = torch.nn.Linear(config.hidden_size * 2, config.hidden_size)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
+        hidden_states = self.fc(
+            torch.cat((hidden_states, forward_batch.spec_info.hidden_states), dim=-1)
+        )
+
+        residual = None
+        for i in range(len(self.layers)):
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
+        return hidden_states
+
+
+class LlamaForCausalLMEagle(nn.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = LlamaModel(config, quant_config=quant_config)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> LogitsProcessorOutput:
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        logits_output = self.logits_processor(
+            None, hidden_states, self.lm_head, forward_batch
+        )
+        return logits_output
+
+    def get_hidden_dim(self, module_name):
+        # return input_dim, output_dim
+        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
+            return self.config.hidden_size, self.config.hidden_size
+        elif module_name in ["kv_proj"]:
+            return self.config.hidden_size, self.config.hidden_size // (
+                self.config.num_attention_heads // self.config.num_key_value_heads
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size
+        elif module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
+    def get_module_name(self, name):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id, num_shard)
+            ("qkv_proj", "q_proj", "q", 3),
+            ("qkv_proj", "k_proj", "k", 3),
+            ("qkv_proj", "v_proj", "v", 3),
+            ("gate_up_proj", "gate_proj", 0, 2),
+            ("gate_up_proj", "up_proj", 1, 2),
+        ]
+        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
+            if weight_name in name:
+                return (
+                    name.replace(weight_name, param_name)[: -len(".weight")],
+                    num_shard,
+                )
+        return name[: -len(".weight")], 1
+
+    def get_num_params(self):
+        params_dict = dict(self.named_parameters())
+        return len(params_dict)
+
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
+    ):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+
+        def load_weights_per_param(name, loaded_weight):
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                return
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                return
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                return
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    return
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+        if name is None or loaded_weight is None:
+            for name, loaded_weight in weights:
+                if "lm_head" not in name:
+                    name = "model." + name
+                load_weights_per_param(name, loaded_weight)
+        else:
+            load_weights_per_param(name, loaded_weight)
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+EntryClass = [LlamaForCausalLMEagle]

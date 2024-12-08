@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +14,7 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+
 
 import logging
 import threading
@@ -37,6 +40,8 @@ logger = logging.getLogger(__name__)
 class TpModelWorker:
     """A tensor parallel model worker."""
 
+    is_draft_worker = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -47,10 +52,16 @@ class TpModelWorker:
     ):
         # Parse args
         self.tp_rank = tp_rank
+        self.server_args = server_args
+        is_draft_worker = self.is_draft_worker
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path,
+            (
+                server_args.model_path
+                if not is_draft_worker
+                else server_args.draft_model_path
+            ),
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.context_length,
@@ -59,6 +70,7 @@ class TpModelWorker:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
+
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -67,6 +79,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            is_draft_runner=is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -149,12 +162,17 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
+        skip_sample: bool = False,
     ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:
             launch_done.set()
-        next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        if skip_sample:
+            next_token_ids = None
+        else:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        model_worker_batch.spec_info = forward_batch.spec_info
         return logits_output, next_token_ids
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):

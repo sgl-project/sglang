@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.speculative_worker import spec_worker_factory
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
@@ -196,6 +197,21 @@ class Scheduler:
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
+
+        # Launch Speculative worker if need
+        if self.server_args.speculative_algorithm.is_not_none():
+            self.draft_worker = spec_worker_factory.get(
+                self.server_args.speculative_algorithm
+            )(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        else:
+            self.draft_worker = None
 
         # Get token and memory info from the model worker
         (
@@ -807,6 +823,8 @@ class Scheduler:
                 if res == AddReqResult.NO_TOKEN:
                     self.batch_is_full = True
                 break
+            if self.server_args.split_prefill_batch:
+                break
 
         # Update waiting queue
         can_run_list = adder.can_run_list
@@ -835,6 +853,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
+            self.server_args.speculative_algorithm,
         )
         new_batch.prepare_for_extend()
 
@@ -868,11 +887,20 @@ class Scheduler:
             return None
 
         # Check if decode out of memory
-        if not batch.check_decode_mem() or (test_retract and batch.batch_size() > 10):
+        buf_multiplier = (
+            self.server_args.num_draft_tokens
+            if self.server_args.speculative_algorithm.is_not_none()
+            else 1
+        )
+        if not batch.check_decode_mem(buf_multiplier) or (
+            test_retract and batch.batch_size() > 10
+        ):
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
             self.new_token_ratio = new_token_ratio
+            if self.draft_worker is not None:
+                self.draft_worker.finish_request(retracted_reqs)
 
             logger.info(
                 "Decode out of memory happened. "
@@ -904,13 +932,18 @@ class Scheduler:
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
         self.forward_ct += 1
-
         if self.is_generation:
-            model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
+                if self.server_args.speculative_algorithm.is_not_none():
+                    logits_output, next_token_ids, model_worker_batch, spec_info = (
+                        self.draft_worker.forward_batch_speculative_generate(batch)
+                    )
+                    batch.spec_info = spec_info
+                else:
+                    model_worker_batch = batch.get_model_worker_batch()
+                    logits_output, next_token_ids = (
+                        self.tp_worker.forward_batch_generation(model_worker_batch)
+                    )
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -1066,7 +1099,10 @@ class Scheduler:
                 continue
 
             req.completion_tokens_wo_jump_forward += 1
-            req.output_ids.append(next_token_id)
+            if (
+                not batch.spec_algorithm.is_not_none()
+            ):  # speculative worker will solve the output_ids in speculative decoding
+                req.output_ids.append(next_token_id)
             req.check_finished()
 
             if req.finished():
@@ -1207,6 +1243,8 @@ class Scheduler:
             if req.finished() or (
                 req.stream and (is_stream_iter or len(req.output_ids) == 1)
             ):
+                if req.finished() and self.draft_worker is not None:
+                    self.draft_worker.finish_request(req)
                 output_rids.append(req.rid)
                 output_finished_reason.append(req.finished_reason)
                 if self.is_generation:

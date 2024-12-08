@@ -5,6 +5,7 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "minimal": [
+        "test_eagle_infer.py",
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
