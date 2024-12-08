@@ -440,16 +440,11 @@ class Scheduler:
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
-            if self.last_batch is None:
-                recv_req = self.recv_from_tokenizer.recv_pyobj()
-                recv_reqs.append(recv_req)
-            else:
-                while True:
-                    try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+            while True:
+                try:
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
         else:
             recv_reqs = None
 
