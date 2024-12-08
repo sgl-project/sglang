@@ -157,28 +157,12 @@ def main():
         # Setup cleanup handler
         setup_signal_handlers(lambda: cleanup_processes(server_processes))
 
-        # Wait for all servers to be healthy
-        all_healthy = True
-
-        for port in worker_ports:
-            if not wait_for_server_health(server_args.host, port):
-                logger.error(f"Server on port {port} failed to become healthy")
-                all_healthy = False
-                break
-
-        if not all_healthy:
-            logger.error("Not all servers are healthy. Shutting down...")
-            cleanup_processes(server_processes)
-            sys.exit(1)
-
-        logger.info("All servers are healthy. Starting router...")
-
         # Update router args with worker URLs
         router_args.worker_urls = [
             f"http://{server_args.host}:{port}" for port in worker_ports
         ]
 
-        # Start the router
+        # Start the router. The router will wait until all workers are healthy.
         router = launch_router(router_args)
 
         if router is None:
