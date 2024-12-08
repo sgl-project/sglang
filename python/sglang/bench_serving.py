@@ -321,6 +321,8 @@ async def async_request_sglang_generate(
             },
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
+            "return_logprob": args.return_logprob,
+            "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
         headers = {}
@@ -911,7 +913,7 @@ async def benchmark(
         prompt=test_prompt,
         api_url=api_url,
         prompt_len=test_prompt_len,
-        output_len=test_output_len,
+        output_len=min(test_output_len, 32),
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
@@ -1412,6 +1414,11 @@ if __name__ == "__main__":
         "--disable-ignore-eos",
         action="store_true",
         help="Disable ignoring EOS.",
+    )
+    parser.add_argument(
+        "--return-logprob",
+        action="store_true",
+        help="Return logprob.",
     )
     parser.add_argument(
         "--extra-request-body",
