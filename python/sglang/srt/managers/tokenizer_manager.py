@@ -308,7 +308,9 @@ class TokenizerManager:
                 break
 
             state.event.clear()
-            yield out
+
+            if obj.stream:
+                yield out
 
     async def _handle_batch_request(
         self,

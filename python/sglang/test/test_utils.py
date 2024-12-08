@@ -720,13 +720,13 @@ def run_and_check_memory_leak(
 
     # Clean up everything
     kill_process_tree(process.pid)
-    kill_process_tree(process.pid)
     stdout.close()
     stderr.close()
     if os.path.exists(STDOUT_FILENAME):
         os.remove(STDOUT_FILENAME)
     if os.path.exists(STDERR_FILENAME):
         os.remove(STDERR_FILENAME)
+    kill_process_tree(process.pid)
     t.join()
 
     # Assert success

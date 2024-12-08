@@ -1229,8 +1229,13 @@ class Scheduler:
                     continue
 
                 # TODO(lianmin): revisit this for overlap + retract + stream
-                is_stream_iter = len(req.output_ids) % self.stream_interval == 0
-                if req.finished() or (req.stream and is_stream_iter):
+                if (
+                    req.finished()
+                    # If stream, follow the given stream_interval
+                    or (req.stream and len(req.output_ids) % self.stream_interval == 0)
+                    # If not stream, we still want to output some tokens to get the benefit of incremental decoding.
+                    or (not req.stream and len(req.output_ids) % 50 == 0)
+                ):
                     rids.append(req.rid)
                     finished_reasons.append(
                         req.finished_reason.to_json() if req.finished_reason else None
