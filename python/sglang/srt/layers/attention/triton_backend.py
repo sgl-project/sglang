@@ -40,6 +40,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.reduce_dtype = torch.float16
 
+        self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+
         self.forward_metadata = None
 
         self.cuda_graph_max_seq_len = model_runner.model_config.context_len
@@ -53,10 +56,14 @@ class TritonAttnBackend(AttentionBackend):
             start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
-            total_num_tokens = forward_batch.seq_lens_sum
             attn_logits = torch.empty(
-                (self.num_head, total_num_tokens),
-                dtype=self.reduce_dtype,
+                (
+                    forward_batch.batch_size,
+                    self.num_head,
+                    self.num_kv_splits,
+                    self.v_head_dim + 1,
+                ),
+                dtype=torch.float32,
                 device=self.device,
             )
 
@@ -75,11 +82,8 @@ class TritonAttnBackend(AttentionBackend):
             (max_bs,), dtype=torch.int32, device=self.device
         )
         self.cuda_graph_attn_logits = torch.empty(
-            (
-                self.num_head,
-                self.cuda_graph_max_total_num_tokens,
-            ),
-            dtype=self.reduce_dtype,
+            (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
+            dtype=torch.float32,
             device="cuda",
         )
 
@@ -189,6 +193,7 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.seq_lens,
             attn_logits,
             max_seq_len,
+            self.num_kv_splits,
             layer.scaling,
             layer.logit_cap,
         )

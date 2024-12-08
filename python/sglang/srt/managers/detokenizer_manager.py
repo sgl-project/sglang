@@ -20,6 +20,7 @@ from collections import OrderedDict
 from typing import List, Union
 
 import psutil
+import setproctitle
 import zmq
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -194,6 +195,7 @@ def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

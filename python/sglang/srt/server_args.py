@@ -141,6 +141,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
+    triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
 
@@ -752,6 +753,12 @@ class ServerArgs:
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
+        )
+        parser.add_argument(
+            "--triton-attention-num-kv-splits",
+            type=int,
+            default=ServerArgs.triton_attention_num_kv_splits,
+            help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
         )
         parser.add_argument(
             "--num-continuous-decode-steps",
