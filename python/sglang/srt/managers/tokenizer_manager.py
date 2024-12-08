@@ -624,18 +624,18 @@ class TokenizerManager:
                     if isinstance(recv_obj, BatchStrOut):
                         out_dict = {
                             "text": recv_obj.output_strs[i],
-                            "meta_info": meta_info[i],
+                            "meta_info": meta_info,
                         }
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
-                            "meta_info": meta_info[i],
+                            "meta_info": meta_info,
                         }
                     else:
                         assert isinstance(recv_obj, BatchEmbeddingOut)
                         out_dict = {
                             "embedding": recv_obj.embeddings[i],
-                            "meta_info": meta_info[i],
+                            "meta_info": meta_info,
                         }
                     state.out_list.append(out_dict)
                     state.finished = recv_obj.finished_reasons[i] is not None
