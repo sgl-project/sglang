@@ -612,7 +612,7 @@ class TokenizerManager:
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
 
-                    if getattr(state.obj, "return_logprobs", False):
+                    if getattr(state.obj, "return_logprob", False):
                         self.convert_logprob_style(
                             meta_info,
                             state.obj.top_logprobs_num,

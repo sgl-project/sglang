@@ -1170,7 +1170,7 @@ class Scheduler:
             )
 
         if req.top_logprobs_num > 0:
-            if req.input_top_logprobs is None:
+            if req.input_top_logprobs_val is None:
                 req.input_top_logprobs_val = output.input_top_logprobs_val[i]
                 req.input_top_logprobs_idx = output.input_top_logprobs_idx[i]
                 if req.logprob_start_len == 0:
