@@ -573,7 +573,7 @@ class TokenizerManager:
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
-            await asyncio.sleep(60)
+            await asyncio.sleep(5)
 
         # drain requests
         while True:
