@@ -1145,7 +1145,7 @@ class Scheduler:
                 req.logprob_start_len == 0
             ):  # The first token does not have logprob, pad it.
                 input_token_logprobs_val = [None] + input_token_logprobs_val
-                input_token_logprobs_idx = req.fill_ids[0] + input_token_logprobs_idx
+                input_token_logprobs_idx = [req.fill_ids[0]] + input_token_logprobs_idx
 
             req.input_token_logprobs_val = input_token_logprobs_val
             req.input_token_logprobs_idx = input_token_logprobs_idx
