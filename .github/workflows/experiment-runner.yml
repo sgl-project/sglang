@@ -2,6 +2,10 @@ name: Experiment Runner
 
 on:
   workflow_dispatch:
+    inputs:
+      script:
+        description: "Experiment Runner Script"
+        default: "configs/sharegpt_config.yml"
 
 concurrency:
   group: experiment-runner-${{ github.ref }}
@@ -23,4 +27,4 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 experiment_runner.py --config configs/sharegpt_config.yaml
+          python3 experiment_runner.py --config ${{ inputs.script }}
