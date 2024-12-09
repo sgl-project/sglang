@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention import AttentionBackend
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
