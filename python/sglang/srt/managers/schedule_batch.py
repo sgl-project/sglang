@@ -182,6 +182,7 @@ class ImageInputs:
         optional_args = [
             "image_sizes",
             "image_offsets",
+            "image_pad_len",
             # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
             "aspect_ratio_ids",
             "aspect_ratio_mask",
