@@ -243,17 +243,15 @@ impl Router {
                         if !res.status().is_success() {
                             info!(
                                 "Worker {} health check is pending with status: {}.",
-                                url, res.status()
+                                url,
+                                res.status()
                             );
                             all_healthy = false;
                             unhealthy_workers.push((url, format!("Status: {}", res.status())));
                         }
                     }
                     Err(e) => {
-                        info!(
-                            "Worker {} health check is pending with error: {}",
-                            url, e
-                        );
+                        info!("Worker {} health check is pending with error: {}", url, e);
                         all_healthy = false;
                         unhealthy_workers.push((url, format!("Error: {}", e)));
                     }
@@ -503,7 +501,8 @@ impl Router {
                     } else {
                         info!(
                             "Worker {} health check is pending with status: {}.",
-                            worker_url, res.status()
+                            worker_url,
+                            res.status()
                         );
                         // if the url does not have http or https prefix, warn users
                         if !worker_url.starts_with("http://") && !worker_url.starts_with("https://")
@@ -516,7 +515,10 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    info!("Worker {} health check is pending with error: {}", worker_url, e);
+                    info!(
+                        "Worker {} health check is pending with error: {}",
+                        worker_url, e
+                    );
 
                     // if the url does not have http or https prefix, warn users
                     if !worker_url.starts_with("http://") && !worker_url.starts_with("https://") {
@@ -543,11 +545,20 @@ impl Router {
         }
 
         // if cache aware, remove the worker from the tree
-        if let Router::CacheAware { tree, running_queue, processed_queue, .. } = self {
+        if let Router::CacheAware {
+            tree,
+            running_queue,
+            processed_queue,
+            ..
+        } = self
+        {
             tree.lock().unwrap().remove_tenant(&worker_url);
             running_queue.lock().unwrap().remove(&worker_url);
             processed_queue.lock().unwrap().remove(&worker_url);
-            info!("Removed worker from tree and cleaned up queues: {}", worker_url);
+            info!(
+                "Removed worker from tree and cleaned up queues: {}",
+                worker_url
+            );
         }
     }
 }
