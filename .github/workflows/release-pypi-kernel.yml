@@ -1,10 +1,10 @@
-name: Build Wheels
+name: Build SGLang Kernel for PyPI
 
 on:
   push:
     branches:
       - main
-  paths:
+    paths:
       - sgl-kernel/pyproject.toml
   workflow_dispatch:
 
