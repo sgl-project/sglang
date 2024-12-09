@@ -17,6 +17,7 @@ suites = {
         "test_eval_accuracy_mini.py",
         "test_get_weights_by_name.py",
         "test_gguf.py",
+        "test_fused_moe.py",
         "test_input_embeddings.py",
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
