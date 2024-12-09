@@ -623,23 +623,23 @@ class TokenizerManager:
                             i,
                         )
 
+                    if not isinstance(recv_obj, BatchEmbeddingOut):
+                        meta_info.update(
+                            {
+                                "completion_tokens": recv_obj.completion_tokens[i],
+                                "cached_tokens": recv_obj.cached_tokens[i],
+                            }
+                        )
+
                     if isinstance(recv_obj, BatchStrOut):
                         out_dict = {
                             "text": recv_obj.output_strs[i],
-                            "meta_info": {
-                                **meta_info,
-                                "completion_tokens": recv_obj.completion_tokens[i],
-                                "cached_tokens": recv_obj.cached_tokens[i],
-                            },
+                            "meta_info": meta_info,
                         }
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
-                            "meta_info": {
-                                **meta_info,
-                                "completion_tokens": recv_obj.completion_tokens[i],
-                                "cached_tokens": recv_obj.cached_tokens[i],
-                            },
+                            "meta_info": meta_info,
                         }
                     else:
                         assert isinstance(recv_obj, BatchEmbeddingOut)
