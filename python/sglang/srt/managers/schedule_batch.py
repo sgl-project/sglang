@@ -484,7 +484,7 @@ bid = 0
 
 @dataclasses.dataclass
 class ScheduleBatch:
-    """Store all inforamtion of a batch on the scheduler."""
+    """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
     reqs: List[Req]

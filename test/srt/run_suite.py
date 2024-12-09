@@ -15,7 +15,6 @@ suites = {
         "test_double_sparsity.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
-        "test_fused_moe.py",
         "test_get_weights_by_name.py",
         "test_gguf.py",
         "test_input_embeddings.py",

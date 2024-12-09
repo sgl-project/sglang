@@ -21,7 +21,6 @@ from transformers import LlamaConfig
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
 
@@ -33,7 +32,6 @@ class LlamaForSequenceClassification(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.torchao_config = None
         self.quant_config = quant_config
         self.num_labels = config.num_labels
         self.model = LlamaModel(config, quant_config=quant_config)
