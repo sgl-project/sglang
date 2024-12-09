@@ -47,4 +47,3 @@ The benchmark results will be saved as plots and data files in the specified out
 - `benchmark_torch_compile_fused_moe.py`: A tool for benchmarking the performance of the fused MoE kernel with `torch.compile` and original fused MoE kernel.
 
 Usage is the same as `benchmark_vllm_vs_sglang_fused_moe_triton.py`.
-
