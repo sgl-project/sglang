@@ -33,7 +33,6 @@ class LlamaForClassification(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.torchao_config = None
         self.quant_config = quant_config
         self.model = LlamaModel(config, quant_config=quant_config)
 
