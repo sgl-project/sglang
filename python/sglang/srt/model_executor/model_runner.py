@@ -114,7 +114,7 @@ class ModelRunner:
             server_args.chunked_prefill_size = -1
             self.mem_fraction_static *= 0.95
             logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static} "
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
                 f"and turn off chunked prefill "
                 f"because this is a multimodal model."
             )
