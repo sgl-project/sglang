@@ -1198,6 +1198,7 @@ class Scheduler:
             decode_ids_list = []
             read_offsets = []
             output_ids = []
+
             skip_special_tokens = []
             spaces_between_special_tokens = []
             no_stop_trim = []
