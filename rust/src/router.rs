@@ -93,7 +93,7 @@ pub enum Router {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PolicyConfig {
     RandomConfig,
     RoundRobinConfig,
@@ -127,9 +127,14 @@ fn get_text_from_request(body: &Bytes, route: &str) -> String {
 
     return "".to_string();
 }
+
 impl Router {
-    pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Self {
-        match policy_config {
+    pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
+        // Wait until all workers are healthy
+        Self::wait_for_healthy_workers(&worker_urls, 300, 10)?;
+
+        // Create router based on policy...
+        Ok(match policy_config {
             PolicyConfig::RandomConfig => Router::Random {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
             },
@@ -196,7 +201,7 @@ impl Router {
                     _eviction_thread: Some(eviction_thread),
                 }
             }
-        }
+        })
     }
 
     pub fn get_first(&self) -> Option<String> {
@@ -209,6 +214,59 @@ impl Router {
                 } else {
                     Some(worker_urls.read().unwrap()[0].clone())
                 }
+            }
+        }
+    }
+
+    fn wait_for_healthy_workers(
+        worker_urls: &[String],
+        timeout_secs: u64,
+        interval_secs: u64,
+    ) -> Result<(), String> {
+        let start_time = std::time::Instant::now();
+        let sync_client = reqwest::blocking::Client::new();
+
+        loop {
+            if start_time.elapsed() > Duration::from_secs(timeout_secs) {
+                return Err(format!(
+                    "Timeout {}s waiting for workers to become healthy",
+                    timeout_secs
+                ));
+            }
+
+            let mut all_healthy = true;
+            let mut unhealthy_workers = Vec::new();
+
+            for url in worker_urls {
+                match sync_client.get(&format!("{}/health", url)).send() {
+                    Ok(res) => {
+                        if !res.status().is_success() {
+                            info!(
+                                "Worker {} health check is pending with status: {}.",
+                                url,
+                                res.status()
+                            );
+                            all_healthy = false;
+                            unhealthy_workers.push((url, format!("Status: {}", res.status())));
+                        }
+                    }
+                    Err(e) => {
+                        info!("Worker {} health check is pending with error: {}", url, e);
+                        all_healthy = false;
+                        unhealthy_workers.push((url, format!("Error: {}", e)));
+                    }
+                }
+            }
+
+            if all_healthy {
+                info!("All workers are healthy");
+                return Ok(());
+            } else {
+                info!("Unhealthy workers:");
+                for (url, reason) in &unhealthy_workers {
+                    info!("  {} - {}", url, reason);
+                }
+                thread::sleep(Duration::from_secs(interval_secs));
             }
         }
     }
@@ -386,7 +444,7 @@ impl Router {
         }
     }
 
-    pub async fn add_worker(&self, worker_url: String) -> HttpResponse {
+    pub async fn add_worker(&self, worker_url: String) -> Result<String, String> {
         let interval_secs = 10; // check every 10 seconds
         let timeout_secs = 300; // 5 minutes
 
@@ -395,7 +453,7 @@ impl Router {
 
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
-                return HttpResponse::InternalServerError().body(format!(
+                return Err(format!(
                     "Timeout {}s waiting for worker {} to become healthy",
                     timeout_secs, worker_url
                 ));
@@ -411,19 +469,40 @@ impl Router {
                                 info!("Worker {} health check passed", worker_url);
                                 let mut urls = worker_urls.write().unwrap();
                                 if urls.contains(&worker_url) {
-                                    return HttpResponse::BadRequest()
-                                        .body(format!("Worker {} already exists", worker_url));
+                                    return Err(format!("Worker {} already exists", worker_url));
                                 }
                                 info!("Added worker: {}", worker_url);
                                 urls.push(worker_url.clone());
                             }
                         }
-                        return HttpResponse::Ok()
-                            .body(format!("Successfully added worker: {}", worker_url));
+
+                        // If cache aware, initialize the queues for the new worker
+                        if let Router::CacheAware {
+                            running_queue,
+                            processed_queue,
+                            tree,
+                            ..
+                        } = self
+                        {
+                            // Add worker to running queue with initial count of 0
+                            running_queue.lock().unwrap().insert(worker_url.clone(), 0);
+
+                            // Add worker to processed queue with initial count of 0
+                            processed_queue
+                                .lock()
+                                .unwrap()
+                                .insert(worker_url.clone(), 0);
+
+                            // Add worker to tree
+                            tree.lock().unwrap().insert(&"".to_string(), &worker_url);
+                        }
+
+                        return Ok(format!("Successfully added worker: {}", worker_url));
                     } else {
                         info!(
-                            "Worker {} health check failed with status: {}. The worker might still be starting up.",
-                            worker_url, res.status()
+                            "Worker {} health check is pending with status: {}.",
+                            worker_url,
+                            res.status()
                         );
                         // if the url does not have http or https prefix, warn users
                         if !worker_url.starts_with("http://") && !worker_url.starts_with("https://")
@@ -436,7 +515,10 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    info!("Worker {} health check failed: {}", worker_url, e);
+                    info!(
+                        "Worker {} health check is pending with error: {}",
+                        worker_url, e
+                    );
 
                     // if the url does not have http or https prefix, warn users
                     if !worker_url.starts_with("http://") && !worker_url.starts_with("https://") {
@@ -463,9 +545,20 @@ impl Router {
         }
 
         // if cache aware, remove the worker from the tree
-        if let Router::CacheAware { tree, .. } = self {
+        if let Router::CacheAware {
+            tree,
+            running_queue,
+            processed_queue,
+            ..
+        } = self
+        {
             tree.lock().unwrap().remove_tenant(&worker_url);
-            info!("Removed worker from tree: {}", worker_url);
+            running_queue.lock().unwrap().remove(&worker_url);
+            processed_queue.lock().unwrap().remove(&worker_url);
+            info!(
+                "Removed worker from tree and cleaned up queues: {}",
+                worker_url
+            );
         }
     }
 }
