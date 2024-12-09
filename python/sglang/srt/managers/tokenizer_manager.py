@@ -22,7 +22,7 @@ import signal
 import sys
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import fastapi
 import uvloop
