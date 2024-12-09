@@ -78,19 +78,19 @@ def get_cuda_info():
     """
     if is_rocm:
         cuda_info = {"ROCM available": torch.cuda.is_available()}
-    
+
         if cuda_info["ROCM available"]:
             cuda_info.update(_get_gpu_info())
             cuda_info.update(_get_cuda_version_info())
-    
+
         return cuda_info
     else:
         cuda_info = {"CUDA available": torch.cuda.is_available()}
-    
+
         if cuda_info["CUDA available"]:
             cuda_info.update(_get_gpu_info())
             cuda_info.update(_get_cuda_version_info())
-    
+
         return cuda_info
 
 
@@ -127,23 +127,23 @@ def _get_cuda_version_info():
     """
     if is_rocm:
         from torch.utils.cpp_extension import ROCM_HOME as ROCM_HOME
-    
+
         cuda_info = {"ROCM_HOME": ROCM_HOME}
-    
+
         if ROCM_HOME and os.path.isdir(ROCM_HOME):
             cuda_info.update(_get_nvcc_info())
             cuda_info.update(_get_cuda_driver_version())
-    
+
         return cuda_info
     else:
         from torch.utils.cpp_extension import CUDA_HOME
-    
+
         cuda_info = {"CUDA_HOME": CUDA_HOME}
-    
+
         if CUDA_HOME and os.path.isdir(CUDA_HOME):
             cuda_info.update(_get_nvcc_info())
             cuda_info.update(_get_cuda_driver_version())
-    
+
         return cuda_info
 
 
@@ -153,7 +153,7 @@ def _get_nvcc_info():
     """
     if is_rocm:
         from torch.utils.cpp_extension import ROCM_HOME
-    
+
         try:
             hipcc = os.path.join(ROCM_HOME, "bin/hipcc")
             hipcc_output = (
@@ -168,7 +168,7 @@ def _get_nvcc_info():
             return {"HIPCC": "Not Available"}
     else:
         from torch.utils.cpp_extension import CUDA_HOME
-    
+
         try:
             nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
             nvcc_output = (
