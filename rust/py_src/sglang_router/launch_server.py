@@ -39,6 +39,35 @@ logger = setup_logger()
 
 # Create new process group
 def run_server(server_args, dp_rank):
+    """
+    Note:
+
+    1. Without os.setpgrp(), all processes share the same PGID. When you press Ctrl+C, the terminal sends SIGINT to all processes in the group simultaneously.
+    This can cause leaf processes to terminate first, which messes up the cleaning order and produces orphaned processes.
+
+    Terminal (PGID=100)
+    └── Main Python Process (PGID=100)
+        └── Server Process 1 (PGID=100)
+            └── Scheduler 1
+            └── Detokenizer 1
+        └── Server Process 2 (PGID=100)
+            └── Scheduler 2
+            └── Detokenizer 2
+
+    2. With os.setpgrp(), the main Python process and its children are in a separate group. Now:
+
+    Terminal (PGID=100)
+    └── Main Python Process (PGID=200)
+        └── Server Process 1 (PGID=300)
+            └── Scheduler 1
+            └── Detokenizer 1
+        └── Server Process 2 (PGID=400)
+            └── Scheduler 2
+            └── Detokenizer 2
+    """
+    # create new process group
+    os.setpgrp()
+
     setproctitle(f"sglang::server")
     # Set SGLANG_DP_RANK environment variable
     os.environ["SGLANG_DP_RANK"] = str(dp_rank)
@@ -91,11 +120,12 @@ def find_available_ports(base_port: int, count: int) -> List[int]:
 
 def cleanup_processes(processes: List[mp.Process]):
     for process in processes:
+        logger.info(f"Terminating process {process.pid}")
         process.terminate()
+    logger.info("All processes terminated")
 
 
 def main():
-
     # CUDA runtime isn't fork-safe, which can lead to subtle bugs or crashes
     mp.set_start_method("spawn")
 
