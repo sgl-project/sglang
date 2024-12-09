@@ -1,13 +1,16 @@
 import unittest
+
 import torch
+from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_vllm
+
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe
-from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_vllm
+
 
 class TestFusedMOE(unittest.TestCase):
     NUM_EXPERTS = [8, 64]
     TOP_KS = [2, 6]
-    
+
     def torch_naive_moe(self, a, w1, w2, score, topk):
         B, D = a.shape
         a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -19,10 +22,12 @@ class TestFusedMOE(unittest.TestCase):
         for i in range(w1.shape[0]):
             mask = topk_ids == i
             if mask.sum():
-                out[mask] = SiluAndMul()(
-                    a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(0, 1)
-        return (out.view(B, -1, w2.shape[1]) *
-                topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
+                out[mask] = SiluAndMul()(a[mask] @ w1[i].transpose(0, 1)) @ w2[
+                    i
+                ].transpose(0, 1)
+        return (
+            out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+        ).sum(dim=1)
 
     def _test_case(self, m, n, k, e, topk, dtype, use_fp8_w8a8=False):
         if use_fp8_w8a8:
@@ -30,7 +35,7 @@ class TestFusedMOE(unittest.TestCase):
             capability = torch.cuda.get_device_capability()
             if not (capability[0] >= 9 or capability == (8, 9)):
                 return
-                
+
             a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
             w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
             w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
@@ -44,23 +49,31 @@ class TestFusedMOE(unittest.TestCase):
             a2_scale = torch.randn(1, dtype=torch.float32, device="cuda")
 
             sglang_output = fused_moe(
-                a, w1, w2, score, topk,
+                a,
+                w1,
+                w2,
+                score,
+                topk,
                 renormalize=False,
                 use_fp8_w8a8=True,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
-                a2_scale=a2_scale
+                a2_scale=a2_scale,
             )
 
             vllm_output = fused_moe_vllm(
-                a, w1, w2, score, topk,
+                a,
+                w1,
+                w2,
+                score,
+                topk,
                 renormalize=False,
                 use_fp8_w8a8=True,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
-                a2_scale=a2_scale
+                a2_scale=a2_scale,
             )
 
             torch.testing.assert_close(sglang_output, vllm_output, atol=2e-2, rtol=0)
@@ -70,7 +83,7 @@ class TestFusedMOE(unittest.TestCase):
             w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
             w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
             score = torch.randn((m, e), device="cuda", dtype=dtype)
-            
+
             triton_output = fused_moe(a, w1, w2, score, topk, renormalize=False)
             torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
             torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
@@ -89,9 +102,25 @@ class TestFusedMOE(unittest.TestCase):
                         for topk in self.TOP_KS:
                             for dtype in dtypes:
                                 for use_fp8_w8a8 in fp8_modes:
-                                    with self.subTest(m=m, n=n, k=k, e=e, topk=topk, dtype=dtype, fp8=use_fp8_w8a8):
-                                        self._test_case(m, n, k, e, topk, dtype, use_fp8_w8a8=use_fp8_w8a8)
+                                    with self.subTest(
+                                        m=m,
+                                        n=n,
+                                        k=k,
+                                        e=e,
+                                        topk=topk,
+                                        dtype=dtype,
+                                        fp8=use_fp8_w8a8,
+                                    ):
+                                        self._test_case(
+                                            m,
+                                            n,
+                                            k,
+                                            e,
+                                            topk,
+                                            dtype,
+                                            use_fp8_w8a8=use_fp8_w8a8,
+                                        )
+
 
 if __name__ == "__main__":
     unittest.main()
-
