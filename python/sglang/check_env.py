@@ -76,13 +76,22 @@ def get_cuda_info():
     """
     Get CUDA-related information if available.
     """
-    cuda_info = {"CUDA available": torch.cuda.is_available()}
-
-    if cuda_info["CUDA available"]:
-        cuda_info.update(_get_gpu_info())
-        cuda_info.update(_get_cuda_version_info())
-
-    return cuda_info
+    if is_rocm:
+        cuda_info = {"ROCM available": torch.cuda.is_available()}
+    
+        if cuda_info["ROCM available"]:
+            cuda_info.update(_get_gpu_info())
+            cuda_info.update(_get_cuda_version_info())
+    
+        return cuda_info
+    else:
+        cuda_info = {"CUDA available": torch.cuda.is_available()}
+    
+        if cuda_info["CUDA available"]:
+            cuda_info.update(_get_gpu_info())
+            cuda_info.update(_get_cuda_version_info())
+    
+        return cuda_info
 
 
 def _get_gpu_info():
@@ -146,13 +155,13 @@ def _get_nvcc_info():
         from torch.utils.cpp_extension import ROCM_HOME
     
         try:
-            nvcc = os.path.join(ROCM_HOME, "bin/hipcc")
-            nvcc_output = (
-                subprocess.check_output(f'"{nvcc}" --version', shell=True).decode("utf-8").strip()
+            hipcc = os.path.join(ROCM_HOME, "bin/hipcc")
+            hipcc_output = (
+                subprocess.check_output(f'"{hipcc}" --version', shell=True).decode("utf-8").strip()
             )
             return {
-                "NVCC": nvcc_output[
-                    nvcc_output.rfind("HIP version")
+                "HIPCC": hipcc_output[
+                    hipcc_output.rfind("HIP version") : hipcc_output.rfind("AMD clang")
                 ].strip()
             }
         except subprocess.SubprocessError:
@@ -191,12 +200,9 @@ def _get_cuda_driver_version():
             versions = set(output.decode().strip().split("\n"))
             versions.discard('name, value')
             ver = versions.pop()
-            ver = ver.replace("\"", "").replace(",", ":")
+            ver = ver.replace('"Driver version", ', "").replace('"', "")
 
-            if len(versions) == 1:
-                return {"ROCM": versions.pop()}
-            else:
-                return {"CUDA Driver Versions": ver}
+            return {"ROCM Driver Version": ver}
         except subprocess.SubprocessError:
             return {"ROCM Driver Version": "Not Available"}
     else:
