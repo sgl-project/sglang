@@ -10,7 +10,7 @@ Example usage:
 ```bash
 # Tune Qwen2-57B with FP8 and TP=4
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
-    --model Qwen/Qwen2-57B-A14B-Instruct-FP8 \
+    --model Qwen/Qwen2-57B-A14B-Instruct \
     --tp-size 4 \
     --dtype fp8_w8a8 \
     --tune
@@ -34,7 +34,7 @@ python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_tri
 
 # Compare with FP8 mode for Qwen2-57B
 python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
-    --model Qwen/Qwen2-57B-A14B-Instruct-FP8 \
+    --model Qwen/Qwen2-57B-A14B-Instruct \
     --use-fp8
 
 # Compare with custom TP size
@@ -43,3 +43,7 @@ python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_tri
 ```
 
 The benchmark results will be saved as plots and data files in the specified output directory (default: `./configs/benchmark_ops/vllm_sglang_fused_moe/`).
+
+- `benchmark_torch_compile_fused_moe.py`: A tool for benchmarking the performance of the fused MoE kernel with `torch.compile` and original fused MoE kernel.
+
+Usage is the same as `benchmark_vllm_vs_sglang_fused_moe_triton.py`.

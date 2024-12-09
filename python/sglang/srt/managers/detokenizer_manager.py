@@ -17,9 +17,10 @@ import dataclasses
 import logging
 import signal
 from collections import OrderedDict
-from typing import List, Union
+from typing import Dict, List, Union
 
 import psutil
+import setproctitle
 import zmq
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -28,7 +29,6 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
 )
-from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, get_zmq_socket
 from sglang.utils import find_printable_text, get_exception_traceback
@@ -75,17 +75,25 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict()
 
-    def trim_eos(self, output: Union[str, List[int]], finished_reason, no_stop_trim):
-        if no_stop_trim:
+    def trim_matched_stop(
+        self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
+    ):
+        if no_stop_trim or not finished_reason:
             return output
 
-        # Trim stop str. TODO(lmzheng): handle the case where multiple stop strs are hit
-        if isinstance(finished_reason, FINISH_MATCHED_STR) and isinstance(output, str):
-            pos = output.find(finished_reason.matched)
+        matched = finished_reason.get("matched", None)
+        if not matched:
+            return output
+
+        # TODO(lmzheng): handle the case where multiple stop strs are hit
+
+        # Trim stop str.
+        if isinstance(matched, str) and isinstance(output, str):
+            pos = output.find(matched)
             return output[:pos] if pos != -1 else output
-        if isinstance(finished_reason, FINISH_MATCHED_TOKEN) and isinstance(
-            output, list
-        ):
+
+        # Trim stop token.
+        if isinstance(matched, int) and isinstance(output, list):
             assert len(output) > 0
             return output[:-1]
         return output
@@ -124,9 +132,9 @@ class DetokenizerManager:
                     s.decode_ids = recv_obj.decode_ids[i]
 
                 read_ids.append(
-                    self.trim_eos(
+                    self.trim_matched_stop(
                         s.decode_ids[s.surr_offset :],
-                        recv_obj.finished_reason[i],
+                        recv_obj.finished_reasons[i],
                         recv_obj.no_stop_trim[i],
                     )
                 )
@@ -149,7 +157,7 @@ class DetokenizerManager:
             for i in range(bs):
                 s = self.decode_status[recv_obj.rids[i]]
                 new_text = read_texts[i][len(surr_texts[i]) :]
-                if recv_obj.finished_reason[i] is None:
+                if recv_obj.finished_reasons[i] is None:
                     # Streaming chunk: update the decode status
                     if len(new_text) > 0 and not new_text.endswith("�"):
                         s.decoded_text = s.decoded_text + new_text
@@ -160,9 +168,9 @@ class DetokenizerManager:
                         new_text = find_printable_text(new_text)
 
                 output_strs.append(
-                    self.trim_eos(
+                    self.trim_matched_stop(
                         s.decoded_text + new_text,
-                        recv_obj.finished_reason[i],
+                        recv_obj.finished_reasons[i],
                         recv_obj.no_stop_trim[i],
                     )
                 )
@@ -170,9 +178,20 @@ class DetokenizerManager:
             self.send_to_tokenizer.send_pyobj(
                 BatchStrOut(
                     rids=recv_obj.rids,
+                    finished_reasons=recv_obj.finished_reasons,
                     output_strs=output_strs,
-                    meta_info=recv_obj.meta_info,
-                    finished_reason=recv_obj.finished_reason,
+                    prompt_tokens=recv_obj.prompt_tokens,
+                    completion_tokens=recv_obj.completion_tokens,
+                    cached_tokens=recv_obj.cached_tokens,
+                    input_token_logprobs_val=recv_obj.input_token_logprobs_val,
+                    input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
+                    output_token_logprobs_val=recv_obj.output_token_logprobs_val,
+                    output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
+                    input_top_logprobs_val=recv_obj.input_top_logprobs_val,
+                    input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
+                    output_top_logprobs_val=recv_obj.output_top_logprobs_val,
+                    output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+                    normalized_prompt_logprob=recv_obj.normalized_prompt_logprob,
                 )
             )
 
@@ -194,6 +213,7 @@ def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

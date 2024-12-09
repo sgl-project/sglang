@@ -95,15 +95,6 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
         self.assertIsInstance(js_obj["name"], str)
         self.assertIsInstance(js_obj["population"], int)
 
-        # Make sure jump forward is triggered
-        # NOTE: The overlap scheduler does not support jump forward so we only do this test
-        # when --disable-overlap-schedule is set.
-        if self.check_jump_forward:
-            self.assertGreater(
-                ret["meta_info"]["completion_tokens"],
-                ret["meta_info"]["completion_tokens_wo_jump_forward"],
-            )
-
     def test_json_generate(self):
         self.run_decode(json_schema=self.json_schema)
 

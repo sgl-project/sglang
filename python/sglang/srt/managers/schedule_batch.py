@@ -129,6 +129,7 @@ class ImageInputs:
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
+    image_pad_len: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None
@@ -181,6 +182,7 @@ class ImageInputs:
         optional_args = [
             "image_sizes",
             "image_offsets",
+            "image_pad_len",
             # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
             "aspect_ratio_ids",
             "aspect_ratio_mask",
@@ -200,6 +202,9 @@ class Req:
         origin_input_text: str,
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
+        return_logprob: bool = False,
+        top_logprobs_num: int = 0,
+        stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
@@ -217,10 +222,11 @@ class Req:
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
         self.session_id = session_id
+        self.input_embeds = input_embeds
 
+        # Sampling info
         self.sampling_params = sampling_params
         self.lora_path = lora_path
-        self.input_embeds = input_embeds
 
         # Memory pool info
         self.req_pool_idx = None
@@ -228,8 +234,8 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
-        self.stream = False
         self.to_abort = False
+        self.stream = stream
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -241,13 +247,9 @@ class Req:
         # 2: read_offset
         # 3: last token
         self.vid = 0  # version id to sync decode status with in detokenizer_manager
-        self.decoded_text = ""
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
-
-        # The number of decoded tokens for token usage report. Note that
-        # this does not include the jump forward tokens.
-        self.completion_tokens_wo_jump_forward = 0
+        self.decoded_text = ""
 
         # For multimodal inputs
         self.image_inputs: Optional[ImageInputs] = None
@@ -256,22 +258,34 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
+
+        # Chunked prefill
         self.is_being_chunked = 0
 
         # For retraction
         self.is_retracted = False
 
         # Logprobs (arguments)
-        self.return_logprob = False
+        self.return_logprob = return_logprob
         self.logprob_start_len = 0
-        self.top_logprobs_num = 0
+        self.top_logprobs_num = top_logprobs_num
 
         # Logprobs (return value)
         self.normalized_prompt_logprob = None
-        self.input_token_logprobs = None
-        self.input_top_logprobs = None
-        self.output_token_logprobs = []
-        self.output_top_logprobs = []
+        self.input_token_logprobs_val = None
+        self.input_token_logprobs_idx = None
+        self.input_top_logprobs_val = None
+        self.input_top_logprobs_idx = None
+
+        if return_logprob:
+            self.output_token_logprobs_val = []
+            self.output_token_logprobs_idx = []
+            self.output_top_logprobs_val = []
+            self.output_top_logprobs_idx = []
+        else:
+            self.output_token_logprobs_val = self.output_token_logprobs_idx = (
+                self.output_top_logprobs_val
+            ) = self.output_top_logprobs_idx = None
 
         # Logprobs (internal values)
         # The tokens is prefilled but need to be considered as decode tokens
@@ -295,8 +309,8 @@ class Req:
         else:
             self.image_inputs.merge(image_inputs)
 
-    # whether request reached finished condition
     def finished(self) -> bool:
+        # Whether request reached finished condition
         return self.finished_reason is not None
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
@@ -454,8 +468,10 @@ class Req:
                     k = k + 1
                 else:
                     break
-            self.output_token_logprobs = self.output_token_logprobs[:k]
-            self.output_top_logprobs = self.output_top_logprobs[:k]
+            self.output_token_logprobs_val = self.output_token_logprobs_val[:k]
+            self.output_token_logprobs_idx = self.output_token_logprobs_idx[:k]
+            self.output_top_logprobs_val = self.output_top_logprobs_val[:k]
+            self.output_top_logprobs_idx = self.output_top_logprobs_idx[:k]
             self.logprob_start_len = prompt_tokens + k
             self.last_update_decode_tokens = len(self.output_ids) - k
 
@@ -470,7 +486,7 @@ bid = 0
 
 @dataclasses.dataclass
 class ScheduleBatch:
-    """Store all inforamtion of a batch on the scheduler."""
+    """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
     reqs: List[Req]
