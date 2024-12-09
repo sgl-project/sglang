@@ -129,6 +129,7 @@ class ImageInputs:
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
+    image_pad_len: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None
@@ -181,6 +182,7 @@ class ImageInputs:
         optional_args = [
             "image_sizes",
             "image_offsets",
+            "image_pad_len",
             # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
             "aspect_ratio_ids",
             "aspect_ratio_mask",

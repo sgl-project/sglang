@@ -111,17 +111,20 @@ class ModelRunner:
             )
 
         if self.is_multimodal:
-            server_args.chunked_prefill_size = -1
             self.mem_fraction_static *= 0.95
-            logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
-                f"and turn off chunked prefill "
-                f"because this is a multimodal model."
-            )
+            if self.model_config.hf_config.architectures == [
+                "MllamaForConditionalGeneration"
+            ]:
+                logger.info("Automatically turn off --chunked-prefill-size for mllama.")
+                server_args.chunked_prefill_size = -1
             # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
             ]:
+                logger.info(
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
+                )
+                server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
 
         # Global vars
