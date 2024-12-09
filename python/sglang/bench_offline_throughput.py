@@ -285,7 +285,7 @@ def throughput_test(
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
 
-    tokenizer_id = server_args.model_path
+    tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environmnets
