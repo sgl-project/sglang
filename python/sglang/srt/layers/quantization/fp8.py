@@ -1,8 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
-
+from typing import Any, Callable, Dict, List, Optional
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
