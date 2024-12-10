@@ -1,4 +1,4 @@
-name: Build SGLang Kernel for PyPI
+name: Release SGLang Kernel to PyPI
 
 on:
   push:
