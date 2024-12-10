@@ -12,5 +12,5 @@ docker run --rm \
     export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
     export CUDA_VERSION=${CUDA_VERSION} && \
     cd /sgl-kernel && \
-    ${PYTHON_ROOT_PATH}/bin/python setup.py bdist_wheel
+    ${PYTHON_ROOT_PATH}/bin/pip wheel .
     "
