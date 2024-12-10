@@ -34,10 +34,12 @@ def rename_wheel():
     new_info = tmp_dir / f"sgl_kernel-{base_version}+cu{cuda_version}.dist-info"
     old_info.rename(new_info)
 
-    new_wheel = (
-        wheel_dir
-        / f"sgl_kernel-{base_version}+cu{cuda_version}-{old_wheel.name.split('-', 2)[-1]}"
+    platform = "manylinux2014_x86_64"
+    new_wheel = wheel_dir / old_wheel.name.replace("linux_x86_64", platform)
+    new_wheel = wheel_dir / new_wheel.name.replace(
+        base_version, f"{base_version}+cu{cuda_version}"
     )
+
     with zipfile.ZipFile(new_wheel, "w", zipfile.ZIP_DEFLATED) as new_zip:
         for file_path in tmp_dir.rglob("*"):
             if file_path.is_file():
