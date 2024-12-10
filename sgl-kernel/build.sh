@@ -6,7 +6,7 @@ PYTHON_VERSION=$1
 CUDA_VERSION=$2
 PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
 
-docker run --rm -it \
+docker run --rm \
     -v "$(pwd)":/sgl-kernel \
     pytorch/manylinux-builder:cuda${CUDA_VERSION} \
     bash -c "

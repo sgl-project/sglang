@@ -33,4 +33,4 @@ jobs:
     - name: Upload to pypi
       run: |
         pip install twine
-        python -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}/*
+        python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
