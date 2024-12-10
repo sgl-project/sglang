@@ -31,13 +31,13 @@ def rename_wheel():
         zip_ref.extractall(tmp_dir)
 
     old_info = tmp_dir / f"sgl_kernel-{base_version}.dist-info"
-    new_info = tmp_dir / f"sgl_kernel-{base_version}+cu{cuda_version}.dist-info"
+    new_info = tmp_dir / f"sgl_kernel-{base_version}.post0+cu{cuda_version}.dist-info"
     old_info.rename(new_info)
 
     platform = "manylinux2014_x86_64"
     new_wheel = wheel_dir / old_wheel.name.replace("linux_x86_64", platform)
     new_wheel = wheel_dir / new_wheel.name.replace(
-        base_version, f"{base_version}+cu{cuda_version}"
+        base_version, f"{base_version}.post0+cu{cuda_version}"
     )
 
     with zipfile.ZipFile(new_wheel, "w", zipfile.ZIP_DEFLATED) as new_zip:
