@@ -31,6 +31,7 @@ jobs:
         ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
 
     - name: Upload to pypi
+      working-directory: sgl-kernel
       run: |
         pip install twine
         python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
