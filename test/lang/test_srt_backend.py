@@ -18,6 +18,7 @@ from sglang.test.test_programs import (
     test_parallel_decoding,
     test_regex,
     test_select,
+    test_select_concurrency,
     test_stream,
     test_tool_use,
 )
@@ -77,6 +78,9 @@ class TestSRTBackend(unittest.TestCase):
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()
+
+    def test_select_concurrency(self):
+        test_select_concurrency()
 
 
 if __name__ == "__main__":
