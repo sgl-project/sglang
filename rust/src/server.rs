@@ -118,7 +118,7 @@ async fn remove_worker(
         None => return HttpResponse::BadRequest().finish(),
     };
     data.router.remove_worker(&worker_url);
-    HttpResponse::Ok().finish()
+    HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
 pub struct ServerConfig {
