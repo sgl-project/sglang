@@ -5,13 +5,14 @@ import os
 import time
 
 from compute_scores import compute_scores
-from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, create_prompt, get_answer, load_data
+from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, create_prompt, get_answer
 
 import sglang as sgl
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
+from sglang.utils import download_and_cache_file, read_jsonl
 
 
 def validate_args(args):
@@ -46,18 +47,21 @@ def main(args):
     backend = select_sglang_backend(args)
     sgl.set_default_backend(backend)
 
-    # Data
+    # Download and load data
     data_name = args.task
+    data_url = "https://huggingface.co/datasets/xinrongzhang2022/InfiniteBench/resolve/main/${data_name}.jsonl"
     max_tokens = DATA_NAME_TO_MAX_NEW_TOKENS[data_name]  # max output length
-    lines = load_data(data_name, data_dir=args.data_dir)
-    if args.end_idx is None:
-        args.end_idx = len(lines)
+
+    filename = download_and_cache_file(data_url)
+    lines = list(read_jsonl(filename))
+    if args.num_samples is None:
+        args.num_samples = len(lines)
 
     # Construct prompts
     questions = []
     labels = []
-    for i in range(len(lines[args.start_idx : args.end_idx])):
-        questions.append(create_prompt(lines[i], data_name, args.data_dir))
+    for i in range(len(lines[: args.num_samples])):
+        questions.append(create_prompt(lines[i], data_name, os.path.dirname(filename)))
         labels.append(get_answer(lines[i], data_name))
     arguments = [{"question": q, "max_tokens": max_tokens} for q in questions]
 
@@ -73,8 +77,12 @@ def main(args):
 
     # Compute scores
     results = [
-        {"ground_truth": label, "prediction": s["answer"], "question_id": line["id"]}
-        for line, label, s in zip(lines, labels, results)
+        {
+            "ground_truth": label,
+            "prediction": result["answer"],
+            "question_id": line["id"],
+        }
+        for line, label, result in zip(lines, labels, results)
     ]
     acc = compute_scores(results, args.task)
     print(f"#questions: {len(questions)}, Latency: {latency:.2f}, Accuracy: {acc:.3f}")
@@ -104,8 +112,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task", type=str, choices=["passkey", "kv_retrieval"], required=True
     )
-    parser.add_argument("--data-dir", type=str, default="./data")
-    parser.add_argument("--start-idx", type=int, default=0)
-    parser.add_argument("--end-idx", type=int, default=None)
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Number of samples from the beginning of dataset to use for eval.",
+    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)

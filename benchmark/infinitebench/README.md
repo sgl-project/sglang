@@ -1,8 +1,3 @@
-## Download dataset
-```
-bash ./download_infinitebench.sh ~/data
-```
-
 ## Run benchmark
 
 ### SGLang
@@ -21,7 +16,7 @@ python -m sglang.launch_server --model-path gradientai/Llama-3-8B-Instruct-Gradi
 
 In a separate terminal, run eval on the first 10 samples as follows
 ```
-python eval_long_context.py --task passkey --end-idx 10 --data-dir ~/data
+python bench_sglang.py --task passkey --num-samples 10
 ```
 
 ### TensorRT
@@ -40,6 +35,14 @@ git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 pip install --upgrade -r requirements-dev.txt
 cd examples/llama
+```
+
+#### Download dataset
+The following commands will download the dataset files in `./data` directory, which is hardcoded in the script.
+```bash
+URL="https://raw.githubusercontent.com/OpenBMB/InfiniteBench/51d9b37b0f1790ead936df2243abbf7f0420e439/scripts/download_dataset.sh"
+wget $URL -O download_infinitebench.sh
+bash download_infinitebench.sh
 ```
 
 #### Prepare checkpoint
@@ -73,6 +76,6 @@ python ../eval_long_context.py \
     --max_input_length 131072 \
     --enable_chunked_context \
     --max_tokens_in_paged_kv_cache 131136 \
-    --data_dir ~/data \
+    --data_dir ./data \
     --output_dir ./
 ```
