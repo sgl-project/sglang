@@ -321,25 +321,25 @@ register_chat_template(
 )
 
 register_chat_template(
-   ChatTemplate(
-       name="granite-3-instruct",
-       default_system_prompt=None,
-       role_prefix_and_suffix={
-           "system": (
-               "<|start_of_role|>system<|end_of_role|>",
-               "<|end_of_text|>",
-           ),
-           "user": (
-               "<|start_of_role|>user<|end_of_role|>",
-               "<|end_of_text|>",
-           ),
-           "assistant": (
-               "<|start_of_role|>assistant<|end_of_role|>",
-               "<|end_of_text|>",
-           ),
-       },
-       stop_str=("<|end_of_text|>",),
-   )
+    ChatTemplate(
+        name="granite-3-instruct",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|start_of_role|>system<|end_of_role|>",
+                "<|end_of_text|>",
+            ),
+            "user": (
+                "<|start_of_role|>user<|end_of_role|>",
+                "<|end_of_text|>",
+            ),
+            "assistant": (
+                "<|start_of_role|>assistant<|end_of_role|>",
+                "<|end_of_text|>",
+            ),
+        },
+        stop_str=("<|end_of_text|>",),
+    )
 )
 
 
@@ -432,6 +432,7 @@ def match_granite_instruct(model_path: str):
     # template works across the board.
     if "granite" in model_path and "instruct" in model_path:
         return get_chat_template("granite-3-instruct")
+
 
 if __name__ == "__main__":
     messages = [

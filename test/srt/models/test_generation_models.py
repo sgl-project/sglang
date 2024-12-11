@@ -57,7 +57,7 @@ ALL_OTHER_MODELS = [
     ModelCase("openai-community/gpt2"),
     ModelCase("microsoft/Phi-3-small-8k-instruct"),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
-    ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True)
+    ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
 ]
 
 TORCH_DTYPES = [torch.float16]
@@ -68,7 +68,7 @@ class TestGenerationModels(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
-        
+
     def assert_close_logits_and_output_strs(
         self,
         prompts: List[str],

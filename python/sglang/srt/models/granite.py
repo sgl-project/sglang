@@ -122,7 +122,7 @@ class GraniteAttention(nn.Module):
         )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling =  config.attention_multiplier
+        self.scaling = config.attention_multiplier
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -232,11 +232,14 @@ class GraniteDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        ) * self.residual_multiplier  # multiplier for Maximal Update Parameterization
+        hidden_states = (
+            self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            * self.residual_multiplier
+        )  # multiplier for Maximal Update Parameterization
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -255,8 +258,7 @@ class GraniteModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size
+            config.vocab_size, config.hidden_size
         )
         self.layers = nn.ModuleList(
             [
@@ -304,7 +306,7 @@ class GraniteForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = GraniteModel(config, quant_config=quant_config)
         # If tie_word_embeddings == True, then input and output embeddings are
-        # the same tensor. Enforce during object creation so that weights will 
+        # the same tensor. Enforce during object creation so that weights will
         # load correctly even if the LM head weights don't have a separate entry
         # in the state dict.
         self.lm_head = ParallelLMHead(
@@ -510,5 +512,6 @@ class GraniteForCausalLM(nn.Module):
                 f"Error getting weights by name {name} in GraniteForCausalLM: {get_exception_traceback()}"
             )
             return None
+
 
 EntryClass = [GraniteForCausalLM]

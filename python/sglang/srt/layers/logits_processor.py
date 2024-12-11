@@ -89,8 +89,9 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
-    def __init__(self, config, skip_all_gather: bool = False,
-                 logit_scale: Optional[float] = None):
+    def __init__(
+        self, config, skip_all_gather: bool = False, logit_scale: Optional[float] = None
+    ):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
