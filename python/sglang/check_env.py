@@ -139,6 +139,9 @@ def _get_cuda_version_info():
             cuda_info.update(_get_cuda_driver_version())
 
         return cuda_info
+    else:
+        cuda_info = {"CUDA_HOME": ""}
+        return cuda_info
 
 
 def _get_nvcc_info():
@@ -181,6 +184,8 @@ def _get_nvcc_info():
             }
         except subprocess.SubprocessError:
             return {"HIPCC": "Not Available"}
+    else:
+        return {"NVCC": "Not Available"}
 
 
 def _get_cuda_driver_version():
@@ -221,6 +226,8 @@ def _get_cuda_driver_version():
             return {"ROCM Driver Version": ver}
         except subprocess.SubprocessError:
             return {"ROCM Driver Version": "Not Available"}
+    else:
+        return {"CUDA Driver Version": "Not Available"}
 
 
 def get_gpu_topology():
@@ -251,6 +258,8 @@ def get_gpu_topology():
             return "\n" + result.stdout if result.returncode == 0 else None
         except subprocess.SubprocessError:
             return None
+    else:
+        return None
 
 
 def get_hypervisor_vendor():
