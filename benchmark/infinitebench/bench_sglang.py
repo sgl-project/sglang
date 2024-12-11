@@ -49,7 +49,7 @@ def main(args):
 
     # Download and load data
     data_name = args.task
-    data_url = "https://huggingface.co/datasets/xinrongzhang2022/InfiniteBench/resolve/main/${data_name}.jsonl"
+    data_url = f"https://huggingface.co/datasets/xinrongzhang2022/InfiniteBench/resolve/main/{data_name}.jsonl"
     max_tokens = DATA_NAME_TO_MAX_NEW_TOKENS[data_name]  # max output length
 
     filename = download_and_cache_file(data_url)
