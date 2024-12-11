@@ -29,6 +29,7 @@
 - SmolLM
 - GLM-4
 - Phi-3-Small
+- IBM Granite 3
 
 ## Embedding Models
 

@@ -91,9 +91,12 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
-    def __init__(self, config, skip_all_gather: bool = False):
+    def __init__(
+        self, config, skip_all_gather: bool = False, logit_scale: Optional[float] = None
+    ):
         super().__init__()
         self.config = config
+        self.logit_scale = logit_scale
         self.do_tensor_parallel_all_gather = (
             not skip_all_gather and get_tensor_model_parallel_world_size() > 1
         )
@@ -240,6 +243,9 @@ class LogitsProcessor(nn.Module):
                 all_logits = self._get_logits(states, lm_head)
                 if self.do_tensor_parallel_all_gather:
                     all_logits = tensor_model_parallel_all_gather(all_logits)
+
+                # The LM head's weights may be zero-padded for parallelism. Remove any
+                # extra logits that this padding may have produced.
                 all_logits = all_logits[:, : self.config.vocab_size].float()
 
                 if hasattr(self.config, "final_logit_softcapping"):
@@ -302,6 +308,10 @@ class LogitsProcessor(nn.Module):
         else:
             # GGUF models
             logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
+
+        # Optional scaling factor, backported from vLLM 0.4
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)  # In-place multiply
         return logits
 
 
