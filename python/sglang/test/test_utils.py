@@ -494,7 +494,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             filename = os.path.join(os.getcwd(), filename)
             print(f"\n\nRun:\npython3 {filename}\n\n", flush=True)
             process = subprocess.Popen(
-                ["cat", filename], stdout=None, stderr=None, env=os.environ
+                ["python3", filename], stdout=None, stderr=None, env=os.environ
             )
             process.wait()
             return process.returncode

@@ -61,6 +61,8 @@ jobs:
       - name: Run e2e test
         run: |
           cd rust/py_test
+          cat test_launch_router.py
+          cat test_launch_server.py
           python3 run_suite.py
 
   finish:
