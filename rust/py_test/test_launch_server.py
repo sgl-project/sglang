@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -182,7 +183,7 @@ class TestLaunchServer(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",  # use round robin to make sure every worker processes requests
         )
-        # 1. start a worker, and wait until it is healthy
+        # 1. start a worker
         port = find_available_port()
         worker_url = f"http://127.0.0.1:{port}"
         worker_process = popen_launch_server(
@@ -219,6 +220,59 @@ class TestLaunchServer(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
 
         # 5. run mmlu again
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
+
+    def test_3_lazy_fault_tolerance(self):
+        print("Running test_3_lazy_fault_tolerance...")
+        # DP size = 1
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",
+        )
+
+        # 1. start a worker
+        port = find_available_port()
+        worker_url = f"http://127.0.0.1:{port}"
+        worker_process = popen_launch_server(
+            self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        )
+        self.other_process.append(worker_process)
+
+        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
+        with requests.Session() as session:
+            response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
+            self.assertEqual(response.status_code, 200)
+
+        # Start a thread to kill the worker after 10 seconds to mimic abrupt worker failure
+        def kill_worker():
+            time.sleep(10)
+            kill_process_tree(worker_process.pid)
+            print("Worker process killed")
+
+        import threading
+
+        kill_thread = threading.Thread(target=kill_worker)
+        kill_thread.daemon = True
+        kill_thread.start()
+
+        # 3. run mmlu
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=256,
+            num_threads=32,
+            temperature=0.1,
+        )
         metrics = run_eval(args)
         score = metrics["score"]
         THRESHOLD = 0.65
