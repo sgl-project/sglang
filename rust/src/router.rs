@@ -274,10 +274,49 @@ impl Router {
     }
 
     pub async fn route_to_first(&self, client: &reqwest::Client, route: &str) -> HttpResponse {
-        match self.select_first_worker() {
-            Ok(worker_url) => self.send_request(client, &worker_url, route).await,
-            Err(e) => HttpResponse::InternalServerError().body(e),
+        const MAX_REQUEST_RETRIES: u32 = 3;
+        const MAX_TOTAL_RETRIES: u32 = 6;
+        let mut total_retries = 0;
+
+        while total_retries < MAX_TOTAL_RETRIES {
+            match self.select_first_worker() {
+                Ok(worker_url) => {
+                    let mut request_retries = 0;
+
+                    // Try the same worker multiple times
+                    while request_retries < MAX_REQUEST_RETRIES {
+                        if total_retries >= 1 {
+                            info!("Retrying request after {} failed attempts", total_retries);
+                        }
+
+                        let response = self.send_request(client, &worker_url, route).await;
+
+                        if response.status().is_success() {
+                            return response;
+                        }
+
+                        warn!(
+                            "Request to {} failed (attempt {}/{})",
+                            worker_url,
+                            request_retries + 1,
+                            MAX_REQUEST_RETRIES
+                        );
+
+                        request_retries += 1;
+                        total_retries += 1;
+
+                        if request_retries == MAX_REQUEST_RETRIES {
+                            warn!("Removing failed worker: {}", worker_url);
+                            self.remove_worker(&worker_url);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => return HttpResponse::InternalServerError().body(e),
+            }
         }
+
+        HttpResponse::InternalServerError().body("All retry attempts failed")
     }
 
     fn get_text_from_request(&self, body: &Bytes, route: &str) -> String {
@@ -488,9 +527,46 @@ impl Router {
         body: &Bytes,
         route: &str,
     ) -> HttpResponse {
-        let worker_url = self.select_generate_worker(&body, route);
-        self.send_generate_request(client, req, body, route, &worker_url)
-            .await
+        const MAX_REQUEST_RETRIES: u32 = 3;
+        const MAX_TOTAL_RETRIES: u32 = 6;
+        let mut total_retries = 0;
+
+        while total_retries < MAX_TOTAL_RETRIES {
+            let worker_url = self.select_generate_worker(body, route);
+            let mut request_retries = 0;
+
+            // Try the same worker multiple times
+            while request_retries < MAX_REQUEST_RETRIES {
+                if total_retries >= 1 {
+                    info!("Retrying request after {} failed attempts", total_retries);
+                }
+                let response = self
+                    .send_generate_request(client, req, body, route, &worker_url)
+                    .await;
+
+                if response.status().is_success() {
+                    return response;
+                }
+
+                warn!(
+                    "Generate request to {} failed (attempt {}/{})",
+                    worker_url,
+                    request_retries + 1,
+                    MAX_REQUEST_RETRIES
+                );
+
+                request_retries += 1;
+                total_retries += 1;
+
+                if request_retries == MAX_REQUEST_RETRIES {
+                    warn!("Removing failed worker: {}", worker_url);
+                    self.remove_worker(&worker_url);
+                    break;
+                }
+            }
+        }
+
+        HttpResponse::InternalServerError().body("All retry attempts failed")
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
@@ -590,9 +666,13 @@ impl Router {
             | Router::Random { worker_urls }
             | Router::CacheAware { worker_urls, .. } => {
                 let mut urls = worker_urls.write().unwrap();
-                let index = urls.iter().position(|url| url == &worker_url).unwrap();
-                urls.remove(index);
-                info!("Removed worker: {}", worker_url);
+                if let Some(index) = urls.iter().position(|url| url == &worker_url) {
+                    urls.remove(index);
+                    info!("Removed worker: {}", worker_url);
+                } else {
+                    warn!("Worker {} not found, skipping removal", worker_url);
+                    return;
+                }
             }
         }
 
