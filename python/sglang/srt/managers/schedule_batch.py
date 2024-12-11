@@ -256,6 +256,7 @@ class Req:
 
         # Prefix info
         self.prefix_indices = []
+        # Tokens to run prefill. input_tokens - shared_prefix_tokens.
         self.extend_input_len = 0
         self.last_node = None
 
@@ -316,6 +317,7 @@ class Req:
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
+            # tree cache is None if the prefix is not computed with tree cache.
             self.prefix_indices, self.last_node = tree_cache.match_prefix(
                 rid=self.rid, key=self.adjust_max_prefix_ids()
             )
