@@ -61,7 +61,7 @@ class SchedulePolicy:
         # Compute matched prefix length
         prefix_computed = False
         # rid to deprioritize in the current run.
-        temporary_deprioritized = set()
+        temporary_deprioritized = {}
         if policy == "lpm" or policy == "dfs-weight":
             # It is used to find the matching prefix for in-batch prefix caching.
             temp_radix = RadixCache(None, None, False)
@@ -87,7 +87,7 @@ class SchedulePolicy:
                         len(in_batch_matching_prefixes)
                         >= IN_BATCH_PREFIX_CACHING_THRESHOLD
                     ):
-                        temporary_deprioritized.add(r.rid)
+                        temporary_deprioritized[r.rid] = r
                     else:
                         temp_radix.insert(prefix_ids, torch.tensor(prefix_ids))
 
@@ -117,6 +117,7 @@ class SchedulePolicy:
             for req in waiting_queue:
                 last_node_to_reqs[req.last_node].append(req)
 
+            # node -> # of requests for that node.
             node_to_weight = defaultdict(int)
             for node in last_node_to_reqs:
                 node_to_weight[node] = len(last_node_to_reqs[node])
@@ -128,7 +129,9 @@ class SchedulePolicy:
                 node_to_weight,
                 last_node_to_reqs,
                 waiting_queue,
+                temporary_deprioritized,
             )
+            waiting_queue.extend(temporary_deprioritized.values())
         else:
             raise ValueError(f"Unknown schedule_policy: {policy=}")
 
@@ -142,15 +145,22 @@ class SchedulePolicy:
     def get_dfs_priority(
         self,
         cur_node: TreeNode,
-        node_to_priority: Dict,
-        last_node_to_reqs: Dict,
+        node_to_priority: Dict[TreeNode, int],
+        last_node_to_reqs: Dict[TreeNode, List[Req]],
         q: List,
+        temporary_deprioritized: Dict[str, Req],
     ):
         childs = [child for child in cur_node.children.values()]
         childs.sort(key=lambda x: -node_to_priority[x])
         for child in childs:
-            self.get_dfs_priority(child, node_to_priority, last_node_to_reqs, q)
-        q.extend(last_node_to_reqs[cur_node])
+            self.get_dfs_priority(
+                child, node_to_priority, last_node_to_reqs, q, temporary_deprioritized
+            )
+
+        for req in last_node_to_reqs[cur_node]:
+            if req.rid in temporary_deprioritized:
+                continue
+            q.append(req)
 
 
 class AddReqResult(Enum):
