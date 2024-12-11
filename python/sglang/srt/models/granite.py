@@ -227,34 +227,20 @@ class GraniteDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        # if residual is None:
-        #     residual = hidden_states
-        #     hidden_states = self.input_layernorm(hidden_states)
-        # else:
-        #     hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        # hidden_states = self.self_attn(
-        #     positions=positions,
-        #     hidden_states=hidden_states,
-        #     forward_batch=forward_batch,
-        # )
-        # Code from vllm head
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-        )
-        hidden_states = residual + hidden_states * self.residual_multiplier
+        ) * self.residual_multiplier  # multiplier for Maximal Update Parameterization
 
         # Fully Connected
-        # Old code
-        #hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        # Code from vllm head
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states * self.residual_multiplier
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states) * self.residual_multiplier
         return hidden_states, residual
 
 
@@ -270,7 +256,7 @@ class GraniteModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
-            config.hidden_size,
+            config.hidden_size
         )
         self.layers = nn.ModuleList(
             [
@@ -321,13 +307,19 @@ class GraniteForCausalLM(nn.Module):
         # the same tensor. Enforce during object creation so that weights will 
         # load correctly even if the LM head weights don't have a separate entry
         # in the state dict.
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, quant_config=quant_config
+        )
         if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+            self.lm_head.tie_weights(self.model.embed_tokens)
+
+        # Granite logit scaling factors are applied via division, but
+        # LogitsProcessor expects a multiplicative factor.
+        if hasattr(config, "logits_scaling"):
+            logit_scale = 1.0 / config.logits_scaling
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
-        self.logits_processor = LogitsProcessor(config)
+            logit_scale = None
+        self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -352,10 +344,6 @@ class GraniteForCausalLM(nn.Module):
             logits_processor_output: LogitsProcessorOutput = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
             )
-            #print(f"Logits processor output before:\n{logits_processor_output}")
-            logits_processor_output.next_token_logits /= self.config.logits_scaling
-            #print(f"Logits processor output after:\n{logits_processor_output}")
-            # TODO: Divide logits indside logits_processor_output by self.config.logits_scaling
             return logits_processor_output
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -419,6 +407,11 @@ class GraniteForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            if "lm_head.weight" in name and self.config.tie_word_embeddings:
+                # Input and output embeddings are tied, so the output embeddings
+                # may not be present in the checkpoint. We assume that the input
+                # embeddings are always present in the checkpoint.
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -432,6 +425,9 @@ class GraniteForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # This block only runs if the preceding for loop doesn't find
+                # a match for `name` in `stacked_params_mapping`.
+
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue

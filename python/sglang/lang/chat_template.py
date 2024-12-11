@@ -322,7 +322,7 @@ register_chat_template(
 
 register_chat_template(
    ChatTemplate(
-       name="granite3-instruct",
+       name="granite-3-instruct",
        default_system_prompt=None,
        role_prefix_and_suffix={
            "system": (
