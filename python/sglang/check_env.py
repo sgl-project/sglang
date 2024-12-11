@@ -11,8 +11,10 @@ import torch
 
 from sglang.srt.utils import is_hip
 
+
 def is_cuda_v2():
     return torch.version.cuda is not None
+
 
 # List of packages to check versions
 PACKAGE_LIST = [
@@ -149,11 +151,15 @@ def _get_nvcc_info():
         try:
             nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
             nvcc_output = (
-                subprocess.check_output(f'"{nvcc}" -V', shell=True).decode("utf-8").strip()
+                subprocess.check_output(f'"{nvcc}" -V', shell=True)
+                .decode("utf-8")
+                .strip()
             )
             return {
                 "NVCC": nvcc_output[
-                    nvcc_output.rfind("Cuda compilation tools") : nvcc_output.rfind("Build")
+                    nvcc_output.rfind("Cuda compilation tools") : nvcc_output.rfind(
+                        "Build"
+                    )
                 ].strip()
             }
         except subprocess.SubprocessError:
@@ -164,7 +170,9 @@ def _get_nvcc_info():
         try:
             hipcc = os.path.join(ROCM_HOME, "bin/hipcc")
             hipcc_output = (
-                subprocess.check_output(f'"{hipcc}" --version', shell=True).decode("utf-8").strip()
+                subprocess.check_output(f'"{hipcc}" --version', shell=True)
+                .decode("utf-8")
+                .strip()
             )
             return {
                 "HIPCC": hipcc_output[
@@ -206,7 +214,7 @@ def _get_cuda_driver_version():
                 ]
             )
             versions = set(output.decode().strip().split("\n"))
-            versions.discard('name, value')
+            versions.discard("name, value")
             ver = versions.pop()
             ver = ver.replace('"Driver version", ', "").replace('"', "")
 
