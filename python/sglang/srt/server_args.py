@@ -283,7 +283,15 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
+            choices=[
+                "auto",
+                "pt",
+                "safetensors",
+                "npcache",
+                "dummy",
+                "gguf",
+                "bitsandbytes",
+            ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -294,7 +302,9 @@ class ServerArgs:
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. ',
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization.",
         )
         parser.add_argument(
             "--trust-remote-code",
