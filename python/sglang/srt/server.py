@@ -196,7 +196,7 @@ async def stop_profile_async():
 @app.post("/update_weights_from_disk")
 @time_func_latency
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
-    """Update the weights from disk inplace without re-launching the server."""
+    """Update the weights from disk in-place without re-launching the server."""
     success, message = await tokenizer_manager.update_weights_from_disk(obj, request)
     content = {"success": success, "message": message}
     if success:
@@ -462,8 +462,8 @@ def launch_engine(
         if server_args.node_rank >= 1:
             # For other nodes, they do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            while True:
-                pass
+            for proc in scheduler_procs:
+                proc.join()
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)

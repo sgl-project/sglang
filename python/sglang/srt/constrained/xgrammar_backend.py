@@ -45,6 +45,7 @@ class XGrammarGrammar(BaseGrammarObject):
         self.matcher = matcher
         self.vocab_size = vocab_size
         self.ctx = ctx
+        self.finished = False
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
@@ -85,12 +86,11 @@ class XGrammarGrammar(BaseGrammarObject):
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if vocab_mask.device.type != logits.device.type:
-            # vocab_mask must then be on the same device as logits
-            # when applying the token bitmask, so we check and move if needed
-            vocab_mask = vocab_mask.to(logits.device)
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
 
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
@@ -117,7 +117,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         key_type, key_string = key
         if key_type == "json":
             try:
-                ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
+                if key_string == "$$ANY$$":
+                    ctx = self.grammar_compiler.compile_builtin_json_grammar()
+                else:
+                    ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
             except RuntimeError as e:
                 logging.warning(
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"

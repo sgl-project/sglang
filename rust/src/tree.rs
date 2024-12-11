@@ -5,6 +5,7 @@ use log::info;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -24,7 +25,6 @@ struct Node {
 #[derive(Debug)]
 pub struct Tree {
     root: NodeRef,
-    // TODO: Char Count per tenant
     pub tenant_char_count: DashMap<String, usize>,
 }
 
@@ -405,20 +405,12 @@ impl Tree {
             .collect()
     }
 
-    pub fn evict_tenant_data(&self, max_size: usize) {
+    pub fn evict_tenant_by_size(&self, max_size: usize) {
         // Calculate used size and collect leaves
         let mut stack = vec![Arc::clone(&self.root)];
-        let mut used_size_per_tenant: HashMap<String, usize> = HashMap::new();
         let mut pq = BinaryHeap::new();
 
         while let Some(curr) = stack.pop() {
-            for tenant in curr.tenant_last_access_time.iter() {
-                let size = used_size_per_tenant
-                    .entry(tenant.key().clone())
-                    .or_insert(0);
-                *size += curr.text.read().unwrap().chars().count();
-            }
-
             for child in curr.children.iter() {
                 stack.push(Arc::clone(child.value()));
             }
@@ -436,65 +428,100 @@ impl Tree {
         }
 
         info!("Before eviction - Used size per tenant:");
-        for (tenant, size) in &used_size_per_tenant {
-            info!("Tenant: {}, Size: {}", tenant, size);
+        for entry in self.tenant_char_count.iter() {
+            info!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
 
         // Process eviction
         while let Some(Reverse(entry)) = pq.pop() {
             let EvictionEntry { tenant, node, .. } = entry;
 
-            if let Some(&used_size) = used_size_per_tenant.get(&tenant) {
-                if used_size <= max_size {
+            if let Some(used_size) = self.tenant_char_count.get(&tenant) {
+                if *used_size <= max_size {
                     continue;
                 }
+            }
 
-                // Update used size
-                if let Some(size) = used_size_per_tenant.get_mut(&tenant) {
-                    *size -= node.text.read().unwrap().chars().count();
-                }
-
-                // Decrement  when removing tenant from node
-                if node.tenant_last_access_time.contains_key(&tenant) {
-                    self.tenant_char_count
-                        .entry(tenant.clone())
-                        .and_modify(|count| {
-                            if *count > 0 {
-                                *count -= node.text.read().unwrap().chars().count();
-                            }
-                        });
-                }
-
-                // Remove tenant from node
-                node.tenant_last_access_time.remove(&tenant);
-
-                // Remove empty nodes
-                if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
-                    if let Some(parent) = node.parent.write().unwrap().as_ref() {
-                        let first_char = node.text.read().unwrap().chars().next().unwrap();
-                        parent.children.remove(&first_char);
-                    }
-                }
-
-                // Add parent to queue if it becomes a leaf
-                if let Some(parent) = node.parent.read().unwrap().as_ref() {
-                    if Tree::leaf_of(parent).contains(&tenant) {
-                        if let Some(timestamp) = parent.tenant_last_access_time.get(&tenant) {
-                            pq.push(Reverse(EvictionEntry {
-                                timestamp: *timestamp,
-                                tenant: tenant.clone(),
-                                node: Arc::clone(parent),
-                            }));
+            // Decrement when removing tenant from node
+            if node.tenant_last_access_time.contains_key(&tenant) {
+                self.tenant_char_count
+                    .entry(tenant.clone())
+                    .and_modify(|count| {
+                        if *count > 0 {
+                            *count -= node.text.read().unwrap().chars().count();
                         }
+                    });
+            }
+
+            // Remove tenant from node
+            node.tenant_last_access_time.remove(&tenant);
+
+            // Remove empty nodes
+            if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+                if let Some(parent) = node.parent.write().unwrap().as_ref() {
+                    let first_char = node.text.read().unwrap().chars().next().unwrap();
+                    parent.children.remove(&first_char);
+                }
+            }
+
+            // Add parent to queue if it becomes a leaf
+            if let Some(parent) = node.parent.read().unwrap().as_ref() {
+                if Tree::leaf_of(parent).contains(&tenant) {
+                    if let Some(timestamp) = parent.tenant_last_access_time.get(&tenant) {
+                        pq.push(Reverse(EvictionEntry {
+                            timestamp: *timestamp,
+                            tenant: tenant.clone(),
+                            node: Arc::clone(parent),
+                        }));
                     }
+                }
+            };
+        }
+
+        info!("After eviction - Used size per tenant:");
+        for entry in self.tenant_char_count.iter() {
+            info!("Tenant: {}, Size: {}", entry.key(), entry.value());
+        }
+    }
+
+    pub fn remove_tenant(&self, tenant: &str) {
+        // 1. Find all the leaves for the tenant
+        let mut stack = vec![Arc::clone(&self.root)];
+        let mut queue = VecDeque::new();
+
+        while let Some(curr) = stack.pop() {
+            for child in curr.children.iter() {
+                stack.push(Arc::clone(child.value()));
+            }
+
+            if Tree::leaf_of(&curr).contains(&tenant.to_string()) {
+                queue.push_back(Arc::clone(&curr));
+            }
+        }
+
+        // 2. Start from the leaves and traverse up to the root, removing the tenant from each node
+        while let Some(curr) = queue.pop_front() {
+            // remove tenant from node
+            curr.tenant_last_access_time.remove(&tenant.to_string());
+
+            // remove empty nodes
+            if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
+                if let Some(parent) = curr.parent.read().unwrap().as_ref() {
+                    let first_char = curr.text.read().unwrap().chars().next().unwrap();
+                    parent.children.remove(&first_char);
+                }
+            }
+
+            // add parent to queue if it becomes a leaf
+            if let Some(parent) = curr.parent.read().unwrap().as_ref() {
+                if Tree::leaf_of(parent).contains(&tenant.to_string()) {
+                    queue.push_back(Arc::clone(&parent));
                 }
             }
         }
 
-        info!("After eviction - Used size per tenant:");
-        for (tenant, size) in &used_size_per_tenant {
-            info!("Tenant: {}, Size: {}", tenant, size);
-        }
+        // 3. Remove the tenant from the tenant_char_count map
+        self.tenant_char_count.remove(&tenant.to_string());
     }
 
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {
@@ -687,7 +714,7 @@ mod tests {
         );
 
         // Test eviction
-        tree.evict_tenant_data(3); // This should evict tenants with more than 3 chars
+        tree.evict_tenant_by_size(3); // This should evict tenants with more than 3 chars
 
         let post_eviction_smallest = tree.get_smallest_tenant();
         println!("Smallest tenant after eviction: {}", post_eviction_smallest);
@@ -768,7 +795,7 @@ mod tests {
         );
 
         // Phase 4: Eviction test
-        tree.evict_tenant_data(10);
+        tree.evict_tenant_by_size(10);
 
         let computed_sizes = tree.get_used_size_per_tenant();
         let maintained_counts: HashMap<String, usize> = tree
@@ -1146,7 +1173,7 @@ mod tests {
         assert_eq!(sizes_before.get("tenant2").unwrap(), &10); // "hello" + "world" = 10
 
         // Evict - should remove "hello" from tenant2 as it's the oldest
-        tree.evict_tenant_data(max_size);
+        tree.evict_tenant_by_size(max_size);
 
         tree.pretty_print();
 
@@ -1182,7 +1209,7 @@ mod tests {
         }
 
         // Perform eviction
-        tree.evict_tenant_data(max_size);
+        tree.evict_tenant_by_size(max_size);
 
         // Check sizes after eviction
         let sizes_after = tree.get_used_size_per_tenant();
@@ -1214,7 +1241,7 @@ mod tests {
             let handle = thread::spawn(move || {
                 while start_time.elapsed() < test_duration {
                     // Run eviction
-                    tree.evict_tenant_data(max_size);
+                    tree.evict_tenant_by_size(max_size);
 
                     // Sleep for 5 seconds
                     thread::sleep(Duration::from_secs(5));
@@ -1259,7 +1286,7 @@ mod tests {
         }
 
         // final eviction
-        tree.evict_tenant_data(max_size);
+        tree.evict_tenant_by_size(max_size);
 
         // Final size check
         let final_sizes = tree.get_used_size_per_tenant();
@@ -1365,5 +1392,92 @@ mod tests {
         // Test non-existent tenant
         assert_eq!(tree.prefix_match_tenant("hello", "tenant3"), ""); // Non-existent tenant
         assert_eq!(tree.prefix_match_tenant("help", "tenant3"), ""); // Non-existent tenant
+    }
+
+    #[test]
+    fn test_simple_tenant_eviction() {
+        let tree = Tree::new();
+
+        // Insert data for multiple tenants
+        tree.insert("hello", "tenant1");
+        tree.insert("world", "tenant1");
+        tree.insert("hello", "tenant2");
+        tree.insert("help", "tenant2");
+
+        // Verify initial state
+        let initial_sizes = tree.get_used_size_per_tenant();
+        assert_eq!(initial_sizes.get("tenant1").unwrap(), &10); // "hello" + "world"
+        assert_eq!(initial_sizes.get("tenant2").unwrap(), &6); // "hello" + "p"
+
+        // Evict tenant1
+        tree.remove_tenant("tenant1");
+
+        // Verify after eviction
+        let final_sizes = tree.get_used_size_per_tenant();
+        assert!(
+            !final_sizes.contains_key("tenant1"),
+            "tenant1 should be completely removed"
+        );
+        assert_eq!(
+            final_sizes.get("tenant2").unwrap(),
+            &6,
+            "tenant2 should be unaffected"
+        );
+
+        // Verify tenant1's data is inaccessible
+        assert_eq!(tree.prefix_match_tenant("hello", "tenant1"), "");
+        assert_eq!(tree.prefix_match_tenant("world", "tenant1"), "");
+
+        // Verify tenant2's data is still accessible
+        assert_eq!(tree.prefix_match_tenant("hello", "tenant2"), "hello");
+        assert_eq!(tree.prefix_match_tenant("help", "tenant2"), "help");
+    }
+
+    #[test]
+    fn test_complex_tenant_eviction() {
+        let tree = Tree::new();
+
+        // Create a more complex tree structure with shared prefixes
+        tree.insert("apple", "tenant1");
+        tree.insert("application", "tenant1");
+        tree.insert("apple", "tenant2");
+        tree.insert("appetite", "tenant2");
+        tree.insert("banana", "tenant1");
+        tree.insert("banana", "tenant2");
+        tree.insert("ball", "tenant2");
+
+        // Verify initial state
+        let initial_sizes = tree.get_used_size_per_tenant();
+        println!("Initial sizes: {:?}", initial_sizes);
+        tree.pretty_print();
+
+        // Evict tenant1
+        tree.remove_tenant("tenant1");
+
+        // Verify final state
+        let final_sizes = tree.get_used_size_per_tenant();
+        println!("Final sizes: {:?}", final_sizes);
+        tree.pretty_print();
+
+        // Verify tenant1 is completely removed
+        assert!(
+            !final_sizes.contains_key("tenant1"),
+            "tenant1 should be completely removed"
+        );
+
+        // Verify all tenant1's data is inaccessible
+        assert_eq!(tree.prefix_match_tenant("apple", "tenant1"), "");
+        assert_eq!(tree.prefix_match_tenant("application", "tenant1"), "");
+        assert_eq!(tree.prefix_match_tenant("banana", "tenant1"), "");
+
+        // Verify tenant2's data is intact
+        assert_eq!(tree.prefix_match_tenant("apple", "tenant2"), "apple");
+        assert_eq!(tree.prefix_match_tenant("appetite", "tenant2"), "appetite");
+        assert_eq!(tree.prefix_match_tenant("banana", "tenant2"), "banana");
+        assert_eq!(tree.prefix_match_tenant("ball", "tenant2"), "ball");
+
+        // Verify the tree structure is still valid for tenant2
+        let tenant2_size = final_sizes.get("tenant2").unwrap();
+        assert_eq!(tenant2_size, &(5 + 5 + 6 + 2)); // "apple" + "etite" + "banana" + "ll"
     }
 }

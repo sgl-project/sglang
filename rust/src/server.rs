@@ -4,6 +4,7 @@ use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Resp
 use bytes::Bytes;
 use env_logger::Builder;
 use log::{info, LevelFilter};
+use std::collections::HashMap;
 use std::io::Write;
 
 #[derive(Debug)]
@@ -19,7 +20,10 @@ impl AppState {
         policy_config: PolicyConfig,
     ) -> Self {
         // Create router based on policy
-        let router = Router::new(worker_urls, policy_config);
+        let router = match Router::new(worker_urls, policy_config) {
+            Ok(router) => router,
+            Err(error) => panic!("Failed to create router: {}", error),
+        };
 
         Self { router, client }
     }
@@ -128,6 +132,38 @@ async fn v1_completions(
         .await
 }
 
+#[post("/add_worker")]
+async fn add_worker(
+    query: web::Query<HashMap<String, String>>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let worker_url = match query.get("url") {
+        Some(url) => url.to_string(),
+        None => {
+            return HttpResponse::BadRequest()
+                .body("Worker URL required. Provide 'url' query parameter")
+        }
+    };
+
+    match data.router.add_worker(worker_url).await {
+        Ok(message) => HttpResponse::Ok().body(message),
+        Err(error) => HttpResponse::BadRequest().body(error),
+    }
+}
+
+#[post("/remove_worker")]
+async fn remove_worker(
+    query: web::Query<HashMap<String, String>>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let worker_url = match query.get("url") {
+        Some(url) => url.to_string(),
+        None => return HttpResponse::BadRequest().finish(),
+    };
+    data.router.remove_worker(worker_url);
+    HttpResponse::Ok().finish()
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -158,19 +194,19 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         )
         .init();
 
-    info!("Starting server on {}:{}", config.host, config.port);
-    info!("Worker URLs: {:?}", config.worker_urls);
-    info!("Policy Config: {:?}", config.policy_config);
-
     let client = reqwest::Client::builder()
         .build()
         .expect("Failed to create HTTP client");
 
     let app_state = web::Data::new(AppState::new(
-        config.worker_urls,
+        config.worker_urls.clone(),
         client,
-        config.policy_config,
+        config.policy_config.clone(),
     ));
+
+    info!("✅ Starting router on {}:{}", config.host, config.port);
+    info!("✅ Serving Worker URLs: {:?}", config.worker_urls);
+    info!("✅ Policy Config: {:?}", config.policy_config);
 
     HttpServer::new(move || {
         App::new()
@@ -183,6 +219,8 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(health)
             .service(health_generate)
             .service(get_server_info)
+            .service(add_worker)
+            .service(remove_worker)
     })
     .bind((config.host, config.port))?
     .run()

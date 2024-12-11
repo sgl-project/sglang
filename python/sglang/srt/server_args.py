@@ -25,6 +25,7 @@ import torch
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
+    get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
@@ -140,6 +141,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
+    triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
 
@@ -158,6 +160,8 @@ class ServerArgs:
             gpu_mem = get_amdgpu_memory_capacity()
         elif torch.cuda.is_available():
             gpu_mem = get_nvgpu_memory_capacity()
+        elif self.device == "hpu":
+            gpu_mem = get_hpu_memory_capacity()
         else:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
@@ -184,12 +188,20 @@ class ServerArgs:
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
+            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
             if gpu_mem is not None and gpu_mem < 25_000:
-                self.cuda_graph_max_bs = 8
+                if self.tp_size < 4:
+                    self.cuda_graph_max_bs = 8
+                else:
+                    self.cuda_graph_max_bs = 80
             else:
                 self.cuda_graph_max_bs = 160
 
         # Choose kernel backends
+        if self.device == "hpu":
+            self.attention_backend = "torch_native"
+            self.sampling_backend = "pytorch"
+
         if self.attention_backend is None:
             self.attention_backend = (
                 "flashinfer" if is_flashinfer_available() else "triton"
@@ -741,6 +753,12 @@ class ServerArgs:
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
+        )
+        parser.add_argument(
+            "--triton-attention-num-kv-splits",
+            type=int,
+            default=ServerArgs.triton_attention_num_kv_splits,
+            help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
         )
         parser.add_argument(
             "--num-continuous-decode-steps",

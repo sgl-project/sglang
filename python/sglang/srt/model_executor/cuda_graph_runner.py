@@ -127,9 +127,23 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         if model_runner.server_args.disable_cuda_graph_padding:
-            self.capture_bs = list(range(1, 32)) + [64, 128]
+            self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+
+        if max(self.capture_bs) > model_runner.req_to_token_pool.size:
+            # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+            # is very samll. We add more values here to make sure we capture the maximum bs.
+            self.capture_bs = list(
+                sorted(
+                    set(
+                        self.capture_bs
+                        + [model_runner.req_to_token_pool.size - 1]
+                        + [model_runner.req_to_token_pool.size]
+                    )
+                )
+            )
+
         self.capture_bs = [
             bs
             for bs in self.capture_bs
@@ -386,9 +400,14 @@ class CudaGraphRunner:
                     forward_mode=ForwardMode.DECODE,
                     top_logprobs_nums=forward_batch.top_logprobs_nums,
                 )
-                logits_output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
+                (
+                    logits_output.output_top_logprobs_val,
+                    logits_output.output_top_logprobs_idx,
+                ) = LogitsProcessor.get_top_logprobs(
                     next_token_logprobs, logits_metadata
-                )[1]
+                )[
+                    2:4
+                ]
         else:
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
