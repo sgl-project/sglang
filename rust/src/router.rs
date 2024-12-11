@@ -273,7 +273,6 @@ impl Router {
         }
     }
 
-
     pub async fn route_to_first(&self, client: &reqwest::Client, route: &str) -> HttpResponse {
         match self.select_first_worker() {
             Ok(worker_url) => self.send_request(client, &worker_url, route).await,
@@ -490,7 +489,8 @@ impl Router {
         route: &str,
     ) -> HttpResponse {
         let worker_url = self.select_generate_worker(&body, route);
-        self.send_generate_request(client, req, body, route, &worker_url).await
+        self.send_generate_request(client, req, body, route, &worker_url)
+            .await
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
@@ -534,7 +534,10 @@ impl Router {
                         } = self
                         {
                             // Add worker to running queue with initial count of 0
-                            running_queue.lock().unwrap().insert(worker_url.to_string(), 0);
+                            running_queue
+                                .lock()
+                                .unwrap()
+                                .insert(worker_url.to_string(), 0);
 
                             // Add worker to processed queue with initial count of 0
                             processed_queue
@@ -602,8 +605,14 @@ impl Router {
         } = self
         {
             tree.lock().unwrap().remove_tenant(&worker_url);
-            running_queue.lock().unwrap().remove(&worker_url.to_string());
-            processed_queue.lock().unwrap().remove(&worker_url.to_string());
+            running_queue
+                .lock()
+                .unwrap()
+                .remove(&worker_url.to_string());
+            processed_queue
+                .lock()
+                .unwrap()
+                .remove(&worker_url.to_string());
             info!(
                 "Removed worker from tree and cleaned up queues: {}",
                 worker_url
