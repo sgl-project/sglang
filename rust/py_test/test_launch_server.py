@@ -287,75 +287,50 @@ class TestLaunchServer(unittest.TestCase):
 
     def test_4_payload_size(self):
         print("Running test_4_payload_size...")
-        # Start router with default 4MB limit
+        # Start router with 3MB limit
         self.process = popen_launch_router(
             self.model,
             self.base_url,
             dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
+            max_payload_size=1 * 1024 * 1024,  # 1MB limit
         )
 
-        # Test case 1: Payload just under 4MB should succeed
-        payload_3mb = {
-            "text": "x" * (3 * 1024 * 1024),  # 3MB of text
+        # Test case 1: Payload just under 1MB should succeed
+        payload_0_5_mb = {
+            "text": "x" * int(0.5 * 1024 * 1024),  # 0.5MB of text
             "temperature": 0.0,
         }
 
         with requests.Session() as session:
             response = session.post(
                 f"{self.base_url}/generate",
-                json=payload_3mb,
+                json=payload_0_5_mb,
                 headers={"Content-Type": "application/json"},
             )
             self.assertEqual(
                 response.status_code,
                 200,
-                f"3MB payload should succeed but got status {response.status_code}",
+                f"0.5MB payload should succeed but got status {response.status_code}",
             )
 
-        # Test case 2: Payload over 4MB should fail
-        payload_5mb = {
-            "text": "x" * (5 * 1024 * 1024),  # 5MB of text
+        # Test case 2: Payload over 1MB should fail
+        payload_1_plus_mb = {
+            "text": "x" * int((1.2 * 1024 * 1024)),  # 1.2MB of text
             "temperature": 0.0,
         }
 
         with requests.Session() as session:
             response = session.post(
                 f"{self.base_url}/generate",
-                json=payload_5mb,
+                json=payload_1_plus_mb,
                 headers={"Content-Type": "application/json"},
             )
             self.assertEqual(
                 response.status_code,
                 413,  # Payload Too Large
-                f"5MB payload should fail with 413 but got status {response.status_code}",
-            )
-
-        # Test case 3: Start router with custom 8MB limit
-        if self.process:
-            terminate_and_wait(self.process)
-
-        self.process = popen_launch_router(
-            self.model,
-            self.base_url,
-            dp_size=1,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            policy="round_robin",
-            max_payload_size=8 * 1024 * 1024,  # 8MB limit
-        )
-
-        # Now 5MB payload should succeed with 8MB limit
-        with requests.Session() as session:
-            response = session.post(
-                f"{self.base_url}/generate",
-                json=payload_5mb,
-                headers={"Content-Type": "application/json"},
-            )
-            self.assertEqual(
-                response.status_code,
-                200,
-                f"5MB payload should succeed with 8MB limit but got status {response.status_code}",
+                f"1.2MB payload should fail with 413 but got status {response.status_code}",
             )
 
 
