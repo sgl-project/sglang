@@ -6,13 +6,14 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
 )
-from sglang.srt.utils import kill_process_tree
+
 
 def popen_launch_router(
     model: str,
@@ -226,8 +227,8 @@ class TestLaunchServer(unittest.TestCase):
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    def test_3_lazy_failure_detection(self):
-        print("Running test_3_lazy_failure_detection...")
+    def test_3_lazy_fault_tolerance(self):
+        print("Running test_3_lazy_fault_tolerance...")
         # DP size = 1
         self.process = popen_launch_router(
             self.model,
@@ -258,6 +259,7 @@ class TestLaunchServer(unittest.TestCase):
             print("Worker process killed")
 
         import threading
+
         kill_thread = threading.Thread(target=kill_worker)
         kill_thread.daemon = True
         kill_thread.start()
@@ -281,4 +283,3 @@ class TestLaunchServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
