@@ -63,7 +63,7 @@ async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
 #[post("/generate")]
 async fn generate(req: HttpRequest, body: Bytes, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_generate_request(&data.client, req, body, "/generate")
+        .route_generate_request(&data.client, &req, &body, "/generate")
         .await
 }
 
@@ -74,7 +74,7 @@ async fn v1_chat_completions(
     data: web::Data<AppState>,
 ) -> impl Responder {
     data.router
-        .route_generate_request(&data.client, req, body, "/v1/chat/completions")
+        .route_generate_request(&data.client, &req, &body, "/v1/chat/completions")
         .await
 }
 
@@ -85,7 +85,7 @@ async fn v1_completions(
     data: web::Data<AppState>,
 ) -> impl Responder {
     data.router
-        .route_generate_request(&data.client, req, body, "/v1/completions")
+        .route_generate_request(&data.client, &req, &body, "/v1/completions")
         .await
 }
 
@@ -102,7 +102,7 @@ async fn add_worker(
         }
     };
 
-    match data.router.add_worker(worker_url).await {
+    match data.router.add_worker(&worker_url).await {
         Ok(message) => HttpResponse::Ok().body(message),
         Err(error) => HttpResponse::BadRequest().body(error),
     }
@@ -117,7 +117,7 @@ async fn remove_worker(
         Some(url) => url.to_string(),
         None => return HttpResponse::BadRequest().finish(),
     };
-    data.router.remove_worker(worker_url);
+    data.router.remove_worker(&worker_url);
     HttpResponse::Ok().finish()
 }
 
