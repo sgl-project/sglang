@@ -14,7 +14,7 @@ Detailed usage of the router can be found in [launch_router](https://github.com/
 
 ```bash
 python -m sglang_router.launch_server --help
-python -m sglang_router.launch_routher --help
+python -m sglang_router.launch_router --help
 ```
 
 The router supports two working modes:
