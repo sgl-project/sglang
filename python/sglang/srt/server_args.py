@@ -162,6 +162,9 @@ class ServerArgs:
     # Custom logit processor
     enable_custom_logit_processor: bool = False
 
+    # Add gRPC port
+    grpc_port: Optional[int] = None
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -872,6 +875,14 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+
+        # Add gRPC port
+        parser.add_argument(
+            "--grpc-port",
+            type=int,
+            default=None,
+            help="Port for gRPC server. If not set, gRPC server will not be started.",
         )
 
     @classmethod
