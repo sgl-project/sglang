@@ -43,6 +43,7 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from uvicorn.config import LOGGING_CONFIG
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.srt.grpc_server import serve_grpc
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -504,24 +505,12 @@ def launch_engine(
     scheduler_info = scheduler_infos[0]
 
 
-def launch_server(
+async def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
     """
-    Launch SRT (SGLang Runtime) Server
-
-    The SRT server consists of an HTTP server and the SRT engine.
-
-    1. HTTP server: A FastAPI server that routes requests to the engine.
-    2. SRT engine:
-        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
-
-    Note:
-    1. The HTTP server and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    Launch SRT (SGLang Runtime) Server with both HTTP and gRPC endpoints.
     """
     launch_engine(server_args=server_args)
 
@@ -541,7 +530,15 @@ def launch_server(
     t.start()
 
     try:
-        # Update logging configs
+        # Start both HTTP and gRPC servers
+        grpc_server = await serve_grpc(
+            tokenizer_manager,
+            host=server_args.host,
+            port=server_args.grpc_port or 50051,
+        )
+        await grpc_server.start()
+
+        # Update logging configs for HTTP server
         LOGGING_CONFIG["formatters"]["default"][
             "fmt"
         ] = "[%(asctime)s] %(levelprefix)s %(message)s"
@@ -551,8 +548,8 @@ def launch_server(
         ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
-        # Listen for HTTP requests
-        uvicorn.run(
+        # Start HTTP server
+        config = uvicorn.Config(
             app,
             host=server_args.host,
             port=server_args.port,
@@ -560,6 +557,11 @@ def launch_server(
             timeout_keep_alive=5,
             loop="uvloop",
         )
+        server = uvicorn.Server(config)
+
+        # Run both servers
+        await asyncio.gather(server.serve(), grpc_server.wait_for_termination())
+
     finally:
         t.join()
 
