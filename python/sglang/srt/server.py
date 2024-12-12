@@ -505,65 +505,64 @@ def launch_engine(
     scheduler_info = scheduler_infos[0]
 
 
-async def launch_server(
+def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
-    """
-    Launch SRT (SGLang Runtime) Server with both HTTP and gRPC endpoints.
-    """
+    """Launch SRT (SGLang Runtime) Server with either HTTP or gRPC."""
     launch_engine(server_args=server_args)
 
-    # Add api key authorization
-    if server_args.api_key:
-        add_api_key_middleware(app, server_args.api_key)
-
-    # Add prometheus middleware
-    if server_args.enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-
-    # Send a warmup request
-    t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
-    )
-    t.start()
-
-    try:
-        # Start both HTTP and gRPC servers
-        grpc_server = await serve_grpc(
+    if server_args.grpc_port:
+        # Launch gRPC server
+        grpc_server = serve_grpc(
             tokenizer_manager,
             host=server_args.host,
-            port=server_args.grpc_port or 50051,
+            port=server_args.grpc_port,
         )
-        await grpc_server.start()
+        grpc_server.start()
+        grpc_server.wait_for_termination()
+    else:
+        # Launch HTTP server
+        # Add api key authorization
+        if server_args.api_key:
+            add_api_key_middleware(app, server_args.api_key)
 
-        # Update logging configs for HTTP server
-        LOGGING_CONFIG["formatters"]["default"][
-            "fmt"
-        ] = "[%(asctime)s] %(levelprefix)s %(message)s"
-        LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-        LOGGING_CONFIG["formatters"]["access"][
-            "fmt"
-        ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
-        LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+        # Add prometheus middleware
+        if server_args.enable_metrics:
+            add_prometheus_middleware(app)
+            enable_func_timer()
 
-        # Start HTTP server
-        config = uvicorn.Config(
-            app,
-            host=server_args.host,
-            port=server_args.port,
-            log_level=server_args.log_level_http or server_args.log_level,
-            timeout_keep_alive=5,
-            loop="uvloop",
+        # Send a warmup request
+        t = threading.Thread(
+            target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
         )
-        server = uvicorn.Server(config)
+        t.start()
 
-        # Run both servers
-        await asyncio.gather(server.serve(), grpc_server.wait_for_termination())
+        try:
+            # Update logging configs
+            LOGGING_CONFIG["formatters"]["default"][
+                "fmt"
+            ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+            LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+            LOGGING_CONFIG["formatters"]["access"][
+                "fmt"
+            ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+            LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
-    finally:
-        t.join()
+            # Start HTTP server
+            config = uvicorn.Config(
+                app,
+                host=server_args.host,
+                port=server_args.port,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+            )
+            server = uvicorn.Server(config)
+            server.run()
+
+        finally:
+            t.join()
 
 
 def _set_envs_and_config(server_args: ServerArgs):

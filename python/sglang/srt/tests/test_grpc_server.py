@@ -1,4 +1,6 @@
 import asyncio
+import multiprocessing
+import time
 from typing import AsyncGenerator
 
 import grpc
@@ -9,23 +11,23 @@ from sglang.srt.server import launch_server
 from sglang.srt.server_args import ServerArgs
 
 
-async def test_grpc_completion():
+def test_grpc_completion():
     # Initialize server args with test configuration
     server_args = ServerArgs(
         model_path="meta-llama/Llama-2-7b-chat-hf",
         host="localhost",
-        port=12345,
         grpc_port=50051,
-        load_format="dummy",  # Use dummy weights for testing
+        load_format="dummy",
     )
 
-    # Start the server
-    server_task = asyncio.create_task(launch_server(server_args))
-    await asyncio.sleep(5)  # Wait for server to start
+    # Start server in a separate process
+    server_process = multiprocessing.Process(target=launch_server, args=(server_args,))
+    server_process.start()
+    time.sleep(5)  # Wait for server to start
 
     try:
         # Create gRPC channel and stub
-        async with grpc.aio.insecure_channel("localhost:50051") as channel:
+        with grpc.insecure_channel("localhost:50051") as channel:
             stub = completion_pb2_grpc.CompletionServiceStub(channel)
 
             # Create completion request
@@ -55,12 +57,8 @@ async def test_grpc_completion():
             )
 
     finally:
-        # Cleanup
-        server_task.cancel()
-        try:
-            await server_task
-        except asyncio.CancelledError:
-            pass
+        server_process.terminate()
+        server_process.join()
 
 
 @pytest.mark.asyncio
@@ -69,18 +67,18 @@ async def test_grpc_error_handling():
     server_args = ServerArgs(
         model_path="meta-llama/Llama-2-7b-chat-hf",
         host="localhost",
-        port=12346,
         grpc_port=50052,
         load_format="dummy",
     )
 
-    # Start the server
-    server_task = asyncio.create_task(launch_server(server_args))
-    await asyncio.sleep(5)  # Wait for server to start
+    # Start server in a separate process
+    server_process = multiprocessing.Process(target=launch_server, args=(server_args,))
+    server_process.start()
+    time.sleep(5)  # Wait for server to start
 
     try:
         # Create gRPC channel and stub
-        async with grpc.aio.insecure_channel("localhost:50052") as channel:
+        with grpc.insecure_channel("localhost:50052") as channel:
             stub = completion_pb2_grpc.CompletionServiceStub(channel)
 
             # Test invalid temperature
@@ -104,12 +102,8 @@ async def test_grpc_error_handling():
             assert exc_info.value.code() == grpc.StatusCode.INTERNAL
 
     finally:
-        # Cleanup
-        server_task.cancel()
-        try:
-            await server_task
-        except asyncio.CancelledError:
-            pass
+        server_process.terminate()
+        server_process.join()
 
 
 if __name__ == "__main__":
