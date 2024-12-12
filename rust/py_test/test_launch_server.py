@@ -21,6 +21,7 @@ def popen_launch_router(
     dp_size: int,
     timeout: float,
     policy: str = "cache_aware",
+    max_payload_size: int = None,
 ):
     """
     Launch the router server process.
@@ -31,6 +32,7 @@ def popen_launch_router(
         dp_size: Data parallel size
         timeout: Server launch timeout
         policy: Router policy, one of "cache_aware", "round_robin", "random"
+        max_payload_size: Maximum payload size in bytes
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -46,12 +48,15 @@ def popen_launch_router(
         "--port",
         port,
         "--dp",
-        str(dp_size),  # Convert dp_size to string
+        str(dp_size),
         "--router-eviction-interval",
-        "5",  # frequent eviction for testing
+        "5",
         "--router-policy",
         policy,
     ]
+
+    if max_payload_size is not None:
+        command.extend(["--router-max-payload-size", str(max_payload_size)])
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
@@ -279,6 +284,54 @@ class TestLaunchServer(unittest.TestCase):
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
+
+    def test_4_payload_size(self):
+        print("Running test_4_payload_size...")
+        # Start router with 3MB limit
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",
+            max_payload_size=1 * 1024 * 1024,  # 1MB limit
+        )
+
+        # Test case 1: Payload just under 1MB should succeed
+        payload_0_5_mb = {
+            "text": "x" * int(0.5 * 1024 * 1024),  # 0.5MB of text
+            "temperature": 0.0,
+        }
+
+        with requests.Session() as session:
+            response = session.post(
+                f"{self.base_url}/generate",
+                json=payload_0_5_mb,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"0.5MB payload should succeed but got status {response.status_code}",
+            )
+
+        # Test case 2: Payload over 1MB should fail
+        payload_1_plus_mb = {
+            "text": "x" * int((1.2 * 1024 * 1024)),  # 1.2MB of text
+            "temperature": 0.0,
+        }
+
+        with requests.Session() as session:
+            response = session.post(
+                f"{self.base_url}/generate",
+                json=payload_1_plus_mb,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(
+                response.status_code,
+                413,  # Payload Too Large
+                f"1.2MB payload should fail with 413 but got status {response.status_code}",
+            )
 
 
 if __name__ == "__main__":

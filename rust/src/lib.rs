@@ -22,6 +22,7 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    max_payload_size: usize,
     verbose: bool,
 }
 
@@ -38,6 +39,7 @@ impl Router {
         balance_rel_threshold = 1.0001,
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
+        max_payload_size = 4 * 1024 * 1024,
         verbose = false
     ))]
     fn new(
@@ -50,6 +52,7 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        max_payload_size: usize,
         verbose: bool,
     ) -> PyResult<Self> {
         Ok(Router {
@@ -62,6 +65,7 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            max_payload_size,
             verbose,
         })
     }
@@ -86,6 +90,7 @@ impl Router {
                 worker_urls: self.worker_urls.clone(),
                 policy_config,
                 verbose: self.verbose,
+                max_payload_size: self.max_payload_size,
             })
             .await
             .unwrap();

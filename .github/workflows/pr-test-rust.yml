@@ -60,6 +60,7 @@ jobs:
           pip install --force-reinstall dist/*.whl
       - name: Run e2e test
         run: |
+          bash scripts/killall_sglang.sh
           cd rust/py_test
           python3 run_suite.py
 
