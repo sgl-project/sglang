@@ -509,7 +509,18 @@ def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
-    """Launch SRT (SGLang Runtime) Server with either HTTP or gRPC."""
+    """
+    Launch SRT (SGLang Runtime) Server
+    The SRT server consists of an HTTP server and the SRT engine.
+    1. HTTP server: A FastAPI server that routes requests to the engine.
+    2. SRT engine:
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+    Note:
+    1. The HTTP server and TokenizerManager both run in the main process.
+    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    """
     launch_engine(server_args=server_args)
 
     if server_args.grpc_port:
