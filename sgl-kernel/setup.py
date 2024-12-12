@@ -78,5 +78,3 @@ setup(
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch"],
 )
-
-rename_wheel()
