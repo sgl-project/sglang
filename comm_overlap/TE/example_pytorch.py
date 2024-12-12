@@ -20,3 +20,4 @@ with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
 
 loss = out.sum()
 loss.backward()
+
