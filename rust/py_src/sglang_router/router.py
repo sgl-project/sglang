@@ -26,6 +26,7 @@ class Router:
             AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
+        max_payload_size: Maximum payload size in bytes. Default: 4MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         verbose: Enable verbose logging. Default: False
     """
@@ -41,6 +42,7 @@ class Router:
         balance_rel_threshold: float = 1.0001,
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
+        max_payload_size: int = 4 * 1024 * 1024,  # 4MB
         verbose: bool = False,
     ):
         self._router = _Router(
@@ -53,6 +55,7 @@ class Router:
             balance_rel_threshold=balance_rel_threshold,
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
+            max_payload_size=max_payload_size,
             verbose=verbose,
         )
 
