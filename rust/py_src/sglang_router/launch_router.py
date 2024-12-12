@@ -203,7 +203,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         return router
 
     except Exception as e:
-        logger.error(f"Error starting router: {e}", file=sys.stderr)
+        logger.error(f"Error starting router: {e}")
         return None
 
 
