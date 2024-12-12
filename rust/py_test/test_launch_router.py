@@ -35,6 +35,7 @@ class TestLaunchRouter(unittest.TestCase):
             balance_rel_threshold=1.0001,
             eviction_interval=60,
             max_tree_size=2**24,
+            max_payload_size=4 * 1024 * 1024,  # 4MB
             verbose=False,
         )
 

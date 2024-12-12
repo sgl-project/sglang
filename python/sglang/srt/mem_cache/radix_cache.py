@@ -22,7 +22,7 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -76,7 +76,17 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
 
-    def match_prefix(self, key: List, **kwargs):
+    def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
+        """Find the matching prefix from the radix tree.
+        Args:
+            key: A list of token IDs to find a matching prefix.
+        Returns:
+            A tuple of a tensor of matching prefix token IDs and
+            the last node that contains the prefix values. Note that
+            this API can modify the internal state of the Radix tree.
+            The last node create a new child if the prefix is shorter
+            than the last node's value.
+        """
         if self.disable:
             return [], self.root_node
 
