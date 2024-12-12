@@ -283,6 +283,9 @@ class ChatCompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    min_p: float = 0.0
+    top_k: int = -1
+    top_n_sigma: float = 0.0
 
 
 class ChatMessage(BaseModel):
