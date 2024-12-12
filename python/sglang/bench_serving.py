@@ -1164,7 +1164,7 @@ def check_chat_template(model_path):
         return False
 
 
-def run_benchmark(args_):
+def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
 
@@ -1415,12 +1415,7 @@ if __name__ == "__main__":
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
     )
-    parser.add_argument(
-        "--grpc-port",
-        type=int,
-        default=-1,
-        help="Port for gRPC server (only used with sglang-grpc backend)",
-    )
+
     parser.add_argument(
         "--dataset-name",
         type=str,
