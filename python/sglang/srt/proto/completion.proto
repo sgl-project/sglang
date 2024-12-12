@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package sglang.completion;
+
+service CompletionService {
+  rpc Complete (CompletionRequest) returns (stream CompletionResponse) {}
+}
+
+message CompletionRequest {
+  string model = 1;
+  string prompt = 2;
+  int32 max_tokens = 3;
+  float temperature = 4;
+  float top_p = 5;
+  int32 top_k = 6;
+  float min_p = 7;
+  float frequency_penalty = 8;
+  float presence_penalty = 9;
+  bool stream = 10;
+  repeated string stop = 11;
+  bool ignore_eos = 12;
+}
+
+message CompletionResponse {
+  string text = 1;
+  bool finished = 2;
+  Usage usage = 3;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+}
