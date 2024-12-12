@@ -8,12 +8,16 @@ on:
       - sgl-kernel/pyproject.toml
   workflow_dispatch:
 
+concurrency:
+  group: release-pypi-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-wheels:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12']
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
         cuda-version: ['12.1']
 
     steps:
