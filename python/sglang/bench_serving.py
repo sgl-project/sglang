@@ -483,6 +483,7 @@ def get_dataset(args, tokenizer):
 
 ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
+    "sglang-grpc": async_request_sglang_grpc,
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
     "vllm": async_request_openai_completions,
@@ -1163,9 +1164,9 @@ def check_chat_template(model_path):
         return False
 
 
-def run_benchmark(args):
+def run_benchmark(args_):
     global args
-    args = args
+    args = args_
 
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
@@ -1324,7 +1325,7 @@ def set_ulimit(target_soft_limit=65535):
 
 
 # Add new request function for gRPC
-async def async_request_grpc(
+async def async_request_sglang_grpc(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
@@ -1391,60 +1392,6 @@ async def async_request_grpc(
     return output
 
 
-# Update get_request_func to support gRPC
-def get_request_func(backend: str):
-    if backend == "sglang":
-        return async_request_sglang
-    elif backend == "vllm":
-        return async_request_vllm
-    elif backend == "tgi":
-        return async_request_tgi
-    elif backend == "trt-llm":
-        return async_request_trt_llm
-    elif backend == "sglang-grpc":  # Add new backend type
-        return async_request_grpc
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
-
-
-# Update run_benchmark to handle gRPC URLs
-def run_benchmark(args):
-    # ... existing setup code ...
-
-    if args.backend == "sglang-grpc":
-        # For gRPC, construct URL with grpc:// prefix
-        api_url = f"grpc://{args.host}:{args.grpc_port}"
-    else:
-        # Existing URL construction for HTTP
-        api_url = f"http://{args.host}:{args.port}"
-
-    # ... rest of benchmark code ...
-
-
-# Update argument parser
-def get_args():
-    parser = ArgumentParser()
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default="sglang",
-        choices=["sglang", "vllm", "tgi", "trt-llm", "sglang-grpc"],
-        help="Name of the backend to benchmark.",
-    )
-    parser.add_argument(
-        "--grpc-port",
-        type=int,
-        default=50051,
-        help="Port for gRPC server (only used with sglang-grpc backend)",
-    )
-    # ... existing arguments ...
-    return parser.parse_args()
-
-
-# Example usage:
-# python -m sglang.bench_serving --backend sglang-grpc --grpc-port 50051 --dataset-name random --num-prompts 100
-
-
 if __name__ == "__main__":
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
@@ -1467,6 +1414,12 @@ if __name__ == "__main__":
         "--port",
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--grpc-port",
+        type=int,
+        default=-1,
+        help="Port for gRPC server (only used with sglang-grpc backend)",
     )
     parser.add_argument(
         "--dataset-name",
