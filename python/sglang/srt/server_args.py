@@ -125,7 +125,7 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     disable_jump_forward: bool = False
-    disable_cuda_graph: bool = False
+    disable_cuda_graph: bool = True
     disable_cuda_graph_padding: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False

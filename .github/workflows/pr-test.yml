@@ -22,6 +22,9 @@ on:
           - 'release'
           - 'nightly'
 
+env:
+  CUDA_GRAPHS_DISABLED: "1"
+
 concurrency:
   group: pr-test-${{ github.ref }}
   cancel-in-progress: true
