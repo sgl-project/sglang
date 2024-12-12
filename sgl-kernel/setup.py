@@ -82,6 +82,8 @@ setup(
                 ],
                 "cxx": ["-O3"],
             },
+            libraries=["c10", "torch", "torch_python"],
+            extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         )
     ],
     cmdclass={"build_ext": BuildExtension},
