@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
+import grpc
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
@@ -38,6 +39,8 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+
+from sglang.srt.proto import completion_pb2, completion_pb2_grpc
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -1160,9 +1163,9 @@ def check_chat_template(model_path):
         return False
 
 
-def run_benchmark(args_: argparse.Namespace):
+def run_benchmark(args):
     global args
-    args = args_
+    args = args
 
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
@@ -1318,6 +1321,128 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             print(f"Fail to set RLIMIT_NOFILE: {e}")
+
+
+# Add new request function for gRPC
+async def async_request_grpc(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    assert api_url.startswith("grpc://"), "gRPC URL must start with grpc://"
+
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    # Create gRPC request
+    request = completion_pb2.CompletionRequest(
+        prompt=request_func_input.prompt,
+        max_tokens=request_func_input.output_len,
+        temperature=0.000001,  # Near greedy
+        top_p=1.0,
+        stream=True,
+        **request_func_input.extra_request_body,
+    )
+
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    ttft = 0.0
+
+    try:
+        # Create channel and stub
+        server_addr = api_url[7:]  # Remove grpc:// prefix
+        async with grpc.aio.insecure_channel(
+            server_addr,
+            options=[
+                ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ],
+        ) as channel:
+            stub = completion_pb2_grpc.CompletionServiceStub(channel)
+
+            # Make streaming request
+            async for response in stub.Complete(request):
+                timestamp = time.perf_counter()
+
+                # First token
+                if ttft == 0.0:
+                    ttft = timestamp - st
+                    output.ttft = ttft
+                # Decoding phase
+                else:
+                    output.itl.append(timestamp - most_recent_timestamp)
+
+                most_recent_timestamp = timestamp
+                output.generated_text += response.text
+
+                if response.finished:
+                    output.latency = timestamp - st
+                    output.success = True
+                    output.output_len = request_func_input.output_len
+                    break
+
+    except Exception as e:
+        output.error = f"Failed with error: {str(e)}"
+        output.success = False
+
+    if pbar:
+        pbar.update(1)
+
+    return output
+
+
+# Update get_request_func to support gRPC
+def get_request_func(backend: str):
+    if backend == "sglang":
+        return async_request_sglang
+    elif backend == "vllm":
+        return async_request_vllm
+    elif backend == "tgi":
+        return async_request_tgi
+    elif backend == "trt-llm":
+        return async_request_trt_llm
+    elif backend == "sglang-grpc":  # Add new backend type
+        return async_request_grpc
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
+
+
+# Update run_benchmark to handle gRPC URLs
+def run_benchmark(args):
+    # ... existing setup code ...
+
+    if args.backend == "sglang-grpc":
+        # For gRPC, construct URL with grpc:// prefix
+        api_url = f"grpc://{args.host}:{args.grpc_port}"
+    else:
+        # Existing URL construction for HTTP
+        api_url = f"http://{args.host}:{args.port}"
+
+    # ... rest of benchmark code ...
+
+
+# Update argument parser
+def get_args():
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="sglang",
+        choices=["sglang", "vllm", "tgi", "trt-llm", "sglang-grpc"],
+        help="Name of the backend to benchmark.",
+    )
+    parser.add_argument(
+        "--grpc-port",
+        type=int,
+        default=50051,
+        help="Port for gRPC server (only used with sglang-grpc backend)",
+    )
+    # ... existing arguments ...
+    return parser.parse_args()
+
+
+# Example usage:
+# python -m sglang.bench_serving --backend sglang-grpc --grpc-port 50051 --dataset-name random --num-prompts 100
 
 
 if __name__ == "__main__":
