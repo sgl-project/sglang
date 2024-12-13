@@ -15,6 +15,8 @@
 
 from typing import List, Optional, Union
 
+from transformers import PretrainedConfig
+
 _SAMPLING_EPS = 1e-6
 
 
@@ -131,3 +133,25 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+    def update_from_config(
+        self, hf_config: PretrainedConfig, model_eos_token_id: Optional[int] = None
+    ) -> None:
+        """Update if there are non-default values from config"""
+
+        # Update eos_token_id for generation
+        if (
+            not self.ignore_eos
+            and (eos_ids := getattr(hf_config, "eos_token_id", None)) is not None
+        ):
+            # it can be either int or list of int
+            eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+            if model_eos_token_id is not None:
+                # We don't need to include the primary eos_token_id in
+                # stop_token_ids since it's handled separately for stopping
+                # purposes.
+                eos_ids.discard(model_eos_token_id)
+            if eos_ids:
+                if self.stop_token_ids:
+                    eos_ids.update(self.stop_token_ids)
+                self.stop_token_ids = eos_ids
