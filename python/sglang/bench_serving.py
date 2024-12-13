@@ -399,41 +399,42 @@ async def async_request_sglang_grpc(
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
-    # Create gRPC request
-    request = completion_pb2.CompletionRequest(
-        prompt=request_func_input.prompt,
-        max_tokens=request_func_input.output_len,
-        temperature=0.000001,  # Near greedy
-        top_p=1.0,
-        stream=True,
-        **request_func_input.extra_request_body,
-    )
-
-    st = time.perf_counter()
-    most_recent_timestamp = st
-    ttft = 0.0
-
     try:
+        # Create gRPC request
+        request = completion_pb2.CompletionRequest(
+            prompt=request_func_input.prompt,
+            max_tokens=request_func_input.output_len,
+            temperature=0.000001,  # Near greedy
+            top_p=1.0,
+            stream=True,
+            **request_func_input.extra_request_body,
+        )
+
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        ttft = 0.0
+
         # Create channel and stub
         server_addr = api_url[7:]  # Remove grpc:// prefix
-        async with grpc.aio.insecure_channel(
+
+        channel = grpc.aio.insecure_channel(
             server_addr,
             options=[
                 ("grpc.max_send_message_length", 100 * 1024 * 1024),
                 ("grpc.max_receive_message_length", 100 * 1024 * 1024),
             ],
-        ) as channel:
-            stub = completion_pb2_grpc.CompletionServiceStub(channel)
+        )
 
-            # Make streaming request
-            async for response in stub.Complete(request):
+        try:
+            stub = completion_pb2_grpc.CompletionServiceStub(channel)
+            response_stream = stub.Complete(request)
+
+            async for response in response_stream:
                 timestamp = time.perf_counter()
 
-                # First token
                 if ttft == 0.0:
                     ttft = timestamp - st
                     output.ttft = ttft
-                # Decoding phase
                 else:
                     output.itl.append(timestamp - most_recent_timestamp)
 
@@ -446,9 +447,41 @@ async def async_request_sglang_grpc(
                     output.output_len = request_func_input.output_len
                     break
 
+        except grpc.aio.AioRpcError as rpc_error:
+            # Get the trailing metadata
+            try:
+                metadata = await rpc_error.trailing_metadata()
+                metadata_dict = {k: v for k, v in metadata}
+            except:
+                metadata_dict = {}
+
+            # Build comprehensive error message
+            error_msg = [
+                f"gRPC error occurred:",
+                f"Status code: {rpc_error.code().name} ({rpc_error.code().value})",
+                f"Details: {rpc_error.details()}",
+                f"Debug error string: {rpc_error.debug_error_string()}",
+            ]
+
+            if metadata_dict:
+                error_msg.append(f"Metadata: {metadata_dict}")
+
+            output.error = "\n".join(error_msg)
+            output.success = False
+            print(f"Full gRPC error: {output.error}", file=sys.stderr)
+
+        except Exception as e:
+            output.error = f"Stream error: {str(e)}\n{traceback.format_exc()}"
+            output.success = False
+            print(f"Stream error: {output.error}", file=sys.stderr)
+
+        finally:
+            await channel.close()
+
     except Exception as e:
-        output.error = f"Failed with error: {str(e)}"
+        output.error = f"Request creation error: {str(e)}\n{traceback.format_exc()}"
         output.success = False
+        print(f"Request creation error: {output.error}", file=sys.stderr)
 
     if pbar:
         pbar.update(1)
@@ -1010,11 +1043,19 @@ async def benchmark(
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
+
+    print(f"Testing with input: {test_input}")
+
     test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
+        error_msg = test_output.error or "Unknown error occurred"
+        print("\nError details from test request:", file=sys.stderr)
+        print("-" * 80, file=sys.stderr)
+        print(error_msg, file=sys.stderr)
+        print("-" * 80, file=sys.stderr)
         raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
+            f"Initial test run failed - Please make sure benchmark arguments "
+            f"are correctly specified.\nError details: {error_msg}"
         )
     else:
         print("Initial test run completed. Starting main benchmark run...")
