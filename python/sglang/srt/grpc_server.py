@@ -1,4 +1,5 @@
 import logging
+import traceback
 from concurrent import futures
 from typing import Optional
 
@@ -15,44 +16,56 @@ class CompletionServicer(completion_pb2_grpc.CompletionServiceServicer):
 
     async def Complete(self, request, context):
         try:
-            # Convert request to sampling params
-            sampling_params = {
-                "max_new_tokens": request.max_tokens,
-                "temperature": request.temperature,
-                "top_p": request.top_p,
-                "top_k": request.top_k,
-                "min_p": request.min_p,
-                "frequency_penalty": request.frequency_penalty,
-                "presence_penalty": request.presence_penalty,
-                "stop": list(request.stop),
-                "ignore_eos": request.ignore_eos,
-            }
+            # Validate request parameters
+            if not request.prompt:
+                raise ValueError("Empty prompt received")
+            if request.temperature < 0:
+                raise ValueError(f"Invalid temperature: {request.temperature}")
+            if request.max_tokens <= 0:
+                raise ValueError(f"Invalid max_tokens: {request.max_tokens}")
 
             # Create GenerateReqInput
             generate_request = GenerateReqInput(
-                text=request.prompt,  # Pass as text instead of prompt
-                sampling_params=sampling_params,
+                text=request.prompt,
+                sampling_params={
+                    "max_new_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "top_p": request.top_p,
+                    "top_k": request.top_k,
+                    "min_p": request.min_p,
+                    "frequency_penalty": request.frequency_penalty,
+                    "presence_penalty": request.presence_penalty,
+                    "stop": list(request.stop),
+                    "ignore_eos": request.ignore_eos,
+                },
                 stream=request.stream,
             )
 
-            # Generate completion
-            async for chunk in self.tokenizer_manager.generate_request(
-                generate_request, None
-            ):
-                yield completion_pb2.CompletionResponse(
-                    text=chunk.get("text", ""),
-                    finished=chunk.get("finished", False),
-                    usage=completion_pb2.Usage(
-                        prompt_tokens=chunk.get("usage", {}).get("prompt_tokens", 0),
-                        completion_tokens=chunk.get("usage", {}).get(
-                            "completion_tokens", 0
+            try:
+                async for chunk in self.tokenizer_manager.generate_request(
+                    generate_request, None
+                ):
+                    if not chunk:
+                        raise ValueError("Empty response chunk received")
+
+                    yield completion_pb2.CompletionResponse(
+                        text=chunk.get("text", ""),
+                        finished=chunk.get("finished", False),
+                        usage=completion_pb2.Usage(
+                            prompt_tokens=chunk.get("usage", {}).get(
+                                "prompt_tokens", 0
+                            ),
+                            completion_tokens=chunk.get("usage", {}).get(
+                                "completion_tokens", 0
+                            ),
+                            total_tokens=chunk.get("usage", {}).get("total_tokens", 0),
                         ),
-                        total_tokens=chunk.get("usage", {}).get("total_tokens", 0),
-                    ),
-                )
+                    )
+            except Exception as gen_error:
+                raise gen_error
 
         except Exception as e:
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            raise e
 
 
 def serve_grpc(
