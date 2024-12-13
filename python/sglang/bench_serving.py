@@ -389,6 +389,73 @@ async def async_request_sglang_generate(
     return output
 
 
+async def async_request_sglang_grpc(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    assert api_url.startswith("grpc://"), "gRPC URL must start with grpc://"
+
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    # Create gRPC request
+    request = completion_pb2.CompletionRequest(
+        prompt=request_func_input.prompt,
+        max_tokens=request_func_input.output_len,
+        temperature=0.000001,  # Near greedy
+        top_p=1.0,
+        stream=True,
+        **request_func_input.extra_request_body,
+    )
+
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    ttft = 0.0
+
+    try:
+        # Create channel and stub
+        server_addr = api_url[7:]  # Remove grpc:// prefix
+        async with grpc.aio.insecure_channel(
+            server_addr,
+            options=[
+                ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ],
+        ) as channel:
+            stub = completion_pb2_grpc.CompletionServiceStub(channel)
+
+            # Make streaming request
+            async for response in stub.Complete(request):
+                timestamp = time.perf_counter()
+
+                # First token
+                if ttft == 0.0:
+                    ttft = timestamp - st
+                    output.ttft = ttft
+                # Decoding phase
+                else:
+                    output.itl.append(timestamp - most_recent_timestamp)
+
+                most_recent_timestamp = timestamp
+                output.generated_text += response.text
+
+                if response.finished:
+                    output.latency = timestamp - st
+                    output.success = True
+                    output.output_len = request_func_input.output_len
+                    break
+
+    except Exception as e:
+        output.error = f"Failed with error: {str(e)}"
+        output.success = False
+
+    if pbar:
+        pbar.update(1)
+
+    return output
+
+
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -1200,6 +1267,9 @@ def run_benchmark(args_: argparse.Namespace):
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
+    if args.backend == "sglang-grpc":
+        # use grpc address
+        api_url = f"grpc://{args.host}:{args.grpc_port}"
     if args.backend in ["sglang", "sglang-native"]:
         api_url = (
             f"{args.base_url}/generate"
@@ -1324,74 +1394,6 @@ def set_ulimit(target_soft_limit=65535):
             print(f"Fail to set RLIMIT_NOFILE: {e}")
 
 
-# Add new request function for gRPC
-async def async_request_sglang_grpc(
-    request_func_input: RequestFuncInput,
-    pbar: Optional[tqdm] = None,
-) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-    assert api_url.startswith("grpc://"), "gRPC URL must start with grpc://"
-
-    output = RequestFuncOutput()
-    output.prompt_len = request_func_input.prompt_len
-
-    # Create gRPC request
-    request = completion_pb2.CompletionRequest(
-        prompt=request_func_input.prompt,
-        max_tokens=request_func_input.output_len,
-        temperature=0.000001,  # Near greedy
-        top_p=1.0,
-        stream=True,
-        **request_func_input.extra_request_body,
-    )
-
-    st = time.perf_counter()
-    most_recent_timestamp = st
-    ttft = 0.0
-
-    try:
-        # Create channel and stub
-        server_addr = api_url[7:]  # Remove grpc:// prefix
-        async with grpc.aio.insecure_channel(
-            server_addr,
-            options=[
-                ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-            ],
-        ) as channel:
-            stub = completion_pb2_grpc.CompletionServiceStub(channel)
-
-            # Make streaming request
-            async for response in stub.Complete(request):
-                timestamp = time.perf_counter()
-
-                # First token
-                if ttft == 0.0:
-                    ttft = timestamp - st
-                    output.ttft = ttft
-                # Decoding phase
-                else:
-                    output.itl.append(timestamp - most_recent_timestamp)
-
-                most_recent_timestamp = timestamp
-                output.generated_text += response.text
-
-                if response.finished:
-                    output.latency = timestamp - st
-                    output.success = True
-                    output.output_len = request_func_input.output_len
-                    break
-
-    except Exception as e:
-        output.error = f"Failed with error: {str(e)}"
-        output.success = False
-
-    if pbar:
-        pbar.update(1)
-
-    return output
-
-
 if __name__ == "__main__":
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
@@ -1412,6 +1414,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--port",
+        type=int,
+        help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--grpc-port",
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
     )
