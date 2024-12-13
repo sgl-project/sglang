@@ -4,6 +4,7 @@ from typing import Optional
 
 import grpc
 
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.proto import completion_pb2, completion_pb2_grpc
 
@@ -27,19 +28,26 @@ class CompletionServicer(completion_pb2_grpc.CompletionServiceServicer):
                 "ignore_eos": request.ignore_eos,
             }
 
-            # Generate completion
-            async for chunk in self.tokenizer_manager.generate_request(
-                prompt=request.prompt,
+            # Create GenerateReqInput
+            generate_request = GenerateReqInput(
+                text=request.prompt,  # Pass as text instead of prompt
                 sampling_params=sampling_params,
                 stream=request.stream,
+            )
+
+            # Generate completion
+            async for chunk in self.tokenizer_manager.generate_request(
+                generate_request, None
             ):
                 yield completion_pb2.CompletionResponse(
-                    text=chunk.text,
-                    finished=chunk.finished,
+                    text=chunk.get("text", ""),
+                    finished=chunk.get("finished", False),
                     usage=completion_pb2.Usage(
-                        prompt_tokens=chunk.usage.prompt_tokens,
-                        completion_tokens=chunk.usage.completion_tokens,
-                        total_tokens=chunk.usage.total_tokens,
+                        prompt_tokens=chunk.get("usage", {}).get("prompt_tokens", 0),
+                        completion_tokens=chunk.get("usage", {}).get(
+                            "completion_tokens", 0
+                        ),
+                        total_tokens=chunk.get("usage", {}).get("total_tokens", 0),
                     ),
                 )
 
