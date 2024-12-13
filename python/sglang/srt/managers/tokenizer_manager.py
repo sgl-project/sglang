@@ -247,6 +247,10 @@ class TokenizerManager:
         # Parse sampling parameters
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.normalize(self.tokenizer)
+        sampling_params.update_from_config(
+            self.model_config.hf_config,
+            None if self.tokenizer is None else self.tokenizer.eos_token_id,
+        )
         sampling_params.verify()
 
         # Build return object
