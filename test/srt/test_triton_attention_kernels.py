@@ -300,7 +300,7 @@ class TestTritonAttention(unittest.TestCase):
         self.assertTrue(torch.allclose(o, o_grouped, atol=3e-2))
 
     def test_grouped_decode_attention(self):
-        seq_lens = [5, 100, 500]
+        seq_lens = [5, 100, 128, 500]
         configs = [
             (2, 16, 16, 64, 64),
             (2, 16, 1, 64, 64),
