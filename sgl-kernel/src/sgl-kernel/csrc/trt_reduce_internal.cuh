@@ -1,4 +1,5 @@
-// reference: https://github.com/NVIDIA/TensorRT-LLM/blob/release/0.14/cpp/tensorrt_llm/plugins/ncclPlugin/allreducePlugin.cpp
+// reference:
+// https://github.com/NVIDIA/TensorRT-LLM/blob/release/0.14/cpp/tensorrt_llm/plugins/ncclPlugin/allreducePlugin.cpp
 /*
  * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -20,24 +21,23 @@
 #include <stdint.h>
 #include <torch/all.h>
 
-#define FatalError(s)                                                          \
-  do {                                                                         \
-    std::stringstream _where, _message;                                        \
-    _where << __FILE__ << ':' << __LINE__;                                     \
-    _message << std::string(s) + "\n" << __FILE__ << ':' << __LINE__;          \
-    std::cerr << _message.str() << "\nAborting...\n";                          \
-    assert(false);                                                             \
-    exit(1);                                                                   \
+#define FatalError(s)                                                 \
+  do {                                                                \
+    std::stringstream _where, _message;                               \
+    _where << __FILE__ << ':' << __LINE__;                            \
+    _message << std::string(s) + "\n" << __FILE__ << ':' << __LINE__; \
+    std::cerr << _message.str() << "\nAborting...\n";                 \
+    assert(false);                                                    \
+    exit(1);                                                          \
   } while (0)
 
-#define CHECKCUDA(cmd)                                              \
-  do {                                                              \
-    cudaError_t e = cmd;                                            \
-    if (e != cudaSuccess) {                                         \
-      printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, \
-             cudaGetErrorString(e));                                \
-      exit(EXIT_FAILURE);                                           \
-    }                                                               \
+#define CHECKCUDA(cmd)                                                                      \
+  do {                                                                                      \
+    cudaError_t e = cmd;                                                                    \
+    if (e != cudaSuccess) {                                                                 \
+      printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
+      exit(EXIT_FAILURE);                                                                   \
+    }                                                                                       \
   } while (0)
 
 namespace trt_llm {
@@ -61,11 +61,11 @@ struct AllReduceParams {
   size_t rank_offset;
   size_t ranks_per_node, rank, local_rank;
   uint32_t barrier_flag;
-  uint32_t *peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
-  uint32_t *peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
-  void *peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
-  void *local_input_buffer_ptr;
-  void *local_output_buffer_ptr;
+  uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
+  uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
+  void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
+  void* local_input_buffer_ptr;
+  void* local_output_buffer_ptr;
 };
 
 inline size_t GetMaxRequiredWorkspaceSize(int world_size) {
@@ -75,8 +75,7 @@ inline size_t GetMaxRequiredWorkspaceSize(int world_size) {
   return 8 * 1000 * 1000;
 }
 
-inline AllReduceStrategyType SelectImplementation(size_t message_size,
-                                                  int world_size) {
+inline AllReduceStrategyType SelectImplementation(size_t message_size, int world_size) {
   const size_t maxWorkspaceSize = GetMaxRequiredWorkspaceSize(world_size);
 
   if (message_size > maxWorkspaceSize) {
@@ -103,9 +102,7 @@ inline AllReduceStrategyType SelectImplementation(size_t message_size,
   return AllReduceStrategyType::TWOSHOT;
 }
 
-void trtCustomAllReduce(AllReduceParams &params,
-                        at::ScalarType data_type,
-                        AllReduceStrategyType strat,
+void trtCustomAllReduce(AllReduceParams& params, at::ScalarType data_type, AllReduceStrategyType strat,
                         cudaStream_t stream);
 
-}
+}  // namespace trt_llm

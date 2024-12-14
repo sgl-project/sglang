@@ -1,10 +1,8 @@
 #include <torch/extension.h>
 
 using fptr_t = int64_t;
-fptr_t init_custom_ar(int64_t rank_id, int64_t world_size,
-                      const std::vector<fptr_t>& buffers,
-                      const std::vector<fptr_t>& barrier_in,
-                      const std::vector<fptr_t>& barrier_out);
+fptr_t init_custom_ar(int64_t rank_id, int64_t world_size, const std::vector<fptr_t>& buffers,
+                      const std::vector<fptr_t>& barrier_in, const std::vector<fptr_t>& barrier_out);
 void dispose(fptr_t _fa);
 void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 
