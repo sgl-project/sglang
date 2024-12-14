@@ -1,4 +1,4 @@
-.PHONY: tree ln install build clean test
+.PHONY: tree ln install build clean test format
 
 tree:
 	@tree --prune -I "__pycache__|*.egg-info|*.so|build"
