@@ -38,6 +38,7 @@ class RouterArgs:
     balance_rel_threshold: float = 1.0001
     eviction_interval: int = 60
     max_tree_size: int = 2**24
+    max_payload_size: int = 4 * 1024 * 1024  # 4MB
     verbose: bool = False
 
     @staticmethod
@@ -117,6 +118,12 @@ class RouterArgs:
             help="Maximum size of the approximation tree for cache-aware routing",
         )
         parser.add_argument(
+            f"--{prefix}max-payload-size",
+            type=int,
+            default=RouterArgs.max_payload_size,
+            help="Maximum payload size in bytes",
+        )
+        parser.add_argument(
             f"--{prefix}verbose",
             action="store_true",
             help="Enable verbose logging",
@@ -144,6 +151,7 @@ class RouterArgs:
             balance_rel_threshold=getattr(args, f"{prefix}balance_rel_threshold"),
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
+            max_payload_size=getattr(args, f"{prefix}max_payload_size"),
             verbose=getattr(args, f"{prefix}verbose", False),
         )
 
@@ -187,6 +195,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             balance_rel_threshold=router_args.balance_rel_threshold,
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
+            max_payload_size=router_args.max_payload_size,
             verbose=router_args.verbose,
         )
 
@@ -194,7 +203,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         return router
 
     except Exception as e:
-        logger.error(f"Error starting router: {e}", file=sys.stderr)
+        logger.error(f"Error starting router: {e}")
         return None
 
 

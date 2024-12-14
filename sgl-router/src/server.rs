@@ -118,7 +118,7 @@ async fn remove_worker(
         None => return HttpResponse::BadRequest().finish(),
     };
     data.router.remove_worker(&worker_url);
-    HttpResponse::Ok().finish()
+    HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
 pub struct ServerConfig {
@@ -127,6 +127,7 @@ pub struct ServerConfig {
     pub worker_urls: Vec<String>,
     pub policy_config: PolicyConfig,
     pub verbose: bool,
+    pub max_payload_size: usize,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
@@ -164,10 +165,16 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     info!("✅ Starting router on {}:{}", config.host, config.port);
     info!("✅ Serving Worker URLs: {:?}", config.worker_urls);
     info!("✅ Policy Config: {:?}", config.policy_config);
+    info!(
+        "✅ Max payload size: {} MB",
+        config.max_payload_size / (1024 * 1024)
+    );
 
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
+            .app_data(web::JsonConfig::default().limit(config.max_payload_size))
+            .app_data(web::PayloadConfig::default().limit(config.max_payload_size))
             .service(generate)
             .service(v1_chat_completions)
             .service(v1_completions)

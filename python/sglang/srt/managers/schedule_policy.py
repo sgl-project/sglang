@@ -20,9 +20,11 @@ from contextlib import contextmanager
 from enum import Enum, auto
 from typing import Dict, List, Optional
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -30,6 +32,13 @@ from sglang.srt.mem_cache.radix_cache import TreeNode
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
 CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+)
+
+# The threshold to apply in-batch prefix caching.
+# If we use too small value, in-batch prefix caching cannot be used. E.g.,
+# imagine "the" prefix.
+IN_BATCH_PREFIX_CACHING_THRESHOLD = int(
+    os.environ.get("SGLANG_IN_BATCH_PREFIX_CACHING_THRESHOLD", "32")
 )
 
 
@@ -51,18 +60,50 @@ class SchedulePolicy:
 
         # Compute matched prefix length
         prefix_computed = False
+        # rid to deprioritize in the current run.
+        temporary_deprioritized = {}
         if policy == "lpm" or policy == "dfs-weight":
+            # It is used to find the matching prefix for in-batch prefix caching.
+            temp_radix = RadixCache(None, None, False)
             for r in waiting_queue:
+                prefix_ids = r.adjust_max_prefix_ids()
                 # NOTE: the prefix_indices must always be aligned with last_node
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
-                    rid=r.rid, key=r.adjust_max_prefix_ids()
+                    rid=r.rid, key=prefix_ids
                 )
+
+                # NOTE(sang): This logic is for In-batch prefix caching;
+                # If there are more than 1 request that have small matching prefix from
+                # existing cache, but all those requests share the same prefix, we prefer
+                # to schedule only one of them so that we can increase the cache hit rate.
+                # We prefer to set IN_BATCH_PREFIX_CACHING_THRESHOLD > 0 because too small
+                # threshold means we cannot use in-batch prefix caching for short prefixes.
+                # It is kind of common when the engine is long running (e.g., imagine "the").
+                if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_THRESHOLD:
+                    in_batch_matching_prefixes, _ = temp_radix.match_prefix(
+                        rid=r.rid, key=prefix_ids
+                    )
+                    if (
+                        len(in_batch_matching_prefixes)
+                        >= IN_BATCH_PREFIX_CACHING_THRESHOLD
+                    ):
+                        temporary_deprioritized[r.rid] = r
+                    else:
+                        temp_radix.insert(prefix_ids, torch.tensor(prefix_ids))
 
             prefix_computed = True
 
         if policy == "lpm":
             # Longest Prefix Match
-            waiting_queue.sort(key=lambda x: -len(x.prefix_indices))
+            def get_priority(r: Req):
+                score = 0
+                if r.rid in temporary_deprioritized:
+                    score = float("inf")
+                else:
+                    score = -len(r.prefix_indices)
+                return score
+
+            waiting_queue.sort(key=get_priority)
         elif policy == "fcfs":
             # first come first serve
             pass
@@ -76,6 +117,7 @@ class SchedulePolicy:
             for req in waiting_queue:
                 last_node_to_reqs[req.last_node].append(req)
 
+            # node -> # of requests for that node.
             node_to_weight = defaultdict(int)
             for node in last_node_to_reqs:
                 node_to_weight[node] = len(last_node_to_reqs[node])
@@ -87,7 +129,9 @@ class SchedulePolicy:
                 node_to_weight,
                 last_node_to_reqs,
                 waiting_queue,
+                temporary_deprioritized,
             )
+            waiting_queue.extend(temporary_deprioritized.values())
         else:
             raise ValueError(f"Unknown schedule_policy: {policy=}")
 
@@ -101,15 +145,22 @@ class SchedulePolicy:
     def get_dfs_priority(
         self,
         cur_node: TreeNode,
-        node_to_priority: Dict,
-        last_node_to_reqs: Dict,
+        node_to_priority: Dict[TreeNode, int],
+        last_node_to_reqs: Dict[TreeNode, List[Req]],
         q: List,
+        temporary_deprioritized: Dict[str, Req],
     ):
         childs = [child for child in cur_node.children.values()]
         childs.sort(key=lambda x: -node_to_priority[x])
         for child in childs:
-            self.get_dfs_priority(child, node_to_priority, last_node_to_reqs, q)
-        q.extend(last_node_to_reqs[cur_node])
+            self.get_dfs_priority(
+                child, node_to_priority, last_node_to_reqs, q, temporary_deprioritized
+            )
+
+        for req in last_node_to_reqs[cur_node]:
+            if req.rid in temporary_deprioritized:
+                continue
+            q.append(req)
 
 
 class AddReqResult(Enum):

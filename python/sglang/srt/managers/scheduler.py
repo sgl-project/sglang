@@ -713,7 +713,7 @@ class Scheduler:
             if crash_on_warnings():
                 raise ValueError(msg)
 
-    def get_next_batch_to_run(self):
+    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.being_chunked_req:

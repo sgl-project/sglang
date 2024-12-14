@@ -49,6 +49,15 @@ def rename_wheel():
     shutil.rmtree(tmp_dir)
 
 
+def update_wheel_platform_tag():
+    wheel_dir = Path("dist")
+    old_wheel = next(wheel_dir.glob("*.whl"))
+    new_wheel = wheel_dir / old_wheel.name.replace(
+        "linux_x86_64", "manylinux2014_x86_64"
+    )
+    old_wheel.rename(new_wheel)
+
+
 setup(
     name="sgl-kernel",
     version=get_version(),
@@ -73,10 +82,12 @@ setup(
                 ],
                 "cxx": ["-O3"],
             },
+            libraries=["c10", "torch", "torch_python"],
+            extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         )
     ],
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch"],
 )
 
-rename_wheel()
+update_wheel_platform_tag()
