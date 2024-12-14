@@ -20,25 +20,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 #include <torch/all.h>
-
-#define FatalError(s)                                                 \
-  do {                                                                \
-    std::stringstream _where, _message;                               \
-    _where << __FILE__ << ':' << __LINE__;                            \
-    _message << std::string(s) + "\n" << __FILE__ << ':' << __LINE__; \
-    std::cerr << _message.str() << "\nAborting...\n";                 \
-    assert(false);                                                    \
-    exit(1);                                                          \
-  } while (0)
-
-#define CHECKCUDA(cmd)                                                                      \
-  do {                                                                                      \
-    cudaError_t e = cmd;                                                                    \
-    if (e != cudaSuccess) {                                                                 \
-      printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-      exit(EXIT_FAILURE);                                                                   \
-    }                                                                                       \
-  } while (0)
+#include "utils.hpp"
 
 namespace trt_llm {
 constexpr size_t WARP_SIZE = 32;

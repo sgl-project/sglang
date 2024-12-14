@@ -230,15 +230,11 @@ template <typename T>
 void invokeOneOrTwoShotAllReduceKernel(AllReduceParams& param, AllReduceStrategyType strat, cudaStream_t stream) {
   void* buffer = reinterpret_cast<void*>(param.peer_comm_buffer_ptrs[param.rank]);
   void* local_inp_buffer = param.local_input_buffer_ptr;
-  CHECKCUDA(
+  CHECK_CUDA_SUCCESS(
       cudaMemcpyAsync(buffer, local_inp_buffer, param.elts_total * param.elts_size, cudaMemcpyDeviceToDevice, stream));
 
   assert(strat == AllReduceStrategyType::ONESHOT && "Custom allreduce only support oneshot");
-  auto last_error = cudaGetLastError();
-  if (last_error != cudaSuccess) {
-    printf("cuda error: %s\n", cudaGetErrorString(last_error));
-    assert(false && "Error before launching the kernel");
-  }
+  CHECK_CUDA_SUCCESS(cudaGetLastError());
 
   size_t elts_per_thread = 16 / sizeof(T);
   auto [blocks_per_grid, threads_per_block] = kernelLaunchConfig(strat, param, elts_per_thread);
@@ -258,11 +254,7 @@ void invokeOneOrTwoShotAllReduceKernel(AllReduceParams& param, AllReduceStrategy
     default:
       break;
   }
-  last_error = cudaGetLastError();
-  if (last_error != cudaSuccess) {
-    printf("cuda error: %s\n", cudaGetErrorString(last_error));
-    assert(false && "Error after launching the kernel");
-  }
+  CHECK_CUDA_SUCCESS(cudaGetLastError());
 }
 
 void trtCustomAllReduce(AllReduceParams& params, at::ScalarType data_type, AllReduceStrategyType strat,
