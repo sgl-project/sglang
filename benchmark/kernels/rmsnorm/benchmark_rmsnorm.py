@@ -155,7 +155,7 @@ def get_benchmark(use_residual):
             x_vals=[list(_) for _ in configs],
             line_arg="provider",
             line_vals=["huggingface", "flashinfer", "vllm"],
-            line_names=["HuggingFace", "FlashInfer", "VLLM"],
+            line_names=["HuggingFace", "FlashInfer", "vLLM"],
             styles=[("blue", "-"), ("green", "-"), ("red", "-")],
             ylabel="us",
             plot_name=f"rmsnorm-performance-{'with' if use_residual else 'without'}-residual",
