@@ -400,23 +400,24 @@ async def async_request_sglang_grpc(
     output.prompt_len = request_func_input.prompt_len
 
     try:
-        # Create gRPC request
+        # Create gRPC request with same parameters as FastAPI
         request = completion_pb2.CompletionRequest(
             prompt=request_func_input.prompt,
-            max_tokens=request_func_input.output_len,
-            temperature=0.000001,  # Near greedy
+            temperature=0.0001,
             top_p=1.0,
-            stream=True,
-            **request_func_input.extra_request_body,
+            top_k=-1,
+            max_tokens=request_func_input.output_len,
+            ignore_eos=not args.disable_ignore_eos,
+            stream=not args.disable_stream,
         )
 
         st = time.perf_counter()
         most_recent_timestamp = st
         ttft = 0.0
+        generated_text = ""
 
         # Create channel and stub
         server_addr = api_url[7:]  # Remove grpc:// prefix
-
         channel = grpc.aio.insecure_channel(
             server_addr,
             options=[
@@ -432,6 +433,7 @@ async def async_request_sglang_grpc(
             async for response in response_stream:
                 timestamp = time.perf_counter()
 
+                # Handle streaming response similar to FastAPI
                 if ttft == 0.0:
                     ttft = timestamp - st
                     output.ttft = ttft
@@ -439,13 +441,27 @@ async def async_request_sglang_grpc(
                     output.itl.append(timestamp - most_recent_timestamp)
 
                 most_recent_timestamp = timestamp
-                output.generated_text += response.text
 
+                # Accumulate text from each response
+                if response.text:
+                    generated_text = (
+                        response.text
+                    )  # Use latest text as it contains full response
+
+                # Check if this is the final response
                 if response.finished:
-                    output.latency = timestamp - st
+                    output.generated_text = generated_text
                     output.success = True
+                    output.latency = time.perf_counter() - st
                     output.output_len = request_func_input.output_len
                     break
+
+            # Ensure we have final output values set
+            if output.success:
+                output.generated_text = generated_text
+                output.success = True
+                output.latency = time.perf_counter() - st
+                output.output_len = request_func_input.output_len
 
         except grpc.aio.AioRpcError as rpc_error:
             # Get the trailing metadata
@@ -462,18 +478,15 @@ async def async_request_sglang_grpc(
                 f"Details: {rpc_error.details()}",
                 f"Debug error string: {rpc_error.debug_error_string()}",
             ]
-
             if metadata_dict:
                 error_msg.append(f"Metadata: {metadata_dict}")
 
             output.error = "\n".join(error_msg)
             output.success = False
-            print(f"Full gRPC error: {output.error}", file=sys.stderr)
 
         except Exception as e:
             output.error = f"Stream error: {str(e)}\n{traceback.format_exc()}"
             output.success = False
-            print(f"Stream error: {output.error}", file=sys.stderr)
 
         finally:
             await channel.close()
@@ -481,7 +494,6 @@ async def async_request_sglang_grpc(
     except Exception as e:
         output.error = f"Request creation error: {str(e)}\n{traceback.format_exc()}"
         output.success = False
-        print(f"Request creation error: {output.error}", file=sys.stderr)
 
     if pbar:
         pbar.update(1)
@@ -1047,6 +1059,7 @@ async def benchmark(
     print(f"Testing with input: {test_input}")
 
     test_output = await request_func(request_func_input=test_input)
+
     if not test_output.success:
         error_msg = test_output.error or "Unknown error occurred"
         print("\nError details from test request:", file=sys.stderr)
