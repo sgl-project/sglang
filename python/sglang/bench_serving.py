@@ -1056,16 +1056,10 @@ async def benchmark(
         extra_request_body=extra_request_body,
     )
 
-    print(f"Testing with input: {test_input}")
-
     test_output = await request_func(request_func_input=test_input)
 
     if not test_output.success:
         error_msg = test_output.error or "Unknown error occurred"
-        print("\nError details from test request:", file=sys.stderr)
-        print("-" * 80, file=sys.stderr)
-        print(error_msg, file=sys.stderr)
-        print("-" * 80, file=sys.stderr)
         raise ValueError(
             f"Initial test run failed - Please make sure benchmark arguments "
             f"are correctly specified.\nError details: {error_msg}"
