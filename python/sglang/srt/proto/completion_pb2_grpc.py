@@ -2,8 +2,9 @@
 """Client and server classes corresponding to protobuf-defined services."""
 import warnings
 
-import completion_pb2 as completion__pb2
 import grpc
+
+from . import completion_pb2 as completion__pb2
 
 GRPC_GENERATED_VERSION = "1.68.1"
 GRPC_VERSION = grpc.__version__
