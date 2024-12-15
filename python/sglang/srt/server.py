@@ -537,7 +537,11 @@ def launch_server(
 
         # Use uvloop for better performance
         uvloop.install()
-        asyncio.run(serve())
+        loop = asyncio.get_event_loop()
+        try:
+            loop.run_until_complete(serve())
+        finally:
+            loop.close()
     else:
         # Launch HTTP server
         # Add api key authorization

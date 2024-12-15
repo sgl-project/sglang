@@ -1,7 +1,7 @@
 import logging
 import traceback
 from concurrent import futures
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import grpc
 
@@ -14,18 +14,14 @@ class CompletionServicer(completion_pb2_grpc.CompletionServiceServicer):
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
 
-    async def Complete(self, request, context):
+    async def Complete(
+        self,
+        request: completion_pb2.CompletionRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncGenerator[completion_pb2.CompletionResponse, None]:
         try:
-            # Validate request parameters
-            if not request.prompt:
-                raise ValueError("Empty prompt received")
-            if request.temperature < 0:
-                raise ValueError(f"Invalid temperature: {request.temperature}")
-            if request.max_tokens <= 0:
-                raise ValueError(f"Invalid max_tokens: {request.max_tokens}")
-
-            # Create GenerateReqInput
-            generate_request = GenerateReqInput(
+            # Convert gRPC request to internal format
+            adapted_request = GenerateReqInput(
                 text=request.prompt,
                 sampling_params={
                     "max_new_tokens": request.max_tokens,
@@ -41,31 +37,41 @@ class CompletionServicer(completion_pb2_grpc.CompletionServiceServicer):
                 stream=request.stream,
             )
 
-            try:
-                async for chunk in self.tokenizer_manager.generate_request(
-                    generate_request, None
-                ):
-                    if not chunk:
-                        raise ValueError("Empty response chunk received")
+            # Process request through tokenizer manager
+            async for content in self.tokenizer_manager.generate_request(
+                adapted_request
+            ):
+                # Create response for each token/chunk
+                response = completion_pb2.CompletionResponse(
+                    text=content["text"],  # Send full text so far
+                    finished=False,  # Not finished until last message
+                    usage=completion_pb2.Usage(
+                        prompt_tokens=content["meta_info"]["prompt_tokens"],
+                        completion_tokens=content["meta_info"]["completion_tokens"],
+                        # TODO: fix this
+                        # total_tokens=content["meta_info"]["total_tokens"],
+                    ),
+                )
+                yield response
 
-                    yield completion_pb2.CompletionResponse(
-                        text=chunk.get("text", ""),
-                        finished=chunk.get("finished", False),
-                        usage=completion_pb2.Usage(
-                            prompt_tokens=chunk.get("usage", {}).get(
-                                "prompt_tokens", 0
-                            ),
-                            completion_tokens=chunk.get("usage", {}).get(
-                                "completion_tokens", 0
-                            ),
-                            total_tokens=chunk.get("usage", {}).get("total_tokens", 0),
-                        ),
-                    )
-            except Exception as gen_error:
-                raise gen_error
+            # Send final response with finished flag
+            final_response = completion_pb2.CompletionResponse(
+                text=content["text"],  # Final complete text
+                finished=True,
+                usage=completion_pb2.Usage(
+                    prompt_tokens=content["meta_info"]["prompt_tokens"],
+                    completion_tokens=content["meta_info"]["completion_tokens"],
+                    # TODO: fix this
+                    # total_tokens=content["meta_info"]["total_tokens"],
+                ),
+            )
+            yield final_response
 
         except Exception as e:
-            raise e
+            # Handle errors consistently
+            error_msg = f"Error in gRPC Complete: {str(e)}\n{traceback.format_exc()}"
+            print(error_msg)
+            await context.abort(grpc.StatusCode.INTERNAL, error_msg)
 
 
 def serve_grpc(
