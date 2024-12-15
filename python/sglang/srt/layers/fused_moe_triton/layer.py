@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.utils import set_weight_attrs
 
-if torch.cuda.is_available() or torch.hip.is_available():
+if torch.cuda.is_available():
     from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
 else:
     fused_experts = None  # type: ignore
