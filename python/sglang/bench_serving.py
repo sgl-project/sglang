@@ -473,7 +473,7 @@ async def async_request_sglang_grpc(
 
             # Build comprehensive error message
             error_msg = [
-                f"gRPC error occurred:",
+                f"gRPC Error:",
                 f"Status code: {rpc_error.code().name} ({rpc_error.code().value})",
                 f"Details: {rpc_error.details()}",
                 f"Debug error string: {rpc_error.debug_error_string()}",
