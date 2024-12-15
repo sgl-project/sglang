@@ -10,7 +10,7 @@ install:
 	@pip install -e .
 
 build:
-	@python3 setup.py bdist_wheel
+	@export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel
 
 clean:
 	@rm -rf build dist *.egg-info
