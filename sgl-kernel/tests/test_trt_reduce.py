@@ -236,8 +236,8 @@ class TestCustomAllReduce(unittest.TestCase):
             if rank == 0:
                 logger.warning(
                     f"test_size = {sz}, world_size = {world_size}, "
-                    f"vllm time = {elapse_vllm * 1000 / test_loop:.4f}us,"
-                    f"custom time = {elapse_custom * 1000 / test_loop:.4f}us"
+                    f"vllm time = {elapse_vllm * 1000 / test_loop:.4f}ms,"
+                    f"custom time = {elapse_custom * 1000 / test_loop:.4f}ms"
                 )
 
         self.free_custom_allreduce(group)
