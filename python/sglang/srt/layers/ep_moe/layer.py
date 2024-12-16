@@ -644,6 +644,10 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                         "QuantConfig has static quantization, but found "
                         "activation scales are None."
                     )
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    torch.max(layer.w13_weight_scale, dim=1).values,
+                    requires_grad=False,
+                )
             return
 
     def apply(
