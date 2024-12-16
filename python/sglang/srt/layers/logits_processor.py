@@ -101,82 +101,6 @@ class LogitsProcessor(nn.Module):
             not skip_all_gather and get_tensor_model_parallel_world_size() > 1
         )
 
-    def _get_normalized_prompt_logprobs(
-        self,
-        input_token_logprobs: torch.Tensor,
-        logits_metadata: LogitsMetadata,
-    ):
-        logprobs_cumsum = torch.cumsum(input_token_logprobs, dim=0, dtype=torch.float32)
-        pruned_lens = torch.tensor(
-            logits_metadata.extend_logprob_pruned_lens_cpu, device="cuda"
-        )
-
-        start = torch.zeros_like(pruned_lens)
-        start[1:] = torch.cumsum(pruned_lens[:-1], dim=0)
-        end = torch.clamp(
-            start + pruned_lens - 2, min=0, max=logprobs_cumsum.shape[0] - 1
-        )
-        sum_logp = (
-            logprobs_cumsum[end] - logprobs_cumsum[start] + input_token_logprobs[start]
-        )
-        normalized_prompt_logprobs = sum_logp / (pruned_lens - 1).clamp(min=1)
-        return normalized_prompt_logprobs
-
-    @staticmethod
-    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
-        max_k = max(logits_metadata.top_logprobs_nums)
-        ret = all_logprobs.topk(max_k, dim=1)
-        values = ret.values.tolist()
-        indices = ret.indices.tolist()
-
-        if logits_metadata.forward_mode.is_decode():
-            output_top_logprobs_val = []
-            output_top_logprobs_idx = []
-            for i, k in enumerate(logits_metadata.top_logprobs_nums):
-                output_top_logprobs_val.append(values[i][:k])
-                output_top_logprobs_idx.append(indices[i][:k])
-            return None, None, output_top_logprobs_val, output_top_logprobs_idx
-        else:
-            input_top_logprobs_val, input_top_logprobs_idx = [], []
-            output_top_logprobs_val, output_top_logprobs_idx = [], []
-
-            pt = 0
-            for k, pruned_len in zip(
-                logits_metadata.top_logprobs_nums,
-                logits_metadata.extend_logprob_pruned_lens_cpu,
-            ):
-                if pruned_len <= 0:
-                    input_top_logprobs_val.append([])
-                    input_top_logprobs_idx.append([])
-                    output_top_logprobs_val.append([])
-                    output_top_logprobs_idx.append([])
-                    continue
-
-                input_top_logprobs_val.append(
-                    [values[pt + j][:k] for j in range(pruned_len - 1)]
-                )
-                input_top_logprobs_idx.append(
-                    [indices[pt + j][:k] for j in range(pruned_len - 1)]
-                )
-                output_top_logprobs_val.append(
-                    list(
-                        values[pt + pruned_len - 1][:k],
-                    )
-                )
-                output_top_logprobs_idx.append(
-                    list(
-                        indices[pt + pruned_len - 1][:k],
-                    )
-                )
-                pt += pruned_len
-
-            return (
-                input_top_logprobs_val,
-                input_top_logprobs_idx,
-                output_top_logprobs_val,
-                output_top_logprobs_idx,
-            )
-
     def forward(
         self,
         input_ids,
@@ -296,6 +220,82 @@ class LogitsProcessor(nn.Module):
                     output_top_logprobs_val=output_top_logprobs_val,
                     output_top_logprobs_idx=output_top_logprobs_idx,
                 )
+
+    def _get_normalized_prompt_logprobs(
+        self,
+        input_token_logprobs: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ):
+        logprobs_cumsum = torch.cumsum(input_token_logprobs, dim=0, dtype=torch.float32)
+        pruned_lens = torch.tensor(
+            logits_metadata.extend_logprob_pruned_lens_cpu, device="cuda"
+        )
+
+        start = torch.zeros_like(pruned_lens)
+        start[1:] = torch.cumsum(pruned_lens[:-1], dim=0)
+        end = torch.clamp(
+            start + pruned_lens - 2, min=0, max=logprobs_cumsum.shape[0] - 1
+        )
+        sum_logp = (
+            logprobs_cumsum[end] - logprobs_cumsum[start] + input_token_logprobs[start]
+        )
+        normalized_prompt_logprobs = sum_logp / (pruned_lens - 1).clamp(min=1)
+        return normalized_prompt_logprobs
+
+    @staticmethod
+    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
+        max_k = max(logits_metadata.top_logprobs_nums)
+        ret = all_logprobs.topk(max_k, dim=1)
+        values = ret.values.tolist()
+        indices = ret.indices.tolist()
+
+        if logits_metadata.forward_mode.is_decode():
+            output_top_logprobs_val = []
+            output_top_logprobs_idx = []
+            for i, k in enumerate(logits_metadata.top_logprobs_nums):
+                output_top_logprobs_val.append(values[i][:k])
+                output_top_logprobs_idx.append(indices[i][:k])
+            return None, None, output_top_logprobs_val, output_top_logprobs_idx
+        else:
+            input_top_logprobs_val, input_top_logprobs_idx = [], []
+            output_top_logprobs_val, output_top_logprobs_idx = [], []
+
+            pt = 0
+            for k, pruned_len in zip(
+                logits_metadata.top_logprobs_nums,
+                logits_metadata.extend_logprob_pruned_lens_cpu,
+            ):
+                if pruned_len <= 0:
+                    input_top_logprobs_val.append([])
+                    input_top_logprobs_idx.append([])
+                    output_top_logprobs_val.append([])
+                    output_top_logprobs_idx.append([])
+                    continue
+
+                input_top_logprobs_val.append(
+                    [values[pt + j][:k] for j in range(pruned_len - 1)]
+                )
+                input_top_logprobs_idx.append(
+                    [indices[pt + j][:k] for j in range(pruned_len - 1)]
+                )
+                output_top_logprobs_val.append(
+                    list(
+                        values[pt + pruned_len - 1][:k],
+                    )
+                )
+                output_top_logprobs_idx.append(
+                    list(
+                        indices[pt + pruned_len - 1][:k],
+                    )
+                )
+                pt += pruned_len
+
+            return (
+                input_top_logprobs_val,
+                input_top_logprobs_idx,
+                output_top_logprobs_val,
+                output_top_logprobs_idx,
+            )
 
     def _get_logits(
         self,
