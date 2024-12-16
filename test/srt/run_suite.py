@@ -34,7 +34,8 @@ suites = {
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torch_compile_moe.py",
-        "test_torch_native_attention_backend.py",
+        # Temporarily disable this because it requires PyTorch >= 2.5
+        # "test_torch_native_attention_backend.py",
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",
