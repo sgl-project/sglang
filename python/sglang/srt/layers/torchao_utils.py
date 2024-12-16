@@ -26,12 +26,11 @@ def apply_torchao_config_to_model(
         quantize_,
     )
     from torchao.quantization.observer import PerRow, PerTensor
-    from torchao.quantization.quant_api import _is_linear
 
     if filter_fn is None:
 
         def filter_fn(module, fqn):
-            return _is_linear(module) and "proj" in fqn
+            return "proj" in fqn
 
     if torchao_config == "" or torchao_config is None:
         return model
