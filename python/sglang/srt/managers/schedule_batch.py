@@ -1086,9 +1086,9 @@ class ScheduleBatch:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
         self.reqs.extend(other.reqs)
 
-        self.return_logprob = self.return_logprob or other.return_logprob
-        self.has_stream = self.has_stream or other.has_stream
-        self.has_grammar = self.has_grammar or other.has_grammar
+        self.return_logprob |= other.return_logprob
+        self.has_stream |= other.has_stream
+        self.has_grammar |= other.has_grammar
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode() or self.forward_mode.is_idle():
@@ -1115,7 +1115,6 @@ class ScheduleBatch:
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
             seq_lens_sum=self.seq_lens_sum,
-            req_to_token_pool_records=self.req_to_token_pool.get_write_records(),
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             global_num_tokens=self.global_num_tokens,
@@ -1169,9 +1168,6 @@ class ModelWorkerBatch:
 
     # The sum of all sequence lengths
     seq_lens_sum: int
-
-    # The memory pool operation records
-    req_to_token_pool_records: Optional[List[Tuple[Tuple, torch.Tensor]]]
 
     # For logprob
     return_logprob: bool
