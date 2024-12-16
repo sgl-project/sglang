@@ -100,6 +100,9 @@ class LogitsProcessor(nn.Module):
         self.do_tensor_parallel_all_gather = (
             not skip_all_gather and get_tensor_model_parallel_world_size() > 1
         )
+        self.final_logit_softcapping = getattr(
+            self.config, "final_logit_softcapping", None
+        )
 
     def forward(
         self,
@@ -125,10 +128,10 @@ class LogitsProcessor(nn.Module):
             last_logits = tensor_model_parallel_all_gather(last_logits)
         last_logits = last_logits[:, : self.config.vocab_size].float()
 
-        if hasattr(self.config, "final_logit_softcapping"):
-            last_logits.div_(self.config.final_logit_softcapping)
+        if self.final_logit_softcapping:
+            last_logits.div_(self.final_logit_softcapping)
             torch.tanh(last_logits, out=last_logits)
-            last_logits.mul_(self.config.final_logit_softcapping)
+            last_logits.mul_(self.final_logit_softcapping)
 
         # Return only last_logits if logprob is not requested
         if not logits_metadata.return_logprob:
@@ -136,7 +139,9 @@ class LogitsProcessor(nn.Module):
                 next_token_logits=last_logits,
             )
         else:
-            last_logprobs = torch.nn.functional.log_softmax(last_logits, dim=-1)
+            last_logprobs = self.compute_temp_top_p_normalized_logprobs(
+                last_logits, logits_metadata
+            )
 
             if logits_metadata.forward_mode.is_decode():
                 if logits_metadata.return_top_logprob:
@@ -172,14 +177,17 @@ class LogitsProcessor(nn.Module):
                 # extra logits that this padding may have produced.
                 all_logits = all_logits[:, : self.config.vocab_size].float()
 
-                if hasattr(self.config, "final_logit_softcapping"):
-                    all_logits.div_(self.config.final_logit_softcapping)
+                if self.final_logit_softcapping:
+                    all_logits.div_(self.final_logit_softcapping)
                     torch.tanh(all_logits, out=all_logits)
-                    all_logits.mul_(self.config.final_logit_softcapping)
+                    all_logits.mul_(self.final_logit_softcapping)
 
                 all_logprobs = all_logits
                 del all_logits, hidden_states
-                all_logprobs[:] = torch.nn.functional.log_softmax(all_logprobs, dim=-1)
+
+                all_logprobs = self.compute_temp_top_p_normalized_logprobs(
+                    all_logprobs, logits_metadata
+                )
 
                 # Get the logprob of top-k tokens
                 if logits_metadata.return_top_logprob:
@@ -221,8 +229,25 @@ class LogitsProcessor(nn.Module):
                     output_top_logprobs_idx=output_top_logprobs_idx,
                 )
 
-    def _get_normalized_prompt_logprobs(
+    def _get_logits(
         self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if hasattr(lm_head, "weight"):
+            logits = torch.matmul(hidden_states, lm_head.weight.T)
+        else:
+            # GGUF models
+            logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
+
+        # Optional scaling factor
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)  # In-place multiply
+        return logits
+
+    @staticmethod
+    def _get_normalized_prompt_logprobs(
         input_token_logprobs: torch.Tensor,
         logits_metadata: LogitsMetadata,
     ):
@@ -297,22 +322,11 @@ class LogitsProcessor(nn.Module):
                 output_top_logprobs_idx,
             )
 
-    def _get_logits(
-        self,
-        hidden_states: torch.Tensor,
-        lm_head: VocabParallelEmbedding,
-        embedding_bias: Optional[torch.Tensor] = None,
+    @staticmethod
+    def compute_temp_top_p_normalized_logprobs(
+        last_logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
-        if hasattr(lm_head, "weight"):
-            logits = torch.matmul(hidden_states, lm_head.weight.T)
-        else:
-            # GGUF models
-            logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
-
-        # Optional scaling factor, backported from vLLM 0.4
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)  # In-place multiply
-        return logits
+        return torch.nn.functional.log_softmax(last_logits, dim=-1)
 
 
 def test():

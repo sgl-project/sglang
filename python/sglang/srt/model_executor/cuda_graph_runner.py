@@ -387,8 +387,14 @@ class CudaGraphRunner:
 
         # Extract logprobs
         if forward_batch.return_logprob:
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
+            logits_metadata = LogitsMetadata(
+                forward_mode=ForwardMode.DECODE,
+                top_logprobs_nums=forward_batch.top_logprobs_nums,
+            )
+            next_token_logprobs = (
+                LogitsProcessor.compute_temp_top_p_normalized_logprobs(
+                    next_token_logits, logits_metadata
+                )
             )
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
@@ -396,10 +402,6 @@ class CudaGraphRunner:
             )
             return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
             if return_top_logprob:
-                logits_metadata = LogitsMetadata(
-                    forward_mode=ForwardMode.DECODE,
-                    top_logprobs_nums=forward_batch.top_logprobs_nums,
-                )
                 (
                     logits_output.output_top_logprobs_val,
                     logits_output.output_top_logprobs_idx,
