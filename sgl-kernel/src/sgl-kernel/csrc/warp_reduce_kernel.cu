@@ -25,34 +25,28 @@ __device__ __forceinline__ scalar_t blockReduceSum(scalar_t val) {
   int lane = threadIdx.x % 32;
   int wid = threadIdx.x / 32;
 
-  val = warpReduceSum(val); // First reduce within warp
+  val = warpReduceSum(val);  // First reduce within warp
 
-  if (lane == 0)
-    shared[wid] = val; // Write reduced value to shared memory
+  if (lane == 0) shared[wid] = val;  // Write reduced value to shared memory
 
-  __syncthreads(); // Wait for all partial reductions
+  __syncthreads();  // Wait for all partial reductions
 
   // Read from shared memory only if that warp existed
   val = (threadIdx.x < (blockDim.x / 32)) ? shared[lane] : 0;
 
-  if (wid == 0)
-    val = warpReduceSum(val); // Final reduce within first warp
+  if (wid == 0) val = warpReduceSum(val);  // Final reduce within first warp
 
   return val;
 }
 
 template <typename scalar_t>
 __global__ void warp_reduce_cuda_kernel(
-    const torch::PackedTensorAccessor32<scalar_t, 1, torch::RestrictPtrTraits>
-        input,
-    torch::PackedTensorAccessor32<scalar_t, 1, torch::RestrictPtrTraits> output,
-    int N) {
-
+    const torch::PackedTensorAccessor32<scalar_t, 1, torch::RestrictPtrTraits> input,
+    torch::PackedTensorAccessor32<scalar_t, 1, torch::RestrictPtrTraits> output, int N) {
   scalar_t sum = 0;
 
   // Grid-stride loop
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N;
-       i += blockDim.x * gridDim.x) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
     sum += input[i];
   }
 
@@ -84,13 +78,11 @@ torch::Tensor warp_reduce_cuda(torch::Tensor input) {
   // Allocate output tensor for partial sums
   auto output = torch::empty({blocks}, input.options());
 
-  AT_DISPATCH_FLOATING_TYPES(
-      input.scalar_type(), "warp_reduce_cuda", ([&] {
-        warp_reduce_cuda_kernel<scalar_t><<<blocks, threads>>>(
-            input.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-            output.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-            N);
-      }));
+  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "warp_reduce_cuda", ([&] {
+                               warp_reduce_cuda_kernel<scalar_t><<<blocks, threads>>>(
+                                   input.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+                                   output.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(), N);
+                             }));
 
   // Sum the partial results
   return output.sum();

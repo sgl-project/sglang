@@ -1,7 +1,7 @@
 # Install the dependency in CI.
 
 # Use repo from environment variable, passed from GitHub Actions
-FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu121/torch2.4}"
+FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu121/torch2.4/flashinfer}"
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
@@ -10,7 +10,7 @@ pip install --upgrade pip
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu121/torch2.4/flashinfer/
 
 # Force reinstall flashinfer
-pip install flashinfer -i ${FLASHINFER_REPO} --force-reinstall
+pip install flashinfer --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
 
 pip install transformers==4.45.2 sentence_transformers accelerate peft
 

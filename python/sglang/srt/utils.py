@@ -92,7 +92,7 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and not is_hip()
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def is_ipv6(address):
@@ -1071,9 +1071,6 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
 
-    if hasattr(torch, "hip") and torch.hip.is_available():
-        return torch.hip.get_device_name(device_id)
-
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_name(device_id)
 
@@ -1084,9 +1081,6 @@ def get_device_name(device_id: int = 0) -> str:
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability(device_id)
-
-    if hasattr(torch, "hip") and torch.hip.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
