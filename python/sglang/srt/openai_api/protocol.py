@@ -166,17 +166,19 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    json_schema: Optional[str] = None
-    regex: Optional[str] = None
+    top_k: int = -1
+    min_p: float = 0.0
     min_tokens: int = 0
+    regex: Optional[str] = None
+    json_schema: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -276,14 +278,16 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    regex: Optional[str] = None
+    top_k: int = -1
+    min_p: float = 0.0
     min_tokens: int = 0
+    regex: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
 
 class ChatMessage(BaseModel):
