@@ -1,18 +1,22 @@
 import logging
 import traceback
 from concurrent import futures
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 import grpc
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.proto import completion_pb2, completion_pb2_grpc
 
 
 class CompletionServicer(completion_pb2_grpc.CompletionServiceServicer):
-    def __init__(self, tokenizer_manager: TokenizerManager):
-        self.tokenizer_manager = tokenizer_manager
+    def __init__(
+        self,
+        generate_request: Callable[
+            [GenerateReqInput], AsyncGenerator[Dict[str, Any], None]
+        ],
+    ):
+        self.generate_request = generate_request
 
     async def Complete(
         self,
@@ -38,9 +42,7 @@ class CompletionServicer(completion_pb2_grpc.CompletionServiceServicer):
             )
 
             # Process request through tokenizer manager
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request
-            ):
+            async for content in self.generate_request(adapted_request):
                 # Create response for each token/chunk
                 response = completion_pb2.CompletionResponse(
                     text=content["text"],  # Send full text so far
@@ -72,25 +74,3 @@ class CompletionServicer(completion_pb2_grpc.CompletionServiceServicer):
             error_msg = f"Error in gRPC Complete: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
             await context.abort(grpc.StatusCode.INTERNAL, error_msg)
-
-
-def serve_grpc(
-    tokenizer_manager: TokenizerManager,
-    host: str = "0.0.0.0",
-    port: int = 50051,
-    max_workers: Optional[int] = None,
-):
-    server = grpc.aio.server(
-        futures.ThreadPoolExecutor(max_workers=max_workers),
-        options=[
-            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-        ],
-    )
-
-    completion_pb2_grpc.add_CompletionServiceServicer_to_server(
-        CompletionServicer(tokenizer_manager), server
-    )
-
-    server.add_insecure_port(f"{host}:{port}")
-    return server
