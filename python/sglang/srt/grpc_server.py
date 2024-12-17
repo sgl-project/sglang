@@ -1,7 +1,5 @@
-import logging
 import traceback
-from concurrent import futures
-from typing import Any, AsyncGenerator, Callable, Dict, Optional
+from typing import Any, AsyncGenerator, Callable, Dict
 
 import grpc
 

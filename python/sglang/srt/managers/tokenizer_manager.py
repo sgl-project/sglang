@@ -230,23 +230,7 @@ class TokenizerManager:
             )
         if self.server_args.grpc_port:
             # Launch gRPC server in a separate thread
-            async def serve_grpc_server():
-                server = self.serve_grpc(
-                    host=self.server_args.host,
-                    port=self.server_args.grpc_port,
-                )
-                await server.start()
-                await server.wait_for_termination()
-
-            uvloop.install()
-            loop = asyncio.new_event_loop()
-            grpc_thread = threading.Thread(
-                target=lambda: loop.run_until_complete(serve_grpc_server()), daemon=True
-            )
-            grpc_thread.start()
-            logger.info(
-                f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
-            )
+            self._run_grpc_server()
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -995,25 +979,34 @@ async def print_exception_wrapper(func):
         logger.error(f"TokenizerManager hit an exception: {traceback}")
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
-    def serve_grpc(
-        self,
-        host: str = "0.0.0.0",
-        port: int = 50051,
-        max_workers: Optional[int] = None,
-    ):
+    def _launch_grpc_server_in_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        server = loop.run_until_complete(self._create_grpc_server())
+        # Start the server before run_forever()
+        loop.run_until_complete(server.start())
+
+        logger.info(
+            f"gRPC server started, listening on {self.server_args.host}:{self.server_args.grpc_port}"
+        )
+        # Keep this loop alive so the server remains accessible
+        loop.run_forever()
+
+    async def _create_grpc_server(self):
+        # Create the server
         server = grpc.aio.server(
-            futures.ThreadPoolExecutor(max_workers=max_workers),
             options=[
                 ("grpc.max_send_message_length", 100 * 1024 * 1024),
                 ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-            ],
+            ]
         )
-
         completion_pb2_grpc.add_CompletionServiceServicer_to_server(
             CompletionServicer(self.generate_request), server
         )
-        server.add_insecure_port(f"{host}:{port}")
-        server.start()
+
+        server.add_insecure_port(
+            f"{self.server_args.host}:{self.server_args.grpc_port}"
+        )
         return server
 
 
