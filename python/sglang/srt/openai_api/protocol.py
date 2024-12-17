@@ -276,6 +276,7 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     regex: Optional[str] = None
     min_tokens: int = 0
     repetition_penalty: float = 1.0
