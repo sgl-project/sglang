@@ -176,7 +176,6 @@ class TokenizerManager:
                 },
             )
         if self.server_args.grpc_port:
-            # Launch gRPC server in a separate thread
             self._run_grpc_server()
 
     async def generate_request(
