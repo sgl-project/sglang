@@ -157,6 +157,11 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        # Apply torchao quantization
+        apply_torchao_config_to_model(
+            self.model, global_server_args_dict["torchao_config"]
+        )
+
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
@@ -164,10 +169,6 @@ class ModelRunner:
             self.torch_tp_applied = True
         else:
             self.torch_tp_applied = False
-
-        apply_torchao_config_to_model(
-            self.model, global_server_args_dict["torchao_config"]
-        )
 
         # Init memory pool and attention backends
         if server_args.lora_paths is not None:
