@@ -27,8 +27,11 @@ import uuid
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
+from concurrent import futures
+from typing import Any, Dict, List, Optional, Union
 
 import fastapi
+import grpc
 import uvloop
 import zmq
 import zmq.asyncio
@@ -36,6 +39,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.grpc_server import CompletionServicer
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
@@ -73,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
+from sglang.srt.proto import completion_pb2_grpc
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -222,6 +227,25 @@ class TokenizerManager:
                     "model_name": self.server_args.served_model_name,
                     # TODO: Add lora name/path in the future,
                 },
+            )
+        if self.server_args.grpc_port:
+            # Launch gRPC server in a separate thread
+            async def serve_grpc_server():
+                server = self.serve_grpc(
+                    host=self.server_args.host,
+                    port=self.server_args.grpc_port,
+                )
+                await server.start()
+                await server.wait_for_termination()
+
+            uvloop.install()
+            loop = asyncio.new_event_loop()
+            grpc_thread = threading.Thread(
+                target=lambda: loop.run_until_complete(serve_grpc_server()), daemon=True
+            )
+            grpc_thread.start()
+            logger.info(
+                f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
             )
 
         self._result_dispatcher = TypeBasedDispatcher(
@@ -971,6 +995,26 @@ async def print_exception_wrapper(func):
         logger.error(f"TokenizerManager hit an exception: {traceback}")
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+    def serve_grpc(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 50051,
+        max_workers: Optional[int] = None,
+    ):
+        server = grpc.aio.server(
+            futures.ThreadPoolExecutor(max_workers=max_workers),
+            options=[
+                ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ],
+        )
+
+        completion_pb2_grpc.add_CompletionServiceServicer_to_server(
+            CompletionServicer(self.generate_request), server
+        )
+        server.add_insecure_port(f"{host}:{port}")
+        server.start()
+        return server
 
 
 class SignalHandler:
