@@ -92,7 +92,7 @@ class SchedulePolicy:
                 # to schedule only one of them so that we can increase the cache hit rate.
                 # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
                 # threshold means we cannot use in-batch prefix caching for short prefixes.
-                # It is kind of common when the engine is long running (e.g., imagine "the").
+                # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
                 if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                     in_batch_matching_prefixes, _ = (
                         self.waiting_queue_radix_tree.match_prefix(
