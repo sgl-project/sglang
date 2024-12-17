@@ -43,7 +43,6 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from uvicorn.config import LOGGING_CONFIG
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.grpc_server import serve_grpc
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,

@@ -177,23 +177,7 @@ class TokenizerManager:
             )
         if self.server_args.grpc_port:
             # Launch gRPC server in a separate thread
-            async def serve_grpc_server():
-                server = self.serve_grpc(
-                    host=self.server_args.host,
-                    port=self.server_args.grpc_port,
-                )
-                await server.start()
-                await server.wait_for_termination()
-
-            uvloop.install()
-            loop = asyncio.new_event_loop()
-            grpc_thread = threading.Thread(
-                target=lambda: loop.run_until_complete(serve_grpc_server()), daemon=True
-            )
-            grpc_thread.start()
-            logger.info(
-                f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
-            )
+            self._run_grpc_server()
 
     async def generate_request(
         self,
@@ -813,7 +797,7 @@ class TokenizerManager:
                 ret.append(None)
         return ret
 
-    def serve_grpc(
+    def _create_grpc_server(
         self,
         host: str = "0.0.0.0",
         port: int = 50051,
@@ -831,8 +815,26 @@ class TokenizerManager:
             CompletionServicer(self.generate_request), server
         )
         server.add_insecure_port(f"{host}:{port}")
-        server.start()
         return server
+
+    def _run_grpc_server(self):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        async def serve_grpc_server(server):
+            await server.start()
+            await server.wait_for_termination()
+
+        uvloop.install()
+        loop = asyncio.get_event_loop()
+        server = self._create_grpc_server(
+            host=self.server_args.host,
+            port=self.server_args.grpc_port,
+        )
+        loop.create_task(serve_grpc_server(server))
+        logger.info(
+            f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
+        )
 
 
 class SignalHandler:
