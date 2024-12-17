@@ -1009,6 +1009,25 @@ async def print_exception_wrapper(func):
         )
         return server
 
+    def _run_grpc_server(self):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        async def serve_grpc_server():
+            server = self._create_grpc_server(
+                host=self.server_args.host,
+                port=self.server_args.grpc_port,
+            )
+            await server.start()
+            await server.wait_for_termination()
+
+        uvloop.install()
+        loop = asyncio.get_event_loop()
+        loop.create_task(serve_grpc_server())
+        logger.info(
+            f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
+        )
+
 
 class SignalHandler:
     def __init__(self, tokenizer_manager):
