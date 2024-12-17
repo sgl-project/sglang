@@ -175,8 +175,6 @@ class TokenizerManager:
                     # TODO: Add lora name/path in the future,
                 },
             )
-        if self.server_args.grpc_port:
-            self._run_grpc_server()
 
     async def generate_request(
         self,
@@ -597,6 +595,15 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+        if self.server_args.grpc_port:
+            server = self._create_grpc_server(
+                host=self.server_args.host,
+                port=self.server_args.grpc_port,
+            )
+            await server.start()
+            logger.info(
+                f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
+            )
 
         while True:
             recv_obj: Union[
@@ -815,25 +822,6 @@ class TokenizerManager:
         )
         server.add_insecure_port(f"{host}:{port}")
         return server
-
-    def _run_grpc_server(self):
-        if self.to_create_loop:
-            self.create_handle_loop()
-
-        async def serve_grpc_server():
-            server = self._create_grpc_server(
-                host=self.server_args.host,
-                port=self.server_args.grpc_port,
-            )
-            await server.start()
-            await server.wait_for_termination()
-
-        uvloop.install()
-        loop = asyncio.get_event_loop()
-        loop.create_task(serve_grpc_server())
-        logger.info(
-            f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
-        )
 
 
 class SignalHandler:
