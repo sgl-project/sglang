@@ -110,6 +110,7 @@ def run_program_batch(
         num_threads = max(96, multiprocessing.cpu_count() * 16)
     num_threads = min(num_threads, len(batch_arguments))
 
+    rets = []
     if num_threads == 1:
         if progress_bar and not generator_style:
             iterator = tqdm.tqdm(batch_arguments)
