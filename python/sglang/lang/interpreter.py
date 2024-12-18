@@ -129,8 +129,6 @@ def run_program_batch(
             if generator_style:
                 yield result
             else:
-                if not 'rets' in locals():
-                    rets = []
                 rets.append(result)
 
     else:
