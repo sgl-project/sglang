@@ -96,6 +96,7 @@ def run_program_batch(
     default_sampling_para,
     num_threads,
     progress_bar,
+    generator_style=False,
 ):
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
@@ -110,62 +111,63 @@ def run_program_batch(
     num_threads = min(num_threads, len(batch_arguments))
 
     if num_threads == 1:
-        rets = []
-        if progress_bar:
-            for arguments in tqdm.tqdm(batch_arguments):
-                rets.append(
-                    run_program(
-                        program,
-                        backend,
-                        (),
-                        arguments,
-                        default_sampling_para,
-                        False,
-                        True,
-                    )
-                )
+        if progress_bar and not generator_style:
+            iterator = tqdm.tqdm(batch_arguments)
         else:
-            for arguments in batch_arguments:
-                rets.append(
-                    run_program(
-                        program,
-                        backend,
-                        (),
-                        arguments,
-                        default_sampling_para,
-                        False,
-                        True,
-                    )
-                )
+            iterator = batch_arguments
+
+        for arguments in iterator:
+            result = run_program(
+                program,
+                backend,
+                (),
+                arguments,
+                default_sampling_para,
+                False,
+                True,
+            )
+            if generator_style:
+                yield arguments, result
+            else:
+                if not 'rets' in locals():
+                    rets = []
+                rets.append(result)
+
     else:
-        if progress_bar:
+        if progress_bar and not generator_style:
             pbar = tqdm.tqdm(total=len(batch_arguments))
 
         with ThreadPoolExecutor(num_threads) as executor:
             futures = []
+            future_to_arguments = {}
             for arguments in batch_arguments:
-                futures.append(
-                    executor.submit(
-                        run_program,
-                        program,
-                        backend,
-                        (),
-                        arguments,
-                        default_sampling_para,
-                        False,
-                        True,
-                    )
+                future = executor.submit(
+                    run_program,
+                    program,
+                    backend,
+                    (),
+                    arguments,
+                    default_sampling_para,
+                    False,
+                    True,
                 )
-                if progress_bar:
-                    futures[-1].add_done_callback(lambda _: pbar.update())
+                futures.append(future)
+                future_to_arguments[future] = arguments
+                if progress_bar and not generator_style:
+                    future.add_done_callback(lambda _: pbar.update())
 
-            rets = [f.result() for f in futures]
-        rets[-1].sync()
+            if generator_style:
+                for future in concurrent.futures.as_completed(futures):
+                    yield future_to_arguments[future], future.result()
+            else:
+                rets = [f.result() for f in futures]
+                rets[-1].sync()
 
-        if progress_bar:
+        if progress_bar and not generator_style:
             pbar.close()
 
-    return rets
+    if not generator_style:
+        return rets
 
 
 def cache_program(program, backend):
