@@ -127,7 +127,7 @@ def run_program_batch(
                 True,
             )
             if generator_style:
-                yield arguments, result
+                yield result
             else:
                 if not 'rets' in locals():
                     rets = []
@@ -158,7 +158,7 @@ def run_program_batch(
 
             if generator_style:
                 for future in concurrent.futures.as_completed(futures):
-                    yield future_to_arguments[future], future.result()
+                    yield future.result()
             else:
                 rets = [f.result() for f in futures]
                 rets[-1].sync()
