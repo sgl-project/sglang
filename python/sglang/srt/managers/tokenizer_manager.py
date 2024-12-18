@@ -266,6 +266,16 @@ class TokenizerManager:
                 ),
             ]
         )
+        if server_args.grpc_port:
+            t = threading.Thread(
+                target=self._launch_grpc_server_in_loop,
+                name="gRPCServerThread",
+                daemon=True,
+            )
+            t.start()
+            logger.info(
+                f"TokenizerManager: launched gRPC server thread on port {server_args.grpc_port}"
+            )
 
     async def generate_request(
         self,
@@ -762,16 +772,6 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
-        if self.server_args.grpc_port:
-            server = self._create_grpc_server(
-                host=self.server_args.host,
-                port=self.server_args.grpc_port,
-            )
-            await server.start()
-            logger.info(
-                f"gRPC server started on {self.server_args.host}:{self.server_args.grpc_port}"
-            )
-
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
@@ -972,19 +972,6 @@ class TokenizerManager:
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
-
-async def print_exception_wrapper(func):
-    """
-    Sometimes an asyncio function does not print exception.
-    We do another wrapper to handle the exception.
-    """
-    try:
-        await func()
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(1)
     def _launch_grpc_server_in_loop(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1014,6 +1001,19 @@ async def print_exception_wrapper(func):
             f"{self.server_args.host}:{self.server_args.grpc_port}"
         )
         return server
+
+async def print_exception_wrapper(func):
+    """
+    Sometimes an asyncio function does not print exception.
+    We do another wrapper to handle the exception.
+    """
+    try:
+        await func()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(1)
 
 
 class SignalHandler:
