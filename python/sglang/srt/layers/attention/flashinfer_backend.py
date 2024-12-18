@@ -181,12 +181,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.num_cascade_levels,
                     self.workspace_buffer,
                     "NHD",
-                    # Pass below args once flashinfer version is bumped
-                    # use_cuda_graph=True,
-                    # qo_indptr_buf_arr=[self.qo_indptr[i][: bs + 1]],
-                    # paged_kv_indptr_buf_arr=[self.kv_indptr[i][: bs + 1]],
-                    # paged_kv_indices_buf_arr=[self.cuda_graph_kv_indices[i]],
-                    # paged_kv_last_page_len_buf_arr=[self.kv_last_page_len[:bs]],
+                    use_cuda_graph=True,
+                    qo_indptr_buf_arr=[self.qo_indptr[i][: bs + 1]],
+                    paged_kv_indptr_buf_arr=[self.kv_indptr[i][: bs + 1]],
+                    paged_kv_indices_buf_arr=[self.cuda_graph_kv_indices[i]],
+                    paged_kv_last_page_len_buf_arr=[self.kv_last_page_len[:bs]],
                 )
             )
 
