@@ -145,9 +145,7 @@ def test_write_req_to_token_pool():
 
     # Run optimized triton kernel
     def grid(batch_size, extend_len):
-        num_token_blocks = triton.cdiv(
-            extend_len, 512
-        )
+        num_token_blocks = triton.cdiv(extend_len, 512)
         return (batch_size, num_token_blocks)
 
     write_req_to_token_pool_triton_optimize[grid(batch_size, extend_len)](
