@@ -221,12 +221,10 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
-            self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             self.disable_overlap_schedule = True
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
-                f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap scheduler is disabled."
@@ -283,7 +281,15 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
+            choices=[
+                "auto",
+                "pt",
+                "safetensors",
+                "npcache",
+                "dummy",
+                "gguf",
+                "bitsandbytes",
+            ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -294,7 +300,9 @@ class ServerArgs:
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. ',
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -689,11 +697,6 @@ class ServerArgs:
             "--disable-mla",
             action="store_true",
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
-        )
-        parser.add_argument(
-            "--disable-nan-detection",
-            action="store_true",
-            help="Disable the NaN detection for better performance.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

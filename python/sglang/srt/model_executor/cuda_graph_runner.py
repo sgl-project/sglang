@@ -20,6 +20,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable
 
 import torch
+import tqdm
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
@@ -127,7 +129,7 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         if model_runner.server_args.disable_cuda_graph_padding:
-            self.capture_bs = list(range(1, 32)) + [64, 128]
+            self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
 
@@ -255,7 +257,12 @@ class CudaGraphRunner:
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
-            for bs in self.capture_bs:
+            capture_bs = (
+                tqdm.tqdm(self.capture_bs)
+                if get_tensor_model_parallel_rank() == 0
+                else self.capture_bs
+            )
+            for bs in capture_bs:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
@@ -387,8 +394,14 @@ class CudaGraphRunner:
 
         # Extract logprobs
         if forward_batch.return_logprob:
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
+            logits_metadata = LogitsMetadata(
+                forward_mode=ForwardMode.DECODE,
+                top_logprobs_nums=forward_batch.top_logprobs_nums,
+            )
+            next_token_logprobs = (
+                LogitsProcessor.compute_temp_top_p_normalized_logprobs(
+                    next_token_logits, logits_metadata
+                )
             )
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
@@ -396,13 +409,14 @@ class CudaGraphRunner:
             )
             return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
             if return_top_logprob:
-                logits_metadata = LogitsMetadata(
-                    forward_mode=ForwardMode.DECODE,
-                    top_logprobs_nums=forward_batch.top_logprobs_nums,
-                )
-                logits_output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
+                (
+                    logits_output.output_top_logprobs_val,
+                    logits_output.output_top_logprobs_idx,
+                ) = LogitsProcessor.get_top_logprobs(
                     next_token_logprobs, logits_metadata
-                )[1]
+                )[
+                    2:4
+                ]
         else:
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,

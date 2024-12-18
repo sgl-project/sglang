@@ -196,7 +196,6 @@ class TestTritonAttention(unittest.TestCase):
 
         req_to_token = torch.arange(total_tokens, device="cuda").reshape(B, seq_len)
         b_req_idx = torch.arange(B, device="cuda")
-        b_start_loc = torch.arange(0, total_tokens, seq_len, device="cuda")
         b_seq_len = torch.full((B,), seq_len, device="cuda")
 
         attn_logits = torch.empty(
@@ -212,10 +211,8 @@ class TestTritonAttention(unittest.TestCase):
             o,
             req_to_token,
             b_req_idx,
-            b_start_loc,
             b_seq_len,
             attn_logits,
-            seq_len,
             num_kv_splits,
             sm_scale,
         )
@@ -235,9 +232,9 @@ class TestTritonAttention(unittest.TestCase):
         for B, H_Q, H_KV, D in configs:
             self._test_decode_attention_once(B, H_Q, H_KV, D)
 
-    def _test_grouped_decode_attention_once(self, B, H_Q, H_KV, D, D_V):
+    def _test_grouped_decode_attention_once(self, B, S, H_Q, H_KV, D, D_V):
         dtype = torch.bfloat16
-        seq_len = 128  # This represents the number of tokens already in the sequence
+        seq_len = S  # This represents the number of tokens already in the sequence
         total_tokens = B * seq_len
         sm_scale = 1.0 / (D**0.5)
         num_kv_splits = 8
@@ -255,7 +252,6 @@ class TestTritonAttention(unittest.TestCase):
 
         req_to_token = torch.arange(total_tokens, device="cuda").reshape(B, seq_len)
         b_req_idx = torch.arange(B, device="cuda")
-        b_start_loc = torch.arange(0, total_tokens, seq_len, device="cuda")
         b_seq_len = torch.full((B,), seq_len, device="cuda")
 
         attn_logits = torch.empty(
@@ -273,7 +269,6 @@ class TestTritonAttention(unittest.TestCase):
             b_req_idx,
             b_seq_len,
             attn_logits,
-            seq_len,
             num_kv_splits,
             sm_scale,
         )
@@ -293,7 +288,6 @@ class TestTritonAttention(unittest.TestCase):
             b_req_idx,
             b_seq_len,
             attn_logits1,
-            seq_len,
             num_kv_splits,
             sm_scale,
         )
@@ -306,6 +300,7 @@ class TestTritonAttention(unittest.TestCase):
         self.assertTrue(torch.allclose(o, o_grouped, atol=3e-2))
 
     def test_grouped_decode_attention(self):
+        seq_lens = [5, 100, 128, 500]
         configs = [
             (2, 16, 16, 64, 64),
             (2, 16, 1, 64, 64),
@@ -315,8 +310,9 @@ class TestTritonAttention(unittest.TestCase):
             (2, 128, 1, 576, 512),
         ]
 
-        for B, H_Q, H_KV, D, D_V in configs:
-            self._test_grouped_decode_attention_once(B, H_Q, H_KV, D, D_V)
+        for S in seq_lens:
+            for B, H_Q, H_KV, D, D_V in configs:
+                self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
 
 
 if __name__ == "__main__":

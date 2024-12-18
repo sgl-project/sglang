@@ -1,0 +1,8 @@
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 120
+AllowShortFunctionsOnASingleLine: Empty
+DerivePointerAlignment: false
+PointerAlignment: Left
+NamespaceIndentation: None
+SortIncludes: true
