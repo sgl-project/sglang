@@ -402,7 +402,7 @@ class Req:
             if self.sampling_params.stop_token_ids:
                 matched_eos = last_token_id in self.sampling_params.stop_token_ids
             if eos_token_ids:
-                matched_eos = last_token_id in eos_token_ids
+                matched_eos |= last_token_id in eos_token_ids
             if self.tokenizer is not None:
                 matched_eos |= last_token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
