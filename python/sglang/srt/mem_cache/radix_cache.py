@@ -37,9 +37,16 @@ from sglang.srt.managers.cache_controller import HiCacheController
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+# import logging
+
+# logger = logging.getLogger(__name__)
+
 
 class TreeNode:
-    def __init__(self):
+
+    counter = 0
+
+    def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
         self.parent = None
         self.key = None
@@ -47,14 +54,24 @@ class TreeNode:
         self.lock_ref = 0
         self.last_access_time = time.time()
 
+        self.hit_count = 0
+        # indicating the node is written to host
+        # self.writing = False
         # indicating the node is loading KV cache from host
         self.loading = False
         # store the host indices of KV cache
         self.host_value = None
 
+        self.id = TreeNode.counter if id is None else id
+        TreeNode.counter += 1
+
     @property
     def evicted(self):
         return self.value is None
+
+    @property
+    def backuped(self):
+        return self.host_value is not None
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -84,6 +101,7 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        TreeNode.counter = 0
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
@@ -347,13 +365,12 @@ class HiRadixCache(RadixCache):
         self.cache_controller = HiCacheController(
             token_to_kv_pool, self.token_to_kv_pool_host
         )
-        super().__init__(req_to_token_pool, token_to_kv_pool, disable=False)
 
-    def is_backup(self, node: TreeNode):
-        if node.host_value is None:
-            return False
-        else:
-            return self.token_to_kv_pool_host.is_backup(node.host_value)
+        self.id_to_node = {}
+        # todo: dynamically adjust the threshold
+        self.write_through_threshold = 1
+        self.load_back_threshold = 10
+        super().__init__(req_to_token_pool, token_to_kv_pool, disable=False)
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -362,41 +379,123 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
+    def inc_hit_count(self, node: TreeNode):
+        if self.cache_controller.write_policy != "write_through_selective":
+            return
+        node.hit_count += 1
+        if node.host_value is None and node.hit_count > self.write_through_threshold:
+            host_indices = self.cache_controller.write_through(
+                device_indices=node.value,
+                priority=-self.get_height(node),
+                node_id=node.id,
+            )
+            if host_indices is None:
+                self.evict_host(len(node.value))
+                host_indices = self.cache_controller.write_through(
+                    device_indices=node.value,
+                    priority=-self.get_height(node),
+                    node_id=node.id,
+                )
+            if host_indices is not None:
+                node.host_value = host_indices
+                self.id_to_node[node.id] = node
+                self.inc_lock_ref(node)
+            else:
+                # todo, check broken chains
+                pass
+
     def evictable_size(self):
-        # to reserve some space for I/O buffer
-        # todo: a more accurate estimation and fix the memory leak detection
-        return max(0, self.evictable_size_ - 1000)
+        if (
+            self.cache_controller.write_policy == "write_through"
+            or self.cache_controller.write_policy == "write_through_selective"
+        ):
+            while not self.cache_controller.ack_write_queue.empty():
+                try:
+                    ack_id = self.cache_controller.ack_write_queue.get_nowait()
+                    self.dec_lock_ref(self.id_to_node[ack_id])
+                    # clear the reference
+                    del self.id_to_node[ack_id]
+                except Exception:
+                    break
+        self.loading_check()
+        return self.evictable_size_
 
     def evict(self, num_tokens: int, evict_callback=None):
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
 
         num_evicted = 0
+        pending_nodes = []
         while num_evicted < num_tokens and len(leaves):
             x = heapq.heappop(leaves)
-            if x == self.root_node:
-                break
+
             if x.lock_ref > 0:
                 continue
 
-            if self.cache_controller.evict_device(x.value, x.host_value) == 0:
-                # the leave node is protected
-                continue
+            if x.host_value is None:
+                if self.cache_controller.write_policy == "write_back":
+                    num_evicted += self._evict_write_back(x)
+                    if x.host_value is not None:
+                        pending_nodes.append(x)
+                elif self.cache_controller.write_policy == "write_through_selective":
+                    num_evicted += self._evict_write_through_selective(x)
+                else:
+                    raise NotImplementedError
             else:
-                num_evicted += len(x.value)
-
-            if self.token_to_kv_pool_host.is_backup(x.host_value):
-                self.evictable_size_ -= len(x.value)
-                x.value = None
-            else:
-                # if the host value does not contain backup, delete the leaf
-                self._delete_leaf(x)
+                # assert self.token_to_kv_pool_host.is_synced(x.host_value), (
+                #     x.host_value,
+                #     self.token_to_kv_pool_host.get_state(x.host_value),
+                # )
+                num_evicted += self._evict_write_through(x)
 
             for child in x.parent.children.values():
+                if child in pending_nodes:
+                    continue
                 if not child.evicted:
                     break
             else:
+                # all children are evicted or no children
                 heapq.heappush(leaves, x.parent)
+
+        # blocking for write back completion
+        while len(pending_nodes) > 0:
+            for x in pending_nodes:
+                if self.token_to_kv_pool_host.is_synced(x.host_value):
+                    num_evicted = self.cache_controller.evict_device(
+                        x.value, x.host_value
+                    )
+                    self.evictable_size_ -= num_evicted
+                    x.value = None
+                    pending_nodes.remove(x)
+                    break
+            else:
+                time.sleep(0.1)
+
+    def _evict_write_back(self, node: TreeNode):
+        host_indices = self.cache_controller.write_back(node.value)
+        if host_indices is None:
+            self.evict_host(len(node.value))
+            host_indices = self.cache_controller.write_back(node.value)
+        if host_indices is None:
+            raise RuntimeError("No sufficient host memory available")
+        else:
+            node.host_value = host_indices
+            return len(node.host_value)
+
+    def _evict_write_through(self, node: TreeNode):
+        # evict a node already written to host
+        num_evicted = self.cache_controller.evict_device(node.value, node.host_value)
+        assert num_evicted > 0
+        self.evictable_size_ -= num_evicted
+        node.value = None
+        return num_evicted
+
+    def _evict_write_through_selective(self, node: TreeNode):
+        # evict a node not initiated write to host
+        self.cache_controller.mem_pool_device.free(node.value)
+        num_evicted = len(node.value)
+        self._delete_leaf(node)
+        return num_evicted
 
     def evict_host(self, num_tokens: int):
         leaves = self._collect_leaves()
@@ -420,52 +519,77 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)
 
-    def load_back(self, node: TreeNode):
+    def load_back(self, node: TreeNode) -> Optional[torch.Tensor]:
+        # todo: more loading policies
+
+        last_hit_node = node
         nodes_to_load = []
-
         while node.evicted:
-            assert self.is_backup(node)
-            nodes_to_load.append(node)
+            assert (
+                node.backuped
+            ), "No backup available on evicted nodes, should not happen"
+            nodes_to_load.insert(0, node)
             node = node.parent
+        else:
+            last_node = node
 
-        # check all parents are available on device
-        while node != self.root_node:
-            assert not node.evicted
-            node = node.parent
+        # load it all or not at all
+        host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        if len(host_indices) < self.load_back_threshold:
+            # skip loading back if the total size is too small
+            return None
 
-        # initiate the loading request following the order of the tree
-        for node in nodes_to_load[::-1]:
-            node.value = self.cache_controller.load_back(host_indices=node.host_value)
-            if node.value is None:
-                self.evict(len(node.host_value))
-                node.value = self.cache_controller.load_back(
-                    host_indices=node.host_value
-                )
-            if node.value is None:
-                # no sufficient GPU memory to load back KV caches
-                return False
-            node.loading = True
-        return True
+        self.inc_lock_ref(last_node)
+        device_indices = self.cache_controller.load_back(
+            host_indices=host_indices, node_id=last_hit_node.id
+        )
+        if device_indices is None:
+            self.evict(len(host_indices))
+            device_indices = self.cache_controller.load_back(
+                host_indices=host_indices, node_id=last_hit_node.id
+            )
+        self.dec_lock_ref(last_node)
+        if device_indices is None:
+            # no sufficient GPU memory to load back KV caches
+            return None
+
+        self.id_to_node[last_hit_node.id] = last_hit_node
+        offset = 0
+        for node in nodes_to_load:
+            node.value = device_indices[offset : offset + len(node.host_value)]
+            offset += len(node.host_value)
+        self.evictable_size_ += len(device_indices)
+        self.inc_lock_ref(last_hit_node)
+        last_hit_node.loading = True
+
+        return device_indices
 
     def loading_complete(self, node: TreeNode):
-        assert node.loading
-        if self.token_to_kv_pool_host.is_synced(node.host_value):
-            while node.loading:
-                self.evictable_size_ += len(node.value)
+        self.loading_check()
+        return node.loading
+
+    def loading_check(self):
+        while not self.cache_controller.ack_load_queue.empty():
+            try:
+                ack_id = self.cache_controller.ack_load_queue.get_nowait()
+                node = self.id_to_node[ack_id]
                 node.loading = False
-                node = node.parent
-            return True
-        else:
-            return False
+                self.dec_lock_ref(node)
+                del self.id_to_node[ack_id]
+            except Exception:
+                break
 
     def match_prefix(self, key: List, load_cache: bool = True, **kwargs):
         value, last_node = super().match_prefix(key, **kwargs)
 
-        if load_cache:
-            self.load_back(last_node)
+        if last_node.evicted:
+            if load_cache:
+                loading_values = self.load_back(last_node)
+                if loading_values is not None:
+                    value = torch.cat([value, loading_values])
 
-        while last_node.evicted:
-            last_node = last_node.parent
+            while last_node.evicted:
+                last_node = last_node.parent
 
         return value, last_node
 
@@ -481,10 +605,12 @@ class HiRadixCache(RadixCache):
             prefix_len = _key_match(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 last_node[0] = new_node
             else:
+                self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 last_node[0] = child
@@ -532,6 +658,7 @@ class HiRadixCache(RadixCache):
                         child, key[prefix_len:], value[prefix_len:]
                     )
                 else:
+                    self.inc_hit_count(child)
                     return prefix_len + self._insert_helper(
                         child, key[prefix_len:], value[prefix_len:]
                     )
@@ -546,6 +673,7 @@ class HiRadixCache(RadixCache):
                     new_node, key[prefix_len:], value[prefix_len:]
                 )
             else:
+                self.inc_hit_count(new_node)
                 return prefix_len + self._insert_helper(
                     new_node, key[prefix_len:], value[prefix_len:]
                 )
@@ -558,21 +686,36 @@ class HiRadixCache(RadixCache):
             node.children[key[0]] = new_node
             self.evictable_size_ += len(value)
 
-            host_value = self.cache_controller.write_through(
-                device_indices=value, priority=self.get_height(new_node)
-            )
-            if host_value is None:
-                self.evict_host(len(value))
-                host_value = self.cache_controller.write_through(
-                    device_indices=value, priority=self.get_height(new_node)
+            # todo: deduplication
+            if self.cache_controller.write_policy == "write_through":
+                new_node.host_value = self.cache_controller.write_through(
+                    device_indices=value,
+                    priority=-self.get_height(new_node),
+                    node_id=new_node.id,
                 )
-                # if there is no sufficient host memory to store, the write through will be skipped
-            new_node.host_value = host_value
+                if new_node.host_value is None:
+                    self.evict_host(len(value))
+                    new_node.host_value = self.cache_controller.write_through(
+                        device_indices=value,
+                        priority=-self.get_height(new_node),
+                        node_id=new_node.id,
+                    )
+                if new_node.host_value is None:
+                    # todo, change raising error to a longer waiting
+                    raise RuntimeError(
+                        "No sufficient host memory available for write through"
+                    )
+                else:
+                    # protect the nodes pending for write through
+                    self.id_to_node[new_node.id] = new_node
+                    self.inc_lock_ref(new_node)
         return 0
 
     def _collect_leaves_device(self):
         def is_leaf(node):
             if node.evicted:
+                return False
+            if node == self.root_node:
                 return False
             if len(node.children) == 0:
                 return True

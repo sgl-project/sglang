@@ -25,10 +25,12 @@ class CacheOperation:
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
+        node_id: int = 0,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.data = None
+        self.node_id = [node_id]
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -38,6 +40,7 @@ class CacheOperation:
         self.host_indices = torch.cat([self.host_indices, other.host_indices])
         self.device_indices = torch.cat([self.device_indices, other.device_indices])
         self.priority = min(self.priority, other.priority)
+        self.node_id.extend(other.node_id)
 
     def __lt__(self, other: "CacheOperation"):
         return self.priority < other.priority
@@ -49,11 +52,7 @@ class TransferBuffer:
         self.buffer_count = buffer_count
         # todo: adjust the buffer size based on throughput profile of the system
         self.buffer_size = buffer_size
-        self.condition = threading.Condition()
         self.timeout = 1
-
-        self.revoke_list = []
-        self.lock = threading.Lock()
 
         # todo: alternative fixed size buffer implementation
 
@@ -94,14 +93,26 @@ class RevokableQueue(PriorityQueue):
 class HiCacheController:
 
     def __init__(
-        self, mem_pool_device: MHATokenToKVPool, mem_pool_host: MLATokenToKVPoolHost
+        self,
+        mem_pool_device: MHATokenToKVPool,
+        mem_pool_host: MLATokenToKVPoolHost,
+        write_policy: str = "write_through_selective",
     ):
 
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        self.write_policy = write_policy
 
-        self.write_queue = RevokableQueue()
+        if write_policy in ["write_through", "write_through_selective", "write_back"]:
+            self.write_queue = PriorityQueue()
+        elif write_policy == "write_through_revokable":
+            # todo: deprecate
+            self.write_queue = RevokableQueue()
+        else:
+            raise ValueError(f"Invalid write policy: {write_policy}")
         self.load_queue = PriorityQueue()
+        self.ack_write_queue = Queue()
+        self.ack_load_queue = Queue()
 
         self.write_buffer = TransferBuffer()
         self.load_buffer = TransferBuffer()
@@ -119,7 +130,10 @@ class HiCacheController:
         self.load_thread.start()
 
     def write_through(
-        self, device_indices: torch.Tensor, priority: Optional[torch.Tensor] = None
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = 0,
     ):
         """
         Optimistically write through calculated KV caches to host memory.
@@ -128,17 +142,41 @@ class HiCacheController:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        self.write_queue.put(CacheOperation(host_indices, device_indices, priority))
+        self.write_queue.put(
+            CacheOperation(host_indices, device_indices, priority, node_id)
+        )
+        self.mem_pool_host.protect_write(host_indices)
         return host_indices
 
-    def load_back(self, host_indices, priority: Optional[int] = None):
+    def write_back(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = 0,
+    ):
+        """
+        Write back KV caches from device memory to host memory.
+        """
+        # todo: deduplicate
+        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:
+            return None
+        self.write_queue.put(
+            CacheOperation(host_indices, device_indices, priority, node_id)
+        )
+        self.mem_pool_host.protect_write(host_indices)
+        return host_indices
+
+    def load_back(self, host_indices, priority: Optional[int] = None, node_id: int = 0):
         """
         Load KV caches from host memory to device memory.
         """
         device_indices = self.mem_pool_device.alloc(len(host_indices))
         if device_indices is None:
             return None
-        self.load_queue.put(CacheOperation(host_indices, device_indices, priority))
+        self.load_queue.put(
+            CacheOperation(host_indices, device_indices, priority, node_id)
+        )
         self.mem_pool_host.protect_load(host_indices)
         return device_indices
 
@@ -152,12 +190,13 @@ class HiCacheController:
                     time.sleep(0.1)
                 try:
                     operation = self.write_queue.get(timeout=1)
-                    self.mem_pool_host.protect_write(operation.host_indices)
                     operation.data = self.mem_pool_device.get_flat_data(
                         operation.device_indices
                     )
                     self.mem_pool_host.transfer(operation.host_indices, operation.data)
                     self.mem_pool_host.complete_io(operation.host_indices)
+                    for node_id in operation.node_id:
+                        self.ack_write_queue.put(node_id)
                 except queue.Empty:
                     continue
                 except Exception as e:
@@ -180,6 +219,8 @@ class HiCacheController:
                         operation.device_indices, operation.data
                     )
                     self.mem_pool_host.complete_io(operation.host_indices)
+                    for node_id in operation.node_id:
+                        self.ack_load_queue.put(node_id)
                 except queue.Empty:
                     continue
                 except Exception as e:
@@ -192,7 +233,6 @@ class HiCacheController:
                 time.sleep(0.1)
             try:
                 operation = self.write_queue.get(timeout=1)
-                self.mem_pool_host.protect_write(operation.host_indices)
                 if buffer is None:
                     buffer = operation
                 else:
@@ -251,6 +291,8 @@ class HiCacheController:
                 continue
             self.mem_pool_host.transfer(operation.host_indices, operation.data)
             self.mem_pool_host.complete_io(operation.host_indices)
+            for node_id in operation.node_id:
+                self.ack_write_queue.put(node_id)
 
     def load_thread_func_(self):
         while True:
@@ -259,6 +301,8 @@ class HiCacheController:
                 continue
             self.mem_pool_device.transfer(operation.device_indices, operation.data)
             self.mem_pool_host.complete_io(operation.host_indices)
+            for node_id in operation.node_id:
+                self.ack_load_queue.put(node_id)
 
     def write_thread_func_buffer(self):
         aux_thread = threading.Thread(target=self.write_aux_func, daemon=True)
@@ -279,11 +323,14 @@ class HiCacheController:
             host_mem_state = self.mem_pool_host.get_state(host_indices)
 
             if host_mem_state == MemoryStateInt.PROTECTED:
+                assert (
+                    self.write_policy == "write_through_revokable"
+                ), "Inconsistent state."
                 return 0
-            elif host_mem_state == MemoryStateInt.IDLE:
-                self.mem_pool_device.free(device_indices)
-                return len(device_indices)
             elif host_mem_state == MemoryStateInt.RESERVED:
+                assert (
+                    self.write_policy == "write_through_revokable"
+                ), "Inconsistent state."
                 # pending write through, revoke to free device memory
                 if self.write_queue.revoke(host_indices):
                     self.mem_pool_host.free(host_indices)
@@ -292,12 +339,16 @@ class HiCacheController:
                     # failed to revoke, wait for the write operation to complete instead
                     return 0
                 return len(device_indices)
+            elif host_mem_state == MemoryStateInt.IDLE:
+                raise ValueError("Inconsistent states.")
+                # self.mem_pool_device.free(device_indices)
+                # return len(device_indices)
+            elif host_mem_state == MemoryStateInt.BACKUP:
+                raise ValueError("Inconsistent states.")
             elif host_mem_state == MemoryStateInt.SYNCED:
                 self.mem_pool_device.free(device_indices)
                 self.mem_pool_host.update_backup(host_indices)
                 return len(device_indices)
-            elif host_mem_state == MemoryStateInt.BACKUP:
-                raise ValueError("Inconsistent states.")
             else:
                 raise ValueError(f"Invalid state: {host_mem_state}")
 
@@ -306,6 +357,7 @@ class HiCacheController:
             host_mem_state = self.mem_pool_host.get_state(host_indices)
 
             if backup_only and host_mem_state != MemoryStateInt.BACKUP:
+                raise ValueError("Inconsistent states.")
                 # it is recommended to evict host-only KV caches
                 return 0
 
@@ -318,10 +370,12 @@ class HiCacheController:
                 raise ValueError("Double free detected.")
             elif host_mem_state == MemoryStateInt.RESERVED:
                 # not supposed to compete with pending write through
-                return 0
+                raise ValueError("Inconsistent states.")
             elif host_mem_state == MemoryStateInt.PROTECTED:
-                return 0
+                raise ValueError("Inconsistent states.")
             elif host_mem_state == MemoryStateInt.SYNCED:
+                # todo: different behavior for different write policies
+                raise ValueError("Inconsistent states.")
                 self.mem_pool_host.free(host_indices)
                 return len(host_indices)
             else:
@@ -337,6 +391,7 @@ if __name__ == "__main__":
         layer_num=12,
         device="cuda:0",
     )
+    # todo: move into a separate test file
 
     mem_pool_host = MLATokenToKVPoolHost(mem_pool_device)
     controller = HiCacheController(mem_pool_device, mem_pool_host)
