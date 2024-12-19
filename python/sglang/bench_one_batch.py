@@ -387,9 +387,14 @@ def latency_test(
     )
 
     try:
+        import os
+        import pwd
+
         from gemlite.core import GemLiteLinearTriton
-        import os, pwd
-        GemLiteLinearTriton.cache_config(f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json")
+
+        GemLiteLinearTriton.cache_config(
+            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
+        )
     except ImportError:
         pass
 

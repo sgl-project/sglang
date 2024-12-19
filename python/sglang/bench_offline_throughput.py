@@ -309,9 +309,6 @@ def throughput_test(
         dataset_path=bench_args.dataset_path,
     )
 
-    import os, pwd
-    print(f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json")
-
     # Warm up
     if not bench_args.skip_warmup:
         logging.info("\nWarmup...")
@@ -326,9 +323,14 @@ def throughput_test(
         time.sleep(0.5)
 
     try:
+        import os
+        import pwd
+
         from gemlite.core import GemLiteLinearTriton
-        import os, pwd
-        GemLiteLinearTriton.cache_config(f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json")
+
+        GemLiteLinearTriton.cache_config(
+            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
+        )
     except ImportError:
         pass
 
