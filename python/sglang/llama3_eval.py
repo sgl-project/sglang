@@ -71,7 +71,7 @@ TASK_TO_MAX_TOKENS = {
 
 TASK_TO_EVAL_SET = {
     "mmlu": "evals__mmlu__details",
-    "mmlu_0_shot": "evals__mmlu__0_shot__cot__details",
+    "mmlu_cot": "evals__mmlu__0_shot__cot__details",
     "mmlu_pro": "evals__mmlu_pro__details",
     "gsm8k": "evals__gsm8k__details",
 }
@@ -297,7 +297,7 @@ if __name__ == "__main__":
         "--task",
         type=str,
         required=True,
-        help="Task (e.g., mmlu, mmlu_0_shot, mmlu_pro, gsm8k)",
+        help="Task (e.g., mmlu, mmlu_cot, mmlu_pro, gsm8k)",
     )
     parser.add_argument(
         "--num-examples", type=int, default=None, help="Number of examples to process"
