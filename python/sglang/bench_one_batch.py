@@ -385,6 +385,19 @@ def latency_test(
         8,  # shorter decoding to speed up the warmup
         server_args.device,
     )
+
+    try:
+        import os
+        import pwd
+
+        from gemlite.core import GemLiteLinearTriton
+
+        GemLiteLinearTriton.cache_config(
+            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
+        )
+    except ImportError:
+        pass
+
     rank_print("Benchmark ...")
 
     # Run the sweep
