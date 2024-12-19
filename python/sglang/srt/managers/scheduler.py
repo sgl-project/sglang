@@ -983,7 +983,7 @@ class Scheduler:
 
                 if req.is_being_chunked <= 0:
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
+                    req.check_finished(batch.get_hf_eos_token_id())
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -1024,7 +1024,7 @@ class Scheduler:
                 if req.is_being_chunked <= 0:
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
-                    req.check_finished()
+                    req.check_finished(batch.get_hf_eos_token_id())
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -1065,7 +1065,7 @@ class Scheduler:
                 continue
 
             req.output_ids.append(next_token_id)
-            req.check_finished()
+            req.check_finished(batch.get_hf_eos_token_id())
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)

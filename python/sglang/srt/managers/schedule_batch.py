@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -379,7 +379,7 @@ class Req:
 
         return False, ""
 
-    def check_finished(self):
+    def check_finished(self, eos_token_ids: Optional[Set] = None):
         if self.finished():
             return
 
@@ -395,18 +395,23 @@ class Req:
 
         last_token_id = self.output_ids[-1]
 
-        matched_eos = False
+        if not self.sampling_params.ignore_eos:
+            matched_eos = False
 
-        # Check stop token ids
-        if self.sampling_params.stop_token_ids:
-            matched_eos = last_token_id in self.sampling_params.stop_token_ids
-        if self.tokenizer is not None:
-            matched_eos |= last_token_id == self.tokenizer.eos_token_id
-            if self.tokenizer.additional_stop_token_ids:
-                matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
-        if matched_eos and not self.sampling_params.ignore_eos:
-            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-            return
+            # Check stop token ids
+            if self.sampling_params.stop_token_ids:
+                matched_eos = last_token_id in self.sampling_params.stop_token_ids
+            if eos_token_ids:
+                matched_eos |= last_token_id in eos_token_ids
+            if self.tokenizer is not None:
+                matched_eos |= last_token_id == self.tokenizer.eos_token_id
+                if self.tokenizer.additional_stop_token_ids:
+                    matched_eos |= (
+                        last_token_id in self.tokenizer.additional_stop_token_ids
+                    )
+            if matched_eos:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+                return
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
@@ -1132,6 +1137,9 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
         )
+
+    def get_hf_eos_token_id(self) -> Optional[Set]:
+        return self.model_config.get_hf_eos_token_id()
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
