@@ -71,17 +71,9 @@ def apply_torchao_config_to_model(
         )
 
         # try to load gemlite kernel config
-        try:
-            GemLiteLinearTriton.load_config(
-                f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-            )
-            print(
-                f"loaded gemlite kernel cache /tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-            )
-        except:
-            print(
-                f"unable to load gemlite kernel cache /tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-            )
+        GemLiteLinearTriton.load_config(
+            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
+        )
 
     elif "fp8wo" in torchao_config:
         # this requires newer hardware
