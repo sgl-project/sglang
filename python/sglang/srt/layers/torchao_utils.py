@@ -55,7 +55,11 @@ def apply_torchao_config_to_model(
 
         import gemlite
         from gemlite.core import GemLiteLinearTriton, set_autotune
-        from torchao.quantization import gemlite_uintx_weight_only
+        try:
+            from torchao.quantization import gemlite_uintx_weight_only
+        except:
+            print(f"import `gemlite_uintx_weight_only` failed, please use torchao nightly to use gemlite quantization")
+            return model
 
         _quant_args = torchao_config.split("-")
         bit_width = int(_quant_args[-2])
