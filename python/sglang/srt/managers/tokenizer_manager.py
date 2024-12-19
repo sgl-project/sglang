@@ -20,17 +20,21 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
+from concurrent import futures
 from typing import Any, Dict, List, Optional, Union
 
 import fastapi
+import grpc
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.grpc_server import CompletionServicer
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
@@ -60,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
+from sglang.srt.proto import completion_pb2_grpc
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
@@ -169,6 +174,17 @@ class TokenizerManager:
                     "model_name": self.server_args.served_model_name,
                     # TODO: Add lora name/path in the future,
                 },
+            )
+
+        if server_args.grpc_port:
+            t = threading.Thread(
+                target=self._launch_grpc_server_in_loop,
+                name="gRPCServerThread",
+                daemon=True,
+            )
+            t.start()
+            logger.info(
+                f"TokenizerManager: launched gRPC server thread on port {server_args.grpc_port}"
             )
 
     async def generate_request(
@@ -566,8 +582,13 @@ class TokenizerManager:
         loop = asyncio.get_event_loop()
         loop.create_task(self.handle_loop())
 
-        signal_handler = SignalHandler(self)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = SignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        else:
+            # the thread that is used by grpc server doesn't need to handle the signal
+            logger.warning("Skipping add_signal_handler because not in main thread.")
+
         loop.create_task(self.sigterm_watchdog())
 
     async def sigterm_watchdog(self):
@@ -590,7 +611,6 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
-
         while True:
             recv_obj: Union[
                 BatchStrOut,
@@ -788,6 +808,36 @@ class TokenizerManager:
             else:
                 ret.append(None)
         return ret
+
+    def _launch_grpc_server_in_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        server = loop.run_until_complete(self._create_grpc_server())
+        # Start the server before run_forever()
+        loop.run_until_complete(server.start())
+
+        logger.info(
+            f"gRPC server started, listening on {self.server_args.host}:{self.server_args.grpc_port}"
+        )
+        # Keep this loop alive so the server remains accessible
+        loop.run_forever()
+
+    async def _create_grpc_server(self):
+        # Create the server
+        server = grpc.aio.server(
+            options=[
+                ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ]
+        )
+        completion_pb2_grpc.add_CompletionServiceServicer_to_server(
+            CompletionServicer(self.generate_request), server
+        )
+
+        server.add_insecure_port(
+            f"{self.server_args.host}:{self.server_args.grpc_port}"
+        )
+        return server
 
 
 class SignalHandler:

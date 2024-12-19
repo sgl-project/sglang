@@ -509,22 +509,21 @@ def launch_server(
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
     """
-    Launch SRT (SGLang Runtime) Server
+    Launch SRT (SGLang Runtime) Server with either HTTP and gRPC.
 
     The SRT server consists of an HTTP server and the SRT engine.
-
-    1. HTTP server: A FastAPI server that routes requests to the engine.
+    1. HTTP server: A FastAPI server that routes requests to the engine. Alternatively, it can be a gRPC server.
     2. SRT engine:
         1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
         2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
-
     Note:
     1. The HTTP server and TokenizerManager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
     launch_engine(server_args=server_args)
 
+    # Launch HTTP server
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
@@ -551,8 +550,8 @@ def launch_server(
         ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
-        # Listen for HTTP requests
-        uvicorn.run(
+        # Start HTTP server
+        config = uvicorn.Config(
             app,
             host=server_args.host,
             port=server_args.port,
@@ -560,6 +559,9 @@ def launch_server(
             timeout_keep_alive=5,
             loop="uvloop",
         )
+        server = uvicorn.Server(config)
+        server.run()
+
     finally:
         t.join()
 

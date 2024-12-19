@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
+import grpc
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
@@ -38,6 +39,8 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+
+from sglang.srt.proto import completion_pb2, completion_pb2_grpc
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -386,6 +389,118 @@ async def async_request_sglang_generate(
     return output
 
 
+async def async_request_sglang_grpc(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    assert api_url.startswith("grpc://"), "gRPC URL must start with grpc://"
+
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    try:
+        # Create gRPC request with same parameters as FastAPI
+        request = completion_pb2.CompletionRequest(
+            prompt=request_func_input.prompt,
+            temperature=0.0001,
+            top_p=1.0,
+            top_k=-1,
+            max_tokens=request_func_input.output_len,
+            ignore_eos=not args.disable_ignore_eos,
+            stream=not args.disable_stream,
+        )
+
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        ttft = 0.0
+        generated_text = ""
+
+        # Create channel and stub
+        server_addr = api_url[7:]  # Remove grpc:// prefix
+        channel = grpc.aio.insecure_channel(
+            server_addr,
+            options=[
+                ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ],
+        )
+
+        try:
+            stub = completion_pb2_grpc.CompletionServiceStub(channel)
+            response_stream = stub.Complete(request)
+
+            async for response in response_stream:
+                timestamp = time.perf_counter()
+
+                # Handle streaming response similar to FastAPI
+                if ttft == 0.0:
+                    ttft = timestamp - st
+                    output.ttft = ttft
+                else:
+                    output.itl.append(timestamp - most_recent_timestamp)
+
+                most_recent_timestamp = timestamp
+
+                # Accumulate text from each response
+                if response.text:
+                    generated_text = (
+                        response.text
+                    )  # Use latest text as it contains full response
+
+                # Check if this is the final response
+                if response.finished:
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = time.perf_counter() - st
+                    output.output_len = request_func_input.output_len
+                    break
+
+            # Ensure we have final output values set
+            if output.success:
+                output.generated_text = generated_text
+                output.success = True
+                output.latency = time.perf_counter() - st
+                output.output_len = request_func_input.output_len
+
+        except grpc.aio.AioRpcError as rpc_error:
+            # Get the trailing metadata
+            try:
+                metadata = await rpc_error.trailing_metadata()
+                metadata_dict = {k: v for k, v in metadata}
+            except:
+                metadata_dict = {}
+
+            # Build comprehensive error message
+            error_msg = [
+                f"gRPC Error:",
+                f"Status code: {rpc_error.code().name} ({rpc_error.code().value})",
+                f"Details: {rpc_error.details()}",
+                f"Debug error string: {rpc_error.debug_error_string()}",
+            ]
+            if metadata_dict:
+                error_msg.append(f"Metadata: {metadata_dict}")
+
+            output.error = "\n".join(error_msg)
+            output.success = False
+
+        except Exception as e:
+            output.error = f"Stream error: {str(e)}\n{traceback.format_exc()}"
+            output.success = False
+
+        finally:
+            await channel.close()
+
+    except Exception as e:
+        output.error = f"Request creation error: {str(e)}\n{traceback.format_exc()}"
+        output.success = False
+
+    if pbar:
+        pbar.update(1)
+
+    return output
+
+
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -478,6 +593,7 @@ def get_dataset(args, tokenizer):
 
 ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
+    "sglang-grpc": async_request_sglang_grpc,
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
     "vllm": async_request_openai_completions,
@@ -917,11 +1033,14 @@ async def benchmark(
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
+
     test_output = await request_func(request_func_input=test_input)
+
     if not test_output.success:
+        error_msg = test_output.error or "Unknown error occurred"
         raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
+            f"Initial test run failed - Please make sure benchmark arguments "
+            f"are correctly specified.\nError details: {error_msg}"
         )
     else:
         print("Initial test run completed. Starting main benchmark run...")
@@ -1169,6 +1288,9 @@ def run_benchmark(args_: argparse.Namespace):
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
+    if args.backend == "sglang-grpc":
+        # use grpc address
+        api_url = f"grpc://{args.host}:{args.grpc_port}"
     if args.backend in ["sglang", "sglang-native"]:
         api_url = (
             f"{args.base_url}/generate"
@@ -1313,6 +1435,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--port",
+        type=int,
+        help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--grpc-port",
         type=int,
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
     )
