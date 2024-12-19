@@ -290,8 +290,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--provider",
         type=str,
-        default="oai",
-        help="Provider name (e.g., oai, sgl, b10)",
+        default="sgl",
+        help="Provider name (e.g., sgl, oai, b10)",
     )
     parser.add_argument(
         "--task",
