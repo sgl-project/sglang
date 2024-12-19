@@ -699,6 +699,7 @@ class Scheduler:
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
+        # todo, locked memory for hierarchical cache is not leaked
         if available_size != self.max_total_num_tokens:
             msg = (
                 "KV cache pool leak detected!"
@@ -813,7 +814,9 @@ class Scheduler:
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    self.batch_is_full = True
+                    # todo: to be aware of the locked memory for hierarchical cache
+                    # self.batch_is_full = True
+                    pass
                 break
 
         # Update waiting queue
