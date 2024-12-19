@@ -115,12 +115,6 @@ class Scheduler:
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-<<<<<<< HEAD
-=======
-
-        # Session info
-        self.sessions = {}
->>>>>>> aef38977 (minimal change to plug in hierarchical cache)
 
         # Init inter-process communication
         context = zmq.Context(2)
