@@ -58,6 +58,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
+    set_cuda_arch,
 )
 
 logger = logging.getLogger(__name__)
@@ -245,6 +246,8 @@ class ModelRunner:
                 self.model_config.dtype = torch.float16
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
+
+        set_cuda_arch()
 
         # Prepare the model config
         self.load_config = LoadConfig(

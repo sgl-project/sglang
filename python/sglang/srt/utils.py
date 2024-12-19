@@ -95,6 +95,13 @@ def is_flashinfer_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
+def set_cuda_arch():
+    if is_flashinfer_available():
+        capability = torch.cuda.get_device_capability()
+        arch = f"{capability[0]}.{capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
 def is_ipv6(address):
     try:
         ipaddress.IPv6Address(address)
