@@ -252,7 +252,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     @debug_timing
     def transfer(self, indices, flat_data):
-        flat_data = flat_data.to(device=self.device)
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        # todo: less expensive protection
+        torch.cuda.synchronize()
         k_data, v_data = flat_data[0], flat_data[1]
         for i in range(self.layer_num):
             self.k_buffer[i][indices] = k_data[i]
@@ -466,6 +468,7 @@ class MLATokenToKVPoolHost:
             pin_memory=pin_memory,
         )
 
+        # indicates the state of the memory slots
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
@@ -480,7 +483,8 @@ class MLATokenToKVPoolHost:
     @debug_timing
     def transfer(self, indices, flat_data):
         # todo: ensure host memory synchronization
-        flat_data = flat_data.to(device=self.device, non_blocking=True)
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        torch.cuda.synchronize()
         self.kv_buffer[:, :, indices] = flat_data
 
     @synchronized
@@ -491,6 +495,7 @@ class MLATokenToKVPoolHost:
 
     @synchronized
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
+        assert len(indices) > 0, "The indices should not be empty"
         states = self.mem_state[indices]
         assert (
             states == states[0]
@@ -510,18 +515,26 @@ class MLATokenToKVPoolHost:
         return select_index
 
     @synchronized
-    def is_backup(self, indices: torch.Tensor) -> bool:
-        return self.get_state(indices) == MemoryStateInt.BACKUP
+    def is_reserved(self, indices: torch.Tensor) -> bool:
+        return self.get_state(indices) == MemoryStateInt.RESERVED
+
+    @synchronized
+    def is_protected(self, indices: torch.Tensor) -> bool:
+        return self.get_state(indices) == MemoryStateInt.PROTECTED
 
     @synchronized
     def is_synced(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.SYNCED
 
     @synchronized
+    def is_backup(self, indices: torch.Tensor) -> bool:
+        return self.get_state(indices) == MemoryStateInt.BACKUP
+
+    @synchronized
     def update_backup(self, indices: torch.Tensor):
-        # assert torch.all(
-        #     self.mem_state[indices] == MemoryStateInt.SYNCED
-        # ), "The host memory slots should be synced after I/O operations"
+        assert self.is_synced(
+            indices
+        ), "The host memory slots should be synced after I/O operations"
         self.mem_state[indices] = MemoryStateInt.BACKUP
 
     @synchronized
@@ -533,7 +546,7 @@ class MLATokenToKVPoolHost:
 
     @synchronized
     def protect_write(self, indices: torch.Tensor):
-        if not self.get_state(indices) == MemoryStateInt.RESERVED:
+        if not self.is_reserved(indices):
             raise ValueError(
                 "The host memory slots should be reserved before write operations",
                 self.get_state(indices),
@@ -542,7 +555,7 @@ class MLATokenToKVPoolHost:
 
     @synchronized
     def protect_load(self, indices: torch.Tensor):
-        if not self.get_state(indices) == MemoryStateInt.BACKUP:
+        if not self.is_backup(indices):
             raise ValueError(
                 "The host memory slots should be backup before read operations",
                 self.get_state(indices),
@@ -551,7 +564,7 @@ class MLATokenToKVPoolHost:
 
     @synchronized
     def complete_io(self, indices: torch.Tensor):
-        if not self.get_state(indices) == MemoryStateInt.PROTECTED:
+        if not self.is_protected(indices):
             raise ValueError(
                 "The host memory slots should be protected during I/O operations",
                 self.get_state(indices),
