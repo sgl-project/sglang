@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -379,7 +379,7 @@ class Req:
 
         return False, ""
 
-    def check_finished(self):
+    def check_finished(self, eos_token_ids: Optional[Set] = None):
         if self.finished():
             return
 
@@ -401,6 +401,8 @@ class Req:
             # Check stop token ids
             if self.sampling_params.stop_token_ids:
                 matched_eos = last_token_id in self.sampling_params.stop_token_ids
+            if eos_token_ids:
+                matched_eos = last_token_id in eos_token_ids
             if self.tokenizer is not None:
                 matched_eos |= last_token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
@@ -1135,6 +1137,9 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
         )
+
+    def get_hf_eos_token_id(self) -> Optional[Set]:
+        return self.model_config.get_hf_eos_token_id()
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
