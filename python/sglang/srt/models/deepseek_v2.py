@@ -19,6 +19,7 @@
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
@@ -90,6 +91,26 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+class MoEGate(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.topk_method = config.topk_method
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        if self.topk_method == "noaux_tc":
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty((self.n_routed_experts))
+            )
+        else:
+            self.e_score_correction_bias = None
+
+    def forward(self, hidden_states):
+        logits = F.linear(hidden_states, self.weight, None)
+        return logits
+
+
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -114,6 +135,8 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
+        self.gate = MoEGate(config=config)
+
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
@@ -125,11 +148,9 @@ class DeepseekV2MoE(nn.Module):
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
         )
 
-        self.gate = ReplicatedLinear(
-            config.hidden_size, config.n_routed_experts, bias=False, quant_config=None
-        )
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
@@ -439,7 +460,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        rope_scaling["rope_type"] = "deepseek_yarn"
+
+        if rope_scaling:
+            rope_scaling["rope_type"] = "deepseek_yarn"
+
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
@@ -454,6 +478,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
+        else:
+            self.rotary_emb.forward = self.rotary_emb.forward_native
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,

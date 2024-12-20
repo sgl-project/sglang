@@ -566,6 +566,7 @@ class Fp8MoEMethod:
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.fused_moe_triton import FusedMoE
         from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
@@ -580,6 +581,7 @@ class Fp8MoEMethod:
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
         )
 
         # Expert fusion with FP8 quantization

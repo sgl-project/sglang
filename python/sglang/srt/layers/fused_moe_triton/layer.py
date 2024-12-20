@@ -106,6 +106,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -117,6 +118,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
         )
 
     def forward_cuda(
@@ -130,6 +132,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -140,6 +143,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
         )
 
         return fused_experts(
@@ -197,6 +201,7 @@ class FusedMoE(torch.nn.Module):
         tp_size: Optional[int] = None,
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -217,6 +222,7 @@ class FusedMoE(torch.nn.Module):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
+        self.correction_bias = correction_bias
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -513,8 +519,10 @@ class FusedMoE(torch.nn.Module):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.layers.fused_moe_triton.fused_moe import (
+            biased_grouped_topk,
             fused_topk,
             grouped_topk,
         )
@@ -523,14 +531,25 @@ class FusedMoE(torch.nn.Module):
         if use_grouped_topk:
             assert topk_group is not None
             assert num_expert_group is not None
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
+            if correction_bias is None:
+                topk_weights, topk_ids = grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                )
+            else:
+                topk_weights, topk_ids = biased_grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                )
         elif custom_routing_function is None:
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
@@ -562,6 +581,7 @@ class FusedMoE(torch.nn.Module):
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
+            correction_bias=self.correction_bias,
         )
 
         if self.reduce_results and self.tp_size > 1:
