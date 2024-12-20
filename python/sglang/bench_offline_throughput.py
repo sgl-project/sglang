@@ -322,6 +322,18 @@ def throughput_test(
         )
         time.sleep(0.5)
 
+    try:
+        import os
+        import pwd
+
+        from gemlite.core import GemLiteLinearTriton
+
+        GemLiteLinearTriton.cache_config(
+            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
+        )
+    except ImportError:
+        pass
+
     logging.info("\nBenchmark...")
     result = throughput_test_once(
         backend_name=bench_args.backend,
