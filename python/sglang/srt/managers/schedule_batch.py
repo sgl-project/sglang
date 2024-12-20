@@ -379,7 +379,7 @@ class Req:
 
         return False, ""
 
-    def check_finished(self, eos_token_ids: Optional[Set] = None):
+    def check_finished(self, eos_token_ids: Optional[Set[int]] = None):
         if self.finished():
             return
 
@@ -1138,7 +1138,7 @@ class ScheduleBatch:
             input_embeds=self.input_embeds,
         )
 
-    def get_hf_eos_token_id(self) -> Optional[Set]:
+    def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         return self.model_config.get_hf_eos_token_id()
 
     def copy(self):

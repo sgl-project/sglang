@@ -266,7 +266,7 @@ class ModelConfig:
                 )
 
     @lru_cache()
-    def get_hf_eos_token_id(self) -> Optional[Set]:
+    def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids:
             # it can be either int or list of int
