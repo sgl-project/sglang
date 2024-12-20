@@ -11,7 +11,7 @@ import triton
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
-from sglang.srt.layers.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_dtype_str,
     get_config_file_name,
@@ -97,7 +97,7 @@ def benchmark_config(
         input_gating.copy_(gating_output[i])
 
     def run():
-        from sglang.srt.layers.fused_moe_triton import override_config
+        from sglang.srt.layers.moe.fused_moe_triton import override_config
 
         with override_config(config):
             fused_moe(
