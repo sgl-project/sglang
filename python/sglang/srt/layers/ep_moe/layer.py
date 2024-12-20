@@ -19,7 +19,11 @@ from sglang.srt.layers.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
-from sglang.srt.layers.fused_moe_triton.fused_moe import fused_topk, grouped_topk
+from sglang.srt.layers.fused_moe_triton.fused_moe import (
+    biased_grouped_topk,
+    fused_topk,
+    grouped_topk,
+)
 from sglang.srt.layers.fused_moe_triton.layer import FusedMoEMethodBase
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -113,6 +117,7 @@ class EPMoE(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -138,6 +143,7 @@ class EPMoE(torch.nn.Module):
             assert num_expert_group is not None and topk_group is not None
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
+        self.correction_bias = correction_bias
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
@@ -177,6 +183,7 @@ class EPMoE(torch.nn.Module):
             self.renormalize,
             self.topk_group,
             self.num_expert_group,
+            self.correction_bias,
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -305,18 +312,30 @@ class EPMoE(torch.nn.Module):
         renormalize: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ):
         if self.use_grouped_topk:
             assert topk_group is not None
             assert num_expert_group is not None
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
+            if correction_bias is None:
+                topk_weights, topk_ids = grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                )
+            else:
+                topk_weights, topk_ids = biased_grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                )
         else:
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,

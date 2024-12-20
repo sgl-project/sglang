@@ -94,14 +94,12 @@ class DeepseekV2MLP(nn.Module):
 class MoEGate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.topk_method = config.topk_method
         self.weight = nn.Parameter(
-            torch.empty((self.n_routed_experts, self.gating_dim))
+            torch.empty((config.n_routed_experts, config.hidden_size))
         )
-        if self.topk_method == "noaux_tc":
+        if config.topk_method == "noaux_tc":
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((self.n_routed_experts))
+                torch.empty((config.n_routed_experts))
             )
         else:
             self.e_score_correction_bias = None
@@ -167,7 +165,7 @@ class DeepseekV2MoE(nn.Module):
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self.gate(hidden_states)
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
