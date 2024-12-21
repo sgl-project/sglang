@@ -25,9 +25,9 @@ from transformers import (
     CLIPVisionModel,
     LlavaConfig,
     MistralConfig,
+    PixtralVisionConfig,
     Qwen2Config,
     SiglipVisionModel,
-    PixtralVisionConfig, 
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
@@ -554,6 +554,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
+
 class LlavaPixtralForCausalLM(LlavaBaseForCausalLM):
     def __init__(
         self,
@@ -567,7 +568,7 @@ class LlavaPixtralForCausalLM(LlavaBaseForCausalLM):
 
         if getattr(self.config, "vision_config", None) is None:
             self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
-        
+
         if getattr(self.config, "text_config", None) is None:
             self.config.text_config = PixtralVisionConfig(self.config._name_or_path)
 
@@ -576,7 +577,7 @@ class LlavaPixtralForCausalLM(LlavaBaseForCausalLM):
 
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
-        
+
         if getattr(self.config, "image_token_index", None) is None:
             self.config.image_token_index = 32001
 
@@ -587,5 +588,12 @@ class LlavaPixtralForCausalLM(LlavaBaseForCausalLM):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
-         
-EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM, LlavaPixtralForCausalLM]
+
+
+EntryClass = [
+    LlavaLlamaForCausalLM,
+    LlavaQwenForCausalLM,
+    LlavaMistralForCausalLM,
+    LlavaPixtralForCausalLM,
+]
+
