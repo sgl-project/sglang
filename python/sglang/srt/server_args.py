@@ -141,6 +141,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
+    triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
 
@@ -220,12 +221,10 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
-            self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             self.disable_overlap_schedule = True
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
-                f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap scheduler is disabled."
@@ -282,7 +281,15 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
+            choices=[
+                "auto",
+                "pt",
+                "safetensors",
+                "npcache",
+                "dummy",
+                "gguf",
+                "bitsandbytes",
+            ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -293,7 +300,9 @@ class ServerArgs:
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. ',
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -690,11 +699,6 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
-            "--disable-nan-detection",
-            action="store_true",
-            help="Disable the NaN detection for better performance.",
-        )
-        parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
@@ -752,6 +756,12 @@ class ServerArgs:
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
+        )
+        parser.add_argument(
+            "--triton-attention-num-kv-splits",
+            type=int,
+            default=ServerArgs.triton_attention_num_kv_splits,
+            help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
         )
         parser.add_argument(
             "--num-continuous-decode-steps",

@@ -92,7 +92,7 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and not is_hip()
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def is_ipv6(address):
@@ -169,7 +169,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False):
+def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -184,7 +184,8 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 "which may cause useless memory allocation for torch CUDA context.",
             )
 
-        torch.cuda.empty_cache()
+        if empty_cache:
+            torch.cuda.empty_cache()
         free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
@@ -196,7 +197,9 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
                 "which may cause useless memory allocation for torch XPU context.",
             )
-        torch.xpu.empty_cache()
+
+        if empty_cache:
+            torch.xpu.empty_cache()
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
@@ -1068,9 +1071,6 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
 
-    if hasattr(torch, "hip") and torch.hip.is_available():
-        return torch.hip.get_device_name(device_id)
-
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_name(device_id)
 
@@ -1081,9 +1081,6 @@ def get_device_name(device_id: int = 0) -> str:
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability(device_id)
-
-    if hasattr(torch, "hip") and torch.hip.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
