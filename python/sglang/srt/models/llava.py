@@ -596,3 +596,4 @@ EntryClass = [
     LlavaMistralForCausalLM,
     LlavaPixtralForCausalLM,
 ]
+
