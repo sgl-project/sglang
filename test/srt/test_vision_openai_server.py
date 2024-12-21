@@ -14,9 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import openai
 import requests
-from decord import VideoReader, cpu
 from PIL import Image
 
+from decord import VideoReader, cpu
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -442,6 +442,44 @@ class TestMllamaServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
+
+class TestPixtralServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "mistralai/Pixtral-12B-2409"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "pixtral",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
+class TestPixtralLargeServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "mistralai/Pixtral-Large-Instruct-2411"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "pixtral-large",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
