@@ -19,7 +19,6 @@
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-
 logger = logging.get_logger(__name__)
 
 PHI3V_PRETRAINED_CONFIG_ARCHIVE_MAP = {
@@ -95,7 +94,7 @@ class Phi3VConfig(PretrainedConfig):
         sliding_window (`int`, *optional*):
             Sliding window attention window size. If `None`, no sliding window is applied.
         embd_layer (`str`, *optional*, defaults to `"default"`):
-            The embedding layer to use. Can be either `"default"` or `"image"`. "default" uses the standard embedding for text. 
+            The embedding layer to use. Can be either `"default"` or `"image"`. "default" uses the standard embedding for text.
 
     Example:
 
@@ -167,7 +166,6 @@ class Phi3VConfig(PretrainedConfig):
         self.sliding_window = sliding_window
         self.embd_layer = embd_layer
 
-
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -192,7 +190,9 @@ class Phi3VConfig(PretrainedConfig):
         rope_scaling_short_factor = self.rope_scaling.get("short_factor", None)
         rope_scaling_long_factor = self.rope_scaling.get("long_factor", None)
         if rope_scaling_type is None or rope_scaling_type not in ["su", "yarn"]:
-            raise ValueError(f"`rope_scaling`'s type field must be one of ['su', 'yarn'], got {rope_scaling_type}")
+            raise ValueError(
+                f"`rope_scaling`'s type field must be one of ['su', 'yarn'], got {rope_scaling_type}"
+            )
         if not (
             isinstance(rope_scaling_short_factor, list)
             and all(isinstance(x, (int, float)) for x in rope_scaling_short_factor)
@@ -200,7 +200,10 @@ class Phi3VConfig(PretrainedConfig):
             raise ValueError(
                 f"`rope_scaling`'s short_factor field must be a list of numbers, got {rope_scaling_short_factor}"
             )
-        if not len(rope_scaling_short_factor) == self.hidden_size // self.num_attention_heads // 2:
+        if (
+            not len(rope_scaling_short_factor)
+            == self.hidden_size // self.num_attention_heads // 2
+        ):
             raise ValueError(
                 f"`rope_scaling`'s short_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_short_factor)}"
             )
@@ -211,7 +214,10 @@ class Phi3VConfig(PretrainedConfig):
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must be a list of numbers, got {rope_scaling_long_factor}"
             )
-        if not len(rope_scaling_long_factor) == self.hidden_size // self.num_attention_heads // 2:
+        if (
+            not len(rope_scaling_long_factor)
+            == self.hidden_size // self.num_attention_heads // 2
+        ):
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
             )
