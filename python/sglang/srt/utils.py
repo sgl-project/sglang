@@ -1326,3 +1326,4 @@ def parse_tool_response(text, tools, **kwargs):
         for call_info in call_info_list
     ]
     return text, call_info_list
+  
