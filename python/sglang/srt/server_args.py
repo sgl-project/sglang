@@ -113,6 +113,10 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # HiP Attention
+    enable_hip_attention: bool = False
+    hip_attention_config_path: str = None
+
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8

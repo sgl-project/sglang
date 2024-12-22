@@ -19,6 +19,7 @@ from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.layers.attention.hip_attention import HiPModelRunner
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -59,6 +60,9 @@ class TpModelWorker:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
+        ModelRunnerClass = ModelRunner
+        if server_args.enable_hip_attention:
+            ModelRunnerClass = HiPModelRunner
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
