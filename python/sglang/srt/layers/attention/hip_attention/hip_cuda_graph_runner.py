@@ -1,0 +1,2 @@
+class HiPCudaGraphRunner:
+    pass
