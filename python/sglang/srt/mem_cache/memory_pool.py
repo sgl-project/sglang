@@ -22,12 +22,12 @@ BaseTokenToKVPool maps a token location to its KV cache data.
 """
 
 import logging
-from typing import List, Tuple, Union
 import threading
-import psutil
 from enum import IntEnum
 from functools import wraps
+from typing import List, Tuple, Union
 
+import psutil
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -45,7 +45,7 @@ def debug_timing(func):
             tic.record()
             result = func(*args, **kwargs)
             toc.record()
-            toc.synchronize() # Ensure event has been recorded and ready for query in the stream.
+            toc.synchronize()  # Ensure event has been recorded and ready for query in the stream.
             elapsed = tic.elapsed_time(toc)
             indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
             num_tokens = len(indices) if indices is not None else 0
@@ -253,8 +253,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     @debug_timing
     def transfer(self, indices, flat_data):
         flat_data = flat_data.to(device=self.device, non_blocking=False)
-        # todo: less expensive protection
-        torch.cuda.synchronize()
         k_data, v_data = flat_data[0], flat_data[1]
         for i in range(self.layer_num):
             self.k_buffer[i][indices] = k_data[i]
@@ -482,9 +480,9 @@ class MLATokenToKVPoolHost:
 
     @debug_timing
     def transfer(self, indices, flat_data):
-        # todo: ensure host memory synchronization
+        # non_blocking=True only works with pinned memory on a separate stream.
+        # otherwise blocks current stream (https://pytorch.org/tutorials/intermediate/pinmem_nonblock.html)
         flat_data = flat_data.to(device=self.device, non_blocking=False)
-        torch.cuda.synchronize()
         self.kv_buffer[:, :, indices] = flat_data
 
     @synchronized
