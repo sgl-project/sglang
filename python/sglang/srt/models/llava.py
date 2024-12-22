@@ -25,12 +25,12 @@ from transformers import (
     CLIPVisionModel,
     LlavaConfig,
     MistralConfig,
-    Phi3VConfig,
     Qwen2Config,
     SiglipVisionModel,
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
+from sglang.srt.configs import Phi3VConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.mm_utils import (
