@@ -1053,11 +1053,14 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         tool_calls = None
         text = ret_item["text"]
         if request.tool_choice != "none" and (
-            "<|plugin|>" in text or "<function=" in text or "<tool_call>" in text
+            "<|plugin|>" in text
+            or "<function=" in text
+            or "<tool_call>" in text
+            or "<|python_tag|>" in text
         ):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
-            try:  # TODO add json_schema guidance to turbomind
+            try:
                 text, call_info_list = parse_tool_response(text, request.tools)  # noqa
                 tool_calls = [
                     ToolCall(

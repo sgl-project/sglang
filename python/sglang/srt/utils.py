@@ -1313,7 +1313,13 @@ def parse_tool_response(text, tools, **kwargs):
             text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
         else:
             text = ""
-
+    elif "<|python_tag|>" in text:  # llama3.2
+        _, action = text.split("<|python_tag|>")
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
     else:
         raise RuntimeError(f"Unexpected model response: {text}")
 
@@ -1326,4 +1332,3 @@ def parse_tool_response(text, tools, **kwargs):
         for call_info in call_info_list
     ]
     return text, call_info_list
-  
