@@ -65,14 +65,14 @@ from sglang.srt.openai_api.protocol import (
     FileDeleteResponse,
     FileRequest,
     FileResponse,
+    FunctionResponse,
     LogProbs,
+    ToolCall,
     TopLogprob,
     UsageInfo,
-    ToolCall,
-    FunctionResponse
 )
-from sglang.utils import get_exception_traceback
 from sglang.srt.utils import parse_tool_response
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -880,12 +880,13 @@ def v1_chat_generate_request(
                     request.stream = False
                 if not isinstance(request.tool_choice, str):
                     tools = [
-                        item.function.model_dump() for item in request.tools
+                        item.function.model_dump()
+                        for item in request.tools
                         if item.function.name == request.tool_choice.function.name
                     ]
                 else:
                     tools = [item.function.model_dump() for item in request.tools]
-            
+
             if chat_template_name is None:
                 openai_compatible_messages = []
                 for message in request.messages:
@@ -909,7 +910,7 @@ def v1_chat_generate_request(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
-                    tools = tools
+                    tools=tools,
                 )
                 if assistant_prefix:
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
@@ -1047,30 +1048,38 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
         tool_calls = None
         text = ret_item["text"]
-        if request.tool_choice != 'none' and ('<|plugin|>' in text or '<function='
-                                            in text or '<tool_call>' in text):
-            if finish_reason == 'stop':
-                finish_reason = 'tool_calls'
+        if request.tool_choice != "none" and (
+            "<|plugin|>" in text or "<function=" in text or "<tool_call>" in text
+        ):
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
             try:  # TODO add json_schema guidance to turbomind
-                text, call_info_list = parse_tool_response(  # noqa
-                    text, request.tools)
+                text, call_info_list = parse_tool_response(text, request.tools)  # noqa
                 tool_calls = [
-                    ToolCall(id=str(call_info[0]),
-                            function=FunctionResponse(name=call_info[1],
-                                                    arguments=call_info[2]))
+                    ToolCall(
+                        id=str(call_info[0]),
+                        function=FunctionResponse(
+                            name=call_info[1], arguments=call_info[2]
+                        ),
+                    )
                     for call_info in call_info_list
                 ]
             except Exception as e:
-                logger.error(f'Exception: {e}')
+                logger.error(f"Exception: {e}")
                 return create_error_response(
                     HTTPStatus.BAD_REQUEST,
-                    'Failed to parse fc related info to json format!')
-        
+                    "Failed to parse fc related info to json format!",
+                )
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
                 "index": 0,
-                "message": {"role": "assistant", "content": ret_item["text"], "tool_calls": tool_calls},
+                "message": {
+                    "role": "assistant",
+                    "content": ret_item["text"],
+                    "tool_calls": tool_calls,
+                },
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
@@ -1082,7 +1091,9 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
-                message=ChatMessage(role="assistant", content=ret_item["text"], tool_calls=tool_calls),
+                message=ChatMessage(
+                    role="assistant", content=ret_item["text"], tool_calls=tool_calls
+                ),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
                 matched_stop=(
