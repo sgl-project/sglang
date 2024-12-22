@@ -311,6 +311,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
+            logger.error(f"Error: {e}")
             return ORJSONResponse(
                 {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
             )

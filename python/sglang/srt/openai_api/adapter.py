@@ -858,6 +858,7 @@ def v1_chat_generate_request(
     logprob_start_lens = []
     top_logprobs_nums = []
     modalities_list = []
+    lora_paths = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -920,6 +921,7 @@ def v1_chat_generate_request(
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
+        lora_paths.append(request.lora_path)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -958,6 +960,7 @@ def v1_chat_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
+        lora_paths = lora_paths[0]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -975,6 +978,7 @@ def v1_chat_generate_request(
         return_text_in_logprobs=True,
         rid=request_ids,
         modalities=modalities_list,
+        lora_path=lora_paths,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]

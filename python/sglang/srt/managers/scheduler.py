@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -260,7 +260,7 @@ class Scheduler:
         self.current_stream = torch.get_device_module(self.device).current_stream()
 
         # Session info
-        self.sessions = {}
+        self.sessions: Dict[str, Session] = {}
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
