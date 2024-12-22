@@ -1052,7 +1052,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
         tool_calls = None
         text = ret_item["text"]
-        if request.tool_choice != "none" and (
+
+        if isinstance(request, list):
+            tool_choice = request[idx].tool_choice
+            tools = request[idx].tools
+        else:
+            tool_choice = request.tool_choice
+            tools = request.tools
+
+        if tool_choice != "none" and (
             "<|plugin|>" in text
             or "<function=" in text
             or "<tool_call>" in text
@@ -1061,7 +1069,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:
-                text, call_info_list = parse_tool_response(text, request.tools)  # noqa
+                text, call_info_list = parse_tool_response(text, tools)  # noqa
                 tool_calls = [
                     ToolCall(
                         id=str(call_info[0]),
