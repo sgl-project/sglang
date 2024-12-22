@@ -12,7 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
+from typing import Optional
 
+import torch
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,6 +36,7 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        rope: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -47,6 +50,18 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
+
+        # Store RoPE for context extension
+        if rope is not None:
+            if isinstance(self.rope, (list, tuple)):
+                _, self.rope_cos, self.rope_sin = self.rope
+            else:
+                cos_sin = self.rope.cos_sin_cache
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                self.rope_cos = cos.repeat(1, 2)
+                self.rope_sin = sin.repeat(1, 2)
+        else:
+            self.rope_cos = self.rope_sin = None
 
     def forward(
         self,
