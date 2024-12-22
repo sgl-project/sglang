@@ -71,7 +71,8 @@ from sglang.srt.openai_api.protocol import (
     ToolCall,
     FunctionResponse
 )
-from sglang.utils import get_exception_traceback, parse_tool_response
+from sglang.utils import get_exception_traceback
+from sglang.srt.utils import parse_tool_response
 
 logger = logging.getLogger(__name__)
 
