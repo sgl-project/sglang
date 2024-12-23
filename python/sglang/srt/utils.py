@@ -1273,5 +1273,3 @@ def dataclass_to_string_truncated(data, max_length=2048):
         )
     else:
         return str(data)
-
-
