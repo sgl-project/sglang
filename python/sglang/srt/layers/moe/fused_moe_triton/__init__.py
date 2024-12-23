@@ -1,14 +1,12 @@
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-import sglang.srt.layers.fused_moe_triton.fused_moe  # noqa
-from sglang.srt.layers.fused_moe_triton.fused_moe import (
+import sglang.srt.layers.moe.fused_moe_triton.fused_moe  # noqa
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_experts,
-    fused_topk,
     get_config_file_name,
-    grouped_topk,
 )
-from sglang.srt.layers.fused_moe_triton.layer import (
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
@@ -37,8 +35,6 @@ __all__ = [
     "override_config",
     "get_config",
     "fused_moe",
-    "fused_topk",
     "fused_experts",
     "get_config_file_name",
-    "grouped_topk",
 ]
