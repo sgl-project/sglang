@@ -25,12 +25,12 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.fused_moe_patch import fused_moe_forward_native
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
     LogitsProcessorOutput,
 )
+from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
