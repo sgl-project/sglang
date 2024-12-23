@@ -289,10 +289,7 @@ class HiPRadixAttention(AttentionBackend):
                     req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
 
                     layer=layer,
-                    is_prefill=True,
                     is_dense=require_dense,
-                    # k=k[start_len:start_len+seq_len] if k is not None else None,
-                    # v=v[start_len:start_len+seq_len] if v is not None else None,
                 )
                 o[start_len:start_len+seq_len] = o_req
             start_len += seq_len
@@ -326,7 +323,7 @@ class HiPRadixAttention(AttentionBackend):
             is_dense_layer or
             self.hip_config.prefill_always_dense or
             self.hip_config.force_dense or
-            any(map(lambda x: x <= self.hip_config.prefill_dense_threshold, forward_batch.extend_prefix_lens_cpu))
+            any(map(lambda x: x <= self.hip_config.decode_dense_threshold, forward_batch.extend_prefix_lens_cpu))
         )
 
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -346,7 +343,6 @@ class HiPRadixAttention(AttentionBackend):
 
             layer=layer,
             cached_metadata=metadata,
-            is_prefill=False,
             is_dense=require_dense,
         )
 
@@ -369,12 +365,13 @@ class HiPRadixAttention(AttentionBackend):
         layer: RadixAttention,
 
         cached_metadata=None,
-        is_prefill: bool = False,
         is_dense: bool = False,
 
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
+
+        layer_config = self.hip_config.layers[layer.layer_id]
 
         N, HEAD, HID = query.shape
         TDST = N // batch_size
@@ -390,16 +387,11 @@ class HiPRadixAttention(AttentionBackend):
             cache_seq_lens=seq_lens,
             position_ids=positions.view(batch_size, TDST) + 1,
 
-            # mask_k=config_mask_k, # control quadratic cost
-            # block_size_q=32 if IS_GEMMA else 64,
-            # block_stride_q=2 if IS_GEMMA else config_bsq,
             block_size_k=32 if is_gemma else 64,  # BLOCK_CHUNK
             block_stride_k=1 if is_gemma else 1,
 
-            # sliding_window_size=(8192 if is_dense else 1024) if self.stages is None else self.stages_sliding_window_size,
-            # sink_token_size=(8192 if is_dense else 256) if self.stages is None else self.stages_sink_token_size,
-            sliding_window_size=1024,
-            sink_token_size=256,
+            sliding_window_size=layer_config.sliding_window_size,
+            sink_token_size=layer_config.sink_token_size,
 
             using_extend=True,
             need_apply_rope=True,
@@ -413,14 +405,14 @@ class HiPRadixAttention(AttentionBackend):
             (query * sm_scale).to(query.dtype),
             k, v,
             args=args,
-            second_stage_k=(self.hip_config.second_k_dense if is_dense else self.hip_config.second_k),
-            stages=self.hip_config.stages,
+            second_stage_k=layer_config.second_stage_k,
+            stages=layer_config.stages,
             model_context_length=self.hip_config.extend_context_length,
             cached_metadata=cached_metadata,
             block_sparse_block_size_q=64,
             scan_extend_backend=('relative' if self.hip_config.apply_v_dot
                                  else ('streaming' if is_dense else 'relative')),
-            sa_extend_backend=self.hip_config.sa_extend_backend,
+            sa_extend_backend=layer_config.sa_extend_backend,
         )
         context = context.to(query.dtype)
 
