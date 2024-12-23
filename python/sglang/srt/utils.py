@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import pickle
-import pwd
 import random
 import re
 import resource
@@ -1276,12 +1275,3 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return str(data)
 
 
-def load_gemlite_cache():
-    try:
-        from gemlite.core import GemLiteLinearTriton
-
-        GemLiteLinearTriton.cache_config(
-            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-        )
-    except ImportError:
-        pass

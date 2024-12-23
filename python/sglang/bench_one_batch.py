@@ -63,12 +63,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    configure_logger,
-    kill_process_tree,
-    load_gemlite_cache,
-    suppress_other_loggers,
-)
+from sglang.srt.utils import configure_logger, kill_process_tree, suppress_other_loggers
 
 
 @dataclasses.dataclass
