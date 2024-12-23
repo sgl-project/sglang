@@ -63,7 +63,12 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, kill_process_tree, suppress_other_loggers
+from sglang.srt.utils import (
+    configure_logger,
+    kill_process_tree,
+    load_gemlite_cache,
+    suppress_other_loggers,
+)
 
 
 @dataclasses.dataclass
@@ -385,18 +390,6 @@ def latency_test(
         8,  # shorter decoding to speed up the warmup
         server_args.device,
     )
-
-    try:
-        import os
-        import pwd
-
-        from gemlite.core import GemLiteLinearTriton
-
-        GemLiteLinearTriton.cache_config(
-            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-        )
-    except ImportError:
-        pass
 
     rank_print("Benchmark ...")
 
