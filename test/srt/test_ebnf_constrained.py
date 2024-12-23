@@ -236,7 +236,7 @@ class TestEBNFConstrained(unittest.TestCase):
         )
 
 
-class TestJumpForward(unittest.TestCase):
+class TestJumpForward(TestEBNFConstrained):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, disable_overlap=True)
