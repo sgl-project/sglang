@@ -772,8 +772,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
     def _is_8bit_weight_name(self, weight_name: str):
         quantized_suffix = {".scb", ".weight_format"}
-        return any(weight_name.lower().endswith(suffix)
-                   for suffix in quantized_suffix)
+        return any(weight_name.lower().endswith(suffix) for suffix in quantized_suffix)
 
     def _is_4bit_weight_name(self, weight_name: str):
         quantized_suffix = {
@@ -785,11 +784,13 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         }
         suffix = weight_name.split(".")[-1]
         return any(q_suffix in suffix for q_suffix in quantized_suffix)
-    
-    def _quantized_8bit_generator(self, hf_weights_files, use_safetensors,
-                                  quant_state_dict) -> Generator:
+
+    def _quantized_8bit_generator(
+        self, hf_weights_files, use_safetensors, quant_state_dict
+    ) -> Generator:
         for weight_name, weight_tensor in self._hf_weight_iter(
-                hf_weights_files, use_safetensors):
+            hf_weights_files, use_safetensors
+        ):
             if not weight_name.lower().endswith(".scb"):
                 continue
 
@@ -797,7 +798,8 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             quant_state_dict[weight_key] = weight_tensor
 
         for weight_name, weight_tensor in self._hf_weight_iter(
-                hf_weights_files, use_safetensors):
+            hf_weights_files, use_safetensors
+        ):
             if self._is_8bit_weight_name(weight_name):
                 continue
 
