@@ -627,6 +627,19 @@ class ServerArgs:
             help="The type of heavy channels in double sparsity attention",
         )
 
+        # HiP Attention
+        parser.add_argument(
+            "--enable-hip-attention",
+            action="store_true",
+            help="Enable HiP attention.",
+        )
+        parser.add_argument(
+            "--hip-attention-config-path",
+            type=str,
+            default=ServerArgs.hip_attention_config_path,
+            help="Path to the HiP attention config.",
+        )
+
         # LoRA
         parser.add_argument(
             "--lora-paths",

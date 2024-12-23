@@ -566,6 +566,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
             )
+        self.hip_metadata_cache_pool = None
         if self.server_args.enable_hip_attention:
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
                 self.max_total_num_tokens,

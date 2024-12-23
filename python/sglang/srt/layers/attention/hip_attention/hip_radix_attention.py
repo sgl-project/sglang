@@ -28,8 +28,8 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.layers.attention.hip_attention import HiPModelRunner
-    from sglang.srt.layers.attention.hip_attention.hip_config import HipAttentionConfig
+    from sglang.srt.model_executor.hip_model_runner import HiPModelRunner
+    from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
 
 from hip.models.hip_attention.attention2_draft_sampling_extend import dual_stage_quadratic_hip_attention
 from hip import HiPAttentionArgs
@@ -51,12 +51,12 @@ class WrapperDispatch(Enum):
     CROSS_ATTENTION = auto()
 
 
-class HiPRadixAttention(AttentionBackend):
+class HiPRadixAttentionBackend(AttentionBackend):
 
     def __init__(self, model_runner: HiPModelRunner):
         super().__init__()
 
-        self.hip_config: HipAttentionConfig = model_runner.hip_attention_config
+        self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config
 
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
@@ -245,9 +245,8 @@ class HiPRadixAttention(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        is_dense_layer = layer.layer_id in self.hip_config.dense_layers
         require_dense = (
-            is_dense_layer or
+            layer.layer_id in self.hip_config.dense_layers or
             self.hip_config.prefill_always_dense or
             self.hip_config.force_dense or
             any(map(lambda x: x <= self.hip_config.prefill_dense_threshold, forward_batch.extend_prefix_lens_cpu))
@@ -318,12 +317,10 @@ class HiPRadixAttention(AttentionBackend):
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-        is_dense_layer = layer.layer_id in self.hip_config.dense_layers
         require_dense = (
-            is_dense_layer or
-            self.hip_config.prefill_always_dense or
-            self.hip_config.force_dense or
-            any(map(lambda x: x <= self.hip_config.decode_dense_threshold, forward_batch.extend_prefix_lens_cpu))
+            layer.layer_id in self.hip_config.dense_layers or
+            self.hip_config.decode_always_dense or
+            self.hip_config.force_dense
         )
 
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -374,12 +371,26 @@ class HiPRadixAttention(AttentionBackend):
         v: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
 
-        layer_config = self.hip_config.layers[layer.layer_id]
+        if len(self.hip_config.layers) == 2:
+            layer_config = self.hip_config.layers[0 if is_dense else 1]
+        else:
+            layer_config = self.hip_config.layers[layer.layer_id]
 
-        N, HEAD, HID = query.shape
-        TDST = N // batch_size
+        N, num_heads, hidden_dims = query.shape
+        dst_seq_len = N // batch_size
+
+        N_PAGE, num_heads_kv, hidden_dims_kv = k_cache.shape
+        assert v_cache.shape == k_cache.shape
+        assert hidden_dims_kv == hidden_dims
+
+        query = query.view(batch_size, dst_seq_len, num_heads, hidden_dims)
+        k_cache = k_cache.view(N_PAGE, 1, num_heads_kv, hidden_dims)
+        v_cache = v_cache.view(N_PAGE, 1, num_heads_kv, hidden_dims)
 
         block_table = req_to_tokens.index_select(dim=0, index=req_pool_indices)
+
+        BLOCK_TABLE_BSZ, MODEL_SEQ_LEN = block_table.shape
+        assert batch_size == BLOCK_TABLE_BSZ
 
         is_gemma = layer.logit_cap != 0.0  # FIXME: find better way to detect Gemma
 
@@ -388,7 +399,7 @@ class HiPRadixAttention(AttentionBackend):
             v_cache=v_cache.view(torch.uint8) if v_cache.dtype == torch.float8_e5m2 else v_cache,
             block_table=block_table,
             cache_seq_lens=seq_lens,
-            position_ids=positions.view(batch_size, TDST) + 1,
+            position_ids=positions.view(batch_size, dst_seq_len) + 1,
 
             block_size_k=32 if is_gemma else 64,  # BLOCK_CHUNK
             block_stride_k=1 if is_gemma else 1,
@@ -419,7 +430,7 @@ class HiPRadixAttention(AttentionBackend):
         )
         context = context.to(query.dtype)
 
-        return context.view(N, HEAD, HID), metadata
+        return context.view(N, num_heads, hidden_dims), metadata
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
