@@ -18,11 +18,7 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_flashinfer_available,
-    should_use_tensor_core,
-)
+from sglang.srt.utils import is_flashinfer_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -731,3 +727,51 @@ def create_flashinfer_kv_indices_triton(
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+
+
+def should_use_tensor_core(
+    kv_cache_dtype: torch.dtype,
+    num_attention_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    """
+    Determine whether to use tensor cores for attention computation.
+
+    Args:
+        kv_cache_dtype: Data type of the KV cache
+        num_attention_heads: Number of attention heads
+        num_kv_heads: Number of key/value heads
+
+    Returns:
+        bool: Whether to use tensor cores
+    """
+    # Try to use environment variable first
+    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
+    if env_override is not None:
+        return env_override.lower() == "true"
+
+    # Try to use _grouped_size_compiled_for_decode_kernels if available
+    # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
+    try:
+        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+
+        if not _grouped_size_compiled_for_decode_kernels(
+            num_attention_heads,
+            num_kv_heads,
+        ):
+            return True
+        else:
+            return False
+    except (ImportError, AttributeError):
+        pass
+
+    # Calculate GQA group size
+    gqa_group_size = num_attention_heads // num_kv_heads
+
+    # Determine based on dtype and GQA group size
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return True
+    elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
+        return gqa_group_size > 4
+    else:
+        return False
