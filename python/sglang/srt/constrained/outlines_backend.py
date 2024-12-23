@@ -20,8 +20,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import interegular
 import torch
 from outlines.fsm.guide import RegexGuide
-from outlines.fsm.json_schema import build_regex_from_schema
 from outlines.models.transformers import TransformerTokenizer
+from outlines_core.fsm.json_schema import build_regex_from_schema
 from pydantic import BaseModel
 
 from sglang.srt.constrained.base_grammar_backend import (
