@@ -407,7 +407,7 @@ def openai_completion_stream(
     if "ebnf" in kwargs:
         warnings.warn("EBNF is not officially supported by OpenAI endpoints. Ignoring.")
         del kwargs["ebnf"]
-        
+
     for attempt in range(retries):
         try:
             if is_chat:

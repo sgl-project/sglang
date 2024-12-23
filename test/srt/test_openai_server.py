@@ -3,10 +3,11 @@ python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
 python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
 
 """
+
 import json
+import re
 import time
 import unittest
-import re
 
 import openai
 
@@ -534,6 +535,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .startswith('"name": "SmartHome Mini",')
         )
 
+
 # -------------------------------------------------------------------------
 #    EBNF Test Class: TestOpenAIServerEBNF
 #    Launches the server with xgrammar, has only EBNF tests
@@ -604,7 +606,10 @@ class TestOpenAIServerEBNF(unittest.TestCase):
             model=self.model,
             messages=[
                 {"role": "system", "content": "EBNF mini-JSON generator."},
-                {"role": "user", "content": "Generate single key JSON with only letters."},
+                {
+                    "role": "user",
+                    "content": "Generate single key JSON with only letters.",
+                },
             ],
             temperature=0,
             max_tokens=64,
@@ -613,7 +618,9 @@ class TestOpenAIServerEBNF(unittest.TestCase):
         text = response.choices[0].message.content.strip()
         print("EBNF strict JSON test output:", repr(text))
         self.assertTrue(len(text) > 0, "Got empty text from EBNF strict JSON test")
-        self.assertRegex(text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape")
+        self.assertRegex(
+            text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape"
+        )
 
 
 if __name__ == "__main__":

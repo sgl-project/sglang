@@ -357,4 +357,3 @@ class EmbeddingResponse(BaseModel):
     model: str
     object: str = "list"
     usage: Optional[UsageInfo] = None
-    
