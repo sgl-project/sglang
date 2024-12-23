@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from hip.models.hip_attention.attention2_draft_sampling_extend import dual_stage_quadratic_hip_attention
-
 """
 Support different attention backends.
 Now there are two backends: FlashInfer and Triton.
@@ -30,9 +28,11 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.layers.attention.hip_attention import HiPModelRunner
     from sglang.srt.layers.attention.hip_attention.hip_config import HipAttentionConfig
 
-from hip import paged_hip_attention, HiPAttentionArgs
+from hip.models.hip_attention.attention2_draft_sampling_extend import dual_stage_quadratic_hip_attention
+from hip import HiPAttentionArgs
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -53,7 +53,7 @@ class WrapperDispatch(Enum):
 
 class HiPRadixAttention(AttentionBackend):
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: HiPModelRunner):
         super().__init__()
 
         self.hip_config: HipAttentionConfig = model_runner.hip_attention_config
@@ -327,6 +327,7 @@ class HiPRadixAttention(AttentionBackend):
         )
 
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache()
 
         o, metadata = self.forward_paged_hip(
             query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -345,6 +346,8 @@ class HiPRadixAttention(AttentionBackend):
             cached_metadata=metadata,
             is_dense=require_dense,
         )
+
+        forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
