@@ -60,8 +60,8 @@ def fp8_get_quant_method(self, layer, prefix):
         is_layer_skipped,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.linear import UnquantizedLinearMethod
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
     if isinstance(layer, LinearBase):
@@ -80,7 +80,7 @@ def gptq_get_quant_method(self, layer, prefix):
         GPTQMarlinMoEMethod,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return GPTQMarlinLinearMethod(self)
@@ -96,7 +96,7 @@ def awq_get_quant_method(self, layer, prefix):
         AWQMoEMethod,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return AWQMarlinLinearMethod(self)

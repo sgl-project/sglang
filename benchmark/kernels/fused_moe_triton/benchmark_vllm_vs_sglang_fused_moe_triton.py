@@ -5,7 +5,9 @@ import triton
 from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
-from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe as fused_moe_sglang
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    fused_moe as fused_moe_sglang,
+)
 
 
 def get_model_config(model_name: str, tp_size: int):
