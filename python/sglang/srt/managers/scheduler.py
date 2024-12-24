@@ -468,9 +468,6 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightFromDiskReqOutput(success, message)
                 )
-            elif isinstance(recv_req, GetWeightsByNameReqInput):
-                parameter = self.get_weights_by_name(recv_req)
-                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 success, message = self.init_weights_update_group(recv_req)
                 self.send_to_tokenizer.send_pyobj(
