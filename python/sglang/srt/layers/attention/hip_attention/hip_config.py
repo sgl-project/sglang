@@ -21,7 +21,7 @@ _DEFAULT_STAGES = [
     ScanStage(
         stage_block_size_q=64,
         stage_block_stride_q=1,
-        stage_chunk_size=16,
+        stage_chunk_size=8,
         stage_k=8192,
         stage_stride=1,
     ),
@@ -58,16 +58,16 @@ class HiPAttentionPerLayerConfig:
 
 @dataclass
 class HiPAttentionConfig:
-    extend_context_length: int = 32768
+    extend_context_length: int = 131072
     apply_v_dot: bool = False
-    dense_layers: list[int] = field(default_factory=lambda: [0, 1, 2, 3])
+    dense_layers: list[int] = field(default_factory=lambda: [0, 1, 2])
     prefill_always_dense: bool = False
     decode_always_dense: bool = False
     force_dense: bool = False
     prefill_dense_threshold: int = 8192
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
-        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 2048}),
-        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096}),
+        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 8192, 'sink_token_size': 8192}),
+        HiPAttentionPerLayerConfig(),
     ])
 
     parsed_json: InitVar[dict | None] = None
