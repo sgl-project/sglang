@@ -366,6 +366,11 @@ class OpenAI(BaseBackend):
 def openai_completion(
     client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
 ):
+    # if "ebnf" is in kwargs, warn and remove
+    if "ebnf" in kwargs:
+        warnings.warn("EBNF is not officially supported by OpenAI endpoints. Ignoring.")
+        del kwargs["ebnf"]
+
     for attempt in range(retries):
         try:
             if is_chat:
@@ -398,6 +403,11 @@ def openai_completion(
 def openai_completion_stream(
     client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
 ):
+    # if "ebnf" is in kwargs, warn and remove
+    if "ebnf" in kwargs:
+        warnings.warn("EBNF is not officially supported by OpenAI endpoints. Ignoring.")
+        del kwargs["ebnf"]
+
     for attempt in range(retries):
         try:
             if is_chat:
