@@ -20,7 +20,6 @@ import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -37,6 +36,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 
 class MiniCPMMLP(nn.Module):
@@ -275,7 +275,6 @@ class MiniCPMForCausalLM(nn.Module):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -308,12 +307,10 @@ class MiniCPMForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
-            lm_head_weight = self.model.embed_tokens.weight
+            lm_head = self.model.embed_tokens
         else:
-            lm_head_weight = self.lm_head.weight
-        return self.logits_processor(
-            input_ids, hidden_states, lm_head_weight, forward_batch
-        )
+            lm_head = self.lm_head
+        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

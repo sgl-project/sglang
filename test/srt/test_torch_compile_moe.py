@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchCompile(unittest.TestCase):
+class TestTorchCompileMoe(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
@@ -23,12 +23,12 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "1"],
+            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "8"],
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(

@@ -29,11 +29,9 @@ class LlamaForSequenceClassification(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.torchao_config = None
         self.quant_config = quant_config
         self.num_labels = config.num_labels
         self.model = LlamaModel(config, quant_config=quant_config)
@@ -84,9 +82,8 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
-        super().__init__(config, quant_config, cache_config)
+        super().__init__(config, quant_config)
         self.weights = self.Weights(config.hidden_size, self.num_labels)
 
     @torch.no_grad()

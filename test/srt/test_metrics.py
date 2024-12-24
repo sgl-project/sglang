@@ -2,7 +2,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -51,8 +51,10 @@ class TestEnableMetrics(unittest.TestCase):
             # Verify essential metrics are present
             essential_metrics = [
                 "sglang:num_running_reqs",
+                "sglang:num_used_tokens",
                 "sglang:token_usage",
                 "sglang:gen_throughput",
+                "sglang:num_queue_reqs",
                 "sglang:cache_hit_rate",
                 "sglang:func_latency_seconds",
                 "sglang:prompt_tokens_total",
@@ -75,7 +77,7 @@ class TestEnableMetrics(unittest.TestCase):
             self.assertIn("_bucket{", metrics_content)
 
         finally:
-            kill_child_process(process.pid, include_self=True)
+            kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":

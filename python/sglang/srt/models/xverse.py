@@ -30,7 +30,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -40,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 
 class XverseMLP(nn.Module):
@@ -295,8 +295,6 @@ class XverseForCausalLM(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
-        efficient_weight_load=False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -315,7 +313,7 @@ class XverseForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(

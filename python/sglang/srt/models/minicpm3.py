@@ -27,7 +27,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -40,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_flashinfer_available
 
 if is_flashinfer_available():
@@ -105,7 +105,6 @@ class MiniCPM3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -249,7 +248,6 @@ class MiniCPM3AttentionMLA(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -406,7 +404,6 @@ class MiniCPM3DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -430,7 +427,6 @@ class MiniCPM3DecoderLayer(nn.Module):
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
                 max_position_embeddings=max_position_embeddings,
-                cache_config=cache_config,
                 quant_config=quant_config,
                 layer_id=layer_id,
             )
@@ -449,7 +445,6 @@ class MiniCPM3DecoderLayer(nn.Module):
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
                 max_position_embeddings=max_position_embeddings,
-                cache_config=cache_config,
                 quant_config=quant_config,
                 layer_id=layer_id,
             )
@@ -498,7 +493,6 @@ class MiniCPM3Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -512,9 +506,7 @@ class MiniCPM3Model(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                MiniCPM3DecoderLayer(
-                    config, i, cache_config=cache_config, quant_config=quant_config
-                )
+                MiniCPM3DecoderLayer(config, i, quant_config=quant_config)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -549,7 +541,6 @@ class MiniCPM3ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -557,9 +548,7 @@ class MiniCPM3ForCausalLM(nn.Module):
 
         self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
-        self.model = MiniCPM3Model(
-            config, cache_config=cache_config, quant_config=quant_config
-        )
+        self.model = MiniCPM3Model(config, quant_config=quant_config)
         # self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if not self.config.tie_word_embeddings:
             self.lm_head = ParallelLMHead(
@@ -585,12 +574,10 @@ class MiniCPM3ForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
-            lm_head_weight = self.model.embed_tokens.weight
+            lm_head = self.model.embed_tokens
         else:
-            lm_head_weight = self.lm_head.weight
-        return self.logits_processor(
-            input_ids, hidden_states, lm_head_weight, forward_batch
-        )
+            lm_head = self.lm_head
+        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

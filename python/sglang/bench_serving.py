@@ -25,6 +25,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
@@ -50,6 +51,7 @@ class RequestFuncInput:
     prompt_len: int
     output_len: int
     model: str
+    lora_name: str
     extra_request_body: Dict[str, Any]
 
 
@@ -318,6 +320,9 @@ async def async_request_sglang_generate(
                 "ignore_eos": not args.disable_ignore_eos,
             },
             "stream": not args.disable_stream,
+            "lora_path": request_func_input.lora_name,
+            "return_logprob": args.return_logprob,
+            "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
         headers = {}
@@ -407,7 +412,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "False").lower() == "true":
+    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
         import huggingface_hub.constants
         from modelscope import snapshot_download
 
@@ -693,6 +698,19 @@ def gen_prompt(tokenizer, token_num):
     return tokenizer.decode(selected_tokens)
 
 
+def get_gen_prefix_cache_path(args, tokenizer):
+    """Create cache directory under ~/.cache/sglang/benchmark"""
+    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
+
+    # Create a unique cache filename based on the generation parameters
+    cache_key = (
+        f"gen_prefix_{args.gen_num_groups}_{args.gen_prompts_per_group}_"
+        f"{args.gen_system_prompt_len}_{args.gen_question_len}_{args.gen_output_len}_"
+        f"{tokenizer.__class__.__name__}.pkl"
+    )
+    return cache_dir / cache_key
+
+
 def sample_generated_shared_prefix_requests(
     num_groups: int,
     prompts_per_group: int,
@@ -701,12 +719,17 @@ def sample_generated_shared_prefix_requests(
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
 ) -> List[Tuple[str, int, int]]:
-    if args.generated_input_path and os.path.exists(args.generated_input_path):
-        print(f"\nloading generated input data from {args.generated_input_path}")
-        with open(args.generated_input_path, "rb") as f:
+    """Generate benchmark requests with shared system prompts using random tokens and caching."""
+    cache_path = get_gen_prefix_cache_path(args, tokenizer)
+
+    # Try to load from cache first
+    if cache_path.exists():
+        print(f"\nLoading cached generated input data from {cache_path}")
+        with open(cache_path, "rb") as f:
             return pickle.load(f)
 
-    """Generate benchmark requests with shared system prompts using random tokens."""
+    print("\nGenerating new input data...")
+
     # Generate system prompts for each group
     system_prompts = []
     for _ in range(num_groups):
@@ -719,9 +742,6 @@ def sample_generated_shared_prefix_requests(
         question = gen_prompt(tokenizer, question_len)
         questions.append(question)
 
-    # Shuffle questions
-    random.shuffle(questions)
-
     # Combine system prompts with questions
     input_requests = []
     total_input_tokens = 0
@@ -729,7 +749,9 @@ def sample_generated_shared_prefix_requests(
 
     for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
-        for prompt_idx in tqdm(range(prompts_per_group), desc="Generating questions"):
+        for prompt_idx in tqdm(
+            range(prompts_per_group), desc="Generating questions", leave=False
+        ):
             question = questions[group_idx * prompts_per_group + prompt_idx]
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
@@ -738,6 +760,10 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_len
 
+    # Shuffle questions
+    random.shuffle(input_requests)
+
+    # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
@@ -750,11 +776,12 @@ def sample_generated_shared_prefix_requests(
     print(
         f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
     )
-    if args.generated_input_save_path:
-        print(f"Saving generated input data to {args.generated_input_save_path}")
-        os.makedirs(os.path.dirname(args.generated_input_save_path), exist_ok=True)
-        with open(args.generated_input_save_path, "wb") as f:
-            pickle.dump(input_requests, f)
+
+    # Save to cache
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Caching generated input data to {cache_path}")
+    with open(cache_path, "wb") as f:
+        pickle.dump(input_requests, f)
 
     return input_requests
 
@@ -861,6 +888,7 @@ async def benchmark(
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
+    lora_name: str,
     extra_request_body: Dict[str, Any],
     profile: bool,
 ):
@@ -885,7 +913,8 @@ async def benchmark(
         prompt=test_prompt,
         api_url=api_url,
         prompt_len=test_prompt_len,
-        output_len=test_output_len,
+        output_len=min(test_output_len, 32),
+        lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
@@ -895,6 +924,7 @@ async def benchmark(
             f"are correctly specified. Error: {test_output.error}"
         )
     else:
+        requests.post(base_url + "/flush_cache")
         print("Initial test run completed. Starting main benchmark run...")
 
     time.sleep(1.5)
@@ -919,6 +949,7 @@ async def benchmark(
             api_url=api_url,
             prompt_len=prompt_len,
             output_len=output_len,
+            lora_name=lora_name,
             extra_request_body=extra_request_body,
         )
         tasks.append(
@@ -1224,6 +1255,7 @@ def run_benchmark(args_: argparse.Namespace):
                 request_rate=args.request_rate,
                 max_concurrency=args.max_concurrency,
                 disable_tqdm=args.disable_tqdm,
+                lora_name=args.lora_name,
                 extra_request_body=extra_request_body,
                 profile=args.profile,
             )
@@ -1244,6 +1276,7 @@ def run_benchmark(args_: argparse.Namespace):
                     request_rate=rate,
                     max_concurrency=args.max_concurrency,
                     disable_tqdm=args.disable_tqdm,
+                    lora_name=args.lora_name,
                     extra_request_body=extra_request_body,
                     profile=args.profile,
                 )
@@ -1384,6 +1417,11 @@ if __name__ == "__main__":
         help="Disable ignoring EOS.",
     )
     parser.add_argument(
+        "--return-logprob",
+        action="store_true",
+        help="Return logprob.",
+    )
+    parser.add_argument(
         "--extra-request-body",
         metavar='{"key1": "value1", "key2": "value2"}',
         type=str,
@@ -1423,20 +1461,16 @@ if __name__ == "__main__":
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
     )
     parser.add_argument(
-        "--generated-input-save-path",
-        type=str,
-        help="Path to save generated input data",
-    )
-    parser.add_argument(
-        "--generated-input-path",
-        type=str,
-        help="Path to load previously generated input data",
-    )
-    parser.add_argument(
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--lora-name",
+        type=str,
+        default=None,
+        help="The name of LoRA adapter",
     )
     args = parser.parse_args()
     run_benchmark(args)

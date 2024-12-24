@@ -49,7 +49,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
@@ -62,10 +61,11 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import get_compiler_backend, set_weight_attrs
 
 
-@torch.compile
+@torch.compile(backend=get_compiler_backend())
 def layer_norm_func(hidden_states, weight, variance_epsilon):
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
@@ -318,7 +318,6 @@ class CohereForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -339,7 +338,7 @@ class CohereForCausalLM(nn.Module):
             forward_batch,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens.weight, forward_batch
+            input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

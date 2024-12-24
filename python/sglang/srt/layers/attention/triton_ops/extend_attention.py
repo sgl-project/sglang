@@ -284,6 +284,9 @@ def extend_attention_fwd(
     elif Lq == 288:
         BLOCK_DMODEL = 256
         BLOCK_DPE = 32
+    elif Lq == 192:
+        BLOCK_DMODEL = 128
+        BLOCK_DPE = 64
     else:
         BLOCK_DMODEL = triton.next_power_of_2(Lq)
         BLOCK_DPE = 0

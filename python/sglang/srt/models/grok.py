@@ -16,29 +16,25 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Grok1 model."""
 
-import warnings
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.fused_moe_grok import FusedMoE
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -46,6 +42,41 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+
+class Grok1MLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        reduce_results=True,
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+            reduce_results=reduce_results,
+        )
+        self.act_fn = GeluAndMul(approximate="tanh")
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 class Grok1MoE(nn.Module):
@@ -59,6 +90,7 @@ class Grok1MoE(nn.Module):
 
     def __init__(
         self,
+        config: PretrainedConfig,
         num_experts: int,
         top_k: int,
         hidden_size: int,
@@ -66,6 +98,7 @@ class Grok1MoE(nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
+        reduce_results=True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -79,13 +112,16 @@ class Grok1MoE(nn.Module):
             quant_config=None,
         )
 
+        self.router_logit_softcapping = getattr(
+            config, "router_logit_softcapping", 30.0
+        )
         self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
-            reduce_results=True,
+            reduce_results=reduce_results,
             renormalize=False,
             quant_config=quant_config,
             tp_size=tp_size,
@@ -95,9 +131,12 @@ class Grok1MoE(nn.Module):
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         router_logits = 30.0 * F.tanh(router_logits / 30.0)
+
+        # need to assert self.gate.quant_method is unquantized
         final_hidden_states = self.experts(hidden_states, router_logits)
         return final_hidden_states.view(orig_shape)
 
@@ -105,16 +144,18 @@ class Grok1MoE(nn.Module):
 class Grok1Attention(nn.Module):
     def __init__(
         self,
+        config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
-        logit_cap: float = 30,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+        self.config = config
+        self.layer_id = layer_id
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -130,7 +171,7 @@ class Grok1Attention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = 128
+        self.head_dim = getattr(config, "head_dim", 128)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -144,7 +185,6 @@ class Grok1Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -158,6 +198,9 @@ class Grok1Attention(nn.Module):
             base=int(self.rope_theta),
             is_neox_style=True,
         )
+
+        logit_cap = max(getattr(config, "attn_logit_softcapping", 30.0), 0.0)
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -166,7 +209,6 @@ class Grok1Attention(nn.Module):
             layer_id=layer_id,
             logit_cap=logit_cap,
         )
-        # TODO(lianmin): load logit cap from config
 
     def forward(
         self,
@@ -190,10 +232,12 @@ class Grok1DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+        self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
 
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = Grok1Attention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -203,11 +247,17 @@ class Grok1DecoderLayer(nn.Module):
             quant_config=quant_config,
         )
         self.block_sparse_moe = Grok1MoE(
+            config=config,
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=getattr(
+                config,
+                "moe_intermediate_size",
+                getattr(config, "intermediate_size", None),
+            ),
             quant_config=quant_config,
+            reduce_results=True,
         )
         self.pre_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -297,13 +347,6 @@ class Grok1ForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
-        # Monkey patch _prepare_weights to load pre-sharded weights
-        setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
-
-        self.use_presharded_weights = True
-
-        warnings.filterwarnings("ignore", category=FutureWarning)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -313,7 +356,7 @@ class Grok1ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -322,6 +365,8 @@ class Grok1ForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -357,27 +402,29 @@ class Grok1ForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
-                    if self.use_presharded_weights:
-                        extra_kwargs = {
-                            "use_presharded_weights": self.use_presharded_weights
-                        }
-                    else:
-                        extra_kwargs = {}
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
 
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
                         loaded_weight,
-                        weight_name,
+                        name,
                         shard_id=shard_id,
                         expert_id=expert_id,
-                        **extra_kwargs,
                     )
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
+                    # Skip loading kv_scale from ckpts towards new design.
+                    if name.endswith(".kv_scale") and name not in params_dict:
                         continue
                     if name is None:
                         continue
@@ -387,31 +434,6 @@ class Grok1ForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-
-
-old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
-
-
-def _prepare_presharded_weights(
-    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
-) -> Tuple[str, List[str], bool]:
-    import glob
-    import os
-
-    if get_tensor_model_parallel_world_size() == 1:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
-
-    tp_rank = get_tensor_model_parallel_rank()
-    allow_patterns = [f"*-{tp_rank:03d}.bin"]
-
-    hf_folder = model_name_or_path
-
-    hf_weights_files: List[str] = []
-    for pattern in allow_patterns:
-        hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
-    use_safetensors = False
-
-    return hf_folder, hf_weights_files, use_safetensors
 
 
 class Grok1ModelForCausalLM(Grok1ForCausalLM):

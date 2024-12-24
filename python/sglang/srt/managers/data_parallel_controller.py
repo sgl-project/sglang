@@ -15,9 +15,11 @@
 
 import logging
 import multiprocessing as mp
+import signal
 import threading
 from enum import Enum, auto
 
+import psutil
 import zmq
 
 from sglang.srt.managers.io_struct import (
@@ -26,13 +28,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    bind_port,
-    configure_logger,
-    get_zmq_socket,
-    kill_parent_process,
-    suppress_other_loggers,
-)
+from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -235,7 +231,7 @@ def run_data_parallel_controller_process(
     pipe_writer,
 ):
     configure_logger(server_args)
-    suppress_other_loggers()
+    parent_process = psutil.Process().parent()
 
     try:
         controller = DataParallelController(server_args, port_args)
@@ -244,6 +240,6 @@ def run_data_parallel_controller_process(
         )
         controller.event_loop()
     except Exception:
-        msg = get_exception_traceback()
-        logger.error(msg)
-        kill_parent_process()
+        traceback = get_exception_traceback()
+        logger.error(f"DataParallelController hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)

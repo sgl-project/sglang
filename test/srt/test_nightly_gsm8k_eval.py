@@ -6,7 +6,7 @@ import warnings
 from datetime import datetime
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
@@ -132,7 +132,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
 
     def tearDown(self):
         if self.process:
-            kill_child_process(self.process.pid, include_self=True)
+            kill_process_tree(self.process.pid)
 
     def test_mgsm_en_all_models(self):
         warnings.filterwarnings(

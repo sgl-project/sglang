@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -23,7 +24,6 @@ from torch import nn
 from transformers import LlamaConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -36,14 +36,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
+from sglang.utils import get_exception_traceback
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaMLP(nn.Module):
@@ -255,6 +257,7 @@ class LlamaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -291,20 +294,55 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
+
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    # in TP, these weights are partitioned along the column dimension (dim=-1)
+    column_parallel_weights_modules = [".down_proj.", ".o_proj."]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     def __init__(
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.torchao_config = global_server_args_dict["torchao_config"]
         self.model = LlamaModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        # Llama 3.2 1B Insturct set tie_word_embeddings to True
+        # Llama 3.1 8B Insturct set tie_word_embeddings to False
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size, config.hidden_size, quant_config=quant_config
+            )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
 
     @torch.no_grad()
     def forward(
@@ -318,7 +356,7 @@ class LlamaForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head.weight, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -349,15 +387,7 @@ class LlamaForCausalLM(nn.Module):
         return params_mapping.get(name, name)
 
     def get_module_name_from_weight_name(self, name):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
-            ("gate_up_proj", "gate_proj", 0, 2),
-            ("gate_up_proj", "up_proj", 1, 2),
-        ]
-        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
+        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:
                 return (
                     name.replace(weight_name, param_name)[: -len(".weight")],
@@ -378,13 +408,8 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
-        params_dict = dict(self.named_parameters())
 
-        load_tie_word_embeddings = (
-            hasattr(self.config, "tie_word_embeddings")
-            and self.config.tie_word_embeddings
-            and "lm_head.weight" in params_dict
-        )
+        params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -418,16 +443,78 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-                if load_tie_word_embeddings and name == "model.embed_tokens.weight":
-                    embed_tokens_weight = loaded_weight
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100, tp_size: int = 1
+    ) -> Optional[torch.Tensor]:
+        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
 
-        if load_tie_word_embeddings:
-            # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
-            param = self.lm_head.weight
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, embed_tokens_weight)
+        Only used for unit test with an unoptimized performance.
+        For optimized performance, please use torch.save and torch.load.
+        """
+        try:
+            if name == "lm_head.weight" and self.config.tie_word_embeddings:
+                logger.info(
+                    "word embedding is tied for this model, return embed_tokens.weight as lm_head.weight."
+                )
+                return (
+                    self.model.embed_tokens.weight.cpu()
+                    .to(torch.float32)
+                    .numpy()
+                    .tolist()[:truncate_size]
+                )
 
-        apply_torchao_config_(self, params_dict, set(["proj.weight"]))
+            mapped_name = name
+            mapped_shard_id = None
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                if weight_name in name:
+                    mapped_name = name.replace(weight_name, param_name)
+                    mapped_shard_id = shard_id
+                    break
+            params_dict = dict(self.named_parameters())
+            param = params_dict[mapped_name]
+            if mapped_shard_id is not None:
+                if mapped_shard_id in ["q", "k", "v"]:
+                    num_heads = self.config.num_attention_heads // tp_size
+                    num_kv_heads = self.config.num_key_value_heads // tp_size
+                    head_dim = (
+                        self.config.hidden_size // self.config.num_attention_heads
+                    )
+                    if mapped_shard_id == "q":
+                        offset = 0
+                        size = num_heads * head_dim
+                    elif mapped_shard_id == "k":
+                        offset = num_heads * head_dim
+                        size = num_kv_heads * head_dim
+                    elif mapped_shard_id == "v":
+                        offset = (num_heads + num_kv_heads) * head_dim
+                        size = num_kv_heads * head_dim
+                    weight = param.data.narrow(0, offset, size)
+                elif mapped_shard_id in [0, 1]:
+                    intermediate_size = self.config.intermediate_size
+                    slice_size = intermediate_size // tp_size
+                    if mapped_shard_id == 0:  # gate_proj
+                        offset = 0
+                        size = slice_size
+                    elif mapped_shard_id == 1:  # up_proj
+                        offset = slice_size
+                        size = slice_size
+
+                    weight = param.data.narrow(0, offset, size)
+                else:
+                    weight = param.data
+            else:
+                weight = param.data
+            if tp_size > 1 and ("o_proj" in name or "down_proj" in name):
+                gathered_weights = [torch.zeros_like(weight) for _ in range(tp_size)]
+                torch.distributed.all_gather(gathered_weights, weight)
+                weight = torch.cat(gathered_weights, dim=1)
+            return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+
+        except Exception:
+            logger.error(
+                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
+            )
+            return None
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

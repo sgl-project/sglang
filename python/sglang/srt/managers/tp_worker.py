@@ -19,7 +19,12 @@ from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.io_struct import UpdateWeightReqInput
+from sglang.srt.managers.io_struct import (
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -47,9 +52,12 @@ class TpModelWorker:
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
@@ -155,8 +163,33 @@ class TpModelWorker:
         embeddings = logits_output.embeddings
         return embeddings
 
-    def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.model_runner.update_weights(
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path, recv_req.load_format
         )
         return success, message
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.init_weights_update_group(
+            recv_req.master_address,
+            recv_req.master_port,
+            recv_req.rank_offset,
+            recv_req.world_size,
+            recv_req.group_name,
+            recv_req.backend,
+        )
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        success, message = self.model_runner.update_weights_from_distributed(
+            recv_req.name, recv_req.dtype, recv_req.shape
+        )
+        return success, message
+
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        parameter = self.model_runner.get_weights_by_name(
+            recv_req.name, recv_req.truncate_size
+        )
+        return parameter

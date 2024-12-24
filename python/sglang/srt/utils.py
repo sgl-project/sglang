@@ -14,7 +14,9 @@
 """Common utilities."""
 
 import base64
+import dataclasses
 import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -29,6 +31,7 @@ import subprocess
 import tempfile
 import time
 import warnings
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
@@ -37,6 +40,7 @@ import numpy as np
 import psutil
 import requests
 import torch
+import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
@@ -66,14 +70,30 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+def is_cuda():
+    return hasattr(torch, "cuda") and torch.cuda.is_available()
+
+
+def is_cuda_alike():
+    return is_cuda() or is_hip()
+
+
+def is_hpu() -> bool:
+    return hasattr(torch, "hpu") and torch.hpu.is_available()
+
+
+def is_xpu() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
-    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and not is_hip()
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def is_ipv6(address):
@@ -150,7 +170,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False):
+def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -165,7 +185,8 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 "which may cause useless memory allocation for torch CUDA context.",
             )
 
-        torch.cuda.empty_cache()
+        if empty_cache:
+            torch.cuda.empty_cache()
         free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
@@ -177,10 +198,24 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
                 "which may cause useless memory allocation for torch XPU context.",
             )
-        torch.xpu.empty_cache()
+
+        if empty_cache:
+            torch.xpu.empty_cache()
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
+
+    elif device == "hpu":
+        num_gpus = torch.hpu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.hpu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
+                "which may cause useless memory allocation for torch HPU context.",
+            )
+
+        free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -411,16 +446,12 @@ def suppress_other_loggers():
     from vllm.logger import logger as vllm_default_logger
 
     vllm_default_logger.setLevel(logging.WARN)
-    logging.getLogger("vllm.config").setLevel(logging.ERROR)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
     logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
         logging.WARN
     )
-    logging.getLogger("vllm.selector").setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.ERROR)
-    logging.getLogger("vllm.model_executor.model_loader.loader").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -442,26 +473,14 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
-def kill_parent_process():
-    """Kill the parent process and all children of the parent process."""
-    current_process = psutil.Process()
-    parent_process = current_process.parent()
-    kill_child_process(
-        parent_process.pid, include_self=True, skip_pid=current_process.pid
-    )
-    try:
-        current_process.kill()
-    except psutil.NoSuchProcess:
-        pass
-
-
-def kill_child_process(pid=None, include_self=False, skip_pid=None):
-    """Kill the process and all its children process."""
-    if pid is None:
-        pid = os.getpid()
+def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
+    """Kill the process and all its child processes."""
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
 
     try:
-        itself = psutil.Process(pid)
+        itself = psutil.Process(parent_pid)
     except psutil.NoSuchProcess:
         return
 
@@ -474,36 +493,15 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
         except psutil.NoSuchProcess:
             pass
 
-    if include_self:
+    if include_parent:
         try:
             itself.kill()
 
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGINT)
+            itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
-
-
-def monkey_patch_vllm_model_config():
-    from vllm.config import ModelConfig
-
-    if not hasattr(ModelConfig, "_resolve_task"):
-        return
-
-    def _resolve_task(
-        self,
-        task_option,
-        hf_config,
-    ):
-        supported_tasks = {
-            "generate": True,
-            "embedding": False,
-        }
-        selected_task = "generate"
-        return supported_tasks, selected_task
-
-    setattr(ModelConfig, "_resolve_task", _resolve_task)
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
@@ -515,6 +513,11 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
+
+    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+
+    setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
 vllm_all_gather_backup = None
@@ -561,6 +564,29 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
         setattr(GroupCoordinator, "all_gather", vllm_all_gather_backup)
     else:
         setattr(GroupCoordinator, "all_gather", all_gather)
+
+
+def monkey_patch_vllm_gguf_config():
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig,
+        GGUFEmbeddingMethod,
+        GGUFLinearMethod,
+    )
+
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+    def get_quant_method_with_embedding_replaced(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional["QuantizeMethodBase"]:
+        if isinstance(layer, LinearBase):
+            return GGUFLinearMethod(self)
+        elif isinstance(layer, VocabParallelEmbedding):
+            # patch to own VocabParallelEmbedding
+            return GGUFEmbeddingMethod(self)
+        return None
+
+    setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
 
 
 def maybe_set_triton_cache_manager() -> None:
@@ -625,7 +651,7 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if "SGLANG_USE_MODELSCOPE" in os.environ:
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
@@ -868,7 +894,9 @@ def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
         result = subprocess.run(
-            ["rocm-smi --showmeminfo vram | grep 'Total Memory' | awk '{print $NF}'"],
+            [
+                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=True,
@@ -879,9 +907,8 @@ def get_amdgpu_memory_capacity():
 
         # Parse the output to extract memory values in MiB
         memory_values = [
-            float(mem) / 1024 / 1024
+            float(mem.split("(")[0].strip()) / 1024
             for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
         ]
 
         if not memory_values:
@@ -928,17 +955,122 @@ def get_nvgpu_memory_capacity():
         )
 
 
+def get_hpu_memory_capacity():
+    try:
+        # Run hl-smi and capture the output
+        result = subprocess.run(
+            ["hl-smi --query | grep 'Total'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "hl-smi not found. Ensure Habana drivers are installed and accessible."
+        )
+
+
+# Copy from pytorch and OpenRLHF to allow creating multiple main groups.
+# https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
+# https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
+def init_custom_process_group(
+    backend=None,
+    init_method=None,
+    timeout=None,
+    world_size=-1,
+    rank=-1,
+    store=None,
+    group_name=None,
+    pg_options=None,
+):
+    from torch.distributed.distributed_c10d import (
+        Backend,
+        PrefixStore,
+        _new_process_group_helper,
+        _world,
+        default_pg_timeout,
+        rendezvous,
+    )
+
+    assert (store is None) or (
+        init_method is None
+    ), "Cannot specify both init_method and store."
+
+    if store is not None:
+        assert world_size > 0, "world_size must be positive if using store"
+        assert rank >= 0, "rank must be non-negative if using store"
+    elif init_method is None:
+        init_method = "env://"
+
+    if backend:
+        backend = Backend(backend)
+    else:
+        backend = Backend("undefined")
+
+    if timeout is None:
+        timeout = default_pg_timeout
+
+    # backward compatible API
+    if store is None:
+        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+
+        # Use a PrefixStore to avoid accidental overrides of keys used by
+        # different systems (e.g. RPC) in case the store is multi-tenant.
+        store = PrefixStore(group_name, store)
+
+    # NOTE: The pg_options parameter was renamed into backend_options in PyTorch 2.6.0
+    # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
+    # We need to determine the appropriate parameter name based on PyTorch version
+    pg_options_param_name = (
+        "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+    )
+    pg, _ = _new_process_group_helper(
+        world_size,
+        rank,
+        [],
+        backend,
+        store,
+        group_name=group_name,
+        **{pg_options_param_name: pg_options},
+        timeout=timeout,
+    )
+
+    _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+
+    return pg
+
+
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
-    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+    return get_bool_env_var("SGLANG_IS_IN_CI")
+
+
+def print_warning_once(msg: str) -> None:
+    # Set the stacklevel to 2 to print the caller's line info
+    logger.warning(msg, stacklevel=2)
 
 
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
-
-    if hasattr(torch, "hip") and torch.hip.is_available():
-        return torch.hip.get_device_name(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_name(device_id)
@@ -947,7 +1079,44 @@ def get_device_name(device_id: int = 0) -> str:
         return torch.hpu.get_device_name(device_id)
 
 
+def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
+    major, minor = None, None
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
+            "."
+        )
+        major, minor = int(major), int(minor)
+
+    # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
+    # Update this once the support is available.
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        try:
+            major, minor = torch.hpu.get_device_capability(device_id)
+        except Exception as e:
+            raise RuntimeError(
+                f"An error occurred while getting device capability of hpu: {e}."
+            ) from e
+
+    return major, minor
+
+
+def get_compiler_backend() -> str:
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return "hpu_backend"
+
+    return "inductor"
+
+
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
+
+
+# Some backends use pytorch version < 2.4.0 which doesn't
+# support `torch.library.custom_op`.
+def supports_custom_op() -> bool:
+    return hasattr(torch.library, "custom_op")
 
 
 def direct_register_custom_op(
@@ -987,3 +1156,120 @@ def direct_register_custom_op(
     my_lib.impl(op_name, op_func, "CUDA")
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
+
+
+def set_gpu_proc_affinity(
+    tp_size: int,
+    nnodes: int,
+    gpu_id: int,
+):
+    # current process
+    pid = os.getpid()
+    p = psutil.Process(pid)
+
+    tp_size_per_node = tp_size // nnodes
+
+    # total physical cores
+    total_pcores = psutil.cpu_count(logical=False)
+    # physical cores per TP (N.B. more Cores than GPUs on node)
+    num_cores_bind = total_pcores // tp_size_per_node
+
+    # able to handle multiple DP per node
+    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
+    end_cpu_id = start_cpu_id + num_cores_bind
+
+    if psutil.cpu_count() != psutil.cpu_count(logical=False):
+        # HT on
+        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
+    else:
+        # HT off
+        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+
+    # set cpu_affinity to current process
+    p.cpu_affinity(bind_cpu_ids)
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")
+
+
+@lru_cache(maxsize=8)
+def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
+    # Note: cuda_visible_devices is not used, but we keep it as an argument for
+    # LRU Cache purposes.
+
+    # Code below is based on
+    # https://github.com/pytorch/pytorch/blob/
+    # c1cd946818442aca8c7f812b16d187ce1586c3bc/
+    # torch/cuda/__init__.py#L831C1-L831C17
+    import torch.cuda
+    import torch.version
+
+    if not torch.cuda._is_compiled():
+        return 0
+    if is_hip():
+        # ROCm uses amdsmi instead of nvml for stateless device count
+        # This requires a sufficiently modern version of Torch 2.4.0
+        raw_count = (
+            torch.cuda._device_count_amdsmi()
+            if (hasattr(torch.cuda, "_device_count_amdsmi"))
+            else -1
+        )
+    else:
+        raw_count = torch.cuda._device_count_nvml()
+    r = torch._C._cuda_getDeviceCount() if raw_count < 0 else raw_count
+    return r
+
+
+# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/utils.py
+def cuda_device_count_stateless() -> int:
+    """Get number of CUDA devices, caching based on the value of
+    CUDA_VISIBLE_DEVICES at the time of call.
+
+    This should be used instead of torch.cuda.device_count()
+    unless CUDA_VISIBLE_DEVICES has already been set to the desired
+    value."""
+
+    # This can be removed and simply replaced with torch.cuda.get_device_count
+    # after https://github.com/pytorch/pytorch/pull/122815 is released.
+    return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
+
+
+def dataclass_to_string_truncated(data, max_length=2048):
+    if isinstance(data, str):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return f'"{data[:half_length]} ... {data[-half_length:]}"'
+        else:
+            return f'"{data}"'
+    elif isinstance(data, (list, tuple)):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+        else:
+            return str(data)
+    elif isinstance(data, dict):
+        return (
+            "{"
+            + ", ".join(
+                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+                for k, v in data.items()
+            )
+            + "}"
+        )
+    elif dataclasses.is_dataclass(data):
+        fields = dataclasses.fields(data)
+        return (
+            f"{data.__class__.__name__}("
+            + ", ".join(
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                for f in fields
+            )
+            + ")"
+        )
+    else:
+        return str(data)
