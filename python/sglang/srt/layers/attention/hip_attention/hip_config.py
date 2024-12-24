@@ -58,7 +58,6 @@ class HiPAttentionPerLayerConfig:
 
 @dataclass
 class HiPAttentionConfig:
-    extend_context_length: int = 131072
     apply_v_dot: bool = False
     dense_layers: list[int] = field(default_factory=lambda: [0, 1, 2])
     prefill_always_dense: bool = False
@@ -75,8 +74,6 @@ class HiPAttentionConfig:
     def __post_init__(self, parsed_json: dict | None):
         super().__init__()
         if parsed_json is not None:
-            if 'extend_context_length' in parsed_json:
-                self.extend_context_length = parsed_json['extend_context_length']
             if 'apply_v_dot' in parsed_json:
                 self.apply_v_dot = parsed_json['apply_v_dot']
             if 'dense_layers' in parsed_json:

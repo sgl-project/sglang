@@ -125,7 +125,6 @@ class LlamaAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        max_position_embeddings = 192*1024  # FIXME
         self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
@@ -159,6 +158,7 @@ class LlamaAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            orig_context_len=getattr(config, "orig_context_len", max_position_embeddings),
             rope=self.rotary_emb,
         )
 

@@ -426,7 +426,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
             args=args,
             second_stage_k=layer_config.second_stage_k,
             stages=layer_config.stages,
-            model_context_length=self.hip_config.extend_context_length,
+            model_context_length=layer.orig_context_len,
+            extend_context_length=self.max_context_len,
             cached_metadata=cached_metadata,
             block_sparse_block_size_q=64,
             scan_extend_backend=('relative' if self.hip_config.apply_v_dot

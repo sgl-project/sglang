@@ -31,6 +31,7 @@ from vllm.distributed import (
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.hf_transformers_utils import update_context_length, get_context_length
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -254,6 +255,13 @@ class ModelRunner:
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
+
+        if self.server_args.enable_hip_attention:
+            orig_context_length = get_context_length(self.model_config.hf_config)
+            update_context_length(self.model_config.hf_config, self.server_args.context_length)
+            self.model_config.hf_config.orig_context_len = orig_context_length
+            logger.info(f"Update model config for HIP context extension "
+                        f"{orig_context_length} -> {self.server_args.context_length}.")
 
         # Load the model
         self.model = get_model(

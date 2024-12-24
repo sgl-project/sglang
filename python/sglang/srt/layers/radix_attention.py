@@ -41,6 +41,7 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        orig_context_len: Optional[int] = None,
         rope: Optional[RotaryEmbedding] = None,
     ):
         super().__init__()
@@ -55,6 +56,8 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
+
+        self.orig_context_len = orig_context_len
 
         # Store RoPE for context extension
         if rope is not None:
