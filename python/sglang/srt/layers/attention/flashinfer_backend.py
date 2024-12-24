@@ -25,12 +25,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 if is_flashinfer_available():
-    from flashinfer import (
-        BatchDecodeWithPagedKVCacheWrapper,
-        BatchPrefillWithPagedKVCacheWrapper,
-        BatchPrefillWithRaggedKVCacheWrapper,
-    )
-    from flashinfer.cascade import merge_state
+    from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+    from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
 
 
 class WrapperDispatch(Enum):
@@ -70,6 +66,8 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
+        self.num_cascade_levels = 1
+
         # Allocate buffers
         self.workspace_buffer = torch.empty(
             global_config.flashinfer_workspace_size,
@@ -97,19 +95,13 @@ class FlashInferAttnBackend(AttentionBackend):
             else None
         )
 
-        # Two wrappers: one for sliding window attention and one for full attention.
-        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
-        self.prefill_wrappers_paged = []
-        self.decode_wrappers = []
+        self.multi_level_wrappers = []
         for _ in range(self.num_wrappers):
-            self.prefill_wrappers_paged.append(
-                BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-            )
-            self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
+            self.multi_level_wrappers.append(
+                MultiLevelCascadeAttentionWrapper(
+                    self.num_cascade_levels,
                     self.workspace_buffer,
                     "NHD",
-                    use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
 
@@ -123,16 +115,19 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata = None
         self.cuda_graph_metadata = {}
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, model_layer: RadixAttention
+    ):
         if forward_batch.forward_mode.is_decode():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
-                decode_wrappers=None,
+                model_layer,
+                multi_level_wrappers=None,
                 encoder_lens=forward_batch.encoder_lens,
             )
-            self.forward_metadata = (self.decode_wrappers,)
+            self.forward_metadata = (self.multi_level_wrappers,)
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -149,6 +144,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
                 prefix_lens,
+                extend_no_prefix,
+                model_layer,
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
             )
@@ -170,19 +167,21 @@ class FlashInferAttnBackend(AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        model_layer: RadixAttention,
         encoder_lens: torch.Tensor = None,
     ):
-        decode_wrappers = []
+        multi_level_wrappers = []
         for i in range(self.num_wrappers):
-            decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
+            multi_level_wrappers.append(
+                MultiLevelCascadeAttentionWrapper(
+                    self.num_cascade_levels,
                     self.workspace_buffer,
                     "NHD",
                     use_cuda_graph=True,
-                    use_tensor_cores=self.decode_use_tensor_cores,
-                    paged_kv_indptr_buffer=self.kv_indptr[i][: bs + 1],
-                    paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                    paged_kv_last_page_len_buffer=self.kv_last_page_len[:bs],
+                    qo_indptr_buf_arr=[self.qo_indptr[i][: bs + 1]],
+                    paged_kv_indptr_buf_arr=[self.kv_indptr[i][: bs + 1]],
+                    paged_kv_indices_buf_arr=[self.cuda_graph_kv_indices[i]],
+                    paged_kv_last_page_len_buf_arr=[self.kv_last_page_len[:bs]],
                 )
             )
 
@@ -191,11 +190,12 @@ class FlashInferAttnBackend(AttentionBackend):
             req_pool_indices,
             seq_lens,
             seq_lens_sum,
-            decode_wrappers=decode_wrappers,
+            model_layer,
+            multi_level_wrappers=multi_level_wrappers,
             encoder_lens=encoder_lens,
         )
-        self.cuda_graph_metadata[bs] = decode_wrappers
-        self.forward_metadata = (decode_wrappers,)
+        self.cuda_graph_metadata[bs] = multi_level_wrappers
+        self.forward_metadata = (multi_level_wrappers,)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -203,13 +203,15 @@ class FlashInferAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
+        model_layer: RadixAttention,
         encoder_lens: torch.Tensor = None,
     ):
         self.indices_updater_decode.update(
             req_pool_indices[:bs],
             seq_lens[:bs],
             seq_lens_sum,
-            decode_wrappers=self.cuda_graph_metadata[bs],
+            model_layer,
+            multi_level_wrappers=self.cuda_graph_metadata[bs],
             encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
         )
 
@@ -225,9 +227,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        prefill_wrapper_paged = self.prefill_wrappers_paged[
-            self._get_wrapper_idx(layer)
-        ]
+        prefill_wrapper_paged = self.multi_level_wrappers[self._get_wrapper_idx(layer)]
 
         use_ragged, extend_no_prefix = self.forward_metadata
         cache_loc = (
@@ -242,13 +242,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-            o = prefill_wrapper_paged.forward(
+            o = prefill_wrapper_paged.run(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
-                logits_soft_cap=layer.logit_cap,
             )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -263,15 +259,10 @@ class FlashInferAttnBackend(AttentionBackend):
             if extend_no_prefix:
                 o = o1
             else:
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                o = prefill_wrapper_paged.run(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=layer.logit_cap,
                 )
-
-                o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
@@ -299,11 +290,9 @@ class FlashInferAttnBackend(AttentionBackend):
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-        o = decode_wrapper.forward(
+        o = decode_wrapper.run(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -337,10 +326,11 @@ class FlashInferIndicesUpdaterDecode:
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
+        self.qo_indptr = attn_backend.qo_indptr
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.decode_wrappers = attn_backend.decode_wrappers
+        self.multi_level_wrappers = attn_backend.multi_level_wrappers
 
         # Dispatch
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -356,7 +346,8 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrappers: List,
+        model_layer: RadixAttention,
+        multi_level_wrappers: List,
         encoder_lens: torch.Tensor,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
@@ -367,17 +358,20 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrappers: List,
+        model_layer: RadixAttention,
+        multi_level_wrappers: List,
         encoder_lens: torch.Tensor,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
+        multi_level_wrappers = multi_level_wrappers or self.multi_level_wrappers
         self.call_begin_forward(
-            decode_wrappers[0],
+            multi_level_wrappers[0],
             req_pool_indices,
             seq_lens,
             seq_lens_sum,
             self.kv_indptr[0],
+            self.qo_indptr[0],
             None,
+            model_layer,
         )
 
     def update_sliding_window(
@@ -385,10 +379,11 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrappers: List,
+        model_layer: RadixAttention,
+        multi_level_wrappers: List,
         encoder_lens: torch.Tensor,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
+        multi_level_wrappers = multi_level_wrappers or self.multi_level_wrappers
 
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -406,12 +401,14 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx_tmp = None
 
             self.call_begin_forward(
-                decode_wrappers[wrapper_id],
+                multi_level_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens_tmp,
                 paged_kernel_lens_sum_tmp,
                 self.kv_indptr[wrapper_id],
+                self.qo_indptr[wrapper_id],
                 kv_start_idx_tmp,
+                model_layer,
             )
 
     def update_cross_attention(
@@ -419,10 +416,11 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrappers: List,
+        model_layer: RadixAttention,
+        multi_level_wrappers: List,
         encoder_lens: torch.Tensor,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
+        multi_level_wrappers = multi_level_wrappers or self.multi_level_wrappers
 
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -436,12 +434,14 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_sum = encoder_lens.sum().item()
 
             self.call_begin_forward(
-                decode_wrappers[wrapper_id],
+                multi_level_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
                 seq_lens_sum,
                 self.kv_indptr[wrapper_id],
+                self.qo_indptr[wrapper_id],
                 kv_start_idx,
+                model_layer,
             )
 
     def call_begin_forward(
@@ -451,7 +451,9 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
+        qo_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
+        model_layer: RadixAttention,
     ):
         bs = len(req_pool_indices)
         kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -470,17 +472,21 @@ class FlashInferIndicesUpdaterDecode:
             self.req_to_token.shape[1],
         )
 
-        wrapper.end_forward()
-        wrapper.begin_forward(
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            data_type=self.data_type,
+        qo_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+        qo_indptr = qo_indptr[: bs + 1]
+
+        wrapper.plan(
+            qo_indptr_arr=[qo_indptr],
+            paged_kv_indptr_arr=[kv_indptr],
+            paged_kv_indices_arr=[kv_indices],
+            paged_kv_last_page_len=[self.kv_last_page_len[:bs]],
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=1,
             q_data_type=self.q_data_type,
+            sm_scale=model_layer.scaling,
+            logits_soft_cap=model_layer.logit_cap,
         )
 
 
@@ -506,7 +512,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.wrapper_ragged = attn_backend.prefill_wrapper_ragged
-        self.wrappers_paged = attn_backend.prefill_wrappers_paged
+        self.multi_level_wrappers = attn_backend.multi_level_wrappers
 
         # Dispatch
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -523,6 +529,8 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
+        model_layer: RadixAttention,
         use_ragged: bool,
         encoder_lens: torch.Tensor,
     ):
@@ -535,6 +543,8 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
+        model_layer: RadixAttention,
         use_ragged: bool,
         encoder_lens: torch.Tensor,
     ):
@@ -547,7 +557,7 @@ class FlashInferIndicesUpdaterPrefill:
 
         self.call_begin_forward(
             self.wrapper_ragged,
-            self.wrappers_paged[0],
+            self.multi_level_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
             paged_kernel_lens_sum,
@@ -556,6 +566,8 @@ class FlashInferIndicesUpdaterPrefill:
             None,
             self.kv_indptr[0],
             self.qo_indptr[0],
+            extend_no_prefix,
+            model_layer,
             use_ragged,
         )
 
@@ -565,6 +577,8 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
+        model_layer: RadixAttention,
         use_ragged: bool,
         encoder_lens: torch.Tensor,
     ):
@@ -585,7 +599,7 @@ class FlashInferIndicesUpdaterPrefill:
 
             self.call_begin_forward(
                 self.wrapper_ragged,
-                self.wrappers_paged[wrapper_id],
+                self.multi_level_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
                 paged_kernel_lens_sum,
@@ -594,6 +608,8 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
+                extend_no_prefix,
+                model_layer,
                 use_ragged,
             )
 
@@ -603,6 +619,8 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
+        model_layer: RadixAttention,
         use_ragged: bool,
         encoder_lens: torch.Tensor,
     ):
@@ -620,7 +638,7 @@ class FlashInferIndicesUpdaterPrefill:
 
             self.call_begin_forward(
                 self.wrapper_ragged,
-                self.wrappers_paged[wrapper_id],
+                self.multi_level_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
                 paged_kernel_lens_sum,
@@ -629,13 +647,16 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
+                forward_metadata,
+                extend_no_prefix,
+                model_layer,
                 use_ragged,
             )
 
     def call_begin_forward(
         self,
         wrapper_ragged,
-        wrapper_paged,
+        wrapper,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
@@ -644,6 +665,8 @@ class FlashInferIndicesUpdaterPrefill:
         kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
+        extend_no_prefix: bool,
+        model_layer: RadixAttention,
         use_ragged: bool,
     ):
         bs = len(req_pool_indices)
@@ -665,6 +688,28 @@ class FlashInferIndicesUpdaterPrefill:
         qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
         qo_indptr = qo_indptr[: bs + 1]
 
+        plan_args = {
+            "qo_indptr_arr": [qo_indptr],
+            "paged_kv_indptr_arr": [kv_indptr],
+            "paged_kv_indices_arr": [kv_indices],
+            "paged_kv_last_page_len": [self.kv_last_page_len[:bs]],
+            "num_qo_heads": self.num_qo_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "page_size": 1,
+            "q_data_type": self.q_data_type,
+        }
+
+        if not use_ragged:
+            plan_args.update(
+                {
+                    "causal": not model_layer.is_cross_attention,
+                    "sm_scale": model_layer.scaling,
+                    "window_left": model_layer.sliding_window_size,
+                    "logits_soft_cap": model_layer.logit_cap,
+                }
+            )
+
         # extend part
         if use_ragged:
             wrapper_ragged.end_forward()
@@ -676,20 +721,16 @@ class FlashInferIndicesUpdaterPrefill:
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
+            if not extend_no_prefix:
+                plan_args.update(
+                    {
+                        "causal": False,
+                        "sm_scale": model_layer.scaling,
+                        "logits_soft_cap": model_layer.logit_cap,
+                    }
+                )
 
-        # cached part
-        wrapper_paged.end_forward()
-        wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-        )
+        wrapper.plan(**plan_args)
 
 
 @triton.jit
