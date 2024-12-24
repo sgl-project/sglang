@@ -307,7 +307,7 @@ def save_configs(
 def main(args: argparse.Namespace):
     print(args)
 
-    config = AutoConfig.from_pretrained(args.model)
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k

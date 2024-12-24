@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 
 def get_model_config(model_name: str, tp_size: int):
     """Get model configuration parameters"""
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts

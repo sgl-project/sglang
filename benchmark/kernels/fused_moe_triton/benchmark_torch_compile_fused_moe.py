@@ -13,7 +13,7 @@ from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
 
 def get_model_config(model_name: str, tp_size: int):
     """Get model configuration parameters"""
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
