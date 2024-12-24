@@ -34,7 +34,7 @@ class HiPAttentionPerLayerConfig:
     sliding_window_size: int = 1024
     sink_token_size: int = 256
     sa_extend_backend: str = 'streaming'
-    stages: list = field(default_factory=lambda: _DEFAULT_STAGES)
+    stages: list[ScanStage] = field(default_factory=lambda: _DEFAULT_STAGES)
 
     parsed_json: InitVar[dict | None] = None
 
@@ -64,6 +64,7 @@ class HiPAttentionConfig:
     decode_always_dense: bool = False
     force_dense: bool = False
     prefill_dense_threshold: int = 8192
+    block_sparse_block_size_q: int = 64
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
         HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 8192, 'sink_token_size': 8192}),
         HiPAttentionPerLayerConfig(),

@@ -255,7 +255,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             any(map(lambda x: x <= self.hip_config.prefill_dense_threshold, forward_batch.extend_prefix_lens_cpu))
         )
 
-        logger.info(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
+        logger.debug(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
 
         if k is not None:
             assert v is not None
@@ -326,10 +326,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
             self.hip_config.force_dense
         )
 
-        logger.info(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
+        logger.debug(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
 
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(layer.layer_id)
+
+        metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
+            layer.layer_id, q.shape[0], forward_batch.batch_size)
 
         o, metadata = self.forward_paged_hip(
             query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -349,7 +351,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
             is_dense=require_dense,
         )
 
-        forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(layer.layer_id, cache_loc, metadata)
+        forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
+            layer.layer_id, q.shape[0], forward_batch.batch_size, cache_loc, metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -429,7 +432,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             model_context_length=layer.orig_context_len,
             extend_context_length=self.max_context_len,
             cached_metadata=cached_metadata,
-            block_sparse_block_size_q=64,
+            block_sparse_block_size_q=self.hip_config.block_sparse_block_size_q,
             scan_extend_backend=('relative' if self.hip_config.apply_v_dot
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,

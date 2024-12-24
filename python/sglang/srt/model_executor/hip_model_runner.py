@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.hip_attention import HiPRadixAttentionBackend
@@ -54,3 +55,11 @@ class HiPModelRunner(ModelRunner):
             with open(hip_attention_config_path, "r") as f:
                 hip_attention_config = json.load(f)
         self.hip_attention_config = HiPAttentionConfig(parsed_json=hip_attention_config)
+
+    def init_memory_pool(
+        self,
+        total_gpu_memory: int,
+        max_num_reqs: Optional[int] = None,
+        max_total_tokens: Optional[int] = None,
+    ):
+        super().init_memory_pool(total_gpu_memory, max_num_reqs, max_total_tokens)
