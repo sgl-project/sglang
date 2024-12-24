@@ -13,6 +13,7 @@ from vllm.distributed import (
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.custom_op_util import register_custom_op
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -20,7 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import set_weight_attrs
 
 if torch.cuda.is_available():
-    from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 else:
     fused_experts = None  # type: ignore
 
@@ -106,6 +107,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -117,6 +119,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
         )
 
     def forward_cuda(
@@ -130,8 +133,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -140,6 +144,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
         )
 
         return fused_experts(
@@ -197,6 +202,7 @@ class FusedMoE(torch.nn.Module):
         tp_size: Optional[int] = None,
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -217,6 +223,7 @@ class FusedMoE(torch.nn.Module):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
+        self.correction_bias = correction_bias
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -503,51 +510,6 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    @staticmethod
-    def select_experts(
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        use_grouped_topk: bool,
-        renormalize: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
-    ):
-        from sglang.srt.layers.fused_moe_triton.fused_moe import (
-            fused_topk,
-            grouped_topk,
-        )
-
-        # DeekSeekv2 uses grouped_top_k
-        if use_grouped_topk:
-            assert topk_group is not None
-            assert num_expert_group is not None
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
-        elif custom_routing_function is None:
-            topk_weights, topk_ids = fused_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-            )
-        else:
-            topk_weights, topk_ids = custom_routing_function(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-            )
-
-        return topk_weights, topk_ids
-
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
@@ -562,6 +524,7 @@ class FusedMoE(torch.nn.Module):
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
+            correction_bias=self.correction_bias,
         )
 
         if self.reduce_results and self.tp_size > 1:

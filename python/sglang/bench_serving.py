@@ -924,6 +924,7 @@ async def benchmark(
             f"are correctly specified. Error: {test_output.error}"
         )
     else:
+        requests.post(base_url + "/flush_cache")
         print("Initial test run completed. Starting main benchmark run...")
 
     time.sleep(1.5)
