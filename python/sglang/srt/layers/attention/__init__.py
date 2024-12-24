@@ -83,3 +83,15 @@ class AttentionBackend(ABC):
     ):
         """Run a forward for extend."""
         raise NotImplementedError()
+
+    def forward_mixed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        """Run a forward for mixed."""
+        raise NotImplementedError()

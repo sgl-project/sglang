@@ -149,6 +149,9 @@ class ForwardBatch:
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
 
+    # For mixed chunked prefill
+    running_bs: int = 0
+
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
