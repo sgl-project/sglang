@@ -47,7 +47,7 @@ def vllm_rope(
 
 def main():
     batch_size, seq_len, head_size = 2, 10, 64
-    rotary_dim = head_size // 2
+    rotary_dim = head_size
     rope_theta = 1e4
 
     torch.cuda.manual_seed_all(42)
@@ -61,7 +61,7 @@ def main():
     flashinfer_q_rope, flashinfer_k_rope = flashinfer_rope(
         rearrange(q, "b s h -> (b s) 1 h"),
         rearrange(k, "b s h -> (b s) 1 h"),
-        positions,
+        positions.int(),
         rotary_dim,
         rope_theta,
     )

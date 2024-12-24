@@ -253,10 +253,11 @@ class RotaryEmbedding(CustomOp):
             n_h=num_k_heads,
             h_d=self.head_size,
         )
+
         apply_rope_pos_ids_inplace(
             flashinfer_query,
             flashinfer_key,
-            pos_ids=positions,
+            pos_ids=positions.int(),
             rotary_dim=self.rotary_dim,
             rope_theta=self.base,
             interleave=(not self.is_neox_style),
