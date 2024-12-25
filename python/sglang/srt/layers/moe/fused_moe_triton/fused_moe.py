@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
@@ -266,9 +267,25 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    ops.moe_align_block_size(
-        topk_ids, num_experts, block_size, sorted_ids, expert_ids, num_tokens_post_pad
-    )
+    # FIXME(zhyncs)
+    if num_experts >= 256:
+        sgl_moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
+    else:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
