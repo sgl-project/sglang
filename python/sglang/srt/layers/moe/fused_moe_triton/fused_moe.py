@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 from vllm import _custom_ops as ops
 
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.utils import direct_register_custom_op, get_device_name
 
 logger = logging.getLogger(__name__)
@@ -415,7 +416,7 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
 ):
-    from sglang.srt.layers.fused_moe_triton import get_config
+    from sglang.srt.layers.moe.fused_moe_triton import get_config
 
     override_config = get_config()
     if override_config:
@@ -433,74 +434,6 @@ def try_get_optimal_moe_config(
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, is_marlin)
     return config
-
-
-def fused_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    M, _ = hidden_states.shape
-
-    topk_weights = torch.empty(
-        M, topk, dtype=torch.float32, device=hidden_states.device
-    )
-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    token_expert_indicies = torch.empty(
-        M, topk, dtype=torch.int32, device=hidden_states.device
-    )
-
-    ops.topk_softmax(
-        topk_weights,
-        topk_ids,
-        token_expert_indicies,
-        gating_output.float(),  # TODO(woosuk): Optimize this.
-    )
-    del token_expert_indicies  # Not used. Will be used in the future.
-
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-    return topk_weights, topk_ids
-
-
-# This is used by the Deepseek-V2 model
-def grouped_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
-):
-
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    scores = torch.softmax(gating_output, dim=-1)
-    num_token = scores.shape[0]
-    group_scores = (
-        scores.view(num_token, num_expert_group, -1).max(dim=-1).values
-    )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
-        1
-    ]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
-        .reshape(num_token, -1)
-    )  # [n, e]
-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
-    topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
-
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
 def get_config_dtype_str(
@@ -869,24 +802,16 @@ def fused_moe(
     # Check constraints.
     assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
 
-    if use_grouped_topk:
-        assert num_expert_group is not None and topk_group is not None
-        topk_weights, topk_ids = grouped_topk(
-            hidden_states,
-            gating_output,
-            topk,
-            renormalize,
-            num_expert_group,
-            topk_group,
-        )
-    elif custom_routing_function is None:
-        topk_weights, topk_ids = fused_topk(
-            hidden_states, gating_output, topk, renormalize
-        )
-    else:
-        topk_weights, topk_ids = custom_routing_function(
-            hidden_states, gating_output, topk, renormalize
-        )
+    topk_weights, topk_ids = select_experts(
+        hidden_states=hidden_states,
+        router_logits=gating_output,
+        use_grouped_topk=use_grouped_topk,
+        top_k=topk,
+        renormalize=renormalize,
+        topk_group=topk_group,
+        num_expert_group=num_expert_group,
+        custom_routing_function=custom_routing_function,
+    )
 
     return fused_experts(
         hidden_states,
