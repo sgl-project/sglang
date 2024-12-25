@@ -114,7 +114,6 @@ class HiPMetadataCachePool:
         layer_id: int,
         size: int,
         batch_size: int,
-        cache_loc: torch.Tensor,  # FIXME: do something with cache_loc
         metadata: HiPAttentionOutputMetadata
     ):
         block_size_q, stage_stride, max_bdst_scan_times_bsz, q_blocks, n_chunks = self.hip_dimens[layer_id]

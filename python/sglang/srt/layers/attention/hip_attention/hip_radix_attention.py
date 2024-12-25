@@ -386,7 +386,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
-            layer.layer_id, q.shape[0], forward_batch.batch_size, cache_loc, metadata)
+            layer.layer_id, q.shape[0], forward_batch.batch_size, metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

@@ -189,7 +189,7 @@ class HiPCudaGraphRunner(CudaGraphRunner):
             self.seq_lens,
             forward_batch.seq_lens_sum + (bs - raw_bs),
             self.encoder_lens,
-        )  # FIXME: somehow use forward_batch.hip_use_cached_mask here?
+        )
 
         # Replay
         key = (bs, forward_batch.hip_use_cached_mask)
