@@ -1107,7 +1107,9 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
-                    role="assistant", content=ret_item["text"], tool_calls=tool_calls
+                    role="assistant",
+                    content=ret_item["text"] if (tool_calls is None) else None,
+                    tool_calls=tool_calls,
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
