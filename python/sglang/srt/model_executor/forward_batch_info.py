@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
 
 
 class ForwardMode(IntEnum):
@@ -139,6 +140,7 @@ class ForwardBatch:
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
+    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
     attn_backend: AttentionBackend = None
 
     # For Qwen2-VL
@@ -275,6 +277,7 @@ class ForwardBatch:
         # Init attention information
         ret.req_to_token_pool = model_runner.req_to_token_pool
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
+        ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
         ret.attn_backend = model_runner.attn_backend
 
         # Init lora information

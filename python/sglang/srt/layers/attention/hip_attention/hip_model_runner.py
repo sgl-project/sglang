@@ -1,2 +1,0 @@
-class HiPModelRunner:
-    pass

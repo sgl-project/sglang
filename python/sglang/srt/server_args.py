@@ -113,6 +113,10 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # HiP Attention
+    enable_hip_attention: bool = False
+    hip_attention_config_path: str = None
+
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
@@ -621,6 +625,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
+        )
+
+        # HiP Attention
+        parser.add_argument(
+            "--enable-hip-attention",
+            action="store_true",
+            help="Enable HiP attention.",
+        )
+        parser.add_argument(
+            "--hip-attention-config-path",
+            type=str,
+            default=ServerArgs.hip_attention_config_path,
+            help="Path to the HiP attention config.",
         )
 
         # LoRA

@@ -31,6 +31,7 @@ from vllm.distributed import (
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.hf_transformers_utils import update_context_length, get_context_length
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -40,6 +41,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -253,6 +255,13 @@ class ModelRunner:
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
+
+        if self.server_args.enable_hip_attention:
+            orig_context_length = get_context_length(self.model_config.hf_config)
+            update_context_length(self.model_config.hf_config, self.server_args.context_length)
+            self.model_config.hf_config.orig_context_len = orig_context_length
+            logger.info(f"Update model config for HIP context extension "
+                        f"{orig_context_length} -> {self.server_args.context_length}.")
 
         # Load the model
         self.model = get_model(
@@ -564,6 +573,15 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+            )
+        self.hip_metadata_cache_pool = None
+        if self.server_args.enable_hip_attention:
+            self.hip_metadata_cache_pool = HiPMetadataCachePool(
+                self.max_total_num_tokens,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
+                hip_config=self.hip_attention_config,
             )
         logger.info(
             f"Memory pool end. "

@@ -12,10 +12,17 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
+from __future__ import annotations
 
+from typing import Optional, TYPE_CHECKING
+
+import torch
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 
 class RadixAttention(nn.Module):
@@ -34,6 +41,8 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        orig_context_len: Optional[int] = None,
+        rope: Optional[RotaryEmbedding] = None,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -47,6 +56,20 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
+
+        self.orig_context_len = orig_context_len
+
+        # Store RoPE for context extension
+        if rope is not None:
+            if isinstance(rope, (list, tuple)):
+                _, self.rope_cos, self.rope_sin = rope
+            else:
+                cos_sin = rope.cos_sin_cache
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                self.rope_cos = cos.repeat(1, 2)
+                self.rope_sin = sin.repeat(1, 2)
+        else:
+            self.rope_cos = self.rope_sin = None
 
     def forward(
         self,
