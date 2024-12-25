@@ -117,7 +117,6 @@ class ServerArgs:
     enable_hip_attention: bool = False
     hip_attention_config: str = None
     enable_hip_offload: bool = False
-    hip_attention_config_path: str = None
 
     # LoRA
     lora_paths: Optional[List[str]] = None
