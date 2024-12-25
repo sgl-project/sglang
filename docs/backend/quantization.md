@@ -31,7 +31,7 @@ python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --torchao-config int4wo-128 \
     --port 30000 --host 0.0.0.0
-``` 
+```
 
 <details>
 <summary>More quantization methods based on torchao</summary>
@@ -100,6 +100,3 @@ python3 -m sglang.launch_server \
 - [torchao](https://github.com/pytorch/ao)
 
 - [llm-compressor](https://github.com/vllm-project/llm-compressor/)
-
-
-
