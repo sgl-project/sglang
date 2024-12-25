@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -628,8 +629,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         tp_size = get_tensor_model_parallel_world_size()
-        shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
-        shard_size = self.output_sizes[loaded_shard_id] // tp_size
+
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = self.quant_method.quant_config.weight_block_size
+            block_n, _ = weight_block_size[0], weight_block_size[1]
+            shard_offset = (
+                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
+            ) // tp_size
+            shard_size = (
+                (self.output_sizes[loaded_shard_id] + block_n - 1) // block_n // tp_size
+            )
+        else:
+            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
+            shard_size = self.output_sizes[loaded_shard_id] // tp_size
 
         param.load_merged_column_weight(
             loaded_weight=loaded_weight,
@@ -794,6 +806,12 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
+
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = self.quant_method.quant_config.weight_block_size
+            block_n, _ = weight_block_size[0], weight_block_size[1]
+            shard_offset = (shard_offset + block_n - 1) // block_n
+            shard_size = (shard_size + block_n - 1) // block_n
 
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
