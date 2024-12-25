@@ -1201,6 +1201,9 @@ class ModelWorkerBatch:
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
 
+    # Use cached mask for HiP Attention
+    hip_use_cached_mask: Optional[bool] = None
+
 
 @triton.jit
 def write_req_to_token_pool_triton(

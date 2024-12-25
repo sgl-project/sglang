@@ -144,7 +144,7 @@ class ForwardBatch:
 
     # For HiP attention
     hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
-    hip_use_cached_mask: bool = False
+    hip_use_cached_mask: Optional[bool] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -280,8 +280,11 @@ class ForwardBatch:
         # Init attention information
         ret.req_to_token_pool = model_runner.req_to_token_pool
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
-        ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
         ret.attn_backend = model_runner.attn_backend
+
+        # Init HiP attention information
+        ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
+        ret.hip_use_cached_mask = batch.hip_use_cached_mask
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
