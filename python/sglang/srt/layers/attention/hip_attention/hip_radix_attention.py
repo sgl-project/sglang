@@ -352,16 +352,16 @@ class HiPRadixAttentionBackend(AttentionBackend):
             is_dense=require_dense,
         )
 
-        print("q shape", q.shape, layer.tp_q_head_num, layer.head_dim)
-        print("k_cache shape", k_cache.shape)
-        print("v_cache shape", v_cache.shape)
-        print("positions", forward_batch.positions)
-        print("seq_lens", forward_batch.seq_lens)
-        print("metadata")
-        print("indices", metadata.indices.shape)
-        print("ks", metadata.ks.shape)
-        print("ks_count", metadata.ks_count.shape)
-        print("ks_start_end", metadata.ks_start_end.shape)
+        #print("q shape", q.shape, layer.tp_q_head_num, layer.head_dim)
+        #print("k_cache shape", k_cache.shape)
+        #print("v_cache shape", v_cache.shape)
+        #print("positions", forward_batch.positions)
+        #print("seq_lens", forward_batch.seq_lens)
+        #print("metadata")
+        #print("indices", metadata.indices.shape)
+        #print("ks", metadata.ks.shape)
+        #print("ks_count", metadata.ks_count.shape)
+        #print("ks_start_end", metadata.ks_start_end.shape)
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
             layer.layer_id, q.shape[0], forward_batch.batch_size, cache_loc, metadata)

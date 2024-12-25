@@ -124,17 +124,17 @@ class HiPMetadataCachePool:
         bdst_scan = triton.cdiv(triton.cdiv(seq_len, block_size_q), stage_stride)
         first_dim = batch_size * self.head_num * bdst_scan * q_blocks
 
-        print(f"size: {size}")
-        print(f"batch_size: {batch_size}")
-        print(f"self.head_num: {self.head_num}")
-        print(f"block_size_q: {block_size_q}")
-        print(f"stage_stride: {stage_stride}")
-        print(f"max_bdst_scan_times_bsz: {max_bdst_scan_times_bsz}")
-        print(f"q_blocks: {q_blocks}")
-        print(f"n_chunks: {n_chunks}")
-        print(f"seq_len: {seq_len}")
-        print(f"bdst_scan: {bdst_scan}")
-        print(f"first_dim: {first_dim}")
+        #print(f"size: {size}")
+        #print(f"batch_size: {batch_size}")
+        #print(f"self.head_num: {self.head_num}")
+        #print(f"block_size_q: {block_size_q}")
+        #print(f"stage_stride: {stage_stride}")
+        #print(f"max_bdst_scan_times_bsz: {max_bdst_scan_times_bsz}")
+        #print(f"q_blocks: {q_blocks}")
+        #print(f"n_chunks: {n_chunks}")
+        #print(f"seq_len: {seq_len}")
+        #print(f"bdst_scan: {bdst_scan}")
+        #print(f"first_dim: {first_dim}")
 
         self.indices_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks) \
