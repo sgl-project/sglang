@@ -963,4 +963,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
 
-EntryClass = DeepseekV2ForCausalLM
+class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
+    pass
+
+
+EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
