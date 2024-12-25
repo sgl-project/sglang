@@ -115,7 +115,7 @@ class ServerArgs:
 
     # HiP Attention
     enable_hip_attention: bool = False
-    hip_attention_config_path: str = None
+    hip_attention_config: str = None
 
     # LoRA
     lora_paths: Optional[List[str]] = None
@@ -634,10 +634,10 @@ class ServerArgs:
             help="Enable HiP attention.",
         )
         parser.add_argument(
-            "--hip-attention-config-path",
+            "--hip-attention-config",
             type=str,
-            default=ServerArgs.hip_attention_config_path,
-            help="Path to the HiP attention config.",
+            default=ServerArgs.hip_attention_config,
+            help="Path to the HiP attention config file, or the json in string format.",
         )
 
         # LoRA

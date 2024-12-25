@@ -30,7 +30,7 @@ class HiPModelRunner(ModelRunner):
             logger.info("HIP attention is turned on.")
             server_args.attention_backend = "hip_attention"
             self.init_hip_attention_config(
-                server_args.hip_attention_config_path
+                server_args.hip_attention_config
             )
 
         super().__init__(
@@ -49,13 +49,13 @@ class HiPModelRunner(ModelRunner):
         else:
             super().init_attention_backend()
 
-    def init_hip_attention_config(self, hip_attention_config_path):
-        if hip_attention_config_path is None:
+    def init_hip_attention_config(self, hip_attention_config):
+        if hip_attention_config is None:
             hip_attention_config = {}
-        elif hip_attention_config_path.startswith("{"):
-            hip_attention_config = json.loads(hip_attention_config_path)
+        elif hip_attention_config.startswith("{"):
+            hip_attention_config = json.loads(hip_attention_config)
         else:
-            with open(hip_attention_config_path, "r") as f:
+            with open(hip_attention_config, "r") as f:
                 hip_attention_config = json.load(f)
         self.hip_attention_config = HiPAttentionConfig(parsed_json=hip_attention_config)
 
