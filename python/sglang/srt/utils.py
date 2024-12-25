@@ -1331,3 +1331,58 @@ def parse_tool_response(text, tools, **kwargs):
         for call_info in call_info_list
     ]
     return text, call_info_list
+
+
+@dataclasses.dataclass
+class StreamToolState:
+    """Store the state of parsing a streaming tool call response."""
+
+    tool_call_list: List
+    current_tool_info: Dict
+    current_tool_call_start_idx: int = 0
+
+
+def parse_stream_tool_response(text, delta, state, tools, bot_token, **kwargs):
+    # TODO: support parallel_tool_calls
+    from sglang.srt.openai_api.protocol import DeltaMessage
+
+    if bot_token == "<|python_tag|>":
+        # lazy import only when used
+        import partial_json_parser
+        from partial_json_parser.core.options import Allow
+
+        if text[state.current_tool_call_start_idx :].startswith(bot_token):
+            state.current_tool_call_start_idx += len(bot_token)
+        current_tool_text = text[state.current_tool_call_start_idx :]
+
+        if len(current_tool_text) == 0:
+            return DeltaMessage(content=None), state
+
+        partial_json_flag = (
+            Allow.ALL
+            if state.current_tool_info.get("name") is not None
+            else Allow.ALL & ~Allow.STR
+        )
+        current_tool_info = partial_json_parser.loads(
+            current_tool_text, partial_json_flag
+        )
+        print(current_tool_info)
+        state.current_tool_info = current_tool_info
+        current_tool_call_name = current_tool_info.get("name")
+        current_tool_call_arguments = current_tool_info.get(
+            "parameters", current_tool_info.get("arguments", {})
+        )
+        return (
+            DeltaMessage(
+                tool_calls=[
+                    (
+                        tools.index(current_tool_call_name),
+                        current_tool_call_name,
+                        current_tool_call_arguments,
+                    )
+                ]
+            ),
+            state,
+        )
+    else:
+        raise RuntimeError(f"Unexpected model response: {text}")
