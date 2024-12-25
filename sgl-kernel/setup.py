@@ -109,6 +109,28 @@ setup(
             libraries=["c10", "torch", "torch_python"],
             extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         ),
+        CUDAExtension(
+            "sgl_kernel.ops.moe_align_block_size",
+            [
+                "src/sgl-kernel/csrc/moe_align_sum_kernels.cu",
+            ],
+            extra_compile_args={
+                "nvcc": [
+                    "-O3",
+                    "-Xcompiler",
+                    "-fPIC",
+                    "-gencode=arch=compute_75,code=sm_75",
+                    "-gencode=arch=compute_80,code=sm_80",
+                    "-gencode=arch=compute_89,code=sm_89",
+                    "-gencode=arch=compute_90,code=sm_90",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                ],
+                "cxx": ["-O3"],
+            },
+            libraries=["c10", "torch", "torch_python"],
+            extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        ),
     ],
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch"],
