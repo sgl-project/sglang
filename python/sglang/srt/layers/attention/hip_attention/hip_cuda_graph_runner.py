@@ -17,13 +17,42 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner, patch_model, clamp_position
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.hip_model_runner import HiPModelRunner
 
 
 class HiPCudaGraphRunner(CudaGraphRunner):
 
-    def __init__(self, model_runner: "ModelRunner"):
+    def __init__(self, model_runner: "HiPModelRunner"):
         super().__init__(model_runner)
+
+    def can_run(self, forward_batch: ForwardBatch):
+        use_cached_mask = forward_batch.hip_use_cached_mask
+
+        if self.enable_dp_attention:
+            min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
+                forward_batch.global_num_tokens
+            )
+            is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
+                (min_num_tokens == max_num_tokens and (max_num_tokens, use_cached_mask) in self.graphs)
+                if self.disable_padding
+                else max_num_tokens <= self.max_bs
+            )
+        else:
+            is_bs_supported = (
+                (forward_batch.batch_size, use_cached_mask) in self.graphs
+                if self.disable_padding
+                else forward_batch.batch_size <= self.max_bs
+            )
+
+        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
+        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
+        # because the full_text_row_masked_out_mask tensor will always be ones
+        is_encoder_lens_supported = (
+            torch.all(forward_batch.encoder_lens > 0)
+            if self.is_encoder_decoder
+            else True
+        )
+        return is_bs_supported and is_encoder_lens_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -40,14 +69,15 @@ class HiPCudaGraphRunner(CudaGraphRunner):
                     bs,
                     self.model_runner.tp_group,
                 ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward)
-                    self.graphs[bs] = graph
-                    self.output_buffers[bs] = output_buffers
+                    for use_cached_mask in [False, True]:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, use_cached_mask)
+                        self.graphs[(bs, use_cached_mask)] = graph
+                        self.output_buffers[(bs, use_cached_mask)] = output_buffers
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, forward: Callable, hip_use_cached_mask: bool = False):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
@@ -89,8 +119,9 @@ class HiPCudaGraphRunner(CudaGraphRunner):
                 seq_lens=seq_lens,
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
                 attn_backend=self.model_runner.attn_backend,
+                hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
+                hip_use_cached_mask=hip_use_cached_mask,
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=seq_lens_sum,
                 encoder_lens=encoder_lens,
@@ -158,11 +189,12 @@ class HiPCudaGraphRunner(CudaGraphRunner):
             self.seq_lens,
             forward_batch.seq_lens_sum + (bs - raw_bs),
             self.encoder_lens,
-        )
+        )  # FIXME: somehow use forward_batch.hip_use_cached_mask here?
 
         # Replay
-        self.graphs[bs].replay()
-        next_token_logits = self.output_buffers[bs][:raw_bs]
+        key = (bs, forward_batch.hip_use_cached_mask)
+        self.graphs[key].replay()
+        next_token_logits = self.output_buffers[key][:raw_bs]
 
         # Extract logprobs
         if forward_batch.return_logprob:

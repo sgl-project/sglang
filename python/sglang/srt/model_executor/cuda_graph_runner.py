@@ -318,7 +318,6 @@ class CudaGraphRunner:
                 seq_lens=seq_lens,
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=seq_lens_sum,

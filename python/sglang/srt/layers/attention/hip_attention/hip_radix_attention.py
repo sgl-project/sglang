@@ -361,8 +361,10 @@ class HiPRadixAttentionBackend(AttentionBackend):
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             offload_cache = None
 
-        metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
-            layer.layer_id, q.shape[0], forward_batch.batch_size)
+        metadata = None
+        if forward_batch.hip_use_cached_mask:
+            metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
+                layer.layer_id, q.shape[0], forward_batch.batch_size)
 
         o, metadata = self.forward_paged_hip(
             query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

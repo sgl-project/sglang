@@ -140,8 +140,11 @@ class ForwardBatch:
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
-    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
     attn_backend: AttentionBackend = None
+
+    # For HiP attention
+    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
+    hip_use_cached_mask: bool = False
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
