@@ -35,8 +35,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.hip_model_runner import HiPModelRunner
     from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
 
-# from hip.models.hip_attention.attention2_draft_sampling_extend import dual_stage_quadratic_hip_attention
-# from hip import HiPAttentionArgs
 from hip.models.hip_attention.gen3.attention_extend import dual_stage_quadratic_hip_attention
 from hip.models.hip_attention.gen3.attention_metadata import HiPAttentionArgs
 from hip.models.hip_attention.gen3.uvm_gpu_cache import HiPOffloadCache
@@ -260,7 +258,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         logger.debug(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
-        
+
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
         if is_offload_cache:
@@ -269,10 +267,10 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, 
-                        cache_loc, 
-                        k, 
-                        v, 
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
                         async_copy=False
                     )
             k_cache = v_cache = None
@@ -337,7 +335,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-
         require_dense = (
             layer.layer_id in self.hip_config.dense_layers or
             self.hip_config.decode_always_dense or
@@ -366,7 +363,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
         metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
             layer.layer_id, q.shape[0], forward_batch.batch_size)
-        #metadata = None
 
         o, metadata = self.forward_paged_hip(
             query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -386,17 +382,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=metadata,
             is_dense=require_dense,
         )
-
-        #print("q shape", q.shape, layer.tp_q_head_num, layer.head_dim)
-        #print("k_cache shape", k_cache.shape)
-        #print("v_cache shape", v_cache.shape)
-        #print("positions", forward_batch.positions)
-        #print("seq_lens", forward_batch.seq_lens)
-        #print("metadata")
-        #print("indices", metadata.indices.shape)
-        #print("ks", metadata.ks.shape)
-        #print("ks_count", metadata.ks_count.shape)
-        #print("ks_start_end", metadata.ks_start_end.shape)
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
             layer.layer_id, q.shape[0], forward_batch.batch_size, cache_loc, metadata)
@@ -436,7 +421,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         dst_seq_len = N // batch_size
 
         query = query.view(batch_size, dst_seq_len, num_heads, hidden_dims)
-        
+
         if k_cache is not None:
             N_PAGE, num_heads_kv, hidden_dims_kv = k_cache.shape
             assert v_cache.shape == k_cache.shape
@@ -471,7 +456,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             rope_sin=layer.rope_sin,
 
             logit_softcap=layer.logit_cap,
-            
+
             second_stage_k=layer_config.second_stage_k,
             stages=layer_config.stages,
             model_context_length=layer.orig_context_len,
