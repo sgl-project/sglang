@@ -2,11 +2,10 @@
 
 #include <ATen/ATen.h>
 #include <torch/all.h>
-// #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
 
-// #include <ATen/ATen.h>
 #include <THC/THCAtomics.cuh>
 
 #ifdef USE_ROCM
@@ -45,16 +44,16 @@ __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t
 }
 
 template <typename scalar_t>
-__global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
-                                            int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
-                                            int32_t block_size, size_t numel) {
+__global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
+                                            int32_t* sorted_token_ids,
+                                            int32_t* expert_ids,
+                                            int32_t* total_tokens_post_pad,
+                                            int32_t num_experts,
+                                            int32_t block_size, size_t numel,
+                                            int32_t* tokens_cnts,
+                                            int32_t* cumsum) {
   const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
   const size_t start_idx = threadIdx.x * tokens_per_thread;
-
-  extern __shared__ int32_t shared_mem[];
-
-  int32_t* tokens_cnts = shared_mem;                              // 2d tensor with shape (blockDim.x + 1, num_experts)
-  int32_t* cumsum = shared_mem + (blockDim.x + 1) * num_experts;  // 1d tensor with shape (num_experts + 1)
 
   for (int i = 0; i < num_experts; ++i) {
     tokens_cnts[index(num_experts, threadIdx.x + 1, i)] = 0;
@@ -75,7 +74,8 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
   if (threadIdx.x < num_experts) {
     tokens_cnts[index(num_experts, 0, threadIdx.x)] = 0;
     for (int i = 1; i <= blockDim.x; ++i) {
-      tokens_cnts[index(num_experts, i, threadIdx.x)] += tokens_cnts[index(num_experts, i - 1, threadIdx.x)];
+      tokens_cnts[index(num_experts, i, threadIdx.x)] +=
+          tokens_cnts[index(num_experts, i - 1, threadIdx.x)];
     }
   }
 
@@ -85,7 +85,10 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
   if (threadIdx.x == 0) {
     cumsum[0] = 0;
     for (int i = 1; i <= num_experts; ++i) {
-      cumsum[i] = cumsum[i - 1] + CEILDIV(tokens_cnts[index(num_experts, blockDim.x, i - 1)], block_size) * block_size;
+      cumsum[i] = cumsum[i - 1] +
+                  CEILDIV(tokens_cnts[index(num_experts, blockDim.x, i - 1)],
+                          block_size) *
+                      block_size;
     }
     *total_tokens_post_pad = cumsum[num_experts];
   }
@@ -97,7 +100,8 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
    * blocks and stores the corresponding expert_id for each block.
    */
   if (threadIdx.x < num_experts) {
-    for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
+    for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1];
+         i += block_size) {
       expert_ids[i / block_size] = threadIdx.x;
     }
   }
@@ -117,27 +121,49 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
      * processed by the expert with expert_id within the current thread's token
      * shard.
      */
-    int32_t rank_post_pad = tokens_cnts[index(num_experts, threadIdx.x, expert_id)] + cumsum[expert_id];
+    int32_t rank_post_pad =
+        tokens_cnts[index(num_experts, threadIdx.x, expert_id)] +
+        cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
     ++tokens_cnts[index(num_experts, threadIdx.x, expert_id)];
   }
 }
 
-void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
-                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids,
+void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
+                          int64_t block_size, torch::Tensor sorted_token_ids,
+                          torch::Tensor experts_ids,
                           torch::Tensor num_tokens_post_pad) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-    // calc needed amount of shared mem for `tokens_cnts` and `cumsum`
-    // tensors
-    const int32_t num_thread = max((int32_t)num_experts, WARP_SIZE);
-    const int32_t shared_mem = ((num_thread + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
+  DISPATCH_INTEGRAL_TYPES(
+      topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
+        // calc needed amount of shared mem for `tokens_cnts` and `cumsum`
+        // tensors
+        const int32_t num_thread = max((int32_t)num_experts, WARP_SIZE);
 
-    // set dynamic shared mem
-    auto kernel = moe_align_block_size_kernel<scalar_t>;
-    AT_CUDA_CHECK(DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
-    kernel<<<1, num_thread, shared_mem, stream>>>(
-        topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(), experts_ids.data_ptr<int32_t>(),
-        num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size, topk_ids.numel());
-  });
+        const int32_t mem_tokens_cnts =
+            ((num_experts + 1) * num_experts) * sizeof(int32_t);
+        const int32_t mem_cumsum =
+            (num_experts + 1) * sizeof(int32_t);
+
+        // allocate global memory
+        int32_t* tokens_cnts;
+        int32_t* cumsum;
+        cudaMalloc(&tokens_cnts, mem_tokens_cnts);
+        cudaMalloc(&cumsum, mem_cumsum);
+
+        // set dynamic shared mem
+        auto kernel = moe_align_block_size_kernel<scalar_t>;
+        kernel<<<1, num_thread, 0, stream>>>(
+            topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+            experts_ids.data_ptr<int32_t>(),
+            num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
+            topk_ids.numel(), tokens_cnts, cumsum);
+
+        cudaFree(tokens_cnts);
+        cudaFree(cumsum);
+      });
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("moe_align_block_size", &moe_align_block_size, "MOE Align Block Size (CUDA)");
 }
