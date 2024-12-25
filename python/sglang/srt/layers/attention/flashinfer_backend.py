@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 if is_flashinfer_available():
     from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
-    from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
+    from flashinfer.cascade import MultiLevelCascadeAttentionWrapper, merge_state
 
 
 class WrapperDispatch(Enum):
@@ -362,22 +362,26 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             )
         else:
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+            o1, s1 = self.prefill_wrapper_ragged.run_return_lse(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
             )
 
             if self.forward_metadata.extend_no_prefix:
                 o = o1
             else:
-                o = prefill_wrapper_paged.run(
+                o2, s2 = prefill_wrapper_paged._batch_prefill_wrappers[
+                    0
+                ].forward_return_lse(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=False,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
                 )
+
+                o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
@@ -872,15 +876,10 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                causal=True,
+                sm_scale=model_layer.scaling,
+                logits_soft_cap=model_layer.logit_cap,
             )
-            if not extend_no_prefix:
-                plan_args.update(
-                    {
-                        "causal": False,
-                        "sm_scale": model_layer.scaling,
-                        "logits_soft_cap": model_layer.logit_cap,
-                    }
-                )
 
         wrapper.plan(**plan_args)
 
