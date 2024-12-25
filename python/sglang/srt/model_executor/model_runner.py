@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -564,6 +565,15 @@ class ModelRunner:
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
             )
+        elif self.server_args.enable_hip_attention and self.server_args.enable_hip_offload:
+            self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=torch.device(self.gpu_id),
+            )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
@@ -573,7 +583,16 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
             )
-        self.hip_metadata_cache_pool = None
+        
+#         if self.server_args.enable_hip_attention:
+#             self.hip_metadata_cache_pool = HiPMetadataCachePool(
+#                 self.max_total_num_tokens,
+#                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
+#                 layer_num=self.model_config.num_hidden_layers,
+#                 device=self.device,
+#                 hip_config=self.hip_attention_config,
+#             )
+        
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
