@@ -49,7 +49,7 @@ class HiPMetadataCachePool:
 
             max_bdst_scan_times_bsz = max(
                 math.ceil(math.ceil((size // bsz) / block_size_q) / stage_stride) * bsz
-                for bsz in range(1, size // 16 + 1)  # FIXME: Assume 16 is the min sequence length for full batch
+                for bsz in range(1, size // 2048 + 1)  # FIXME: Assume 2048 is the min sequence length for full batch
             )
 
             q_blocks = max(1, block_size_q // hip_config.block_sparse_block_size_q)
@@ -123,6 +123,18 @@ class HiPMetadataCachePool:
 
         bdst_scan = triton.cdiv(triton.cdiv(seq_len, block_size_q), stage_stride)
         first_dim = batch_size * self.head_num * bdst_scan * q_blocks
+
+        print(f"size: {size}")
+        print(f"batch_size: {batch_size}")
+        print(f"self.head_num: {self.head_num}")
+        print(f"block_size_q: {block_size_q}")
+        print(f"stage_stride: {stage_stride}")
+        print(f"max_bdst_scan_times_bsz: {max_bdst_scan_times_bsz}")
+        print(f"q_blocks: {q_blocks}")
+        print(f"n_chunks: {n_chunks}")
+        print(f"seq_len: {seq_len}")
+        print(f"bdst_scan: {bdst_scan}")
+        print(f"first_dim: {first_dim}")
 
         self.indices_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks) \
