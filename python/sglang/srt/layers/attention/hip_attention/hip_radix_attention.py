@@ -477,6 +477,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=cached_metadata,
         )
         context = context.to(query.dtype)
+        
+        print('mask', metadata.mask_cache_statistics.compute_statistics())
+        print('sa', metadata.sa_cache_statistics.compute_statistics())
 
         return context.view(N, num_heads, hidden_dims), metadata
 
