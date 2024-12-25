@@ -85,6 +85,9 @@ class HiPMetadataCachePool:
         bdst_scan = triton.cdiv(triton.cdiv(seq_len, block_size_q), stage_stride)
         first_dim = batch_size * self.head_num * bdst_scan * q_blocks
 
+        assert self.indices_pool[layer_id].size(0) >= first_dim, \
+            f"Requested batch size {batch_size} is too large for the metadata cache pool"
+
         indices = self.indices_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks)
         ks = self.ks_pool[layer_id][:first_dim] \
@@ -120,6 +123,9 @@ class HiPMetadataCachePool:
 
         bdst_scan = triton.cdiv(triton.cdiv(seq_len, block_size_q), stage_stride)
         first_dim = batch_size * self.head_num * bdst_scan * q_blocks
+
+        assert self.indices_pool[layer_id].size(0) >= first_dim, \
+            f"Requested batch size {batch_size} is too large for the metadata cache pool"
 
         self.indices_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks) \

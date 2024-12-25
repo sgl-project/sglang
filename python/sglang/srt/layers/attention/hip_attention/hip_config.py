@@ -73,6 +73,7 @@ class HiPAttentionConfig:
     prefill_dense_threshold: int = 8192
     block_sparse_block_size_q: int = 64
     metadata_cache_max_batch_size: int = 256
+    mask_refresh_interval: int = 4
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
         HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 8192, 'sink_token_size': 8192}),
         HiPAttentionPerLayerConfig(),
@@ -107,6 +108,9 @@ class HiPAttentionConfig:
             if 'metadata_cache_max_batch_size' in parsed_json:
                 self.metadata_cache_max_batch_size = parsed_json['metadata_cache_max_batch_size']
                 parsed_json.pop('metadata_cache_max_batch_size')
+            if 'mask_refresh_interval' in parsed_json:
+                self.mask_refresh_interval = parsed_json['mask_refresh_interval']
+                parsed_json.pop('mask_refresh_interval')
             if 'layers' in parsed_json:
                 self.layers = [
                     HiPAttentionPerLayerConfig(parsed_json=layer)
