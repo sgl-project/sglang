@@ -43,17 +43,24 @@ class HiPAttentionPerLayerConfig:
         if parsed_json is not None:
             if 'second_stage_k' in parsed_json:
                 self.second_stage_k = parsed_json['second_stage_k']
+                parsed_json.pop('second_stage_k')
             if 'sliding_window_size' in parsed_json:
                 self.sliding_window_size = parsed_json['sliding_window_size']
+                parsed_json.pop('sliding_window_size')
             if 'sink_token_size' in parsed_json:
                 self.sink_token_size = parsed_json['sink_token_size']
+                parsed_json.pop('sink_token_size')
             if 'sa_extend_backend' in parsed_json:
                 self.sa_extend_backend = parsed_json['sa_extend_backend']
+                parsed_json.pop('sa_extend_backend')
             if 'stages' in parsed_json:
                 self.stages = [
                     ScanStage(**stage)
                     for stage in parsed_json['stages']
                 ]
+                parsed_json.pop('stages')
+            if parsed_json:
+                raise ValueError(f'Unknown keys in json: {parsed_json.keys()}')
 
 
 @dataclass
@@ -65,6 +72,7 @@ class HiPAttentionConfig:
     force_dense: bool = False
     prefill_dense_threshold: int = 8192
     block_sparse_block_size_q: int = 64
+    metadata_cache_max_batch_size: int = 256
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
         HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 8192, 'sink_token_size': 8192}),
         HiPAttentionPerLayerConfig(),
@@ -77,18 +85,33 @@ class HiPAttentionConfig:
         if parsed_json is not None:
             if 'apply_v_dot' in parsed_json:
                 self.apply_v_dot = parsed_json['apply_v_dot']
+                parsed_json.pop('apply_v_dot')
             if 'dense_layers' in parsed_json:
                 self.dense_layers = parsed_json['dense_layers']
+                parsed_json.pop('dense_layers')
             if 'prefill_always_dense' in parsed_json:
                 self.prefill_always_dense = parsed_json['prefill_always_dense']
+                parsed_json.pop('prefill_always_dense')
             if 'decode_always_dense' in parsed_json:
                 self.decode_always_dense = parsed_json['decode_always_dense']
+                parsed_json.pop('decode_always_dense')
             if 'force_dense' in parsed_json:
                 self.force_dense = parsed_json['force_dense']
+                parsed_json.pop('force_dense')
             if 'prefill_dense_threshold' in parsed_json:
                 self.prefill_dense_threshold = parsed_json['prefill_dense_threshold']
+                parsed_json.pop('prefill_dense_threshold')
+            if 'block_sparse_block_size_q' in parsed_json:
+                self.block_sparse_block_size_q = parsed_json['block_sparse_block_size_q']
+                parsed_json.pop('block_sparse_block_size_q')
+            if 'metadata_cache_max_batch_size' in parsed_json:
+                self.metadata_cache_max_batch_size = parsed_json['metadata_cache_max_batch_size']
+                parsed_json.pop('metadata_cache_max_batch_size')
             if 'layers' in parsed_json:
                 self.layers = [
                     HiPAttentionPerLayerConfig(parsed_json=layer)
                     for layer in parsed_json['layers']
                 ]
+                parsed_json.pop('layers')
+            if parsed_json:
+                raise ValueError(f'Unknown keys in json: {parsed_json.keys()}')

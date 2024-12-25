@@ -47,10 +47,7 @@ class HiPMetadataCachePool:
             block_size_q = layer_config.stages[0].stage_block_size_q  # BLOCK_SIZE_Q
             stage_stride = layer_config.stages[0].stage_stride
 
-            max_bdst_scan_times_bsz = max(
-                math.ceil(math.ceil((size // bsz) / block_size_q) / stage_stride) * bsz
-                for bsz in range(1, size // 2048 + 1)  # FIXME: Assume 2048 is the min sequence length for full batch
-            )
+            max_bdst_scan_times_bsz = hip_config.metadata_cache_max_batch_size
 
             q_blocks = max(1, block_size_q // hip_config.block_sparse_block_size_q)
             n_chunks = triton.cdiv(layer_config.second_stage_k, layer_config.stages[-1].stage_chunk_size)

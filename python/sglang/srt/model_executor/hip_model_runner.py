@@ -52,6 +52,8 @@ class HiPModelRunner(ModelRunner):
     def init_hip_attention_config(self, hip_attention_config_path):
         if hip_attention_config_path is None:
             hip_attention_config = {}
+        elif hip_attention_config_path.startswith("{"):
+            hip_attention_config = json.loads(hip_attention_config_path)
         else:
             with open(hip_attention_config_path, "r") as f:
                 hip_attention_config = json.load(f)
