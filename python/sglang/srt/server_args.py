@@ -116,6 +116,8 @@ class ServerArgs:
     # HiP Attention
     enable_hip_attention: bool = False
     hip_attention_config: str = None
+    enable_hip_offload: bool = False
+    hip_attention_config_path: str = None
 
     # LoRA
     lora_paths: Optional[List[str]] = None
@@ -632,6 +634,11 @@ class ServerArgs:
             "--enable-hip-attention",
             action="store_true",
             help="Enable HiP attention.",
+        )
+        parser.add_argument(
+            "--enable-hip-offload",
+            action="store_true",
+            help="Enable HiP offloading.",
         )
         parser.add_argument(
             "--hip-attention-config",

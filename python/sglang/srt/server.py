@@ -657,6 +657,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
+            logger.info(f'Warmup response: {res.json()}')
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
