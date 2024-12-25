@@ -118,20 +118,12 @@ class SchedulePolicy:
     ) -> Policy:
         """
         Validates the policy and adjusts it if necessary based on tree cache settings.
-
-        Args:
-            policy (str): The scheduling policy.
-            tree_cache (BasePrefixCache): The tree cache.
-
-        Returns:
-            CacheAwarePolicy | CacheAgnosticPolicy: The adjusted policy.
         """
         try:
             policy_enum = CacheAwarePolicy(policy)
             if tree_cache.disable:
-                return (
-                    CacheAgnosticPolicy.FCFS
-                )  # If tree_cache is disabled, only FCFS is meaningful
+                # If tree_cache is disabled, using CacheAgnosticPolicy policy
+                return CacheAgnosticPolicy.FCFS
             return policy_enum
         except ValueError:
             try:
