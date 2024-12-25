@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field, InitVar
 
-from hip.models.hip_attention.attention2_draft_sampling_extend import ScanStage
+from hip.models.hip_attention.gen3.attention_metadata import ScanStage
 
 
 _DEFAULT_STAGES = [

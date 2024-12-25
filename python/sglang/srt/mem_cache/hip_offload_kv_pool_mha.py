@@ -34,9 +34,9 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         
         self.layer_buffer = [
             HiPOffloadCache(
-                max_token_size=256 * 1024,
-                max_mask_cache_token_size=1 * 1024 * 1024,
-                max_sa_cache_token_size=32 * 3 * 1024,
+                max_token_size=512 * 1024,
+                max_mask_cache_token_size=256 * 1024,
+                max_sa_cache_token_size=16 * 1024,
                 head_num=head_num,
                 head_dim=head_dim,
                 dtype=dtype,
@@ -139,12 +139,13 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
 
     def set_kv_buffer(
         self,
-        layer_id: int,
+        layer: RadixAttention,
         table: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        async_copy: bool,
+        async_copy: bool = False,
     ):
+        layer_id = layer.layer_id
         # pass async_copy=True when only prefill (eager mode)
         assert (not async_copy) or (async_copy and (not torch.cuda.is_current_stream_capturing()))
         
