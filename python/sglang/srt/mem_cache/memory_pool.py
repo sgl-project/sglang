@@ -333,6 +333,7 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         self.head_dim = head_dim
         self.layer_num = layer_num
         self.heavy_channel_num = heavy_channel_num
+        self.create_buffers()
 
     def create_buffers(self):
         # [size, head_num, head_dim] for each layer
