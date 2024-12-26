@@ -190,8 +190,7 @@ class TokenizerManager:
     ):
         created_time = time.time()
 
-        if self.to_create_loop:
-            self.create_handle_loop()
+        self.auto_create_handle_loop()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -440,8 +439,7 @@ class TokenizerManager:
         obj: UpdateWeightFromDiskReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        if self.to_create_loop:
-            self.create_handle_loop()
+        self.auto_create_handle_loop()
 
         # default the load format to the server_args
         if obj.load_format is None:
@@ -485,8 +483,7 @@ class TokenizerManager:
         obj: InitWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        if self.to_create_loop:
-            self.create_handle_loop()
+        self.auto_create_handle_loop()
         self.send_to_scheduler.send_pyobj(obj)
 
         self.init_weights_update_group_result = asyncio.Future()
@@ -501,8 +498,7 @@ class TokenizerManager:
         obj: UpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        if self.to_create_loop:
-            self.create_handle_loop()
+        self.auto_create_handle_loop()
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -520,8 +516,7 @@ class TokenizerManager:
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
-        if self.to_create_loop:
-            self.create_handle_loop()
+        self.auto_create_handle_loop()
 
         self.send_to_scheduler.send_pyobj(obj)
         self.get_weights_by_name_result = asyncio.Future()
@@ -537,8 +532,7 @@ class TokenizerManager:
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
-        if self.to_create_loop:
-            self.create_handle_loop()
+        self.auto_create_handle_loop()
 
         session_id = uuid.uuid4().hex
         obj.session_id = session_id
@@ -568,7 +562,7 @@ class TokenizerManager:
         background_tasks.add_task(abort_request)
         return background_tasks
 
-    def create_handle_loop(self):
+    def auto_create_handle_loop(self):
         if not self.to_create_loop:
             return
 
