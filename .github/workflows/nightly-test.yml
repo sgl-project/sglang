@@ -1,4 +1,4 @@
-name: Nightly Evaluation
+name: Nightly Test
 
 on:
   schedule:
@@ -11,11 +11,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: nightly-eval-${{ github.ref }}
+  group: nightly-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  nightly-eval-2-gpu:
+  nightly-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
     steps:
@@ -27,14 +27,8 @@ jobs:
           bash scripts/ci_install_dependency.sh
           pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
 
-      - name: Test gsm8k
-        timeout-minutes: 120
+      - name: Run test
+        timeout-minutes: 10
         run: |
-          cd test/srt
-          python3 test_nightly_gsm8k_eval.py
-
-      - name: Test human eval
-        timeout-minutes: 120
-        run: |
-          cd test/srt
-          python3 test_nightly_human_eval.py
+          cd test/lang
+          python3 run_suite.py --suite nightly --timeout-per-file 2400

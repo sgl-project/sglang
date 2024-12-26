@@ -517,6 +517,7 @@ def v1_generate_request(
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
                 "json_schema": request.json_schema,
+                "ebnf": request.ebnf,
                 "n": request.n,
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
@@ -692,6 +693,14 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    if "extra_body" in request_json:
+        extra = request_json["extra_body"]
+        if "ebnf" in extra:
+            request_json["ebnf"] = extra["ebnf"]
+        if "regex" in extra:
+            request_json["regex"] = extra["regex"]
+        # remove extra_body to avoid pydantic conflict
+        del request_json["extra_body"]
     all_requests = [CompletionRequest(**request_json)]
     adapted_request, request = v1_generate_request(all_requests)
 
@@ -858,6 +867,7 @@ def v1_chat_generate_request(
     logprob_start_lens = []
     top_logprobs_nums = []
     modalities_list = []
+    lora_paths = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -920,6 +930,7 @@ def v1_chat_generate_request(
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
+        lora_paths.append(request.lora_path)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -934,6 +945,7 @@ def v1_chat_generate_request(
             "frequency_penalty": request.frequency_penalty,
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
+            "ebnf": request.ebnf,
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
@@ -958,6 +970,7 @@ def v1_chat_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
+        lora_paths = lora_paths[0]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -975,6 +988,7 @@ def v1_chat_generate_request(
         return_text_in_logprobs=True,
         rid=request_ids,
         modalities=modalities_list,
+        lora_path=lora_paths,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -1104,6 +1118,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    if "extra_body" in request_json:
+        extra = request_json["extra_body"]
+        # For example, if 'ebnf' is given:
+        if "ebnf" in extra:
+            request_json["ebnf"] = extra["ebnf"]
+        if "regex" in extra:
+            request_json["regex"] = extra["regex"]
+        # remove extra_body to avoid pydantic conflict
+        del request_json["extra_body"]
     all_requests = [ChatCompletionRequest(**request_json)]
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
