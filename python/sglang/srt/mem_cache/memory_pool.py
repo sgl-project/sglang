@@ -184,25 +184,34 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         device: str,
     ):
         super().__init__(size, dtype, device)
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.layer_num = layer_num
+        self._create_buffers()
 
+    def _create_buffers(self):
         # [size, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.k_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim),
+                (self.size + 1, self.head_num, self.head_dim),
                 dtype=self.store_dtype,
-                device=device,
+                device=self.device,
             )
-            for _ in range(layer_num)
+            for _ in range(self.layer_num)
         ]
         self.v_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim),
+                (self.size + 1, self.head_num, self.head_dim),
                 dtype=self.store_dtype,
-                device=device,
+                device=self.device,
             )
-            for _ in range(layer_num)
+            for _ in range(self.layer_num)
         ]
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
@@ -245,7 +254,6 @@ def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
 
 
 class MLATokenToKVPool(BaseTokenToKVPool):
-
     def __init__(
         self,
         size: int,
@@ -298,7 +306,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
 
 class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
-
     def __init__(
         self,
         size: int,

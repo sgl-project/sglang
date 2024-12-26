@@ -4,7 +4,7 @@ import glob
 from sglang.test.test_utils import run_unittest_files
 
 suites = {
-    "minimal": ["test_srt_backend.py", "test_openai_backend.py"],
+    "per-commit": ["test_srt_backend.py", "test_openai_backend.py"],
 }
 
 
