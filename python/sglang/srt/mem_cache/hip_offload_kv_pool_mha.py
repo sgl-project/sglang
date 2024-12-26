@@ -97,11 +97,13 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         hip_offload_cache = self.get_kv_buffer(layer_id)
         
         handle_id = (layer_id, batch_id)
-        torch.cuda.current_stream().synchronize()
+        torch.cuda.current_stream(device=self.device).synchronize()
         # torch.cuda.synchronize(device=self.device)
+        # print(threading.current_thread().native_id, 'start copy')
         stream = torch.cuda.Stream(device=self.device)
         # start_event = torch.cuda.Event()
         def thread_main():
+            # print(threading.current_thread().native_id, 'start copy')
             with torch.cuda.stream(stream):
                 # start_event.synchronize()
                 k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
@@ -113,6 +115,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 self.prefetched_kv[handle_id] = (k, v, prefix_seq_len)
             stream.synchronize()
             self.prefetch_threads.pop(handle_id)
+            # print(threading.current_thread().native_id, 'done copy')
         t = threading.Thread(target=thread_main, daemon=True)
         self.prefetch_threads[handle_id] = t
         t.start()
@@ -179,7 +182,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             cache_v = cache_v.to(self.dtype)
         
         if async_copy:
-            torch.cuda.current_stream().synchronize()
+            torch.cuda.current_stream(device=self.device).synchronize()
             # torch.cuda.synchronize()
             stream = torch.cuda.Stream(device=self.device)
             # start_event = torch.cuda.Event()
@@ -211,8 +214,11 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
     
     def synchronize(self):
         torch.cuda.synchronize()
+        # t = time.time()
         # you must call this function when finish prefill, before decode
         while (len(self.prefetch_threads) > 0) or (len(self.async_set_threads) > 0):
             time.sleep(0.001)
         assert len(self.prefetch_threads) == 0
         assert len(self.async_set_threads) == 0
+        # elapsed = time.time() - t
+        # print(f'sync took {(time.time() * elapsed)}')

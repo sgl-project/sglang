@@ -74,7 +74,7 @@ class HiPAttentionConfig:
     metadata_cache_max_batch_size: int = 256
     mask_refresh_interval: int = 4
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
-        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 2048, 'sliding_window_size': 256, 'sink_token_size': 1024}),
+        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 1024, 'sink_token_size': 256}),
         HiPAttentionPerLayerConfig(),
     ])
 
