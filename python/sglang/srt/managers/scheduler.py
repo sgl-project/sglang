@@ -487,9 +487,9 @@ class Scheduler:
                 parameter = self.get_weights_by_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, ReleaseGPUOccupationReqInput):
-                TODO
+                self.release_gpu_occupation()
             elif isinstance(recv_req, ResumeGPUOccupationReqInput):
-                TODO
+                self.resume_gpu_occupation()
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
                     self.start_profile()
@@ -1469,6 +1469,14 @@ class Scheduler:
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return parameter
+
+    def release_gpu_occupation(self):
+        self.flush_cache()
+        self.token_to_kv_pool._clear_buffers()
+        torch.cuda.empty_cache()
+
+    def resume_gpu_occupation(self):
+        self.token_to_kv_pool._create_buffers()
 
     def start_profile(self) -> None:
         if self.profiler is None:
