@@ -25,3 +25,33 @@ pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-Base --enable-dp-attention --tp 8 --trust-remote-code
 ```
+
+### Example with OpenAI API
+
+```python3
+import openai
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0,
+    max_tokens=64,
+)
+print(response)
+```
+
+## DeepSeek V3 optimization plan
+
+https://github.com/sgl-project/sglang/issues/2591
+
+## Appendix
+
+SGLang is the inference engine officially recommended by the DeepSeek team.
+
+https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended

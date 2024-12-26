@@ -23,7 +23,7 @@ runtime_common = ["aiohttp", "decord", "fastapi",
     "psutil", "pydantic", "python-multipart",
     "pyzmq>=25.1.2", "torchao>=0.7.0", "uvicorn", "uvloop",
     "xgrammar>=0.1.6"]
-srt = ["sglang[runtime_common]", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1", "cuda-python", "flashinfer==0.1.6", "sgl-kernel>=0.0.2.post8"]
+srt = ["sglang[runtime_common]", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1", "cuda-python", "flashinfer==0.1.6", "sgl-kernel>=0.0.2.post9"]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20241022, not from public vllm whl
