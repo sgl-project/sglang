@@ -53,7 +53,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     ReleaseGPUOccupationReqInput,
-    ResumeGPUOccupationReqInput,
+    ResumeGPUOccupationReqInput, ReleaseGPUOccupationReqOutput, ResumeGPUOccupationReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -488,8 +488,10 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, ReleaseGPUOccupationReqInput):
                 self.release_gpu_occupation()
+                self.send_to_tokenizer.send_pyobj(ReleaseGPUOccupationReqOutput())
             elif isinstance(recv_req, ResumeGPUOccupationReqInput):
                 self.resume_gpu_occupation()
+                self.send_to_tokenizer.send_pyobj(ResumeGPUOccupationReqOutput())
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
                     self.start_profile()
@@ -1471,6 +1473,7 @@ class Scheduler:
         return parameter
 
     def release_gpu_occupation(self):
+        assert self.server_args.disable_cuda_graph, 'release_gpu_occupation does not support CUDA graph'
         self.flush_cache()
         self.token_to_kv_pool.clear_buffers()
         torch.cuda.empty_cache()
