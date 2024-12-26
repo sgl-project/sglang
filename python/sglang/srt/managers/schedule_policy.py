@@ -248,7 +248,7 @@ class PrefillAdder:
         self.can_run_list.append(req)
 
         self._prefill_one_req(
-            len(req.prefix_indices),
+            0,
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
