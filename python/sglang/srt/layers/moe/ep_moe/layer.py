@@ -12,15 +12,15 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 
 from sglang.srt.layers.custom_op_util import register_custom_op
-from sglang.srt.layers.ep_moe.kernels import (
+from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
-from sglang.srt.layers.fused_moe_triton.fused_moe import fused_topk, grouped_topk
-from sglang.srt.layers.fused_moe_triton.layer import FusedMoEMethodBase
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -113,6 +113,7 @@ class EPMoE(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -138,6 +139,7 @@ class EPMoE(torch.nn.Module):
             assert num_expert_group is not None and topk_group is not None
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
+        self.correction_bias = correction_bias
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
@@ -170,13 +172,15 @@ class EPMoE(torch.nn.Module):
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
 
-        topk_weights, topk_ids = self.select_experts(
-            hidden_states,
-            router_logits,
-            self.top_k,
-            self.renormalize,
-            self.topk_group,
-            self.num_expert_group,
+        topk_weights, topk_ids = select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            use_grouped_topk=self.use_grouped_topk,
+            renormalize=self.renormalize,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            correction_bias=self.correction_bias,
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -296,35 +300,6 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
         return output
-
-    def select_experts(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-    ):
-        if self.use_grouped_topk:
-            assert topk_group is not None
-            assert num_expert_group is not None
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
-        else:
-            topk_weights, topk_ids = fused_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-            )
-        return topk_weights, topk_ids.to(torch.int32)
 
     @classmethod
     def make_expert_params_mapping(

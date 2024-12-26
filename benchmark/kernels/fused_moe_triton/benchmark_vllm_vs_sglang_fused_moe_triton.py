@@ -5,12 +5,14 @@ import triton
 from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
-from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe as fused_moe_sglang
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    fused_moe as fused_moe_sglang,
+)
 
 
 def get_model_config(model_name: str, tp_size: int):
     """Get model configuration parameters"""
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
@@ -27,6 +29,11 @@ def get_model_config(model_name: str, tp_size: int):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
+    elif config.architectures[0] == "DeepseekV2ForCausalLM":
+        E = config.n_routed_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
     else:
         # Default: Mixtral
         E = config.num_local_experts
