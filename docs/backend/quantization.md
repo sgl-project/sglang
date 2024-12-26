@@ -4,7 +4,7 @@
 
 ## Online Dynamic Quantization
 
-To enable oneline dynamic quantization, you can simply specify `--quantize` in command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can lauch the server with following command:
+To enable oneline dynamic quantization, you can simply specify `--quantization` in command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can lauch the server with following command:
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
