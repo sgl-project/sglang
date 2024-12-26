@@ -11,7 +11,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+from sglang.srt.utils import is_hip
+if not is_hip():
+    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
@@ -268,7 +270,7 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     # FIXME(zhyncs)
-    if num_experts >= 256:
+    if num_experts >= 256 and not is_hip():
         sgl_moe_align_block_size(
             topk_ids,
             num_experts,
@@ -430,7 +432,7 @@ def get_default_config(
     dtype: Optional[str],
     is_marlin: bool,
 ) -> Dict[str, int]:
-    if dtype == "fp8_w8a8":
+    if dtype == "fp8_w8a8" and not is_hip():
         config = {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 256,

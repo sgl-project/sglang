@@ -402,7 +402,7 @@ def _decode_grouped_att_m_fwd(
     sm_scale,
     logit_cap,
 ):
-    BLOCK = 32
+    BLOCK = 16 if is_hip() else 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 

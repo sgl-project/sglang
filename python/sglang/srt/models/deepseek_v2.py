@@ -55,7 +55,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, is_hip
 
 if is_flashinfer_available():
     from flashinfer import bmm_fp8
@@ -573,13 +573,16 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        if self.w_kc.dtype == torch.float8_e4m3fn:
-            q_nope_val, q_nope_scale = input_to_float8(
-                q_nope.transpose(0, 1), torch.float8_e4m3fn
-            )
-            q_nope_out = bmm_fp8(
-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-            )
+        if self.w_kc.dtype == torch.float8_e4m3fn or torch.float8_e4m3fnuz:
+            if is_hip():
+                q_nope_out = torch.bmm(q_nope.to(torch.bfloat16).transpose(0, 1), self.w_kc.to(torch.bfloat16))
+            else:
+                q_nope_val, q_nope_scale = input_to_float8(
+                    q_nope.transpose(0, 1), torch.float8_e4m3fn
+                )
+                q_nope_out = bmm_fp8(
+                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+                )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
@@ -598,17 +601,20 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.w_vc.dtype == torch.float8_e4m3fn:
-            attn_output_val, attn_output_scale = input_to_float8(
-                attn_output.transpose(0, 1), torch.float8_e4m3fn
-            )
-            attn_bmm_output = bmm_fp8(
-                attn_output_val,
-                self.w_vc,
-                attn_output_scale,
-                self.w_scale,
-                torch.bfloat16,
-            )
+        if self.w_vc.dtype == torch.float8_e4m3fn or torch.float8_e4m3fnuz:
+            if is_hip():
+                attn_bmm_output = torch.bmm(attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc.to(torch.bfloat16))
+            else:
+                attn_output_val, attn_output_scale = input_to_float8(
+                    attn_output.transpose(0, 1), torch.float8_e4m3fn
+                )
+                attn_bmm_output = bmm_fp8(
+                    attn_output_val,
+                    self.w_vc,
+                    attn_output_scale,
+                    self.w_scale,
+                    torch.bfloat16,
+                )
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
@@ -942,7 +948,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # This may affect the accuracy of fp8 model.
                 if (
                     hasattr(self.quant_config, "weight_block_size")
-                    and w.dtype == torch.float8_e4m3fn
+                    and w.dtype == torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
                 ):
                     weight_block_size = self.quant_config.weight_block_size
                     if weight_block_size is not None:
