@@ -589,12 +589,15 @@ class Scheduler:
         if (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
         ):
             assert self.grammar_backend is not None
             if req.sampling_params.json_schema is not None:
                 key = ("json", req.sampling_params.json_schema)
             elif req.sampling_params.regex is not None:
                 key = ("regex", req.sampling_params.regex)
+            elif req.sampling_params.ebnf is not None:
+                key = ("ebnf", req.sampling_params.ebnf)
 
             req.grammar = self.grammar_backend.get_cached_value(key)
             if not req.grammar:
