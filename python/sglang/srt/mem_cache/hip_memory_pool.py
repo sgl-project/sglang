@@ -125,7 +125,7 @@ class HiPMetadataCachePool:
 
         assert self.indices_pool[layer_id].size(0) >= first_dim, \
             f"Requested batch size {batch_size} is too large for the metadata cache pool"
-
+            
         self.indices_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks) \
             .copy_(metadata.indices)

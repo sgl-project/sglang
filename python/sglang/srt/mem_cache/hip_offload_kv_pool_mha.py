@@ -13,7 +13,11 @@ from hip.models.hip_attention.gen3.uvm_gpu_cache import (
     UVMCache,
     GPUCache,
     HiPOffloadCache,
+    format_size_bytes,
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
 
@@ -24,19 +28,24 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         head_num: int,
         head_dim: int,
         layer_num: int,
-        device: str,
+        device: torch.device,
     ):
+        assert isinstance(device, torch.device)
+        assert device.index is not None
+        
         super().__init__(size, dtype, device)
         
         #TODO: derive token sizes from size
         self.head_num = head_num
         self.head_dim = head_dim
+        self.max_mask_cache_token_size = 128 * 1024
+        self.max_sa_cache_token_size = 16 * 1024
         
         self.layer_buffer = [
             HiPOffloadCache(
-                max_token_size=256 * 1024,
-                max_mask_cache_token_size=128 * 1024,
-                max_sa_cache_token_size=16 * 1024,
+                max_token_size=size + 1,
+                max_mask_cache_token_size=self.max_mask_cache_token_size,
+                max_sa_cache_token_size=self.max_sa_cache_token_size,
                 head_num=head_num,
                 head_dim=head_dim,
                 dtype=dtype,
@@ -50,6 +59,20 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         self.prefetched_kv: Dict[Tuple[int, int], Tuple[Tensor, Tensor, int]] = {}
         
         self.async_set_threads: Set[threading.Thread] = set()
+        
+        uvm_allocated_bytes = 0
+        gpu_allocated_bytes = 0
+        for cache in self.layer_buffer:
+            uvm_allocated_bytes += cache.k_uvm.allocated_cpu_bytes
+            gpu_allocated_bytes += cache.k_uvm.allocated_gpu_bytes
+            uvm_allocated_bytes += cache.v_uvm.allocated_cpu_bytes
+            gpu_allocated_bytes += cache.v_uvm.allocated_gpu_bytes
+            gpu_allocated_bytes += cache.mask_k_cache.allocated_gpu_bytes
+            gpu_allocated_bytes += cache.sa_kv_cache.allocated_gpu_bytes
+        logger.info(
+            f'Allocated CPU(UVM) bytes: {format_size_bytes(gpu_allocated_bytes)} '
+            f'Allocated GPU bytes: {format_size_bytes(gpu_allocated_bytes)}'
+        )
 
     def get_key_buffer(self, layer_id: int):
         raise NotImplementedError()

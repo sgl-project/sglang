@@ -585,15 +585,6 @@ class ModelRunner:
                 device=self.device,
             )
 
-#         if self.server_args.enable_hip_attention:
-#             self.hip_metadata_cache_pool = HiPMetadataCachePool(
-#                 self.max_total_num_tokens,
-#                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
-#                 layer_num=self.model_config.num_hidden_layers,
-#                 device=self.device,
-#                 hip_config=self.hip_attention_config,
-#             )
-
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

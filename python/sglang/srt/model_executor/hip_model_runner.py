@@ -70,7 +70,7 @@ class HiPModelRunner(ModelRunner):
         if self.server_args.enable_hip_attention:
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
                 self.max_total_num_tokens,
-                head_num=self.model_config.num_attention_heads,
+                head_num=self.model_config.num_attention_heads // self.server_args.tp_size,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 hip_config=self.hip_attention_config,
