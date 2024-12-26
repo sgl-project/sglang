@@ -452,7 +452,17 @@ class HiPRadixAttentionBackend(AttentionBackend):
         BLOCK_TABLE_BSZ, MODEL_SEQ_LEN = block_table.shape
         assert batch_size == BLOCK_TABLE_BSZ
 
-        is_gemma = layer.logit_cap != 0.0  # FIXME: find better way to detect Gemma
+        # NOTE(heejun): the whole point to need to find gemma is large size of hidden size
+        # FIXME: find better way to detect Gemma
+        if k_cache is not None:
+            hidden_size = k_cache.shape[-1]
+        elif k is not None:
+            hidden_size = k.shape[-1]
+        elif offload_cache is not None:
+            hidden_size = offload_cache.k_uvm.bank_cpu.shape[-1]
+        else:
+            raise Exception()
+        is_gemma = hidden_size > 128
 
         args = HiPAttentionArgs(
             k_cache=k_cache.view(torch.uint8) if isinstance(k_cache, torch.Tensor) and k_cache.dtype == torch.float8_e5m2 else k_cache,
@@ -472,7 +482,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             rope_cos=layer.rope_cos,
             rope_sin=layer.rope_sin,
 
-            logit_softcap=layer.logit_cap,
+            logit_softcap=layer.logit_cap if layer.logit_cap != 0.0 else None,
 
             second_stage_k=layer_config.second_stage_k,
             stages=layer_config.stages,

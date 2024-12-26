@@ -97,13 +97,14 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         hip_offload_cache = self.get_kv_buffer(layer_id)
         
         handle_id = (layer_id, batch_id)
-        torch.cuda.current_stream(device=self.device).synchronize()
-        # torch.cuda.synchronize(device=self.device)
-        # print(threading.current_thread().native_id, 'start copy')
-        stream = torch.cuda.Stream(device=self.device)
+        # print(threading.current_thread().native_id, 'start prefetch')
         # start_event = torch.cuda.Event()
         def thread_main():
+            torch.cuda.synchronize(device=self.device)
             # print(threading.current_thread().native_id, 'start copy')
+            stream = torch.cuda.Stream(device=self.device, priority=0)
+            stream.wait_stream(torch.cuda.default_stream(device=self.device))
+            # t_local = time.time()
             with torch.cuda.stream(stream):
                 # start_event.synchronize()
                 k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
@@ -115,7 +116,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 self.prefetched_kv[handle_id] = (k, v, prefix_seq_len)
             stream.synchronize()
             self.prefetch_threads.pop(handle_id)
-            # print(threading.current_thread().native_id, 'done copy')
+            # print(threading.current_thread().native_id, 'done copy', (time.time() - t_local) * 1000, (k.numel() * k.element_size()) * 2 / 1024 / 1024)
         t = threading.Thread(target=thread_main, daemon=True)
         self.prefetch_threads[handle_id] = t
         t.start()
@@ -182,24 +183,24 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             cache_v = cache_v.to(self.dtype)
         
         if async_copy:
-            torch.cuda.current_stream(device=self.device).synchronize()
-            # torch.cuda.synchronize()
-            stream = torch.cuda.Stream(device=self.device)
             # start_event = torch.cuda.Event()
             def thread_main():
+                torch.cuda.synchronize(device=self.device)
+                stream = torch.cuda.Stream(device=self.device)
+                stream.wait_stream(torch.cuda.default_stream(device=self.device))
                 with torch.cuda.stream(stream):
                     # start_event.synchronize()
                     table_gpu = table
-                    table_cpu = table.to('cpu', non_blocking=True)
-                    cache_k_cpu = cache_k.to('cpu', non_blocking=True)
-                    cache_v_cpu = cache_v.to('cpu', non_blocking=True)
+                    table_cpu = table.to('cpu', non_blocking=False)
+                    cache_k_cpu = cache_k.to('cpu', non_blocking=False)
+                    cache_v_cpu = cache_v.to('cpu', non_blocking=False)
                     self.layer_buffer[layer_id].set_kv_buffer(
                         table=table_cpu,
                         table_gpu=table_gpu,
                         cache_k=cache_k_cpu,
                         cache_v=cache_v_cpu,
                     )
-                    stream.synchronize()
+                stream.synchronize()
                 self.async_set_threads.remove(t)
             t = threading.Thread(target=thread_main, daemon=True)
             self.async_set_threads.add(t)
@@ -213,12 +214,13 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             )
     
     def synchronize(self):
-        torch.cuda.synchronize()
-        # t = time.time()
+        torch.cuda.synchronize(device=self.device)
+        t = time.time()
         # you must call this function when finish prefill, before decode
         while (len(self.prefetch_threads) > 0) or (len(self.async_set_threads) > 0):
             time.sleep(0.001)
         assert len(self.prefetch_threads) == 0
         assert len(self.async_set_threads) == 0
-        # elapsed = time.time() - t
-        # print(f'sync took {(time.time() * elapsed)}')
+        assert len(self.prefetched_kv) == 0
+        elapsed = time.time() - t
+        logger.debug(f'Final layer sync took {elapsed * 1024:.4f} ms')

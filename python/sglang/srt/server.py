@@ -636,7 +636,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 128 if model_info["is_generation"] else 1
+    max_new_tokens = 32 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
             "temperature": 0,
