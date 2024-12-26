@@ -245,12 +245,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.num_cascade_levels,
                     self.workspace_buffer,
                     "NHD",
-                    # Pass below args once flashinfer version is bumped
-                    # use_cuda_graph=True,
-                    # qo_indptr_buf_arr=[self.qo_indptr[i][: bs + 1]],
-                    # paged_kv_indptr_buf_arr=[self.kv_indptr[i][: bs + 1]],
-                    # paged_kv_indices_buf_arr=[self.cuda_graph_kv_indices[i]],
-                    # paged_kv_last_page_len_buf_arr=[self.kv_last_page_len[:bs]],
                 )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
@@ -284,6 +278,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 req_pool_indices,
                 seq_lens,
                 seq_lens_sum,
+                model_layer,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
@@ -506,7 +501,6 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[MultiLevelCascadeAttentionWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
-=======
         decode_wrappers = decode_wrappers or self.decode_wrappers
 
         for wrapper_id in range(2):
@@ -790,7 +784,6 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
-                forward_metadata,
                 extend_no_prefix,
                 model_layer,
                 use_ragged,
@@ -881,7 +874,7 @@ class FlashInferIndicesUpdaterPrefill:
                 logits_soft_cap=model_layer.logit_cap,
             )
 
-        wrapper.plan(**plan_args)
+        wrapper_paged.plan(**plan_args)
 
 
 @triton.jit
