@@ -254,6 +254,24 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
         return _create_error_response(e)
 
 
+@app.api_route("/release_gpu_occupation", methods=["GET", "POST"])
+async def release_gpu_occupation(obj: ReleaseGPUOccupationReqInput, request: Request):
+    """Release GPU occupation temporarily"""
+    try:
+        await tokenizer_manager.release_gpu_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/resume_gpu_occupation", methods=["GET", "POST"])
+async def resume_gpu_occupation(obj: ResumeGPUOccupationReqInput, request: Request):
+    """Resume GPU occupation"""
+    try:
+        await tokenizer_manager.resume_gpu_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
@@ -868,7 +886,7 @@ class Engine:
         loop.run_until_complete(tokenizer_manager.release_gpu_occupation(obj, None))
 
     def resume_gpu_occupation(self):
-        """Release GPU occupation temporarily"""
+        """Resume GPU occupation"""
         obj = ResumeGPUOccupationReqInput()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(tokenizer_manager.resume_gpu_occupation(obj, None))
