@@ -49,3 +49,9 @@ print(response)
 ## DeepSeek V3 optimization plan
 
 https://github.com/sgl-project/sglang/issues/2591
+
+## Appendix
+
+SGLang is the inference engine officially recommended by the DeepSeek team.
+
+https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended
