@@ -47,10 +47,7 @@ class HiPMetadataCachePool:
             block_size_q = layer_config.stages[0].stage_block_size_q  # BLOCK_SIZE_Q
             stage_stride = layer_config.stages[0].stage_stride
 
-            max_bdst_scan_times_bsz = max(
-                math.ceil(math.ceil((size // bsz) / block_size_q) / stage_stride) * bsz
-                for bsz in range(1, size // 2048 + 1)  # FIXME: Assume 2048 is the min sequence length for full batch
-            )
+            max_bdst_scan_times_bsz = hip_config.metadata_cache_max_batch_size
 
             q_blocks = max(1, block_size_q // hip_config.block_sparse_block_size_q)
             n_chunks = triton.cdiv(layer_config.second_stage_k, layer_config.stages[-1].stage_chunk_size)
@@ -63,7 +60,7 @@ class HiPMetadataCachePool:
             )
             metadata_pool_bytes += self.indices_pool[-1].numel() * self.indices_pool[-1].element_size()
             self.ks_pool.append(
-                torch.zeros((max_bdst_scan_times_bsz * head_num * q_blocks, n_chunks),
+                torch.zeros((max_bdst_scan_times_bsz * head_num * q_blocks),
                             dtype=torch.int32, device=device)
             )
             metadata_pool_bytes += self.ks_pool[-1].numel() * self.ks_pool[-1].element_size()
@@ -88,10 +85,13 @@ class HiPMetadataCachePool:
         bdst_scan = triton.cdiv(triton.cdiv(seq_len, block_size_q), stage_stride)
         first_dim = batch_size * self.head_num * bdst_scan * q_blocks
 
+        assert self.indices_pool[layer_id].size(0) >= first_dim, \
+            f"Requested batch size {batch_size} is too large for the metadata cache pool"
+
         indices = self.indices_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks)
         ks = self.ks_pool[layer_id][:first_dim] \
-            .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks)
+            .view(batch_size * self.head_num, bdst_scan * q_blocks)
         ks_count = self.ks_count_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, 1)
         ks_start_end = self.ks_start_end_pool[layer_id][:first_dim] \
@@ -114,7 +114,6 @@ class HiPMetadataCachePool:
         layer_id: int,
         size: int,
         batch_size: int,
-        cache_loc: torch.Tensor,  # FIXME: do something with cache_loc
         metadata: HiPAttentionOutputMetadata
     ):
         block_size_q, stage_stride, max_bdst_scan_times_bsz, q_blocks, n_chunks = self.hip_dimens[layer_id]
@@ -124,23 +123,14 @@ class HiPMetadataCachePool:
         bdst_scan = triton.cdiv(triton.cdiv(seq_len, block_size_q), stage_stride)
         first_dim = batch_size * self.head_num * bdst_scan * q_blocks
 
-        #print(f"size: {size}")
-        #print(f"batch_size: {batch_size}")
-        #print(f"self.head_num: {self.head_num}")
-        #print(f"block_size_q: {block_size_q}")
-        #print(f"stage_stride: {stage_stride}")
-        #print(f"max_bdst_scan_times_bsz: {max_bdst_scan_times_bsz}")
-        #print(f"q_blocks: {q_blocks}")
-        #print(f"n_chunks: {n_chunks}")
-        #print(f"seq_len: {seq_len}")
-        #print(f"bdst_scan: {bdst_scan}")
-        #print(f"first_dim: {first_dim}")
+        assert self.indices_pool[layer_id].size(0) >= first_dim, \
+            f"Requested batch size {batch_size} is too large for the metadata cache pool"
 
         self.indices_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks) \
             .copy_(metadata.indices)
         self.ks_pool[layer_id][:first_dim] \
-            .view(batch_size * self.head_num, bdst_scan * q_blocks, n_chunks) \
+            .view(batch_size * self.head_num, bdst_scan * q_blocks) \
             .copy_(metadata.ks)
         self.ks_count_pool[layer_id][:first_dim] \
             .view(batch_size * self.head_num, bdst_scan * q_blocks, 1) \

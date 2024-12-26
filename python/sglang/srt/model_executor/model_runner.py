@@ -583,7 +583,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
             )
-        
+
 #         if self.server_args.enable_hip_attention:
 #             self.hip_metadata_cache_pool = HiPMetadataCachePool(
 #                 self.max_total_num_tokens,
@@ -592,7 +592,7 @@ class ModelRunner:
 #                 device=self.device,
 #                 hip_config=self.hip_attention_config,
 #             )
-        
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -652,6 +652,7 @@ class ModelRunner:
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        from sglang.srt.layers.attention.hip_attention import HiPCudaGraphRunner
 
         self.cuda_graph_runner = None
 
@@ -663,8 +664,11 @@ class ModelRunner:
             return
 
         tic = time.time()
+        CudaGraphRunnerClass = CudaGraphRunner
+        if self.server_args.enable_hip_attention:
+            CudaGraphRunnerClass = HiPCudaGraphRunner
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        self.cuda_graph_runner = CudaGraphRunnerClass(self)
         logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
