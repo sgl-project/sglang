@@ -443,6 +443,7 @@ class TestMllamaServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
+
 class TestPixtralServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -461,6 +462,7 @@ class TestPixtralServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+
 class TestPixtralLargeServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -478,6 +480,7 @@ class TestPixtralLargeServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
 
 class TestPixtralServer(TestOpenAIVisionServer):
     @classmethod

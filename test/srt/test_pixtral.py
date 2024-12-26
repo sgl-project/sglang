@@ -57,7 +57,7 @@ class RawPixtralTest(unittest.IsolatedAsyncioTestCase):
             # Load processor
             self.processors[key] = AutoProcessor.from_pretrained(model_name)
 
-    async def test_vision_encoder(self):
+    def test_vision_encoder(self):
         messages = [
             {
                 "role": "user",
