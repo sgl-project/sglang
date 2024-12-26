@@ -597,12 +597,15 @@ class Scheduler:
         if (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
         ):
             assert self.grammar_backend is not None
             if req.sampling_params.json_schema is not None:
                 key = ("json", req.sampling_params.json_schema)
             elif req.sampling_params.regex is not None:
                 key = ("regex", req.sampling_params.regex)
+            elif req.sampling_params.ebnf is not None:
+                key = ("ebnf", req.sampling_params.ebnf)
 
             req.grammar = self.grammar_backend.get_cached_value(key)
             if not req.grammar:
@@ -637,16 +640,13 @@ class Scheduler:
         self.waiting_queue.append(req)
 
     def log_prefill_stats(self, adder, can_run_list, running_bs, has_being_chunked):
-        if isinstance(self.tree_cache, RadixCache):
-            self.tree_cache_metrics["total"] += (
-                adder.log_input_tokens + adder.log_hit_tokens
-            ) / 10**9
-            self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
-            tree_cache_hit_rate = (
-                self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
-            )
-        else:
-            tree_cache_hit_rate = 0.0
+        self.tree_cache_metrics["total"] += (
+            adder.log_input_tokens + adder.log_hit_tokens
+        ) / 10**9
+        self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
+        tree_cache_hit_rate = (
+            self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
+        )
 
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
