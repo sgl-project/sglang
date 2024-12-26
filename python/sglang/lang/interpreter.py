@@ -136,8 +136,8 @@ def run_program_batch(
         if progress_bar and not generator_style:
             pbar = tqdm.tqdm(total=len(batch_arguments))
 
+        futures = []
         with ThreadPoolExecutor(num_threads) as executor:
-            futures = []
             for arguments in batch_arguments:
                 future = executor.submit(
                     run_program,

@@ -34,9 +34,6 @@ def test_few_shot_qa():
         ],
         temperature=0.1,
     )
-    # Handle both list and generator results
-    if not isinstance(rets, list):
-        rets = list(rets)
     answers = [x["answer"].strip().lower() for x in rets]
     assert answers == ["tokyo", "london", "beijing"], f"answers: {answers}"
 
@@ -513,9 +510,6 @@ def test_hellaswag_select():
         num_threads=64,
         progress_bar=True,
     )
-    # Handle both list and generator results
-    if not isinstance(rets, list):
-        rets = list(rets)
     preds = [choices[i].index(rets[i]["answer"]) for i in range(len(rets))]
     latency = time.time() - tic
 
