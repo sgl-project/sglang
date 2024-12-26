@@ -251,7 +251,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         require_dense = (
-            layer.layer_id in self.hip_config.dense_layers or
+            # layer.layer_id in self.hip_config.dense_layers or
             self.hip_config.prefill_always_dense or
             self.hip_config.force_dense or
             any(map(lambda x: x <= self.hip_config.prefill_dense_threshold, forward_batch.extend_prefix_lens_cpu))
@@ -321,7 +321,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
 
                     layer=layer,
-                    is_dense=require_dense,
+                    # is_dense=require_dense,
                     
                     k=k,
                     v=v,
@@ -349,7 +349,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         require_dense = (
-            layer.layer_id in self.hip_config.dense_layers or
+            # layer.layer_id in self.hip_config.dense_layers or
             self.hip_config.decode_always_dense or
             self.hip_config.force_dense
         )
@@ -397,7 +397,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
             layer=layer,
             cached_metadata=metadata,
-            is_dense=require_dense,
+            # is_dense=require_dense,
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
@@ -423,12 +423,13 @@ class HiPRadixAttentionBackend(AttentionBackend):
         layer: RadixAttention,
 
         cached_metadata=None,
-        is_dense: bool = False,
+        # is_dense: bool = False,
 
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
-
+        is_dense = layer.layer_id in self.hip_config.dense_layers
+        
         if len(self.hip_config.layers) == 2:
             layer_config = self.hip_config.layers[0 if is_dense else 1]
         else:
