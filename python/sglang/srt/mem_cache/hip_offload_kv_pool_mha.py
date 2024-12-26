@@ -34,8 +34,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         
         self.layer_buffer = [
             HiPOffloadCache(
-                max_token_size=512 * 1024,
-                max_mask_cache_token_size=256 * 1024,
+                max_token_size=256 * 1024,
+                max_mask_cache_token_size=128 * 1024,
                 max_sa_cache_token_size=16 * 1024,
                 head_num=head_num,
                 head_dim=head_dim,
@@ -74,6 +74,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         hip_offload_cache = self.get_kv_buffer(layer_id)
         
         handle_id = (layer_id, batch_id)
+        torch.cuda.synchronize()
         stream = torch.cuda.Stream(device=self.device)
         start_event = torch.cuda.Event()
         def thread_main():
@@ -104,7 +105,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
     ) -> Tuple[Tensor, Tensor]:
         # Use this function for prefill
         handle_id = (layer_id, batch_id)
-        prefetch_thread = self.prefetch_threads.get(handle_id, default=None)
+        prefetch_thread = self.prefetch_threads.get(handle_id, None)
         if prefetch_thread is not None:
             prefetch_thread.join()
         
@@ -115,7 +116,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         assert isinstance(v, Tensor)
         assert isinstance(seq_len, int)
         assert k.shape == v.shape
-        assert k.ndim == 4
+        assert k.ndim == 4, f'{k.shape}'
         assert k.shape[0] == 1
         assert k.shape[1] >= seq_len
         assert k.shape[2] == self.head_num
@@ -154,20 +155,21 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             cache_v = cache_v.to(self.dtype)
         
         if async_copy:
-            stream = torch.cuda.Stream()
+            torch.cuda.synchronize()
+            stream = torch.cuda.Stream(device=self.device)
             start_event = torch.cuda.Event()
             def thread_main():
                 with torch.cuda.stream(stream):
                     start_event.synchronize()
                     table_gpu = table
-                    table = table.to('cpu')
-                    cache_k = cache_k.to('cpu')
-                    cache_v = cache_v.to('cpu')
+                    table_cpu = table.to('cpu')
+                    cache_k_cpu = cache_k.to('cpu')
+                    cache_v_cpu = cache_v.to('cpu')
                     self.layer_buffer[layer_id].set_kv_buffer(
-                        table=table,
+                        table=table_cpu,
                         table_gpu=table_gpu,
-                        cache_k=cache_k,
-                        cache_v=cache_v,
+                        cache_k=cache_k_cpu,
+                        cache_v=cache_v_cpu,
                     )
                     stream.synchronize()
                 self.async_set_threads.remove(t)
@@ -183,6 +185,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             )
     
     def synchronize(self):
+        torch.cuda.synchronize()
         # you must call this function when finish prefill, before decode
         while (len(self.prefetch_threads) > 0) or (len(self.async_set_threads) > 0):
             time.sleep(0.001)

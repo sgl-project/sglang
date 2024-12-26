@@ -40,10 +40,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
+from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +287,33 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+        
+        def prefetch_layer(layer_id: int):
+            if not forward_batch.forward_mode.is_extend():
+                return
+
+            assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
+            for ibatch in range(forward_batch.batch_size):
+                req_to_tokens = forward_batch.req_to_token_pool.req_to_token
+                req_pool_indices = forward_batch.req_pool_indices[ibatch:ibatch+1]
+                block_table = req_to_tokens.index_select(
+                    dim=0, index=req_pool_indices
+                )[0, :forward_batch.extend_prefix_lens_cpu[ibatch] + forward_batch.extend_seq_lens_cpu[ibatch]]
+                # print(block_table, block_table.shape)
+                forward_batch.token_to_kv_pool.prefetch_prefix_kv_buffer(
+                    layer_id=layer_id, 
+                    batch_id=ibatch,
+                    table=block_table,
+                    prefix_seq_len=forward_batch.extend_prefix_lens_cpu[ibatch]
+                )
+        
+        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+            prefetch_layer(0)
+        
         for i in range(len(self.layers)):
+            if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+                if i < (len(self.layers) - 1):
+                    prefetch_layer(i+1)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -294,6 +321,10 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
+        
+        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+            forward_batch.token_to_kv_pool.synchronize()
+        
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

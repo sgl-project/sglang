@@ -48,7 +48,7 @@ class HiPMetadataCachePool:
             stage_stride = layer_config.stages[0].stage_stride
 
             max_bdst_scan_times_bsz = max(
-                math.ceil(math.ceil((size // bsz) / block_size_q) / stage_stride) * bsz
+                1 * bsz
                 for bsz in range(1, size // 2048 + 1)  # FIXME: Assume 2048 is the min sequence length for full batch
             )
 

@@ -66,7 +66,7 @@ class HiPAttentionConfig:
     prefill_dense_threshold: int = 8192
     block_sparse_block_size_q: int = 64
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
-        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 8192, 'sink_token_size': 8192}),
+        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 2048, 'sliding_window_size': 256, 'sink_token_size': 1024}),
         HiPAttentionPerLayerConfig(),
     ])
 

@@ -64,7 +64,7 @@ class HiPModelRunner(ModelRunner):
         max_total_tokens: Optional[int] = None,
     ):
         super().init_memory_pool(total_gpu_memory, max_num_reqs, max_total_tokens)
-
+        
         if self.server_args.enable_hip_attention:
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
                 self.max_total_num_tokens,
