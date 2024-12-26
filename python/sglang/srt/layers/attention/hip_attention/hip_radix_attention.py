@@ -483,7 +483,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,
         )
-
+        
         context, metadata = dual_stage_quadratic_hip_attention(
             (query * sm_scale).to(query.dtype),
             k, v,

@@ -222,3 +222,5 @@ work_dirs/
 compile_commands.json
 
 .vscode/
+report*.nsys-rep
+report*.ncu-rep

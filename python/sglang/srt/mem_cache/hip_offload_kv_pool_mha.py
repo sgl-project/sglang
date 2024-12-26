@@ -38,8 +38,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         #TODO: derive token sizes from size
         self.head_num = head_num
         self.head_dim = head_dim
-        self.max_mask_cache_token_size = 128 * 1024
-        self.max_sa_cache_token_size = 16 * 1024
+        self.max_mask_cache_token_size = 32 * 1024
+        self.max_sa_cache_token_size = 4 * 1024
         
         self.layer_buffer = [
             HiPOffloadCache(
@@ -70,7 +70,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             gpu_allocated_bytes += cache.mask_k_cache.allocated_gpu_bytes
             gpu_allocated_bytes += cache.sa_kv_cache.allocated_gpu_bytes
         logger.info(
-            f'Allocated CPU(UVM) bytes: {format_size_bytes(gpu_allocated_bytes)} '
+            f'Allocated CPU(UVM) bytes: {format_size_bytes(uvm_allocated_bytes)}, '
             f'Allocated GPU bytes: {format_size_bytes(gpu_allocated_bytes)}'
         )
 
@@ -97,12 +97,13 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         hip_offload_cache = self.get_kv_buffer(layer_id)
         
         handle_id = (layer_id, batch_id)
-        torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
+        # torch.cuda.synchronize(device=self.device)
         stream = torch.cuda.Stream(device=self.device)
-        start_event = torch.cuda.Event()
+        # start_event = torch.cuda.Event()
         def thread_main():
             with torch.cuda.stream(stream):
-                start_event.synchronize()
+                # start_event.synchronize()
                 k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
                     table=table,
                     device=self.device,
@@ -178,16 +179,17 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             cache_v = cache_v.to(self.dtype)
         
         if async_copy:
-            torch.cuda.synchronize()
+            torch.cuda.current_stream().synchronize()
+            # torch.cuda.synchronize()
             stream = torch.cuda.Stream(device=self.device)
-            start_event = torch.cuda.Event()
+            # start_event = torch.cuda.Event()
             def thread_main():
                 with torch.cuda.stream(stream):
-                    start_event.synchronize()
+                    # start_event.synchronize()
                     table_gpu = table
-                    table_cpu = table.to('cpu')
-                    cache_k_cpu = cache_k.to('cpu')
-                    cache_v_cpu = cache_v.to('cpu')
+                    table_cpu = table.to('cpu', non_blocking=True)
+                    cache_k_cpu = cache_k.to('cpu', non_blocking=True)
+                    cache_v_cpu = cache_v.to('cpu', non_blocking=True)
                     self.layer_buffer[layer_id].set_kv_buffer(
                         table=table_cpu,
                         table_gpu=table_gpu,
