@@ -26,6 +26,8 @@ pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-Base --enable-dp-attention --tp 8 --trust-remote-code
 ```
 
+If you see errors when launching the server, please check if it has finished downloading the weights. It is recommended to download the weights before launching, or to launch multiple times until all the weights have been downloaded.
+
 ### Example with OpenAI API
 
 ```python3
