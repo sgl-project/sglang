@@ -244,6 +244,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        use_ragged, extend_no_prefix = self.forward_metadata
+        assert not use_ragged, "Ragged attention is not supported"
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -267,10 +270,10 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, 
-                        cache_loc, 
-                        k, 
-                        v, 
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
                         async_copy=True,
                     )
             offload_cache = k_cache = v_cache = None
@@ -298,14 +301,14 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else:
                 if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
                     k, v = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
-                        layer_id=layer.layer_id, 
+                        layer_id=layer.layer_id,
                         batch_id=idx_batch,
                         cache_k=k[start_len:start_len+seq_len].unsqueeze(0),
                         cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
                     )
                 else:
                     k = v = None
-                
+
                 o_req, _ = self.forward_paged_hip(
                     query=q_reshaped[start_len:start_len+seq_len],
                     sm_scale=layer.scaling,
@@ -322,7 +325,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
                     layer=layer,
                     is_dense=require_dense,
-                    
+
                     k=k,
                     v=v,
                 )
@@ -385,7 +388,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             sm_scale=layer.scaling,
             batch_size=forward_batch.batch_size,
-            
+
             k_cache=k_cache,
             v_cache=v_cache,
             offload_cache=offload_cache,
@@ -410,7 +413,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         query: torch.Tensor,
         sm_scale: float,
         batch_size: int,
-        
+
         k_cache: Optional[torch.Tensor],
         v_cache: Optional[torch.Tensor],
         offload_cache: Optional[HiPOffloadCache],
@@ -483,7 +486,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,
         )
-        
+
         context, metadata = dual_stage_quadratic_hip_attention(
             (query * sm_scale).to(query.dtype),
             k, v,
@@ -491,7 +494,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=cached_metadata,
         )
         context = context.to(query.dtype)
-        
+
         # print('cached meta?', cached_metadata is not None)
         # print('mask', metadata.mask_cache_statistics.compute_statistics())
         # print('sa', metadata.sa_cache_statistics.compute_statistics())
