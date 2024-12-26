@@ -217,6 +217,27 @@ class SglFunction:
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,
+        """Run the function in batch mode.
+
+        Args:
+            batch_kwargs: List of keyword arguments to run the function with.
+            max_new_tokens: Maximum number of new tokens to generate.
+            stop: Stop sequence(s) that will stop generation.
+            stop_token_ids: Stop token IDs that will stop generation.
+            temperature: Sampling temperature.
+            top_p: Nucleus sampling probability.
+            top_k: Top-k sampling parameter.
+            min_p: Minimum probability for nucleus sampling.
+            backend: The backend to use. If None, use the default backend.
+            num_threads: Number of threads to use. Can be "auto" or an integer.
+            progress_bar: Whether to show a progress bar.
+            generator_style: If True, yield results as they become available while maintaining input order.
+                          If False, return all results at once in a list.
+
+        Returns:
+            If generator_style=False, returns a list of program states in the same order as batch_kwargs.
+            If generator_style=True, yields program states in the same order as batch_kwargs.
+        """
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         ignore_eos: bool = False,
