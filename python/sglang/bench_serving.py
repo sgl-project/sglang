@@ -897,6 +897,7 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
@@ -906,6 +907,7 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
+    # Warmup
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
     test_input = RequestFuncInput(
@@ -924,11 +926,15 @@ async def benchmark(
             f"are correctly specified. Error: {test_output.error}"
         )
     else:
-        requests.post(base_url + "/flush_cache")
         print("Initial test run completed. Starting main benchmark run...")
 
-    time.sleep(1.5)
+    # Flush cache
+    if "sglang" in backend:
+        requests.post(base_url + "/flush_cache")
 
+    time.sleep(1.0)
+
+    # Start profiler
     if profile:
         print("Starting profiler...")
         profile_output = await async_request_profile(
@@ -939,6 +945,7 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
+    # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
@@ -959,6 +966,7 @@ async def benchmark(
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
+    # Stop profiler
     if profile:
         print("Stopping profiler...")
         profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
@@ -968,8 +976,8 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
+    # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
-
     metrics, output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
