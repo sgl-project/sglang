@@ -441,6 +441,16 @@ class GetWeightsByNameReqOutput:
 
 
 @dataclass
+class ReleaseGPUOccupationReqInput:
+    pass
+
+
+@dataclass
+class ResumeGPUOccupationReqInput:
+    pass
+
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str
