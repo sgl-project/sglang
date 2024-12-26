@@ -4,7 +4,7 @@ We're excited to announce [SGLang v0.4.1](https://github.com/sgl-project/sglang/
 
 The SGLang and DeepSeek teams worked together to get DeepSeek V3 FP8 running on NVIDIA and AMD GPU **from day one**. We've also supported MLA optimization and DP attention before, making SGLang one of the best open-source LLM engines for running DeepSeek models.
 
-Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for their support, and DataCrunch for providing GPU resources.
+Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
