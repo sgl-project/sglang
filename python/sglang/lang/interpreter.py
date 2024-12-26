@@ -153,13 +153,13 @@ def run_program_batch(
                 if progress_bar and not generator_style:
                     future.add_done_callback(lambda _: pbar.update())
 
-            if generator_style:
-                # Wait for each future in order to maintain input order
-                for future in futures:
-                    yield future.result()
-            else:
-                rets = [f.result() for f in futures]
-                rets[-1].sync()
+        if generator_style:
+            # Wait for each future in order to maintain input order
+            for future in futures:
+                yield future.result()
+        else:
+            rets = [f.result() for f in futures]
+            rets[-1].sync()
 
         if progress_bar and not generator_style:
             pbar.close()
