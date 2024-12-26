@@ -138,7 +138,6 @@ def run_program_batch(
 
         with ThreadPoolExecutor(num_threads) as executor:
             futures = []
-            future_to_arguments = {}
             for arguments in batch_arguments:
                 future = executor.submit(
                     run_program,
@@ -151,7 +150,6 @@ def run_program_batch(
                     True,
                 )
                 futures.append(future)
-                future_to_arguments[future] = arguments
                 if progress_bar and not generator_style:
                     future.add_done_callback(lambda _: pbar.update())
 
