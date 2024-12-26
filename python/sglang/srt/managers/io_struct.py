@@ -446,7 +446,17 @@ class ReleaseGPUOccupationReqInput:
 
 
 @dataclass
+class ReleaseGPUOccupationReqOutput:
+    pass
+
+
+@dataclass
 class ResumeGPUOccupationReqInput:
+    pass
+
+
+@dataclass
+class ResumeGPUOccupationReqOutput:
     pass
 
 

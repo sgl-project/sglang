@@ -870,6 +870,18 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
 
+    def release_gpu_occupation(self):
+        """Release GPU occupation temporarily"""
+        obj = ReleaseGPUOccupationReqInput()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(tokenizer_manager.release_gpu_occupation(obj, None))
+
+    def resume_gpu_occupation(self):
+        """Release GPU occupation temporarily"""
+        obj = ResumeGPUOccupationReqInput()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(tokenizer_manager.resume_gpu_occupation(obj, None))
+
 
 class Runtime:
     """
