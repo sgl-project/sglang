@@ -565,7 +565,7 @@ class Scheduler:
 
         if req.logprob_start_len == -1:
             # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(recv_req.input_ids) - 1
+            req.logprob_start_len = len(req.origin_input_ids) - 1
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) > self.max_req_input_len:
