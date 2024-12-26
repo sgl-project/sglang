@@ -98,22 +98,6 @@ def run_program_batch(
     progress_bar,
     generator_style=False,
 ):
-    """Run a program in batch mode.
-
-    Args:
-        program: The program to run
-        backend: The backend to use
-        batch_arguments: List of arguments to run the program with
-        default_sampling_para: Default sampling parameters
-        num_threads: Number of threads to use, can be "auto" or an integer
-        progress_bar: Whether to show a progress bar
-        generator_style: If True, yield results as they become available while maintaining input order.
-                       If False, return all results at once in a list.
-
-    Returns:
-        If generator_style=False, returns a list of program states in the same order as batch_arguments.
-        If generator_style=True, yields program states in the same order as batch_arguments.
-    """
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
 
