@@ -849,12 +849,8 @@ class Engine:
             group_name=group_name,
             backend=backend,
         )
-
-        async def _init_group():
-            return await tokenizer_manager.init_weights_update_group(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_init_group())
+        return loop.run_until_complete(tokenizer_manager.init_weights_update_group(obj, None))
 
     def update_weights_from_distributed(self, name, dtype, shape):
         """Update weights from distributed source."""
@@ -863,22 +859,14 @@ class Engine:
             dtype=dtype,
             shape=shape,
         )
-
-        async def _update_weights():
-            return await tokenizer_manager.update_weights_from_distributed(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_update_weights())
+        return loop.run_until_complete(tokenizer_manager.update_weights_from_distributed(obj, None))
 
     def get_weights_by_name(self, name, truncate_size=100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
-
-        async def _get_weights():
-            return await tokenizer_manager.get_weights_by_name(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get_weights())
+        return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
 
 
 class Runtime:
