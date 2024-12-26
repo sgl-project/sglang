@@ -1472,11 +1472,11 @@ class Scheduler:
 
     def release_gpu_occupation(self):
         self.flush_cache()
-        self.token_to_kv_pool._clear_buffers()
+        self.token_to_kv_pool.clear_buffers()
         torch.cuda.empty_cache()
 
     def resume_gpu_occupation(self):
-        self.token_to_kv_pool._create_buffers()
+        self.token_to_kv_pool.create_buffers()
 
     def start_profile(self) -> None:
         if self.profiler is None:

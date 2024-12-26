@@ -187,9 +187,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        self._create_buffers()
+        self.create_buffers()
 
-    def _create_buffers(self):
+    def create_buffers(self):
         # [size, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.k_buffer = [
@@ -209,7 +209,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             for _ in range(self.layer_num)
         ]
 
-    def _clear_buffers(self):
+    def clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
 
