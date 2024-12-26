@@ -52,6 +52,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    ReleaseGPUOccupationReqInput,
+    ResumeGPUOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -484,6 +486,10 @@ class Scheduler:
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+            elif isinstance(recv_req, ReleaseGPUOccupationReqInput):
+                TODO
+            elif isinstance(recv_req, ResumeGPUOccupationReqInput):
+                TODO
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
                     self.start_profile()
