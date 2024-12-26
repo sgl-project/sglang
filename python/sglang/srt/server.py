@@ -247,16 +247,11 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     try:
         ret = await tokenizer_manager.get_weights_by_name(obj, request)
         if ret is None:
-            return ORJSONResponse(
-                {"error": {"message": "Get parameter by name failed"}},
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
+            return _create_error_response("Get parameter by name failed")
         else:
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
@@ -266,9 +261,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
         session_id = await tokenizer_manager.open_session(obj, request)
         return session_id
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
@@ -278,9 +271,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         await tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -314,9 +305,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return ret
         except ValueError as e:
             logger.error(f"Error: {e}")
-            return ORJSONResponse(
-                {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-            )
+            return _create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -327,9 +316,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
@@ -340,9 +327,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -416,6 +401,12 @@ async def retrieve_file(file_id: str):
 async def retrieve_file_content(file_id: str):
     # https://platform.openai.com/docs/api-reference/files/retrieve-contents
     return await v1_retrieve_file_content(file_id)
+
+
+def _create_error_response(e):
+    return ORJSONResponse(
+        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
 
 
 def launch_engine(
