@@ -172,7 +172,7 @@ class LlamaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if not forward_batch.hip_metadata_cache_pool:  # FIXME: find better way to detect if HIP is enabled
+        if not forward_batch.hip_metadata_cache_pool:  # FIXME(geon): find better way to detect if HIP is enabled
             q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
