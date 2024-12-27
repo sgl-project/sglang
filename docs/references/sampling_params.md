@@ -192,13 +192,13 @@ SGLang supports two grammar backends:
 - [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and Regular Expression constraints.
 - [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema and EBNF constraints. 
 
+> 🔔 Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified at a time.
+
 Initialise grammar backend using `--grammar-backend xgrammar` flag
 ```python
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
 --port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: outlines)
 ```
-
-> **Note:** Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified at a time.
 
 ```python
 import json
