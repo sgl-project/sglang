@@ -11,7 +11,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
@@ -19,6 +18,10 @@ from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
 is_hip_ = is_hip()
+
+from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
