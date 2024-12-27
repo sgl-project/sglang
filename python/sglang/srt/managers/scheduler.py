@@ -520,6 +520,7 @@ class Scheduler:
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
+                eos_token_ids=self.model_config.get_hf_eos_token_id(),
             )
             req.tokenizer = self.tokenizer
 
@@ -983,7 +984,7 @@ class Scheduler:
 
                 if req.is_being_chunked <= 0:
                     req.output_ids.append(next_token_id)
-                    req.check_finished(batch.get_hf_eos_token_id())
+                    req.check_finished()
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -1024,7 +1025,7 @@ class Scheduler:
                 if req.is_being_chunked <= 0:
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
-                    req.check_finished(batch.get_hf_eos_token_id())
+                    req.check_finished()
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -1065,7 +1066,7 @@ class Scheduler:
                 continue
 
             req.output_ids.append(next_token_id)
-            req.check_finished(batch.get_hf_eos_token_id())
+            req.check_finished()
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
