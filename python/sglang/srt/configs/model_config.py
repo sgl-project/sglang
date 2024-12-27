@@ -15,7 +15,6 @@
 import json
 import logging
 from enum import IntEnum, auto
-from functools import lru_cache
 from typing import List, Optional, Set, Union
 
 import torch
@@ -48,6 +47,7 @@ class ModelConfig:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+
         # Parse args
         self.model_override_args = json.loads(model_override_args)
         self.hf_config = get_config(
@@ -130,6 +130,9 @@ class ModelConfig:
 
         # Veirfy quantization
         self._verify_quantization()
+
+        # Text attrs
+        self.hf_eos_token_id = self.get_hf_eos_token_id()
 
         # Multimodel attrs
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
@@ -272,7 +275,6 @@ class ModelConfig:
                     self.quantization,
                 )
 
-    @lru_cache()
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids:
