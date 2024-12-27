@@ -95,12 +95,6 @@ class ModelRunner:
         ):
             logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
-            # FIXME(HandH1998)
-            if (
-                "DeepseekV3ForCausalLM" in self.model_config.hf_config.architectures
-                and not self.server_args.disable_cuda_graph
-            ):
-                self.server_args.disable_cuda_graph = True
 
         if self.server_args.enable_double_sparsity:
             logger.info(
