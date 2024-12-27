@@ -271,7 +271,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         cache_loc, 
                         k, 
                         v, 
-                        async_copy=False,
+                        async_copy=True,
                     )
             offload_cache = k_cache = v_cache = None
             # offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -305,10 +305,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
                     )
                     k_cache = v_cache = None
-                    print(layer.layer_id, k[0,::8192,0,0])
+                    # if layer.layer_id == 31:
+                    # print(layer.layer_id, k[0,::8192,0,0])
                 else:
                     k = v = None
-                    print(layer.layer_id, k_cache[1::8192,0,0])
+                    # if layer.layer_id == 31:
+                    # print(layer.layer_id, k_cache[1::8192,0,0])
                 
                 o_req, _ = self.forward_paged_hip(
                     query=q_reshaped[start_len:start_len+seq_len],
@@ -330,6 +332,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     k=k,
                     v=v,
                 )
+                # if layer.layer_id == 31:
+                # print(o_req[::8192,0,0])
                 o[start_len:start_len+seq_len] = o_req
             start_len += seq_len
         assert len(decoding_reqs) == 0
