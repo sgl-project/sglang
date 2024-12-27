@@ -45,7 +45,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/lang
-          python3 run_suite.py --suite minimal
+          python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -70,7 +70,7 @@ jobs:
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
           range_end=${RANGE#*-}
-          python3 run_suite.py --suite minimal --range-begin ${range_begin} --range-end ${range_end}
+          python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
 
   unit-test-backend-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

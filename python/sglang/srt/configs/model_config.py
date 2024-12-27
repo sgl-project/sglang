@@ -94,7 +94,10 @@ class ModelConfig:
         )
 
         # FIXME: temporary special judge for MLA architecture
-        if "DeepseekV2ForCausalLM" in self.hf_config.architectures:
+        if (
+            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV3ForCausalLM" in self.hf_config.architectures
+        ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
@@ -124,7 +127,11 @@ class ModelConfig:
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
+        # Veirfy quantization
         self._verify_quantization()
+
+        # Multimodel attrs
+        self.image_token_id = getattr(self.hf_config, "image_token_id", None)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
