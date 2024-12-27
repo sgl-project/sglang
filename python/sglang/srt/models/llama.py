@@ -321,7 +321,9 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-            torch.cuda.current_stream(hidden_states.device).synchronize()
+            if forward_batch.forward_mode.is_extend() and\
+                isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+                torch.cuda.current_stream(hidden_states.device).synchronize()
         
         hidden_states, _ = self.norm(hidden_states, residual)
         

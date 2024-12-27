@@ -250,7 +250,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        logger.info(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
+        # logger.info(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
@@ -347,7 +347,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        logger.info(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
+        # logger.info(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
