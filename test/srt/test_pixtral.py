@@ -20,9 +20,9 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, LlavaForConditionalGeneration
 
-from python.sglang.srt.configs.model_config import ModelConfig
-from python.sglang.srt.model_executor.model_runner import ModelRunner
-from python.sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import PortArgs, ServerArgs
 
 
 class RawPixtralTest(unittest.IsolatedAsyncioTestCase):
