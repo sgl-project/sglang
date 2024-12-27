@@ -2,6 +2,10 @@ import os
 import shutil
 import zipfile
 from pathlib import Path
+import torch 
+def is_hip() -> bool:
+    """Return whether it is HIP on the AMD ROCm platform."""
+    return torch.version.hip is not None
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -58,80 +62,116 @@ def update_wheel_platform_tag():
     old_wheel.rename(new_wheel)
 
 
-setup(
-    name="sgl-kernel",
-    version=get_version(),
-    packages=["sgl_kernel"],
-    package_dir={"": "src"},
-    ext_modules=[
-        CUDAExtension(
-            "sgl_kernel.ops.warp_reduce_cuda",
-            [
-                "src/sgl-kernel/csrc/warp_reduce.cc",
-                "src/sgl-kernel/csrc/warp_reduce_kernel.cu",
-            ],
-            extra_compile_args={
-                "nvcc": [
-                    "-O3",
-                    "-Xcompiler",
-                    "-fPIC",
-                    "-gencode=arch=compute_75,code=sm_75",
-                    "-gencode=arch=compute_80,code=sm_80",
-                    "-gencode=arch=compute_89,code=sm_89",
-                    "-gencode=arch=compute_90,code=sm_90",
+
+if not is_hip(): 
+    setup(
+        name="sgl-kernel",
+        version=get_version(),
+        packages=["sgl_kernel"],
+        package_dir={"": "src"},
+        ext_modules=[
+            CUDAExtension(
+                "sgl_kernel.ops.warp_reduce_cuda",
+                [
+                    "src/sgl-kernel/csrc/warp_reduce.cc",
+                    "src/sgl-kernel/csrc/warp_reduce_kernel.cu",
                 ],
-                "cxx": ["-O3"],
-            },
-            libraries=["c10", "torch", "torch_python"],
-            extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        ),
-        CUDAExtension(
-            "sgl_kernel.ops.custom_reduce_cuda",
-            [
-                "src/sgl-kernel/csrc/trt_reduce_internal.cu",
-                "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
-                "src/sgl-kernel/csrc/trt_reduce.cc",
-            ],
-            extra_compile_args={
-                "nvcc": [
-                    "-O3",
-                    "-Xcompiler",
-                    "-fPIC",
-                    "-gencode=arch=compute_75,code=sm_75",
-                    "-gencode=arch=compute_80,code=sm_80",
-                    "-gencode=arch=compute_89,code=sm_89",
-                    "-gencode=arch=compute_90,code=sm_90",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                extra_compile_args={
+                    "nvcc": [
+                        "-O3",
+                        "-Xcompiler",
+                        "-fPIC",
+                        "-gencode=arch=compute_75,code=sm_75",
+                        "-gencode=arch=compute_80,code=sm_80",
+                        "-gencode=arch=compute_89,code=sm_89",
+                        "-gencode=arch=compute_90,code=sm_90",
+                    ],
+                    "cxx": ["-O3"],
+                },
+                libraries=["c10", "torch", "torch_python"],
+                extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+            ),
+            CUDAExtension(
+                "sgl_kernel.ops.custom_reduce_cuda",
+                [
+                    "src/sgl-kernel/csrc/trt_reduce_internal.cu",
+                    "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
+                    "src/sgl-kernel/csrc/trt_reduce.cc",
                 ],
-                "cxx": ["-O3"],
-            },
-            libraries=["c10", "torch", "torch_python"],
-            extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        ),
-        CUDAExtension(
-            "sgl_kernel.ops.moe_align_block_size",
-            [
-                "src/sgl-kernel/csrc/moe_align_kernel.cu",
-            ],
-            extra_compile_args={
-                "nvcc": [
-                    "-O3",
-                    "-Xcompiler",
-                    "-fPIC",
-                    "-gencode=arch=compute_75,code=sm_75",
-                    "-gencode=arch=compute_80,code=sm_80",
-                    "-gencode=arch=compute_89,code=sm_89",
-                    "-gencode=arch=compute_90,code=sm_90",
+                extra_compile_args={
+                    "nvcc": [
+                        "-O3",
+                        "-Xcompiler",
+                        "-fPIC",
+                        "-gencode=arch=compute_75,code=sm_75",
+                        "-gencode=arch=compute_80,code=sm_80",
+                        "-gencode=arch=compute_89,code=sm_89",
+                        "-gencode=arch=compute_90,code=sm_90",
+                        "-U__CUDA_NO_HALF_OPERATORS__",
+                        "-U__CUDA_NO_HALF2_OPERATORS__",
+                    ],
+                    "cxx": ["-O3"],
+                },
+                libraries=["c10", "torch", "torch_python"],
+                extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+            ),
+            CUDAExtension(
+                "sgl_kernel.ops.moe_align_block_size",
+                [
+                    "src/sgl-kernel/csrc/moe_align_kernel.cu",
                 ],
-                "cxx": ["-O3"],
-            },
-            libraries=["c10", "torch", "torch_python"],
-            extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        ),
-    ],
-    cmdclass={"build_ext": BuildExtension},
-    install_requires=["torch"],
-)
+                extra_compile_args={
+                    "nvcc": [
+                        "-O3",
+                        "-Xcompiler",
+                        "-fPIC",
+                        "-gencode=arch=compute_75,code=sm_75",
+                        "-gencode=arch=compute_80,code=sm_80",
+                        "-gencode=arch=compute_89,code=sm_89",
+                        "-gencode=arch=compute_90,code=sm_90",
+                    ],
+                    "cxx": ["-O3"],
+                },
+                libraries=["c10", "torch", "torch_python"],
+                extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+            ),
+        ],
+        cmdclass={"build_ext": BuildExtension},
+        install_requires=["torch"],
+    )
+else:
+    hipcc_flags = [
+        "-D__HIP_PLATFORM_AMD__=1",
+        "--amdgpu-target=gfx942",  
+        "-DENABLE_BF16", # Enable BF16 for cuda_version >= 11
+        "-DENABLE_FP8",  # Enable FP8 for cuda_version >= 11.8
+    ]
+    setup(
+        name="sgl-kernel",
+        version=get_version(),
+        packages=["sgl_kernel"],
+        package_dir={"": "src"},
+        ext_modules=[
+            CUDAExtension(
+                "sgl_kernel.ops.moe_align_block_size",
+                [
+                    "src/sgl-kernel/csrc/moe_align_kernel.cu",
+                ],
+                extra_compile_args={
+                    "nvcc": hipcc_flags + [
+                        "-O3",
+                        "-Xcompiler",
+                        "-fPIC",
+                    ],
+                    "cxx": ["-O3"],
+                },
+                libraries=["hiprtc", "amdhip64", "c10", "torch", "torch_python"],
+                extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+            ),
+        ],
+        cmdclass={"build_ext": BuildExtension},
+        install_requires=["torch"],
+    )   
 
 update_wheel_platform_tag()
+
