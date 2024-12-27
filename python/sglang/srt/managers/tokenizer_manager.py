@@ -520,7 +520,11 @@ class TokenizerManager:
     ):
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
-        return [r.parameter for r in results]
+        all_parameters = [r.parameter for r in results]
+        if self.server_args.dp_size == 1:
+            return all_parameters[0]
+        else:
+            return all_parameters
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
