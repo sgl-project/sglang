@@ -18,7 +18,7 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 
 import torch
 
@@ -66,8 +66,7 @@ class CacheAgnosticPolicy(Enum):
 
 
 class SchedulePolicy:
-
-    Policy = CacheAwarePolicy | CacheAgnosticPolicy
+    Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 
     def __init__(self, policy: str, tree_cache: BasePrefixCache):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
