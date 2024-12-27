@@ -4,9 +4,9 @@
 
 Please visit [here](https://huggingface.co/collections/neuralmagic) for some popular quantized LLMs on huggingface.
 
-## Online Dynamic Quantization
+## Online Quantization
 
-To enable online dynamic quantization, you can simply specify `--quantization` in the command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
+To enable online quantization, you can simply specify `--quantization` in the command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -15,7 +15,7 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-Our team is working on supporting more quantization methods with high priority. We will soon support other quantization methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
+Our team is working on supporting more quantization methods. We will soon support other quantization methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
 
 We also support quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
