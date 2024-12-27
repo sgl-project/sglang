@@ -5,6 +5,7 @@
 ## Online Dynamic Quantization
 
 To enable oneline dynamic quantization, you can simply specify `--quantization` in command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can lauch the server with following command:
+
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -12,20 +13,10 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-Then, you can test your FP8 quantized model with `curl`:
-```bash
-curl -s http://localhost:30000/v1/chat/completions \
-  -d '{"model": "meta-llama/Meta-Llama-3.1-8B-Instruct", "messages": [{"role": "user", "content": "What is the capital of France?"}]}'
-```
-
-<details>
-<summary>More quantization methods</summary>
-
-Our team is wokring on supporting more quantization methods with high priority. We will soon support other quantization methods including but not limitied to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
-
-</details>
+Our team is working on supporting more quantization methods with high priority. We will soon support other quantization methods including but not limitied to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
 
 We also support quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can lauch the server with following command:
+
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -33,12 +24,10 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-<details>
-<summary>More quantization methods based on torchao</summary>
-
 We support the following quantization methods based on torchao `["int8dq", "int8wo", "fp8wo", "fp8dq-per_tensor", "fp8dq-per_row", "int4wo-32", "int4wo-64", "int4wo-128", "int4wo-256"]`
 
-Note: `"int8dq"` method currently has some bugs when using together with cuda graph capture. So we suggest to disable cuda graph capture when using `"int8dq"` method. Namely, please use the following command:
+Note: According to [this issue](https://github.com/sgl-project/sglang/issues/2219#issuecomment-2561890230), `"int8dq"` method currently has some bugs when using together with cuda graph capture. So we suggest to disable cuda graph capture when using `"int8dq"` method. Namely, please use the following command:
+
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -47,12 +36,11 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-</details>
-
 
 ## Offline Quantization
 
 To do offline quantization for your model, firstly you need to install [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:
+
 ```bash
 pip install llmcompressor
 ```
@@ -86,11 +74,14 @@ tokenizer.save_pretrained(SAVE_DIR)
 ```
 
 Then, you can directly use the quantized model with `SGLang`, using the following command:
+
 ```bash
 python3 -m sglang.launch_server \
     --model-path $PWD/Meta-Llama-3-8B-Instruct-FP8-Dynamic \
     --port 30000 --host 0.0.0.0
 ```
+
+Note: If the moded is quantized offline, you **do not** need to add `--quantization` argument when starting the engine.
 
 
 ## Reference
