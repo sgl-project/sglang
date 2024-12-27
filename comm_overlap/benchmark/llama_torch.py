@@ -78,7 +78,6 @@ def test_latency(num_requests=50):
             "median latency": f"{statistics.median(latencies):.2f}ms"
         }
         
-        # 保存结果
         with open("latency_results_torch_{max_new_tokens}.json", "w") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
             
