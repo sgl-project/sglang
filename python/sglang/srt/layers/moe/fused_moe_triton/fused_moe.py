@@ -272,13 +272,14 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    token_cnts_buffer = torch.empty(
-        (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
-    )
-    cumsum_buffer = torch.empty(
-        num_experts + 1, dtype=torch.int32, device=topk_ids.device
-    )
     if not_hip and num_experts >= 224:
+        token_cnts_buffer = torch.empty(
+            (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
+        )
+        cumsum_buffer = torch.empty(
+            num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        )
+
         sgl_moe_align_block_size(
             topk_ids,
             num_experts,
