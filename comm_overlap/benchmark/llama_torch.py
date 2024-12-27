@@ -79,7 +79,7 @@ def test_latency(num_requests=50):
         }
         
         # 保存结果
-        with open("latency_results_torch.json", "w") as f:
+        with open("latency_results_torch_{max_new_tokens}.json", "w") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
             
         print("\n测试结果:")
