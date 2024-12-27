@@ -4,7 +4,7 @@ import glob
 from sglang.test.test_utils import run_unittest_files
 
 suites = {
-    "minimal": [
+    "per-commit": [
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",

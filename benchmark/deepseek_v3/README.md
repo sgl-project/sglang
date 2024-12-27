@@ -4,17 +4,21 @@ We're excited to announce [SGLang v0.4.1](https://github.com/sgl-project/sglang/
 
 The SGLang and DeepSeek teams worked together to get DeepSeek V3 FP8 running on NVIDIA and AMD GPU **from day one**. We've also supported MLA optimization and DP attention before, making SGLang one of the best open-source LLM engines for running DeepSeek models.
 
-Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for their support, and DataCrunch for providing GPU resources.
+Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
 
+If you do not have GPUs with large enough memory, please try multi-node tensor parallelism ([help 1](https://github.com/sgl-project/sglang/blob/637de9e8ce91fd3e92755eb2a842860925954ab1/docs/backend/backend.md?plain=1#L88-L95) [help 2](https://github.com/sgl-project/sglang/blob/637de9e8ce91fd3e92755eb2a842860925954ab1/docs/backend/backend.md?plain=1#L152-L168)).
+
 ## Installation & Launch
+
+If you see errors when launching the server, please check if it has finished downloading the weights. It is recommended to download the weights before launching, or to launch multiple times until all the weights have been downloaded.
 
 ### Using Docker (Recommended)
 ```bash
 docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-Base --enable-dp-attention --tp 8 --trust-remote-code --port 30000
+    python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --enable-dp-attention --tp 8 --trust-remote-code --port 30000
 ```
 
 ### Using pip
@@ -23,10 +27,8 @@ docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/roo
 pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-Base --enable-dp-attention --tp 8 --trust-remote-code
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --enable-dp-attention --tp 8 --trust-remote-code
 ```
-
-If you see errors when launching the server, please check if it has finished downloading the weights. It is recommended to download the weights before launching, or to launch multiple times until all the weights have been downloaded.
 
 ### Example with OpenAI API
 
@@ -48,7 +50,7 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-## DeepSeek V3 optimization plan
+## DeepSeek V3 Optimization Plan
 
 https://github.com/sgl-project/sglang/issues/2591
 
