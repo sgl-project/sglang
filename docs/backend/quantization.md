@@ -2,6 +2,8 @@
 
 `SGLang` support various quantization methods, including online dynamic quantization and offline quantization.
 
+Please visit [here](https://huggingface.co/collections/neuralmagic) for some popular quantized LLMs on huggingface.
+
 ## Online Dynamic Quantization
 
 To enable online dynamic quantization, you can simply specify `--quantization` in the command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
