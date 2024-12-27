@@ -21,7 +21,7 @@ _DEFAULT_STAGES = [
     ScanStage(
         stage_block_size_q=64,
         stage_block_stride_q=1,
-        stage_chunk_size=16,
+        stage_chunk_size=8,
         stage_k=8192,
         stage_stride=1,
     ),
