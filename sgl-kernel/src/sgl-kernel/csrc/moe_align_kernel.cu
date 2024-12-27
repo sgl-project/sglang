@@ -118,9 +118,8 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
 }
 
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
-                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids,
-                          torch::Tensor num_tokens_post_pad, torch::Tensor token_cnts_buffer,
-                          torch::Tensor cumsum_buffer) {
+                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
+                          torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     // calc needed amount of shared mem for `tokens_cnts` and `cumsum`
@@ -130,7 +129,8 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
     auto kernel = moe_align_block_size_kernel<scalar_t>;
     kernel<<<1, num_thread, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                          experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
-                                         num_experts, block_size, topk_ids.numel(), token_cnts_buffer.data_ptr<int32_t>(), cumsum_buffer.data_ptr<int32_t>());
+                                         num_experts, block_size, topk_ids.numel(),
+                                         token_cnts_buffer.data_ptr<int32_t>(), cumsum_buffer.data_ptr<int32_t>());
   });
 }
 
