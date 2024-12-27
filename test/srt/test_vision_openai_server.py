@@ -14,9 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import openai
 import requests
+from decord import VideoReader, cpu
 from PIL import Image
 
-from decord import VideoReader, cpu
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -439,9 +439,6 @@ class TestMllamaServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
 
 
 class TestPixtralServer(TestOpenAIVisionServer):
