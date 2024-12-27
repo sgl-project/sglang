@@ -20,6 +20,7 @@ from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 not_hip = False
 if not is_hip():
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
     not_hip = True
 
 logger = logging.getLogger(__name__)
