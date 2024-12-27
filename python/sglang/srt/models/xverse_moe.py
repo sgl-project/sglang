@@ -33,8 +33,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
-from sglang.srt.layers.fused_moe_triton import fused_moe
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import fused_moe
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (

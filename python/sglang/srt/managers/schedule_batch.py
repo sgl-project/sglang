@@ -479,8 +479,22 @@ class Req:
 
         return True
 
+    def reset_for_retract(self):
+        self.prefix_indices = []
+        self.last_node = None
+        self.extend_input_len = 0
+        self.is_retracted = True
+
+        # For incremental logprobs
+        # TODO: Fix the `logprob_start_len`
+        self.last_update_decode_tokens = 0
+        self.logprob_start_len = 10**9
+
     def __repr__(self):
-        return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
+        return (
+            f"rid(n={self.rid}, "
+            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}"
+        )
 
 
 bid = 0
@@ -894,15 +908,7 @@ class ScheduleBatch:
                 )
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
-
-            req.prefix_indices = []
-            req.last_node = None
-            req.extend_input_len = 0
-            req.is_retracted = True
-
-            # For incremental logprobs
-            req.last_update_decode_tokens = 0
-            req.logprob_start_len = 10**9
+            req.reset_for_retract()
 
         self.filter_batch(keep_indices=sorted_indices)
 
