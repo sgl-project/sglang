@@ -441,7 +441,6 @@ class FlashInferIndicesUpdaterDecode:
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
-        self.qo_indptr = attn_backend.qo_indptr
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -486,7 +485,6 @@ class FlashInferIndicesUpdaterDecode:
             seq_lens,
             seq_lens_sum,
             self.kv_indptr[0],
-            self.qo_indptr[0],
             None,
             model_layer,
             spec_info,
@@ -524,7 +522,6 @@ class FlashInferIndicesUpdaterDecode:
                 paged_kernel_lens_tmp,
                 paged_kernel_lens_sum_tmp,
                 self.kv_indptr[wrapper_id],
-                self.qo_indptr[wrapper_id],
                 kv_start_idx_tmp,
                 model_layer,
                 spec_info,
@@ -559,7 +556,6 @@ class FlashInferIndicesUpdaterDecode:
                 paged_kernel_lens,
                 seq_lens_sum,
                 self.kv_indptr[wrapper_id],
-                self.qo_indptr[wrapper_id],
                 kv_start_idx,
                 model_layer,
                 spec_info,
@@ -572,7 +568,6 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
-        qo_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
         model_layer,
         spec_info: Optional[SpecInfo],
@@ -600,8 +595,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token,
             )
 
-        qo_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-        qo_indptr = qo_indptr[: bs + 1]
+        qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
 
         wrapper.plan(
             qo_indptr_arr=[qo_indptr],
