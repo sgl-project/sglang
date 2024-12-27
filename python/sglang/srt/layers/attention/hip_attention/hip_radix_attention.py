@@ -244,23 +244,13 @@ class HiPRadixAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        use_ragged, extend_no_prefix = self.forward_metadata
-        assert not use_ragged, "Ragged attention is not supported"
-
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
 
-        require_dense = (
-            layer.layer_id in self.hip_config.dense_layers or
-            self.hip_config.prefill_always_dense or
-            self.hip_config.force_dense or
-            any(map(lambda x: x <= self.hip_config.prefill_dense_threshold, forward_batch.extend_prefix_lens_cpu))
-        )
-
-        logger.debug(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
+        logger.info(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
@@ -274,10 +264,10 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         cache_loc,
                         k,
                         v,
-                        async_copy=True,
+                        async_copy=False
                     )
-            offload_cache = k_cache = v_cache = None
-            # offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            k_cache = v_cache = None
+            offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         else:
             if k is not None:
                 assert v is not None
@@ -324,7 +314,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
 
                     layer=layer,
-                    is_dense=require_dense,
+                    is_dense=layer.layer_id in self.hip_config.dense_layers,
 
                     k=k,
                     v=v,
@@ -351,13 +341,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        require_dense = (
-            layer.layer_id in self.hip_config.dense_layers or
-            self.hip_config.decode_always_dense or
-            self.hip_config.force_dense
-        )
-
-        logger.debug(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
+        logger.info(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
@@ -400,7 +384,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
             layer=layer,
             cached_metadata=metadata,
-            is_dense=require_dense,
+            is_dense=layer.layer_id in self.hip_config.dense_layers,
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
@@ -494,10 +478,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=cached_metadata,
         )
         context = context.to(query.dtype)
-
-        # print('cached meta?', cached_metadata is not None)
-        # print('mask', metadata.mask_cache_statistics.compute_statistics())
-        # print('sa', metadata.sa_cache_statistics.compute_statistics())
 
         return context.view(N, num_heads, hidden_dims), metadata
 
