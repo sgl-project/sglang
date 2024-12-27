@@ -29,6 +29,7 @@ The core features include:
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
    backend/backend.md
+   backend/constaint_decoding.ipynb
 
 
 .. toctree::
