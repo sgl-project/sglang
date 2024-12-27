@@ -22,7 +22,7 @@ import signal
 import sys
 import time
 import uuid
-from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union, Generic, TypeVar
+from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
 import uvloop
@@ -173,9 +173,15 @@ class TokenizerManager:
 
         # Others
         self.gracefully_exit = False
-        self.init_weights_update_group_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.update_weights_from_distributed_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.get_weights_by_name_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
+        self.init_weights_update_group_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_weights_from_distributed_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_weights_by_name_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         # Metrics
         if self.enable_metrics:
@@ -785,7 +791,7 @@ class SignalHandler:
         self.tokenizer_manager.gracefully_exit = True
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class _Communicator(Generic[T]):
