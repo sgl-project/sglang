@@ -296,15 +296,19 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 decoding_reqs.append(idx_batch)
                 decoding_reqs_poistions.append(start_len)
             else:
-                if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+                if is_offload_cache:
+                    assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
                     k, v = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
                         layer_id=layer.layer_id, 
                         batch_id=idx_batch,
                         cache_k=k[start_len:start_len+seq_len].unsqueeze(0),
                         cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
                     )
+                    k_cache = v_cache = None
+                    print(layer.layer_id, k[0,::8192,0,0])
                 else:
                     k = v = None
+                    print(layer.layer_id, k_cache[1::8192,0,0])
                 
                 o_req, _ = self.forward_paged_hip(
                     query=q_reshaped[start_len:start_len+seq_len],
