@@ -6,6 +6,8 @@ Please visit [here](https://huggingface.co/collections/neuralmagic) for some pop
 
 ## Online Quantization
 
+> Note: Although we support online quantization, we recommend users to use quantized models.
+
 To enable online quantization, you can simply specify `--quantization` in the command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
 ```bash
