@@ -94,7 +94,10 @@ class ModelConfig:
         )
 
         # FIXME: temporary special judge for MLA architecture
-        if "DeepseekV2ForCausalLM" in self.hf_config.architectures:
+        if (
+            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV3ForCausalLM" in self.hf_config.architectures
+        ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
