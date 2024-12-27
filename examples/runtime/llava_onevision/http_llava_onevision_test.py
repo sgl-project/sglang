@@ -15,9 +15,8 @@ import time
 import numpy as np
 import openai
 import requests
-from PIL import Image
-
 from decord import VideoReader, cpu
+from PIL import Image
 
 # pip install httpx==0.23.3
 # pip install decord
