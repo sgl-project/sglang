@@ -1,10 +1,10 @@
 # Quantization
 
-`SGLang` support various quantization methods, inclding online dynamic quantization and offline quantization.
+`SGLang` support various quantization methods, including online dynamic quantization and offline quantization.
 
 ## Online Dynamic Quantization
 
-To enable oneline dynamic quantization, you can simply specify `--quantization` in command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can lauch the server with following command:
+To enable online dynamic quantization, you can simply specify `--quantization` in the command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -13,9 +13,9 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-Our team is working on supporting more quantization methods with high priority. We will soon support other quantization methods including but not limitied to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
+Our team is working on supporting more quantization methods with high priority. We will soon support other quantization methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
 
-We also support quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can lauch the server with following command:
+We also support quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -45,7 +45,8 @@ To do offline quantization for your model, firstly you need to install [llm-comp
 pip install llmcompressor
 ```
 
-Here, we take quantize `meta-llama/Meta-Llama-3-8B-Instruct` to `FP8` as an example to elaborate how to do offline quantization.
+Here, we take quantize `meta-llama/Meta-Llama-3-8B-Instruct` to `FP8` as an example to elaborate on how to do offline quantization.
+
 ```python
 from transformers import AutoTokenizer
 from llmcompressor.transformers import SparseAutoModelForCausalLM
@@ -73,7 +74,7 @@ model.save_pretrained(SAVE_DIR)
 tokenizer.save_pretrained(SAVE_DIR)
 ```
 
-Then, you can directly use the quantized model with `SGLang`, using the following command:
+Then, you can directly use the quantized model with `SGLang`, by using the following command:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -81,7 +82,7 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-Note: If the moded is quantized offline, you **do not** need to add `--quantization` argument when starting the engine.
+Note: If the model has already quantized offline, please **do not** add `--quantization` argument when starting the engine.
 
 
 ## Reference
