@@ -13,6 +13,9 @@ ARG SGL_REPO="https://github.com/sgl-project/sglang"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
+ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
+ARG TRITON_COMMIT="845d75a"
+
 RUN git clone ${SGL_REPO} \
     && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
@@ -29,6 +32,13 @@ RUN git clone ${SGL_REPO} \
 
 RUN cp -r /sgl-workspace/sglang /sglang
 RUN python -m pip cache purge
+
+RUN pip uninstall -y triton
+RUN git clone ${TRITON_REPO} \
+    && cd triton \
+    && git checkout ${TRITON_COMMIT} \
+    && cd python \
+    && python3 setup.py install
 
 # Performance environment variable.
 
