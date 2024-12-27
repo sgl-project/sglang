@@ -50,7 +50,7 @@ The core features include:
 - [Backend: SGLang Runtime (SRT)](https://sgl-project.github.io/backend/backend.html)
 - [Frontend: Structured Generation Language (SGLang)](https://sgl-project.github.io/frontend/frontend.html)
 
-## Benchmark And Performance
+## Benchmark and Performance
 Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
 
 ## Roadmap
