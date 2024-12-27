@@ -19,4 +19,4 @@ Add unit tests under [sglang/test](https://github.com/sgl-project/sglang/tree/ma
 
 ## For Newcomers
 If you want to contribute or learn but don't have a concrete idea yet, you can pick a task labeled as "good first issue" or "help wanted" from the list below.
-https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22
+[https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22)

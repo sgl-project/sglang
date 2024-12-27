@@ -24,7 +24,7 @@ docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/roo
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
+pip install "sglang[all]==0.4.1.post1" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --enable-dp-attention --tp 8 --trust-remote-code
