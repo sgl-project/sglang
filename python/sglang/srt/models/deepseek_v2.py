@@ -575,7 +575,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.w_kc.dtype == torch.float8_e4m3fn or torch.float8_e4m3fnuz:
             if is_hip():
-                q_nope_out = torch.bmm(q_nope.to(torch.bfloat16).transpose(0, 1), self.w_kc.to(torch.bfloat16))
+                # TODO(BruceXcluding): lack of bmm for torch.float8_e4m3fnuz.
+                q_nope_out = torch.bmm(
+                    q_nope.to(torch.bfloat16).transpose(0, 1),
+                    self.w_kc.to(torch.bfloat16),
+                )
             else:
                 q_nope_val, q_nope_scale = input_to_float8(
                     q_nope.transpose(0, 1), torch.float8_e4m3fn
@@ -603,7 +607,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.w_vc.dtype == torch.float8_e4m3fn or torch.float8_e4m3fnuz:
             if is_hip():
-                attn_bmm_output = torch.bmm(attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc.to(torch.bfloat16))
+                # TODO(BruceXcluding): lack of bmm for torch.float8_e4m3fnuz.
+                attn_bmm_output = torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    self.w_vc.to(torch.bfloat16),
+                )
             else:
                 attn_output_val, attn_output_scale = input_to_float8(
                     attn_output.transpose(0, 1), torch.float8_e4m3fn
@@ -946,9 +954,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     w = self_attn.kv_b_proj.weight
                 # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
                 # This may affect the accuracy of fp8 model.
-                if (
-                    hasattr(self.quant_config, "weight_block_size")
-                    and w.dtype == torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+                if hasattr(self.quant_config, "weight_block_size") and w.dtype == (
+                    torch.float8_e4m3fn or torch.float8_e4m3fnuz
                 ):
                     weight_block_size = self.quant_config.weight_block_size
                     if weight_block_size is not None:

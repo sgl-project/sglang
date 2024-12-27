@@ -217,9 +217,13 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # WEIGHT
         weight_dtype = (
-            torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
-            if self.quant_config.is_checkpoint_fp8_serialized
-            else params_dtype
+            torch.float8_e4m3fnuz
+            if is_hip()
+            else (
+                torch.float8_e4m3fn
+                if self.quant_config.is_checkpoint_fp8_serialized
+                else params_dtype
+            )
         )
 
         weight = ModelWeightParameter(

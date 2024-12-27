@@ -2,10 +2,14 @@ import os
 import shutil
 import zipfile
 from pathlib import Path
-import torch 
+
+import torch
+
+
 def is_hip() -> bool:
     """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
+
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -62,8 +66,7 @@ def update_wheel_platform_tag():
     old_wheel.rename(new_wheel)
 
 
-
-if not is_hip(): 
+if not is_hip():
     setup(
         name="sgl-kernel",
         version=get_version(),
@@ -142,9 +145,7 @@ if not is_hip():
 else:
     hipcc_flags = [
         "-D__HIP_PLATFORM_AMD__=1",
-        "--amdgpu-target=gfx942",  
-        "-DENABLE_BF16", # Enable BF16 for cuda_version >= 11
-        "-DENABLE_FP8",  # Enable FP8 for cuda_version >= 11.8
+        "--amdgpu-target=gfx90a,gfx940,gfx941,gfx942",
     ]
     setup(
         name="sgl-kernel",
@@ -158,7 +159,8 @@ else:
                     "src/sgl-kernel/csrc/moe_align_kernel.cu",
                 ],
                 extra_compile_args={
-                    "nvcc": hipcc_flags + [
+                    "nvcc": hipcc_flags
+                    + [
                         "-O3",
                         "-Xcompiler",
                         "-fPIC",
@@ -171,7 +173,6 @@ else:
         ],
         cmdclass={"build_ext": BuildExtension},
         install_requires=["torch"],
-    )   
+    )
 
 update_wheel_platform_tag()
-

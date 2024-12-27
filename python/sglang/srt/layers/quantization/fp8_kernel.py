@@ -17,7 +17,9 @@ from typing import List, Tuple
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.utils import is_hip
+
 
 @triton.jit
 def _per_token_group_quant_fp8(
@@ -61,11 +63,11 @@ def _per_token_group_quant_fp8(
     tl.store(y_s_ptr, y_s)
 
 
+dtype_ = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+
+
 def per_token_group_quant_fp8(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-    dtype: torch.dtype = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+    x: torch.Tensor, group_size: int, eps: float = 1e-10, dtype: torch.dtype = dtype_
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
