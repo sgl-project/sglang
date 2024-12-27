@@ -353,78 +353,87 @@ class TELlamaForCausalLM(nn.Module):
 
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # 定义参数映射关系,用于处理堆叠的参数
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj.weight", "q"),
-            (".qkv_proj", ".k_proj.weight", "k"),
-            (".qkv_proj", ".v_proj.weight", "v"),
-            # (".gate_up_proj", ".gate_proj", 0),
-            # (".gate_up_proj", ".up_proj", 1),
-            (".layernorm_mlp.fc1_weight", ".gate_proj.weight", 0),
-            (".layernorm_mlp.fc1_weight", ".up_proj.weight", 1),
-            (".layernorm_mlp.fc2_weight", ".down_proj.weight", 0),
+            (".qkv_proj", ".q_proj.weight", "q"),  # q_proj 映射到 qkv_proj 的第一部分
+            (".qkv_proj", ".k_proj.weight", "k"),  # k_proj 映射到 qkv_proj 的第二部分  
+            (".qkv_proj", ".v_proj.weight", "v"),  # v_proj 映射到 qkv_proj 的第三部分
+            # MLP层参数映射
+            (".layernorm_mlp.fc1_weight", ".gate_proj.weight", 0),  # gate_proj 映射到 fc1 的前半部分
+            (".layernorm_mlp.fc1_weight", ".up_proj.weight", 1),    # up_proj 映射到 fc1 的后半部分
+            (".layernorm_mlp.fc2_weight", ".down_proj.weight", 0),  # down_proj 映射到 fc2
+            # LayerNorm参数映射
             (".layernorm_mlp.layer_norm_weight", ".post_attention_layernorm.weight", 0),
         ]
+        
+        # 获取模型所有参数的字典
         params_dict = dict(self.named_parameters())
 
+        # 遍历权重进行加载
         for name, loaded_weight in weights:
+            # 跳过不需要的权重
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             
+            # 如果权重为空则跳过
             if loaded_weight.numel() == 0:
                 print(f"Warning: loaded_weight for {name} is empty.")
                 continue
 
+            # 遍历映射关系处理堆叠参数
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue 
                 mapped_name = name.replace(weight_name, param_name)
-                # qkv_proj 
+                
+                # QKV投影层的特殊处理
                 if param_name == ".qkv_proj":
                     if mapped_name not in params_dict:
                         params_dict[mapped_name] = torch.zeros_like(loaded_weight)
 
-                    # split loaded_weight into q_proj, k_proj, v_proj
+                    # 将loaded_weight分成q,k,v三部分
                     q_weight, k_weight, v_weight = torch.chunk(loaded_weight, 3, dim=0)
 
-                    if shard_id == 0:  # q_proj 
+                    if shard_id == "q":  # q_proj 
                         params_dict[mapped_name][: q_weight.shape[0]] = q_weight
-                    elif shard_id == 1:  # k_proj 
+                    elif shard_id == "k":  # k_proj 
                         params_dict[mapped_name][q_weight.shape[0]: 2 * q_weight.shape[0]] = k_weight
-                    elif shard_id == 2:  # v_proj 
+                    elif shard_id == "v":  # v_proj 
                         params_dict[mapped_name][2 * q_weight.shape[0]:] = v_weight
                     break
+
+                # LayerNorm权重的处理
                 if param_name == ".layernorm_mlp.layer_norm_weight":
                     if mapped_name in params_dict:
                         params_dict[mapped_name].data.copy_(loaded_weight)
                     break
-                # Handle combined weights (fc1_weight -> gate_proj + up_proj)
+
+                # MLP的gate_proj和up_proj合并处理
                 if param_name == ".layernorm_mlp.fc1_weight":
-                    # Initialize the combined weight if not present
                     if mapped_name not in params_dict:
                         params_dict[mapped_name] = torch.zeros_like(loaded_weight)
                     
-                    # Split loaded_weight into gate_proj and up_proj
+                    # 将loaded_weight分成gate_proj和up_proj两部分
                     gate_weight, up_weight = torch.split(loaded_weight, loaded_weight.shape[0] // 2, dim=0)
 
-                    if shard_id == 0:  # gate_proj part
+                    if shard_id == 0:  # gate_proj部分
                         params_dict[mapped_name][: gate_weight.shape[0]] = gate_weight
-                    elif shard_id == 1:  # up_proj part
+                    elif shard_id == 1:  # up_proj部分
                         params_dict[mapped_name][gate_weight.shape[0]:] = up_weight
                     break
 
-                # fc2
+                # down_proj权重的处理
                 elif param_name == ".layernorm_mlp.fc2_weight":
                     if mapped_name in params_dict:
                         params_dict[mapped_name].data.copy_(loaded_weight)
                     break
-                # Skip loading extra bias for GPTQ models.
+
+                # 跳过GPTQ模型的额外bias
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -432,24 +441,22 @@ class TELlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break  
             else:
-                # Skip loading extra bias for GPTQ models.
+                # 处理其他普通参数
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip loading kv_scale from ckpts towards new design.
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-        if (
-            hasattr(self.config, "tie_word_embeddings")
-            and self.config.tie_word_embeddings
-        ):
-            # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
+        # 处理词嵌入层的权重绑定
+        if hasattr(self.config, "tie_word_embeddings") and self.config.tie_word_embeddings:
             param = self.lm_head.weight
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, self.model.embed_tokens.weight)
+
+        # 应用torchao配置
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 

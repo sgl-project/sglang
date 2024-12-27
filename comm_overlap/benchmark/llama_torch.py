@@ -8,7 +8,7 @@ import signal
 import atexit
 
 def start_server():
-    print("启动服务器...")
+    print("starting server...")
     server_cmd = (
         "python -m sglang.launch_server "
         "--model-path meta-llama/Meta-Llama-3.1-8B-Instruct "
@@ -30,7 +30,7 @@ def start_server():
     atexit.register(lambda: os.kill(server_process.pid, signal.SIGTERM))
     
     # 等待服务器启动
-    print("等待服务器启动...")
+    print("waiting for server to start...")
     time.sleep(30)
     return server_process
 
@@ -49,7 +49,7 @@ def test_latency(num_requests=50):
     
     latencies = []
     
-    print(f"开始测试 {num_requests} 个请求的延迟...")
+    print(f"start to test latency for {num_requests} requests...")
     
     for i in range(num_requests):
         start_time = time.time()
@@ -59,30 +59,30 @@ def test_latency(num_requests=50):
                 end_time = time.time()
                 latency = (end_time - start_time) * 1000  # 转换为毫秒
                 latencies.append(latency)
-                print(f"请求 {i+1}: {latency:.2f}ms")
-                print(f"响应内容: {response.json()}")
+                print(f"request {i+1}: {latency:.2f}ms")
+                print(f"response: {response.json()}")
             else:
-                print(f"请求 {i+1} 失败: HTTP {response.status_code}")
-                print(f"错误信息: {response.text}")
+                print(f"request {i+1} failed: HTTP {response.status_code}")
+                print(f"error: {response.text}")
         except Exception as e:
-            print(f"请求 {i+1} 失败: {str(e)}")
+            print(f"request {i+1} failed: {str(e)}")
         
         # 请求之间稍作暂停
         time.sleep(0.5)
     
     if latencies:
         results = {
-            "平均延迟": f"{statistics.mean(latencies):.2f}ms",
-            "最小延迟": f"{min(latencies):.2f}ms",
-            "最大延迟": f"{max(latencies):.2f}ms",
-            "延迟中位数": f"{statistics.median(latencies):.2f}ms"
+            "min latency": f"{min(latencies):.2f}ms",
+            "max latency": f"{max(latencies):.2f}ms",
+            "mean latency": f"{statistics.mean(latencies):.2f}ms",
+            "median latency": f"{statistics.median(latencies):.2f}ms"
         }
         
         # 保存结果
         with open("latency_results_torch_{max_new_tokens}.json", "w") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
             
-        print("\n测试结果:")
+        print("\ntest results:")
         for key, value in results.items():
             print(f"{key}: {value}")
 
@@ -91,6 +91,6 @@ if __name__ == "__main__":
     try:
         test_latency()
     finally:
-        print("关闭服务器...")
+        print("closing server...")
         server_process.terminate()
         server_process.wait()
