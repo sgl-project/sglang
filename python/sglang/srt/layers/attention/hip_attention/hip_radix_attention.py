@@ -271,7 +271,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         cache_loc, 
                         k, 
                         v, 
-                        async_copy=True,
+                        async_copy=False,
                     )
             offload_cache = k_cache = v_cache = None
             # offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

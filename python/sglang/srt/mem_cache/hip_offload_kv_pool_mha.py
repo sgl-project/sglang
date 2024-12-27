@@ -113,7 +113,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 )
                 assert k.device == self.device
                 assert v.device == self.device
-                self.prefetched_kv[handle_id] = (k, v, prefix_seq_len)
+                self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
             stream.synchronize()
             self.prefetch_threads.pop(handle_id)
             # print(threading.current_thread().native_id, 'done copy', (time.time() - t_local) * 1000, (k.numel() * k.element_size()) * 2 / 1024 / 1024)
@@ -124,7 +124,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         return t
     
     def get_fetched_prefix_kv_buffer(
-        self, 
+        self,
         layer_id: int,
         batch_id: int,
         # you need to pass KV for extend
@@ -138,7 +138,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             prefetch_thread.join()
         
         assert handle_id in self.prefetched_kv, "did prefetch successed?"
-        k, v, seq_len = self.prefetched_kv.pop(handle_id)
+        k, v, seq_len, table = self.prefetched_kv.pop(handle_id)
         
         assert isinstance(k, Tensor)
         assert isinstance(v, Tensor)
@@ -161,8 +161,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             cache_k = cache_k.to(self.dtype, non_blocking=True)
             cache_v = cache_v.to(self.dtype, non_blocking=True)
         
-        k[:, seq_len:seq_len+cache_k.shape[1], :, :].copy_(cache_k, non_blocking=True)
-        v[:, seq_len:seq_len+cache_v.shape[1], :, :].copy_(cache_v, non_blocking=True)
+        k[:, seq_len:, :, :].copy_(cache_k, non_blocking=True)
+        v[:, seq_len:, :, :].copy_(cache_v, non_blocking=True)
         
         return k, v
 
