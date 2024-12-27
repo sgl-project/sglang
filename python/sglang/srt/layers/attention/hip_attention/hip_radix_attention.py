@@ -250,14 +250,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        require_dense = (
-            # layer.layer_id in self.hip_config.dense_layers or
-            self.hip_config.prefill_always_dense or
-            self.hip_config.force_dense or
-            any(map(lambda x: x <= self.hip_config.prefill_dense_threshold, forward_batch.extend_prefix_lens_cpu))
-        )
-
-        logger.debug(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
+        logger.info(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
@@ -267,14 +260,14 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, 
-                        cache_loc, 
-                        k, 
-                        v, 
-                        async_copy=True,
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        async_copy=False
                     )
-            offload_cache = k_cache = v_cache = None
-            # offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            k_cache = v_cache = None
+            offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         else:
             if k is not None:
                 assert v is not None
@@ -299,7 +292,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 if is_offload_cache:
                     assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
                     k, v = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
-                        layer_id=layer.layer_id, 
+                        layer_id=layer.layer_id,
                         batch_id=idx_batch,
                         cache_k=k[start_len:start_len+seq_len].unsqueeze(0),
                         cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
@@ -309,9 +302,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     # print(layer.layer_id, k[0,::8192,0,0])
                 else:
                     k = v = None
-                    # if layer.layer_id == 31:
-                    # print(layer.layer_id, k_cache[1::8192,0,0])
-                
+
                 o_req, _ = self.forward_paged_hip(
                     query=q_reshaped[start_len:start_len+seq_len],
                     sm_scale=layer.scaling,
@@ -327,8 +318,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
 
                     layer=layer,
-                    # is_dense=require_dense,
-                    
+                    is_dense=layer.layer_id in self.hip_config.dense_layers,
+
                     k=k,
                     v=v,
                 )
@@ -356,13 +347,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        require_dense = (
-            # layer.layer_id in self.hip_config.dense_layers or
-            self.hip_config.decode_always_dense or
-            self.hip_config.force_dense
-        )
-
-        logger.debug(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
+        logger.info(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
@@ -393,7 +378,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             sm_scale=layer.scaling,
             batch_size=forward_batch.batch_size,
-            
+
             k_cache=k_cache,
             v_cache=v_cache,
             offload_cache=offload_cache,
@@ -405,7 +390,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
             layer=layer,
             cached_metadata=metadata,
-            # is_dense=require_dense,
+            is_dense=layer.layer_id in self.hip_config.dense_layers,
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
@@ -418,7 +403,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         query: torch.Tensor,
         sm_scale: float,
         batch_size: int,
-        
+
         k_cache: Optional[torch.Tensor],
         v_cache: Optional[torch.Tensor],
         offload_cache: Optional[HiPOffloadCache],
@@ -431,7 +416,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         layer: RadixAttention,
 
         cached_metadata=None,
-        # is_dense: bool = False,
+        is_dense: bool = False,
 
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
@@ -502,7 +487,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,
         )
-        
+
         context, metadata = dual_stage_quadratic_hip_attention(
             (query * sm_scale).to(query.dtype),
             k, v,
@@ -510,10 +495,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=cached_metadata,
         )
         context = context.to(query.dtype)
-        
-        # print('cached meta?', cached_metadata is not None)
-        # print('mask', metadata.mask_cache_statistics.compute_statistics())
-        # print('sa', metadata.sa_cache_statistics.compute_statistics())
 
         return context.view(N, num_heads, hidden_dims), metadata
 

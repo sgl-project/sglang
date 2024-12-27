@@ -62,6 +62,7 @@ class HiPAttentionPerLayerConfig:
             if parsed_json:
                 raise ValueError(f'Unknown keys in json: {parsed_json.keys()}')
 
+
 @dataclass
 class HiPAttentionConfig:
     apply_v_dot: bool = False
