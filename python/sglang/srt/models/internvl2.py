@@ -196,8 +196,8 @@ def dynamic_preprocess(image: Image.Image, min_num: int, max_num: int,
 
 
 # adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
-def image_to_pixel_values(image: Image.Image, input_size: int, min_num: int,
-                          max_num: int, use_thumbnail: bool) -> torch.Tensor:
+def image_to_pixel_values(image: Image.Image, input_size: int = 448, min_num: int = 1,
+                          max_num: int = 6, use_thumbnail: bool = True) -> torch.Tensor:
     transform = build_transform(input_size=input_size)
     images = dynamic_preprocess(image,
                                 min_num=min_num,

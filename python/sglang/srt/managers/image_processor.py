@@ -15,6 +15,7 @@ from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_image
 from sglang.utils import get_exception_traceback
+from sglang.srt.models.internvl2 import image_to_pixel_values
 
 logger = logging.getLogger(__name__)
 
@@ -350,110 +351,95 @@ class InternVL2ImageProcessor(BaseImageProcessor):
     async def process_images_async(self, *args, **kwargs):
         return None
     
-    # @staticmethod
-    # def _process_single_image_task(images, input_text):
-    #     return global_processor(images, input_text, return_tensors="pt")
+    @staticmethod
+    def _process_single_image_task(
+        image_data: Union[str, bytes],
+        image_processor=None,
+    ):
+        try:
+            image, image_size = load_image(image_data)
+            if image_size is not None:
+                # It is a video with multiple images
+                image_hash = hash(image_data)
+                # process_result = image_processor(image)
+                pixel_values = image_to_pixel_values(image)
+                # pixel_values = process_result["pixel_values"]
+                for _ in range(len(pixel_values)):
+                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                pixel_values = np.stack(pixel_values, axis=0)
+                return pixel_values, image_hash, image_size
+            else:
+                # It is an image
+                image_hash = hash(image_data)
+                # process_result = image_processor(image)
+                pixel_values = image_to_pixel_values(image)
+                if isinstance(pixel_values, np.ndarray):
+                    pixel_values = pixel_values.astype(np.float16)
+
+                return pixel_values, image_hash, image.size
+        except Exception:
+            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+
+    async def _process_single_image(self, image_data: Union[bytes, str]):
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.executor,
+                InternVL2ImageProcessor._process_single_image_task,
+                image_data,
+            )
+        else:
+            return self._process_single_image_task(image_data)
+
+    async def process_images_async(
+        self, image_data: List[Union[str, bytes]], input_text, request_obj
+    ):
+        if not image_data:
+            return None
+
+        if isinstance(image_data, list) and len(image_data) > 0:
+            # Multiple images
+            if len(image_data) > 1:
+                pixel_values, image_hashes, image_sizes = (
+                    [],
+                    [],
+                    [],
+                )
+                res = []
+                for img_data in image_data:
+                    res.append(self._process_single_image(img_data))
+                res = await asyncio.gather(*res)
+                for pixel_v, image_h, image_s in res:
+                    pixel_values.append(pixel_v)
+                    image_hashes.append(image_h)
+                    image_sizes.append(image_s)
+
+                if isinstance(pixel_values[0], np.ndarray):
+                    pixel_values = np.concatenate(pixel_values, axis=0)
+            else:
+                # A single image
+                pixel_values, image_hash, image_size = (
+                    await self._process_single_image(image_data[0])
+                )
+                image_hashes = [image_hash]
+                image_sizes = [image_size]
+        elif isinstance(image_data, str):
+            # A single image
+            pixel_values, image_hash, image_size = (
+                await self._process_single_image(image_data)
+            )
+            image_hashes = [image_hash]
+            image_sizes = [image_size]
+        else:
+            raise ValueError(f"Invalid image data: {image_data}")
+
+        return {
+            "pixel_values": pixel_values,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "modalities": request_obj.modalities or ["image"],
+        }
     
-    # def input_processor(
-    #     self,
-    #     hf_config,
-    #     inputs,
-    #     *,
-    #     max_dynamic_patch: Optional[int] = None,
-    #     dynamic_image_size: Optional[bool] = None,
-    # ) -> DecoderOnlyInputs:
-    #     num_patches = get_internvl_num_patches(hf_config)
-    #     num_blocks_calculator = calculate_num_blocks_wrapper(
-    #         hf_config, max_dynamic_patch, dynamic_image_size)
-    #     if isinstance(inputs, Image.Image):
-    #         width, height = image_data.size
-    #         num_blocks, _, _ = num_blocks_calculator(width, height)
-    #         image_feature_sizes = [num_blocks * num_patches]
-    #     elif is_list_of(image_data, Image.Image):
-    #         image_feature_sizes = []
-    #         for image in image_data:
-    #             width, height = image.size
-    #             num_blocks, _, _ = num_blocks_calculator(width, height)
-    #             image_feature_sizes.append(num_blocks * num_patches)
-    #     elif isinstance(image_data, torch.Tensor):
-    #         num_images, image_feature_size, hidden_size = image_data.shape
-    #         image_feature_sizes = [image_feature_size]
-    #     else:
-    #         raise TypeError(f"Invalid image type: {type(image_data)}")
-
-    #     tokenizer = cached_get_tokenizer(
-    #         model_config.tokenizer,
-    #         trust_remote_code=model_config.trust_remote_code)
-
-    #     prompt = inputs.get("prompt")
-    #     prompt_token_ids = inputs["prompt_token_ids"]
-    #     if prompt is None:
-    #         prompt = tokenizer.decode(prompt_token_ids)
-
-    #     new_prompt = self._expand_image_prompt(prompt, image_feature_sizes,
-    #                                            num_patches)
-    #     new_prompt_token_ids = tokenizer.encode(new_prompt)
-    #     img_context_token_id = tokenizer.encode(self.img_context_token,
-    #                                             add_special_tokens=False)
-    #     assert len(img_context_token_id) == 1, \
-    #         (f"Invalid image token '{self.img_context_token}': A valid image "
-    #         f"token encodes to a single token ID, got {img_context_token_id}.")
-    #     img_context_token_id = img_context_token_id[0]
-
-    #     # Get precise tracking of placeholder positions
-    #     token_idx = image_idx = 0
-    #     placeholder_ranges = []
-    #     while token_idx < len(new_prompt_token_ids):
-    #         if new_prompt_token_ids[token_idx] == img_context_token_id:
-    #             curr_image_featue_size = image_feature_sizes[image_idx]
-    #             placeholder_ranges.append(
-    #                 PlaceholderRange(offset=token_idx,
-    #                                  length=curr_image_featue_size))
-    #             image_idx += 1
-    #             token_idx += curr_image_featue_size
-    #         else:
-    #             token_idx += 1
-
-    #     return token_inputs(
-    #         prompt=prompt,
-    #         prompt_token_ids=new_prompt_token_ids,
-    #         multi_modal_data=multi_modal_data,
-    #         multi_modal_placeholders={"image": placeholder_ranges})
-
-    # def input_mapper(
-    #     self,
-    #     ctx: InputContext,
-    #     data: object,
-    #     *,
-    #     max_dynamic_patch: Optional[int] = None,
-    #     dynamic_image_size: Optional[bool] = None,
-    # ):
-    #     hf_config = ctx.get_hf_config()
-
-    #     image_pixel_values_mapper = image_to_pixel_values_wrapper(
-    #         hf_config, max_dynamic_patch, dynamic_image_size)
-    #     if isinstance(data, Image.Image):
-    #         data = image_pixel_values_mapper(data)
-    #         # Add an N dimension for number of images per prompt (currently 1).
-    #         data = data.unsqueeze(0)
-    #     elif is_list_of(data, Image.Image):
-    #         # we can't stack here because images may have different num_patches
-    #         data = [image_pixel_values_mapper(img) for img in data]
-    #     else:
-    #         return MultiModalKwargs({"image_embeds": data})
-    #     model_config = ctx.model_config
-    #     tokenizer = cached_get_tokenizer(
-    #         model_config.tokenizer,
-    #         trust_remote_code=model_config.trust_remote_code)
-    #     image_token_id = tokenizer.encode(self.img_context_token,
-    #                                       add_special_tokens=False,
-    #                                       return_tensors="pt")[0]
-
-    #     return MultiModalKwargs({
-    #         "pixel_values": data,
-    #         "image_token_id": image_token_id
-    #     })
-
 
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor
