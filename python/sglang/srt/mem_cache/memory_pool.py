@@ -25,8 +25,9 @@ import logging
 from typing import List, Tuple, Union
 
 import torch
+
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_compiler_backend, primary_memory_saver
+from sglang.srt.utils import get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
@@ -170,12 +171,6 @@ class BaseTokenToKVPool:
     ) -> None:
         raise NotImplementedError()
 
-    def create_buffers(self):
-        raise NotImplementedError()
-
-    def clear_buffers(self):
-        raise NotImplementedError()
-
 
 class MHATokenToKVPool(BaseTokenToKVPool):
 
@@ -192,30 +187,29 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        self.create_buffers()
+        self._create_buffers()
 
-    def create_buffers(self):
-        with primary_memory_saver.region():
-            # [size, head_num, head_dim] for each layer
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.empty(
-                    (self.size + 1, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.empty(
-                    (self.size + 1, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+    def _create_buffers(self):
+        # [size, head_num, head_dim] for each layer
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.k_buffer = [
+            torch.empty(
+                (self.size + 1, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.v_buffer = [
+            torch.empty(
+                (self.size + 1, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
 
-    def clear_buffers(self):
+    def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
 
@@ -270,24 +264,17 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         device: str,
     ):
         super().__init__(size, dtype, device)
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.layer_num = layer_num
-        self.create_buffers()
 
-    def create_buffers(self):
+        self.kv_lora_rank = kv_lora_rank
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.kv_buffer = [
             torch.empty(
-                (self.size + 1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+                (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
                 dtype=self.store_dtype,
-                device=self.device,
+                device=device,
             )
-            for _ in range(self.layer_num)
+            for _ in range(layer_num)
         ]
-
-    def clear_buffers(self):
-        del self.kv_buffer
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
@@ -330,35 +317,24 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         heavy_channel_num: int,
     ):
         super().__init__(size, dtype, device)
-        self.head_num = head_num
-        self.head_dim = head_dim
-        self.layer_num = layer_num
-        self.heavy_channel_num = heavy_channel_num
-        self.create_buffers()
 
-    def create_buffers(self):
         # [size, head_num, head_dim] for each layer
         self.k_buffer = [
-            torch.empty((self.size + 1, self.head_num, self.head_dim), dtype=self.dtype, device=self.device)
-            for _ in range(self.layer_num)
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+            for _ in range(layer_num)
         ]
         self.v_buffer = [
-            torch.empty((self.size + 1, self.head_num, self.head_dim), dtype=self.dtype, device=self.device)
-            for _ in range(self.layer_num)
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+            for _ in range(layer_num)
         ]
 
         # [size, head_num, heavy_channel_num] for each layer
         self.label_buffer = [
             torch.empty(
-                (self.size + 1, self.head_num, self.heavy_channel_num), dtype=self.dtype, device=self.device
+                (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
             )
-            for _ in range(self.layer_num)
+            for _ in range(layer_num)
         ]
-
-    def clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
-        del self.label_buffer
 
     def get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id]
