@@ -6,7 +6,7 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from transformers import AutoModelForCausalLM
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
-_DEBUG_EXTRA = True
+_DEBUG_EXTRA = False
 
 
 class TestReleaseGPUOccupation(unittest.TestCase):
@@ -18,7 +18,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
 
         engine = sgl.Engine(
             model_path=model_old, random_seed=42,
-            # disable_cuda_graph=True,  # TODO kvcache is happy w/ cuda graph; temp disable to test model weight release
+            disable_cuda_graph=True,  # TODO kvcache is happy w/ cuda graph; temp disable to test model weight release
         )
         hf_model_new = AutoModelForCausalLM.from_pretrained(model_new, torch_dtype="bfloat16")
 
