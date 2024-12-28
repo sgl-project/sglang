@@ -1,8 +1,12 @@
+import time
 import unittest
+
 import sglang as sgl
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
 )
+
+_DEBUG_SLEEP = True
 
 
 class TestReleaseGPUOccupation(unittest.TestCase):
@@ -19,11 +23,21 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         outputs = engine.generate(prompt, sampling_params)["text"]
         self.assertEqual(outputs, expect_output)
 
+        if _DEBUG_SLEEP:
+            time.sleep(3)
+
         engine.release_gpu_occupation()
+
+        if _DEBUG_SLEEP:
+            time.sleep(3)
+
         engine.resume_gpu_occupation()
 
         outputs = engine.generate(prompt, sampling_params)["text"]
         self.assertEqual(outputs, expect_output)
+
+        if _DEBUG_SLEEP:
+            time.sleep(5)
 
         engine.shutdown()
 
