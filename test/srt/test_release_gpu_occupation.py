@@ -6,8 +6,8 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
 )
 
-# set to true to observe memory usage in nvidia-smi more clearly
-_DEBUG_EXTRA = False
+# (temporarily) set to true to observe memory usage in nvidia-smi more clearly
+_DEBUG_EXTRA = True
 
 
 class TestReleaseGPUOccupation(unittest.TestCase):
