@@ -25,7 +25,6 @@ import logging
 from typing import List, Tuple, Union
 
 import torch
-
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_compiler_backend, primary_memory_saver
 
@@ -39,9 +38,10 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        self.req_to_token = torch.zeros(
-            (size, max_context_len), dtype=torch.int32, device=device
-        )
+        with primary_memory_saver.region():
+            self.req_to_token = torch.zeros(
+                (size, max_context_len), dtype=torch.int32, device=device
+            )
         self.free_slots = list(range(size))
         self.write_records = []
         self.use_records = use_records
