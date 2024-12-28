@@ -17,8 +17,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         model_new = model_old.replace("-Instruct", "")
 
         engine = sgl.Engine(model_path=model_old, random_seed=42)
-        hf_model_new = AutoModelForCausalLM.from_pretrained(
-            model_new, torch_dtype="bfloat16", tie_word_embeddings=False)
+        hf_model_new = AutoModelForCausalLM.from_pretrained(model_new, torch_dtype="bfloat16")
 
         outputs = engine.generate(prompt, sampling_params)["text"]
         self.assertEqual(outputs, " to spend it outdoors. I decided to")
