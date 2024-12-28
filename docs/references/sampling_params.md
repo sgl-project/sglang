@@ -61,7 +61,7 @@ spaces_between_special_tokens: bool = True,
 # Do parallel sampling and return `n` outputs.
 n: int = 1,
 
-## Structured Decoding Constraints 
+## Structured Decoding Constraints
 # Only one of the below three can be set at a time:
 
 # Constrains the output to follow a given regular expression.
@@ -190,7 +190,7 @@ You can specify a JSON schema, Regular Expression or [EBNF](https://en.wikipedia
 SGLang supports two grammar backends:
 
 - [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and Regular Expression constraints.
-- [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema and EBNF constraints. 
+- [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema and EBNF constraints.
 
 > 🔔 Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified at a time.
 
