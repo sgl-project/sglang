@@ -16,20 +16,16 @@ def start_server():
         "--tp 4"
     )
     
-    # 切换到正确的目录
     original_dir = os.getcwd()
     server_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "python")
     os.chdir(server_dir)
     
     server_process = subprocess.Popen(server_cmd.split())
     
-    # 切回原来的目录
     os.chdir(original_dir)
     
-    # 注册退出时清理
     atexit.register(lambda: os.kill(server_process.pid, signal.SIGTERM))
     
-    # 等待服务器启动
     print("waiting for server to start...")
     time.sleep(30)
     return server_process
@@ -38,7 +34,6 @@ def test_latency(num_requests=50):
     url = "http://localhost:30001/generate"
     headers = {"Content-Type": "application/json"}
     
-    # 修改payload格式以匹配正确的API格式
     payload = {
         "text": "The president of USA,",
         "sampling_params": {
@@ -67,7 +62,6 @@ def test_latency(num_requests=50):
         except Exception as e:
             print(f"request {i+1} failed: {str(e)}")
         
-        # 请求之间稍作暂停
         time.sleep(0.5)
     
     if latencies:
