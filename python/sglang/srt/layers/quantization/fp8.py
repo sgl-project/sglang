@@ -216,13 +216,9 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # WEIGHT
         weight_dtype = (
-            torch.float8_e4m3fnuz
-            if is_hip()
-            else (
-                torch.float8_e4m3fn
-                if self.quant_config.is_checkpoint_fp8_serialized
-                else params_dtype
-            )
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else params_dtype
         )
 
         weight = ModelWeightParameter(
@@ -274,10 +270,29 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if is_hip():
+                weight = layer.weight
+                weight_scale = layer.weight_scale_inv
+                weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=weight,
+                    weight_scale=weight_scale,
+                    input_scale=layer.input_scale,
+                )
+                if input_scale is not None:
+                    layer.input_scale = Parameter(input_scale, requires_grad=False)
+
+                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    weight_scale, requires_grad=False
+                )
+                if input_scale is not None:
+                    layer.input_scale = torch.nn.Parameter(
+                        input_scale, requires_grad=False
+                    )
             return
-        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         # If checkpoint not serialized fp8, quantize the weights.
         if not self.quant_config.is_checkpoint_fp8_serialized:
             qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
@@ -435,7 +450,7 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+            params_dtype = torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -557,6 +572,47 @@ class Fp8MoEMethod:
 
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if is_hip():
+                # Normalize the weights and scales
+                w13_weight, w13_weight_scale, w13_input_scale = (
+                    normalize_e4m3fn_to_e4m3fnuz(
+                        layer.w13_weight, layer.w13_weight_scale_inv, layer.w13_input_scale
+                    )
+                )
+                w2_weight, w2_weight_scale, w2_input_scale = (
+                    normalize_e4m3fn_to_e4m3fnuz(
+                        layer.w2_weight, layer.w2_weight_scale_inv, layer.w2_input_scale
+                    )
+                )
+                # Reset the parameter
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                if w13_input_scale is not None:
+                    layer.w13_input_scale = torch.nn.Parameter(
+                        w13_input_scale, requires_grad=False
+                    )
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                if w2_input_scale is not None:
+                    layer.w2_input_scale = torch.nn.Parameter(
+                        w2_input_scale, requires_grad=False
+                    )
+
+                if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
+                    layer.w13_weight = torch.nn.Parameter(
+                        F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
             return
         # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
