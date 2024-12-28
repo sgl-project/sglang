@@ -555,3 +555,16 @@ register_conv_template(
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
     )
 )
+
+# Reference: https://huggingface.co/OpenGVLab/InternVL2-8B/blob/4012170d22bf10e14bf5ede3748cbaa97e2763c0/conversation.py
+register_conv_template(
+    Conversation(
+        name='internvl2-chat',
+        system_template='<|im_start|>system\n{system_message}',
+        system_message='你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。',
+        roles=('<|im_start|>user\n', '<|im_start|>assistant\n'),
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        sep='<|im_end|>',
+        stop_str=["</s>", "<|im_end|>", "<|im_start|>"],
+    )
+)
