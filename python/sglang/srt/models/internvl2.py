@@ -32,7 +32,6 @@ from vllm.inputs import (DecoderOnlyInputs, DummyData,
                          InputContext, token_inputs)
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from sglang.srt.models.intern_vit import (InternVisionModel,
                                           InternVisionPatchModel)
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
@@ -494,14 +493,21 @@ class InternVLChatModel(nn.Module):
         self.ps_version = config.ps_version
 
         self.llm_arch_name = config.text_config.architectures[0]
-        self.is_mono = self.llm_arch_name == 'InternLM2VEForCausalLM'
+        self.is_mono = (self.llm_arch_name == 'InternLM2VEForCausalLM')
         self.language_model = InternLM2ForCausalLM(config.text_config, quant_config)
-        self.mlp1 = self._init_mlp1(config)
+
+        vit_hidden_size = config.vision_config.hidden_size
+        llm_hidden_size = config.text_config.hidden_size
+        self.mlp1 = nn.Sequential(
+            nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio)**2),
+            nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio)**2,
+                      llm_hidden_size),
+            nn.GELU(),
+            nn.Linear(llm_hidden_size, llm_hidden_size),
+        )
 
         self.img_context_token_id = None
         self.visual_token_mask = None
-        self.logits_processor = LogitsProcessor(config)
-        self.lm_head = self.language_model.output
 
     # def _patch_quant_config(self, config: PretrainedConfig,
     #                         quant_config: QuantizationConfig):
@@ -514,25 +520,6 @@ class InternVLChatModel(nn.Module):
     #         if (not quant_config.modules_to_not_convert) and \
     #             (llm_quant_config is not None):
     #             quant_config.modules_to_not_convert.append("vision_model")
-
-    @cached_property
-    def sampler(self):
-        if hasattr(self.language_model, "sampler"):
-            return self.language_model.sampler
-
-        return get_sampler()
-
-    def _init_mlp1(self, config: PretrainedConfig) -> nn.Sequential:
-        vit_hidden_size = config.vision_config.hidden_size
-        llm_hidden_size = config.text_config.hidden_size
-
-        return nn.Sequential(
-            nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio)**2),
-            nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio)**2,
-                      llm_hidden_size),
-            nn.GELU(),
-            nn.Linear(llm_hidden_size, llm_hidden_size),
-        )
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -729,13 +716,6 @@ class InternVLChatModel(nn.Module):
                 forward_batch=forward_batch,
             )
             return hidden_states
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        return self.language_model.sample(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         if not self.is_mono:
