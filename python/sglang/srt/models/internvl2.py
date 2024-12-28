@@ -481,21 +481,10 @@ class InternVLChatModel(nn.Module):
     def __init__(self, config, quant_config, prefix: str = "") -> None:
         super().__init__()
 
-        print(config)
-        # pdb.breakpoint()
-
-        # config = vllm_config.model_config.hf_config
-        # quant_config = vllm_config.quant_config
-        # multimodal_config = vllm_config.model_config.multimodal_config
-
         self.config = config
         self.quant_config = quant_config
         if hasattr(self.config, "llm_config"):
             self.config.text_config = self.config.llm_config
-        # self.config.text_config = self.config.llm_config
-        # self.multimodal_config = multimodal_config
-        # self._patch_quant_config(config, quant_config)
-
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
@@ -506,28 +495,13 @@ class InternVLChatModel(nn.Module):
 
         self.llm_arch_name = config.text_config.architectures[0]
         self.is_mono = self.llm_arch_name == 'InternLM2VEForCausalLM'
-        # self.vision_model = self._init_vision_model(
-        #     config,
-        #     quant_config=quant_config,
-        #     is_mono=self.is_mono,
-        #     prefix=maybe_prefix(prefix, "vision_model"),
-        # )
-
         self.language_model = InternLM2ForCausalLM(config.text_config, quant_config)
-        # self.language_model = init_vllm_registered_model(
-        #     vllm_config=vllm_config,
-        #     hf_config=config.text_config,
-        #     prefix=maybe_prefix(prefix, "language_model"),
-        # )
-
         self.mlp1 = self._init_mlp1(config)
 
         self.img_context_token_id = None
         self.visual_token_mask = None
         self.logits_processor = LogitsProcessor(config)
         self.lm_head = self.language_model.output
-        # self.make_empty_intermediate_tensors = (
-        #     self.language_model.make_empty_intermediate_tensors)
 
     # def _patch_quant_config(self, config: PretrainedConfig,
     #                         quant_config: QuantizationConfig):
@@ -547,31 +521,6 @@ class InternVLChatModel(nn.Module):
             return self.language_model.sampler
 
         return get_sampler()
-
-    def _init_vision_model(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig],
-        *,
-        is_mono: bool,
-        prefix: str,
-    ):
-        if not is_mono:
-            vision_feature_layer = config.select_layer
-            if vision_feature_layer < 0:
-                num_hidden_layers = config.vision_config.num_hidden_layers \
-                    + vision_feature_layer + 1
-            else:
-                num_hidden_layers = vision_feature_layer + 1
-
-            return InternVisionModel(
-                config.vision_config,
-                quant_config=quant_config,
-                num_hidden_layers_override=num_hidden_layers,
-                prefix=prefix,
-            )
-        else:
-            return InternVisionPatchModel(config.vision_config)
 
     def _init_mlp1(self, config: PretrainedConfig) -> nn.Sequential:
         vit_hidden_size = config.vision_config.hidden_size
@@ -734,16 +683,10 @@ class InternVLChatModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        # kv_caches: List[torch.Tensor],
-        # intermediate_tensors: Optional[IntermediateTensors] = None,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> Union[SamplerOutput, IntermediateTensors]:
-
-        # if intermediate_tensors is not None:
-        #     input_ids = None
-        #     inputs_embeds = None
 
         # NOTE: In v1, inputs_embeds is always generated at model runner, this
         # condition is for v0 compatibility.
@@ -762,8 +705,6 @@ class InternVLChatModel(nn.Module):
             forward_kwargs = {
                 "input_ids": input_ids,
                 "positions": positions,
-                # "kv_caches": kv_caches,
-                # "intermediate_tensors": intermediate_tensors,
                 "forward_batch": forward_batch,
                 "input_embeds": input_embeds,
             }
