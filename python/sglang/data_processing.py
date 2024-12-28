@@ -1,9 +1,14 @@
+import os
 import json
+import numpy as np
 import random
 from typing import List, Optional, Tuple
-from toolbench.utils import standardize, contain, get_white_list
 from transformers import PreTrainedTokenizerBase
 from bench.nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
+from pathlib import Path
+import pickle
+import requests
+from tqdm.asyncio import tqdm
 from utils import MsgContent
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -24,6 +29,7 @@ def common_filter_chat(
     min_output_len: Optional[int],
     max_prompt_len: Optional[int],
     max_output_len: Optional[int],
+    fixed_output_len: Optional[int],
 ) -> SampleOutput:
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = []
@@ -59,7 +65,7 @@ def common_filter_chat(
                     # Prune too short sequences.
                     continue
                 input_tokens += prompt_len
-                output_len += output_len
+                output_tokens += output_len
                 processed.append((prompt, prompt_len, output_len))
             filtered_dataset.append(processed)
             l += 1
@@ -151,7 +157,8 @@ def sample_sharegpt_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 4, 4)
+        num_requests, new_dataset, tokenizer, 
+        4, 4, None, None, fixed_output_len)
     return filtered_dataset
 
 
@@ -200,7 +207,8 @@ def sample_ultrachat_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 4, 4)
+        num_requests, new_dataset, tokenizer, 
+        4, 4, None, None, fixed_output_len)
     return filtered_dataset
 
 
@@ -265,7 +273,8 @@ def sample_loogle_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 4)
+        num_requests, new_dataset, tokenizer, 
+        4, None, None, None, fixed_output_len)
     return filtered_dataset
 
 
@@ -443,7 +452,8 @@ def sample_generated_shared_prefix_requests(
     question_len: int,
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
-    disable_shuffle: bool = False
+    args,
+    disable_shuffle: bool = False,
 ) -> SampleOutput:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
@@ -521,7 +531,7 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
-            fixed_output_len=args.sharegpt_output_len,
+            fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "ultrachat":
         input_requests = sample_ultrachat_requests(
@@ -530,7 +540,7 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
-            fixed_output_len=args.sharegpt_output_len,
+            fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "loogle":
         input_requests = sample_loogle_requests(
@@ -539,7 +549,7 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
-            fixed_output_len=args.sharegpt_output_len,
+            fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "nextqa":
         input_requests = sample_nextqa_requests(
@@ -549,7 +559,7 @@ def get_dataset(args, tokenizer):
             max_frames=args.max_frames,
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
-            fixed_output_len=args.sharegpt_output_len,
+            fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
@@ -567,6 +577,7 @@ def get_dataset(args, tokenizer):
             system_prompt_len=args.gen_system_prompt_len,
             question_len=args.gen_question_len,
             output_len=args.gen_output_len,
+            args=args,
             tokenizer=tokenizer,
         )
     else:

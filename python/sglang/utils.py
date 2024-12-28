@@ -17,7 +17,11 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
+<<<<<<< HEAD
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
+=======
+from typing import Optional, Union, List
+>>>>>>> 77511ba2 (Feature: Add online multiturn chat. WIP)
 
 import numpy as np
 import requests
