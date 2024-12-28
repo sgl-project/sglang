@@ -28,7 +28,6 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
 
 from sglang.srt.layers.linear import LinearMethodBase, UnquantizedLinearMethod
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import padding_size
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -548,6 +547,10 @@ class Fp8MoEMethod:
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            padding_size,  # Avoid circular import
+        )
+
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             return
