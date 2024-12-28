@@ -11,15 +11,20 @@ class TestReleaseGPUOccupation(unittest.TestCase):
 
         param_name = "model.layers.2.self_attn.k_proj.weight"
 
-        print(engine.get_weights_by_name(param_name)[:5])
-        assert engine.get_weights_by_name(param_name)[:5] == ['TODO']
+        param_value = _get_sample_sub_tensor(engine.get_weights_by_name(param_name))
+        assert param_value == ['TODO'], f'{param_value=}'
 
         new_tensor = torch.full((100,), 42)  # TODO
         engine.update_weights_from_tensor(param_name, new_tensor)
 
-        assert engine.get_weights_by_name(param_name)[:5] == ['TODO']
+        param_value = _get_sample_sub_tensor(engine.get_weights_by_name(param_name))
+        assert param_value == ['TODO'], f'{param_value=}'
 
         engine.shutdown()
+
+
+def _get_sample_sub_tensor(x):
+    return torch.tensor(x)[0, :5]
 
 
 if __name__ == "__main__":
