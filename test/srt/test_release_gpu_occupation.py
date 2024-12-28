@@ -16,7 +16,10 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         model_old = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         model_new = model_old.replace("-Instruct", "")
 
-        engine = sgl.Engine(model_path=model_old, random_seed=42)
+        engine = sgl.Engine(
+            model_path=model_old, random_seed=42,
+            disable_cuda_graph=True,  # TODO kvcache is happy w/ cuda graph; temp disable to test model weight release
+        )
         hf_model_new = AutoModelForCausalLM.from_pretrained(model_new, torch_dtype="bfloat16")
 
         outputs = engine.generate(prompt, sampling_params)["text"]
