@@ -25,7 +25,6 @@ import logging
 from typing import List, Tuple, Union
 
 import torch
-
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_compiler_backend
 
@@ -177,6 +176,13 @@ class BaseTokenToKVPool:
     def clear_buffers(self):
         raise NotImplementedError()
 
+
+from torch_memory_saver import TorchMemorySaver
+
+# TODO move
+memory_saver = TorchMemorySaver()
+
+
 class MHATokenToKVPool(BaseTokenToKVPool):
 
     def __init__(
@@ -195,24 +201,25 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.create_buffers()
 
     def create_buffers(self):
-        # [size, head_num, head_dim] for each layer
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.k_buffer = [
-            torch.empty(
-                (self.size + 1, self.head_num, self.head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            for _ in range(self.layer_num)
-        ]
-        self.v_buffer = [
-            torch.empty(
-                (self.size + 1, self.head_num, self.head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            for _ in range(self.layer_num)
-        ]
+        with memory_saver.region():
+            # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.k_buffer = [
+                torch.empty(
+                    (self.size + 1, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.empty(
+                    (self.size + 1, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
 
     def clear_buffers(self):
         del self.k_buffer
