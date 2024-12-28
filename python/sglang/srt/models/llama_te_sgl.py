@@ -42,7 +42,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.torchao_utils import apply_torchao_config_
+# from sglang.srt.layers.torchao_utils import apply_torchao_config_
+from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -353,26 +354,26 @@ class TELlamaForCausalLM(nn.Module):
 
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # 定义参数映射关系,用于处理堆叠的参数
+        # define the mapping relationship of parameters, used to handle stacked parameters
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj.weight", "q"),  # q_proj 映射到 qkv_proj 的第一部分
-            (".qkv_proj", ".k_proj.weight", "k"),  # k_proj 映射到 qkv_proj 的第二部分  
-            (".qkv_proj", ".v_proj.weight", "v"),  # v_proj 映射到 qkv_proj 的第三部分
-            # MLP层参数映射
-            (".layernorm_mlp.fc1_weight", ".gate_proj.weight", 0),  # gate_proj 映射到 fc1 的前半部分
-            (".layernorm_mlp.fc1_weight", ".up_proj.weight", 1),    # up_proj 映射到 fc1 的后半部分
-            (".layernorm_mlp.fc2_weight", ".down_proj.weight", 0),  # down_proj 映射到 fc2
-            # LayerNorm参数映射
+            (".qkv_proj", ".q_proj.weight", "q"),  # map q_proj to the first part of qkv_proj
+            (".qkv_proj", ".k_proj.weight", "k"),  # map k_proj to the second part of qkv_proj  
+            (".qkv_proj", ".v_proj.weight", "v"),  # map v_proj to the third part of qkv_proj
+            # map MLP layer parameters
+            (".layernorm_mlp.fc1_weight", ".gate_proj.weight", 0),  # map gate_proj to the first part of fc1
+            (".layernorm_mlp.fc1_weight", ".up_proj.weight", 1),    # map up_proj to the second part of fc1
+            (".layernorm_mlp.fc2_weight", ".down_proj.weight", 0),  # map down_proj to the first part of fc2
+            # map LayerNorm parameters
             (".layernorm_mlp.layer_norm_weight", ".post_attention_layernorm.weight", 0),
         ]
         
-        # 获取模型所有参数的字典
+        # get the dictionary of all parameters of the model
         params_dict = dict(self.named_parameters())
 
-        # 遍历权重进行加载
+        # traverse weights to load
         for name, loaded_weight in weights:
-            # 跳过不需要的权重
+            # skip unnecessary weights
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -380,23 +381,23 @@ class TELlamaForCausalLM(nn.Module):
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             
-            # 如果权重为空则跳过
+            # if the weight is empty, skip
             if loaded_weight.numel() == 0:
                 print(f"Warning: loaded_weight for {name} is empty.")
                 continue
 
-            # 遍历映射关系处理堆叠参数
+            # traverse the mapping relationship to handle stacked parameters
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue 
                 mapped_name = name.replace(weight_name, param_name)
                 
-                # QKV投影层的特殊处理
+                # special processing for QKV projection layer
                 if param_name == ".qkv_proj":
                     if mapped_name not in params_dict:
                         params_dict[mapped_name] = torch.zeros_like(loaded_weight)
 
-                    # 将loaded_weight分成q,k,v三部分
+                    # split loaded_weight into q,k,v three parts
                     q_weight, k_weight, v_weight = torch.chunk(loaded_weight, 3, dim=0)
 
                     if shard_id == "q":  # q_proj 
@@ -407,33 +408,33 @@ class TELlamaForCausalLM(nn.Module):
                         params_dict[mapped_name][2 * q_weight.shape[0]:] = v_weight
                     break
 
-                # LayerNorm权重的处理
+                # process LayerNorm weights
                 if param_name == ".layernorm_mlp.layer_norm_weight":
                     if mapped_name in params_dict:
                         params_dict[mapped_name].data.copy_(loaded_weight)
                     break
 
-                # MLP的gate_proj和up_proj合并处理
+                # combine gate_proj and up_proj of MLP
                 if param_name == ".layernorm_mlp.fc1_weight":
                     if mapped_name not in params_dict:
                         params_dict[mapped_name] = torch.zeros_like(loaded_weight)
                     
-                    # 将loaded_weight分成gate_proj和up_proj两部分
+                    # split loaded_weight into gate_proj and up_proj two parts
                     gate_weight, up_weight = torch.split(loaded_weight, loaded_weight.shape[0] // 2, dim=0)
 
-                    if shard_id == 0:  # gate_proj部分
+                    if shard_id == 0:  # gate_proj
                         params_dict[mapped_name][: gate_weight.shape[0]] = gate_weight
-                    elif shard_id == 1:  # up_proj部分
+                    elif shard_id == 1:  # up_proj
                         params_dict[mapped_name][gate_weight.shape[0]:] = up_weight
                     break
 
-                # down_proj权重的处理
+                # process down_proj weights
                 elif param_name == ".layernorm_mlp.fc2_weight":
                     if mapped_name in params_dict:
                         params_dict[mapped_name].data.copy_(loaded_weight)
                     break
 
-                # 跳过GPTQ模型的额外bias
+                # skip extra bias of GPTQ model
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -441,7 +442,7 @@ class TELlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break  
             else:
-                # 处理其他普通参数
+                # process other normal parameters
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name.endswith(".kv_scale") and name not in params_dict:
@@ -450,14 +451,15 @@ class TELlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-        # 处理词嵌入层的权重绑定
+        # process weight binding of embedding layer
         if hasattr(self.config, "tie_word_embeddings") and self.config.tie_word_embeddings:
             param = self.lm_head.weight
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, self.model.embed_tokens.weight)
 
-        # 应用torchao配置
-        apply_torchao_config_(self, params_dict, set(["proj.weight"]))
+        # apply torchao configuration
+        # apply_torchao_config_(self, params_dict, set(["proj.weight"])) #zhuohaol: this is the old version of apply_torchao_config_ in torchao_utils.py
+        apply_torchao_config_to_model(self, params_dict, set(["proj.weight"]))
 
 
 class TEPhi3ForCausalLM(TELlamaForCausalLM):
