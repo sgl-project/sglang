@@ -26,12 +26,16 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         if _DEBUG_SLEEP:
             time.sleep(3)
 
+        t = time.time()
         engine.release_gpu_occupation()
+        print('release_gpu_occupation', time.time() - t)
 
         if _DEBUG_SLEEP:
             time.sleep(3)
 
+        t = time.time()
         engine.resume_gpu_occupation()
+        print('resume_gpu_occupation', time.time() - t)
 
         outputs = engine.generate(prompt, sampling_params)["text"]
         self.assertEqual(outputs, expect_output)
