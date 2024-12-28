@@ -53,13 +53,16 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
+    ReleaseGPUOccupationReqInput,
+    ReleaseGPUOccupationReqOutput,
+    ResumeGPUOccupationReqInput,
+    ResumeGPUOccupationReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
-    ReleaseGPUOccupationReqOutput, ResumeGPUOccupationReqOutput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -183,8 +186,12 @@ class TokenizerManager:
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.release_gpu_occupation_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.resume_gpu_occupation_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
+        self.release_gpu_occupation_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.resume_gpu_occupation_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         # Metrics
         if self.enable_metrics:
@@ -530,13 +537,17 @@ class TokenizerManager:
             return all_parameters
 
     async def release_gpu_occupation(
-        self, obj: ReleaseGPUOccupationReqInput, request: Optional[fastapi.Request] = None
+        self,
+        obj: ReleaseGPUOccupationReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.release_gpu_occupation_communicator(obj)
 
     async def resume_gpu_occupation(
-        self, obj: ResumeGPUOccupationReqInput, request: Optional[fastapi.Request] = None
+        self,
+        obj: ResumeGPUOccupationReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.resume_gpu_occupation_communicator(obj)

@@ -55,10 +55,10 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     ReleaseGPUOccupationReqInput,
     ResumeGPUOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager

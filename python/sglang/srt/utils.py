@@ -51,13 +51,13 @@ from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
+from torch_memory_saver import TorchMemorySaver
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
     default_dump_dir,
     default_override_dir,
 )
-from torch_memory_saver import TorchMemorySaver
 
 logger = logging.getLogger(__name__)
 
@@ -1274,5 +1274,6 @@ def dataclass_to_string_truncated(data, max_length=2048):
         )
     else:
         return str(data)
+
 
 primary_memory_saver = TorchMemorySaver()
