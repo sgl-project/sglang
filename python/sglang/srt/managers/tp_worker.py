@@ -23,7 +23,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqInput, UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -185,6 +185,14 @@ class TpModelWorker:
     ):
         success, message = self.model_runner.update_weights_from_distributed(
             recv_req.name, recv_req.dtype, recv_req.shape
+        )
+        return success, message
+
+    def update_weights_from_tensor(
+        self, recv_req: UpdateWeightsFromTensorReqInput
+    ):
+        success, message = self.model_runner.update_weights_from_tensor(
+            recv_req.name, recv_req.tensor
         )
         return success, message
 

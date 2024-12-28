@@ -148,7 +148,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -429,6 +429,9 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
+    def update_weights_from_tensor(self, name, tensor):
+        TODO
+
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
@@ -615,7 +618,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
