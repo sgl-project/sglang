@@ -23,8 +23,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         hf_model_new = AutoModelForCausalLM.from_pretrained(model_new, torch_dtype="bfloat16")
 
         outputs = engine.generate(prompt, sampling_params)["text"]
-        # self.assertEqual(outputs, " to spend it outdoors. I decided to")
-        self.assertEqual(outputs, " like like like like like like like like")
+        self.assertEqual(outputs, " to spend it outdoors. I decided to")
 
         if _DEBUG_EXTRA:
             time.sleep(3)
@@ -47,8 +46,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
             engine.update_weights_from_tensor(name, tensor)
 
         outputs = engine.generate(prompt, sampling_params)["text"]
-        # self.assertEqual(outputs, " it. I like it even more when")
-        self.assertEqual(outputs, " like like like like like like like like")
+        self.assertEqual(outputs, " it. I like it even more when")
 
         if _DEBUG_EXTRA:
             time.sleep(5)
