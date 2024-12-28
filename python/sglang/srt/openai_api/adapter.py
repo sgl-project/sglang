@@ -71,7 +71,7 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.utils import parse_tool_response
+from sglang.srt.utils import TOOLS_TAG_LIST, parse_tool_response
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -1070,12 +1070,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
             tool_choice = request.tool_choice
             tools = request.tools
 
-        if tool_choice != "none" and (
-            "<|plugin|>" in text
-            or "<function=" in text
-            or "<tool_call>" in text
-            or "<|python_tag|>" in text
-        ):
+        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:
@@ -1102,7 +1097,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": ret_item["text"] if (tool_calls is None) else None,
+                    "content": ret_item["text"] if tool_calls is None else None,
                     "tool_calls": tool_calls,
                 },
                 "logprobs": choice_logprobs,
@@ -1118,7 +1113,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=ret_item["text"] if (tool_calls is None) else None,
+                    content=ret_item["text"] if tool_calls is None else None,
                     tool_calls=tool_calls,
                 ),
                 logprobs=choice_logprobs,

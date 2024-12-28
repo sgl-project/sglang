@@ -1275,6 +1275,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return str(data)
 
 
+TOOLS_TAG_LIST = ["<|plugin|>", "<function=", "<tool_call>", "<|python_tag|>"]
+
+
 def parse_tool_response(text, tools, **kwargs):
     """Parse model response containing tool information.
 
