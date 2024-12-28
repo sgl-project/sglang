@@ -547,7 +547,10 @@ class Fp8MoEMethod:
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import padding_size # Avoid circular import
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            padding_size,  # Avoid circular import
+        )
+
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             return
