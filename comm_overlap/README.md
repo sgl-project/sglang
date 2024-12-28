@@ -18,7 +18,7 @@ Key changes:
 - In `sglang.model_executor.model_runner.py` and `server_args.py`, we add corresponding arguments to enable TE when launching the engine. 
 - In `comm_overlap.profile`, we provide some scripts to profile performance with torch/te
 - In `comm_overlap.benchmark`, we provide the benchmark instructions for the latency of the TE model. 
-- In `comm_overlap.TE1, it is an example of using TE features (comm_overlap and fp8) to do inference.
+- In `comm_overlap.TE`, it is an example of using TE features (comm_overlap and fp8) to do inference.
 
 #### Benchmark
 
