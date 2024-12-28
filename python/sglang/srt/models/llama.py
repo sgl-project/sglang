@@ -20,6 +20,11 @@ import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
+from torch import nn
+from transformers import LlamaConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.rotary_embedding import get_rope
+
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -39,10 +44,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
-from torch import nn
-from transformers import LlamaConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.rotary_embedding import get_rope
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ class LlamaAttention(nn.Module):
         )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -280,20 +281,20 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        # NOTE TEMP HACK to make it shorter
-        # for i in range(len(self.layers)):
-        #     layer = self.layers[i]
-        #     hidden_states, residual = layer(
-        #         positions,
-        #         hidden_states,
-        #         forward_batch,
-        #         residual,
-        #     )
+        for i in range(len(self.layers)):
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class LlamaForCausalLM(nn.Module):
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
