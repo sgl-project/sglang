@@ -282,13 +282,14 @@ class LlamaModel(nn.Module):
         residual = None
         # NOTE TEMP HACK to make it shorter
         # for i in range(len(self.layers)):
-        #     layer = self.layers[i]
-        #     hidden_states, residual = layer(
-        #         positions,
-        #         hidden_states,
-        #         forward_batch,
-        #         residual,
-        #     )
+        for i in range(1):
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
