@@ -1471,7 +1471,6 @@ class Scheduler:
 
     def release_gpu_occupation(self):
         from sglang.srt.mem_cache.memory_pool import memory_saver
-        assert self.server_args.disable_cuda_graph, 'release_gpu_occupation does not support CUDA graph'
         self.flush_cache()
         memory_saver.pause()
         # self.token_to_kv_pool.clear_buffers()
