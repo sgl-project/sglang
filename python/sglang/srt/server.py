@@ -57,6 +57,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    ReleaseGPUOccupationReqInput,
+    ResumeGPUOccupationReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -248,6 +250,24 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
             return _create_error_response("Get parameter by name failed")
         else:
             return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/release_gpu_occupation", methods=["GET", "POST"])
+async def release_gpu_occupation(obj: ReleaseGPUOccupationReqInput, request: Request):
+    """Release GPU occupation temporarily"""
+    try:
+        await tokenizer_manager.release_gpu_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/resume_gpu_occupation", methods=["GET", "POST"])
+async def resume_gpu_occupation(obj: ResumeGPUOccupationReqInput, request: Request):
+    """Resume GPU occupation"""
+    try:
+        await tokenizer_manager.resume_gpu_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -862,6 +882,18 @@ class Engine:
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
+
+    def release_gpu_occupation(self):
+        """Release GPU occupation temporarily"""
+        obj = ReleaseGPUOccupationReqInput()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(tokenizer_manager.release_gpu_occupation(obj, None))
+
+    def resume_gpu_occupation(self):
+        """Resume GPU occupation"""
+        obj = ResumeGPUOccupationReqInput()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(tokenizer_manager.resume_gpu_occupation(obj, None))
 
 
 class Runtime:

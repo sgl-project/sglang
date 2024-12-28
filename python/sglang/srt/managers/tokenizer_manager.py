@@ -58,7 +58,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromDistributedReqOutput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
+    ReleaseGPUOccupationReqOutput, ResumeGPUOccupationReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -182,6 +183,8 @@ class TokenizerManager:
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.release_gpu_occupation_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
+        self.resume_gpu_occupation_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
 
         # Metrics
         if self.enable_metrics:
@@ -526,6 +529,18 @@ class TokenizerManager:
         else:
             return all_parameters
 
+    async def release_gpu_occupation(
+        self, obj: ReleaseGPUOccupationReqInput, request: Optional[fastapi.Request] = None
+    ):
+        self.auto_create_handle_loop()
+        await self.release_gpu_occupation_communicator(obj)
+
+    async def resume_gpu_occupation(
+        self, obj: ResumeGPUOccupationReqInput, request: Optional[fastapi.Request] = None
+    ):
+        self.auto_create_handle_loop()
+        await self.resume_gpu_occupation_communicator(obj)
+
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -601,6 +616,8 @@ class TokenizerManager:
                 UpdateWeightsFromDistributedReqOutput,
                 GetWeightsByNameReqOutput,
                 InitWeightsUpdateGroupReqOutput,
+                ReleaseGPUOccupationReqOutput,
+                ResumeGPUOccupationReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
@@ -710,6 +727,10 @@ class TokenizerManager:
                 self.update_weights_from_distributed_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, ReleaseGPUOccupationReqOutput):
+                self.release_gpu_occupation_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, ResumeGPUOccupationReqOutput):
+                self.resume_gpu_occupation_communicator.handle_recv(recv_obj)
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
 
