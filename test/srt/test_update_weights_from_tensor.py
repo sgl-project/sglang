@@ -15,12 +15,12 @@ class TestReleaseGPUOccupation(unittest.TestCase):
             actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
             assert torch.allclose(actual_values, torch.tensor(expect_values)), f'{actual_values=}'
 
-        _check_param([1, 2, 3, 4, 5])
+        _check_param([0.0571, -0.0114, 0.0444, 0.0215, -0.0149])
 
-        new_tensor = torch.full((100,), 42)  # TODO
+        new_tensor = torch.full((100,), 1.5)  # TODO
         engine.update_weights_from_tensor(param_name, new_tensor)
 
-        _check_param(['TODO'])
+        _check_param([1.5] * 5)
 
         engine.shutdown()
 
