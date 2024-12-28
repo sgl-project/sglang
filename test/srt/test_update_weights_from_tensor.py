@@ -1,23 +1,29 @@
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
-)
+import sglang as sgl
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
-class TestUpdateWeightsFromTensor(unittest.TestCase):
-    def test_update_weights(self):
-        process = popen_launch_server(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_URL_FOR_TEST, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+class TestReleaseGPUOccupation(unittest.TestCase):
+    def test_release_and_resume_occupation(self):
+        prompt = "Today is a sunny day and I like"
+        expect_output = " to spend it outdoors. I decided to"
+        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
+        engine = sgl.Engine(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            random_seed=42,
         )
-       
-        TODO
 
-        kill_process_tree(process.pid)
+        outputs = engine.generate(prompt, sampling_params)["text"]
+        self.assertEqual(outputs, expect_output)
+
+        engine.update_weights_from_tensor(TODO, TODO)
+
+        outputs = engine.generate(prompt, sampling_params)["text"]
+        self.assertEqual(outputs, expect_output)
+
+        engine.shutdown()
 
 
 if __name__ == "__main__":
