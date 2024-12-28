@@ -42,6 +42,9 @@ from vllm.multimodal.inputs import NestedTensors, PlaceholderRange
 from vllm.multimodal.utils import cached_get_tokenizer
 from vllm.sequence import IntermediateTensors
 from vllm.utils import is_list_of
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 IMG_START = '<img>'
 IMG_END = '</img>'
@@ -521,6 +524,8 @@ class InternVLChatModel(nn.Module):
 
         self.img_context_token_id = None
         self.visual_token_mask = None
+        self.logits_processor = LogitsProcessor(config)
+        self.lm_head = self.language_model.output
         # self.make_empty_intermediate_tensors = (
         #     self.language_model.make_empty_intermediate_tensors)
 
@@ -716,61 +721,73 @@ class InternVLChatModel(nn.Module):
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[NestedTensors] = None,
     ) -> torch.Tensor:
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
+        input_embeds = self.language_model.model.tok_embeddings(input_ids)
         if multimodal_embeddings is not None:
             assert self.img_context_token_id is not None
             self._set_visual_token_mask(input_ids)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings,
+            input_embeds = merge_multimodal_embeddings(
+                input_ids, input_embeds, multimodal_embeddings,
                 self.img_context_token_id)
-        return inputs_embeds
+        return input_embeds
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        # kv_caches: List[torch.Tensor],
+        # intermediate_tensors: Optional[IntermediateTensors] = None,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> Union[SamplerOutput, IntermediateTensors]:
 
-        if intermediate_tensors is not None:
-            input_ids = None
-            inputs_embeds = None
+        # if intermediate_tensors is not None:
+        #     input_ids = None
+        #     inputs_embeds = None
 
         # NOTE: In v1, inputs_embeds is always generated at model runner, this
         # condition is for v0 compatibility.
-        elif inputs_embeds is None:
+        # elif inputs_embeds is None:
+        #     vision_embeddings = self.get_multimodal_embeddings(**kwargs)
+        #     inputs_embeds = self.get_input_embeddings(input_ids,
+        #                                               vision_embeddings)
+        #     input_ids = None
+        
+        if forward_batch.forward_mode.is_extend():
             vision_embeddings = self.get_multimodal_embeddings(**kwargs)
-            inputs_embeds = self.get_input_embeddings(input_ids,
-                                                      vision_embeddings)
+            input_embeds = self.get_input_embeddings(input_ids,
+                                                     vision_embeddings)
             input_ids = None
 
-        forward_kwargs = {
-            "input_ids": input_ids,
-            "positions": positions,
-            "kv_caches": kv_caches,
-            "intermediate_tensors": intermediate_tensors,
-            "inputs_embeds": inputs_embeds,
-        }
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "positions": positions,
+                # "kv_caches": kv_caches,
+                # "intermediate_tensors": intermediate_tensors,
+                "forward_batch": forward_batch,
+                "input_embeds": input_embeds,
+            }
 
-        # Only required if the model is mono-architecture
-        if self.visual_token_mask is not None:
-            forward_kwargs.update(
-                {"visual_token_mask": self.visual_token_mask})
-            self.visual_token_mask = None
+            # Only required if the model is mono-architecture
+            if self.visual_token_mask is not None:
+                forward_kwargs.update(
+                    {"visual_token_mask": self.visual_token_mask})
+                self.visual_token_mask = None
 
-        hidden_states = self.language_model.model(**forward_kwargs)
-        return hidden_states
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        return self.language_model.compute_logits(hidden_states,
-                                                  sampling_metadata)
+            hidden_states = self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+            )
+            return hidden_states
+        if forward_batch.forward_mode.is_decode():
+            hidden_states = self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+            return hidden_states
 
     def sample(
         self,
@@ -788,26 +805,25 @@ class InternVLChatModel(nn.Module):
             else:
                 num_hidden_layers = vision_feature_layer + 1
 
-            self.vision_tower = InternVisionModel(
+            self.vision_model = InternVisionModel(
                 self.config.vision_config,
                 quant_config=self.quant_config,
                 num_hidden_layers_override=num_hidden_layers,
                 # prefix=prefix,
             ).cuda()
         else:
-            self.vision_tower = InternVisionPatchModel(config.vision_config).cuda()
-        vision_path = self.config.mm_vision_tower
-        self.vision_tower.eval()
+            self.vision_model = InternVisionPatchModel(config.vision_config).cuda()
+        self.vision_model.eval()
 
         # load mm_projector
         projector_weights = {
             # "model.mm_projector.0": "multi_modal_projector.linear_1",
             # "model.mm_projector.2": "multi_modal_projector.linear_2",
-            "vision_model": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            # "vision_model": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "projector" in name or "vision_tower" in name:
+            if "mlp" in name or "vision_model" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
@@ -815,6 +831,7 @@ class InternVLChatModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:
+                name = name.replace("language_model.", "")
                 self.language_model.load_weights([(name, loaded_weight)])
 
 EntryClass = InternVLChatModel
