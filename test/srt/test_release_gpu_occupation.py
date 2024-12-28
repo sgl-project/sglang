@@ -16,7 +16,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
-        engine = sgl.Engine(model_name=model_name, random_seed=42)
+        engine = sgl.Engine(model_path=model_name, random_seed=42)
         hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="bfloat16")
 
         outputs = engine.generate(prompt, sampling_params)["text"]
