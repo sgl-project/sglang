@@ -18,8 +18,9 @@ If you see errors when launching the server, please check if it has finished dow
 ### Using Docker (Recommended)
 ```bash
 docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --enable-dp-attention --tp 8 --trust-remote-code --port 30000
+    python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
 ```
+For large QPS scenarios, you can add the `--enable-dp-attention` argument to improve throughput.
 
 ### Using pip
 ```bash
@@ -27,7 +28,7 @@ docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/roo
 pip install "sglang[all]==0.4.1.post1" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --enable-dp-attention --tp 8 --trust-remote-code
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 ```
 
 ### Example with OpenAI API
