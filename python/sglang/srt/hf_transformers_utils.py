@@ -27,6 +27,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
+    ProcessorMixin,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -201,13 +202,25 @@ def get_processor(
     tokenizer_revision: Optional[str] = None,
     **kwargs,
 ):
-    processor = AutoProcessor.from_pretrained(
-        tokenizer_name,
-        *args,
-        trust_remote_code=trust_remote_code,
-        tokenizer_revision=tokenizer_revision,
-        **kwargs,
-    )
+    if "InternVL" in tokenizer_name:
+        # tokenizer = get_tokenizer(tokenizer_name, *args, tokenizer_mode, trust_remote_code, tokenizer_revision, **kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            tokenizer_revision=tokenizer_revision,
+            clean_up_tokenization_spaces=False,
+            **kwargs,
+        )
+        processor = DummyProcessor(tokenizer=tokenizer)
+    else:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            tokenizer_revision=tokenizer_revision,
+            **kwargs,
+        )
 
     attach_additional_stop_token_ids(processor.tokenizer)
     return processor
@@ -234,3 +247,21 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+
+class DummyProcessor(ProcessorMixin):
+    attributes = ["tokenizer", "image_processor"]
+    image_processor_class = None
+    tokenizer_class = "PreTrainedTokenizerFast"
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.image_processor = None
+
+    def save_pretrained(self, save_directory):
+        self.tokenizer.save_pretrained(save_directory)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        return cls(tokenizer=tokenizer)

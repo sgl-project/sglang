@@ -343,6 +343,118 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         }
 
 
+class InternVL2ImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
+    
+    async def process_images_async(self, *args, **kwargs):
+        return None
+    
+    # @staticmethod
+    # def _process_single_image_task(images, input_text):
+    #     return global_processor(images, input_text, return_tensors="pt")
+    
+    # def input_processor(
+    #     self,
+    #     hf_config,
+    #     inputs,
+    #     *,
+    #     max_dynamic_patch: Optional[int] = None,
+    #     dynamic_image_size: Optional[bool] = None,
+    # ) -> DecoderOnlyInputs:
+    #     num_patches = get_internvl_num_patches(hf_config)
+    #     num_blocks_calculator = calculate_num_blocks_wrapper(
+    #         hf_config, max_dynamic_patch, dynamic_image_size)
+    #     if isinstance(inputs, Image.Image):
+    #         width, height = image_data.size
+    #         num_blocks, _, _ = num_blocks_calculator(width, height)
+    #         image_feature_sizes = [num_blocks * num_patches]
+    #     elif is_list_of(image_data, Image.Image):
+    #         image_feature_sizes = []
+    #         for image in image_data:
+    #             width, height = image.size
+    #             num_blocks, _, _ = num_blocks_calculator(width, height)
+    #             image_feature_sizes.append(num_blocks * num_patches)
+    #     elif isinstance(image_data, torch.Tensor):
+    #         num_images, image_feature_size, hidden_size = image_data.shape
+    #         image_feature_sizes = [image_feature_size]
+    #     else:
+    #         raise TypeError(f"Invalid image type: {type(image_data)}")
+
+    #     tokenizer = cached_get_tokenizer(
+    #         model_config.tokenizer,
+    #         trust_remote_code=model_config.trust_remote_code)
+
+    #     prompt = inputs.get("prompt")
+    #     prompt_token_ids = inputs["prompt_token_ids"]
+    #     if prompt is None:
+    #         prompt = tokenizer.decode(prompt_token_ids)
+
+    #     new_prompt = self._expand_image_prompt(prompt, image_feature_sizes,
+    #                                            num_patches)
+    #     new_prompt_token_ids = tokenizer.encode(new_prompt)
+    #     img_context_token_id = tokenizer.encode(self.img_context_token,
+    #                                             add_special_tokens=False)
+    #     assert len(img_context_token_id) == 1, \
+    #         (f"Invalid image token '{self.img_context_token}': A valid image "
+    #         f"token encodes to a single token ID, got {img_context_token_id}.")
+    #     img_context_token_id = img_context_token_id[0]
+
+    #     # Get precise tracking of placeholder positions
+    #     token_idx = image_idx = 0
+    #     placeholder_ranges = []
+    #     while token_idx < len(new_prompt_token_ids):
+    #         if new_prompt_token_ids[token_idx] == img_context_token_id:
+    #             curr_image_featue_size = image_feature_sizes[image_idx]
+    #             placeholder_ranges.append(
+    #                 PlaceholderRange(offset=token_idx,
+    #                                  length=curr_image_featue_size))
+    #             image_idx += 1
+    #             token_idx += curr_image_featue_size
+    #         else:
+    #             token_idx += 1
+
+    #     return token_inputs(
+    #         prompt=prompt,
+    #         prompt_token_ids=new_prompt_token_ids,
+    #         multi_modal_data=multi_modal_data,
+    #         multi_modal_placeholders={"image": placeholder_ranges})
+
+    # def input_mapper(
+    #     self,
+    #     ctx: InputContext,
+    #     data: object,
+    #     *,
+    #     max_dynamic_patch: Optional[int] = None,
+    #     dynamic_image_size: Optional[bool] = None,
+    # ):
+    #     hf_config = ctx.get_hf_config()
+
+    #     image_pixel_values_mapper = image_to_pixel_values_wrapper(
+    #         hf_config, max_dynamic_patch, dynamic_image_size)
+    #     if isinstance(data, Image.Image):
+    #         data = image_pixel_values_mapper(data)
+    #         # Add an N dimension for number of images per prompt (currently 1).
+    #         data = data.unsqueeze(0)
+    #     elif is_list_of(data, Image.Image):
+    #         # we can't stack here because images may have different num_patches
+    #         data = [image_pixel_values_mapper(img) for img in data]
+    #     else:
+    #         return MultiModalKwargs({"image_embeds": data})
+    #     model_config = ctx.model_config
+    #     tokenizer = cached_get_tokenizer(
+    #         model_config.tokenizer,
+    #         trust_remote_code=model_config.trust_remote_code)
+    #     image_token_id = tokenizer.encode(self.img_context_token,
+    #                                       add_special_tokens=False,
+    #                                       return_tensors="pt")[0]
+
+    #     return MultiModalKwargs({
+    #         "pixel_values": data,
+    #         "image_token_id": image_token_id
+    #     })
+
+
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor
 ) -> BaseImageProcessor:
@@ -350,6 +462,8 @@ def get_image_processor(
         return MllamaImageProcessor(hf_config, server_args, processor)
     elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
         return Qwen2VLImageProcessor(hf_config, server_args, processor.image_processor)
+    elif "InternVLChatModel" in hf_config.architectures:
+        return InternVL2ImageProcessor(hf_config, server_args, processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
 

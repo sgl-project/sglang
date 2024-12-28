@@ -16,6 +16,7 @@
 # Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_internvl_chat.py
 
 import pdb
+import logging
 import re
 from functools import cached_property, partial
 from typing import (Iterable, List, Literal, Mapping, Optional, Set, Tuple,
@@ -44,6 +45,9 @@ from vllm.utils import is_list_of
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from vllm.logger import init_logger
+
+logger = logging.getLogger(__name__)
 
 IMG_START = '<img>'
 IMG_END = '</img>'
@@ -231,18 +235,19 @@ def get_internvl_num_patches(hf_config: PretrainedConfig):
     downsample_ratio = hf_config.downsample_ratio
     image_size = vision_config.image_size
     patch_size = vision_config.patch_size
-    return int(
-        get_clip_num_patches(image_size=image_size, patch_size=patch_size) *
-        (downsample_ratio**2))
+
+    assert image_size % patch_size == 0
+    grid_length = image_size // patch_size
+    num_patches = grid_length * grid_length
+    
+    return int(num_patches * (downsample_ratio ** 2))
 
 
 def get_max_internvl_image_tokens(
-    ctx: InputContext,
-    *,
+    hf_config: PretrainedConfig,
     max_dynamic_patch: Optional[int] = None,
     dynamic_image_size: Optional[bool] = None,
 ):
-    hf_config = ctx.get_hf_config()
     if dynamic_image_size is None:
         dynamic_image_size = hf_config.dynamic_image_size
 
@@ -258,12 +263,10 @@ def get_max_internvl_image_tokens(
 
 
 def get_max_internvl_image_size(
-    ctx: InputContext,
-    *,
+    hf_config: PretrainedConfig,
     max_dynamic_patch: Optional[int] = None,
     dynamic_image_size: Optional[bool] = None,
 ):
-    hf_config = ctx.get_hf_config()
     image_size = hf_config.vision_config.image_size
     if dynamic_image_size is None:
         dynamic_image_size = hf_config.dynamic_image_size
@@ -546,6 +549,8 @@ class InternVLChatModel(nn.Module):
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1,
                                         vit_embeds.shape[-1])
         vit_embeds = self.mlp1(vit_embeds)
+        logger.info("vit_embeds")
+        logger.info(vit_embeds)
         return vit_embeds
 
     def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
@@ -638,6 +643,43 @@ class InternVLChatModel(nn.Module):
         image_embeds = image_embeds.split(image_feature_sizes)
         return image_embeds
 
+    def merge_vision_embeddings(input_ids: torch.Tensor,
+                            inputs_embeds: torch.Tensor,
+                            vision_embeddings,
+                            image_token_id: int) -> torch.Tensor:
+        """
+        Merge `vision_embeddings` into `inputs_embeds` by overwriting the positions
+        in `inputs_embeds` corresponding to placeholder image tokens in `input_ids`.
+
+        Note:
+            This updates `inputs_embeds` in place.
+        """
+        mask = (input_ids == image_token_id)
+        num_expected_tokens = mask.sum()
+
+        if isinstance(vision_embeddings, torch.Tensor):
+            batch_size, batch_tokens, *_, embed_dim = vision_embeddings.shape
+            total_tokens = batch_size * batch_tokens
+            if num_expected_tokens != total_tokens:
+                expr = f"{batch_size} x {batch_tokens}"
+                raise ValueError(
+                    f"Attempted to assign {expr} = {total_tokens} "
+                    f"image tokens to {num_expected_tokens} placeholders")
+
+            inputs_embeds[mask] = vision_embeddings.view(total_tokens, embed_dim)
+        else:
+            size_per_batch = [t.shape[0] for t in vision_embeddings]
+            total_tokens = sum(size_per_batch)
+            if num_expected_tokens != total_tokens:
+                expr = ' + '.join(map(str, size_per_batch))
+                raise ValueError(
+                    f"Attempted to assign {expr} = {total_tokens} "
+                    f"image tokens to {num_expected_tokens} placeholders")
+
+            inputs_embeds[mask] = torch.cat(vision_embeddings)
+
+        return inputs_embeds
+
     def _set_visual_token_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.is_mono:
             self.visual_token_mask = (
@@ -657,6 +699,7 @@ class InternVLChatModel(nn.Module):
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[NestedTensors] = None,
     ) -> torch.Tensor:
+        # TODO: change below line to generalize to many different lms (qwen and llama)
         input_embeds = self.language_model.model.tok_embeddings(input_ids)
         if multimodal_embeddings is not None:
             assert self.img_context_token_id is not None
@@ -673,21 +716,24 @@ class InternVLChatModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
-    ) -> Union[SamplerOutput, IntermediateTensors]:
+    ):
+        image_inputs = None
+        if forward_batch.image_inputs is not None:
+            image_inputs = [
+                img for img in forward_batch.image_inputs if img is not None
+            ]
 
-        # NOTE: In v1, inputs_embeds is always generated at model runner, this
-        # condition is for v0 compatibility.
-        # elif inputs_embeds is None:
-        #     vision_embeddings = self.get_multimodal_embeddings(**kwargs)
-        #     inputs_embeds = self.get_input_embeddings(input_ids,
-        #                                               vision_embeddings)
-        #     input_ids = None
-        
         if forward_batch.forward_mode.is_extend():
+            # Clamp input ids. This is because the input_ids for the image tokens are
+            # filled with the hash values of the image for the prefix matching in the radix attention.
+            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            # input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
+            # input_embeds = 
+            # inputs_embeds = self.model.embed_tokens(input_ids)
             vision_embeddings = self.get_multimodal_embeddings(**kwargs)
             input_embeds = self.get_input_embeddings(input_ids,
                                                      vision_embeddings)
-            input_ids = None
+            # input_ids = None
 
             forward_kwargs = {
                 "input_ids": input_ids,
@@ -709,7 +755,7 @@ class InternVLChatModel(nn.Module):
                 input_embeds=input_embeds,
             )
             return hidden_states
-        if forward_batch.forward_mode.is_decode():
+        elif forward_batch.forward_mode.is_decode():
             hidden_states = self.language_model(
                 input_ids=input_ids,
                 positions=positions,
@@ -749,9 +795,11 @@ class InternVLChatModel(nn.Module):
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
                 param = params_dict[name]
+                print(name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:
+                print(name)
                 name = name.replace("language_model.", "")
                 self.language_model.load_weights([(name, loaded_weight)])
 
