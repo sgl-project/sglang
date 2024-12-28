@@ -14,7 +14,6 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             random_seed=42,
-            disable_cuda_graph=True,
         )
 
         outputs = engine.generate(prompt, sampling_params)["text"]
