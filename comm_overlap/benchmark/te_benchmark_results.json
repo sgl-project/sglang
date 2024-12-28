@@ -1,7 +1,0 @@
-{
-  "enable_te": true,
-  "tp_size": 4,
-  "results": [
-    "Failed to fetch model from http://0.0.0.0:30000/v1/models. Error: HTTPConnectionPool(host='0.0.0.0', port=30000): Max retries exceeded with url: /v1/models (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x7802e7169f90>: Failed to establish a new connection: [Errno 111] Connection refused'))\nPlease specify the correct host and port using `--host` and `--port`.\n"
-  ]
-}
