@@ -59,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -177,6 +179,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.update_weights_from_distributed_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_weights_from_tensor_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_weights_by_name_communicator = _Communicator(
@@ -515,6 +520,22 @@ class TokenizerManager:
             result = (await self.update_weights_from_distributed_communicator(obj))[0]
             return result.success, result.message
 
+    async def update_weights_from_tensor(
+        self,
+        obj: UpdateWeightsFromTensorReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be for update weights from distributed"
+
+        # This means that weight sync
+        # cannot run while requests are in progress.
+        async with self.model_update_lock.writer_lock:
+            result = (await self.update_weights_from_tensor_communicator(obj))[0]
+            return result.success, result.message
+
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -708,6 +729,11 @@ class TokenizerManager:
                     self.server_args.dp_size == 1
                 ), "dp_size must be 1 for update weights from distributed"
                 self.update_weights_from_distributed_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, UpdateWeightsFromTensorReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for update weights from distributed"
+                self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
             else:

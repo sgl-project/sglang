@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 
+import torch
+
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -403,6 +405,18 @@ class UpdateWeightsFromDistributedReqInput:
 
 @dataclass
 class UpdateWeightsFromDistributedReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class UpdateWeightsFromTensorReqInput:
+    name: str
+    tensor: torch.Tensor
+
+
+@dataclass
+class UpdateWeightsFromTensorReqOutput:
     success: bool
     message: str
 
