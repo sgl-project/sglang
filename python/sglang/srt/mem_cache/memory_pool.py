@@ -26,7 +26,7 @@ from typing import List, Tuple, Union
 
 import torch
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, primary_memory_saver
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +177,6 @@ class BaseTokenToKVPool:
         raise NotImplementedError()
 
 
-from torch_memory_saver import TorchMemorySaver
-
-# TODO move
-memory_saver = TorchMemorySaver()
-
-
 class MHATokenToKVPool(BaseTokenToKVPool):
 
     def __init__(
@@ -201,7 +195,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.create_buffers()
 
     def create_buffers(self):
-        with memory_saver.region():
+        with primary_memory_saver.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [

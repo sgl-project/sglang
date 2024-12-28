@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
+    primary_memory_saver,
 )
 from sglang.utils import get_exception_traceback
 
@@ -1470,16 +1471,12 @@ class Scheduler:
         return parameter
 
     def release_gpu_occupation(self):
-        from sglang.srt.mem_cache.memory_pool import memory_saver
         self.flush_cache()
-        memory_saver.pause()
-        # self.token_to_kv_pool.clear_buffers()
+        primary_memory_saver.pause()
         torch.cuda.empty_cache()
 
     def resume_gpu_occupation(self):
-        from sglang.srt.mem_cache.memory_pool import memory_saver
-        memory_saver.resume()
-        # self.token_to_kv_pool.create_buffers()
+        primary_memory_saver.resume()
 
     def start_profile(self) -> None:
         if self.profiler is None:
