@@ -15,7 +15,6 @@ import argparse
 import asyncio
 import json
 import os
-import pickle
 import random
 import resource
 import sys
@@ -25,7 +24,6 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
@@ -42,7 +40,7 @@ from transformers import (
 from data_processing import get_dataset, SampleOutput
 from utils import MsgContent
 
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
 global args
 
@@ -87,15 +85,20 @@ async def async_request_trt_llm(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
+    # TODO: Support multiturn chat
+    assert(len(request_func_input.prompts) == 1)
+
+    prompt, prompt_len, output_len = request_func_input.prompts[0]
+
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "accumulate_tokens": True,
-            "text_input": request_func_input.prompt,
+            "text_input": prompt,
             "temperature": 0.000001,
             "top_p": 1.0,
-            "max_tokens": request_func_input.output_len,
+            "max_tokens": output_len,
             "stream": True,
-            "min_length": request_func_input.output_len,
+            "min_length": output_len,
             "end_id": 1048576,
             **request_func_input.extra_request_body,
         }
@@ -103,8 +106,9 @@ async def async_request_trt_llm(
             del payload["min_length"]
             del payload["end_id"]
         output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output.prompt_len.append(prompt_len)
 
+        generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -119,12 +123,12 @@ async def async_request_trt_llm(
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
 
                         data = json.loads(chunk)
-                        output.generated_text += data["text_output"]
+                        generated_text += data["text_output"]
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
                             ttft = time.perf_counter() - st
-                            output.ttft = ttft
+                            output.ttft.append(ttft)
 
                         # Decoding phase
                         else:
@@ -132,9 +136,10 @@ async def async_request_trt_llm(
 
                         most_recent_timestamp = timestamp
 
-                    output.latency = most_recent_timestamp - st
+                    output.generated_text.append(generated_text)
+                    output.latency.append(most_recent_timestamp - st)
                     output.success = True
-                    output.output_len = request_func_input.output_len
+                    output.output_len.append(output_len)
 
                 else:
                     output.error = response.reason or ""
@@ -160,8 +165,6 @@ async def async_request_openai_completions(
     assert api_url.endswith(
         "completions"
     ), "OpenAI Completions API URL must end with 'completions'."
-
-    prompt = request_func_input.prompt
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -199,6 +202,7 @@ async def async_request_openai_completions(
         payload["max_tokens"] = max_tokens
 
         #output.prompt_len = request_func_input.prompt_len
+        #print(payload)
 
         generated_text = ""
         ttft = 0.0
@@ -224,7 +228,9 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            delta = data["choices"][0]["delta"]
+
+                            if delta.get("content", None):
                                 # First token
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
@@ -234,7 +240,7 @@ async def async_request_openai_completions(
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
 
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += delta["content"]
                             most_recent_timestamp = timestamp
 
                     output_len = len(tokenizer(generated_text).input_ids)
@@ -284,7 +290,10 @@ async def async_request_truss(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
 
-    prompt = request_func_input.prompt
+    # TODO: Support multiturn chat
+    assert(len(request_func_input.prompts) == 1)
+
+    prompt, prompt_len, output_len = request_func_input.prompts[0]
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -292,7 +301,7 @@ async def async_request_truss(
             "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
-            "max_tokens": request_func_input.output_len,
+            "max_tokens": output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
@@ -300,7 +309,7 @@ async def async_request_truss(
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
 
         output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output.prompt_len.append(prompt_len)
 
         generated_text = ""
         ttft = 0.0
@@ -331,7 +340,7 @@ async def async_request_truss(
                                 # First token
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                    output.ttft.append(ttft)
 
                                 # Decoding phase
                                 else:
@@ -340,10 +349,10 @@ async def async_request_truss(
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["delta"]["content"]
 
-                    output.generated_text = generated_text
+                    output.generated_text.append(generated_text)
                     output.success = True
-                    output.latency = latency
-                    output.output_len = request_func_input.output_len
+                    output.latency.append(latency)
+                    output.output_len.append(output_len)
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -365,14 +374,18 @@ async def async_request_sglang_generate(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    prompt = request_func_input.prompt
+
+    # TODO: Support multiturn chat
+    assert(len(request_func_input.prompts) == 1)
+
+    prompt, prompt_len, output_len = request_func_input.prompts[0]
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "text": prompt,
             "sampling_params": {
                 "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
+                "max_new_tokens": output_len,
                 "ignore_eos": not args.disable_ignore_eos,
             },
             "stream": not args.disable_stream,
@@ -384,7 +397,7 @@ async def async_request_sglang_generate(
         headers = {}
 
         output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output.prompt_len.append(prompt_len)
 
         generated_text = ""
         ttft = 0.0
@@ -416,7 +429,7 @@ async def async_request_sglang_generate(
                                 # First token
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                    output.ttft.append(ttft)
 
                                 # Decoding phase
                                 else:
@@ -425,10 +438,10 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 generated_text = data["text"]
 
-                    output.generated_text = generated_text
+                    output.generated_text.append(generated_text)
                     output.success = True
-                    output.latency = latency
-                    output.output_len = request_func_input.output_len
+                    output.latency.append(latency)
+                    output.output_len.append(output_len)
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -554,7 +567,7 @@ async def get_requests(
     for _ in range(num_actual_requests):
         try:
             request = await asyncio.wait_for(
-                input_requests_queue.get(), timeout=30
+                input_requests_queue.get(), timeout=300
             )  # Wait for 5 minites then abort
         except Exception as e:
             print(f"exception: {e}")
@@ -570,7 +583,6 @@ async def get_requests(
 
 
 def calculate_metrics(
-    input_requests: List[List[Tuple[MsgContent, int, int]]],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -597,7 +609,7 @@ def calculate_metrics(
                     tokenizer.encode(outputs[i].generated_text[j], add_special_tokens=False)
                 )
                 retokenized_output_lens.append(retokenized_output_len)
-                total_input += input_requests[i][j][1]
+                total_input += outputs[i].prompt_len[j]
                 if output_len > 1:
                     tpots.append((outputs[i].latency[j] - outputs[i].ttft[j]) / (output_len - 1))
 
@@ -689,17 +701,19 @@ async def benchmark(
                 tokenizer=tokenizer,
                 pbar=pbar)
 
-    # Warmup
+    inputs_requests_queue = asyncio.Queue(maxsize=len(input_requests))
     print("Starting initial single prompt test run...")
     # NOTE: Just use the first request of the first conversation for warmup
     test_input = RequestFuncInput(
         model=model_id,
-        prompt=input_requests[0][:1],
+        prompts=input_requests[0][:1],
         api_url=api_url,
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
-    test_output = await request_func(request_func_input=test_input)
+    test_output = await request_func(request_func_input=test_input, 
+                                     queue=inputs_requests_queue,
+                                     tokenizer=tokenizer)
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please make sure benchmark arguments "
@@ -707,6 +721,9 @@ async def benchmark(
         )
     else:
         print("Initial test run completed. Starting main benchmark run...")
+    
+    # Check the states
+    assert(inputs_requests_queue.empty())
 
     # Flush cache
     if "sglang" in backend:
@@ -723,7 +740,6 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
-    inputs_requests_queue = asyncio.Queue(maxsize=len(input_requests))
     for request in input_requests:
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -750,7 +766,7 @@ async def benchmark(
         tasks.append(
             asyncio.create_task(
                 limited_request_func(
-                    request_func_input=request_func_input, 
+                    request_func_input=request, 
                     queue=inputs_requests_queue,
                     tokenizer=tokenizer,
                     pbar=pbar)
@@ -771,7 +787,6 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -862,7 +877,7 @@ async def benchmark(
             "median_ttft_ms": metrics.median_ttft_ms,
             "median_itl_ms": metrics.median_itl_ms,
             "output_throughput": metrics.output_throughput,
-            "sharegpt_output_len": args.sharegpt_output_len,
+            "fixed_output_len": args.fixed_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
@@ -983,10 +998,11 @@ def run_benchmark(args_: argparse.Namespace):
             else f"http://{args.host}:{args.port}/generate"
         )
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
+        # TODO: Verify lmdeploy
         api_url = (
-            f"{args.base_url}/v1/completions"
+            f"{args.base_url}/v1/chat/completions"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/completions"
+            else f"http://{args.host}:{args.port}/v1/chat/completions"
         )
     elif args.backend == "trt":
         api_url = (
@@ -1151,10 +1167,10 @@ if __name__ == "__main__":
         help="Number of prompts to process. Default is 1000.",
     )
     parser.add_argument(
-        "--sharegpt-output-len",
+        "--fixed-output-len",
         type=int,
         default=None,
-        help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
+        help="Output length for each request. Overrides the output length from the dataset.",
     )
     parser.add_argument(
         "--random-input-len",

@@ -15,7 +15,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import numpy as np
 import requests
