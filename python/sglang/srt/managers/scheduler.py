@@ -470,9 +470,6 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightFromDiskReqOutput(success, message)
                 )
-            elif isinstance(recv_req, GetWeightsByNameReqInput):
-                parameter = self.get_weights_by_name(recv_req)
-                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 success, message = self.init_weights_update_group(recv_req)
                 self.send_to_tokenizer.send_pyobj(
@@ -528,6 +525,7 @@ class Scheduler:
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
+                eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
 
@@ -573,7 +571,7 @@ class Scheduler:
 
         if req.logprob_start_len == -1:
             # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(recv_req.input_ids) - 1
+            req.logprob_start_len = len(req.origin_input_ids) - 1
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) > self.max_req_input_len:
