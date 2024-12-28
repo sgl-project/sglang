@@ -1,4 +1,4 @@
-"""Common utilities."""
+"""Common utilities"""
 
 import base64
 import gc
@@ -79,7 +79,14 @@ class HttpResponse:
         return self.resp.status
 
 
-def http_request(url, json=None, stream=False, api_key=None, verify=None):
+def http_request(
+    url,
+    json=None,
+    stream=False,
+    api_key=None,
+    verify=None,
+    method: Optional[str] = None,
+):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
 
@@ -90,7 +97,7 @@ def http_request(url, json=None, stream=False, api_key=None, verify=None):
     if stream:
         return requests.post(url, json=json, stream=True, headers=headers)
     else:
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers=headers, method=method)
         if json is None:
             data = None
         else:
@@ -348,9 +355,9 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 
 def terminate_process(process):
-    from sglang.srt.utils import kill_child_process
+    from sglang.srt.utils import kill_process_tree
 
-    kill_child_process(process.pid, include_self=True)
+    kill_process_tree(process.pid)
 
 
 def print_highlight(html_content: str):

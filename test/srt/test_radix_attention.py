@@ -8,7 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    kill_child_process,
+    kill_process_tree,
     popen_launch_server,
 )
 
@@ -80,7 +80,7 @@ class TestRadixCacheFCFS(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_radix_attention(self):
         nodes = gen_radix_tree()
@@ -107,7 +107,7 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
         )
 
 
-class TestRadixCacheOverlapLPM(TestRadixCacheFCFS):
+class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -117,7 +117,7 @@ class TestRadixCacheOverlapLPM(TestRadixCacheFCFS):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-overlap-schedule",
+                "--disable-overlap-schedule",
                 "--chunked-prefill-size",
                 "128",
                 "--max-total-tokens",

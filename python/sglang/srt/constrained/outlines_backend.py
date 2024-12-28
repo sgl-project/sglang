@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Constrained decoding with outlines backend."""
 
 import json
@@ -44,6 +42,7 @@ class OutlinesGrammar(BaseGrammarObject):
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
+        self.finished = False
 
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
@@ -86,10 +85,17 @@ class OutlinesGrammar(BaseGrammarObject):
     ) -> torch.Tensor:
         return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
 
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask
+
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        tokens = torch.tensor(
+            self.guide.get_next_instruction(self.state).tokens, dtype=torch.int64
+        ).to(vocab_mask.device, non_blocking=True)
         vocab_mask = vocab_mask[idx]
         vocab_mask.fill_(1)
-        vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
+        vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
@@ -151,7 +157,12 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             raise ValueError(f"Invalid key_type: {key_type}")
 
         try:
-            guide = RegexGuide(regex, self.outlines_tokenizer)
+            if hasattr(RegexGuide, "from_regex"):
+                # outlines >= 0.1.1
+                guide = RegexGuide.from_regex(regex, self.outlines_tokenizer)
+            else:
+                # outlines <= 0.0.46
+                guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
             logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
             return None

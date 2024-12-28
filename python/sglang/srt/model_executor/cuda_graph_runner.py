@@ -1,36 +1,36 @@
-from __future__ import annotations
-
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Run the model with cuda graph and torch.compile."""
+
+from __future__ import annotations
 
 import bisect
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable
 
 import torch
+import tqdm
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.fused_moe.patch import fused_moe_forward_native
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
     LogitsProcessorOutput,
 )
+from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-def _to_torch(model: torch.nn.Module, reverse: bool = False):
+def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             if reverse:
@@ -47,35 +47,46 @@ def _to_torch(model: torch.nn.Module, reverse: bool = False):
             else:
                 # NOTE: Temporarily workaround MoE
                 if "FusedMoE" in sub.__class__.__name__:
-                    sub._forward_method = fused_moe_forward_native
+                    if batch_size == 1:
+                        # The performance of torch.compile on this layer is not always good when bs > 1,
+                        # so we decide to only use torch.compile when bs =1
+                        sub._forward_method = fused_moe_forward_native
                 else:
                     sub._forward_method = sub.forward_native
                 setattr(sub, "is_torch_compile", True)
         if isinstance(sub, torch.nn.Module):
-            _to_torch(sub, reverse)
+            _to_torch(sub, reverse, batch_size)
 
 
 @contextmanager
 def patch_model(
-    model: torch.nn.Module, enable_compile: bool, tp_group: "GroupCoordinator"
+    model: torch.nn.Module,
+    enable_compile: bool,
+    batch_size: int,
+    tp_group: "GroupCoordinator",
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
 
     try:
         if enable_compile:
-            _to_torch(model)
+            _to_torch(model, reverse=False, batch_size=batch_size)
             monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
-            tp_group.ca_comm = None
+            # Use custom-allreduce here.
+            # We found the custom allreduce is much faster than the built-in allreduce in torch,
+            # even with ENABLE_INTRA_NODE_COMM=1.
+            # tp_group.ca_comm = None
             yield torch.compile(
-                torch.no_grad()(model.forward), mode="max-autotune-no-cudagraphs"
+                torch.no_grad()(model.forward),
+                mode="max-autotune-no-cudagraphs",
+                dynamic=False,
             )
         else:
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True)
+            _to_torch(model, reverse=True, batch_size=batch_size)
             monkey_patch_vllm_all_gather(reverse=True)
             tp_group.ca_comm = backup_ca_comm
 
@@ -118,9 +129,23 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         if model_runner.server_args.disable_cuda_graph_padding:
-            self.capture_bs = list(range(1, 32)) + [64, 128]
+            self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+
+        if max(self.capture_bs) > model_runner.req_to_token_pool.size:
+            # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+            # is very samll. We add more values here to make sure we capture the maximum bs.
+            self.capture_bs = list(
+                sorted(
+                    set(
+                        self.capture_bs
+                        + [model_runner.req_to_token_pool.size - 1]
+                        + [model_runner.req_to_token_pool.size]
+                    )
+                )
+            )
+
         self.capture_bs = [
             bs
             for bs in self.capture_bs
@@ -170,7 +195,6 @@ class CudaGraphRunner:
                 self.encoder_lens = None
 
             if self.enable_dp_attention:
-                self.global_num_tokens = [0] * self.tp_size
                 self.gathered_buffer = torch.zeros(
                     (
                         self.max_bs * self.tp_size,
@@ -233,10 +257,16 @@ class CudaGraphRunner:
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
-            for bs in self.capture_bs:
+            capture_bs = (
+                tqdm.tqdm(self.capture_bs)
+                if get_tensor_model_parallel_rank() == 0
+                else self.capture_bs
+            )
+            for bs in capture_bs:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
+                    bs,
                     self.model_runner.tp_group,
                 ) as forward:
                     (
@@ -264,10 +294,10 @@ class CudaGraphRunner:
         mrope_positions = self.mrope_positions[:, :bs]
 
         if self.enable_dp_attention:
-            self.global_num_tokens[:] = [bs] * self.tp_size
+            global_num_tokens = [bs] * self.tp_size
             gathered_buffer = self.gathered_buffer[: bs * self.tp_size]
         else:
-            self.global_num_tokens = None
+            global_num_tokens = None
             gathered_buffer = None
 
         # Attention backend
@@ -296,7 +326,7 @@ class CudaGraphRunner:
                 top_logprobs_nums=[0] * bs,
                 positions=clamp_position(seq_lens),
                 mrope_positions=mrope_positions,
-                global_num_tokens=self.global_num_tokens,
+                global_num_tokens=global_num_tokens,
                 gathered_buffer=gathered_buffer,
             )
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
@@ -348,8 +378,6 @@ class CudaGraphRunner:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
-        if self.enable_dp_attention:
-            self.global_num_tokens[:] = [bs] * self.tp_size
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -366,8 +394,14 @@ class CudaGraphRunner:
 
         # Extract logprobs
         if forward_batch.return_logprob:
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
+            logits_metadata = LogitsMetadata(
+                forward_mode=ForwardMode.DECODE,
+                top_logprobs_nums=forward_batch.top_logprobs_nums,
+            )
+            next_token_logprobs = (
+                LogitsProcessor.compute_temp_top_p_normalized_logprobs(
+                    next_token_logits, logits_metadata
+                )
             )
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
@@ -375,13 +409,14 @@ class CudaGraphRunner:
             )
             return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
             if return_top_logprob:
-                logits_metadata = LogitsMetadata(
-                    forward_mode=ForwardMode.DECODE,
-                    top_logprobs_nums=forward_batch.top_logprobs_nums,
-                )
-                logits_output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
+                (
+                    logits_output.output_top_logprobs_val,
+                    logits_output.output_top_logprobs_idx,
+                ) = LogitsProcessor.get_top_logprobs(
                     next_token_logprobs, logits_metadata
-                )[1]
+                )[
+                    2:4
+                ]
         else:
             logits_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,

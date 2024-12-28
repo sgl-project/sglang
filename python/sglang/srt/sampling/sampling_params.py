@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Sampling parameters for text generation."""
 
 from typing import List, Optional, Union
@@ -24,7 +22,6 @@ class SamplingParams:
     def __init__(
         self,
         max_new_tokens: int = 128,
-        min_new_tokens: int = 0,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
@@ -34,10 +31,12 @@ class SamplingParams:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
+        min_new_tokens: int = 0,
         spaces_between_special_tokens: bool = True,
         regex: Optional[str] = None,
         n: int = 1,
         json_schema: Optional[str] = None,
+        ebnf: Optional[str] = None,
         no_stop_trim: bool = False,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
@@ -62,6 +61,7 @@ class SamplingParams:
         self.regex = regex
         self.n = n
         self.json_schema = json_schema
+        self.ebnf = ebnf
         self.no_stop_trim = no_stop_trim
 
         # Process some special cases
@@ -113,8 +113,13 @@ class SamplingParams:
                     f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
-        if self.regex is not None and self.json_schema is not None:
-            raise ValueError("regex and json_schema cannot be both set.")
+        grammars = [
+            self.json_schema,
+            self.regex,
+            self.ebnf,
+        ]  # since mutually exclusive, only one can be set
+        if sum(x is not None for x in grammars) > 1:
+            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
 
     def normalize(self, tokenizer):
         # Process stop strings

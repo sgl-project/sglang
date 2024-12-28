@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Inference-only LLaVa model compatible with HuggingFace weights."""
 
 import math
@@ -31,7 +29,6 @@ from transformers import (
     SiglipVisionModel,
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
@@ -41,6 +38,7 @@ from sglang.srt.mm_utils import (
     unpad_image_shape,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
@@ -51,9 +49,16 @@ class LlavaBaseForCausalLM(nn.Module):
         image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
 
         # hardcode for spatial_unpad + anyres
-        image_aspect_ratio = "anyres" if len(image_sizes) == 1 else "pad"
+        if image_inputs.modalities is not None and (
+            "multi-images" in image_inputs.modalities
+            or "video" in image_inputs.modalities
+        ):
+            image_aspect_ratio = "pad"
+        else:
+            image_aspect_ratio = "anyres"
         offset_list = []
-        for image_s in image_sizes:
+        image_inputs.image_pad_len = []
+        for image_idx, image_s in enumerate(image_sizes):
             if len(image_sizes) > 16:
                 # 2x2 pooling with stride 2
                 new_image_feature_len = (
@@ -88,10 +93,6 @@ class LlavaBaseForCausalLM(nn.Module):
                         new_w = int(new_w // times)
                 new_image_feature_len += new_h * (new_w + 1)
 
-            pad_ids = pad_values * (
-                (new_image_feature_len + len(pad_values)) // len(pad_values)
-            )
-            # print("calculated new_image_feature_len: ", new_image_feature_len)
             try:
                 offset = input_ids.index(self.config.image_token_index)
             except ValueError:
@@ -99,10 +100,11 @@ class LlavaBaseForCausalLM(nn.Module):
             # old_len + pad_len - 1, because we need to remove image_token_id
             input_ids = (
                 input_ids[:offset]
-                + pad_ids[:new_image_feature_len]
+                + [pad_values[image_idx]] * new_image_feature_len
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)
+            image_inputs.image_pad_len.append(new_image_feature_len)
 
         image_inputs.image_offsets = offset_list
         return input_ids
@@ -134,7 +136,14 @@ class LlavaBaseForCausalLM(nn.Module):
         image_inputs = forward_batch.image_inputs
 
         if forward_batch.forward_mode.is_extend():
-            bs = forward_batch.batch_size
+            # Clamp input ids. This is because the input_ids for the image tokens are
+            # filled with the hash values of the image for the prefix matching in the radix attention.
+            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
+
+            # Embed text inputs
+            input_embeds = self.language_model.model.embed_tokens(input_ids)
+
             # Got List[List[str]] extend it to List[str]
             # The length of the List should be equal to batch size
             modalities_list = []
@@ -142,18 +151,18 @@ class LlavaBaseForCausalLM(nn.Module):
             for im in image_inputs:
                 if im and im.modalities is not None:
                     modalities_list.extend(im.modalities)
-                if im and im.image_offsets is not None:
-                    max_image_offset.append(max(im.image_offsets))
+                if im and im.image_offsets:
+                    max_image_offset.append(
+                        np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
+                    )
                 else:
                     max_image_offset.append(-1)
-
-            # Embed text inputs
-            input_embeds = self.language_model.model.embed_tokens(input_ids)
 
             start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
             need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
+                bs = forward_batch.batch_size
                 pixel_values = [
                     image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
                 ]
@@ -345,6 +354,7 @@ class LlavaBaseForCausalLM(nn.Module):
 
                 # Fill in the placeholder for the image
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+                extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
                 prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
                 pt = 0
                 for i in range(bs):
@@ -352,18 +362,36 @@ class LlavaBaseForCausalLM(nn.Module):
                         continue
 
                     start_idx = extend_start_loc_cpu[i]
+                    seq_len = extend_seq_lens[i]
                     prefix_len = prefix_lens_cpu[i]
 
                     # Multiple images
-                    for j, image_offset in enumerate(image_inputs[i].image_offsets):
-                        if image_offset < prefix_len:
+                    for image_idx, image_offset in enumerate(
+                        image_inputs[i].image_offsets
+                    ):
+                        if (
+                            image_offset + image_inputs[i].image_pad_len[image_idx]
+                            <= prefix_len
+                        ):
                             continue
+                        if image_offset >= prefix_len + seq_len:
+                            break
 
-                        tmp_image_feature = image_features[pt][j]
+                        tmp_image_feature = image_features[pt][image_idx]
                         pad_len = tmp_image_feature.shape[0]
 
-                        left_idx = start_idx + (image_offset - prefix_len)
-                        right_idx = start_idx + (image_offset - prefix_len) + pad_len
+                        input_offset = image_offset - prefix_len
+                        left_idx = start_idx + input_offset
+                        right_idx = left_idx + pad_len
+                        assert right_idx > start_idx
+                        if input_offset < 0:
+                            left_idx = start_idx
+                            tmp_image_feature = tmp_image_feature[-input_offset:]
+                        if right_idx > start_idx + seq_len:
+                            tmp_image_feature = tmp_image_feature[
+                                : start_idx + seq_len - right_idx
+                            ]
+                            right_idx = start_idx + seq_len
                         try:
                             input_embeds[left_idx:right_idx] = tmp_image_feature
                         except RuntimeError as e:
@@ -446,7 +474,6 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -468,7 +495,6 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -501,7 +527,6 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
 

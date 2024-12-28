@@ -7,6 +7,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import os
 from enum import Enum, auto
 from typing import TYPE_CHECKING, List
 
@@ -30,7 +31,6 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 
 class WrapperDispatch(Enum):
@@ -44,14 +44,15 @@ class FlashInferAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
-        # Parse constants
-        if not _grouped_size_compiled_for_decode_kernels(
-            model_runner.model_config.num_attention_heads // model_runner.tp_size,
-            model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
-        ):
-            self.decode_use_tensor_cores = True
-        else:
-            self.decode_use_tensor_cores = False
+        self.decode_use_tensor_cores = should_use_tensor_core(
+            kv_cache_dtype=model_runner.kv_cache_dtype,
+            num_attention_heads=model_runner.model_config.num_attention_heads
+            // model_runner.tp_size,
+            num_kv_heads=model_runner.model_config.get_num_kv_heads(
+                model_runner.tp_size
+            ),
+        )
+
         self.max_context_len = model_runner.model_config.context_len
 
         assert not (
@@ -216,7 +217,13 @@ class FlashInferAttnBackend(AttentionBackend):
         return 0
 
     def forward_extend(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         prefill_wrapper_paged = self.prefill_wrappers_paged[
             self._get_wrapper_idx(layer)
@@ -232,7 +239,8 @@ class FlashInferAttnBackend(AttentionBackend):
         if not use_ragged:
             if k is not None:
                 assert v is not None
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
             o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -265,12 +273,19 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         decode_wrapper = self.forward_metadata[0][self._get_wrapper_idx(layer)]
         cache_loc = (
@@ -281,7 +296,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if k is not None:
             assert v is not None
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -658,6 +674,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
+                q_data_type=self.q_data_type,
             )
 
         # cached part
@@ -671,6 +688,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_kv_heads,
             self.head_dim,
             1,
+            q_data_type=self.q_data_type,
         )
 
 
@@ -709,3 +727,51 @@ def create_flashinfer_kv_indices_triton(
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+
+
+def should_use_tensor_core(
+    kv_cache_dtype: torch.dtype,
+    num_attention_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    """
+    Determine whether to use tensor cores for attention computation.
+
+    Args:
+        kv_cache_dtype: Data type of the KV cache
+        num_attention_heads: Number of attention heads
+        num_kv_heads: Number of key/value heads
+
+    Returns:
+        bool: Whether to use tensor cores
+    """
+    # Try to use environment variable first
+    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
+    if env_override is not None:
+        return env_override.lower() == "true"
+
+    # Try to use _grouped_size_compiled_for_decode_kernels if available
+    # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
+    try:
+        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+
+        if not _grouped_size_compiled_for_decode_kernels(
+            num_attention_heads,
+            num_kv_heads,
+        ):
+            return True
+        else:
+            return False
+    except (ImportError, AttributeError):
+        pass
+
+    # Calculate GQA group size
+    gqa_group_size = num_attention_heads // num_kv_heads
+
+    # Determine based on dtype and GQA group size
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return True
+    elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
+        return gqa_group_size > 4
+    else:
+        return False

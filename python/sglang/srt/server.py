@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 The entry point of inference server.
 SRT = SGLang Runtime.
@@ -25,6 +23,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import signal
 import threading
 import time
 from http import HTTPStatus
@@ -50,9 +49,14 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
-    UpdateWeightReqInput,
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    OpenSessionReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -79,19 +83,20 @@ from sglang.srt.utils import (
     configure_logger,
     delete_directory,
     is_port_available,
-    kill_child_process,
+    kill_process_tree,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
+from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-
+# Fast API
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -102,6 +107,7 @@ app.add_middleware(
 )
 
 tokenizer_manager: TokenizerManager = None
+scheduler_info: Dict = None
 
 ##### Native API endpoints #####
 
@@ -145,10 +151,13 @@ async def get_model_info():
     return result
 
 
-@app.get("/get_server_args")
-async def get_server_args():
-    """Get the server arguments."""
-    return dataclasses.asdict(tokenizer_manager.server_args)
+@app.get("/get_server_info")
+async def get_server_info():
+    return {
+        **dataclasses.asdict(tokenizer_manager.server_args),  # server args
+        **scheduler_info,
+        "version": __version__,
+    }
 
 
 @app.post("/flush_cache")
@@ -164,7 +173,7 @@ async def flush_cache():
 
 @app.get("/start_profile")
 @app.post("/start_profile")
-async def start_profile():
+async def start_profile_async():
     """Start profiling."""
     tokenizer_manager.start_profile()
     return Response(
@@ -175,7 +184,7 @@ async def start_profile():
 
 @app.get("/stop_profile")
 @app.post("/stop_profile")
-async def stop_profile():
+async def stop_profile_async():
     """Stop profiling."""
     tokenizer_manager.stop_profile()
     return Response(
@@ -184,24 +193,11 @@ async def stop_profile():
     )
 
 
-@app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
-async def get_memory_pool_size():
-    """Get the memory pool size in number of tokens"""
-    try:
-        ret = await tokenizer_manager.get_memory_pool_size()
-
-        return ret
-    except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
-
-
-@app.post("/update_weights")
+@app.post("/update_weights_from_disk")
 @time_func_latency
-async def update_weights(obj: UpdateWeightReqInput, request: Request):
-    """Update the weights inplace without re-launching the server."""
-    success, message = await tokenizer_manager.update_weights(obj, request)
+async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
+    """Update the weights from disk in-place without re-launching the server."""
+    success, message = await tokenizer_manager.update_weights_from_disk(obj, request)
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(
@@ -215,6 +211,69 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         )
 
 
+@app.post("/init_weights_update_group")
+async def init_weights_update_group(
+    obj: InitWeightsUpdateGroupReqInput, request: Request
+):
+    """Initialize the parameter update group."""
+    success, message = await tokenizer_manager.init_weights_update_group(obj, request)
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_distributed")
+async def update_weights_from_distributed(
+    obj: UpdateWeightsFromDistributedReqInput, request: Request
+):
+    """Update model parameter from distributed online."""
+    success, message = await tokenizer_manager.update_weights_from_distributed(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.api_route("/get_weights_by_name", methods=["GET", "POST"])
+async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+    """Get model parameter by name."""
+    try:
+        ret = await tokenizer_manager.get_weights_by_name(obj, request)
+        if ret is None:
+            return _create_error_response("Get parameter by name failed")
+        else:
+            return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/open_session", methods=["GET", "POST"])
+async def open_session(obj: OpenSessionReqInput, request: Request):
+    """Open a session, and return its unique session id."""
+    try:
+        session_id = await tokenizer_manager.open_session(obj, request)
+        return session_id
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/close_session", methods=["GET", "POST"])
+async def close_session(obj: CloseSessionReqInput, request: Request):
+    """Close the session"""
+    try:
+        await tokenizer_manager.close_session(obj, request)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+# fastapi implicitly converts json in the request to obj (dataclass)
+@app.api_route("/generate", methods=["POST", "PUT"])
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
@@ -243,16 +302,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
-            return ORJSONResponse(
-                {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-            )
+            logger.error(f"Error: {e}")
+            return _create_error_response(e)
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
-app.post("/generate")(generate_request)
-app.put("/generate")(generate_request)
-
-
+@app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
@@ -260,15 +314,10 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
-app.post("/encode")(encode_request)
-app.put("/encode")(encode_request)
-
-
+@app.api_route("/classify", methods=["POST", "PUT"])
 @time_func_latency
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
@@ -276,13 +325,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
-
-
-app.post("/classify")(classify_request)
-app.put("/classify")(classify_request)
+        return _create_error_response(e)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -358,14 +401,21 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 
+def _create_error_response(e):
+    return ORJSONResponse(
+        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
+
+
 def launch_engine(
     server_args: ServerArgs,
 ):
     """
-    Launch the Tokenizer Manager in the main process, the Scheduler in a subprocess, and the Detokenizer Manager in another subprocess.
+    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
 
     global tokenizer_manager
+    global scheduler_info
 
     # Configure global environment
     configure_logger(server_args)
@@ -392,7 +442,7 @@ def launch_engine(
         )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
-            gpu_id = tp_rank % tp_size_per_node
+            gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
@@ -404,8 +454,8 @@ def launch_engine(
         if server_args.node_rank >= 1:
             # For other nodes, they do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            while True:
-                pass
+            for proc in scheduler_procs:
+                proc.join()
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
@@ -432,8 +482,18 @@ def launch_engine(
         load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
     # Wait for model to finish loading
+    scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
-        scheduler_pipe_readers[i].recv()
+        data = scheduler_pipe_readers[i].recv()
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+
+    # Assume all schedulers have same max_total_num_tokens
+    scheduler_info = scheduler_infos[0]
 
 
 def launch_server(
@@ -447,12 +507,12 @@ def launch_server(
 
     1. HTTP server: A FastAPI server that routes requests to the engine.
     2. SRT engine:
-        1. Tokenizer Manager: Tokenizes the requests and sends them to the scheduler.
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
         2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. Detokenizer Manager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server and Tokenizer Manager both run in the main process.
+    1. The HTTP server and TokenizerManager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
     launch_engine(server_args=server_args)
@@ -461,7 +521,7 @@ def launch_server(
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
 
-    # add prometheus middleware
+    # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
@@ -473,7 +533,7 @@ def launch_server(
     t.start()
 
     try:
-        # Listen for HTTP requests
+        # Update logging configs
         LOGGING_CONFIG["formatters"]["default"][
             "fmt"
         ] = "[%(asctime)s] %(levelprefix)s %(message)s"
@@ -482,6 +542,8 @@ def launch_server(
             "fmt"
         ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+        # Listen for HTTP requests
         uvicorn.run(
             app,
             host=server_args.host,
@@ -524,6 +586,15 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
+    # Register the signal handler.
+    # The child processes will send SIGQUIT to this process when any error happens
+    # This process then clean up the whole process tree
+    def sigquit_handler(signum, frame):
+        kill_process_tree(os.getpid())
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
+
+    # Set mp start method
     mp.set_start_method("spawn", force=True)
 
 
@@ -550,7 +621,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid())
         return
 
     model_info = res.json()
@@ -583,9 +654,10 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(include_self=True)
+        kill_process_tree(os.getpid())
         return
 
+    # Debug print
     # logger.info(f"{res.json()=}")
 
     logger.info("The server is fired up and ready to roll!")
@@ -594,149 +666,6 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
 
     if server_args.delete_ckpt_after_loading:
         delete_directory(server_args.model_path)
-
-
-class Runtime:
-    """
-    A wrapper for the server.
-    This is used for launching the server in a python program without
-    using the commond line interface.
-    """
-
-    def __init__(
-        self,
-        log_level: str = "error",
-        *args,
-        **kwargs,
-    ):
-        """See the arguments in server_args.py::ServerArgs"""
-        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-
-        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
-        atexit.register(self.shutdown)
-
-        # Pre-allocate ports
-        for port in range(10000, 40000):
-            if is_port_available(port):
-                break
-            port += 1
-        self.server_args.port = port
-
-        self.url = self.server_args.url()
-        self.generate_url = self.url + "/generate"
-
-        # NOTE: We store pid instead of proc to fix some issues during __delete__
-        self.pid = None
-        pipe_reader, pipe_writer = mp.Pipe(duplex=False)
-
-        proc = mp.Process(
-            target=launch_server,
-            args=(self.server_args, pipe_writer),
-        )
-        proc.start()
-        pipe_writer.close()
-        self.pid = proc.pid
-
-        try:
-            init_state = pipe_reader.recv()
-        except EOFError:
-            init_state = ""
-
-        if init_state != "ready":
-            self.shutdown()
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-
-        self.endpoint = RuntimeEndpoint(self.url)
-
-    def shutdown(self):
-        if self.pid is not None:
-            kill_child_process(self.pid, include_self=True)
-            self.pid = None
-
-    def cache_prefix(self, prefix: str):
-        self.endpoint.cache_prefix(prefix)
-
-    def get_tokenizer(self):
-        return get_tokenizer(
-            self.server_args.tokenizer_path,
-            tokenizer_mode=self.server_args.tokenizer_mode,
-            trust_remote_code=self.server_args.trust_remote_code,
-        )
-
-    async def async_generate(
-        self,
-        prompt: str,
-        sampling_params: Optional[Dict] = None,
-    ):
-        if self.server_args.skip_tokenizer_init:
-            json_data = {
-                "input_ids": prompt,
-                "sampling_params": sampling_params,
-                "stream": True,
-            }
-        else:
-            json_data = {
-                "text": prompt,
-                "sampling_params": sampling_params,
-                "stream": True,
-            }
-        pos = 0
-
-        timeout = aiohttp.ClientTimeout(total=3 * 3600)
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(self.generate_url, json=json_data) as response:
-                async for chunk, _ in response.content.iter_chunks():
-                    chunk = chunk.decode("utf-8")
-                    if chunk and chunk.startswith("data:"):
-                        if chunk == "data: [DONE]\n\n":
-                            break
-                        data = json.loads(chunk[5:].strip("\n"))
-                        if "text" in data:
-                            cur = data["text"][pos:]
-                            if cur:
-                                yield cur
-                            pos += len(cur)
-                        else:
-                            yield data
-
-    add_request = async_generate
-
-    def generate(
-        self,
-        prompt: Union[str, List[str]],
-        sampling_params: Optional[Dict] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-    ):
-        json_data = {
-            "text": prompt,
-            "sampling_params": sampling_params,
-            "return_logprob": return_logprob,
-            "logprob_start_len": logprob_start_len,
-            "top_logprobs_num": top_logprobs_num,
-            "lora_path": lora_path,
-        }
-        assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
-        response = requests.post(
-            self.url + "/generate",
-            json=json_data,
-        )
-        return json.dumps(response.json())
-
-    def encode(
-        self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-    ):
-        json_data = {"text": prompt}
-        response = requests.post(self.url + "/encode", json=json_data)
-        return json.dumps(response.json())
-
-    def __del__(self):
-        self.shutdown()
 
 
 STREAM_END_SYMBOL = b"data: [DONE]"
@@ -751,18 +680,13 @@ class Engine:
     launching the HTTP server adds unnecessary complexity or overhead,
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, log_level: str = "error", *args, **kwargs):
+        """See the arguments in server_args.py::ServerArgs"""
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
 
-        # runtime server default log level is log
-        # offline engine works in scripts, so we set it to error
-
-        if "log_level" not in kwargs:
-            kwargs["log_level"] = "error"
-
-        server_args = ServerArgs(*args, **kwargs)
+        server_args = ServerArgs(*args, log_level=log_level, **kwargs)
         launch_engine(server_args=server_args)
 
     def generate(
@@ -865,7 +789,7 @@ class Engine:
             return ret
 
     def shutdown(self):
-        kill_child_process()
+        kill_process_tree(os.getpid(), include_parent=False)
 
     def get_tokenizer(self):
         global tokenizer_manager
@@ -884,3 +808,214 @@ class Engine:
         # get the current event loop
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
+
+    def start_profile(self):
+        tokenizer_manager.start_profile()
+
+    def stop_profile(self):
+        tokenizer_manager.stop_profile()
+
+    def get_server_info(self):
+        return {
+            **dataclasses.asdict(tokenizer_manager.server_args),  # server args
+            **scheduler_info,
+            "version": __version__,
+        }
+
+    def init_weights_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str = "nccl",
+    ):
+        """Initialize parameter update group."""
+        obj = InitWeightsUpdateGroupReqInput(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            tokenizer_manager.init_weights_update_group(obj, None)
+        )
+
+    def update_weights_from_distributed(self, name, dtype, shape):
+        """Update weights from distributed source."""
+        obj = UpdateWeightsFromDistributedReqInput(
+            name=name,
+            dtype=dtype,
+            shape=shape,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def get_weights_by_name(self, name, truncate_size=100):
+        """Get weights by parameter name."""
+        obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
+
+
+class Runtime:
+    """
+    A wrapper for the HTTP server.
+    This is used for launching the server in a python program without
+    using the commond line interface.
+
+    It is mainly used for the frontend language.
+    You should use the Engine class if you want to do normal offline processing.
+    """
+
+    def __init__(
+        self,
+        log_level: str = "error",
+        *args,
+        **kwargs,
+    ):
+        """See the arguments in server_args.py::ServerArgs"""
+        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
+
+        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
+        atexit.register(self.shutdown)
+
+        # Pre-allocate ports
+        for port in range(10000, 40000):
+            if is_port_available(port):
+                break
+            port += 1
+        self.server_args.port = port
+
+        self.url = self.server_args.url()
+        self.generate_url = self.url + "/generate"
+
+        # NOTE: We store pid instead of proc to fix some issues during __delete__
+        self.pid = None
+        pipe_reader, pipe_writer = mp.Pipe(duplex=False)
+
+        proc = mp.Process(
+            target=launch_server,
+            args=(self.server_args, pipe_writer),
+        )
+        proc.start()
+        pipe_writer.close()
+        self.pid = proc.pid
+
+        try:
+            init_state = pipe_reader.recv()
+        except EOFError:
+            init_state = ""
+
+        if init_state != "ready":
+            self.shutdown()
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+
+        self.endpoint = RuntimeEndpoint(self.url)
+
+    def shutdown(self):
+        if self.pid is not None:
+            kill_process_tree(self.pid)
+            self.pid = None
+
+    def cache_prefix(self, prefix: str):
+        self.endpoint.cache_prefix(prefix)
+
+    def get_tokenizer(self):
+        return get_tokenizer(
+            self.server_args.tokenizer_path,
+            tokenizer_mode=self.server_args.tokenizer_mode,
+            trust_remote_code=self.server_args.trust_remote_code,
+        )
+
+    async def async_generate(
+        self,
+        prompt: str,
+        sampling_params: Optional[Dict] = None,
+    ):
+        if self.server_args.skip_tokenizer_init:
+            json_data = {
+                "input_ids": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
+        else:
+            json_data = {
+                "text": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
+        pos = 0
+
+        timeout = aiohttp.ClientTimeout(total=3 * 3600)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(self.generate_url, json=json_data) as response:
+                async for chunk, _ in response.content.iter_chunks():
+                    chunk = chunk.decode("utf-8")
+                    if chunk and chunk.startswith("data:"):
+                        if chunk == "data: [DONE]\n\n":
+                            break
+                        data = json.loads(chunk[5:].strip("\n"))
+                        if "text" in data:
+                            cur = data["text"][pos:]
+                            if cur:
+                                yield cur
+                            pos += len(cur)
+                        else:
+                            yield data
+
+    add_request = async_generate
+
+    def generate(
+        self,
+        prompt: Union[str, List[str]],
+        sampling_params: Optional[Dict] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+    ):
+        json_data = {
+            "text": prompt,
+            "sampling_params": sampling_params,
+            "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
+            "top_logprobs_num": top_logprobs_num,
+            "lora_path": lora_path,
+        }
+        assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
+        response = requests.post(
+            self.url + "/generate",
+            json=json_data,
+        )
+        return json.dumps(response.json())
+
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+    ):
+        json_data = {"text": prompt}
+        response = requests.post(self.url + "/encode", json=json_data)
+        return json.dumps(response.json())
+
+    async def get_server_info(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.url}/get_server_info") as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_data = await response.json()
+                    raise RuntimeError(
+                        f"Failed to get server info. {error_data['error']['message']}"
+                    )
+
+    def __del__(self):
+        self.shutdown()

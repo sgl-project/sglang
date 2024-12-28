@@ -1,30 +1,26 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
+
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-
-# from vllm.model_executor.layers.rotary_embedding import GemmaRotaryEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -38,6 +34,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -97,7 +95,7 @@ class Gemma2MLP(nn.Module):
 class Gemma2Attention(nn.Module):
     def __init__(
         self,
-        layer_idx: int,
+        layer_id: int,
         config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
@@ -105,11 +103,10 @@ class Gemma2Attention(nn.Module):
         head_dim: int,
         max_position_embeddings: int,
         rope_theta: float,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
+        self.layer_id = layer_id
         self.config = config
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -156,13 +153,13 @@ class Gemma2Attention(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        use_sliding_window = layer_idx % 2 == 0 and hasattr(config, "sliding_window")
+        use_sliding_window = layer_id % 2 == 0 and hasattr(config, "sliding_window")
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            layer_id=layer_idx,
+            layer_id=layer_id,
             logit_cap=self.config.attn_logit_softcapping,
             sliding_window_size=(
                 get_attention_sliding_window_size(config)
@@ -188,15 +185,14 @@ class Gemma2Attention(nn.Module):
 class Gemma2DecoderLayer(nn.Module):
     def __init__(
         self,
-        layer_idx: int,
+        layer_id: int,
         config: PretrainedConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma2Attention(
-            layer_idx=layer_idx,
+            layer_id=layer_id,
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -204,7 +200,6 @@ class Gemma2DecoderLayer(nn.Module):
             head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
-            cache_config=cache_config,
             quant_config=quant_config,
         )
         self.hidden_size = config.hidden_size
@@ -257,7 +252,6 @@ class Gemma2Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -267,11 +261,14 @@ class Gemma2Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList(
-            [
-                Gemma2DecoderLayer(layer_idx, config, cache_config, quant_config)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Gemma2DecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+            ),
+            prefix="",
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -310,6 +307,25 @@ class Gemma2Model(nn.Module):
 
 
 class Gemma2ForCausalLM(nn.Module):
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -337,15 +353,12 @@ class Gemma2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
     ) -> None:
-        del lora_config  # Unused.
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Gemma2Model(config, cache_config, quant_config)
+        self.model = Gemma2Model(config, quant_config)
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -358,8 +371,42 @@ class Gemma2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens.weight, forward_batch
+            input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
+
+    def get_hidden_dim(self, module_name):
+        # return input_dim, output_dim
+        if module_name in ["q_proj", "qkv_proj"]:
+            return (
+                self.config.hidden_size,
+                self.config.head_dim * self.config.num_attention_heads,
+            )
+        elif module_name in ["o_proj"]:
+            return (
+                self.config.head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        elif module_name in ["kv_proj"]:
+            return (
+                self.config.hidden_size,
+                self.config.head_dim * self.config.num_key_value_heads,
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size
+        elif module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
+    def get_module_name(self, name):
+        params_mapping = {
+            "q_proj": "qkv_proj",
+            "k_proj": "qkv_proj",
+            "v_proj": "qkv_proj",
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+        }
+        return params_mapping.get(name, name)
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)

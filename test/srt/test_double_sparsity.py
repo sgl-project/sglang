@@ -2,7 +2,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -18,7 +18,9 @@ class TestDoubleSparsity(unittest.TestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         dirpath = os.path.dirname(__file__)
-        config_file = os.path.join(dirpath, "Llama-3.1-8B-Instruct.json")
+        config_file = os.path.join(
+            dirpath, "double-sparsity-config-Llama-3.1-8B-Instruct.json"
+        )
         # NOTE: Generate the config file by running https://github.com/andy-yang-1/DoubleSparse/blob/main/evaluation/group_channel_config.py
         cls.process = popen_launch_server(
             cls.model,
@@ -43,7 +45,7 @@ class TestDoubleSparsity(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(

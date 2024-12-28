@@ -1,22 +1,21 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-# coding=utf-8
 # Adapted from
 # https://github.com/THUDM/ChatGLM2-6B
 """Inference-only ChatGLM model compatible with THUDM weights."""
+
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -24,7 +23,6 @@ from torch import nn
 from torch.nn import LayerNorm
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs import ChatGLMConfig
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -42,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 LoraConfig = None
 
@@ -51,7 +50,6 @@ class GLMAttention(nn.Module):
         self,
         config,
         layer_id: int = 0,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -187,7 +185,6 @@ class GLMBlock(nn.Module):
         self,
         config,
         layer_id: int,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -204,7 +201,7 @@ class GLMBlock(nn.Module):
         )
 
         # Self attention.
-        self.self_attention = GLMAttention(config, layer_id, cache_config, quant_config)
+        self.self_attention = GLMAttention(config, layer_id, quant_config)
         self.hidden_dropout = config.hidden_dropout
 
         # Layernorm on the attention output
@@ -259,7 +256,6 @@ class GLMTransformer(nn.Module):
     def __init__(
         self,
         config,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -270,10 +266,7 @@ class GLMTransformer(nn.Module):
 
         # Transformer layers.
         self.layers = nn.ModuleList(
-            [
-                GLMBlock(config, i, cache_config, quant_config)
-                for i in range(self.num_layers)
-            ]
+            [GLMBlock(config, i, quant_config) for i in range(self.num_layers)]
         )
 
         if self.post_layer_norm:
@@ -307,7 +300,6 @@ class ChatGLMM(nn.Module):
     def __init__(
         self,
         config,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -319,7 +311,7 @@ class ChatGLMM(nn.Module):
         self.num_layers = config.num_layers
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
-        self.encoder = GLMTransformer(config, cache_config, quant_config)
+        self.encoder = GLMTransformer(config, quant_config)
 
         self.output_layer = ParallelLMHead(config.padded_vocab_size, config.hidden_size)
 
@@ -358,15 +350,13 @@ class ChatGLMForCausalLM(nn.Module):
     def __init__(
         self,
         config: ChatGLMConfig,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoraConfig] = None,
     ):
         super().__init__()
         self.config: ChatGLMConfig = config
         self.quant_config = quant_config
         self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
-        self.transformer = ChatGLMM(config, cache_config, quant_config)
+        self.transformer = ChatGLMM(config, quant_config)
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
 
@@ -379,7 +369,7 @@ class ChatGLMForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

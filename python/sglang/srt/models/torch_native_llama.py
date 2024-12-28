@@ -1,24 +1,22 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-"""Inference-only LLaMA model compatible with HuggingFace weights."""
-
-# PyTorch Tensor Parallel Available for This Model
 """
+Inference-only LLaMA model compatible with HuggingFace weights.
+
 This model supports tensor parallelism (TP) using the PyTorch tensor parallel package.
 Reference: https://pytorch.org/docs/stable/distributed.tensor.parallel.html
 
@@ -30,10 +28,10 @@ device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
 tensor_parallel(model, device_mesh)
 ```
 
-An end-to-end example can be found in `python/sglang/bench_latency.py`.
+An end-to-end example can be found in `python/sglang/bench_one_batch.py`.
 You can run it with the following command:
 ```bash
-$ python3 -m sglang.bench_latency --correct \
+$ python3 -m sglang.bench_one_batch --correct \
   --model meta-llama/Meta-Llama-3-8B \
   --json-model-override-args '{"architectures": ["TorchNativeLlamaForCausalLM"]}' \
   --tensor-parallel-size 2 \
@@ -54,20 +52,18 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 tp_size = get_tensor_model_parallel_world_size()
 tp_rank = get_tensor_model_parallel_rank()
@@ -390,16 +386,21 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.torchao_config = global_server_args_dict["torchao_config"]
         self.supports_torch_tp = True
         self.model = LlamaModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+
+        # turning off autotune for fp8dq since it doesn't give speedup and
+        # increases compile time significantly
+        torch._inductor.config.max_autotune_gemm_backends = "ATEN"
 
     @torch.no_grad()
     def forward(
@@ -411,7 +412,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def get_hidden_dim(self, module_name):
@@ -498,16 +499,6 @@ class TorchNativeLlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        if (
-            hasattr(self.config, "tie_word_embeddings")
-            and self.config.tie_word_embeddings
-        ):
-            # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
-            param = self.lm_head.weight
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, self.model.embed_tokens.weight)
-        apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
 class TorchNativePhi3ForCausalLM(TorchNativeLlamaForCausalLM):

@@ -1,37 +1,44 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """A tensor parallel worker."""
 
+import dataclasses
 import logging
+import signal
 import threading
-import time
 from queue import Queue
 from typing import Optional
 
+import psutil
 import torch
 
-from sglang.srt.managers.io_struct import UpdateWeightReqInput
+from sglang.srt.managers.io_struct import (
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_compiler_backend
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
@@ -67,11 +74,13 @@ class TpModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
-        self.forward_stream = torch.cuda.Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
+        self.parent_process = psutil.Process().parent()
+        self.scheduler_stream = torch.get_device_module(self.device).current_stream()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -89,17 +98,33 @@ class TpModelWorkerClient:
         )
 
     def forward_thread_func(self):
-        with torch.cuda.stream(self.forward_stream):
-            self.forward_thread_func_()
+        try:
+            with torch.get_device_module(self.device).stream(self.forward_stream):
+                self.forward_thread_func_()
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
+            self.parent_process.send_signal(signal.SIGQUIT)
 
     @torch.no_grad()
     def forward_thread_func_(self):
+        batch_pt = 0
+        batch_lists = [None] * 2
+
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
-            self.launch_event = threading.Event()
-            copy_event = torch.cuda.Event()
+
+            # Keep a reference of model_worker_batch by storing it into a list.
+            # Otherwise, the tensor members of model_worker_batch will be released
+            # by pytorch and cause CUDA illegal memory access errors.
+            batch_lists[batch_pt % 2] = model_worker_batch
+            batch_pt += 1
+
+            # Create event
+            self.launch_done = threading.Event()
+            copy_done = torch.get_device_module(self.device).Event()
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
@@ -107,7 +132,7 @@ class TpModelWorkerClient:
 
             # Run forward
             logits_output, next_token_ids = self.worker.forward_batch_generation(
-                model_worker_batch
+                model_worker_batch, self.launch_done
             )
 
             # Update the future token ids map
@@ -132,16 +157,14 @@ class TpModelWorkerClient:
                         )
                     )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
-            copy_event.record()
+            copy_done.record()
 
-            self.launch_event.set()
-            self.output_queue.put((copy_event, logits_output, next_token_ids))
+            self.output_queue.put((copy_done, logits_output, next_token_ids))
 
     def resolve_batch_result(self, bid: int):
-        copy_event, logits_output, next_token_ids = self.output_queue.get()
-        while not copy_event.query():
-            time.sleep(1e-5)
-        self.launch_event.wait()
+        copy_done, logits_output, next_token_ids = self.output_queue.get()
+        copy_done.synchronize()
+        self.launch_done.wait()
 
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = (
@@ -158,8 +181,21 @@ class TpModelWorkerClient:
         return logits_output, next_token_ids
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
+        sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
+        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
+            sampling_info,
+            sampling_info_done=threading.Event(),
+            scaling_penalties=sampling_info.scaling_penalties,
+            linear_penalties=sampling_info.linear_penalties,
+        )
+
+        # A cuda stream sync here to avoid the cuda illegal memory access error.
+        self.scheduler_stream.synchronize()
+
         # Push a new batch to the queue
-        self.input_queue.put((model_worker_batch.copy(), self.future_token_ids_ct))
+        self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
@@ -175,9 +211,22 @@ class TpModelWorkerClient:
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
-    def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.worker.update_weights(recv_req)
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        success, message = self.worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        success, message = self.worker.update_weights_from_distributed(recv_req)
+        return success, message
+
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        return self.worker.get_weights_by_name(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

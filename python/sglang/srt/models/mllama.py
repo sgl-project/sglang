@@ -15,7 +15,6 @@ from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.layernorm import RMSNorm
@@ -34,6 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 
 
@@ -654,7 +654,6 @@ class MllamaTextModel(nn.Module):
         self,
         config: config_mllama.MllamaTextConfig,
         quant_config: Optional[QuantizationConfig],
-        cache_config=None,
     ):
         super().__init__()
         self.padding_id = config.pad_token_id
@@ -732,11 +731,10 @@ class MllamaForCausalLM(nn.Module):
         self,
         config: config_mllama.MllamaTextConfig,
         quant_config: Optional[QuantizationConfig],
-        cache_config=None,
     ):
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.model = MllamaTextModel(config, cache_config, quant_config)
+        self.model = MllamaTextModel(config, quant_config)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -772,7 +770,6 @@ class MllamaForConditionalGeneration(nn.Module):
         self,
         config: config_mllama.MllamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ):
         super().__init__()
         self.vocab_size = config.text_config.vocab_size
@@ -787,7 +784,6 @@ class MllamaForConditionalGeneration(nn.Module):
         self.vision_model = MllamaVisionModel(config.vision_config)
         self.language_model = MllamaForCausalLM(
             config.text_config,
-            cache_config=cache_config,
             quant_config=quant_config,
         )
         self.multi_modal_projector = nn.Linear(
@@ -966,7 +962,7 @@ class MllamaForConditionalGeneration(nn.Module):
             skip_cross_attention=skip_cross_attention,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.language_model.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

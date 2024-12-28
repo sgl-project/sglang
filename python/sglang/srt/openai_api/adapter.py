@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
@@ -488,6 +486,7 @@ def v1_generate_request(
     return_logprobs = []
     logprob_start_lens = []
     top_logprobs_nums = []
+    lora_paths = []
 
     for request in all_requests:
         # NOTE: with openai API, the prompt's logprobs are always not computed
@@ -498,6 +497,7 @@ def v1_generate_request(
             )
 
         prompts.append(request.prompt)
+        lora_paths.append(request.lora_path)
         if request.echo and request.logprobs:
             current_logprob_start_len = 0
         else:
@@ -510,18 +510,21 @@ def v1_generate_request(
                 "stop": request.stop,
                 "stop_token_ids": request.stop_token_ids,
                 "top_p": request.top_p,
+                "top_k": request.top_k,
+                "min_p": request.min_p,
                 "presence_penalty": request.presence_penalty,
                 "frequency_penalty": request.frequency_penalty,
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
                 "json_schema": request.json_schema,
+                "ebnf": request.ebnf,
                 "n": request.n,
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
                 "skip_special_tokens": request.skip_special_tokens,
             }
         )
-        return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
+        return_logprobs.append(request.logprobs is not None)
         logprob_start_lens.append(current_logprob_start_len)
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
@@ -536,6 +539,7 @@ def v1_generate_request(
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
+        lora_paths = lora_paths[0]
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -551,6 +555,7 @@ def v1_generate_request(
         return_text_in_logprobs=True,
         stream=all_requests[0].stream,
         rid=request_ids,
+        lora_path=lora_paths,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -593,9 +598,9 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
             text = prompts[prompt_index] + text
 
         logprobs = False
-        if isinstance(request, list) and request[idx].logprobs:
+        if isinstance(request, list) and request[idx].logprobs is not None:
             logprobs = True
-        elif (not isinstance(request, list)) and request.logprobs:
+        elif (not isinstance(request, list)) and request.logprobs is not None:
             logprobs = True
         if logprobs:
             if echo:
@@ -688,6 +693,14 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    if "extra_body" in request_json:
+        extra = request_json["extra_body"]
+        if "ebnf" in extra:
+            request_json["ebnf"] = extra["ebnf"]
+        if "regex" in extra:
+            request_json["regex"] = extra["regex"]
+        # remove extra_body to avoid pydantic conflict
+        del request_json["extra_body"]
     all_requests = [CompletionRequest(**request_json)]
     adapted_request, request = v1_generate_request(all_requests)
 
@@ -737,7 +750,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             # Prepend prompt in response text.
                             text = prompts + text
 
-                    if request.logprobs:
+                    if request.logprobs is not None:
                         # The first chunk and echo is enabled.
                         if not stream_buffer and request.echo:
                             input_token_logprobs = content["meta_info"][
@@ -854,6 +867,7 @@ def v1_chat_generate_request(
     logprob_start_lens = []
     top_logprobs_nums = []
     modalities_list = []
+    lora_paths = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -916,6 +930,7 @@ def v1_chat_generate_request(
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
+        lora_paths.append(request.lora_path)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -924,10 +939,13 @@ def v1_chat_generate_request(
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
             "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
+            "ebnf": request.ebnf,
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
@@ -952,6 +970,7 @@ def v1_chat_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
+        lora_paths = lora_paths[0]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -969,6 +988,7 @@ def v1_chat_generate_request(
         return_text_in_logprobs=True,
         rid=request_ids,
         modalities=modalities_list,
+        lora_path=lora_paths,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -989,11 +1009,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
             )
             token_logprobs = []
-            for token, logprob in zip(logprobs.tokens, logprobs.token_logprobs):
+            for token_idx, (token, logprob) in enumerate(
+                zip(logprobs.tokens, logprobs.token_logprobs)
+            ):
                 token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
                 if logprobs.top_logprobs:
-                    for top_token, top_logprob in logprobs.top_logprobs[0].items():
+                    for top_token, top_logprob in logprobs.top_logprobs[
+                        token_idx
+                    ].items():
                         top_token_bytes = list(top_token.encode("utf-8"))
                         top_logprobs.append(
                             TopLogprob(
@@ -1094,6 +1118,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    if "extra_body" in request_json:
+        extra = request_json["extra_body"]
+        # For example, if 'ebnf' is given:
+        if "ebnf" in extra:
+            request_json["ebnf"] = extra["ebnf"]
+        if "regex" in extra:
+            request_json["regex"] = extra["regex"]
+        # remove extra_body to avoid pydantic conflict
+        del request_json["extra_body"]
     all_requests = [ChatCompletionRequest(**request_json)]
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
@@ -1273,7 +1306,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     for request in all_requests:
         prompt = request.input
         assert (
-            type(prompt) == first_prompt_type
+            type(prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
         prompts.append(prompt)
 
@@ -1284,7 +1317,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
-        if isinstance(prompts[0], str) or isinstance(propmts[0][0], str):
+        if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}

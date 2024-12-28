@@ -1,20 +1,16 @@
-from __future__ import annotations
-
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 Store information about a forward batch.
 
@@ -30,6 +26,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -52,14 +50,18 @@ if TYPE_CHECKING:
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
-    # Extend a sequence. The KV cache of the first part of the sequence is already computed (e.g., system prompt).
+    # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
-    # Contains both EXTEND and DECODE.
+    # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence allocated.
+    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
+
+    # A dummy first batch to start the pipeline for overlap scheduler.
+    # It is now used for triggering the sampling_info_done event for the first prefill batch.
+    DUMMY_FIRST = auto()
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
@@ -75,6 +77,9 @@ class ForwardMode(IntEnum):
 
     def is_idle(self):
         return self == ForwardMode.IDLE
+
+    def is_dummy_first(self):
+        return self == ForwardMode.DUMMY_FIRST
 
 
 @dataclass
@@ -124,6 +129,9 @@ class ForwardBatch:
 
     # For LoRA
     lora_paths: Optional[List[str]] = None
+
+    # For input embeddings
+    input_embeds: Optional[torch.tensor] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -226,6 +234,7 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
+            input_embeds=batch.input_embeds,
         )
 
         if ret.global_num_tokens is not None:
@@ -247,10 +256,15 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            ret.extend_num_tokens = batch.extend_num_tokens
-            ret.positions, ret.extend_start_loc = compute_position_triton(
-                ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
-            )
+            if model_runner.server_args.attention_backend != "torch_native":
+                ret.extend_num_tokens = batch.extend_num_tokens
+                ret.positions, ret.extend_start_loc = compute_position_triton(
+                    ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
+                )
+            else:
+                ret.positions, ret.extend_start_loc = compute_position_torch(
+                    ret.extend_prefix_lens, ret.extend_seq_lens
+                )
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens

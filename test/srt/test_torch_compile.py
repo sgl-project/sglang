@@ -1,9 +1,10 @@
+import time
 import unittest
 from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -27,7 +28,7 @@ class TestTorchCompile(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid, include_self=True)
+        kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -56,14 +57,14 @@ class TestTorchCompile(unittest.TestCase):
         return response.json()
 
     def test_throughput(self):
-        import time
+        # Warmup
+        res = self.run_decode(16)
 
         max_tokens = 256
-
         tic = time.time()
         res = self.run_decode(max_tokens)
         tok = time.time()
-        print(res["text"])
+        print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
         self.assertGreaterEqual(throughput, 152)
