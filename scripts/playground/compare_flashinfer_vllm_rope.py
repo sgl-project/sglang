@@ -55,13 +55,13 @@ def main():
     k = torch.rand((batch_size, seq_len, head_size), dtype=torch.float16, device="cuda")
 
     max_position = seq_len
-    positions = torch.randint(0, seq_len, (batch_size + 1,), device="cuda")
+    positions = torch.randint(0, seq_len, (batch_size * seq_len,), device="cuda")
 
     #  (batch_size, seq_len, head_size) -> flashinfer input shape (nnz, num_heads, head_dim)
     flashinfer_q_rope, flashinfer_k_rope = flashinfer_rope(
         rearrange(q, "b s h -> (b s) 1 h"),
         rearrange(k, "b s h -> (b s) 1 h"),
-        positions.int(),
+        positions.int(),  # flashinfer posiitons should have i32 data type
         rotary_dim,
         rope_theta,
     )
@@ -76,9 +76,9 @@ def main():
         q, k, positions, head_size, rotary_dim, rope_theta, max_position
     )
 
-    # Mismatched elements: 2 / 1280 (0.2%)
-    # Greatest absolute difference: 0.0001220703125 at index (0, 1, 4) (up to 1e-05 allowed)
-    # Greatest relative difference: 0.017852783203125 at index (0, 2, 6) (up to 0.001 allowed)
+    # Mismatched elements: 35 / 1280 (2.7%)
+    # Greatest absolute difference: 0.000732421875 at index (1, 0, 7) (up to 1e-05 allowed)
+    # Greatest relative difference: 0.08514404296875 at index (0, 1, 35) (up to 0.001 allowed)
 
     torch.testing.assert_close(flashinfer_q_rope, vllm_q_rope, atol=2e-4, rtol=2e-1)
     torch.testing.assert_close(flashinfer_k_rope, vllm_k_rope, atol=2e-4, rtol=2e-1)
