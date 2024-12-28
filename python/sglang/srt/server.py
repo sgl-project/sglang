@@ -484,7 +484,16 @@ def launch_engine(
     # Wait for model to finish loading
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
-        data = scheduler_pipe_readers[i].recv()
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError as e:
+            logger.exception(e)
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
 
         if data["status"] != "ready":
             raise RuntimeError(
