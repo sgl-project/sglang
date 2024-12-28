@@ -56,7 +56,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput, UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -167,7 +168,7 @@ async def flush_cache():
     tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-                "(When there are running or waiting requests, the operation will not be performed.)\n",
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -739,7 +740,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -789,7 +790,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -871,7 +872,9 @@ class Engine:
         """Update weights from distributed source."""
         obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(tokenizer_manager.update_weights_from_tensor(obj, None))
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_tensor(obj, None)
+        )
 
     def get_weights_by_name(self, name, truncate_size=100):
         """Get weights by parameter name."""

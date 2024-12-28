@@ -1,7 +1,8 @@
 import unittest
 
-import sglang as sgl
 import torch
+
+import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
@@ -13,7 +14,9 @@ class TestReleaseGPUOccupation(unittest.TestCase):
 
         def _check_param(expect_values):
             actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
-            assert torch.allclose(actual_values, torch.tensor(expect_values), atol=0.001), f'{actual_values=}'
+            assert torch.allclose(
+                actual_values, torch.tensor(expect_values), atol=0.001
+            ), f"{actual_values=}"
 
         _check_param([0.0571, -0.0114, 0.0444, 0.0215, -0.0149])
 
