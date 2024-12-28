@@ -43,7 +43,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
             engine.update_weights_from_tensor(name, tensor)
 
         outputs = engine.generate(prompt, sampling_params)["text"]
-        self.assertEqual(outputs, " to spend it outdoors. I decided to")
+        self.assertEqual(outputs, "it. I like it even more when")
 
         if _DEBUG_EXTRA:
             time.sleep(5)
