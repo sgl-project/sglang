@@ -21,13 +21,6 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-from vllm.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-    set_custom_all_reduce,
-)
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -58,6 +51,12 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
+)
+from vllm.distributed import (
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+    set_custom_all_reduce,
 )
 
 logger = logging.getLogger(__name__)
@@ -429,8 +428,9 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(self, name, tensor):
-        TODO
+    def update_weights_from_tensor(self, name, tensor: torch.Tensor):
+        self.model.load_weights([(name, tensor)])
+        return True, 'Success'  # TODO error handling
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
