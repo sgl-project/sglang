@@ -1,16 +1,17 @@
 import argparse
+import datetime
 import os
 import sys
 import time
-import torch
-import torch.nn as nn
+from contextlib import nullcontext
+
 import numpy as np
-import datetime
+import pandas as pd
+import torch
 import torch.distributed as dist
+import torch.nn as nn
 import transformer_engine.pytorch as te
 import transformer_engine.pytorch.cpp_extensions as tex
-import pandas as pd
-from contextlib import nullcontext
 
 RANK = int(os.environ.get("RANK", 0))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
@@ -36,7 +37,12 @@ torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 np.random.seed(3 + RANK)
 
 
-torch.distributed.init_process_group(backend="nccl", world_size=WORLD_SIZE, rank=RANK, timeout=datetime.timedelta(seconds=1800))
+torch.distributed.init_process_group(
+    backend="nccl",
+    world_size=WORLD_SIZE,
+    rank=RANK,
+    timeout=datetime.timedelta(seconds=1800),
+)
 # use all ranks as tp group
 TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="nccl")
 
@@ -113,7 +119,9 @@ def perf_torch(
     warmup_iters = warmup
     total_iters = warmup_iters + iters
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    allgather_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
+    allgather_end_events = [
+        torch.cuda.Event(enable_timing=True) for _ in range(total_iters)
+    ]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
 
     torch.distributed.barrier()
@@ -135,8 +143,12 @@ def perf_torch(
         allgather_end_events[i].synchronize()
         end_events[i].synchronize()
         if i >= warmup_iters:
-            comm_times.append(start_events[i].elapsed_time(allgather_end_events[i]) / 1000)
-            gemm_times.append(allgather_end_events[i].elapsed_time(end_events[i]) / 1000)
+            comm_times.append(
+                start_events[i].elapsed_time(allgather_end_events[i]) / 1000
+            )
+            gemm_times.append(
+                allgather_end_events[i].elapsed_time(end_events[i]) / 1000
+            )
 
     comm_time = sum(comm_times) / iters * 1000
     gemm_time = sum(gemm_times) / iters * 1000
@@ -169,7 +181,10 @@ def perf_te(
     dist.barrier()
     # Initialize output buffer for AllGather
     full_input = torch.zeros(
-        (M, input.size(1)), dtype=input.dtype, device=torch.cuda.current_device(),requires_grad=False,
+        (M, input.size(1)),
+        dtype=input.dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=False,
     )
     alpha_scale = 1.0
     if is_fp8:
@@ -179,15 +194,17 @@ def perf_te(
         full_input = full_input.to(torch.bfloat16)
 
     dist.all_gather_into_tensor(full_input, input, group=TP_GROUP)
-    
+
     dist.barrier()
     # Warmup and timing setup
     warmup_iters = warmup
     total_iters = warmup_iters + iters
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(warmup + iters)]
-    allgather_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(warmup + iters)]
+    allgather_end_events = [
+        torch.cuda.Event(enable_timing=True) for _ in range(warmup + iters)
+    ]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(warmup + iters)]
-    
+
     dist.barrier()
 
     for i in range(total_iters):
@@ -197,15 +214,16 @@ def perf_te(
         allgather_end_events[i].record()
 
         workspace_size = M * weight.size(0)  # pre-allocate memory for tex.gemm()
-        workspace = torch.empty((workspace_size,), dtype=torch.float16, device='cuda')
+        workspace = torch.empty((workspace_size,), dtype=torch.float16, device="cuda")
         # GEMM operation using TransformerEngine
         output_gemm = tex.gemm(
-            full_input, weight.t(),
+            full_input,
+            weight.t(),
             dtype=input.dtype,
             workspace=workspace,
             gelu=False,
             grad=False,
-            accumulate=False
+            accumulate=False,
         )
         output = output_gemm[0]
         if is_fp8:
@@ -220,8 +238,12 @@ def perf_te(
         allgather_end_events[i].synchronize()
         end_events[i].synchronize()
         if i >= warmup_iters:
-            comm_times.append(start_events[i].elapsed_time(allgather_end_events[i]) / 1000)
-            gemm_times.append(allgather_end_events[i].elapsed_time(end_events[i]) / 1000)
+            comm_times.append(
+                start_events[i].elapsed_time(allgather_end_events[i]) / 1000
+            )
+            gemm_times.append(
+                allgather_end_events[i].elapsed_time(end_events[i]) / 1000
+            )
 
     comm_time = sum(comm_times) / len(comm_times) * 1000
     gemm_time = sum(gemm_times) / len(gemm_times) * 1000
@@ -237,7 +259,6 @@ def perf_te(
     )
 
 
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("M", type=int)
@@ -247,7 +268,10 @@ def parse_args():
     parser.add_argument("--iters", default=10, type=int, help="perf iterations")
     parser.add_argument("--dtype", default="bfloat16", type=str, help="data type")
     parser.add_argument(
-        "--profile", default=False, action="store_true", help="dump torch.profiler.profile"
+        "--profile",
+        default=False,
+        action="store_true",
+        help="dump torch.profiler.profile",
     )
     parser.add_argument(
         "--local_copy",
@@ -257,7 +281,10 @@ def parse_args():
         default=True,
     )
     parser.add_argument(
-        "--gather_output", default=False, action="store_true", help="output gather results"
+        "--gather_output",
+        default=False,
+        action="store_true",
+        help="output gather results",
     )
     parser.add_argument(
         "--transpose_weight",
@@ -266,7 +293,9 @@ def parse_args():
         help="transpose weight",
         default=True,
     )
-    parser.add_argument("--has_bias", default=False, action="store_true", help="whether have bias")
+    parser.add_argument(
+        "--has_bias", default=False, action="store_true", help="whether have bias"
+    )
     parser.add_argument(
         "--fastacc",
         default=False,
@@ -301,7 +330,7 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
 
     dtype = DTYPE_MAP[args.dtype]
-    is_fp8 = False # to be supported in the future
+    is_fp8 = False  # to be supported in the future
     if args.transpose_weight and is_fp8:
         raise ValueError("FP8 GEMM does not support RRR layout")
 
@@ -337,7 +366,10 @@ if __name__ == "__main__":
 
     ctx = (
         torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
             record_shapes=True,
         )
         if args.profile
@@ -346,7 +378,14 @@ if __name__ == "__main__":
 
     with ctx:
         perf_res_torch = perf_torch(
-            input, weight, bias, input_scale, weight_scale, is_fp8, args.warmup, args.iters
+            input,
+            weight,
+            bias,
+            input_scale,
+            weight_scale,
+            is_fp8,
+            args.warmup,
+            args.iters,
         )
         perf_res_te = perf_te(
             input,
@@ -356,7 +395,7 @@ if __name__ == "__main__":
             weight_scale,
             is_fp8,
             args.warmup,
-            args.iters
+            args.iters,
         )
 
     if args.profile:
@@ -375,7 +414,6 @@ if __name__ == "__main__":
             print(perf_res_torch)
         torch.distributed.barrier()
     torch.distributed.barrier()
-
 
     for i in range(TP_GROUP.size()):
         if i == TP_GROUP.rank():

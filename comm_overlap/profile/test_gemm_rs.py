@@ -1,22 +1,23 @@
 # usage: torchrun --node_rank=0 --nproc_per_node=8 --nnodes=1 --rdzv_id=none --master_addr=127.0.0.1 --master_port=23456 test/test_gemm_rs.py 2048 10240 40960
 import argparse
-from functools import partial
+import datetime
 import os
 import sys
 import time
-from typing import Union
-import torch
-import numpy as np
-import datetime
 from contextlib import nullcontext
+from functools import partial
+from typing import Union
+
 import flux
+import numpy as np
+import pandas as pd
+import torch
+import torch.distributed as dist
+
 # from flux.gemm_rs_sm80 import get_intra_node_pg_group
 import torch.nn as nn
-import torch.distributed as dist
 import transformer_engine.pytorch as te
 import transformer_engine.pytorch.cpp_extensions as tex
-import pandas as pd
-
 
 RANK = int(os.environ.get("RANK", 0))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
@@ -40,7 +41,10 @@ torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 np.random.seed(3 + RANK)
 
 torch.distributed.init_process_group(
-    backend="nccl", world_size=WORLD_SIZE, rank=RANK, timeout=datetime.timedelta(seconds=1800)
+    backend="nccl",
+    world_size=WORLD_SIZE,
+    rank=RANK,
+    timeout=datetime.timedelta(seconds=1800),
 )
 # use all ranks as tp group
 TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="nccl")
@@ -88,7 +92,7 @@ def perf_torch(
         device=torch.cuda.current_device(),
         requires_grad=False,
     )
-    
+
     output = torch.zeros(
         [m // WORLD_SIZE, n],
         dtype=output_dtype,
@@ -113,7 +117,7 @@ def perf_torch(
     gemm_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
     torch.distributed.barrier()
-    
+
     for i in range(total_iters):
         start_events[i].record()
         # if is_fp8:
@@ -175,21 +179,20 @@ def perf_te(
     n = w.size(0)
 
     output_dtype = input.dtype if not is_fp8 else torch.bfloat16
-   
+
     full_output = torch.zeros(
         [m, n],
         dtype=output_dtype,
         device=torch.cuda.current_device(),
         requires_grad=False,
     )
-    
+
     output = torch.zeros(
         [m // WORLD_SIZE, n],
         dtype=output_dtype,
         device=torch.cuda.current_device(),
         requires_grad=False,
     )
-    
 
     warmup_iters = warmup
     total_iters = warmup_iters + iters
@@ -200,21 +203,26 @@ def perf_te(
 
     for i in range(total_iters):
         start_events[i].record()
-        workspace_size = input.size(0) * weight.size(0)  # pre-allocate memory for tex.gemm()
-        workspace = torch.empty((workspace_size,), dtype=torch.float16, device='cuda')
+        workspace_size = input.size(0) * weight.size(
+            0
+        )  # pre-allocate memory for tex.gemm()
+        workspace = torch.empty((workspace_size,), dtype=torch.float16, device="cuda")
         output_gemm = tex.gemm(
-            weight, input,
+            weight,
+            input,
             # input, weight,
             dtype=input.dtype,
             workspace=workspace,
             gelu=False,
             grad=False,
-            accumulate=False
+            accumulate=False,
         )
         full_output = output_gemm[0]
         expected_shape = (output.size(0) * WORLD_SIZE, output.size(1))
         if full_output.size() != expected_shape:
-            raise ValueError(f"full_output shape {full_output.size()} does not match the expected shape {expected_shape}, input size {input.size()} and weight.t() size {weight.t().size()} and weight size {weight.size()} ")
+            raise ValueError(
+                f"full_output shape {full_output.size()} does not match the expected shape {expected_shape}, input size {input.size()} and weight.t() size {weight.t().size()} and weight size {weight.size()} "
+            )
         if bias is not None:
             full_output += bias
         gemm_end_events[i].record()
@@ -253,15 +261,26 @@ def parse_args():
     parser.add_argument("--iters", default=100, type=int, help="perf iterations")
     parser.add_argument("--dtype", default="bfloat16", type=str, help="data type")
     parser.add_argument(
-        "--profile", default=False, action="store_true", help="dump torch.profiler.profile"
+        "--profile",
+        default=False,
+        action="store_true",
+        help="dump torch.profiler.profile",
     )
     parser.add_argument(
-        "--transpose_weight", default=False, action="store_true", help="whether to transpose weight"
+        "--transpose_weight",
+        default=False,
+        action="store_true",
+        help="whether to transpose weight",
     )
     parser.add_argument(
-        "--fuse_reduction", default=False, action="store_true", help="fuse reduction to gemm"
+        "--fuse_reduction",
+        default=False,
+        action="store_true",
+        help="fuse reduction to gemm",
     )
-    parser.add_argument("--has_bias", default=False, action="store_true", help="whether have bias")
+    parser.add_argument(
+        "--has_bias", default=False, action="store_true", help="whether have bias"
+    )
     parser.add_argument(
         "--runs_per_node", default=False, action="store_true", help="multi-stage gemm"
     )
@@ -283,7 +302,9 @@ def _rand(shape, dtype):
         )
         with flux.util.with_torch_deterministic(False):
             return tensor.to(dtype)
-    return (-2 * torch.rand(shape, dtype=dtype).cuda() + 1) / 100 * (TP_GROUP.rank() + 1)
+    return (
+        (-2 * torch.rand(shape, dtype=dtype).cuda() + 1) / 100 * (TP_GROUP.rank() + 1)
+    )
 
 
 if __name__ == "__main__":
@@ -299,7 +320,7 @@ if __name__ == "__main__":
     # print("after flux shm initialization")
 
     dtype = DTYPE_MAP[args.dtype]
-    is_fp8 = False # tobe supported in the future
+    is_fp8 = False  # tobe supported in the future
     if args.transpose_weight and is_fp8:
         raise ValueError("FP8 GEMM does not support RRR layout")
 
@@ -313,15 +334,21 @@ if __name__ == "__main__":
 
     input_scale, weight_scale = None, None
 
-
     bias = None
     bias_dtype = dtype if not is_fp8 else torch.bfloat16  # always BF16 for FP8 matmul
     if args.has_bias:
-        bias = torch.rand((args.M, args.N), dtype=dtype).cuda() / 10 * (TP_GROUP.rank() + 1)
+        bias = (
+            torch.rand((args.M, args.N), dtype=dtype).cuda()
+            / 10
+            * (TP_GROUP.rank() + 1)
+        )
 
     ctx = (
         torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
             record_shapes=True,
             with_stack=True,
         )

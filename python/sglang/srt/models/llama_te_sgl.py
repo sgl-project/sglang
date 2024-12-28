@@ -22,6 +22,7 @@ limitations under the License.
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
+import transformer_engine as te
 from torch import nn
 from transformers import LlamaConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -42,12 +43,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+
 # from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-import transformer_engine as te
 # from transformer_engine.pytorch.attention import RotaryPositionEmbedding
 # from transformer_engine.pytorch.fp8 import fp8_model_init
 
@@ -139,6 +140,7 @@ class TELlamaAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+
 class TELlamaDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -174,22 +176,22 @@ class TELlamaDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         self.layernorm_mlp = te.pytorch.LayerNormMLP(
-                hidden_size = self.hidden_size,
-                ffn_hidden_size = config.intermediate_size,
-                eps=config.rms_norm_eps,
-                tp_size=tp_size,
-                bias=False,
-                return_layernorm_output=True,
-                return_layernorm_output_gathered=True,
-                set_parallel_mode=True,
-                ub_bulk_wgrad=True,
-                ub_bulk_dgrad=True,
-                ub_overlap_rs_dgrad=True,
-                ub_overlap_rs=True,
-                ub_overlap_ag=True,
-                normalization="RMSNorm",
-                activation = "swiglu",
-            )
+            hidden_size=self.hidden_size,
+            ffn_hidden_size=config.intermediate_size,
+            eps=config.rms_norm_eps,
+            tp_size=tp_size,
+            bias=False,
+            return_layernorm_output=True,
+            return_layernorm_output_gathered=True,
+            set_parallel_mode=True,
+            ub_bulk_wgrad=True,
+            ub_bulk_dgrad=True,
+            ub_overlap_rs_dgrad=True,
+            ub_overlap_rs=True,
+            ub_overlap_ag=True,
+            normalization="RMSNorm",
+            activation="swiglu",
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -212,8 +214,11 @@ class TELlamaDecoderLayer(nn.Module):
         )
 
         # Fully Connected with TE
-        hidden_states, residual = self.layernorm_mlp(hidden_states) # set return_layernorm_output = true
+        hidden_states, residual = self.layernorm_mlp(
+            hidden_states
+        )  # set return_layernorm_output = true
         return hidden_states, residual
+
 
 class TELlamaModel(nn.Module):
     def __init__(
@@ -225,13 +230,13 @@ class TELlamaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        
+
         # embedding layers
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
-        
+
         # multi-layer transformer decoder = attention + MLP
         self.layers = nn.ModuleList(
             [
@@ -241,7 +246,7 @@ class TELlamaModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        
+
         # RMSNorm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -268,6 +273,7 @@ class TELlamaModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+
 # the complete tellama model
 class TELlamaForCausalLM(nn.Module):
     def __init__(
@@ -280,15 +286,17 @@ class TELlamaForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.torchao_config = global_server_args_dict["torchao_config"]
-        
+
         # backbone of llama model
         self.model = TELlamaModel(config, quant_config=quant_config)
         # head
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         # logits processing
         self.logits_processor = LogitsProcessor(config)
-        
-        print("sucessfully load TE llama") #zhuohaol: test if TELlamaForCausalLM imported
+
+        print(
+            "sucessfully load TE llama"
+        )  # zhuohaol: test if TELlamaForCausalLM imported
 
     @torch.no_grad()
     def forward(
@@ -338,7 +346,7 @@ class TELlamaForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v", 3),
             ("gate_up_proj", "gate_proj", 0, 2),
             ("gate_up_proj", "up_proj", 1, 2),
-            #TODO: (zhuohaol) need to be updated later for get_module_name usage in other files
+            # TODO: (zhuohaol) need to be updated later for get_module_name usage in other files
         ]
         for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
             if weight_name in name:
@@ -352,22 +360,45 @@ class TELlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         return len(params_dict)
 
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # define the mapping relationship of parameters, used to handle stacked parameters
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj.weight", "q"),  # map q_proj to the first part of qkv_proj
-            (".qkv_proj", ".k_proj.weight", "k"),  # map k_proj to the second part of qkv_proj  
-            (".qkv_proj", ".v_proj.weight", "v"),  # map v_proj to the third part of qkv_proj
+            (
+                ".qkv_proj",
+                ".q_proj.weight",
+                "q",
+            ),  # map q_proj to the first part of qkv_proj
+            (
+                ".qkv_proj",
+                ".k_proj.weight",
+                "k",
+            ),  # map k_proj to the second part of qkv_proj
+            (
+                ".qkv_proj",
+                ".v_proj.weight",
+                "v",
+            ),  # map v_proj to the third part of qkv_proj
             # map MLP layer parameters
-            (".layernorm_mlp.fc1_weight", ".gate_proj.weight", 0),  # map gate_proj to the first part of fc1
-            (".layernorm_mlp.fc1_weight", ".up_proj.weight", 1),    # map up_proj to the second part of fc1
-            (".layernorm_mlp.fc2_weight", ".down_proj.weight", 0),  # map down_proj to the first part of fc2
+            (
+                ".layernorm_mlp.fc1_weight",
+                ".gate_proj.weight",
+                0,
+            ),  # map gate_proj to the first part of fc1
+            (
+                ".layernorm_mlp.fc1_weight",
+                ".up_proj.weight",
+                1,
+            ),  # map up_proj to the second part of fc1
+            (
+                ".layernorm_mlp.fc2_weight",
+                ".down_proj.weight",
+                0,
+            ),  # map down_proj to the first part of fc2
             # map LayerNorm parameters
             (".layernorm_mlp.layer_norm_weight", ".post_attention_layernorm.weight", 0),
         ]
-        
+
         # get the dictionary of all parameters of the model
         params_dict = dict(self.named_parameters())
 
@@ -380,7 +411,7 @@ class TELlamaForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            
+
             # if the weight is empty, skip
             if loaded_weight.numel() == 0:
                 print(f"Warning: loaded_weight for {name} is empty.")
@@ -389,9 +420,9 @@ class TELlamaForCausalLM(nn.Module):
             # traverse the mapping relationship to handle stacked parameters
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
-                    continue 
+                    continue
                 mapped_name = name.replace(weight_name, param_name)
-                
+
                 # special processing for QKV projection layer
                 if param_name == ".qkv_proj":
                     if mapped_name not in params_dict:
@@ -400,12 +431,14 @@ class TELlamaForCausalLM(nn.Module):
                     # split loaded_weight into q,k,v three parts
                     q_weight, k_weight, v_weight = torch.chunk(loaded_weight, 3, dim=0)
 
-                    if shard_id == "q":  # q_proj 
+                    if shard_id == "q":  # q_proj
                         params_dict[mapped_name][: q_weight.shape[0]] = q_weight
-                    elif shard_id == "k":  # k_proj 
-                        params_dict[mapped_name][q_weight.shape[0]: 2 * q_weight.shape[0]] = k_weight
-                    elif shard_id == "v":  # v_proj 
-                        params_dict[mapped_name][2 * q_weight.shape[0]:] = v_weight
+                    elif shard_id == "k":  # k_proj
+                        params_dict[mapped_name][
+                            q_weight.shape[0] : 2 * q_weight.shape[0]
+                        ] = k_weight
+                    elif shard_id == "v":  # v_proj
+                        params_dict[mapped_name][2 * q_weight.shape[0] :] = v_weight
                     break
 
                 # process LayerNorm weights
@@ -418,14 +451,16 @@ class TELlamaForCausalLM(nn.Module):
                 if param_name == ".layernorm_mlp.fc1_weight":
                     if mapped_name not in params_dict:
                         params_dict[mapped_name] = torch.zeros_like(loaded_weight)
-                    
+
                     # split loaded_weight into gate_proj and up_proj two parts
-                    gate_weight, up_weight = torch.split(loaded_weight, loaded_weight.shape[0] // 2, dim=0)
+                    gate_weight, up_weight = torch.split(
+                        loaded_weight, loaded_weight.shape[0] // 2, dim=0
+                    )
 
                     if shard_id == 0:  # gate_proj
                         params_dict[mapped_name][: gate_weight.shape[0]] = gate_weight
                     elif shard_id == 1:  # up_proj
-                        params_dict[mapped_name][gate_weight.shape[0]:] = up_weight
+                        params_dict[mapped_name][gate_weight.shape[0] :] = up_weight
                     break
 
                 # process down_proj weights
@@ -440,7 +475,7 @@ class TELlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                break  
+                break
             else:
                 # process other normal parameters
                 if name.endswith(".bias") and name not in params_dict:
@@ -452,7 +487,10 @@ class TELlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
         # process weight binding of embedding layer
-        if hasattr(self.config, "tie_word_embeddings") and self.config.tie_word_embeddings:
+        if (
+            hasattr(self.config, "tie_word_embeddings")
+            and self.config.tie_word_embeddings
+        ):
             param = self.lm_head.weight
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, self.model.embed_tokens.weight)

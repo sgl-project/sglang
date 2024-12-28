@@ -5,7 +5,7 @@
 Please follow: [TransformerEngine](https://github.com/NVIDIA/TransformerEngine/tree/main) and [Flux](https://github.com/bytedance/flux) prerequsite for installation.
 
 ### TransformerEngine
-For a quick pre-knwoledge, [TransformerEngine](https://github.com/NVIDIA/TransformerEngine/tree/main) is a library for accelerating Transformer Model on NVIDIA GPUs. The official document and API cookbook is [here](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html). 
+For a quick pre-knwoledge, [TransformerEngine](https://github.com/NVIDIA/TransformerEngine/tree/main) is a library for accelerating Transformer Model on NVIDIA GPUs. The official document and API cookbook is [here](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html).
 
 Useful code:
 * [Distributed Test](https://github.com/NVIDIA/TransformerEngine/tree/main/tests/pytorch/distributed) is a good reference for a quick understanding the TE kernels for gemm, communication overlapping, and common TE APIs. (especially [test_comm_gemm_overlap.py](https://github.com/NVIDIA/TransformerEngine/blob/main/tests/pytorch/distributed/test_comm_gemm_overlap.py))

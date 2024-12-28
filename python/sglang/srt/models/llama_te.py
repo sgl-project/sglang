@@ -21,26 +21,28 @@ limitations under the License.
 # zhuohaol: Adapted from:
 # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/te_llama/tutorial_accelerate_hf_llama_with_te.html
 
+import gc
 import os
 import re
-import gc
 from contextlib import contextmanager
 
 import torch
-from torch import nn
-
 import transformer_engine as te
+import transformers
+from torch import nn
 from transformer_engine.pytorch.attention import RotaryPositionEmbedding
 from transformer_engine.pytorch.fp8 import fp8_model_init
-
-import transformers
-from transformers.models.llama.modeling_llama import (
-    LlamaModel,
-    LlamaForCausalLM,
-    LlamaRMSNorm,
-    LlamaConfig,
+from transformers.modeling_utils import (
+    _add_variant,
+    _load_state_dict_into_model,
+    load_state_dict,
 )
-from transformers.modeling_utils import _add_variant, load_state_dict, _load_state_dict_into_model
+from transformers.models.llama.modeling_llama import (
+    LlamaConfig,
+    LlamaForCausalLM,
+    LlamaModel,
+    LlamaRMSNorm,
+)
 from transformers.utils import WEIGHTS_INDEX_NAME
 from transformers.utils.hub import get_checkpoint_shard_files
 
@@ -50,12 +52,16 @@ def replace_decoder(te_decoder_cls):
     """
     Replace `LlamaDecoderLayer` with custom `TELlamaDecoderLayer`.
     """
-    original_llama_decoder_cls = transformers.models.llama.modeling_llama.LlamaDecoderLayer
+    original_llama_decoder_cls = (
+        transformers.models.llama.modeling_llama.LlamaDecoderLayer
+    )
     transformers.models.llama.modeling_llama.LlamaDecoderLayer = te_decoder_cls
     try:
         yield
     finally:
-        transformers.models.llama.modeling_llama.LlamaDecoderLayer = original_llama_decoder_cls
+        transformers.models.llama.modeling_llama.LlamaDecoderLayer = (
+            original_llama_decoder_cls
+        )
 
 
 class TELlamaDecoderLayer(te.pytorch.TransformerLayer):
@@ -84,7 +90,9 @@ class TELlamaDecoderLayer(te.pytorch.TransformerLayer):
             attn_input_format="bshd",
             num_gqa_groups=config.num_key_value_heads,
         )
-        te_rope = RotaryPositionEmbedding(config.hidden_size // config.num_attention_heads)
+        te_rope = RotaryPositionEmbedding(
+            config.hidden_size // config.num_attention_heads
+        )
         self.te_rope_emb = te_rope(max_seq_len=config.max_position_embeddings).cuda()
 
     def forward(self, hidden_states, *args, attention_mask, **kwargs):
@@ -95,7 +103,9 @@ class TELlamaDecoderLayer(te.pytorch.TransformerLayer):
         """
         return (
             super().forward(
-                hidden_states, attention_mask=attention_mask, rotary_pos_emb=self.te_rope_emb
+                hidden_states,
+                attention_mask=attention_mask,
+                rotary_pos_emb=self.te_rope_emb,
             ),
         )
 
@@ -116,7 +126,9 @@ class NVTELlamaForCausalLM:
         return llama_for_causal_lm
 
     @classmethod
-    def from_pretrained_local(cls, pretrained_model_name_or_path, *args, config, **kwargs):
+    def from_pretrained_local(
+        cls, pretrained_model_name_or_path, *args, config, **kwargs
+    ):
         """
         Custom method adapted from `from_pretrained` method in HuggingFace
         Transformers repo: https://github.com/huggingface/transformers/blob/f497f564bb76697edab09184a252fc1b1a326d1e/src/transformers/modeling_utils.py#L2579
@@ -144,16 +156,22 @@ class NVTELlamaForCausalLM:
             is_sharded = True
         elif os.path.isfile(
             os.path.join(
-                pretrained_model_name_or_path, subfolder, _add_variant(WEIGHTS_INDEX_NAME, variant)
+                pretrained_model_name_or_path,
+                subfolder,
+                _add_variant(WEIGHTS_INDEX_NAME, variant),
             )
         ):
             # Load from a sharded PyTorch checkpoint
             archive_file = os.path.join(
-                pretrained_model_name_or_path, subfolder, _add_variant(WEIGHTS_INDEX_NAME, variant)
+                pretrained_model_name_or_path,
+                subfolder,
+                _add_variant(WEIGHTS_INDEX_NAME, variant),
             )
             is_sharded = True
         else:
-            raise AssertionError("Only sharded PyTorch ckpt format supported at the moment")
+            raise AssertionError(
+                "Only sharded PyTorch ckpt format supported at the moment"
+            )
 
         resolved_archive_file, _ = get_checkpoint_shard_files(
             pretrained_model_name_or_path,
@@ -192,34 +210,34 @@ def replace_params(hf_state_dict, te_state_dict, config):
         # When loading weights into models with less number of layers, skip the
         # copy if the corresponding layer doesn't exist in HF model
         if layer_prefix + "input_layernorm.weight" in hf_state_dict:
-            te_state_dict[layer_prefix + "self_attention.layernorm_qkv.layer_norm_weight"].data[
-                :
-            ] = hf_state_dict[layer_prefix + "input_layernorm.weight"].data[:]
+            te_state_dict[
+                layer_prefix + "self_attention.layernorm_qkv.layer_norm_weight"
+            ].data[:] = hf_state_dict[layer_prefix + "input_layernorm.weight"].data[:]
 
         if layer_prefix + "self_attn.q_proj.weight" in hf_state_dict:
-            te_state_dict[layer_prefix + "self_attention.layernorm_qkv.query_weight"].data[:] = (
-                hf_state_dict[layer_prefix + "self_attn.q_proj.weight"].data[:]
-            )
+            te_state_dict[
+                layer_prefix + "self_attention.layernorm_qkv.query_weight"
+            ].data[:] = hf_state_dict[layer_prefix + "self_attn.q_proj.weight"].data[:]
 
         if layer_prefix + "self_attn.k_proj.weight" in hf_state_dict:
-            te_state_dict[layer_prefix + "self_attention.layernorm_qkv.key_weight"].data[:] = (
-                hf_state_dict[layer_prefix + "self_attn.k_proj.weight"].data[:]
-            )
+            te_state_dict[
+                layer_prefix + "self_attention.layernorm_qkv.key_weight"
+            ].data[:] = hf_state_dict[layer_prefix + "self_attn.k_proj.weight"].data[:]
 
         if layer_prefix + "self_attn.v_proj.weight" in hf_state_dict:
-            te_state_dict[layer_prefix + "self_attention.layernorm_qkv.value_weight"].data[:] = (
-                hf_state_dict[layer_prefix + "self_attn.v_proj.weight"].data[:]
-            )
+            te_state_dict[
+                layer_prefix + "self_attention.layernorm_qkv.value_weight"
+            ].data[:] = hf_state_dict[layer_prefix + "self_attn.v_proj.weight"].data[:]
 
         if layer_prefix + "self_attn.o_proj.weight" in hf_state_dict:
-            te_state_dict[layer_prefix + "self_attention.proj.weight"].data[:] = hf_state_dict[
-                layer_prefix + "self_attn.o_proj.weight"
-            ].data[:]
+            te_state_dict[layer_prefix + "self_attention.proj.weight"].data[:] = (
+                hf_state_dict[layer_prefix + "self_attn.o_proj.weight"].data[:]
+            )
 
         if layer_prefix + "post_attention_layernorm.weight" in hf_state_dict:
-            te_state_dict[layer_prefix + "layernorm_mlp.layer_norm_weight"].data[:] = hf_state_dict[
-                layer_prefix + "post_attention_layernorm.weight"
-            ].data[:]
+            te_state_dict[layer_prefix + "layernorm_mlp.layer_norm_weight"].data[:] = (
+                hf_state_dict[layer_prefix + "post_attention_layernorm.weight"].data[:]
+            )
 
         # It may happen that gate_proj.weight and up_proj.weight will be in the different files, so we need to
         # load them separately.
@@ -234,11 +252,10 @@ def replace_params(hf_state_dict, te_state_dict, config):
             ] = hf_state_dict[layer_prefix + "mlp.up_proj.weight"].data
 
         if layer_prefix + "mlp.down_proj.weight" in hf_state_dict:
-            te_state_dict[layer_prefix + "layernorm_mlp.fc2_weight"].data[:] = hf_state_dict[
-                layer_prefix + "mlp.down_proj.weight"
-            ].data[:]
+            te_state_dict[layer_prefix + "layernorm_mlp.fc2_weight"].data[:] = (
+                hf_state_dict[layer_prefix + "mlp.down_proj.weight"].data[:]
+            )
     return all_layer_prefixes
-
 
 
 EntryClass = NVTELlamaForCausalLM

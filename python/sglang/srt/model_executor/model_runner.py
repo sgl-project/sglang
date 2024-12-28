@@ -151,7 +151,10 @@ class ModelRunner:
         if server_args.enable_te:
             global_server_args_dict.update(
                 {
-                    "TELLaMAForCausalLM": ("llama", "LlamaForCausalLM"), #TODO update TELLaMAForCausalLM with TE integreated (zhuohaol)
+                    "TELLaMAForCausalLM": (
+                        "llama",
+                        "LlamaForCausalLM",
+                    ),  # TODO update TELLaMAForCausalLM with TE integreated (zhuohaol)
                 }
             )
 

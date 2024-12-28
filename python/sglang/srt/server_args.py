@@ -144,7 +144,7 @@ class ServerArgs:
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
-    enable_te: bool = True # zhuohaol: te args, set True for now
+    enable_te: bool = True  # zhuohaol: te args, set True for now
 
     def __post_init__(self):
         # Set missing default values
@@ -780,7 +780,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-te",
             action="store_true",
-            help="Enable TranformerEngine for Communication Overlapping in Tensor Parallelism"
+            help="Enable TranformerEngine for Communication Overlapping in Tensor Parallelism",
         )
 
         # Deprecated arguments

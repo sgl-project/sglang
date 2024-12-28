@@ -7,17 +7,23 @@ It is recommended to use the pre-built docker image. The docker image is built w
 To launch the sglang server with TE enabled, run:
 
 ```bash
+docker run -it --shm-size 32g --gpus all -p 30001:30001 --ipc=host --rm zhuohaol/sglang-te:latest
+
+git clone https://github.com/Zhuohao-Li/sglang/tree/zhuohaol-comm-overlap
+
+cd sglang/python
+
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000 --host 0.0.0.0 --enable-te
 ```
 
-Methods to request the server remains the same. 
+Methods to request the server remains the same.
 
 Key changes:
 
 - In `sglang.srt.models`, we add `llama_te_sgl.py` to support llama models with TE. (`llama_te.py` is a another support version, but it is not recommended to use it now.)
-- In `sglang.model_executor.model_runner.py` and `server_args.py`, we add corresponding arguments to enable TE when launching the engine. 
+- In `sglang.model_executor.model_runner.py` and `server_args.py`, we add corresponding arguments to enable TE when launching the engine.
 - In `comm_overlap.profile`, we provide some scripts to profile performance with torch/te
-- In `comm_overlap.benchmark`, we provide the benchmark instructions for the latency of the TE model. 
+- In `comm_overlap.benchmark`, we provide the benchmark instructions for the latency of the TE model.
 - In `comm_overlap.TE`, it is an example of using TE features (comm_overlap and fp8) to do inference.
 
 #### Benchmark

@@ -16,13 +16,13 @@
 ################################################################################
 
 
-from functools import partial
-import torch
-import numpy as np
+import datetime
 import os
 import sys
+from functools import partial
+
+import numpy as np
 import torch
-import datetime
 
 print = partial(print, file=sys.stderr)
 
@@ -36,7 +36,10 @@ TP_LOCAL_GROUP = None
 torch.cuda.set_device(LOCAL_RANK)
 barrier_tensor = torch.tensor([1], device="cuda")
 torch.distributed.init_process_group(
-    backend="nccl", world_size=WORLD_SIZE, rank=RANK, timeout=datetime.timedelta(seconds=1800)
+    backend="nccl",
+    world_size=WORLD_SIZE,
+    rank=RANK,
+    timeout=datetime.timedelta(seconds=1800),
 )
 assert torch.distributed.is_initialized()
 # use all ranks as tp group
@@ -92,15 +95,22 @@ def get_profiler(exp_name, warmups=1, iters=1):
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
             prof_dir, worker_name=f"{RANK}", use_gzip=True
         ),
-        schedule=torch.profiler.schedule(wait=1, warmup=warmups, active=iters, repeat=1),
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(
+            wait=1, warmup=warmups, active=iters, repeat=1
+        ),
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
         record_shapes=True,
         with_stack=True,
     )
 
 
 def _async_barrier():
-    torch.distributed.all_reduce(barrier_tensor, op=torch.distributed.ReduceOp.MAX, async_op=False)
+    torch.distributed.all_reduce(
+        barrier_tensor, op=torch.distributed.ReduceOp.MAX, async_op=False
+    )
 
 
 def run_perf(expname, warmups, iters, func, sync_per_iter=False):
