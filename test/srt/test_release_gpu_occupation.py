@@ -18,7 +18,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
 
         engine = sgl.Engine(
             model_path=model_old, random_seed=42,
-            disable_cuda_graph=True,  # TODO kvcache is happy w/ cuda graph; temp disable to test model weight release
+            # disable_cuda_graph=True,  # TODO kvcache is happy w/ cuda graph; temp disable to test model weight release
         )
         hf_model_new = AutoModelForCausalLM.from_pretrained(model_new, torch_dtype="bfloat16")
 
