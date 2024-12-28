@@ -576,7 +576,9 @@ class Fp8MoEMethod:
                 # Normalize the weights and scales
                 w13_weight, w13_weight_scale, w13_input_scale = (
                     normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w13_weight, layer.w13_weight_scale_inv, layer.w13_input_scale
+                        layer.w13_weight,
+                        layer.w13_weight_scale_inv,
+                        layer.w13_input_scale,
                     )
                 )
                 w2_weight, w2_weight_scale, w2_input_scale = (
