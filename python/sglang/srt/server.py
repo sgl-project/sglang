@@ -57,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -108,6 +109,7 @@ app.add_middleware(
 
 tokenizer_manager: TokenizerManager = None
 scheduler_info: Dict = None
+
 
 ##### Native API endpoints #####
 
@@ -864,6 +866,14 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def update_weights_from_tensor(self, name, tensor):
+        """Update weights from distributed source."""
+        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
     def get_weights_by_name(self, name, truncate_size=100):
