@@ -44,11 +44,16 @@ suites = {
         "test_vision_openai_server.py",
         "test_session_control.py",
     ],
+    "nightly": [
+        "test_nightly_gsm8k_eval.py",
+        "test_nightly_human_eval.py",
+    ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
     ),
 }
 
+# Expand suite
 for target_suite_name, target_tests in suites.items():
     for suite_name, tests in suites.items():
         if suite_name == target_suite_name:
