@@ -21,6 +21,13 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from vllm.distributed import (
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+    set_custom_all_reduce,
+)
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -51,13 +58,6 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
-    primary_memory_saver,
-)
-from vllm.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-    set_custom_all_reduce,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,14 +67,14 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
-            self,
-            model_config: ModelConfig,
-            mem_fraction_static: float,
-            gpu_id: int,
-            tp_rank: int,
-            tp_size: int,
-            nccl_port: int,
-            server_args: ServerArgs,
+        self,
+        model_config: ModelConfig,
+        mem_fraction_static: float,
+        gpu_id: int,
+        tp_rank: int,
+        tp_size: int,
+        nccl_port: int,
+        server_args: ServerArgs,
     ):
         # Parse args
         self.model_config = model_config
@@ -90,8 +90,8 @@ class ModelRunner:
 
         # Model-specific adjustment
         if (
-                self.model_config.attention_arch == AttentionArch.MLA
-                and not self.server_args.disable_mla
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not self.server_args.disable_mla
         ):
             logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
@@ -148,7 +148,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -255,12 +255,11 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         # Load the model
-        with primary_memory_saver.region():
-            self.model = get_model(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-            )
+        self.model = get_model(
+            model_config=self.model_config,
+            load_config=self.load_config,
+            device_config=DeviceConfig(self.device),
+        )
 
         # Parse other args
         self.sliding_window_size = (
@@ -278,7 +277,7 @@ class ModelRunner:
         )
 
     def update_weights_from_disk(
-            self, model_path: str, load_format: str
+        self, model_path: str, load_format: str
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         from sglang.srt.model_loader.loader import (
@@ -351,13 +350,13 @@ class ModelRunner:
         return True, "Succeeded to update model weights."
 
     def init_weights_update_group(
-            self,
-            master_address,
-            master_port,
-            rank_offset,
-            world_size,
-            group_name,
-            backend="nccl",
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
     ):
         """Initialize the Torch process group for model parameter updates.
 
@@ -412,7 +411,7 @@ class ModelRunner:
         current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
 
         assert (
-                self._model_update_group is not None
+            self._model_update_group is not None
         ), "model update group must be initialized"
 
         try:
@@ -431,7 +430,7 @@ class ModelRunner:
             return False, error_msg
 
     def get_weights_by_name(
-            self, name: str, truncate_size: int = 100
+        self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
 
@@ -463,33 +462,33 @@ class ModelRunner:
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         if (
-                self.model_config.attention_arch == AttentionArch.MLA
-                and not self.server_args.disable_mla
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not self.server_args.disable_mla
         ):
             cell_size = (
-                    (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                    * self.model_config.num_hidden_layers
-                    * torch._utils._element_size(self.kv_cache_dtype)
+                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                * self.model_config.num_hidden_layers
+                * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
             cell_size = (
-                    self.model_config.get_num_kv_heads(self.tp_size)
-                    * self.model_config.head_dim
-                    * self.model_config.num_hidden_layers
-                    * 2
-                    * torch._utils._element_size(self.kv_cache_dtype)
+                self.model_config.get_num_kv_heads(self.tp_size)
+                * self.model_config.head_dim
+                * self.model_config.num_hidden_layers
+                * 2
+                * torch._utils._element_size(self.kv_cache_dtype)
             )
         rest_memory = available_gpu_memory - total_gpu_memory * (
-                1 - self.mem_fraction_static
+            1 - self.mem_fraction_static
         )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
     def init_memory_pool(
-            self,
-            total_gpu_memory: int,
-            max_num_reqs: Optional[int] = None,
-            max_total_tokens: Optional[int] = None,
+        self,
+        total_gpu_memory: int,
+        max_num_reqs: Optional[int] = None,
+        max_total_tokens: Optional[int] = None,
     ):
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
@@ -536,8 +535,8 @@ class ModelRunner:
             use_records=False,
         )
         if (
-                self.model_config.attention_arch == AttentionArch.MLA
-                and not self.server_args.disable_mla
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not self.server_args.disable_mla
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
@@ -616,7 +615,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -699,7 +698,7 @@ class ModelRunner:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 
     def sample(
-            self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
+        self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         sampling_info = forward_batch.sampling_info
         if sampling_info.sampling_info_done:
