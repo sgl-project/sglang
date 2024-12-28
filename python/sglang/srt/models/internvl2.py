@@ -15,6 +15,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/internvl.py
 # Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_internvl_chat.py
 
+import pdb
 import re
 from functools import cached_property, partial
 from typing import (Iterable, List, Literal, Mapping, Optional, Set, Tuple,
@@ -26,27 +27,21 @@ import torchvision.transforms as T
 from PIL import Image
 from transformers import PretrainedConfig
 
-from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
-from vllm.inputs import (INPUT_REGISTRY, DecoderOnlyInputs, DummyData,
+from vllm.inputs import (DecoderOnlyInputs, DummyData,
                          InputContext, token_inputs)
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.awq import AWQConfig
+
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from sglang.srt.models.intern_vit import (InternVisionModel,
                                           InternVisionPatchModel)
+from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
+from vllm.multimodal import MultiModalKwargs
 from vllm.multimodal.inputs import NestedTensors, PlaceholderRange
 from vllm.multimodal.utils import cached_get_tokenizer
 from vllm.sequence import IntermediateTensors
 from vllm.utils import is_list_of
-
-from .clip import (dummy_image_for_clip, dummy_seq_data_for_clip,
-                   get_clip_num_patches)
-from .interfaces import SupportsMultiModal, SupportsPP
-from .utils import (AutoWeightsLoader, flatten_bn, init_vllm_registered_model,
-                    maybe_prefix, merge_multimodal_embeddings)
 
 IMG_START = '<img>'
 IMG_END = '</img>'
@@ -282,218 +277,221 @@ def get_max_internvl_image_size(
     return width, height
 
 
-class InternVLInputPipeline:
+# class InternVLInputPipeline:
 
-    def __init__(
-        self,
-        img_start_token: str,
-        img_end_token: str,
-        img_context_token: str,
-    ) -> None:
+#     def __init__(
+#         self,
+#         img_start_token: str,
+#         img_end_token: str,
+#         img_context_token: str,
+#     ) -> None:
+#         super().__init__()
+
+#         self.img_start_token = img_start_token
+#         self.img_end_token = img_end_token
+#         self.img_context_token = img_context_token
+
+#     def _create_image_prompt(self, feature_size: int, num_patches: int) -> str:
+#         return (self.img_start_token + self.img_context_token * feature_size +
+#                 self.img_end_token)
+
+#     def _expand_image_prompt(
+#         self,
+#         prompt: str,
+#         feature_sizes: List[int],
+#         num_patches: int,
+#     ) -> str:
+#         image_idx = sorted(
+#             map(int, re.findall(r"Image-(\d+): <image>\n", prompt)))
+
+#         new_prompt = prompt
+#         for idx, feature_size in enumerate(feature_sizes, start=1):
+#             image_prompt = self._create_image_prompt(feature_size, num_patches)
+#             if not image_idx:
+#                 image_prompt = f"Image-{idx}: {image_prompt}"
+
+#             new_prompt = new_prompt.replace('<image>', image_prompt, 1)
+
+#         return new_prompt
+
+#     def input_processor(
+#         self,
+#         ctx: InputContext,
+#         inputs: DecoderOnlyInputs,
+#         *,
+#         max_dynamic_patch: Optional[int] = None,
+#         dynamic_image_size: Optional[bool] = None,
+#     ) -> DecoderOnlyInputs:
+#         multi_modal_data = inputs.get("multi_modal_data")
+#         if multi_modal_data is None or "image" not in multi_modal_data:
+#             return inputs
+
+#         model_config = ctx.model_config
+#         hf_config = ctx.get_hf_config()
+
+#         image_data = multi_modal_data["image"]
+#         num_patches = get_internvl_num_patches(hf_config)
+#         num_blocks_calculator = calculate_num_blocks_wrapper(
+#             hf_config, max_dynamic_patch, dynamic_image_size)
+#         if isinstance(image_data, Image.Image):
+#             width, height = image_data.size
+#             num_blocks, _, _ = num_blocks_calculator(width, height)
+#             image_feature_sizes = [num_blocks * num_patches]
+#         elif is_list_of(image_data, Image.Image):
+#             image_feature_sizes = []
+#             for image in image_data:
+#                 width, height = image.size
+#                 num_blocks, _, _ = num_blocks_calculator(width, height)
+#                 image_feature_sizes.append(num_blocks * num_patches)
+#         elif isinstance(image_data, torch.Tensor):
+#             num_images, image_feature_size, hidden_size = image_data.shape
+#             image_feature_sizes = [image_feature_size]
+#         else:
+#             raise TypeError(f"Invalid image type: {type(image_data)}")
+
+#         tokenizer = cached_get_tokenizer(
+#             model_config.tokenizer,
+#             trust_remote_code=model_config.trust_remote_code)
+
+#         prompt = inputs.get("prompt")
+#         prompt_token_ids = inputs["prompt_token_ids"]
+#         if prompt is None:
+#             prompt = tokenizer.decode(prompt_token_ids)
+
+#         new_prompt = self._expand_image_prompt(prompt, image_feature_sizes,
+#                                                num_patches)
+#         new_prompt_token_ids = tokenizer.encode(new_prompt)
+#         img_context_token_id = tokenizer.encode(self.img_context_token,
+#                                                 add_special_tokens=False)
+#         assert len(img_context_token_id) == 1, \
+#             (f"Invalid image token '{self.img_context_token}': A valid image "
+#             f"token encodes to a single token ID, got {img_context_token_id}.")
+#         img_context_token_id = img_context_token_id[0]
+
+#         # Get precise tracking of placeholder positions
+#         token_idx = image_idx = 0
+#         placeholder_ranges = []
+#         while token_idx < len(new_prompt_token_ids):
+#             if new_prompt_token_ids[token_idx] == img_context_token_id:
+#                 curr_image_featue_size = image_feature_sizes[image_idx]
+#                 placeholder_ranges.append(
+#                     PlaceholderRange(offset=token_idx,
+#                                      length=curr_image_featue_size))
+#                 image_idx += 1
+#                 token_idx += curr_image_featue_size
+#             else:
+#                 token_idx += 1
+
+#         return token_inputs(
+#             prompt=prompt,
+#             prompt_token_ids=new_prompt_token_ids,
+#             multi_modal_data=multi_modal_data,
+#             multi_modal_placeholders={"image": placeholder_ranges})
+
+#     def input_mapper(
+#         self,
+#         ctx: InputContext,
+#         data: object,
+#         *,
+#         max_dynamic_patch: Optional[int] = None,
+#         dynamic_image_size: Optional[bool] = None,
+#     ):
+#         hf_config = ctx.get_hf_config()
+
+#         image_pixel_values_mapper = image_to_pixel_values_wrapper(
+#             hf_config, max_dynamic_patch, dynamic_image_size)
+#         if isinstance(data, Image.Image):
+#             data = image_pixel_values_mapper(data)
+#             # Add an N dimension for number of images per prompt (currently 1).
+#             data = data.unsqueeze(0)
+#         elif is_list_of(data, Image.Image):
+#             # we can't stack here because images may have different num_patches
+#             data = [image_pixel_values_mapper(img) for img in data]
+#         else:
+#             return MultiModalKwargs({"image_embeds": data})
+#         model_config = ctx.model_config
+#         tokenizer = cached_get_tokenizer(
+#             model_config.tokenizer,
+#             trust_remote_code=model_config.trust_remote_code)
+#         image_token_id = tokenizer.encode(self.img_context_token,
+#                                           add_special_tokens=False,
+#                                           return_tensors="pt")[0]
+
+#         return MultiModalKwargs({
+#             "pixel_values": data,
+#             "image_token_id": image_token_id
+#         })
+
+#     def dummy_data(
+#         self,
+#         ctx: InputContext,
+#         seq_len: int,
+#         mm_counts: Mapping[str, int],
+#         *,
+#         max_dynamic_patch: Optional[int] = None,
+#         dynamic_image_size: Optional[bool] = None,
+#     ):
+#         num_images = mm_counts["image"]
+
+#         hf_config = ctx.get_hf_config()
+
+#         image_feature_size = get_max_internvl_image_tokens(
+#             ctx,
+#             max_dynamic_patch=max_dynamic_patch,
+#             dynamic_image_size=dynamic_image_size,
+#         )
+#         model_config = ctx.model_config
+#         tokenizer = cached_get_tokenizer(
+#             model_config.tokenizer,
+#             trust_remote_code=model_config.trust_remote_code)
+
+#         seq_data, ranges = dummy_seq_data_for_clip(
+#             hf_config.vision_config,
+#             seq_len,
+#             num_images,
+#             image_token_id=tokenizer.encode(self.img_context_token,
+#                                             add_special_tokens=False)[0],
+#             image_feature_size_override=image_feature_size,
+#         )
+
+#         max_image_width, max_image_height = get_max_internvl_image_size(
+#             ctx,
+#             max_dynamic_patch=max_dynamic_patch,
+#             dynamic_image_size=dynamic_image_size,
+#         )
+
+#         mm_data = dummy_image_for_clip(
+#             hf_config.vision_config,
+#             num_images,
+#             image_width_override=max_image_width,
+#             image_height_override=max_image_height,
+#         )
+
+#         return DummyData(seq_data, mm_data, ranges)
+
+
+# input_pipeline = InternVLInputPipeline(IMG_START, IMG_END, IMG_CONTEXT)
+
+
+class InternVLChatModel(nn.Module):
+
+    def __init__(self, config, quant_config, prefix: str = "") -> None:
         super().__init__()
 
-        self.img_start_token = img_start_token
-        self.img_end_token = img_end_token
-        self.img_context_token = img_context_token
+        print(config)
+        # pdb.breakpoint()
 
-    def _create_image_prompt(self, feature_size: int, num_patches: int) -> str:
-        return (self.img_start_token + self.img_context_token * feature_size +
-                self.img_end_token)
-
-    def _expand_image_prompt(
-        self,
-        prompt: str,
-        feature_sizes: List[int],
-        num_patches: int,
-    ) -> str:
-        image_idx = sorted(
-            map(int, re.findall(r"Image-(\d+): <image>\n", prompt)))
-
-        new_prompt = prompt
-        for idx, feature_size in enumerate(feature_sizes, start=1):
-            image_prompt = self._create_image_prompt(feature_size, num_patches)
-            if not image_idx:
-                image_prompt = f"Image-{idx}: {image_prompt}"
-
-            new_prompt = new_prompt.replace('<image>', image_prompt, 1)
-
-        return new_prompt
-
-    def input_processor(
-        self,
-        ctx: InputContext,
-        inputs: DecoderOnlyInputs,
-        *,
-        max_dynamic_patch: Optional[int] = None,
-        dynamic_image_size: Optional[bool] = None,
-    ) -> DecoderOnlyInputs:
-        multi_modal_data = inputs.get("multi_modal_data")
-        if multi_modal_data is None or "image" not in multi_modal_data:
-            return inputs
-
-        model_config = ctx.model_config
-        hf_config = ctx.get_hf_config()
-
-        image_data = multi_modal_data["image"]
-        num_patches = get_internvl_num_patches(hf_config)
-        num_blocks_calculator = calculate_num_blocks_wrapper(
-            hf_config, max_dynamic_patch, dynamic_image_size)
-        if isinstance(image_data, Image.Image):
-            width, height = image_data.size
-            num_blocks, _, _ = num_blocks_calculator(width, height)
-            image_feature_sizes = [num_blocks * num_patches]
-        elif is_list_of(image_data, Image.Image):
-            image_feature_sizes = []
-            for image in image_data:
-                width, height = image.size
-                num_blocks, _, _ = num_blocks_calculator(width, height)
-                image_feature_sizes.append(num_blocks * num_patches)
-        elif isinstance(image_data, torch.Tensor):
-            num_images, image_feature_size, hidden_size = image_data.shape
-            image_feature_sizes = [image_feature_size]
-        else:
-            raise TypeError(f"Invalid image type: {type(image_data)}")
-
-        tokenizer = cached_get_tokenizer(
-            model_config.tokenizer,
-            trust_remote_code=model_config.trust_remote_code)
-
-        prompt = inputs.get("prompt")
-        prompt_token_ids = inputs["prompt_token_ids"]
-        if prompt is None:
-            prompt = tokenizer.decode(prompt_token_ids)
-
-        new_prompt = self._expand_image_prompt(prompt, image_feature_sizes,
-                                               num_patches)
-        new_prompt_token_ids = tokenizer.encode(new_prompt)
-        img_context_token_id = tokenizer.encode(self.img_context_token,
-                                                add_special_tokens=False)
-        assert len(img_context_token_id) == 1, \
-            (f"Invalid image token '{self.img_context_token}': A valid image "
-            f"token encodes to a single token ID, got {img_context_token_id}.")
-        img_context_token_id = img_context_token_id[0]
-
-        # Get precise tracking of placeholder positions
-        token_idx = image_idx = 0
-        placeholder_ranges = []
-        while token_idx < len(new_prompt_token_ids):
-            if new_prompt_token_ids[token_idx] == img_context_token_id:
-                curr_image_featue_size = image_feature_sizes[image_idx]
-                placeholder_ranges.append(
-                    PlaceholderRange(offset=token_idx,
-                                     length=curr_image_featue_size))
-                image_idx += 1
-                token_idx += curr_image_featue_size
-            else:
-                token_idx += 1
-
-        return token_inputs(
-            prompt=prompt,
-            prompt_token_ids=new_prompt_token_ids,
-            multi_modal_data=multi_modal_data,
-            multi_modal_placeholders={"image": placeholder_ranges})
-
-    def input_mapper(
-        self,
-        ctx: InputContext,
-        data: object,
-        *,
-        max_dynamic_patch: Optional[int] = None,
-        dynamic_image_size: Optional[bool] = None,
-    ):
-        hf_config = ctx.get_hf_config()
-
-        image_pixel_values_mapper = image_to_pixel_values_wrapper(
-            hf_config, max_dynamic_patch, dynamic_image_size)
-        if isinstance(data, Image.Image):
-            data = image_pixel_values_mapper(data)
-            # Add an N dimension for number of images per prompt (currently 1).
-            data = data.unsqueeze(0)
-        elif is_list_of(data, Image.Image):
-            # we can't stack here because images may have different num_patches
-            data = [image_pixel_values_mapper(img) for img in data]
-        else:
-            return MultiModalKwargs({"image_embeds": data})
-        model_config = ctx.model_config
-        tokenizer = cached_get_tokenizer(
-            model_config.tokenizer,
-            trust_remote_code=model_config.trust_remote_code)
-        image_token_id = tokenizer.encode(self.img_context_token,
-                                          add_special_tokens=False,
-                                          return_tensors="pt")[0]
-
-        return MultiModalKwargs({
-            "pixel_values": data,
-            "image_token_id": image_token_id
-        })
-
-    def dummy_data(
-        self,
-        ctx: InputContext,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-        *,
-        max_dynamic_patch: Optional[int] = None,
-        dynamic_image_size: Optional[bool] = None,
-    ):
-        num_images = mm_counts["image"]
-
-        hf_config = ctx.get_hf_config()
-
-        image_feature_size = get_max_internvl_image_tokens(
-            ctx,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-        )
-        model_config = ctx.model_config
-        tokenizer = cached_get_tokenizer(
-            model_config.tokenizer,
-            trust_remote_code=model_config.trust_remote_code)
-
-        seq_data, ranges = dummy_seq_data_for_clip(
-            hf_config.vision_config,
-            seq_len,
-            num_images,
-            image_token_id=tokenizer.encode(self.img_context_token,
-                                            add_special_tokens=False)[0],
-            image_feature_size_override=image_feature_size,
-        )
-
-        max_image_width, max_image_height = get_max_internvl_image_size(
-            ctx,
-            max_dynamic_patch=max_dynamic_patch,
-            dynamic_image_size=dynamic_image_size,
-        )
-
-        mm_data = dummy_image_for_clip(
-            hf_config.vision_config,
-            num_images,
-            image_width_override=max_image_width,
-            image_height_override=max_image_height,
-        )
-
-        return DummyData(seq_data, mm_data, ranges)
-
-
-input_pipeline = InternVLInputPipeline(IMG_START, IMG_END, IMG_CONTEXT)
-
-
-@MULTIMODAL_REGISTRY.register_image_input_mapper(input_pipeline.input_mapper)
-@MULTIMODAL_REGISTRY.register_max_image_tokens(get_max_internvl_image_tokens)
-@INPUT_REGISTRY.register_dummy_data(input_pipeline.dummy_data)
-@INPUT_REGISTRY.register_input_processor(input_pipeline.input_processor)
-class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__()
-
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        multimodal_config = vllm_config.model_config.multimodal_config
+        # config = vllm_config.model_config.hf_config
+        # quant_config = vllm_config.quant_config
+        # multimodal_config = vllm_config.model_config.multimodal_config
 
         self.config = config
-        self.multimodal_config = multimodal_config
-        self._patch_quant_config(config, quant_config)
+        self.quant_config = quant_config
+        if hasattr(self.config, "llm_config"):
+            self.config.text_config = self.config.llm_config
+        # self.config.text_config = self.config.llm_config
+        # self.multimodal_config = multimodal_config
+        # self._patch_quant_config(config, quant_config)
 
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
@@ -505,37 +503,38 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
 
         self.llm_arch_name = config.text_config.architectures[0]
         self.is_mono = self.llm_arch_name == 'InternLM2VEForCausalLM'
-        self.vision_model = self._init_vision_model(
-            config,
-            quant_config=quant_config,
-            is_mono=self.is_mono,
-            prefix=maybe_prefix(prefix, "vision_model"),
-        )
+        # self.vision_model = self._init_vision_model(
+        #     config,
+        #     quant_config=quant_config,
+        #     is_mono=self.is_mono,
+        #     prefix=maybe_prefix(prefix, "vision_model"),
+        # )
 
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-        )
+        self.language_model = InternLM2ForCausalLM(config.text_config, quant_config)
+        # self.language_model = init_vllm_registered_model(
+        #     vllm_config=vllm_config,
+        #     hf_config=config.text_config,
+        #     prefix=maybe_prefix(prefix, "language_model"),
+        # )
 
         self.mlp1 = self._init_mlp1(config)
 
         self.img_context_token_id = None
         self.visual_token_mask = None
-        self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors)
+        # self.make_empty_intermediate_tensors = (
+        #     self.language_model.make_empty_intermediate_tensors)
 
-    def _patch_quant_config(self, config: PretrainedConfig,
-                            quant_config: QuantizationConfig):
-        # the awq models from OpenGVLab missing `modules_to_not_convert`
-        # patch the quant_config to add `modules_to_not_convert` back
-        if isinstance(quant_config, AWQConfig):
-            text_config = config.text_config
-            llm_quant_config = getattr(text_config, "quantization_config",
-                                       None)
-            if (not quant_config.modules_to_not_convert) and \
-                (llm_quant_config is not None):
-                quant_config.modules_to_not_convert.append("vision_model")
+    # def _patch_quant_config(self, config: PretrainedConfig,
+    #                         quant_config: QuantizationConfig):
+    #     # the awq models from OpenGVLab missing `modules_to_not_convert`
+    #     # patch the quant_config to add `modules_to_not_convert` back
+    #     if isinstance(quant_config):
+    #         text_config = config.text_config
+    #         llm_quant_config = getattr(text_config, "quantization_config",
+    #                                    None)
+    #         if (not quant_config.modules_to_not_convert) and \
+    #             (llm_quant_config is not None):
+    #             quant_config.modules_to_not_convert.append("vision_model")
 
     @cached_property
     def sampler(self):
@@ -731,7 +730,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
@@ -753,7 +751,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
             "input_ids": input_ids,
             "positions": positions,
             "kv_caches": kv_caches,
-            "attn_metadata": attn_metadata,
             "intermediate_tensors": intermediate_tensors,
             "inputs_embeds": inputs_embeds,
         }
@@ -782,7 +779,42 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
     ) -> Optional[SamplerOutput]:
         return self.language_model.sample(logits, sampling_metadata)
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        if not self.is_mono:
+            vision_feature_layer = self.config.select_layer
+            if vision_feature_layer < 0:
+                num_hidden_layers = self.config.vision_config.num_hidden_layers \
+                    + vision_feature_layer + 1
+            else:
+                num_hidden_layers = vision_feature_layer + 1
+
+            self.vision_tower = InternVisionModel(
+                self.config.vision_config,
+                quant_config=self.quant_config,
+                num_hidden_layers_override=num_hidden_layers,
+                # prefix=prefix,
+            ).cuda()
+        else:
+            self.vision_tower = InternVisionPatchModel(config.vision_config).cuda()
+        vision_path = self.config.mm_vision_tower
+        self.vision_tower.eval()
+
+        # load mm_projector
+        projector_weights = {
+            # "model.mm_projector.0": "multi_modal_projector.linear_1",
+            # "model.mm_projector.2": "multi_modal_projector.linear_2",
+            "vision_model": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+        }
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            if "projector" in name or "vision_tower" in name:
+                for weight_name, param_name in projector_weights.items():
+                    if weight_name in name:
+                        name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            else:
+                self.language_model.load_weights([(name, loaded_weight)])
+
+EntryClass = InternVLChatModel

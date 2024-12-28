@@ -153,6 +153,7 @@ class InternParallelAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         *,
         num_dummy_heads: int = 0,
+        layer_id: int = 0,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -202,8 +203,11 @@ class InternParallelAttention(nn.Module):
             prefix=f"{prefix}.proj",
         )
 
-        self.attn = RadixAttention(self.num_heads_per_partition,
-                                   self.head_dim, self.scale)
+        self.attn = RadixAttention(num_heads=self.num_heads_per_partition,
+                                   head_dim=self.head_dim, 
+                                   scaling=self.scale,
+                                   num_kv_heads=self.num_heads_per_partition, # TODO: CHECK IF RIGHT
+                                   layer_id=layer_id)
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         if self.tp_size > 1:
@@ -337,6 +341,7 @@ class InternVisionEncoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         *,
         num_dummy_heads: int = 0,
+        layer_id: int = 0,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -348,6 +353,7 @@ class InternVisionEncoderLayer(nn.Module):
         self.attn = self._init_attn(config,
                                     quant_config,
                                     num_dummy_heads=num_dummy_heads,
+                                    layer_id=layer_id,
                                     prefix=f"{prefix}.attn")
 
         self.mlp = InternMLP(config,
@@ -369,6 +375,7 @@ class InternVisionEncoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig],
         *,
         num_dummy_heads: int,
+        layer_id: int,
         prefix: str = "",
     ):
         # fallback to sdpa attention if tp unavailable
@@ -380,6 +387,7 @@ class InternVisionEncoderLayer(nn.Module):
             return InternParallelAttention(config,
                                            quant_config=quant_config,
                                            num_dummy_heads=num_dummy_heads,
+                                           layer_id=layer_id,
                                            prefix=prefix)
 
         logger.info("using SDPA attention")
@@ -422,6 +430,7 @@ class InternVisionEncoder(nn.Module):
             InternVisionEncoderLayer(config,
                                      quant_config,
                                      num_dummy_heads=num_dummy_heads,
+                                     layer_id=layer_idx,
                                      prefix=f"{prefix}.layers.{layer_idx}")
             for layer_idx in range(num_hidden_layers)
         ])

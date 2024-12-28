@@ -33,13 +33,14 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
 
-    from sglang.srt.configs import ExaoneConfig, Qwen2VLConfig
+    from sglang.srt.configs import ExaoneConfig, Qwen2VLConfig, InternVLChatConfig
 
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         ChatGLMConfig.model_type: ChatGLMConfig,
         DbrxConfig.model_type: DbrxConfig,
         ExaoneConfig.model_type: ExaoneConfig,
         Qwen2VLConfig.model_type: Qwen2VLConfig,
+        # InternVLChatConfig.model_type: InternVLChatConfig,
     }
 except ImportError:
     # We want this file to run without vllm dependency
@@ -74,7 +75,9 @@ def get_config(
     )
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
+        print(config_class)
         config = config_class.from_pretrained(model, revision=revision)
+        print(config)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
     if model_override_args:
