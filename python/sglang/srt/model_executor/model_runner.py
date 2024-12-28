@@ -51,7 +51,6 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
-    primary_memory_saver,
 )
 from vllm.distributed import (
     get_tp_group,
@@ -255,12 +254,12 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         # Load the model
-        with primary_memory_saver.region():
-            self.model = get_model(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-            )
+        # with primary_memory_saver.region():
+        self.model = get_model(
+            model_config=self.model_config,
+            load_config=self.load_config,
+            device_config=DeviceConfig(self.device),
+        )
 
         # Parse other args
         self.sliding_window_size = (
