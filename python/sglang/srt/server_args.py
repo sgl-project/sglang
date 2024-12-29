@@ -54,6 +54,7 @@ class ServerArgs:
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
+    return_token_ids: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -279,6 +280,12 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--return-token-ids",
+            action="store_true",
+            default=ServerArgs.return_token_ids,
+            help="Whether to return token IDs in the output, this may introduce additional overhead.",
         )
         parser.add_argument(
             "--load-format",
