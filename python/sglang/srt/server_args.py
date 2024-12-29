@@ -285,7 +285,7 @@ class ServerArgs:
             "--return-token-ids",
             action="store_true",
             default=ServerArgs.return_token_ids,
-            help="Whether to return token IDs in the output. Experimental feature.",
+            help="Whether to return token IDs in the output.",
         )
         parser.add_argument(
             "--load-format",
