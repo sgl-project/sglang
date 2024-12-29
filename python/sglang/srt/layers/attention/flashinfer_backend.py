@@ -240,7 +240,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        prefill_wrapper_paged = self.forward_metadata.wrapper_pagged[
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
         cache_loc = (
@@ -557,7 +557,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.wrapper_ragged,
+            self.prefill_wrapper_ragged,
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -596,7 +596,7 @@ class FlashInferIndicesUpdaterPrefill:
             kv_start_idx = seq_lens - paged_kernel_lens
 
             self.call_begin_forward(
-                self.wrapper_ragged,
+                self.prefill_wrapper_ragged,
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -632,7 +632,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
-                self.wrapper_ragged,
+                self.prefill_wrapper_ragged,
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
