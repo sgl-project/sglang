@@ -116,9 +116,9 @@ class TritonAttnBackend(AttentionBackend):
 
     def forward_extend(
         self,
-        q,
-        k,
-        v,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
@@ -155,9 +155,9 @@ class TritonAttnBackend(AttentionBackend):
 
     def forward_decode(
         self,
-        q,
-        k,
-        v,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
