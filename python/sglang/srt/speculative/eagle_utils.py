@@ -430,7 +430,7 @@ class EAGLEDraftInput(SpecDraftInput):
             self.num_verify_token,
         )
 
-    def generate_attn_arg(
+    def generate_attn_arg_decode(
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
@@ -472,7 +472,7 @@ class EAGLEDraftInput(SpecDraftInput):
         draft_cache = torch.cat(self.cache_list, dim=0)
         batch.token_to_kv_pool.free(draft_cache)
 
-    def generate_attn_arg_spec_extend(
+    def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
@@ -484,9 +484,6 @@ class EAGLEDraftInput(SpecDraftInput):
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-        kv_last_page_len = torch.ones((bs,), dtype=torch.int32, device="cuda")
-
         kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
 
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -499,7 +496,7 @@ class EAGLEDraftInput(SpecDraftInput):
             req_to_token.size(1),
         )
 
-        return kv_indices, cum_kv_seq_len, kv_last_page_len, qo_indptr
+        return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def merge_batch(self, spec_info: EAGLEDraftInput):
 
@@ -545,7 +542,7 @@ class EagleVerifyInput(SpecVerifyInput):
             triton.next_power_of_2(bs),
         )
 
-    def generate_attn_arg(
+    def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
@@ -578,7 +575,7 @@ class EagleVerifyInput(SpecVerifyInput):
             kv_indices,
             req_to_token.size(1),
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr
+        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
         predict = torch.argmax(logits_output.next_token_logits, dim=-1)

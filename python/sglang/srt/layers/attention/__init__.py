@@ -1,12 +1,13 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
 if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.speculative_utils import SpecInput
 
 
@@ -29,7 +30,8 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
@@ -37,12 +39,12 @@ class AttentionBackend(ABC):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()

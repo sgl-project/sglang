@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.attention import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -84,11 +84,14 @@ class TritonAttnBackend(AttentionBackend):
         num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: torch.Tensor = None,
-        spec_info: SpecInput = None,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
     ):
-        # NOTE: encoder_lens expected to be zeros or None
+        assert encoder_lens is None, "Not supported"
+        assert forward_mode.is_decode(), "Not supported"
+        assert spec_info is None, "Not supported"
+
         self.forward_metadata = (
             self.cuda_graph_attn_logits,
             None,
@@ -97,12 +100,12 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens=None,
-        forward_batch=None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
     ):
         # NOTE: encoder_lens expected to be zeros or None
         self.cuda_graph_start_loc.zero_()

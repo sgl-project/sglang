@@ -389,7 +389,8 @@ class CudaGraphRunner:
             req_pool_indices,
             seq_lens,
             encoder_lens,
-            forward_batch,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
         )
 
         # Run and capture
@@ -431,7 +432,6 @@ class CudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        num_token = self.num_tokens[index]
         if bs != raw_bs:
             self.seq_lens.fill_(1)
             self.out_cache_loc.zero_()
@@ -465,7 +465,8 @@ class CudaGraphRunner:
             self.seq_lens,
             forward_batch.seq_lens_sum + (bs - raw_bs),
             self.encoder_lens,
-            forward_batch=forward_batch,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
         )
 
         # Replay
