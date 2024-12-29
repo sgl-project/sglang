@@ -259,6 +259,10 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await tokenizer_manager.open_session(obj, request)
+        if session_id is None:
+            raise Exception(
+                "Failed to open the session. Check if a session with the same id is still open."
+            )
         return session_id
     except Exception as e:
         return _create_error_response(e)
