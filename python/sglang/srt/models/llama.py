@@ -158,6 +158,7 @@ class LlamaAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
         )
+        self.layer_id = layer_id
 
     def forward(
         self,
@@ -170,6 +171,11 @@ class LlamaAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
+
+        if self.layer_id == 0:
+            print(
+                f'hi {type(self)}#{self.layer_id}\n{qkv=}\n{q=}\n{k=}\n{v=}\n{attn_output=}\n{output=}\n{self.qkv_proj.weight.data=}\n')
+
         return output
 
 
@@ -217,7 +223,6 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.layer_id = layer_id
 
     def forward(
         self,
@@ -241,10 +246,6 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-
-        if self.layer_id == 8:
-            print(f'hi {type(self)}#{self.layer_id} {hidden_states=} {self.mlp.gate_up_proj.weight}')
-
         return hidden_states, residual
 
 
