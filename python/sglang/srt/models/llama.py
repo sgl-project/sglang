@@ -172,9 +172,9 @@ class LlamaAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
 
-        if self.layer_id == 0 and forward_batch.forward_mode.is_extend():
+        if self.layer_id == 0:
             print(
-                f'hi {type(self)}#{self.layer_id}\n{forward_batch=}\n{hidden_states=}\n{positions=}\n{qkv=}\n{q=}\n{k=}\n{v=}\n{attn_output=}\n{output=}\n{self.qkv_proj.weight.data=}\n')
+                f'hi {type(self)}#{self.layer_id}\n{qkv=}\n{q=}\n{k=}\n{v=}\n{attn_output=}\n{output=}\n{self.qkv_proj.weight.data=}\n')
 
         return output
 
