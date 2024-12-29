@@ -54,6 +54,10 @@ class LogitsProcessorOutput:
     output_top_logprobs_val: List = None
     output_top_logprobs_idx: List = None
 
+    # Used by speculative decoding (EAGLE)
+    # The output of transformer layers
+    hidden_states: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -88,10 +92,11 @@ class LogitsMetadata:
         else:
             return_top_logprob = False
 
-        if forward_batch.spec_info is not None:
+        if forward_batch.spec_info:
             capture_hidden_mode = forward_batch.spec_info.capture_hidden_mode
         else:
             capture_hidden_mode = CaptureHiddenMode.NULL
+
         return cls(
             forward_mode=forward_batch.forward_mode,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
@@ -101,9 +106,7 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            capture_hidden_mode=getattr(
-                forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-            ),
+            capture_hidden_mode=capture_hidden_mode,
         )
 
 

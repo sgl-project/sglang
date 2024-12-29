@@ -503,7 +503,7 @@ def launch_engine(
             )
         scheduler_infos.append(data)
 
-    # Assume all schedulers have same max_total_num_tokens
+    # Assume all schedulers have same scheduler_info
     scheduler_info = scheduler_infos[0]
 
 
@@ -890,7 +890,7 @@ class Runtime:
     using the commond line interface.
 
     It is mainly used for the frontend language.
-    You should use the Engine class if you want to do normal offline processing.
+    You should use the Engine class above if you want to do normal offline processing.
     """
 
     def __init__(
