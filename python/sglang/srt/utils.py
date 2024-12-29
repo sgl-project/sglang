@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import base64
+import dataclasses
 import ipaddress
 import itertools
 import json
@@ -92,7 +93,7 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and not is_hip()
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def is_ipv6(address):
@@ -169,7 +170,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False):
+def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -184,7 +185,8 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 "which may cause useless memory allocation for torch CUDA context.",
             )
 
-        torch.cuda.empty_cache()
+        if empty_cache:
+            torch.cuda.empty_cache()
         free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
@@ -196,10 +198,24 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
                 "which may cause useless memory allocation for torch XPU context.",
             )
-        torch.xpu.empty_cache()
+
+        if empty_cache:
+            torch.xpu.empty_cache()
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
+
+    elif device == "hpu":
+        num_gpus = torch.hpu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.hpu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
+                "which may cause useless memory allocation for torch HPU context.",
+            )
+
+        free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -939,6 +955,37 @@ def get_nvgpu_memory_capacity():
         )
 
 
+def get_hpu_memory_capacity():
+    try:
+        # Run hl-smi and capture the output
+        result = subprocess.run(
+            ["hl-smi --query | grep 'Total'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "hl-smi not found. Ensure Habana drivers are installed and accessible."
+        )
+
+
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -1025,9 +1072,6 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
 
-    if hasattr(torch, "hip") and torch.hip.is_available():
-        return torch.hip.get_device_name(device_id)
-
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_name(device_id)
 
@@ -1038,9 +1082,6 @@ def get_device_name(device_id: int = 0) -> str:
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability(device_id)
-
-    if hasattr(torch, "hip") and torch.hip.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -1060,6 +1101,13 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
             ) from e
 
     return major, minor
+
+
+def get_compiler_backend() -> str:
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return "hpu_backend"
+
+    return "inductor"
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
@@ -1191,49 +1239,99 @@ def cuda_device_count_stateless() -> int:
     return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
 
 
-def should_use_tensor_core(
-    kv_cache_dtype: torch.dtype,
-    num_attention_heads: int,
-    num_kv_heads: int,
-) -> bool:
-    """
-    Determine whether to use tensor cores for attention computation.
+def dataclass_to_string_truncated(data, max_length=2048):
+    if isinstance(data, str):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return f'"{data[:half_length]} ... {data[-half_length:]}"'
+        else:
+            return f'"{data}"'
+    elif isinstance(data, (list, tuple)):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+        else:
+            return str(data)
+    elif isinstance(data, dict):
+        return (
+            "{"
+            + ", ".join(
+                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+                for k, v in data.items()
+            )
+            + "}"
+        )
+    elif dataclasses.is_dataclass(data):
+        fields = dataclasses.fields(data)
+        return (
+            f"{data.__class__.__name__}("
+            + ", ".join(
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                for f in fields
+            )
+            + ")"
+        )
+    else:
+        return str(data)
+
+
+TOOLS_TAG_LIST = ["<|plugin|>", "<function=", "<tool_call>", "<|python_tag|>"]
+
+
+def parse_tool_response(text, tools, **kwargs):
+    """Parse model response containing tool information.
 
     Args:
-        kv_cache_dtype: Data type of the KV cache
-        num_attention_heads: Number of attention heads
-        num_kv_heads: Number of key/value heads
-
-    Returns:
-        bool: Whether to use tensor cores
+        text(str): model response in string format
+        tools(List): tools from user request
     """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
-
-    # Try to use _grouped_size_compiled_for_decode_kernels if available
-    # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
-    try:
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
-        if not _grouped_size_compiled_for_decode_kernels(
-            num_attention_heads,
-            num_kv_heads,
-        ):
-            return True
+    if "<|plugin|>" in text:  # internlm2
+        text, action = text.split("<|action_start|><|plugin|>")
+        action = action.split("<|action_end|>".strip())[0]
+        action = action[action.find("{") :]
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
+    elif "<function=" in text:  # llama3.1
+        action, _ = text.split("</function>")
+        parameters = action[action.find("{") :]
+        name = action.split("<function=")[1].split(">{")[0]
+        call_info_list = [(name, parameters)]
+    elif "<tool_call>" in text and "</tool_call>" in text:  # qwen2.5
+        # get tool_call in text
+        pattern = r"<tool_call>(.*?)</tool_call>"
+        match_result_list = re.findall(pattern, text, re.DOTALL)
+        call_info_list = []
+        for match_result in match_result_list:
+            action = json.loads(match_result)
+            call_info_list.append(
+                (action["name"], json.dumps(action["arguments"], ensure_ascii=False))
+            )
+        # get text outside of tags
+        if not text.startswith("<tool_call>"):
+            text = text[: text.find("<tool_call>")]
+        elif not text.endswith("</tool_call>"):
+            text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
         else:
-            return False
-    except (ImportError, AttributeError):
-        pass
-
-    # Calculate GQA group size
-    gqa_group_size = num_attention_heads // num_kv_heads
-
-    # Determine based on dtype and GQA group size
-    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return True
-    elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
+            text = ""
+    elif "<|python_tag|>" in text:  # llama3.2
+        _, action = text.split("<|python_tag|>")
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
     else:
-        return False
+        raise RuntimeError(f"Unexpected model response: {text}")
+
+    call_info_list = [
+        (
+            [tool.function.name for tool in tools].index(call_info[0]),
+            call_info[0],
+            call_info[1],
+        )
+        for call_info in call_info_list
+    ]
+    return text, call_info_list

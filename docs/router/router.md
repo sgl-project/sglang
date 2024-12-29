@@ -7,14 +7,14 @@ The router is a independent Python package, and it can be used as a drop-in repl
 ## Installation
 
 ```bash
-pip install sglang-router
+$ pip install sglang-router
 ```
 
-Detailed usage of the router can be found in [launch_router](https://github.com/sgl-project/sglang/blob/main/rust/py_src/sglang_router/launch_router.py) and [launch_server](https://github.com/sgl-project/sglang/blob/main/rust/py_src/sglang/launch_server.py). Also, you can directly run the following command to see the usage of the router.
+Detailed usage of the router can be found in [launch_router](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang_router/launch_router.py) and [launch_server](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang/launch_server.py). Also, you can directly run the following command to see the usage of the router.
 
 ```bash
-python -m sglang_router.launch_server --help
-python -m sglang_router.launch_routher --help
+$ python -m sglang_router.launch_server --help
+$ python -m sglang_router.launch_router --help
 ```
 
 The router supports two working modes:
@@ -27,7 +27,7 @@ The router supports two working modes:
 This will be a drop-in replacement for the existing `--dp-size` arguement of SGLang Runtime. Under the hood, it uses multi-processes to launch multiple workers, wait for them to be ready, then connect the router to all workers.
 
 ```bash
-python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dp-size 1
+$ python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dp-size 1
 ```
 
 After the server is ready, you can directly send requests to the router as the same way as sending requests to each single worker.
@@ -47,12 +47,62 @@ print(response.json())
 This is useful for multi-node DP. First, launch workers on multiple nodes, then launch a router on the main node, and connect the router to all workers.
 
 ```bash
-python -m sglang_router.launch_router --worker-urls http://worker_url_1 http://worker_url_2
+$ python -m sglang_router.launch_router --worker-urls http://worker_url_1 http://worker_url_2
 ```
 
-## Strategies
+## Dynamic Scaling APIs
 
-### Cache-Aware Load-Balancing Router
+We offer `/add_worker` and `/remove_worker` APIs to dynamically add or remove workers from the router.
+
+- `/add_worker`
+
+Usage:
+
+```bash
+$ curl -X POST http://localhost:30000/add_worker?url=http://worker_url_1
+```
+
+Example:
+
+```bash
+$ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30001
+$ curl -X POST http://localhost:30000/add_worker?url=http://127.0.0.1:30001
+Successfully added worker: http://127.0.0.1:30001
+```
+
+- `/remove_worker`
+
+Usage:
+
+```bash
+$ curl -X POST http://localhost:30000/remove_worker?url=http://worker_url_1
+```
+
+Example:
+
+```bash
+$ curl -X POST http://localhost:30000/remove_worker?url=http://127.0.0.1:30001
+Successfully removed worker: http://127.0.0.1:30001
+```
+
+Note:
+
+- For cache-aware router, the worker will be removed from the tree and the queues.
+
+## Fault Tolerance
+
+We provide retries based for failure tolerance.
+
+1. If the request to a worker fails for `max_worker_retries` times, the router will remove the worker from the router and move on to the next worker.
+2. If the total number of retries exceeds `max_total_retries`, the router will return an error.
+
+Note:
+
+- `max_worker_retries` is 3 and `max_total_retries` is 6 by default.
+
+## Routing Strategies
+
+#### Cache-Aware Load-Balancing Router
 
 The native router combines two strategies to optimize both cache utilization and request distribution:
 

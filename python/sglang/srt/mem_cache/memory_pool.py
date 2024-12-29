@@ -27,6 +27,7 @@ from typing import List, Tuple, Union
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.utils import get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,9 @@ class BaseTokenToKVPool:
         return select_index.to(self.device, non_blocking=True)
 
     def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
         if self.is_not_in_free_group:
             self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
         else:
@@ -180,25 +184,34 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         device: str,
     ):
         super().__init__(size, dtype, device)
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.layer_num = layer_num
+        self._create_buffers()
 
+    def _create_buffers(self):
         # [size, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.k_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim),
+                (self.size + 1, self.head_num, self.head_dim),
                 dtype=self.store_dtype,
-                device=device,
+                device=self.device,
             )
-            for _ in range(layer_num)
+            for _ in range(self.layer_num)
         ]
         self.v_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim),
+                (self.size + 1, self.head_num, self.head_dim),
                 dtype=self.store_dtype,
-                device=device,
+                device=self.device,
             )
-            for _ in range(layer_num)
+            for _ in range(self.layer_num)
         ]
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
@@ -234,14 +247,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
 # This compiled version is slower in the unit test
 # python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
     dst_1[loc] = src_1.to(dtype).view(store_dtype)
     dst_2[loc] = src_2.to(dtype).view(store_dtype)
 
 
 class MLATokenToKVPool(BaseTokenToKVPool):
-
     def __init__(
         self,
         size: int,
@@ -294,7 +306,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
 
 class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
-
     def __init__(
         self,
         size: int,

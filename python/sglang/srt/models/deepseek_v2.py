@@ -19,8 +19,10 @@
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
+from vllm import _custom_ops as ops
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -30,7 +32,6 @@ from vllm.distributed import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -39,7 +40,13 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_to_tensor_quant,
+    input_to_float8,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -88,6 +95,24 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+class MoEGate(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty((config.n_routed_experts, config.hidden_size))
+        )
+        if config.topk_method == "noaux_tc":
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty((config.n_routed_experts))
+            )
+        else:
+            self.e_score_correction_bias = None
+
+    def forward(self, hidden_states):
+        logits = F.linear(hidden_states, self.weight, None)
+        return logits
+
+
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -112,22 +137,22 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.experts = FusedMoE(
+        self.gate = MoEGate(config=config)
+
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
         )
 
-        self.gate = ReplicatedLinear(
-            config.hidden_size, config.n_routed_experts, bias=False, quant_config=None
-        )
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
@@ -144,7 +169,7 @@ class DeepseekV2MoE(nn.Module):
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self.gate(hidden_states)
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
@@ -163,15 +188,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def input_to_float8(x, dtype=torch.float8_e4m3fn):
-    finfo = torch.finfo(dtype)
-    min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-    scale = finfo.max / amax
-    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
-    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
 class DeepseekV2Attention(nn.Module):
@@ -437,7 +453,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        rope_scaling["rope_type"] = "deepseek_yarn"
+
+        if rope_scaling:
+            rope_scaling["rope_type"] = "deepseek_yarn"
+
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
@@ -452,6 +471,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
+        else:
+            self.rotary_emb.forward = self.rotary_emb.forward_native
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
@@ -833,7 +854,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -842,6 +864,16 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            # TODO(HandH1998): Modify it when nextn is supported.
+            if hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                if num_nextn_layers > 0 and name.startswith("model.layers"):
+                    name_list = name.split(".")
+                    if (
+                        len(name_list) >= 3
+                        and int(name_list[2]) >= self.config.num_hidden_layers
+                    ):
+                        continue
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -894,13 +926,45 @@ class DeepseekV2ForCausalLM(nn.Module):
         if not global_server_args_dict["disable_mla"]:
             for layer_id in range(self.config.num_hidden_layers):
                 self_attn = self.model.layers[layer_id].self_attn
-                w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
+                if hasattr(self_attn.kv_b_proj, "qweight"):
+                    # AWQ compatible
+                    w = ops.awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                        0,
+                        0,
+                        0,
+                    ).T
+                else:
+                    w = self_attn.kv_b_proj.weight
+                # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+                # This may affect the accuracy of fp8 model.
+                if (
+                    hasattr(self.quant_config, "weight_block_size")
+                    and w.dtype == torch.float8_e4m3fn
+                ):
+                    weight_block_size = self.quant_config.weight_block_size
+                    if weight_block_size is not None:
+                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        w, scale = block_quant_to_tensor_quant(
+                            w, self_attn.kv_b_proj.weight_scale_inv, weight_block_size
+                        )
+                        self_attn.w_scale = scale
+                w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-                if hasattr(self_attn.kv_b_proj, "weight_scale"):
+                if (
+                    hasattr(self_attn.kv_b_proj, "weight_scale")
+                    and self_attn.w_scale is None
+                ):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
 
-EntryClass = DeepseekV2ForCausalLM
+class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
+    pass
+
+
+EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]

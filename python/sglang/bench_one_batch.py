@@ -385,6 +385,7 @@ def latency_test(
         8,  # shorter decoding to speed up the warmup
         server_args.device,
     )
+
     rank_print("Benchmark ...")
 
     # Run the sweep

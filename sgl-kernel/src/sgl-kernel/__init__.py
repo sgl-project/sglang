@@ -1,3 +1,5 @@
-from .ops import warp_reduce
+from .ops import moe_align_block_size
 
-__all__ = ["warp_reduce"]
+__all__ = [
+    "moe_align_block_size",
+]

@@ -22,7 +22,7 @@ import signal
 import sys
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
 import uvloop
@@ -30,6 +30,7 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -58,11 +59,17 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import (
+    dataclass_to_string_truncated,
+    get_zmq_socket,
+    kill_process_tree,
+)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -76,10 +83,14 @@ class ReqState:
     out_list: List
     finished: bool
     event: asyncio.Event
+    obj: Any
 
     # For metrics
     created_time: float
     first_token_time: Optional[float] = None
+
+    # For streaming output
+    last_output_offset: int = 0
 
 
 class TokenizerManager:
@@ -119,6 +130,7 @@ class TokenizerManager:
 
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
+        self.image_token_id = self.model_config.image_token_id
 
         # Create image processor placeholder
         self.image_processor = get_dummy_image_processor()
@@ -151,15 +163,30 @@ class TokenizerManager:
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
 
-        # For update model weights
-        self.model_update_lock = asyncio.Lock()
-        self.model_update_result = None
+        # The event to notify the weight sync is finished.
+        self.model_update_lock = RWLock()
+        self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
+            None
+        )
+        self.asyncio_tasks = set()
 
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
 
         # Others
         self.gracefully_exit = False
+        self.init_weights_update_group_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_weights_from_distributed_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_weights_from_tensor_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_weights_by_name_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         # Metrics
         if self.enable_metrics:
@@ -177,11 +204,7 @@ class TokenizerManager:
     ):
         created_time = time.time()
 
-        if self.to_create_loop:
-            self.create_handle_loop()
-
-        while self.model_update_lock.locked():
-            await asyncio.sleep(0.001)
+        self.auto_create_handle_loop()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -190,17 +213,24 @@ class TokenizerManager:
             )
 
         obj.normalize_batch_and_arguments()
-        is_single = obj.is_single
-        if is_single:
-            tokenized_obj = await self._tokenize_one_request(obj)
-            self.send_to_scheduler.send_pyobj(tokenized_obj)
-            async for response in self._wait_one_response(obj, request, created_time):
-                yield response
-        else:
-            async for response in self._handle_batch_request(
-                obj, request, created_time
-            ):
-                yield response
+
+        if self.server_args.log_requests:
+            logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)}")
+
+        async with self.model_update_lock.reader_lock:
+            is_single = obj.is_single
+            if is_single:
+                tokenized_obj = await self._tokenize_one_request(obj)
+                self.send_to_scheduler.send_pyobj(tokenized_obj)
+                async for response in self._wait_one_response(
+                    obj, request, created_time
+                ):
+                    yield response
+            else:
+                async for response in self._handle_batch_request(
+                    obj, request, created_time
+                ):
+                    yield response
 
     async def _tokenize_one_request(
         self,
@@ -214,7 +244,7 @@ class TokenizerManager:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
-                    "Please add `--disable-radix-cach` when you launch the server "
+                    "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
             input_embeds = obj.input_embeds
@@ -283,7 +313,7 @@ class TokenizerManager:
     ):
         """Wait for the response of one request."""
         event = asyncio.Event()
-        state = ReqState([], False, event, created_time=created_time)
+        state = ReqState([], False, event, obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
 
         while True:
@@ -295,27 +325,25 @@ class TokenizerManager:
                     raise ValueError(f"Abort request {obj.rid}")
                 continue
 
-            if isinstance(obj, GenerateReqInput):
-                out = self.convert_logprob_style(
-                    state.out_list[-1],
-                    obj.return_logprob,
-                    obj.top_logprobs_num,
-                    obj.return_text_in_logprobs,
-                )
-            else:  # isinstance(obj, (EmbeddingReqInput,))
-                out = state.out_list[-1]
+            out = state.out_list[-1]
 
             state.out_list = []
             if state.finished:
                 if self.server_args.log_requests:
-                    # Log requests
-                    logger.info(f"in={obj}, out={out}")
+                    msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
+                    logger.info(msg)
                 del self.rid_to_state[obj.rid]
                 yield out
                 break
 
             state.event.clear()
-            yield out
+
+            if obj.stream:
+                yield out
+            else:
+                if request is not None and await request.is_disconnected():
+                    self.abort_request(obj.rid)
+                    raise ValueError(f"Abort request {obj.rid}")
 
     async def _handle_batch_request(
         self,
@@ -424,112 +452,105 @@ class TokenizerManager:
         self,
         obj: UpdateWeightFromDiskReqInput,
         request: Optional[fastapi.Request] = None,
-    ):
-        if self.to_create_loop:
-            self.create_handle_loop()
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
 
         # default the load format to the server_args
         if obj.load_format is None:
             obj.load_format = self.server_args.load_format
+        logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if not self.model_update_lock.locked():
+        if True:
+            # Hold the lock if it is not async. This means that weight sync
+            # cannot run while requests are in progress.
+            async with self.model_update_lock.writer_lock:
+                return await self._wait_for_model_update_from_disk(obj)
 
-            async with self.model_update_lock:
-                # wait for the previous generation requests to finish
-                for i in range(3):
-                    while len(self.rid_to_state) > 0:
-                        await asyncio.sleep(0.001)
-                    # FIXME: We add some sleep here to avoid some race conditions.
-                    # We can use a read-write lock as a better fix.
-                    await asyncio.sleep(0.01)
-                self.send_to_scheduler.send_pyobj(obj)
-                self.model_update_result = asyncio.Future()
+    async def _wait_for_model_update_from_disk(
+        self, obj: UpdateWeightFromDiskReqInput
+    ) -> Tuple[bool, str]:
+        self.send_to_scheduler.send_pyobj(obj)
+        self.model_update_result = asyncio.Future()
+        if self.server_args.dp_size == 1:
+            result = await self.model_update_result
+            if result.success:
+                self.served_model_name = obj.model_path
+                self.server_args.model_path = obj.model_path
+                self.server_args.load_format = obj.load_format
+                self.model_path = obj.model_path
+            return result.success, result.message
+        else:  # self.server_args.dp_size > 1
+            self.model_update_tmp = []
+            result = await self.model_update_result
 
-                if self.server_args.dp_size == 1:
-                    result = await self.model_update_result
-                    if result.success:
-                        self.server_args.model_path = obj.model_path
-                        self.server_args.load_format = obj.load_format
-                        self.model_path = obj.model_path
-                    return result.success, result.message
-                else:  # self.server_args.dp_size > 1
-                    self.model_update_tmp = []
-                    result = await self.model_update_result
-
-                    all_success = all([r.success for r in result])
-                    if all_success is True:
-                        self.server_args.model_path = obj.model_path
-                        self.server_args.load_format = obj.load_format
-                        self.model_path = obj.model_path
-                    all_message = [r.message for r in result]
-                    all_message = " | ".join(all_message)
-                    return all_success, all_message
-
-        else:
-            return False, "Another update is in progress. Please try again later."
+            all_success = all([r.success for r in result])
+            if all_success is True:
+                self.server_args.model_path = obj.model_path
+                self.server_args.load_format = obj.load_format
+                self.model_path = obj.model_path
+            all_message = [r.message for r in result]
+            all_message = " | ".join(all_message)
+            return all_success, all_message
 
     async def init_weights_update_group(
         self,
         obj: InitWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> bool:
-        if self.to_create_loop:
-            self.create_handle_loop()
-        self.send_to_scheduler.send_pyobj(obj)
-
-        self.init_weights_update_group_result = asyncio.Future()
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for init parameter update group"
-        result = await self.init_weights_update_group_result
+        result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(
         self,
         obj: UpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
-    ):
-        if self.to_create_loop:
-            self.create_handle_loop()
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be for update weights from distributed"
 
-        if not self.model_update_lock.locked():
-            async with self.model_update_lock:
-                self.send_to_scheduler.send_pyobj(obj)
-                self.parameter_update_result = asyncio.Future()
-                assert (
-                    self.server_args.dp_size == 1
-                ), "dp_size must be for update weights from distributed"
-                result = await self.parameter_update_result
-                return result.success, result.message
-        else:
-            logger.error("Another parameter update is in progress in tokenizer manager")
-            return (
-                False,
-                "Another parameter update is in progress. Please try again later.",
-            )
+        # This means that weight sync
+        # cannot run while requests are in progress.
+        async with self.model_update_lock.writer_lock:
+            result = (await self.update_weights_from_distributed_communicator(obj))[0]
+            return result.success, result.message
+
+    async def update_weights_from_tensor(
+        self,
+        obj: UpdateWeightsFromTensorReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be for update weights from distributed"
+
+        # This means that weight sync
+        # cannot run while requests are in progress.
+        async with self.model_update_lock.writer_lock:
+            result = (await self.update_weights_from_tensor_communicator(obj))[0]
+            return result.success, result.message
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
-        if self.to_create_loop:
-            self.create_handle_loop()
-
-        self.send_to_scheduler.send_pyobj(obj)
-        self.get_weights_by_name_result = asyncio.Future()
+        self.auto_create_handle_loop()
+        results = await self.get_weights_by_name_communicator(obj)
+        all_parameters = [r.parameter for r in results]
         if self.server_args.dp_size == 1:
-            result = await self.get_weights_by_name_result
-            return result.parameter
+            return all_parameters[0]
         else:
-            self.get_weights_by_name_tmp = []
-            result = await self.get_weights_by_name_result
-            all_parameters = [r.parameter for r in result]
             return all_parameters
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
-        if self.to_create_loop:
-            self.create_handle_loop()
+        self.auto_create_handle_loop()
 
         session_id = uuid.uuid4().hex
         obj.session_id = session_id
@@ -559,21 +580,21 @@ class TokenizerManager:
         background_tasks.add_task(abort_request)
         return background_tasks
 
-    def create_handle_loop(self):
+    def auto_create_handle_loop(self):
         if not self.to_create_loop:
             return
 
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
-        loop.create_task(self.handle_loop())
+        self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
 
         signal_handler = SignalHandler(self)
         loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
-        loop.create_task(self.sigterm_watchdog())
+        self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
-            await asyncio.sleep(60)
+            await asyncio.sleep(5)
 
         # drain requests
         while True:
@@ -609,29 +630,55 @@ class TokenizerManager:
                     if state is None:
                         continue
 
-                    recv_obj.meta_info[i]["id"] = rid
+                    meta_info = {
+                        "id": rid,
+                        "finish_reason": recv_obj.finished_reasons[i],
+                        "prompt_tokens": recv_obj.prompt_tokens[i],
+                    }
+
+                    if getattr(state.obj, "return_logprob", False):
+                        self.convert_logprob_style(
+                            meta_info,
+                            state.obj.top_logprobs_num,
+                            state.obj.return_text_in_logprobs,
+                            recv_obj,
+                            i,
+                        )
+
+                    if not isinstance(recv_obj, BatchEmbeddingOut):
+                        meta_info.update(
+                            {
+                                "completion_tokens": recv_obj.completion_tokens[i],
+                                "cached_tokens": recv_obj.cached_tokens[i],
+                            }
+                        )
+
                     if isinstance(recv_obj, BatchStrOut):
                         out_dict = {
                             "text": recv_obj.output_strs[i],
-                            "meta_info": recv_obj.meta_info[i],
+                            "meta_info": meta_info,
                         }
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
-                            "meta_info": recv_obj.meta_info[i],
+                            "meta_info": meta_info,
                         }
                     else:
                         assert isinstance(recv_obj, BatchEmbeddingOut)
                         out_dict = {
                             "embedding": recv_obj.embeddings[i],
-                            "meta_info": recv_obj.meta_info[i],
+                            "meta_info": meta_info,
                         }
                     state.out_list.append(out_dict)
-                    state.finished = recv_obj.finished_reason[i] is not None
+                    state.finished = recv_obj.finished_reasons[i] is not None
                     state.event.set()
 
                     if self.enable_metrics:
-                        completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
+                        completion_tokens = (
+                            recv_obj.completion_tokens[i]
+                            if recv_obj.completion_tokens
+                            else 0
+                        )
 
                         if state.first_token_time is None:
                             state.first_token_time = time.time()
@@ -647,7 +694,7 @@ class TokenizerManager:
 
                         if state.finished:
                             self.metrics_collector.inc_prompt_tokens(
-                                recv_obj.meta_info[i]["prompt_tokens"]
+                                recv_obj.prompt_tokens[i]
                             )
                             self.metrics_collector.inc_generation_tokens(
                                 completion_tokens
@@ -676,77 +723,91 @@ class TokenizerManager:
                 assert (
                     self.server_args.dp_size == 1
                 ), "dp_size must be 1 for init parameter update group"
-                self.init_weights_update_group_result.set_result(recv_obj)
+                self.init_weights_update_group_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, UpdateWeightsFromDistributedReqOutput):
                 assert (
                     self.server_args.dp_size == 1
                 ), "dp_size must be 1 for update weights from distributed"
-                self.parameter_update_result.set_result(recv_obj)
+                self.update_weights_from_distributed_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, UpdateWeightsFromTensorReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for update weights from distributed"
+                self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
-                if self.server_args.dp_size == 1:
-                    self.get_weights_by_name_result.set_result(recv_obj)
-                else:
-                    self.get_weights_by_name_tmp.append(recv_obj)
-                    if len(self.get_weights_by_name_tmp) == self.server_args.dp_size:
-                        self.get_weights_by_name_result.set_result(
-                            self.get_weights_by_name_tmp
-                        )
+                self.get_weights_by_name_communicator.handle_recv(recv_obj)
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
 
     def convert_logprob_style(
         self,
-        ret: dict,
-        return_logprob: bool,
+        meta_info: dict,
         top_logprobs_num: int,
         return_text_in_logprobs: bool,
+        recv_obj: BatchStrOut,
+        recv_obj_index: int,
     ):
-        if return_logprob:
-            ret["meta_info"]["input_token_logprobs"] = self.detokenize_logprob_tokens(
-                ret["meta_info"]["input_token_logprobs"], return_text_in_logprobs
-            )
-            ret["meta_info"]["output_token_logprobs"] = self.detokenize_logprob_tokens(
-                ret["meta_info"]["output_token_logprobs"], return_text_in_logprobs
-            )
-
-            if top_logprobs_num > 0:
-                ret["meta_info"]["input_top_logprobs"] = (
-                    self.detokenize_top_logprobs_tokens(
-                        ret["meta_info"]["input_top_logprobs"],
-                        return_text_in_logprobs,
-                    )
-                )
-                ret["meta_info"]["output_top_logprobs"] = (
-                    self.detokenize_top_logprobs_tokens(
-                        ret["meta_info"]["output_top_logprobs"], return_text_in_logprobs
-                    )
-                )
-        return ret
-
-    def detokenize_logprob_tokens(
-        self, token_logprobs: List[Tuple[float, int]], decode_to_text: bool
-    ):
-        # TODO(lianmin): This should run on DetokenizerManager
-        if not decode_to_text:
-            return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
-
-        assert self.tokenizer is not None
-        token_ids = [tid for _, tid in token_logprobs]
-        token_texts = self.tokenizer.batch_decode(token_ids)
-        return [
-            (logprob, token_id, token_text)
-            for (logprob, token_id), token_text in zip(token_logprobs, token_texts)
+        meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
+            recv_obj.input_token_logprobs_val[recv_obj_index],
+            recv_obj.input_token_logprobs_idx[recv_obj_index],
+            return_text_in_logprobs,
+        )
+        meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
+            recv_obj.output_token_logprobs_val[recv_obj_index],
+            recv_obj.output_token_logprobs_idx[recv_obj_index],
+            return_text_in_logprobs,
+        )
+        meta_info["normalized_prompt_logprob"] = recv_obj.normalized_prompt_logprob[
+            recv_obj_index
         ]
 
-    def detokenize_top_logprobs_tokens(self, top_logprobs, decode_to_text: bool):
+        if top_logprobs_num > 0:
+            meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+                recv_obj.input_top_logprobs_val[recv_obj_index],
+                recv_obj.input_top_logprobs_idx[recv_obj_index],
+                return_text_in_logprobs,
+            )
+            meta_info["output_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+                recv_obj.output_top_logprobs_val[recv_obj_index],
+                recv_obj.output_top_logprobs_idx[recv_obj_index],
+                return_text_in_logprobs,
+            )
+
+    def detokenize_logprob_tokens(
+        self,
+        token_logprobs_val: List[float],
+        token_logprobs_idx: List[int],
+        decode_to_text: bool,
+    ):
+        if not decode_to_text:
+            return [
+                (logprob, token_id, None)
+                for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
+            ]
+        else:
+            assert self.tokenizer is not None
+            token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+
+    def detokenize_top_logprobs_tokens(
+        self,
+        token_logprobs_val: List[float],
+        token_logprobs_idx: List[int],
+        decode_to_text: bool,
+    ):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
-        for i, token_top_logprobs in enumerate(top_logprobs):
-            if token_top_logprobs:
-                top_logprobs[i] = self.detokenize_logprob_tokens(
-                    token_top_logprobs, decode_to_text
+        ret = []
+        for i in range(len(token_logprobs_val)):
+            if token_logprobs_val[i]:
+                ret.append(
+                    self.detokenize_logprob_tokens(
+                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                    )
                 )
-        return top_logprobs
+            else:
+                ret.append(None)
+        return ret
 
 
 class SignalHandler:
@@ -758,3 +819,28 @@ class SignalHandler:
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
         self.tokenizer_manager.gracefully_exit = True
+
+
+T = TypeVar("T")
+
+
+class _Communicator(Generic[T]):
+    def __init__(self, sender, fan_out: int):
+        self._sender = sender
+        self._fan_out = fan_out
+        self._result_future: Optional[asyncio.Future] = None
+        self._result_values: Optional[List[T]] = None
+
+    async def __call__(self, obj):
+        self._sender.send_pyobj(obj)
+        self._result_future = asyncio.Future()
+        self._result_values = []
+        await self._result_future
+        result_values = self._result_values
+        self._result_future = self._result_values = None
+        return result_values
+
+    def handle_recv(self, recv_obj: T):
+        self._result_values.append(recv_obj)
+        if len(self._result_values) == self._fan_out:
+            self._result_future.set_result(None)

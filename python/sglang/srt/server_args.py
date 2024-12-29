@@ -26,6 +26,7 @@ from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.model_executor.forward_batch_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
+    get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
@@ -95,6 +96,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # Expert parallelism
+    ep_size: int = 1
 
     # Multi-node distributed serving
     dist_init_addr: Optional[List[str]] = None
@@ -132,6 +135,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_ep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -139,6 +143,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
+    triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
 
@@ -169,6 +174,8 @@ class ServerArgs:
             gpu_mem = get_amdgpu_memory_capacity()
         elif torch.cuda.is_available():
             gpu_mem = get_nvgpu_memory_capacity()
+        elif self.device == "hpu":
+            gpu_mem = get_hpu_memory_capacity()
         else:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
@@ -195,12 +202,20 @@ class ServerArgs:
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
+            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
             if gpu_mem is not None and gpu_mem < 25_000:
-                self.cuda_graph_max_bs = 8
+                if self.tp_size < 4:
+                    self.cuda_graph_max_bs = 8
+                else:
+                    self.cuda_graph_max_bs = 80
             else:
                 self.cuda_graph_max_bs = 160
 
         # Choose kernel backends
+        if self.device == "hpu":
+            self.attention_backend = "torch_native"
+            self.sampling_backend = "pytorch"
+
         if self.attention_backend is None:
             self.attention_backend = (
                 "flashinfer" if is_flashinfer_available() else "triton"
@@ -220,15 +235,19 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
-            self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             self.disable_overlap_schedule = True
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
-                f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap scheduler is disabled."
+            )
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         # Speculative Decoding
@@ -289,7 +308,15 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
+            choices=[
+                "auto",
+                "pt",
+                "safetensors",
+                "npcache",
+                "dummy",
+                "gguf",
+                "bitsandbytes",
+            ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -300,7 +327,9 @@ class ServerArgs:
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. ',
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -553,6 +582,14 @@ class ServerArgs:
                 "shortest_queue",
             ],
         )
+        # Expert parallelism
+        parser.add_argument(
+            "--expert-parallel-size",
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -690,11 +727,6 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
-            "--disable-nan-detection",
-            action="store_true",
-            help="Disable the NaN detection for better performance.",
-        )
-        parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
@@ -708,6 +740,11 @@ class ServerArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+        )
+        parser.add_argument(
+            "--enable-ep-moe",
+            action="store_true",
+            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -747,6 +784,12 @@ class ServerArgs:
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
+        )
+        parser.add_argument(
+            "--triton-attention-num-kv-splits",
+            type=int,
+            default=ServerArgs.triton_attention_num_kv_splits,
+            help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
         )
         parser.add_argument(
             "--num-continuous-decode-steps",
@@ -838,6 +881,7 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
+        args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 

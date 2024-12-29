@@ -307,6 +307,25 @@ class Gemma2Model(nn.Module):
 
 
 class Gemma2ForCausalLM(nn.Module):
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -354,6 +373,40 @@ class Gemma2ForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
+
+    def get_hidden_dim(self, module_name):
+        # return input_dim, output_dim
+        if module_name in ["q_proj", "qkv_proj"]:
+            return (
+                self.config.hidden_size,
+                self.config.head_dim * self.config.num_attention_heads,
+            )
+        elif module_name in ["o_proj"]:
+            return (
+                self.config.head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        elif module_name in ["kv_proj"]:
+            return (
+                self.config.hidden_size,
+                self.config.head_dim * self.config.num_key_value_heads,
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size
+        elif module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
+    def get_module_name(self, name):
+        params_mapping = {
+            "q_proj": "qkv_proj",
+            "k_proj": "qkv_proj",
+            "v_proj": "qkv_proj",
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+        }
+        return params_mapping.get(name, name)
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)

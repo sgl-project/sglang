@@ -57,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -108,6 +109,7 @@ app.add_middleware(
 
 tokenizer_manager: TokenizerManager = None
 scheduler_info: Dict = None
+
 
 ##### Native API endpoints #####
 
@@ -196,7 +198,7 @@ async def stop_profile_async():
 @app.post("/update_weights_from_disk")
 @time_func_latency
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
-    """Update the weights from disk inplace without re-launching the server."""
+    """Update the weights from disk in-place without re-launching the server."""
     success, message = await tokenizer_manager.update_weights_from_disk(obj, request)
     content = {"success": success, "message": message}
     if success:
@@ -245,16 +247,11 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     try:
         ret = await tokenizer_manager.get_weights_by_name(obj, request)
         if ret is None:
-            return ORJSONResponse(
-                {"error": {"message": "Get parameter by name failed"}},
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
+            return _create_error_response("Get parameter by name failed")
         else:
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
@@ -264,9 +261,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
         session_id = await tokenizer_manager.open_session(obj, request)
         return session_id
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
@@ -276,9 +271,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         await tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -311,9 +304,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
-            return ORJSONResponse(
-                {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-            )
+            logger.error(f"Error: {e}")
+            return _create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -324,9 +316,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
@@ -337,9 +327,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -415,6 +403,12 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 
+def _create_error_response(e):
+    return ORJSONResponse(
+        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
+
+
 def launch_engine(
     server_args: ServerArgs,
 ):
@@ -462,8 +456,8 @@ def launch_engine(
         if server_args.node_rank >= 1:
             # For other nodes, they do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            while True:
-                pass
+            for proc in scheduler_procs:
+                proc.join()
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
@@ -492,7 +486,16 @@ def launch_engine(
     # Wait for model to finish loading
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
-        data = scheduler_pipe_readers[i].recv()
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError as e:
+            logger.exception(e)
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
 
         if data["status"] != "ready":
             raise RuntimeError(
@@ -848,12 +851,10 @@ class Engine:
             group_name=group_name,
             backend=backend,
         )
-
-        async def _init_group():
-            return await tokenizer_manager.init_weights_update_group(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_init_group())
+        return loop.run_until_complete(
+            tokenizer_manager.init_weights_update_group(obj, None)
+        )
 
     def update_weights_from_distributed(self, name, dtype, shape):
         """Update weights from distributed source."""
@@ -862,22 +863,24 @@ class Engine:
             dtype=dtype,
             shape=shape,
         )
-
-        async def _update_weights():
-            return await tokenizer_manager.update_weights_from_distributed(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_update_weights())
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def update_weights_from_tensor(self, name, tensor):
+        """Update weights from distributed source."""
+        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_tensor(obj, None)
+        )
 
     def get_weights_by_name(self, name, truncate_size=100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
-
-        async def _get_weights():
-            return await tokenizer_manager.get_weights_by_name(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get_weights())
+        return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
 
 
 class Runtime:
