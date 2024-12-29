@@ -480,8 +480,6 @@ class MLATokenToKVPoolHost:
 
     @debug_timing
     def transfer(self, indices, flat_data):
-        # non_blocking=True only works with pinned memory on a separate stream.
-        # otherwise blocks current stream (https://pytorch.org/tutorials/intermediate/pinmem_nonblock.html)
         flat_data = flat_data.to(device=self.device, non_blocking=False)
         self.kv_buffer[:, :, indices] = flat_data
 

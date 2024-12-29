@@ -101,7 +101,6 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
-        TreeNode.counter = 0
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
@@ -371,6 +370,10 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold = 1
         self.load_back_threshold = 10
         super().__init__(req_to_token_pool, token_to_kv_pool, disable=False)
+
+    def reset(self):
+        TreeNode.counter = 0
+        super().reset()
 
     def get_height(self, node: TreeNode):
         height = 0

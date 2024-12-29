@@ -87,8 +87,6 @@ class SchedulePolicy:
                 )
                 # to prevent evicting nodes referenced by other requests in waiting queue
                 self.tree_cache.inc_lock_ref(r.last_node)
-            for r in waiting_queue:
-                self.tree_cache.dec_lock_ref(r.last_node)
 
                 # NOTE(sang): This logic is for in-batch prefix caching;
                 # If there are more than 1 request that have small matching prefix from
@@ -113,8 +111,7 @@ class SchedulePolicy:
                         self.waiting_queue_radix_tree.insert(
                             prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool)
                         )
-                # to prevent evicting nodes referenced by other requests in waiting queue
-                self.tree_cache.inc_lock_ref(r.last_node)
+
             for r in waiting_queue:
                 self.tree_cache.dec_lock_ref(r.last_node)
 
