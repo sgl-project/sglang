@@ -5,15 +5,55 @@ import time
 
 import requests
 from lorem_text import lorem
+from tqdm import tqdm
 
 import sglang as sgl
-from sglang import RuntimeEndpoint, set_default_backend
+from sglang import set_default_backend
+from sglang.test.test_utils import (
+    add_common_sglang_args_and_parse,
+    select_sglang_backend,
+)
+
+# TODO: To avoid too much unintended tokenizer spliting,
+# sample more reasonably text from datasets like alpaca or sample from nltk corpus?
+try:
+    import nltk
+
+    # use brown corpus for generating text
+    try:
+        nltk.data.find("corpora/brown")
+    except LookupError:
+        nltk.download("brown")
+    sentences = nltk.corpus.brown.sents()
+except ImportError:
+    sentences = None
 
 
-def generate_text(num_tokens):
+def generate_text_nltk(num_tokens):
+    """Generates a text with approximately num_tokens."""
+    num_words = int(num_tokens / 1.93)
+    text = []
+    while len(text) < num_words:
+        sentence = random.choice(sentences)
+        text.extend(sentence)
+    return " ".join(text[: int(num_words)])
+
+
+def generate_text_lorem(num_tokens):
     """Generates a text with approximately num_tokens."""
     num_words = int(num_tokens / 1.93)  # Assuming average word length
     return lorem.words(num_words)
+
+
+def generate_text(num_tokens, method="nltk"):
+    if method == "nltk":
+        if sentences is None:
+            raise ImportError("Please install nltk to sample from its corpus.")
+        return generate_text_nltk(num_tokens)
+    elif method == "lorem":
+        return generate_text_lorem(num_tokens)
+    else:
+        raise ValueError(f"Invalid method: {method}")
 
 
 def generate_prompts(
@@ -23,6 +63,7 @@ def generate_prompts(
     cache_rate=0.8,
     order="random",
     max_tokens=1,
+    method="nltk",
 ):
     """
     Generate prompts for the benchmark.
@@ -34,6 +75,7 @@ def generate_prompts(
         cache_rate (float): Proportion of context cached across prompts within a group.
         order (str): Order of prompts, one of 'random', 'sequential', or 'interleaved'.
         max_tokens (int): Maximum tokens to generate.
+        method (str): Method to generate text, one of 'nltk' or 'lorem'.
 
     Returns:
         list: List of generated prompts.
@@ -41,10 +83,12 @@ def generate_prompts(
     assert order in ["random", "sequential", "interleaved"], "Invalid prompt order"
     prompts = []
 
-    for _ in range(num_groups):
-        shared_context = generate_text(context_length * cache_rate)
+    for _ in tqdm(range(num_groups), desc="Generating prompts"):
+        shared_context = generate_text(context_length * cache_rate, method)
         for _ in range(group_size):
-            prompt = shared_context + generate_text(context_length * (1 - cache_rate))
+            prompt = shared_context + generate_text(
+                context_length * (1 - cache_rate), method
+            )
             prompts.append({"prompt": prompt, "max_tokens": max_tokens})
 
     if order == "random":
@@ -63,37 +107,9 @@ def test_sgl(s, prompt, max_tokens):
     s += sgl.gen(max_tokens=max_tokens, ignore_eos=True)
 
 
-def main():
-    # Set up command-line arguments
-    parser = argparse.ArgumentParser(
-        description="Benchmark prompt generation and SGLang execution."
-    )
-    parser.add_argument(
-        "--order",
-        type=str,
-        default="random",
-        choices=["random", "sequential", "interleaved"],
-        help="Order of prompt execution",
-    )
-    parser.add_argument(
-        "--num_groups", type=int, default=100, help="Number of prompt groups"
-    )
-    parser.add_argument(
-        "--group_size", type=int, default=100, help="Size of each prompt group"
-    )
-    parser.add_argument(
-        "--context_length", type=int, default=1000, help="Length of the context"
-    )
-    parser.add_argument(
-        "--cache_rate", type=float, default=0.8, help="Cache rate for shared context"
-    )
-    parser.add_argument("--output_length", type=int, default=1, help="Output length")
-    parser.add_argument("--num_threads", type=int, default=64, help="Number of threads")
-
-    args = parser.parse_args()
-
+def main(args):
     # Initialize SGLang runtime
-    set_default_backend(RuntimeEndpoint("http://localhost:30000"))
+    set_default_backend(select_sglang_backend(args))
     result_jsonl = []
 
     # Log current parameters
@@ -113,9 +129,11 @@ def main():
         cache_rate=args.cache_rate,
         order=args.order,
         max_tokens=args.output_length,
+        method=args.prompt_pool,
     )
+    print(f"Sample prompt: {prompts[0]['prompt'][:80]}...")
 
-    url = "http://localhost:30000/flush_cache"
+    url = f"http://localhost:{args.port}/flush_cache"
     requests.post(url)
     # sgl.flush_cache()
     time.sleep(1)  # Wait for the cache to be flushed
@@ -150,4 +168,39 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Set up command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Benchmark prompt generation and SGLang execution."
+    )
+    parser.add_argument(
+        "--order",
+        type=str,
+        default="random",
+        choices=["random", "sequential", "interleaved"],
+        help="Order of prompt execution",
+    )
+    parser.add_argument(
+        "--num_groups", "-n", type=int, default=100, help="Number of prompt groups"
+    )
+    parser.add_argument(
+        "--group_size", "-s", type=int, default=100, help="Size of each prompt group"
+    )
+    parser.add_argument(
+        "--context_length", type=int, default=1000, help="Length of the context"
+    )
+    parser.add_argument(
+        "--cache_rate", type=float, default=0.8, help="Cache rate for shared context"
+    )
+    parser.add_argument("--output_length", type=int, default=1, help="Output length")
+    parser.add_argument("--num_threads", type=int, default=64, help="Number of threads")
+    parser.add_argument(
+        "--prompt_pool",
+        type=str,
+        default="nltk",
+        help="Method to sample prompts",
+        choices=["nltk", "lorem"],
+    )
+
+    # args = parser.parse_args()
+    args = add_common_sglang_args_and_parse(parser)
+    main(args)
