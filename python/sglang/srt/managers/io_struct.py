@@ -28,6 +28,14 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
+class SessionParams:
+    id: Optional[str] = None
+    rid: Optional[str] = None
+    offset: Optional[int] = None
+    replace: Optional[bool] = None
+
+
+@dataclass
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
@@ -58,10 +66,8 @@ class GenerateReqInput:
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Session id info for continual prompting
-    session: Optional[
-        Union[List[Tuple[str, Optional[str]]], Tuple[str, Optional[str]]]
-    ] = None
+    # Session info for continual prompting
+    session_params: Optional[Union[List[Dict], Dict]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -223,9 +229,8 @@ class TokenizedGenerateReqInput:
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
-    # Session id info for continual prompting
-    session_id: Optional[str] = None
-    session_rid: Optional[str] = None
+    # Session info for continual prompting
+    session_params: Optional[SessionParams] = None
 
 
 @dataclass
@@ -468,6 +473,7 @@ class ProfileReq(Enum):
 @dataclass
 class OpenSessionReqInput:
     capacity_of_str_len: int
+    session_id: Optional[str] = None
 
 
 @dataclass
@@ -477,4 +483,5 @@ class CloseSessionReqInput:
 
 @dataclass
 class OpenSessionReqOutput:
-    session_id: str
+    session_id: Optional[str]
+    success: bool
