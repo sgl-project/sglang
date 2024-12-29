@@ -282,6 +282,12 @@ class ServerArgs:
             help="If set, skip init tokenizer and pass input_ids in generate request",
         )
         parser.add_argument(
+            "--return-token-ids",
+            action="store_true",
+            default=ServerArgs.return_token_ids,
+            help="Whether to return token IDs in the output. Experimental feature.",
+        )
+        parser.add_argument(
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
