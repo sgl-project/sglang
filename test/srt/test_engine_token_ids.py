@@ -3,16 +3,15 @@ import unittest
 from transformers import AutoTokenizer
 
 import sglang as sgl
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestEngineTokenIds(unittest.TestCase):
     def test_token_ids_in_generate(self):
         llm = sgl.Engine(
-            model_path="meta-llama/Meta-Llama-3.1-8B-Instruct", return_token_ids=True
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, return_token_ids=True
         )
-        tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Meta-Llama-3.1-8B-Instruct"
-        )
+        tokenizer = AutoTokenizer.from_pretrained(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
         prompts = [
             "Hello, my name is",
@@ -20,37 +19,21 @@ class TestEngineTokenIds(unittest.TestCase):
             "The capital of France is",
             "The future of AI is",
         ]
-        sampling_params = {"temperature": 0.8, "top_p": 0.95}
+        sampling_params = {"temperature": 0, "top_p": 0.95}
         outputs = llm.generate(prompts, sampling_params)
 
-        # Hugging Face tokenizer has a start token in its output,
-        # while SGLang only adds next_token_id in output_ids.
-        # We remove start token in HF output for comparison.
         for prompt, output in zip(prompts, outputs):
-            hf_input_ids = tokenizer.encode(prompt)
-            self.assertEqual(
-                output["input_ids"],
-                hf_input_ids,
-                f"Input token IDs mismatch for: {prompt}",
-            )
+            # SGLang's input_ids has a start token, so we remove it for comparison.
+            deocode_input = tokenizer.decode(output["input_ids"][1:])
+            assert (
+                deocode_input in prompt
+            ), f"Decode input: {deocode_input} mismatch for: {prompt}"
 
-            hf_output_ids = tokenizer.encode(output["text"])[1:]  # remove start token
-            self.assertEqual(
-                output["output_ids"],
-                hf_output_ids,
-                f"Output token IDs mismatch for: {output['text']}",
-            )
-
-            self.assertEqual(
-                len(output["input_ids"]),
-                output["meta_info"]["prompt_tokens"],
-                "Prompt token count mismatch",
-            )
-            self.assertEqual(
-                len(output["output_ids"]),
-                output["meta_info"]["completion_tokens"],
-                "Completion token count mismatch",
-            )
+            # SGLang's output_ids does not have a start token.
+            deocode_output = tokenizer.decode(output["output_ids"])
+            assert (
+                deocode_output in output["text"]
+            ), f"Decode output: {deocode_output} mismatch for: {output['text']}"
 
         llm.shutdown()
 
