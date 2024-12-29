@@ -50,7 +50,8 @@ from sglang.srt.utils import (
     is_hip,
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
-    set_cpu_offload_max_bytes, primary_memory_saver,
+    set_cpu_offload_max_bytes,
+    primary_memory_saver,
 )
 from vllm.distributed import (
     get_tp_group,
