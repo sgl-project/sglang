@@ -291,6 +291,7 @@ class LlamaModel(nn.Module):
         def prefetch_layer(layer_id: int):
             if not forward_batch.forward_mode.is_extend():
                 return
+            return
 
             assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
             for ibatch in range(forward_batch.batch_size):

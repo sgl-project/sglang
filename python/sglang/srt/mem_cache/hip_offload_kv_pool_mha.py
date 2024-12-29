@@ -70,8 +70,9 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             gpu_allocated_bytes += cache.mask_k_cache.allocated_gpu_bytes
             gpu_allocated_bytes += cache.sa_kv_cache.allocated_gpu_bytes
         logger.info(
-            f'Allocated CPU(UVM) bytes: {format_size_bytes(uvm_allocated_bytes)}, '
-            f'Allocated GPU bytes: {format_size_bytes(gpu_allocated_bytes)}'
+            f'Allocated total CPU (UVM) bytes: {format_size_bytes(uvm_allocated_bytes)}, '
+            f'Allocated total GPU bytes: {format_size_bytes(gpu_allocated_bytes)}, '
+            f'{self.dtype} on {self.device}'
         )
 
     def get_key_buffer(self, layer_id: int):
@@ -131,6 +132,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         cache_k: Tensor,
         cache_v: Tensor,
     ) -> Tuple[Tensor, Tensor]:
+        return cache_k, cache_v
+    
         # Use this function for prefill
         handle_id = (layer_id, batch_id)
         prefetch_thread = self.prefetch_threads.get(handle_id, None)
@@ -138,33 +141,40 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             prefetch_thread.join()
         
         assert handle_id in self.prefetched_kv, "did prefetch successed?"
-        k, v, seq_len, table = self.prefetched_kv.pop(handle_id)
+        k, v, prefix_seq_len, table = self.prefetched_kv.pop(handle_id)
         
         assert isinstance(k, Tensor)
         assert isinstance(v, Tensor)
-        assert isinstance(seq_len, int)
+        assert isinstance(prefix_seq_len, int)
         assert k.shape == v.shape
         assert k.ndim == 4, f'{k.shape}'
         assert k.shape[0] == 1
-        assert k.shape[1] >= seq_len
+        assert k.shape[1] >= prefix_seq_len
         assert k.shape[2] == self.head_num
         assert k.shape[3] == self.head_dim
         assert k.dtype == v.dtype
         assert k.dtype == self.dtype
-        assert k.shape[1] >= seq_len+cache_k.shape[1]
         assert cache_k.ndim == 4
         assert cache_k.shape[0] == 1
         assert cache_k.shape[2] == self.head_num
         assert cache_k.shape[3] == self.head_dim
+        assert k.shape[1] == prefix_seq_len + cache_k.shape[1]
+        assert k.dtype in [torch.float8_e5m2, torch.float16, torch.bfloat16, torch.float32]
+
+        if self.dtype not in [torch.float8_e5m2]:
+            assert cache_k.dtype == self.dtype
+        else:
+            if cache_k.dtype != self.dtype:
+                cache_k = cache_k.to(self.dtype, non_blocking=True)
+                cache_v = cache_v.to(self.dtype, non_blocking=True)
         
-        if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype, non_blocking=True)
-            cache_v = cache_v.to(self.dtype, non_blocking=True)
-        
-        k[:, seq_len:, :, :].copy_(cache_k, non_blocking=True)
-        v[:, seq_len:, :, :].copy_(cache_v, non_blocking=True)
-        
-        return k, v
+        if prefix_seq_len == 0:
+            return cache_k, cache_v
+        else:
+            k[:, prefix_seq_len:, :, :].copy_(cache_k, non_blocking=True)
+            v[:, prefix_seq_len:, :, :].copy_(cache_v, non_blocking=True)
+            
+            return k, v
 
     def set_kv_buffer(
         self,
@@ -173,6 +183,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         async_copy: bool = False,
+        push_to_gpu_cache: bool = False,
     ):
         layer_id = layer.layer_id
         # pass async_copy=True when only prefill (eager mode)

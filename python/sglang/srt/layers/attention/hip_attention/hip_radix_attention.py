@@ -97,14 +97,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        async_copy=False
+                        layer, cache_loc, k, v,
+                        async_copy=True, push_to_gpu_cache=False
                     )
             k_cache = v_cache = None
-            offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            # offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            offload_cache = None
         else:
             if k is not None:
                 assert v is not None
@@ -128,17 +126,31 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else:
                 if is_offload_cache:
                     assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
-                    k, v = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
+                    k_chunk, v_chunk = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
                         layer_id=layer.layer_id,
                         batch_id=idx_batch,
                         cache_k=k[start_len:start_len+seq_len].unsqueeze(0),
                         cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
                     )
+
+                    # print(k_chunk.shape)
+
+                    _k_chunk = torch.zeros((1, 196608, k_chunk.shape[2], 128), dtype=k_chunk.dtype, device=k_chunk.device)
+                    _v_chunk = torch.zeros((1, 196608, k_chunk.shape[2], 128), dtype=k_chunk.dtype, device=k_chunk.device)
+                    _k_chunk[:, :k_chunk.shape[1], :, :] = k_chunk
+                    _v_chunk[:, :v_chunk.shape[1], :, :] = v_chunk
+                    k_chunk = _k_chunk
+                    v_chunk = _v_chunk
+
+                    # print(k_chunk.shape)
+
                     k_cache = v_cache = None
+                    offload_cache = None
                     # if layer.layer_id == 31:
-                    # print(layer.layer_id, k[0,::8192,0,0])
                 else:
-                    k = v = None
+                    k_chunk = v_chunk = None
+                
+                # print(layer.layer_id, k[::1,0,0], v[::1,0,0])
 
                 o_req, _ = self.forward_paged_hip(
                     query=q_reshaped[start_len:start_len+seq_len],
@@ -157,11 +169,11 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     layer=layer,
                     is_dense=layer.layer_id in self.hip_config.dense_layers,
 
-                    k=k,
-                    v=v,
+                    k=k_chunk,
+                    v=v_chunk,
                 )
                 # if layer.layer_id == 31:
-                # print(o_req[::8192,0,0])
+                # print(layer.layer_id, o_req[::1,0,0])
                 o[start_len:start_len+seq_len] = o_req
             start_len += seq_len
         assert len(decoding_reqs) == 0
@@ -193,7 +205,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, async_copy=False
+                        layer, cache_loc, k, v, 
+                        async_copy=False, push_to_gpu_cache=True,
                     )
             k_cache = v_cache = None
             offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -323,6 +336,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,
         )
+
+        # print(isinstance(k, torch.Tensor), isinstance(v, torch.Tensor), args.offload_cache, isinstance(args.k_cache, torch.Tensor))
 
         context, metadata = dual_stage_quadratic_hip_attention(
             (query * sm_scale).to(query.dtype),
