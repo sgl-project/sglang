@@ -442,7 +442,6 @@ class EAGLEDraftInput(SpecDraftInput):
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(seq_len + 1, dim=0)
-        kv_last_page_len = torch.ones((bs,), dtype=torch.int32, device="cuda")
         total_len = torch.sum(paged_kernel_lens).item()
 
         kv_indices = torch.empty(
@@ -462,7 +461,7 @@ class EAGLEDraftInput(SpecDraftInput):
             triton.next_power_of_2(seq_num),
             triton.next_power_of_2(self.spec_steps),
         )
-        return kv_indices, cum_kv_seq_len, kv_last_page_len, None
+        return bs, kv_indices, cum_kv_seq_len
 
     def clear(self):
         self.iter = 0
@@ -568,8 +567,6 @@ class EagleVerifyInput(SpecVerifyInput):
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
-
         kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
 
         create_flashinfer_kv_indices_triton[(batch_size,)](
@@ -581,7 +578,7 @@ class EagleVerifyInput(SpecVerifyInput):
             kv_indices,
             req_to_token.size(1),
         )
-        return kv_indices, cum_kv_seq_len, kv_last_page_len, qo_indptr
+        return kv_indices, cum_kv_seq_len, qo_indptr
 
     def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
         predict = torch.argmax(logits_output.next_token_logits, dim=-1)

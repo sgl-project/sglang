@@ -256,7 +256,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 forward_batch=forward_batch,
             )
-            self.decode_cuda_graph_metadata[num_token] = decode_wrappers
+            self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_batch.forward_mode.is_target_verify():
             prefill_wrappers = []
@@ -285,7 +285,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 forward_batch=forward_batch,
             )
-            self.prefill_cuda_graph_metadata[num_token] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_batch.forward_mode=}")
@@ -293,31 +293,28 @@ class FlashInferAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        if forward_batch is None or forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[num_token],
+                decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 forward_batch=forward_batch,
             )
-        elif (
-            forward_batch is not None and forward_batch.forward_mode.is_target_verify()
-        ):
+        elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[num_token],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 forward_batch=forward_batch,
@@ -566,17 +563,7 @@ class FlashInferIndicesUpdaterDecode:
         kv_start_idx: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-
-        if forward_batch is not None and forward_batch.spec_info is not None:
-            bs = forward_batch.input_ids.numel()
-            kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
-                forward_batch.spec_info.generate_attn_arg(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    self.req_to_token,
-                )
-            )
-        else:
+        if forward_batch.spec_info is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -591,6 +578,12 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
+            )
+        else:
+            bs, kv_indices, kv_indptr = forward_batch.spec_info.generate_attn_arg(
+                req_pool_indices,
+                paged_kernel_lens,
+                self.req_to_token,
             )
 
         wrapper.end_forward()
@@ -781,19 +774,17 @@ class FlashInferIndicesUpdaterPrefill:
         forward_batch: ForwardBatch,
     ):
         bs = len(req_pool_indices)
-        if forward_batch is not None and forward_batch.forward_mode.is_draft_extend():
-            # spec extend update generate arg
-            kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
+        custom_mask = None
+        if forward_batch.forward_mode.is_draft_extend():
+            kv_indices, kv_indptr, qo_indptr = (
                 forward_batch.spec_info.generate_attn_arg_spec_extend(
                     req_pool_indices,
                     paged_kernel_lens,
                     self.req_to_token,
                 )
             )
-        elif (
-            forward_batch is not None and forward_batch.forward_mode.is_target_verify()
-        ):
-            kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
+        elif forward_batch.forward_mode.is_target_verify():
+            kv_indices, kv_indptr, qo_indptr = (
                 forward_batch.spec_info.generate_attn_arg(
                     req_pool_indices,
                     paged_kernel_lens,
@@ -801,19 +792,6 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
             custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
-            wrapper_paged.end_forward()
-            wrapper_paged.begin_forward(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                custom_mask=custom_mask,
-            )
-            return
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -832,7 +810,6 @@ class FlashInferIndicesUpdaterPrefill:
 
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            kv_last_page_len = self.kv_last_page_len[:bs]
 
         # extend part
         if use_ragged:
@@ -852,12 +829,13 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            kv_last_page_len[:bs],
+            self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
             1,
             q_data_type=self.q_data_type,
+            custom_mask=custom_mask,
         )
 
 

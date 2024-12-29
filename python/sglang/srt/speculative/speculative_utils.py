@@ -6,7 +6,6 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.server_args import ServerArgs
 
 
 class SpecInput:
