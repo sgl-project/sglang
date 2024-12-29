@@ -214,7 +214,7 @@ class HiCacheController:
                     operation = self.load_queue.get(timeout=1)
                     operation.data = self.mem_pool_host.get_flat_data(
                         operation.host_indices
-                    ).pin_memory()
+                    )
                     self.mem_pool_device.transfer(
                         operation.device_indices, operation.data
                     )
@@ -246,6 +246,9 @@ class HiCacheController:
                     if len(buffer.host_indices) == 0:
                         buffer = None
                         continue
+                    buffer.device_indices.to(
+                        device=self.mem_pool_device.device, copy=True
+                    )
                     buffer.data = self.mem_pool_device.get_flat_data(
                         buffer.device_indices
                     ).contiguous()
@@ -276,6 +279,9 @@ class HiCacheController:
                         self.mem_pool_host.get_flat_data(buffer.host_indices)
                         .contiguous()
                         .pin_memory()
+                    )
+                    buffer.device_indices.to(
+                        device=self.mem_pool_device.device, copy=True
                     )
                     self.load_buffer.put(buffer)
                     buffer = None
