@@ -250,6 +250,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens,
                 forward_batch=forward_batch,
+                encoder_wrappers=prefill_wrappers,
             )
             self.cuda_graph_metadata[num_token] = prefill_wrappers
 
@@ -829,6 +830,7 @@ class FlashInferIndicesUpdaterPrefill:
                 1,
                 custom_mask=custom_mask,
             )
+            return
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]

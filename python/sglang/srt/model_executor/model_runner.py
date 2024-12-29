@@ -655,9 +655,9 @@ class ModelRunner:
         tensor_parallel(self.model, device_mesh)
 
     def forward_decode(self, forward_batch: ForwardBatch):
-
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
             return self.cuda_graph_runner.replay(forward_batch)
+
         if hasattr(forward_batch.spec_info, "positions"):
             forward_batch.positions = forward_batch.spec_info.positions
         else:
@@ -668,8 +668,11 @@ class ModelRunner:
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
-        self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
+            if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
+                return self.cuda_graph_runner.replay(forward_batch)
+
+            self.attn_backend.init_forward_metadata(forward_batch)
             if getattr(forward_batch.spec_info, "positions", None) is not None:
                 forward_batch.positions = forward_batch.spec_info.positions
 
@@ -685,6 +688,8 @@ class ModelRunner:
                     input_embeds=forward_batch.input_embeds.bfloat16(),
                 )
         else:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
             # Only embedding models have get_embedding parameter
             return self.model.forward(
                 forward_batch.input_ids,
