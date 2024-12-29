@@ -10,7 +10,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import triton
@@ -230,9 +230,8 @@ class FlashInferAttnBackend(AttentionBackend):
         num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: torch.Tensor = None,
-        spec_info: SpecInput = None,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         if forward_batch.forward_mode.is_decode():
             decode_wrappers = []
@@ -255,6 +254,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
+                forward_batch=forward_batch,
             )
             self.decode_cuda_graph_metadata[num_token] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
@@ -297,8 +297,8 @@ class FlashInferAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens=None,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         if forward_batch is None or forward_batch.forward_mode.is_decode():
             self.indices_updater_decode.update(
@@ -468,7 +468,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
@@ -480,8 +480,8 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: torch.Tensor,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -500,7 +500,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
         for wrapper_id in range(2):
@@ -533,8 +533,8 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: torch.Tensor,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -564,7 +564,7 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
-        forward_batch: ForwardBatch = None,
+        forward_batch: ForwardBatch,
     ):
 
         if forward_batch is not None and forward_batch.spec_info is not None:
@@ -647,8 +647,8 @@ class FlashInferIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: torch.Tensor,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -661,8 +661,8 @@ class FlashInferIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: torch.Tensor,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -694,8 +694,8 @@ class FlashInferIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: torch.Tensor,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -735,8 +735,8 @@ class FlashInferIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: torch.Tensor,
-        forward_batch: ForwardBatch = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -778,7 +778,7 @@ class FlashInferIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        forward_batch: ForwardBatch = None,
+        forward_batch: ForwardBatch,
     ):
         bs = len(req_pool_indices)
         if forward_batch is not None and forward_batch.forward_mode.is_draft_extend():

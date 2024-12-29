@@ -68,7 +68,6 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
-    split_prefill_batch: bool = False
     cpu_offload_gb: int = 0
     prefill_only_one_req: bool = False
 
@@ -258,7 +257,7 @@ class ServerArgs:
             self.speculative_algorithm
         )
         if self.speculative_algorithm.is_eagle():
-            self.split_prefill_batch = True
+            self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
             self.disable_overlap_schedule = True
@@ -842,13 +841,6 @@ class ServerArgs:
             required=False,
             choices=[1, 2, 4, 8],
             default=8,
-        )
-        parser.add_argument(
-            "--split-prefill-batch",
-            type=bool,
-            help="Whether to inference prefill sample one by one.",
-            required=False,
-            default=False,
         )
         parser.add_argument(
             "--draft-runner-cache-size",

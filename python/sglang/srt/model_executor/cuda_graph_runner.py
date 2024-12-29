@@ -389,8 +389,7 @@ class CudaGraphRunner:
             req_pool_indices,
             seq_lens,
             encoder_lens,
-            spec_info,
-            forward_batch=forward_batch,
+            forward_batch,
         )
 
         # Run and capture
