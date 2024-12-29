@@ -516,6 +516,9 @@ class LlamaForCausalLM(nn.Module):
             )
             return None
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
 
 class Phi3ForCausalLM(LlamaForCausalLM):
     pass
