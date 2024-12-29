@@ -1,27 +1,18 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Type
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    SpeculativeAlgorithm,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel
-from sglang.srt.speculative.speculative_utils import (
-    DraftInfoFactory,
-    SpecDraftInput,
-    SpecVerifyInput,
-)
+from sglang.srt.speculative.spec_info import SpecInfo
 
 if TYPE_CHECKING:
     from python.sglang.srt.layers.sampler import SampleOutput
     from python.sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
 
 
@@ -221,8 +212,7 @@ def generate_draft_decode_kv_indices(
     tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
 
 
-@DraftInfoFactory.register(SpeculativeAlgorithm.EAGLE, "DraftInput")
-class EAGLEDraftInput(SpecDraftInput):
+class EAGLEDraftInput(SpecInfo):
     hidden_states: torch.Tensor = None
     verified_id: torch.Tensor = None
     positions: torch.Tensor = None
@@ -508,8 +498,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self.sample_output = torch.cat([self.sample_output, spec_info.sample_output])
 
 
-@DraftInfoFactory.register(SpeculativeAlgorithm.EAGLE, "VerifyInput")
-class EagleVerifyInput(SpecVerifyInput):
+class EagleVerifyInput(SpecInfo):
     def __init__(
         self,
         draft_token: torch.Tensor,

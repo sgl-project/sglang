@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, List, Optional, Type, Union
+from typing import List, Optional, Type, Union
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker

@@ -10,7 +10,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.speculative_utils import SpecInput
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -86,7 +86,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         assert encoder_lens is None, "Not supported"
         assert forward_mode.is_decode(), "Not supported"
@@ -105,7 +105,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         # NOTE: encoder_lens expected to be zeros or None
         self.cuda_graph_start_loc.zero_()

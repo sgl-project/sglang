@@ -24,7 +24,7 @@ from sglang.srt.utils import is_flashinfer_available
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.speculative_utils import SpecInput
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -232,7 +232,7 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode():
             decode_wrappers = []
@@ -299,7 +299,7 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode():
             self.indices_updater_decode.update(
@@ -467,7 +467,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -479,7 +479,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -499,7 +499,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -533,7 +533,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -564,7 +564,7 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
@@ -643,7 +643,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -657,7 +657,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -690,7 +690,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -731,7 +731,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -773,7 +773,7 @@ class FlashInferIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[SpecInput],
+        spec_info: Optional[SpecInfo],
     ):
         bs = len(req_pool_indices)
         if spec_info is None:

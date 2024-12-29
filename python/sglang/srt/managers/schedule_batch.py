@@ -53,7 +53,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.speculative_utils import SpecInput
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -577,7 +577,7 @@ class ScheduleBatch:
     device: str = "cuda"
 
     # speculative decoding
-    spec_info: SpecInput = None
+    spec_info: SpecInfo = None
     spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
 
     @classmethod
@@ -1234,7 +1234,7 @@ class ModelWorkerBatch:
 
     # Speclulative decoding
     spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
-    spec_info: SpecInput = None
+    spec_info: SpecInfo = None
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
 

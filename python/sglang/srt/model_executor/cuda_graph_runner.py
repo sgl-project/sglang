@@ -37,7 +37,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     SpeculativeAlgorithm,
 )
-from sglang.srt.speculative.speculative_utils import DraftInfoFactory
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
@@ -318,18 +317,19 @@ class CudaGraphRunner:
 
         spec_info = None
         if self.model_runner.server_args.speculative_algorithm.is_eagle():
+            from sglang.srt.speculative.eagle_utils import (
+                EAGLEDraftInput,
+                EagleVerifyInput,
+            )
+
             if self.model_runner.is_draft_runner:
-                spec_info = DraftInfoFactory.get(
-                    self.model_runner.server_args.speculative_algorithm, "DraftInput"
-                )()
+                spec_info = EAGLEDraftInput()
                 spec_info.hidden_states = self.hidden_states[:num_token]
                 spec_info.positions = positions
                 spec_info.init(self.model_runner.server_args)
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
             else:
-                spec_info = DraftInfoFactory.get(
-                    self.model_runner.server_args.speculative_algorithm, "VerifyInput"
-                )(
+                spec_info = EagleVerifyInput(
                     None,
                     None,
                     None,
@@ -452,10 +452,9 @@ class CudaGraphRunner:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
 
         # EAGLE speculative decoding
-        if isinstance(
-            forward_batch.spec_info,
-            DraftInfoFactory.get(SpeculativeAlgorithm.EAGLE, "DraftInput"),
-        ):
+        from sglang.srt.speculative.eagle_utils import EAGLEDraftInput
+
+        if isinstance(forward_batch.spec_info, EAGLEDraftInput):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
 
         # Attention backend

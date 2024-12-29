@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.speculative_utils import SpecInput
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 
 class SpeculativeAlgorithm(IntEnum):
