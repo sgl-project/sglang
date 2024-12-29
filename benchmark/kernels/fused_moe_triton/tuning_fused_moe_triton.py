@@ -418,8 +418,7 @@ def main(args: argparse.Namespace):
             search_space = [
                 config
                 for config in search_space
-                if block_n % config["BLOCK_SIZE_N"] == 0
-                and block_k % config["BLOCK_SIZE_K"] == 0
+                if block_k % config["BLOCK_SIZE_K"] == 0
             ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
