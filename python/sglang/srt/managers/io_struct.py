@@ -361,9 +361,13 @@ class BatchStrOut:
     output_ids: Optional[List[int]]
 
     # Token counts
+    # real input and output tokens can be get from
+    # origin_input_ids and output_ids by enabling --return_token_ids
+    # TODO (Shuai): Rename this to clarify the meaning.
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+
     # Logprobs
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
