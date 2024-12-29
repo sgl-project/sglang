@@ -45,8 +45,10 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
+        # Skip the input_layernorm
         if layer_id == 0:
-            self.input_layernorm = lambda x: x
+            del self.input_layernorm
+            setattr(self, "input_layernorm", lambda x: x)
 
 
 class LlamaModel(nn.Module):
