@@ -35,6 +35,20 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
 
 
+class LlamaDecoderLayer(LlamaDecoderLayer):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, layer_id, quant_config, prefix)
+
+        if layer_id == 0:
+            self.input_layernorm = lambda x: x
+
+
 class LlamaModel(nn.Module):
     def __init__(
         self,
@@ -83,7 +97,7 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-        return hidden_states
+        return hidden_states + residual
 
 
 class LlamaForCausalLMEagle(LlamaForCausalLM):
