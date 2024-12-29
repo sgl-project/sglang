@@ -131,10 +131,8 @@ class ModelConfig:
         # Veirfy quantization
         self._verify_quantization()
 
-        # Text attrs
+        # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
-
-        # Multimodel attrs
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
