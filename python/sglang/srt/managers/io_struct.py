@@ -318,8 +318,10 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init`
-    output_ids: Optional[List[int]]
+    # The token ids
+    output_ids: List[int]
+    origin_input_ids: List[int]
+
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
@@ -348,6 +350,10 @@ class BatchStrOut:
     finished_reasons: List[dict]
     # The output decoded strings
     output_strs: List[str]
+
+    # The token ids
+    origin_input_ids: List[int]
+    output_ids: List[int]
 
     # Token counts
     prompt_tokens: List[int]

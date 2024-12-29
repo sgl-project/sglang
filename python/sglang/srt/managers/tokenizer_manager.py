@@ -657,6 +657,8 @@ class TokenizerManager:
                         out_dict = {
                             "text": recv_obj.output_strs[i],
                             "meta_info": meta_info,
+                            "input_ids": recv_obj.origin_input_ids[i],
+                            "output_ids": recv_obj.output_ids[i],
                         }
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
