@@ -496,7 +496,7 @@ class FlashInferIndicesUpdaterDecode:
 
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        # Constants
+        # Parse Constants
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
@@ -517,7 +517,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
-        # Dispatch
+        # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
             self.update = self.update_sliding_window
         elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
@@ -647,8 +647,8 @@ class FlashInferIndicesUpdaterPrefill:
 
     def call_begin_forward(
         self,
-        wrapper_ragged,
-        wrapper_paged,
+        wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
+        wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
