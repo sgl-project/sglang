@@ -409,7 +409,7 @@ def _decode_grouped_att_m_fwd(
     # [TODO] work around shmem limit on MI3xx
     if is_hip_ and Lk >= 576:
         BLOCK = 16
-        
+
     if Lk == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
