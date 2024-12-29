@@ -322,11 +322,12 @@ def invoke_fused_moe_kernel(
 
     padded_size = 0
     if use_fp8_w8a8:
-        padded_size = padding_size
         assert B_scale is not None
         if block_shape is None:
+            padded_size = padding_size
             A, A_scale = ops.scaled_fp8_quant(A, A_scale)
         else:
+            padding_size = 0
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             A, A_scale = per_token_group_quant_fp8(A, block_k)
@@ -724,7 +725,7 @@ def fused_experts_impl(
     block_shape: Optional[List[int]] = None,
 ):
     padded_size = padding_size
-    if not use_fp8_w8a8:
+    if not use_fp8_w8a8 or block_shape is not None:
         padded_size = 0
 
     # Check constraints.

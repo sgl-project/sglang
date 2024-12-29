@@ -603,18 +603,6 @@ class Fp8MoEMethod:
                     layer.w2_input_scale = torch.nn.Parameter(
                         w2_input_scale, requires_grad=False
                     )
-
-                if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
-                    layer.w13_weight = torch.nn.Parameter(
-                        F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
-                        requires_grad=False,
-                    )
-                    torch.cuda.empty_cache()
-                    layer.w2_weight = torch.nn.Parameter(
-                        F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
-                        requires_grad=False,
-                    )
-                    torch.cuda.empty_cache()
             return
         # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
