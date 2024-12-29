@@ -143,14 +143,6 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.fn_get_rope = lambda: get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=rope_is_neox_style,
-        )
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -174,9 +166,6 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # HACK!!!
-        self.rotary_emb = self.fn_get_rope()
-       
         if self.layer_id == 0 and forward_batch.forward_mode.is_extend():
             self.qkv_proj.enable_debug = True
 
