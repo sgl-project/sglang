@@ -290,7 +290,7 @@ class XverseModel(nn.Module):
         return hidden_states
 
 
-class XverseForCausalLM(nn.Module):
+class XverseForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: LlamaConfig,

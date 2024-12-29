@@ -290,7 +290,7 @@ class MixtralModel(nn.Module):
         return hidden_states
 
 
-class MixtralForCausalLM(nn.Module):
+class MixtralForCausalLM(BaseCausalLM):
 
     def __init__(
         self,

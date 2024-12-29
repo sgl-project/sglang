@@ -333,7 +333,7 @@ class Grok1Model(nn.Module):
         return hidden_states
 
 
-class Grok1ForCausalLM(nn.Module):
+class Grok1ForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,

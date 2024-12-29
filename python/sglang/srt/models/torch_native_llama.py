@@ -381,7 +381,7 @@ class LlamaModel(nn.Module):
         return hidden_states
 
 
-class TorchNativeLlamaForCausalLM(nn.Module):
+class TorchNativeLlamaForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: LlamaConfig,

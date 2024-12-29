@@ -270,7 +270,7 @@ class MiniCPMModel(nn.Module):
         return hidden_states
 
 
-class MiniCPMForCausalLM(nn.Module):
+class MiniCPMForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config,
