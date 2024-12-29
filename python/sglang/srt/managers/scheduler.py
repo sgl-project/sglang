@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from types import SimpleNamespace
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import psutil
 import setproctitle
@@ -52,6 +52,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -477,6 +479,11 @@ class Scheduler:
                 success, message = self.update_weights_from_distributed(recv_req)
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success, message)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
+                success, message = self.update_weights_from_tensor(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightsFromTensorReqOutput(success, message)
                 )
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
@@ -1451,6 +1458,17 @@ class Scheduler:
     ):
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        return success, message
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        """Update the online model parameter from tensors."""
+        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
+        # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
