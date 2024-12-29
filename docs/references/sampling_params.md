@@ -185,12 +185,13 @@ The `image_data` can be a file name, a URL, or a base64 encoded string. See also
 Streaming is supported in a similar manner as [above](#streaming).
 
 ### Structured Outputs (JSON, Regex, EBNF)
-You can specify a JSON schema, Regular Expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints.
+You can specify a JSON schema, Regular Expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. XGrammar uses 
 
 SGLang supports two grammar backends:
 
 - [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and Regular Expression constraints.
 - [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema and EBNF constraints.
+  - XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md)
 
 > 🔔 Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified at a time.
 
