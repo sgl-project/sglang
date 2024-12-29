@@ -55,7 +55,7 @@ class ServerArgs:
     is_embedding: bool = False
     revision: Optional[str] = None
 
-    # Port
+    # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
 
@@ -68,6 +68,7 @@ class ServerArgs:
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
+    prefill_only_one_req: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -94,6 +95,7 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+
     # Expert parallelism
     ep_size: int = 1
 
@@ -217,6 +219,13 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         # Others
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
@@ -228,12 +237,6 @@ class ServerArgs:
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap scheduler is disabled."
-            )
-        # Expert parallelism
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.info(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         # GGUF
@@ -430,12 +433,17 @@ class ServerArgs:
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
-
         parser.add_argument(
             "--cpu-offload-gb",
             type=int,
             default=ServerArgs.cpu_offload_gb,
             help="How many GBs of RAM to reserve for CPU offloading",
+        )
+        parser.add_argument(
+            "--prefill-only-one-req",
+            type=bool,
+            help="If true, we only prefill one request at one prefill batch",
+            default=ServerArgs.prefill_only_one_req,
         )
 
         # Other runtime options
@@ -555,6 +563,7 @@ class ServerArgs:
                 "shortest_queue",
             ],
         )
+
         # Expert parallelism
         parser.add_argument(
             "--expert-parallel-size",
@@ -775,28 +784,6 @@ class ServerArgs:
             "--delete-ckpt-after-loading",
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
-        )
-
-        # Deprecated arguments
-        parser.add_argument(
-            "--enable-overlap-schedule",
-            action=DeprecatedAction,
-            help="'--enable-overlap-schedule' is deprecated. It is enabled by default now. Please drop this argument.",
-        )
-        parser.add_argument(
-            "--disable-flashinfer",
-            action=DeprecatedAction,
-            help="'--disable-flashinfer' is deprecated. Please use '--attention-backend triton' instead.",
-        )
-        parser.add_argument(
-            "--disable-flashinfer-sampling",
-            action=DeprecatedAction,
-            help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
-        )
-        parser.add_argument(
-            "--disable-disk-cache",
-            action=DeprecatedAction,
-            help="'--disable-disk-cache' is deprecated. Please use '--disable-outlines-disk-cache' instead.",
         )
 
     @classmethod
