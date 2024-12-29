@@ -816,6 +816,8 @@ class Scheduler:
                 if res == AddReqResult.NO_TOKEN:
                     self.batch_is_full = True
                 break
+            if self.server_args.prefill_only_one_req:
+                break
 
         # Update waiting queue
         can_run_list = adder.can_run_list

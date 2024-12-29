@@ -8,9 +8,9 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import os
-from dataclasses import Union, dataclass
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Union
 
 import torch
 import triton

@@ -68,6 +68,7 @@ class ServerArgs:
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
+    prefill_only_one_req: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -437,6 +438,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.cpu_offload_gb,
             help="How many GBs of RAM to reserve for CPU offloading",
+        )
+        parser.add_argument(
+            "--prefill-only-one-req",
+            type=bool,
+            help="If true, we only prefill one request at one prefill batch",
+            default=ServerArgs.prefill_only_one_req,
         )
 
         # Other runtime options
