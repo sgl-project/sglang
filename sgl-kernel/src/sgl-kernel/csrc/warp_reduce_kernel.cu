@@ -1,6 +1,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <torch/extension.h>
+
+#include "utils.hpp"
 
 #define FINAL_MASK 0xffffffff
 #define BLOCK_SIZE 256
