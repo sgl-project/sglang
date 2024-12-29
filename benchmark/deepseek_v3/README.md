@@ -13,19 +13,19 @@ If you do not have GPUs with large enough memory, please try multi-node tensor p
 
 ## Installation & Launch
 
-If you see errors when launching the server, please check if it has finished downloading the weights. It is recommended to download the weights before launching, or to launch multiple times until all the weights have been downloaded.
+If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded.
 
 ### Using Docker (Recommended)
 ```bash
 docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
 ```
-For large QPS scenarios, you can add the `--enable-dp-attention` argument to improve throughput.
+For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]==0.4.1.post1" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
+pip install "sglang[all]==0.4.1.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
