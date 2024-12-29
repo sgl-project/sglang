@@ -61,7 +61,7 @@ spaces_between_special_tokens: bool = True,
 # Do parallel sampling and return `n` outputs.
 n: int = 1,
 
-## Structured Decoding Constraints
+## Structured Outputs
 # Only one of the below three can be set at a time:
 
 # Constrains the output to follow a given regular expression.
@@ -184,7 +184,7 @@ print(response.json())
 The `image_data` can be a file name, a URL, or a base64 encoded string. See also `python/sglang/srt/utils.py:load_image`.
 Streaming is supported in a similar manner as [above](#streaming).
 
-### Structured decoding (JSON, Regex, EBNF)
+### Structured Outputs (JSON, Regex, EBNF)
 You can specify a JSON schema, Regular Expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints.
 
 SGLang supports two grammar backends:
