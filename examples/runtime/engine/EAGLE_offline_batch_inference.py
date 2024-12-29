@@ -9,6 +9,7 @@ def main():
         "The capital of France is",
         "The future of AI is",
     ]
+
     # Create a sampling params object.
     sampling_params = {"temperature": 0, "max_new_tokens": 30}
 
@@ -23,8 +24,8 @@ def main():
     )
 
     outputs = llm.generate(prompts, sampling_params)
-    # Print the outputs.
 
+    # Print the outputs.
     for prompt, output in zip(prompts, outputs):
         print("===============================")
         print(f"Prompt: {prompt}\nGenerated text: {output['text']}")

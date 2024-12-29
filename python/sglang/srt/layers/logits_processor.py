@@ -38,10 +38,6 @@ class LogitsProcessorOutput:
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
     next_token_logprobs: torch.Tensor = None
 
-    # Used by speculative inference (eagle)
-    # The output of transformer layers
-    hidden_states: Optional[torch.Tensor] = None
-
     # The normlaized logprobs of prompts.  shape: [#seq]
     normalized_prompt_logprobs: torch.Tensor = None
     # The logprobs of input tokens.        shape: [#token, vocab_size]
