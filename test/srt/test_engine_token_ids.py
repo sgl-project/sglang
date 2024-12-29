@@ -25,7 +25,7 @@ class TestEngineTokenIds(unittest.TestCase):
 
         # Hugging Face tokenizer has a start token in its output,
         # while SGLang only adds next_token_id in output_ids.
-        # We remove start token in output_ids for comparison.
+        # We remove start token in HF output for comparison.
         for prompt, output in zip(prompts, outputs):
             hf_input_ids = tokenizer.encode(prompt)
             self.assertEqual(
