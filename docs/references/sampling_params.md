@@ -58,13 +58,18 @@ ignore_eos: bool = False,
 skip_special_tokens: bool = True,
 # Whether to add spaces between special tokens during detokenization.
 spaces_between_special_tokens: bool = True,
-# Constrains the output to follow a given regular expression.
-regex: Optional[str] = None,
 # Do parallel sampling and return `n` outputs.
 n: int = 1,
+
+## Structured Outputs
+# Only one of the below three can be set at a time:
+
+# Constrains the output to follow a given regular expression.
+regex: Optional[str] = None,
 # Constrains the output to follow a given JSON schema.
-# `regex` and `json_schema` cannot be set at the same time.
 json_schema: Optional[str] = None,
+# Constrains the output to follow a given EBNF Grammar.
+ebnf: Optional[str] = None,
 
 ## Penalties. See [Performance Implications on Penalties] section below for more informations.
 
@@ -179,25 +184,37 @@ print(response.json())
 The `image_data` can be a file name, a URL, or a base64 encoded string. See also `python/sglang/srt/utils.py:load_image`.
 Streaming is supported in a similar manner as [above](#streaming).
 
-### Structured decoding (JSON, Regex)
-You can specify a JSON schema or a regular expression to constrain the model output. The model output will be guaranteed to follow the given constraints.
+### Structured Outputs (JSON, Regex, EBNF)
+You can specify a JSON schema, Regular Expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints.
+
+SGLang supports two grammar backends:
+
+- [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and Regular Expression constraints.
+- [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema and EBNF constraints.
+  - XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md)
+
+> 🔔 Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified at a time.
+
+Initialise xgrammar backend using `--grammar-backend xgrammar` flag
+```bash
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+--port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: outlines)
+```
 
 ```python
 import json
 import requests
 
-json_schema = json.dumps(
-    {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string", "pattern": "^[\\w]+$"},
-            "population": {"type": "integer"},
-        },
-        "required": ["name", "population"],
-    }
-)
+json_schema = json.dumps({
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "pattern": "^[\\w]+$"},
+        "population": {"type": "integer"},
+    },
+    "required": ["name", "population"],
+})
 
-# JSON
+# JSON (works with both Outlines and XGrammar)
 response = requests.post(
     "http://localhost:30000/generate",
     json={
@@ -211,7 +228,7 @@ response = requests.post(
 )
 print(response.json())
 
-# Regular expression
+# Regular expression (Outlines backend only)
 response = requests.post(
     "http://localhost:30000/generate",
     json={
@@ -220,6 +237,20 @@ response = requests.post(
             "temperature": 0,
             "max_new_tokens": 64,
             "regex": "(France|England)",
+        },
+    },
+)
+print(response.json())
+
+# EBNF (XGrammar backend only)
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "Write a greeting.",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 64,
+            "ebnf": 'root ::= "Hello" | "Hi" | "Hey"',
         },
     },
 )
