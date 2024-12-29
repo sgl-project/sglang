@@ -65,9 +65,16 @@ from sglang.srt.openai_api.protocol import (
     FileDeleteResponse,
     FileRequest,
     FileResponse,
+    FunctionResponse,
     LogProbs,
+    ToolCall,
     TopLogprob,
     UsageInfo,
+)
+from sglang.srt.utils import (
+    StreamToolState,
+    parse_stream_tool_response,
+    parse_tool_response,
 )
 from sglang.utils import get_exception_traceback
 
@@ -879,6 +886,18 @@ def v1_chat_generate_request(
         #    None skips any image processing in GenerateReqInput.
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
+            tools = None
+            if request.tools and request.tool_choice != "none":
+                request.skip_special_tokens = False
+                if not isinstance(request.tool_choice, str):
+                    tools = [
+                        item.function.model_dump()
+                        for item in request.tools
+                        if item.function.name == request.tool_choice.function.name
+                    ]
+                else:
+                    tools = [item.function.model_dump() for item in request.tools]
+
             if chat_template_name is None:
                 openai_compatible_messages = []
                 for message in request.messages:
@@ -902,6 +921,7 @@ def v1_chat_generate_request(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
+                    tools=tools,
                 )
                 if assistant_prefix:
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
@@ -1041,11 +1061,51 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
+        tool_calls = None
+        text = ret_item["text"]
+
+        if isinstance(request, list):
+            tool_choice = request[idx].tool_choice
+            tools = request[idx].tools
+        else:
+            tool_choice = request.tool_choice
+            tools = request.tools
+
+        if tool_choice != "none" and (
+            "<|plugin|>" in text
+            or "<function=" in text
+            or "<tool_call>" in text
+            or "<|python_tag|>" in text
+        ):
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
+            try:
+                text, call_info_list = parse_tool_response(text, tools)  # noqa
+                tool_calls = [
+                    ToolCall(
+                        id=str(call_info[0]),
+                        function=FunctionResponse(
+                            name=call_info[1], arguments=call_info[2]
+                        ),
+                    )
+                    for call_info in call_info_list
+                ]
+            except Exception as e:
+                logger.error(f"Exception: {e}")
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "Failed to parse fc related info to json format!",
+                )
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
                 "index": 0,
-                "message": {"role": "assistant", "content": ret_item["text"]},
+                "message": {
+                    "role": "assistant",
+                    "content": ret_item["text"] if (tool_calls is None) else None,
+                    "tool_calls": tool_calls,
+                },
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
@@ -1057,7 +1117,11 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
-                message=ChatMessage(role="assistant", content=ret_item["text"]),
+                message=ChatMessage(
+                    role="assistant",
+                    content=ret_item["text"] if (tool_calls is None) else None,
+                    tool_calls=tool_calls,
+                ),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
                 matched_stop=(
@@ -1130,6 +1194,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     all_requests = [ChatCompletionRequest(**request_json)]
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
+    # Streaming response.
     if adapted_request.stream:
 
         async def generate_stream_resp():
@@ -1138,6 +1203,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             n_prev_tokens = {}
             prompt_tokens = {}
             completion_tokens = {}
+            stream_tool_states = {}
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
@@ -1147,6 +1213,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
+                    stream_tool_state = stream_tool_states.get(
+                        index, StreamToolState([], dict())
+                    )
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -1223,9 +1292,24 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     text = content["text"]
                     delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
+                    # find the BOT token, start to parse the tool calls from streaming chunk
+                    if request.tools and request.tool_choice != "none":
+                        if "<|python_tag|>" in text:
+                            delta, stream_tool_state = parse_stream_tool_response(
+                                text,
+                                delta,
+                                stream_tool_state,
+                                request.tools,
+                                bot_token="<|python_tag|>",
+                            )
+                        # TODO: supports other BOT tokens
+                        else:  # if no BOT token is matched, just respond like normal
+                            delta = DeltaMessage(content=delta)
+                    else:
+                        delta = DeltaMessage(content=delta)
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
-                        delta=DeltaMessage(content=delta),
+                        delta=delta,
                         finish_reason=(finish_reason["type"] if finish_reason else ""),
                         matched_stop=(
                             finish_reason["matched"]
@@ -1243,8 +1327,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     is_firsts[index] = is_first
                     stream_buffers[index] = stream_buffer
                     n_prev_tokens[index] = n_prev_token
+                    stream_tool_states[index] = stream_tool_state
 
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                # if stream_options.include_usage is True, send the final usage infomation
                 if request.stream_options and request.stream_options.include_usage:
                     total_prompt_tokens = sum(
                         tokens

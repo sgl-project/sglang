@@ -1273,3 +1273,116 @@ def dataclass_to_string_truncated(data, max_length=2048):
         )
     else:
         return str(data)
+
+
+def parse_tool_response(text, tools, **kwargs):
+    """Parse model response containing tool information.
+    Args:
+        text(str): model response in string format
+        tools(List): tools from user request
+    """
+    if "<|plugin|>" in text:  # internlm2
+        text, action = text.split("<|action_start|><|plugin|>")
+        action = action.split("<|action_end|>".strip())[0]
+        action = action[action.find("{") :]
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
+    elif "<function=" in text:  # llama3.1
+        action, _ = text.split("</function>")
+        parameters = action[action.find("{") :]
+        name = action.split("<function=")[1].split(">{")[0]
+        call_info_list = [(name, parameters)]
+    elif "<tool_call>" in text and "</tool_call>" in text:  # qwen2.5
+        # get tool_call in text
+        pattern = r"<tool_call>(.*?)</tool_call>"
+        match_result_list = re.findall(pattern, text, re.DOTALL)
+        call_info_list = []
+        for match_result in match_result_list:
+            action = json.loads(match_result)
+            call_info_list.append(
+                (action["name"], json.dumps(action["arguments"], ensure_ascii=False))
+            )
+        # get text outside of tags
+        if not text.startswith("<tool_call>"):
+            text = text[: text.find("<tool_call>")]
+        elif not text.endswith("</tool_call>"):
+            text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
+        else:
+            text = ""
+    elif "<|python_tag|>" in text:  # llama3.2
+        _, action = text.split("<|python_tag|>")
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
+    else:
+        raise RuntimeError(f"Unexpected model response: {text}")
+
+    call_info_list = [
+        (
+            [tool.function.name for tool in tools].index(call_info[0]),
+            call_info[0],
+            call_info[1],
+        )
+        for call_info in call_info_list
+    ]
+    return text, call_info_list
+
+
+@dataclasses.dataclass
+class StreamToolState:
+    """Store the state of parsing a streaming tool call response."""
+
+    tool_call_list: List
+    current_tool_info: Dict
+    current_tool_call_start_idx: int = 0
+
+
+def parse_stream_tool_response(text, delta, state, tools, bot_token, **kwargs):
+    # TODO: support parallel_tool_calls
+    from sglang.srt.openai_api.protocol import DeltaMessage
+
+    if bot_token == "<|python_tag|>":
+        # lazy import only when used
+        import partial_json_parser
+        from partial_json_parser.core.options import Allow
+
+        if text[state.current_tool_call_start_idx :].startswith(bot_token):
+            state.current_tool_call_start_idx += len(bot_token)
+        current_tool_text = text[state.current_tool_call_start_idx :]
+
+        if len(current_tool_text) == 0:
+            return DeltaMessage(content=None), state
+
+        partial_json_flag = (
+            Allow.ALL
+            if state.current_tool_info.get("name") is not None
+            else Allow.ALL & ~Allow.STR
+        )
+        current_tool_info = partial_json_parser.loads(
+            current_tool_text, partial_json_flag
+        )
+        print(current_tool_info)
+        state.current_tool_info = current_tool_info
+        current_tool_call_name = current_tool_info.get("name")
+        current_tool_call_arguments = current_tool_info.get(
+            "parameters", current_tool_info.get("arguments", {})
+        )
+        return (
+            DeltaMessage(
+                tool_calls=[
+                    (
+                        tools.index(current_tool_call_name),
+                        current_tool_call_name,
+                        current_tool_call_arguments,
+                    )
+                ]
+            ),
+            state,
+        )
+    else:
+        raise RuntimeError(f"Unexpected model response: {text}")
