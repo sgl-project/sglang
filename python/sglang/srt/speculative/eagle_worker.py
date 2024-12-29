@@ -71,7 +71,7 @@ class EAGLEWorker(SpeculativeWorker):
         if batch.forward_mode.is_decode():
             prev_spec_info = batch.spec_info
             self._swap_mem_pool(batch, self.model_runner)
-            for i in range(self.server_args.num_speculative_steps):
+            for i in range(self.server_args.speculative_num_steps):
                 self.forward_draft_decode(batch)
             batch.spec_info.clear_draft_cache(batch)
             self._swap_mem_pool(batch, self.target_worker.model_runner)

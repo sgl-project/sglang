@@ -531,7 +531,7 @@ class ModelRunner:
             else:
                 self.server_args.draft_runner_cache_size = (
                     self.max_total_num_tokens
-                    + max_num_reqs * self.server_args.num_speculative_steps
+                    + max_num_reqs * self.server_args.speculative_num_steps
                     + 100
                 )
 

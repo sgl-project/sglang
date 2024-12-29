@@ -161,10 +161,10 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         if model_runner.server_args.speculative_algorithm.is_eagle():
             if self.model_runner.is_draft_runner:
-                expand_num = self.model_runner.server_args.eagle_topk
+                expand_num = self.model_runner.server_args.speculative_eagle_topk
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                expand_num = self.model_runner.server_args.num_draft_tokens
+                expand_num = self.model_runner.server_args.speculative_num_draft_tokens
             self.num_tokens = [bs * expand_num for bs in self.capture_bs]
         else:
             self.num_tokens = [bs for bs in self.capture_bs]
@@ -336,7 +336,7 @@ class CudaGraphRunner:
                     None,
                     None,
                     None,
-                    self.model_runner.server_args.num_draft_tokens,
+                    self.model_runner.server_args.speculative_num_draft_tokens,
                 )
                 spec_info.custom_mask = torch.zeros(
                     (num_token * self.model_runner.model_config.context_len),

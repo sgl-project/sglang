@@ -15,11 +15,11 @@ def main():
     # Create an LLM.
     llm = sgl.Engine(
         model_path="meta-llama/Llama-2-7b-chat-hf",
-        draft_model_path="kavio/Sglang-EAGLE-llama2-chat-7B",
         speculative_algorithm="EAGLE",
-        num_speculative_steps=3,
-        eagle_topk=4,
-        num_draft_tokens=16,
+        speculative_draft_model_path="kavio/Sglang-EAGLE-llama2-chat-7B",
+        speculative_num_steps=3,
+        speculative_eagle_topk=4,
+        speculative_num_draft_tokens=16,
     )
 
     outputs = llm.generate(prompts, sampling_params)

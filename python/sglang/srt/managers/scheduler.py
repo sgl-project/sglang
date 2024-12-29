@@ -897,7 +897,7 @@ class Scheduler:
 
         # Check if decode out of memory
         buf_multiplier = (
-            self.server_args.num_draft_tokens
+            self.server_args.speculative_num_draft_tokens
             if self.server_args.speculative_algorithm.is_not_none()
             else 1
         )

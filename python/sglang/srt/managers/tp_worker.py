@@ -61,7 +61,7 @@ class TpModelWorker:
             (
                 server_args.model_path
                 if not is_draft_worker
-                else server_args.draft_model_path
+                else server_args.speculative_draft_model_path
             ),
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,

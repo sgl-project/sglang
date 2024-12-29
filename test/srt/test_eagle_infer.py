@@ -21,17 +21,17 @@ class TestEAGLEEngine(unittest.TestCase):
     def test_eagle_accuracy(self):
         prompt = "Today is a sunny day and I like"
         target_model_path = "meta-llama/Llama-2-7b-chat-hf"
-        draft_model_path = "kavio/Sglang-EAGLE-llama2-chat-7B"
+        speculative_draft_model_path = "kavio/Sglang-EAGLE-llama2-chat-7B"
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
         engine = sgl.Engine(
             model_path=target_model_path,
-            draft_model_path=draft_model_path,
+            speculative_draft_model_path=speculative_draft_model_path,
             speculative_algorithm="EAGLE",
-            num_speculative_steps=3,
-            eagle_topk=4,
-            num_draft_tokens=16,
+            speculative_num_steps=3,
+            speculative_eagle_topk=4,
+            speculative_num_draft_tokens=16,
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()

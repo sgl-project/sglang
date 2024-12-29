@@ -149,13 +149,13 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
 
     # speculative decoding
-    draft_model_path: Optional[str] = None
+    speculative_draft_model_path: Optional[str] = None
     speculative_algorithm: Optional[SpeculativeAlgorithm] = None
-    num_speculative_steps: Optional[int] = None
+    speculative_num_steps: Optional[int] = None
     # should been set as 2^n
-    num_draft_tokens: Optional[int] = None
+    speculative_num_draft_tokens: Optional[int] = None
     # should been set as [1, 2, 4, 8]
-    eagle_topk: Optional[int] = None
+    speculative_eagle_topk: Optional[int] = None
     # should not been set by cli, it is only a placeholder
     # which would be set and used in model_runner
     draft_runner_cache_size: Optional[int] = None
@@ -808,7 +808,7 @@ class ServerArgs:
             "The default value is 1, meaning only run one decoding step at a time.",
         )
         parser.add_argument(
-            "--draft-model-path",
+            "--speculative-draft-model-path",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
             required=False,
@@ -821,21 +821,21 @@ class ServerArgs:
             required=False,
         )
         parser.add_argument(
-            "--num-speculative-steps",
+            "--speculative-num-steps",
             type=int,
             help="The number of steps sampled from draft model in Speculative Decoding.",
             required=False,
             default=5,
         )
         parser.add_argument(
-            "--num-draft-tokens",
+            "--speculative-num-draft-tokens",
             type=int,
             help="The number of token sampled from draft model in Speculative Decoding.",
             required=False,
             default=64,
         )
         parser.add_argument(
-            "--eagle-topk",
+            "--speculative-eagle-topk",
             type=int,
             help="The number of token sampled from draft model in eagle2 each step.",
             required=False,

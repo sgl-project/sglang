@@ -233,9 +233,9 @@ class EAGLEDraftInput(SpecDraftInput):
     def init(self, server_args: ServerArgs):
         self.prev_mode = ForwardMode.DECODE
         self.sample_output = None
-        self.topk: int = server_args.eagle_topk
-        self.num_verify_token: int = server_args.num_draft_tokens
-        self.spec_steps = server_args.num_speculative_steps
+        self.topk: int = server_args.speculative_eagle_topk
+        self.num_verify_token: int = server_args.speculative_num_draft_tokens
+        self.spec_steps = server_args.speculative_num_steps
 
         self.scores: torch.Tensor = None
         self.score_list: List[torch.Tensor] = []
