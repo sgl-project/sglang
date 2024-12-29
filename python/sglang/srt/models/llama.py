@@ -166,13 +166,21 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self.layer_id == 0 and forward_batch.forward_mode.is_extend():
+            self.qkv_proj.enable_debug = True
+
         qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.layer_id == 0 and forward_batch.forward_mode.is_extend():
+            print(f'hi {type(self)}#{self.layer_id} (early) {qkv=}')
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
 
         if self.layer_id == 0 and forward_batch.forward_mode.is_extend():
+            self.qkv_proj.enable_debug = False
             print(
                 f'hi {type(self)}#{self.layer_id}\n{forward_batch=}\n{hidden_states=}\n{positions=}\n{qkv=}\n{q=}\n{k=}\n{v=}\n{attn_output=}\n{output=}\n{self.qkv_proj.weight.data=}\n')
 

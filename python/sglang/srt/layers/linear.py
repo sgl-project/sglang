@@ -6,6 +6,12 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
+from sglang.srt.utils import set_weight_attrs
 from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm.distributed import (
     divide,
@@ -15,7 +21,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-
 # workaround
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.parameter import (
@@ -25,13 +30,6 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
 )
-
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
-from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +163,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         return F.linear(x, layer.weight, bias)
 
 
@@ -334,6 +331,8 @@ class ColumnParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
+        self.enable_debug = False
+
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
         output_dim = getattr(param, "output_dim", None)
@@ -386,6 +385,10 @@ class ColumnParallelLinear(LinearBase):
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
+
+        if self.enable_debug:
+            print(f'{type(self)}.forward {input_=} {output=} {output_bias=} {self.quant_method=}')
+
         return output, output_bias
 
     def extra_repr(self) -> str:
@@ -634,8 +637,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             block_n, _ = weight_block_size[0], weight_block_size[1]
             shard_offset = (
-                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
-            ) // tp_size
+                               (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
+                           ) // tp_size
             shard_size = (
                 (self.output_sizes[loaded_shard_id] + block_n - 1) // block_n // tp_size
             )
