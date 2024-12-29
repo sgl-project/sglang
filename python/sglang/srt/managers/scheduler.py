@@ -1492,13 +1492,14 @@ class Scheduler:
 
     def release_gpu_occupation(self):
         self.flush_cache()
-        TODO = self.tp_worker.worker.model_runner.model.export_static_params()
+        self.stashed_model_static_params = self.tp_worker.worker.model_runner.model.export_static_params()
         primary_memory_saver.pause()
         torch.cuda.empty_cache()
 
     def resume_gpu_occupation(self):
         primary_memory_saver.resume()
-        self.tp_worker.worker.model_runner.model.import_static_params(TODO)
+        self.tp_worker.worker.model_runner.model.import_static_params(self.stashed_model_static_params)
+        del self.stashed_model_static_params
 
     def start_profile(self) -> None:
         if self.profiler is None:
