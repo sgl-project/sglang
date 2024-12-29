@@ -1254,9 +1254,8 @@ class Scheduler:
                     read_offsets.append(read_offset)
                     if self.skip_tokenizer_init:
                         output_ids.append(req.output_ids)
-
-                    output_ids.append(req.output_ids)
                     origin_input_ids.append(req.origin_input_ids)
+                    output_ids.append(req.output_ids)
                     skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                     spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
@@ -1288,8 +1287,8 @@ class Scheduler:
                         decoded_texts,
                         decode_ids_list,
                         read_offsets,
-                        output_ids,
                         origin_input_ids,
+                        output_ids,
                         skip_special_tokens,
                         spaces_between_special_tokens,
                         no_stop_trim,

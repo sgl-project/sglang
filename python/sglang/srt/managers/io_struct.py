@@ -319,9 +319,8 @@ class BatchTokenIDOut:
     decode_ids: List[int]
     read_offsets: List[int]
     # The token ids
-    output_ids: List[int]
     origin_input_ids: List[int]
-
+    output_ids: List[int]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
