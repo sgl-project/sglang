@@ -5,15 +5,11 @@ from transformers import AutoTokenizer
 import sglang as sgl
 
 
-def get_test_engine():
-    return sgl.Engine(
-        model_path="meta-llama/Meta-Llama-3.1-8B-Instruct", return_token_ids=True
-    )
-
-
 class TestEngineTokenIds(unittest.TestCase):
     def test_token_ids_in_generate(self):
-        llm = get_test_engine()
+        llm = sgl.Engine(
+            model_path="meta-llama/Meta-Llama-3.1-8B-Instruct", return_token_ids=True
+        )
         tokenizer = AutoTokenizer.from_pretrained(
             "meta-llama/Meta-Llama-3.1-8B-Instruct"
         )
