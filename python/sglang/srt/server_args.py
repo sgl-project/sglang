@@ -54,6 +54,7 @@ class ServerArgs:
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
+    return_token_ids: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
