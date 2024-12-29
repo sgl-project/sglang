@@ -30,7 +30,7 @@ class AttentionBackend(ABC):
         seq_lens: torch.Tensor,
         encoder_lens: torch.Tensor = None,
         spec_info: "SpecInput" = None,
-        forward_batch: Optional[ForwardBatch] = None,
+        forward_batch: ForwardBatch = None,
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
@@ -42,8 +42,8 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens=None,
-        forward_batch: Optional[ForwardBatch] = None,
+        encoder_lens: torch.Tensor = None,
+        forward_batch: ForwardBatch = None,
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
@@ -58,7 +58,7 @@ class AttentionBackend(ABC):
         k: torch.Tensor,
         v: torch.Tensor,
         layer: RadixAttention,
-        forward_batch: Optional[ForwardBatch],
+        forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
         """Run forward on an attention layer."""
@@ -73,7 +73,7 @@ class AttentionBackend(ABC):
         k: torch.Tensor,
         v: torch.Tensor,
         layer: RadixAttention,
-        forward_batch: Optional[ForwardBatch],
+        forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
         """Run a forward for decode."""
@@ -85,7 +85,7 @@ class AttentionBackend(ABC):
         k: torch.Tensor,
         v: torch.Tensor,
         layer: RadixAttention,
-        forward_batch: Optional[ForwardBatch],
+        forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
         """Run a forward for extend."""

@@ -336,7 +336,6 @@ def throughput_test(
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
             fout.write(json.dumps(result) + "\n")
-    backend.shutdown()
 
     print(
         "\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="=")

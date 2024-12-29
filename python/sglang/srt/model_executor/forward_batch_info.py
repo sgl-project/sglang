@@ -78,10 +78,6 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
-    # Speculative Verify stage
-    TARGET_VERIFY = auto()
-    # Speculative draft Extend stage which after verify stage
-    DRAFT_EXTEND = auto()
     # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
 

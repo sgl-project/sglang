@@ -286,12 +286,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch=forward_batch,
             )
             self.prefill_cuda_graph_metadata[num_token] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged, False, False
-            )
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_batch.forward_mode=}")
-
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -312,7 +309,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 forward_batch=forward_batch,
             )
-        elif forward_batch is not None and forward_batch.forward_mode.is_target_verify():
+        elif (
+            forward_batch is not None and forward_batch.forward_mode.is_target_verify()
+        ):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -352,27 +351,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and graph_wrapper is not None
-            ):
-                o = graph_wrapper[0].forward(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    window_left=layer.sliding_window_size,
-                    logits_soft_cap=layer.logit_cap,
-                )
-            else:
-                o = prefill_wrapper_paged.forward(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=not layer.is_cross_attention,
-                    sm_scale=layer.scaling,
-                    window_left=layer.sliding_window_size,
-                    logits_soft_cap=layer.logit_cap,
-                )
+
+            o = prefill_wrapper_paged.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=not layer.is_cross_attention,
+                sm_scale=layer.scaling,
+                window_left=layer.sliding_window_size,
+                logits_soft_cap=layer.logit_cap,
+            )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -813,10 +800,9 @@ class FlashInferIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
-            wrapper = wrapper_paged[0]
             custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
-            wrapper.end_forward()
-            wrapper.begin_forward(
+            wrapper_paged.end_forward()
+            wrapper_paged.begin_forward(
                 qo_indptr,
                 kv_indptr,
                 kv_indices,
