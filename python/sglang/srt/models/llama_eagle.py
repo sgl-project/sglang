@@ -14,9 +14,7 @@ limitations under the License.
 """
 
 # Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-# and
-# https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/modeling_llama_kv.py
+# https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
 from typing import Iterable, Optional, Tuple
@@ -46,6 +44,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         super().__init__(config, layer_id, quant_config, prefix)
 
         # Skip the input_layernorm
+        # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
         if layer_id == 0:
             del self.input_layernorm
             setattr(self, "input_layernorm", lambda x: x)
