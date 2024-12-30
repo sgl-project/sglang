@@ -371,7 +371,6 @@ async def async_request_truss(
     return output
 
 
-# TODO: Add multiturn support for sglang native
 async def async_request_sglang_generate(
     request_func_input: RequestFuncInput,
     queue: asyncio.Queue,
@@ -380,17 +379,10 @@ async def async_request_sglang_generate(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
 
-    # TODO: Support multiturn chat
-    assert(len(request_func_input.prompts) == 1)
-
-    prompt, prompt_len, output_len = request_func_input.prompts[0]
-
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
-            "text": prompt,
             "sampling_params": {
                 "temperature": 0.0,
-                "max_new_tokens": output_len,
                 "ignore_eos": not args.disable_ignore_eos,
             },
             "stream": not args.disable_stream,
@@ -402,7 +394,24 @@ async def async_request_sglang_generate(
         headers = get_auth_headers()
 
         output = RequestFuncOutput()
-        output.prompt_len.append(prompt_len)
+        
+        prompt_idx = request_func_input.finished_prompts
+        messages = request_func_input.prev_messages
+        prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
+        prompt_len = sum(
+            prompt[1] + prompt[2]  # input_len + output_len
+            for prompt in request_func_input.prompts[: prompt_idx]
+        )
+        prompt_len += input_len
+
+        # TODO: Make use of the new session field of the GenerateReqInput
+        # Now we simply concatenate all the prompts and responses in the 
+        # text field
+        
+        messages.append(prompt)
+        payload["text"] = " ".join(messages)
+        payload["sampling_params"]["max_new_tokens"] = max_tokens
+        
 
         generated_text = ""
         ttft = 0.0
@@ -440,13 +449,30 @@ async def async_request_sglang_generate(
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
 
-                                most_recent_timestamp = timestamp
                                 generated_text = data["text"]
+                            most_recent_timestamp = timestamp
 
+                    output_len = len(tokenizer(generated_text).input_ids)
+                    output.prompt_len.append(prompt_len - 1) # truncate <s>
+                    output.output_len.append(output_len)
                     output.generated_text.append(generated_text)
                     output.success = True
                     output.latency.append(latency)
-                    output.output_len.append(output_len)
+
+                    # Prepare for the new request
+                    request_func_input.prompts[prompt_idx] = (
+                        prompt,
+                        input_len,
+                        output_len,  # changes from max_tokens to output_len
+                    )
+                    prompt_idx += 1
+                    messages.append(generated_text)
+
+                    # Move the new request to the end of the queue
+                    if prompt_idx < len(request_func_input.prompts):
+                        request_func_input.finished_prompts = prompt_idx
+                        request_func_input.prev_messages = messages
+                        await queue.put(request_func_input)
                 else:
                     output.error = response.reason or ""
                     output.success = False
