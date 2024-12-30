@@ -15,7 +15,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Optional, Union, List
+from typing import List, Optional, Union
 
 import numpy as np
 import requests
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 # type of content fields, can be only prompts or with images/videos
 MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
+
 
 def get_exception_traceback():
     etype, value, tb = sys.exc_info()

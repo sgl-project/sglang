@@ -1,19 +1,21 @@
 """
-Launch the benchmark client for Llava-video model. 
+Launch the benchmark client for Llava-video model.
 Sends all the videos in a directory to the server and ask the LLM to discribe.
 Example: unpack videos into ./videos and run the following command:
 python client.py --port 3000
 """
 
-import sglang as sgl
 import argparse
 import os
-import time
 import sys
-from video import VideoFileLoader, Video, VideoPrompt, NExTQALoader
+import time
 from typing import List
-from sglang.utils import encode_video_base64
+
 import requests
+from video import NExTQALoader, Video, VideoFileLoader, VideoPrompt
+
+import sglang as sgl
+from sglang.utils import encode_video_base64
 
 
 @sgl.function
