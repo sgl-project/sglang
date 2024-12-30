@@ -67,10 +67,6 @@ class GenerateReqInput:
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Session id info for continual prompting
-    session: Optional[
-        Union[List[Tuple[str, Optional[str]]], Tuple[str, Optional[str]]]
-    ] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
     # Custom logit processor (serialized function)
