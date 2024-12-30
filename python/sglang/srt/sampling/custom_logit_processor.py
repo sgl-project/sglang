@@ -9,7 +9,11 @@ import torch
 class CustomLogitProcessor(ABC):
     """Abstract base class for callable functions."""
 
-    required_args: List[str]
+    @property
+    @abstractmethod
+    def required_args(self) -> List[str]:
+        """List of required arguments for this processor."""
+        raise NotImplementedError
 
     @abstractmethod
     def __call__(
