@@ -1,13 +1,13 @@
 # DeepSeek V3 Support
 
-The SGLang and DeepSeek teams worked together to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. SGLang also has supported [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making SGLang one of the best open-source LLM engines for running DeepSeek models.
+The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. SGLang also supports [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making SGLang one of the best open-source LLM engines for running DeepSeek models. SGLang is the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
 
-If you do not have GPUs with large enough memory, please try multi-node tensor parallelism ([help 1](https://github.com/sgl-project/sglang/blob/637de9e8ce91fd3e92755eb2a842860925954ab1/docs/backend/backend.md?plain=1#L88-L95) [help 2](https://github.com/sgl-project/sglang/blob/637de9e8ce91fd3e92755eb2a842860925954ab1/docs/backend/backend.md?plain=1#L152-L168)). Here is an example serving with [2 H20 node](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208)
+If you do not have GPUs with large enough memory, please try multi-node tensor parallelism. There is an example serving with [2 H20 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) below.
 
 ## Installation & Launch
 
@@ -61,10 +61,10 @@ For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `
 
 ```bash
 # node 1
-GLOO_SOCKET_IFNAME=eth0 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
 
 # node 2
-GLOO_SOCKET_IFNAME=eth0 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
 ```
 
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
@@ -72,9 +72,3 @@ If you have two H100 nodes, the usage is similar to the aforementioned H20.
 ## DeepSeek V3 Optimization Plan
 
 https://github.com/sgl-project/sglang/issues/2591
-
-## Appendix
-
-SGLang is the inference engine officially recommended by the DeepSeek team.
-
-https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended

@@ -42,7 +42,6 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
-    skip_tokenizer_init: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = True
     dtype: str = "auto"
@@ -54,6 +53,7 @@ class ServerArgs:
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
+    skip_tokenizer_init: bool = False
     return_token_ids: bool = False
 
     # Port for the HTTP server
@@ -277,17 +277,6 @@ class ServerArgs:
             "always use the slow tokenizer.",
         )
         parser.add_argument(
-            "--skip-tokenizer-init",
-            action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request",
-        )
-        parser.add_argument(
-            "--return-token-ids",
-            action="store_true",
-            default=ServerArgs.return_token_ids,
-            help="Whether to return token IDs in the output, this may introduce additional overhead.",
-        )
-        parser.add_argument(
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
@@ -393,6 +382,17 @@ class ServerArgs:
             help="The specific model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
+        )
+        parser.add_argument(
+            "--skip-tokenizer-init",
+            action="store_true",
+            help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--return-token-ids",
+            action="store_true",
+            default=ServerArgs.return_token_ids,
+            help="Whether to return token IDs in the output, this may introduce additional overhead.",
         )
 
         # Memory and scheduling
