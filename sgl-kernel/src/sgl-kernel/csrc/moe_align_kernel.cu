@@ -3,10 +3,10 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <torch/all.h>
-#include <torch/extension.h>
 
 #include <THC/THCAtomics.cuh>
+
+#include "utils.hpp"
 
 #ifdef USE_ROCM
 #include <hip/hip_runtime.h>
@@ -132,8 +132,4 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
                                          num_experts, block_size, topk_ids.numel(),
                                          token_cnts_buffer.data_ptr<int32_t>(), cumsum_buffer.data_ptr<int32_t>());
   });
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("moe_align_block_size", &moe_align_block_size, "MOE Align Block Size (CUDA)");
 }
