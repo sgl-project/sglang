@@ -55,6 +55,9 @@ class Sampler(nn.Module):
             del logits
 
             if global_server_args_dict["sampling_backend"] == "flashinfer":
+                if return_logprob:
+                    logprobs = torch.log(top_p_renorm_prob(probs, sampling_info.top_ps))
+
                 max_top_k_round, batch_size = 32, probs.shape[0]
                 uniform_samples = torch.rand(
                     (max_top_k_round, batch_size), device=probs.device
@@ -78,8 +81,6 @@ class Sampler(nn.Module):
                     logger.warning("Detected errors during sampling!")
                     batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
 
-                if return_logprob:
-                    logprobs = torch.log(top_p_renorm_prob(probs, sampling_info.top_ps))
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 # A slower fallback implementation with torch native operations.
                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
