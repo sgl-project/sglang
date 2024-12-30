@@ -1062,7 +1062,7 @@ class Scheduler:
             next_token_logprobs = logits_output.next_token_logprobs
         else:
             next_token_ids = next_token_ids.tolist()
-            if logits_output.next_token_logprobs:
+            if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool.free_group_begin()

@@ -79,7 +79,7 @@ class Sampler(nn.Module):
                     batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
 
                 if return_logprob:
-                    logprobs = torch.log(top_k_renorm_prob(probs, sampling_info.top_ps))
+                    logprobs = torch.log(top_p_renorm_prob(probs, sampling_info.top_ps))
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 # A slower fallback implementation with torch native operations.
                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
@@ -102,7 +102,6 @@ class Sampler(nn.Module):
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
-            logits_output.next_token_logprobs = logprobs
             if any(x > 0 for x in top_logprobs_nums):
                 (
                     logits_output.next_token_top_logprobs_val,
