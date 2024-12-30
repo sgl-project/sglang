@@ -51,6 +51,16 @@ response = client.chat.completions.create(
 )
 print(response)
 ```
+### Example serving with 2 H20*8
+For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`.
+
+```bash
+# node 1
+GLOO_SOCKET_IFNAME=eth0 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
+
+# node 2
+GLOO_SOCKET_IFNAME=eth0 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
+```
 
 ## DeepSeek V3 Optimization Plan
 
