@@ -62,9 +62,7 @@ class GenerateReqInput:
         Union[List[Tuple[str, Optional[str]]], Tuple[str, Optional[str]]]
     ] = None
     # Custom logit processor (serialized function)
-    customized_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = (
-        None
-    )
+    custom_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -179,12 +177,10 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
-            if self.customized_logit_processor is None:
-                self.customized_logit_processor = [None] * num
-            elif not isinstance(self.customized_logit_processor, list):
-                self.customized_logit_processor = [
-                    self.customized_logit_processor
-                ] * num
+            if self.custom_logit_processor is None:
+                self.custom_logit_processor = [None] * num
+            elif not isinstance(self.custom_logit_processor, list):
+                self.custom_logit_processor = [self.custom_logit_processor] * num
             else:
                 assert self.parallel_sample_num == 1
 
@@ -206,9 +202,9 @@ class GenerateReqInput:
             stream=self.stream,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
-            customized_logit_processor=(
-                self.customized_logit_processor[i]
-                if self.customized_logit_processor is not None
+            custom_logit_processor=(
+                self.custom_logit_processor[i]
+                if self.custom_logit_processor is not None
                 else None
             ),
         )
@@ -245,7 +241,7 @@ class TokenizedGenerateReqInput:
     session_rid: Optional[str] = None
 
     # Custom logit processor (serialized function)
-    customized_logit_processor: Optional[str] = None
+    custom_logit_processor: Optional[str] = None
 
 
 @dataclass

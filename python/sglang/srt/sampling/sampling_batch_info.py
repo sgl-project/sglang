@@ -50,7 +50,7 @@ class SamplingBatchInfo:
     custom_params: Optional[Dict[str, Any]] = None
 
     # Custom Logit Processor
-    custom_logit_processors: Optional[Dict[str, torch.Tensor]] = None
+    custom_logit_processor: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def from_schedule_batch(
@@ -93,7 +93,7 @@ class SamplingBatchInfo:
                 processor_dict[processor_str] = []
             processor_dict[processor_str].append(i)
 
-        merged_custom_logit_processors = {
+        merged_custom_logit_processor = {
             processor_str: torch.zeros(len(reqs), dtype=torch.bool).scatter_(
                 0, torch.tensor(true_indices), True
             )
@@ -110,7 +110,7 @@ class SamplingBatchInfo:
             vocab_size=vocab_size,
             device=device,
             custom_params=merged_custom_params,
-            custom_logit_processors=merged_custom_logit_processors,
+            custom_logit_processor=merged_custom_logit_processor,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
@@ -259,7 +259,7 @@ class SamplingBatchInfo:
         return merged_dict
 
     @staticmethod
-    def merge_custom_logit_processors(
+    def merge_custom_logit_processor(
         lhs: Dict[str, torch.Tensor], rhs: Dict[str, torch.Tensor]
     ):
         keys = set(lhs.keys()).union(set(rhs.keys()))
@@ -291,6 +291,6 @@ class SamplingBatchInfo:
         self.custom_params = SamplingBatchInfo.merge_custom_params(
             self.custom_params, other.custom_params
         )
-        self.custom_logit_processors = SamplingBatchInfo.merge_custom_logit_processors(
-            self.custom_logit_processors, other.custom_logit_processors
+        self.custom_logit_processor = SamplingBatchInfo.merge_custom_logit_processor(
+            self.custom_logit_processor, other.custom_logit_processor
         )

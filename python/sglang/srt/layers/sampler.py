@@ -38,11 +38,11 @@ class Sampler(nn.Module):
         logits = logits.contiguous()
 
         # Apply the custom logit processors if registered in the sampling info.
-        if sampling_info.custom_logit_processors is not None:
+        if sampling_info.custom_logit_processor is not None:
             for (
                 processor_str,
                 batch_mask,
-            ) in sampling_info.custom_logit_processors.items():
+            ) in sampling_info.custom_logit_processor.items():
                 processor = CustomLogitProcessor.from_str(processor_str)
                 logits = processor(logits, batch_mask, sampling_info.custom_params)
 
