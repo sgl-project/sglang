@@ -47,7 +47,7 @@ class SamplingBatchInfo:
     device: str = "cuda"
 
     # Custom Parameters
-    custom_params: Optional[Dict[str, Any]] = None
+    custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # Custom Logit Processor
     custom_logit_processor: Optional[Dict[str, torch.Tensor]] = None
@@ -104,7 +104,7 @@ class SamplingBatchInfo:
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             vocab_size=vocab_size,
             device=device,
-            custom_params=merged_custom_params,
+            custom_params=custom_params_list,
             custom_logit_processor=merged_custom_logit_processor,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
