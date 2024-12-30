@@ -62,15 +62,12 @@ def apply_torchao_config_to_model(
         quantize_(model, int8_dynamic_activation_int8_weight(), filter_fn=filter_fn)
     elif "int4wo" in torchao_config:
         group_size = int(torchao_config.split("-")[-1])
-        assert (
-            group_size
-            in [
-                32,
-                64,
-                128,
-                256,
-            ]
-        ), f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
+        assert group_size in [
+            32,
+            64,
+            128,
+            256,
+        ], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
         quantize_(model, int4_weight_only(group_size=group_size), filter_fn=filter_fn)
     elif "gemlite" in torchao_config:
         # gemlite-<packing_bitwidth>-<bit_width>-<group_size> or
