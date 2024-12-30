@@ -56,7 +56,10 @@ class Sampler(nn.Module):
 
             if global_server_args_dict["sampling_backend"] == "flashinfer":
                 if return_logprob:
-                    logprobs = torch.log(top_p_renorm_prob(probs, sampling_info.top_ps))
+                    # NOTE: the top_p_renorm_prob from flashinfer has numerical problems
+                    logprobs = torch.log(
+                        top_p_normalize_probs_torch(probs, sampling_info.top_ps)
+                    )
 
                 max_top_k_round, batch_size = 32, probs.shape[0]
                 uniform_samples = torch.rand(
