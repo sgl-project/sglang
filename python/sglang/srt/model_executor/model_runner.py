@@ -571,6 +571,8 @@ class ModelRunner:
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
             if is_cuda():
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "int8":
+            self.kv_cache_dtype = torch.int8
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -625,7 +627,7 @@ class ModelRunner:
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
