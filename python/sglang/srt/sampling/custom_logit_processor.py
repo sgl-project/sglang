@@ -1,9 +1,9 @@
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import dill
-from torch import Tensor
+import torch
 
 
 class CustomLogitProcessor(ABC):
@@ -14,10 +14,10 @@ class CustomLogitProcessor(ABC):
     @abstractmethod
     def __call__(
         self,
-        logits: Tensor,
-        batch_mask: List[bool],
-        custom_params: Dict[str, List[Any]],
-    ) -> Tensor:
+        logits: torch.Tensor,
+        batch_mask: torch.Tensor,
+        custom_params: Optional[List[Dict[str, Any]]] = None,
+    ) -> torch.Tensor:
         """Define the callable behavior."""
         raise NotImplementedError
 
