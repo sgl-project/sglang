@@ -48,7 +48,10 @@ class TestEvalAccuracyMini(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.519 - 0.03) # -3% to account for sampling variance
-        
+        self.assertGreaterEqual(
+            metrics["score"], 0.519 - 0.03
+        ) # -3% to account for sampling variance
+
+
 if __name__ == "__main__":
     unittest.main()
