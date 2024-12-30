@@ -3,7 +3,6 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-
 #include "utils.hpp"
 
 #include <THC/THCAtomics.cuh>
