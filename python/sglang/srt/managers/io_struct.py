@@ -71,10 +71,10 @@ class GenerateReqInput:
     session: Optional[
         Union[List[Tuple[str, Optional[str]]], Tuple[str, Optional[str]]]
     ] = None
-    # Custom logit processor (serialized function)
-    custom_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+    # Custom logit processor (serialized function)
+    custom_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     def normalize_batch_and_arguments(self):
         if (

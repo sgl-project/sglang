@@ -294,10 +294,8 @@ class TokenizerManager:
                 obj.stream,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
-                session_id=session_id,
-                session_rid=session_rid,
-                custom_logit_processor=obj.custom_logit_processor,
                 session_params=session_params,
+                custom_logit_processor=obj.custom_logit_processor,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

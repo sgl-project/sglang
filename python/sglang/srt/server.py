@@ -717,7 +717,7 @@ class Engine:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
-        custom_logit_processor: Optional[Union[str, List[str]]] = None,
+        custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
     ):
         obj = GenerateReqInput(
