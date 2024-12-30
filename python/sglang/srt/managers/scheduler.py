@@ -1491,10 +1491,9 @@ class Scheduler:
         return parameter
 
     def release_gpu_occupation(self):
-        self.flush_cache()
         self.stashed_model_static_state = self.tp_worker.worker.model_runner.model.export_static_state()
         primary_memory_saver.pause()
-        torch.cuda.empty_cache()
+        self.flush_cache()
 
     def resume_gpu_occupation(self):
         primary_memory_saver.resume()
