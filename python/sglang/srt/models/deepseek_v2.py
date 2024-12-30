@@ -578,7 +578,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.w_kc.dtype == torch.float8_e4m3fn or torch.float8_e4m3fnuz:
             if is_hip_:
-                # TODO(flashinfer): add bmm_fp8 for torch.float8_e4m3fnuz
+                # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
                 q_nope_out = torch.bmm(
                     q_nope.to(torch.bfloat16).transpose(0, 1),
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
@@ -610,7 +610,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.w_vc.dtype == torch.float8_e4m3fn or torch.float8_e4m3fnuz:
             if is_hip_:
-                # TODO(flashinfer): add bmm_fp8 for torch.float8_e4m3fnuz
+                # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
                     self.w_vc.to(torch.bfloat16) * self.w_scale,
@@ -986,7 +986,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
                 ):
-                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale * 2.0
+                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                    if is_hip_:
+                        self_attn.w_scale *= 2.0
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
