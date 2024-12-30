@@ -44,7 +44,11 @@ class Sampler(nn.Module):
                 batch_mask,
             ) in sampling_info.custom_logit_processor.items():
                 processor = CustomLogitProcessor.from_str(processor_str)
-                logits = processor(logits, batch_mask, sampling_info.custom_params)
+                batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+                logits[batch_mask] = processor(
+                    logits[batch_mask],
+                    [sampling_info.custom_params[i] for i in batch_indices],
+                )
 
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")

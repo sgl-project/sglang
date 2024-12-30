@@ -15,7 +15,6 @@ class CustomLogitProcessor(ABC):
     def __call__(
         self,
         logits: torch.Tensor,
-        batch_mask: torch.Tensor,
         custom_params: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
         """Define the callable behavior."""
