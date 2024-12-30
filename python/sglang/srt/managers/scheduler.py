@@ -760,35 +760,42 @@ class Scheduler:
         return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        # Check if the grammar is ready in the grammar queue
-        if self.grammar_queue:
-            self.move_ready_grammar_requests()
-
-        # Handle the cases where prefill is not allowed
-        if (
-            self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.being_chunked_req is None:
+        # 1. Prepare for new batch creation
+        if not self._prepare_prefill_phase():
             return None
 
-        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
-        if running_bs >= self.max_running_requests:
-            self.batch_is_full = True
-            return None
-
-        # Get priority queue
+        # 2. Sort the waiting queue by priority
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
-        # Prefill policy
-        adder = PrefillAdder(
-            self.tree_cache,
-            self.running_batch,
-            self.new_token_ratio,
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
-            self.max_prefill_tokens,
-            self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
-        )
+        # 3. Create PrefillAdder object
+        adder = self._create_prefill_adder()
 
+        # 4. Apply policies through for the waiting queue
+        self._apply_prefill_policies(adder, prefix_computed)
+
+        # 5. Update waiting queue
+        can_run_list = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+
+        # 6. Post-process selected requests
+        self._post_process_prefill(adder)
+
+        # 7. Create a new batch
+        new_batch = self._create_new_schedule_batch(can_run_list, adder)
+
+        # 8. Handle Mixed-style chunked prefill (if enabled)
+        self._handle_mixed_prefill_mode(new_batch)
+
+        return new_batch
+
+    def _apply_prefill_policies(
+        self, adder: PrefillAdder, prefix_computed: bool
+    ) -> None:
+        """Applies prefill policies sequentially."""
         has_being_chunked = self.being_chunked_req is not None
         if has_being_chunked:
             self.being_chunked_req.init_next_round_input()
@@ -801,6 +808,7 @@ class Scheduler:
                 else set([])
             )
 
+        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
@@ -828,26 +836,44 @@ class Scheduler:
             if self.server_args.prefill_only_one_req:
                 break
 
-        # Update waiting queue
-        can_run_list = adder.can_run_list
-        if len(can_run_list) == 0:
-            return None
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+    def _prepare_prefill_phase(self) -> bool:
+        """Prepares for the prefill phase, handles grammar queue, and checks preconditions."""
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
 
-        if adder.new_being_chunked_req is not None:
-            assert self.being_chunked_req is None
-            self.being_chunked_req = adder.new_being_chunked_req
+        # Add resource check to allow the scheduler to stop early
+        if (
+            self.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.being_chunked_req is None:
+            return False
 
-        if self.being_chunked_req:
-            self.being_chunked_req.is_being_chunked += 1
+        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
+        if running_bs >= self.max_running_requests:
+            self.batch_is_full = True
+            return False
 
-        # Print stats
-        if self.tp_rank == 0:
-            self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
+        return True
 
-        # Create a new batch
+    def _create_prefill_adder(self) -> PrefillAdder:
+        """Creates and returns a PrefillAdder object for request addition."""
+        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
+        adder = PrefillAdder(
+            self.tree_cache,
+            self.running_batch,
+            self.new_token_ratio,
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+        )
+
+        return adder
+
+    def _create_new_schedule_batch(
+        self, can_run_list: List[Req], adder: PrefillAdder
+    ) -> ScheduleBatch:
+        """Creates a new ScheduleBatch object."""
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -857,8 +883,26 @@ class Scheduler:
             self.enable_overlap,
         )
         new_batch.prepare_for_extend()
+        return new_batch
 
-        # Mixed-style chunked prefill
+    def _post_process_prefill(self, adder: PrefillAdder) -> None:
+        """Post-process requests after selection."""
+        if adder.new_being_chunked_req is not None:
+            assert self.being_chunked_req is None
+            self.being_chunked_req = adder.new_being_chunked_req
+
+        if self.being_chunked_req:
+            self.being_chunked_req.is_being_chunked += 1
+
+        if self.tp_rank == 0:
+            has_being_chunked = self.being_chunked_req is not None
+            running_bs = len(self.running_batch.reqs) if self.running_batch else 0
+            self.log_prefill_stats(
+                adder, self.waiting_queue, running_bs, has_being_chunked
+            )
+
+    def _handle_mixed_prefill_mode(self, new_batch: ScheduleBatch) -> None:
+        """Handles mixed prefill mode, combining new batch with running batch if needed."""
         if (
             self.is_mixed_chunk
             and self.running_batch is not None
@@ -873,8 +917,6 @@ class Scheduler:
             self.running_batch = None
         else:
             new_batch.decoding_reqs = None
-
-        return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
@@ -969,25 +1011,9 @@ class Scheduler:
 
         if self.is_generation:
             logits_output, next_token_ids, bid = result
-
-            if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
-            else:
-                # Move next_token_ids and logprobs to cpu
-                if batch.return_logprob:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs[
-                            torch.arange(len(next_token_ids), device=self.device),
-                            next_token_ids,
-                        ].tolist()
-                    )
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.tolist()
-                    )
-                    logits_output.normalized_prompt_logprobs = (
-                        logits_output.normalized_prompt_logprobs.tolist()
-                    )
-                next_token_ids = next_token_ids.tolist()
+            logits_output, next_token_ids = self._resolve_generation_result(
+                bid, batch, logits_output, next_token_ids
+            )
 
             # Check finish conditions
             logprob_pt = 0
@@ -995,64 +1021,35 @@ class Scheduler:
                 if req.is_retracted:
                     continue
 
-                if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    # Free the one delayed token for the mixed decode batch
-                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                if self._should_free_delayed_token(req, batch, i):
                     continue
 
-                if req.is_being_chunked <= 0:
-                    req.output_ids.append(next_token_id)
-                    req.check_finished()
-
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
-
-                    if req.return_logprob:
-                        logprob_pt += self.add_logprob_return_values(
-                            i, req, logprob_pt, next_token_ids, logits_output
-                        )
-
-                    if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
-                        req.grammar.finished = req.finished()
-                else:
+                if req.is_being_chunked > 0:
                     # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
+                    continue
 
-            if batch.next_batch_sampling_info:
-                batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
-                batch.next_batch_sampling_info.sampling_info_done.set()
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+
+                self._cache_request(req)
+
+                if req.return_logprob:
+                    logprob_pt += self.add_logprob_return_values(
+                        i, req, logprob_pt, next_token_ids, logits_output
+                    )
+
+                self._accept_grammar_token(req, next_token_id)
+            self._handle_sampling_info(batch)
 
         else:  # embedding or reward model
             embeddings, bid = result
             embeddings = embeddings.tolist()
-
-            # Check finish conditions
-            for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
-                    continue
-
-                req.embedding = embeddings[i]
-                if req.is_being_chunked <= 0:
-                    # Dummy output token for embedding models
-                    req.output_ids.append(0)
-                    req.check_finished()
-
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                    else:
-                        self.tree_cache.cache_unfinished_req(req)
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_being_chunked -= 1
+            self._process_batch_result_prefill_non_generation(batch, embeddings)
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
@@ -1101,14 +1098,8 @@ class Scheduler:
                         logits_output.output_top_logprobs_idx[i]
                     )
 
-            if req.grammar is not None:
-                req.grammar.accept_token(next_token_id)
-                req.grammar.finished = req.finished()
-
-        if batch.next_batch_sampling_info:
-            batch.next_batch_sampling_info.update_regex_vocab_mask()
-            self.current_stream.synchronize()
-            batch.next_batch_sampling_info.sampling_info_done.set()
+            self._accept_grammar_token(req, next_token_id)
+        self._handle_sampling_info(batch)
 
         self.stream_output(batch.reqs, batch.return_logprob)
 
@@ -1120,6 +1111,75 @@ class Scheduler:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats()
+
+    def _resolve_generation_result(
+        self, bid: int, batch: ScheduleBatch, logits_output, next_token_ids
+    ):
+        if self.enable_overlap:
+            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+        else:
+            # Move next_token_ids and logprobs to cpu
+            if batch.return_logprob:
+                logits_output.next_token_logprobs = logits_output.next_token_logprobs[
+                    torch.arange(len(next_token_ids), device=self.device),
+                    next_token_ids,
+                ].tolist()
+                logits_output.input_token_logprobs = (
+                    logits_output.input_token_logprobs.tolist()
+                )
+                logits_output.normalized_prompt_logprobs = (
+                    logits_output.normalized_prompt_logprobs.tolist()
+                )
+            next_token_ids = next_token_ids.tolist()
+
+        return logits_output, next_token_ids
+
+    def _process_batch_result_prefill_non_generation(
+        self, batch: ScheduleBatch, embeddings
+    ):
+        # Check finish conditions
+        for i, req in enumerate(batch.reqs):
+            if req.is_retracted:
+                continue
+
+            req.embedding = embeddings[i]
+            if req.is_being_chunked <= 0:
+                # Dummy output token for embedding models
+                req.output_ids.append(0)
+                req.check_finished()
+
+                self._cache_request(req)
+            else:
+                # being chunked reqs' prefill is not finished
+                req.is_being_chunked -= 1
+
+    def _should_free_delayed_token(
+        self, req: Req, batch: ScheduleBatch, index: int
+    ) -> bool:
+        if self.is_mixed_chunk and self.enable_overlap and req.finished():
+            # Free the one delayed token for the mixed decode batch
+            j = len(batch.out_cache_loc) - len(batch.reqs) + index
+            self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+            return True
+
+        return False
+
+    def _cache_request(self, req: Req):
+        if req.finished():
+            self.tree_cache.cache_finished_req(req)
+        else:
+            self.tree_cache.cache_unfinished_req(req)
+
+    def _handle_sampling_info(self, batch: ScheduleBatch):
+        if batch.next_batch_sampling_info:
+            batch.next_batch_sampling_info.update_regex_vocab_mask()
+            self.current_stream.synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
+
+    def _accept_grammar_token(self, req: Req, next_token_id: int):
+        if req.grammar:
+            req.grammar.accept_token(next_token_id)
+            req.grammar.finished = req.finished()
 
     def add_logprob_return_values(
         self,
