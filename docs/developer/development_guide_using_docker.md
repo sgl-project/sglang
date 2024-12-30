@@ -14,6 +14,8 @@ tar xf vscode_cli_alpine_x64_cli.tar.gz
 
 ## Setup Docker Container
 
+The following startup command is an example for internal development by the SGLang team. You can **modify or add directory mappings as needed**, especially for model weight downloads, to prevent repeated downloads by different Docker containers.
+
 ### H100
 
 ```bash
