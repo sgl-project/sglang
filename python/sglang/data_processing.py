@@ -7,10 +7,11 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import requests
-from bench.nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
-from utils import MsgContent
+
+from sglang.bench.nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
+from sglang.utils import MsgContent
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
