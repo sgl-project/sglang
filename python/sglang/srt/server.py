@@ -280,6 +280,10 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await tokenizer_manager.open_session(obj, request)
+        if session_id is None:
+            raise Exception(
+                "Failed to open the session. Check if a session with the same id is still open."
+            )
         return session_id
     except Exception as e:
         return _create_error_response(e)
@@ -526,7 +530,7 @@ def launch_engine(
             )
         scheduler_infos.append(data)
 
-    # Assume all schedulers have same max_total_num_tokens
+    # Assume all schedulers have same scheduler_info
     scheduler_info = scheduler_infos[0]
 
 
@@ -925,7 +929,7 @@ class Runtime:
     using the commond line interface.
 
     It is mainly used for the frontend language.
-    You should use the Engine class if you want to do normal offline processing.
+    You should use the Engine class above if you want to do normal offline processing.
     """
 
     def __init__(

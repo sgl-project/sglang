@@ -22,7 +22,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name
+from sglang.srt.utils import get_device_name, is_hip
+
+is_hip_ = is_hip()
+fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,7 @@ def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = torch.float8_e4m3fn,
+    dtype: torch.dtype = fp8_type_,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -95,8 +98,12 @@ def per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
-    fp8_min = finfo.min
     fp8_max = finfo.max
+
+    if is_hip_:
+        fp8_max = 224.0
+
+    fp8_min = -fp8_max
 
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     M = x.numel() // group_size
@@ -302,15 +309,14 @@ def w8a8_block_fp8_matmul(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_N must be divisable by block_size[0]
-        # BLOCK_SIZE_K must be divisable by block_size[1]
+        # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_size[0],
             "BLOCK_SIZE_K": block_size[1],
             "GROUP_SIZE_M": 32,
             "num_warps": 4,
-            "num_stages": 2,
+            "num_stages": 3,
         }
 
     def grid(META):
