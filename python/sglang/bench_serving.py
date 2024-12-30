@@ -29,7 +29,6 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 import aiohttp
 import numpy as np
 import requests
-from data_processing import SampleOutput, get_dataset
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoTokenizer,
@@ -38,6 +37,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from utils import MsgContent
+
+from sglang.data_processing import SampleOutput, get_dataset
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
