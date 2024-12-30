@@ -1,8 +1,6 @@
-# SGLang v0.4.1 - DeepSeek V3 Support
+# DeepSeek V3 Support
 
-We're excited to announce [SGLang v0.4.1](https://github.com/sgl-project/sglang/releases/tag/v0.4.1), which now supports [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base) - currently the strongest open-source LLM, even surpassing GPT-4o.
-
-The SGLang and DeepSeek teams worked together to get DeepSeek V3 FP8 running on NVIDIA and AMD GPU **from day one**. We've also supported MLA optimization and DP attention before, making SGLang one of the best open-source LLM engines for running DeepSeek models.
+The SGLang and DeepSeek teams worked together to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. SGLang also has supported [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making SGLang one of the best open-source LLM engines for running DeepSeek models.
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
@@ -13,23 +11,26 @@ If you do not have GPUs with large enough memory, please try multi-node tensor p
 
 ## Installation & Launch
 
-If you see errors when launching the server, please check if it has finished downloading the weights. It is recommended to download the weights before launching, or to launch multiple times until all the weights have been downloaded.
+If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded.
 
 ### Using Docker (Recommended)
 ```bash
 docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
 ```
-For large QPS scenarios, you can add the `--enable-dp-attention` argument to improve throughput.
+
+For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]==0.4.1.post1" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
+pip install "sglang[all]>=0.4.1.post3" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 ```
+
+For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 
 ### Example with OpenAI API
 
