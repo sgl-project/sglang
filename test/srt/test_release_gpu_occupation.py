@@ -13,18 +13,18 @@ class TestReleaseGPUOccupation(unittest.TestCase):
     def test_release_and_resume_occupation(self):
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
-        model_old = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        model_new = model_old.replace("-Instruct", "")
+        model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        expect_output = " to spend it outdoors. I decided to"
 
         engine = sgl.Engine(
-            model_path=model_old, random_seed=42,
+            model_path=model_name, random_seed=42,
             # disable_cuda_graph=True,  # for debugging only
         )
-        hf_model_new = AutoModelForCausalLM.from_pretrained(model_new, torch_dtype="bfloat16")
+        hf_model_new = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="bfloat16")
 
         print('generate (#1)')
         outputs = engine.generate(prompt, sampling_params)["text"]
-        self.assertEqual(outputs, " to spend it outdoors. I decided to")
+        self.assertEqual(outputs, expect_output)
 
         if _DEBUG_EXTRA:
             time.sleep(3)
@@ -51,7 +51,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
 
         print('generate (#2)')
         outputs = engine.generate(prompt, sampling_params)["text"]
-        self.assertEqual(outputs, " it. I like it even more when")
+        self.assertEqual(outputs, expect_output)
 
         if _DEBUG_EXTRA:
             time.sleep(5)
