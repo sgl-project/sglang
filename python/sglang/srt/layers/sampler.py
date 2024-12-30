@@ -51,6 +51,10 @@ class Sampler(nn.Module):
                     sampling_info.device,
                 )
 
+                logger.debug(
+                    f"Custom logit processor {processor.__class__.__name__} is applied."
+                )
+
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
             logits = torch.where(
