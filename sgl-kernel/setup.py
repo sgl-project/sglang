@@ -58,6 +58,11 @@ def update_wheel_platform_tag():
     old_wheel.rename(new_wheel)
 
 
+cutlass = root / "3rdparty" / "cutlass"
+include_dirs = [
+    cutlass.resolve() / "include",
+    cutlass.resolve() / "tools" / "util" / "include",
+]
 nvcc_flags = [
     "-O3",
     "-Xcompiler",
