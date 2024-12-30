@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -76,14 +76,7 @@ class SamplingBatchInfo:
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
 
-        # Merge custom params as a dictionary for one batch of requests
         custom_params_list = [r.sampling_params.custom_params for r in reqs]
-        merged_custom_params = {}
-        if custom_params_list:
-            merged_custom_params = {
-                key: [d.get(key, None) for d in custom_params_list]
-                for key in set(key for d in custom_params_list for key in d)
-            }
 
         # Merge the same type of customlogit processors together
         processor_dict = {}
@@ -250,17 +243,6 @@ class SamplingBatchInfo:
         return None
 
     @staticmethod
-    def merge_custom_params(lhs: Dict[str, List[Any]], rhs: Dict[str, List[Any]]):
-        keys = set(lhs.keys()).union(set(rhs.keys()))
-        merged_dict = {}
-
-        for k in keys:
-            left_values = lhs.get(k, [None] * len(lhs))
-            right_values = rhs.get(k, [None] * len(rhs))
-            merged_dict[k] = left_values + right_values
-        return merged_dict
-
-    @staticmethod
     def merge_custom_logit_processor(
         lhs: Dict[str, torch.Tensor], rhs: Dict[str, torch.Tensor]
     ):
@@ -290,9 +272,7 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
-        self.custom_params = SamplingBatchInfo.merge_custom_params(
-            self.custom_params, other.custom_params
-        )
+        self.custom_params = self.custom_params + other.custom_params
         self.custom_logit_processor = SamplingBatchInfo.merge_custom_logit_processor(
             self.custom_logit_processor, other.custom_logit_processor
         )
