@@ -74,14 +74,11 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             model=self.model,
             eval_name="math",
             num_examples=5000,
-            num_threads=1024,
+            num_threads=1024
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(
-            metrics["score"], 0.519 - 0.01
-        ) # -1% to account for sampling variance
-
+        self.assertGreaterEqual(metrics["score"], 0.519 - 0.01) # -1% to account for sampling variance
 
 if __name__ == "__main__":
     unittest.main()
