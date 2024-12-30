@@ -21,9 +21,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 
+import torch
+
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
+
+
+@dataclass
+class SessionParams:
+    id: Optional[str] = None
+    rid: Optional[str] = None
+    offset: Optional[int] = None
+    replace: Optional[bool] = None
 
 
 @dataclass
@@ -63,6 +73,8 @@ class GenerateReqInput:
     ] = None
     # Custom logit processor (serialized function)
     custom_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Session info for continual prompting
+    session_params: Optional[Union[List[Dict], Dict]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -236,9 +248,8 @@ class TokenizedGenerateReqInput:
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
-    # Session id info for continual prompting
-    session_id: Optional[str] = None
-    session_rid: Optional[str] = None
+    # Session info for continual prompting
+    session_params: Optional[SessionParams] = None
 
     # Custom logit processor (serialized function)
     custom_logit_processor: Optional[str] = None
@@ -334,7 +345,9 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init`
+    # Only used when --return-token-ids` is set
+    origin_input_ids: Optional[List[int]]
+    # Only used when `--skip-tokenizer-init` or `--return-token-ids` is set
     output_ids: Optional[List[int]]
     # Detokenization configs
     skip_special_tokens: List[bool]
@@ -365,10 +378,18 @@ class BatchStrOut:
     # The output decoded strings
     output_strs: List[str]
 
+    # The token ids
+    origin_input_ids: Optional[List[int]]
+    output_ids: Optional[List[int]]
+
     # Token counts
+    # real input and output tokens can be get from
+    # origin_input_ids and output_ids by enabling --return_token_ids
+    # TODO (Shuai): Rename this to clarify the meaning.
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+
     # Logprobs
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -426,6 +447,18 @@ class UpdateWeightsFromDistributedReqOutput:
 
 
 @dataclass
+class UpdateWeightsFromTensorReqInput:
+    name: str
+    tensor: torch.Tensor
+
+
+@dataclass
+class UpdateWeightsFromTensorReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsUpdateGroupReqInput:
     # The master address
     master_address: str
@@ -472,6 +505,7 @@ class ProfileReq(Enum):
 @dataclass
 class OpenSessionReqInput:
     capacity_of_str_len: int
+    session_id: Optional[str] = None
 
 
 @dataclass
@@ -481,4 +515,5 @@ class CloseSessionReqInput:
 
 @dataclass
 class OpenSessionReqOutput:
-    session_id: str
+    session_id: Optional[str]
+    success: bool

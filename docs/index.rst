@@ -28,6 +28,7 @@ The core features include:
    backend/openai_api_embeddings.ipynb
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
+   backend/structured_outputs.ipynb
    backend/backend.md
 
 

@@ -53,12 +53,15 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
+    SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -179,6 +182,9 @@ class TokenizerManager:
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_tensor_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -259,8 +265,9 @@ class TokenizerManager:
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
-            session_id = obj.session[0] if obj.session else None
-            session_rid = obj.session[1] if obj.session else None
+            session_params = (
+                SessionParams(**obj.session_params) if obj.session_params else None
+            )
 
         if obj.input_ids is not None and len(input_ids) >= self.context_len:
             raise ValueError(
@@ -290,6 +297,7 @@ class TokenizerManager:
                 session_id=session_id,
                 session_rid=session_rid,
                 custom_logit_processor=obj.custom_logit_processor,
+                session_params=session_params,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -516,6 +524,22 @@ class TokenizerManager:
             result = (await self.update_weights_from_distributed_communicator(obj))[0]
             return result.success, result.message
 
+    async def update_weights_from_tensor(
+        self,
+        obj: UpdateWeightsFromTensorReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be for update weights from distributed"
+
+        # This means that weight sync
+        # cannot run while requests are in progress.
+        async with self.model_update_lock.writer_lock:
+            result = (await self.update_weights_from_tensor_communicator(obj))[0]
+            return result.success, result.message
+
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -532,12 +556,16 @@ class TokenizerManager:
     ):
         self.auto_create_handle_loop()
 
-        session_id = uuid.uuid4().hex
-        obj.session_id = session_id
+        if obj.session_id is None:
+            obj.session_id = uuid.uuid4().hex
+        elif obj.session_id in self.session_futures:
+            return None
+
         self.send_to_scheduler.send_pyobj(obj)
-        self.session_futures[session_id] = asyncio.Future()
-        session_id = await self.session_futures[session_id]
-        del self.session_futures[session_id]
+
+        self.session_futures[obj.session_id] = asyncio.Future()
+        session_id = await self.session_futures[obj.session_id]
+        del self.session_futures[obj.session_id]
         return session_id
 
     async def close_session(
@@ -638,6 +666,13 @@ class TokenizerManager:
                             "text": recv_obj.output_strs[i],
                             "meta_info": meta_info,
                         }
+                        if self.server_args.return_token_ids:
+                            out_dict.update(
+                                {
+                                    "input_ids": recv_obj.origin_input_ids[i],
+                                    "output_ids": recv_obj.output_ids[i],
+                                }
+                            )
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
@@ -689,7 +724,7 @@ class TokenizerManager:
                                 )
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
-                    recv_obj.session_id
+                    recv_obj.session_id if recv_obj.success else None
                 )
             elif isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
                 if self.server_args.dp_size == 1:
@@ -709,6 +744,11 @@ class TokenizerManager:
                     self.server_args.dp_size == 1
                 ), "dp_size must be 1 for update weights from distributed"
                 self.update_weights_from_distributed_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, UpdateWeightsFromTensorReqOutput):
+                assert (
+                    self.server_args.dp_size == 1
+                ), "dp_size must be 1 for update weights from distributed"
+                self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
             else:

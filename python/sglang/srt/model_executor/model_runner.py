@@ -95,12 +95,6 @@ class ModelRunner:
         ):
             logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
-            # FIXME(HandH1998)
-            if (
-                "DeepseekV3ForCausalLM" in self.model_config.hf_config.architectures
-                and not self.server_args.disable_cuda_graph
-            ):
-                self.server_args.disable_cuda_graph = True
 
         if self.server_args.enable_double_sparsity:
             logger.info(
@@ -434,6 +428,10 @@ class ModelRunner:
             )
             logger.error(error_msg)
             return False, error_msg
+
+    def update_weights_from_tensor(self, name, tensor: torch.Tensor):
+        self.model.load_weights([(name, tensor)])
+        return True, "Success"  # TODO error handling
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100

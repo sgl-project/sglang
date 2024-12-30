@@ -57,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -108,6 +109,7 @@ app.add_middleware(
 
 tokenizer_manager: TokenizerManager = None
 scheduler_info: Dict = None
+
 
 ##### Native API endpoints #####
 
@@ -257,6 +259,10 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await tokenizer_manager.open_session(obj, request)
+        if session_id is None:
+            raise Exception(
+                "Failed to open the session. Check if a session with the same id is still open."
+            )
         return session_id
     except Exception as e:
         return _create_error_response(e)
@@ -484,7 +490,16 @@ def launch_engine(
     # Wait for model to finish loading
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
-        data = scheduler_pipe_readers[i].recv()
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError as e:
+            logger.exception(e)
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
 
         if data["status"] != "ready":
             raise RuntimeError(
@@ -492,7 +507,7 @@ def launch_engine(
             )
         scheduler_infos.append(data)
 
-    # Assume all schedulers have same max_total_num_tokens
+    # Assume all schedulers have same scheduler_info
     scheduler_info = scheduler_infos[0]
 
 
@@ -563,6 +578,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    if "GLOO_SOCKET_IFNAME" not in os.environ:
+        os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -861,6 +878,14 @@ class Engine:
             tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
+    def update_weights_from_tensor(self, name, tensor):
+        """Update weights from distributed source."""
+        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_tensor(obj, None)
+        )
+
     def get_weights_by_name(self, name, truncate_size=100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
@@ -875,7 +900,7 @@ class Runtime:
     using the commond line interface.
 
     It is mainly used for the frontend language.
-    You should use the Engine class if you want to do normal offline processing.
+    You should use the Engine class above if you want to do normal offline processing.
     """
 
     def __init__(
