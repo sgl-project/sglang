@@ -576,7 +576,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        if self.w_kc.dtype == (torch.float8_e4m3fn or torch.float8_e4m3fnuz):
+        if self.w_kc.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             if is_hip_:
                 # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
                 q_nope_out = torch.bmm(
