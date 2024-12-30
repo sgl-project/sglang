@@ -36,9 +36,9 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
-from utils import MsgContent
 
 from sglang.data_processing import SampleOutput, get_dataset
+from sglang.utils import MsgContent
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
