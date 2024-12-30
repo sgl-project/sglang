@@ -1,25 +1,27 @@
-import os
 import json
-import numpy as np
-import random
-from typing import List, Optional, Tuple
-from transformers import PreTrainedTokenizerBase
-from bench.nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
-from pathlib import Path
+import os
 import pickle
+import random
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
 import requests
+from bench.nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
 from tqdm.asyncio import tqdm
+from transformers import PreTrainedTokenizerBase
 from utils import MsgContent
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-# A list of all the conversations. Each conversation is a list of 
-# tuples. If multiturn is not enabled, the length of list is 1, 
+# A list of all the conversations. Each conversation is a list of
+# tuples. If multiturn is not enabled, the length of list is 1,
 # containing only the first Q&A pair.
-# For the shared prefix workload (synthetic, loogle, nextqa), it 
-# is a list of conversations sharing the same prefix (synthetic, 
+# For the shared prefix workload (synthetic, loogle, nextqa), it
+# is a list of conversations sharing the same prefix (synthetic,
 # doc, video)
 SampleOutput = List[List[Tuple[MsgContent, int, int]]]
+
 
 def common_filter_chat(
     num_requests: int,
@@ -54,14 +56,16 @@ def common_filter_chat(
                     if fixed_output_len is None
                     else fixed_output_len
                 )
-                if (min_prompt_len is not None and 
-                    prompt_len < min_prompt_len or 
-                    min_output_len is not None and 
-                    output_len < min_output_len or 
-                    max_prompt_len is not None and 
-                    prompt_len > max_prompt_len or 
-                    max_output_len is not None and
-                    output_len > max_output_len):
+                if (
+                    min_prompt_len is not None
+                    and prompt_len < min_prompt_len
+                    or min_output_len is not None
+                    and output_len < min_output_len
+                    or max_prompt_len is not None
+                    and prompt_len > max_prompt_len
+                    or max_output_len is not None
+                    and output_len > max_output_len
+                ):
                     # Prune too short sequences.
                     continue
                 input_tokens += prompt_len
@@ -129,7 +133,7 @@ def sample_sharegpt_requests(
         dataset = json.load(f)
     # Filter out the conversations with less than 2 turns.
     dataset = [data for data in dataset if len(data["conversations"]) >= 2]
-    
+
     # Keep one conversation in one list
     new_dataset = []
     for data in dataset:
@@ -150,15 +154,15 @@ def sample_sharegpt_requests(
                 )
             )
         new_dataset.append(chat)
-    
+
     if not disable_shuffle:
         # Shuffle the dataset.
         random.shuffle(new_dataset)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 
-        4, 4, None, None, fixed_output_len)
+        num_requests, new_dataset, tokenizer, 4, 4, None, None, fixed_output_len
+    )
     return filtered_dataset
 
 
@@ -181,7 +185,7 @@ def sample_ultrachat_requests(
             if not line:
                 break
             dataset.append(json.loads(line))
-    
+
     # Filter out the conversations with less than 2 turns.
     dataset = [data for data in dataset if len(data["data"]) >= 2]
 
@@ -205,8 +209,8 @@ def sample_ultrachat_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 
-        4, 4, None, None, fixed_output_len)
+        num_requests, new_dataset, tokenizer, 4, 4, None, None, fixed_output_len
+    )
     return filtered_dataset
 
 
@@ -230,16 +234,18 @@ def sample_loogle_requests(
             if not line:
                 break
             dataset.append(json.loads(line))
-    
+
     # Keep one conversation in one list
     new_dataset = []
     # TODO: Add shared prefix support for loogle
     # NOTE: Now we preprocess it only for chat
     for data in dataset:
         chat = []
-        if ("qa_pairs" not in data or
-            data["qa_pairs"] == "none" or 
-            len(data["qa_pairs"]) == 0):
+        if (
+            "qa_pairs" not in data
+            or data["qa_pairs"] == "none"
+            or len(data["qa_pairs"]) == 0
+        ):
             # If Q is none (for summarization),
             # We add a question for summarization
             # And keep the summary up to 1024 words
@@ -263,7 +269,7 @@ def sample_loogle_requests(
                     )
                 elif enable_multiturn:
                     chat.append((qa["Q"], qa["A"]))
-                
+
             new_dataset.append(chat)
 
     # Shuffle the dataset.
@@ -272,8 +278,8 @@ def sample_loogle_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 
-        4, None, None, None, fixed_output_len)
+        num_requests, new_dataset, tokenizer, 4, None, None, None, fixed_output_len
+    )
     return filtered_dataset
 
 
@@ -281,9 +287,9 @@ def sample_nextqa_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
-    max_frames: int, # Specific for video
+    max_frames: int,  # Specific for video
     disable_shuffle: bool = False,
-    enable_multiturn: bool = True, # No multiturn support for now
+    enable_multiturn: bool = True,  # No multiturn support for now
     fixed_output_len: Optional[int] = None,
 ) -> SampleOutput:
     """
@@ -339,6 +345,7 @@ def sample_nextqa_requests(
             filtered_dataset.append([(content, prompt_len, output_len)])
             l += 1
     return filtered_dataset
+
 
 def sample_random_requests(
     input_len: int,
@@ -494,7 +501,7 @@ def sample_generated_shared_prefix_requests(
             input_requests[-1].append((full_prompt, prompt_len, output_len))
             total_input_tokens += prompt_len
             total_output_tokens += output_len
-    
+
     if not disable_shuffle:
         # Shuffle questions
         random.shuffle(input_requests)
@@ -583,4 +590,3 @@ def get_dataset(args, tokenizer):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
-
