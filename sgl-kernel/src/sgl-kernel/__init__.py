@@ -1,4 +1,4 @@
-from .ops import (
+from sgl_kernel.ops import (
     custom_dispose,
     custom_reduce,
     init_custom_reduce,

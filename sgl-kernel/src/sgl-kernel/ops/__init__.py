@@ -1,8 +1,8 @@
-from ._kernels import all_reduce as _all_reduce
-from ._kernels import dispose as _dispose
-from ._kernels import init_custom_ar as _init_custom_ar
-from ._kernels import moe_align_block_size as _moe_align_block_size
-from ._kernels import reduce as _reduce
+from sgl_kernel.ops._kernels import all_reduce as _all_reduce
+from sgl_kernel.ops._kernels import dispose as _dispose
+from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
+from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
+from sgl_kernel.ops._kernels import reduce as _reduce
 
 
 def warp_reduce(input_tensor):
