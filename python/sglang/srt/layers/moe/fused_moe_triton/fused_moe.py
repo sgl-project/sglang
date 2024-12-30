@@ -472,8 +472,7 @@ def get_default_config(
                     "num_stages": 2 if is_hip_ else 4,
                 }
         else:
-            # Block-wise quant: BLOCK_SIZE_N must be divisable by block_shape[0]
-            # BLOCK_SIZE_K must be divisable by block_shape[1]
+            # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
             config = {
                 "BLOCK_SIZE_M": 64,
                 "BLOCK_SIZE_N": block_shape[0],

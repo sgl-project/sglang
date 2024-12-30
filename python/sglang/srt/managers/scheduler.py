@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -90,7 +90,7 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
-# Test retract decode
+# Test retract decode for debugging purposes
 test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
 
 
@@ -129,12 +129,12 @@ class Scheduler:
             )
 
             if server_args.skip_tokenizer_init:
-                # Directly send to the tokenizer/api
+                # Directly send to the TokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name
                 )
             else:
-                # Send to the detokenizer
+                # Send to the DetokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name
                 )
@@ -385,7 +385,8 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
-            if self.server_args.enable_dp_attention:
+
+            if self.server_args.enable_dp_attention:  # TODO: simplify this
                 batch = self.prepare_dp_attn_batch(batch)
 
             self.cur_batch = batch
@@ -394,7 +395,7 @@ class Scheduler:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # Self-check and re-init some states when the server is idle
+                # When the server is idle, so self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -411,12 +412,13 @@ class Scheduler:
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
             if batch:
                 result = self.run_batch(batch)
                 result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
-                    # A dummy first batch to start the pipeline for overlap scheduler.
+                    # Create a dummy first batch to start the pipeline for overlap scheduler.
                     # It is now used for triggering the sampling_info_done event.
                     tmp_batch = ScheduleBatch(
                         reqs=None,
@@ -426,19 +428,21 @@ class Scheduler:
                     self.process_batch_result(tmp_batch, None)
 
             if self.last_batch:
+                # Process the results of the last batch
                 tmp_batch, tmp_result = result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
-                # Self-check and re-init some states when the server is idle
+                # When the server is idle, so self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
-    def recv_requests(self):
+    def recv_requests(self) -> List[Req]:
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
@@ -494,8 +498,10 @@ class Scheduler:
                 else:
                     self.stop_profile()
             elif isinstance(recv_req, OpenSessionReqInput):
-                session_id = self.open_session(recv_req)
-                self.send_to_tokenizer.send_pyobj(OpenSessionReqOutput(session_id))
+                session_id, success = self.open_session(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    OpenSessionReqOutput(session_id=session_id, success=success)
+                )
             elif isinstance(recv_req, CloseSessionReqInput):
                 self.close_session(recv_req)
             else:
@@ -506,7 +512,11 @@ class Scheduler:
         recv_req: TokenizedGenerateReqInput,
     ):
         # Create a new request
-        if recv_req.session_id is None or recv_req.session_id not in self.sessions:
+        if (
+            recv_req.session_params is None
+            or recv_req.session_params.id is None
+            or recv_req.session_params.id not in self.sessions
+        ):
 
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
@@ -528,15 +538,18 @@ class Scheduler:
             )
             req.tokenizer = self.tokenizer
 
-            if recv_req.session_id is not None:
+            if (
+                recv_req.session_params is not None
+                and recv_req.session_params.id is not None
+            ):
                 req.finished_reason = FINISH_ABORT(
-                    f"Invalid request: session id {recv_req.session_id} does not exist"
+                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
                 self.waiting_queue.append(req)
                 return
         else:
-            # Create a new request from a previsou session
-            session = self.sessions[recv_req.session_id]
+            # Create a new request from a previous session
+            session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.waiting_queue.append(req)
@@ -811,6 +824,8 @@ class Scheduler:
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     self.batch_is_full = True
+                break
+            if self.server_args.prefill_only_one_req:
                 break
 
         # Update waiting queue
@@ -1203,6 +1218,7 @@ class Scheduler:
             decode_ids_list = []
             read_offsets = []
             output_ids = []
+            origin_input_ids = []
 
             skip_special_tokens = []
             spaces_between_special_tokens = []
@@ -1251,8 +1267,14 @@ class Scheduler:
                     decode_ids, read_offset = req.init_incremental_detokenize()
                     decode_ids_list.append(decode_ids)
                     read_offsets.append(read_offset)
-                    if self.skip_tokenizer_init:
+                    if self.skip_tokenizer_init or self.server_args.return_token_ids:
                         output_ids.append(req.output_ids)
+                    else:
+                        output_ids = None
+                    if self.server_args.return_token_ids:
+                        origin_input_ids.append(req.origin_input_ids)
+                    else:
+                        origin_input_ids = None
                     skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                     spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
@@ -1284,6 +1306,7 @@ class Scheduler:
                         decoded_texts,
                         decode_ids_list,
                         read_offsets,
+                        origin_input_ids,
                         output_ids,
                         skip_special_tokens,
                         spaces_between_special_tokens,
@@ -1494,16 +1517,20 @@ class Scheduler:
         )
         logger.info("Profiler is done")
 
-    def open_session(self, recv_req: OpenSessionReqInput) -> str:
+    def open_session(self, recv_req: OpenSessionReqInput) -> Tuple[Optional[str], bool]:
         # handle error
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
+            return session_id, False
+        elif session_id is None:
+            logger.warning(f"session id is None, cannot open.")
+            return session_id, False
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len, session_id
             )
-        return session_id
+            return session_id, True
 
     def close_session(self, recv_req: CloseSessionReqInput):
         # handle error
@@ -1528,18 +1555,20 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
+    # Configue the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
         configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
+    suppress_other_loggers()
 
-    # set cpu affinity to this gpu process
+    # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
-    suppress_other_loggers()
     parent_process = psutil.Process().parent()
 
+    # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send(

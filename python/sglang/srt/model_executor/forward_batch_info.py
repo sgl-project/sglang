@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 
 class ForwardMode(IntEnum):
@@ -59,6 +60,11 @@ class ForwardMode(IntEnum):
     # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
 
+    # Used in speculative decoding: verify a batch in the target model.
+    TARGET_VERIFY = auto()
+    # Used in speculative decoding: extend a batch in the draft model.
+    DRAFT_EXTEND = auto()
+
     # A dummy first batch to start the pipeline for overlap scheduler.
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
     DUMMY_FIRST = auto()
@@ -67,7 +73,12 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):
-        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
+            or self == ForwardMode.DRAFT_EXTEND
+            or self == self.TARGET_VERIFY
+        )
 
     def is_decode(self):
         return self == ForwardMode.DECODE
@@ -77,6 +88,15 @@ class ForwardMode(IntEnum):
 
     def is_idle(self):
         return self == ForwardMode.IDLE
+
+    def is_target_verify(self):
+        return self == ForwardMode.TARGET_VERIFY
+
+    def is_draft_extend(self):
+        return self == ForwardMode.DRAFT_EXTEND
+
+    def is_cuda_graph(self):
+        return self in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
@@ -141,13 +161,17 @@ class ForwardBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
 
-    # For Qwen2-VL
-    mrope_positions: torch.Tensor = None
+    # Speculative decoding
+    spec_info: SpecInfo = None
+    spec_algorithm: SpeculativeAlgorithm = None
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+
+    # For Qwen2-VL
+    mrope_positions: torch.Tensor = None
 
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -351,3 +375,18 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
+
+
+class CaptureHiddenMode(IntEnum):
+    NULL = auto()
+    FULL = auto()
+    LAST = auto()
+
+    def need_capture(self):
+        return self != CaptureHiddenMode.NULL
+
+    def is_full(self):
+        return self == CaptureHiddenMode.FULL
+
+    def is_last(self):
+        return self == CaptureHiddenMode.LAST
