@@ -85,6 +85,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/trt_reduce_internal.cu",
             "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
+            "src/sgl-kernel/csrc/test_cutlass_kernel.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
         include_dirs=include_dirs,

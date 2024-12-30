@@ -3,6 +3,7 @@ from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
 from sgl_kernel.ops._kernels import reduce as _reduce
+from sgl_kernel.ops._kernels import test_fp16_mm as _test_fp16_mm
 
 
 def warp_reduce(input_tensor):
@@ -40,4 +41,12 @@ def moe_align_block_size(
         num_tokens_post_pad,
         token_cnts_buffer,
         cumsum_buffer,
+    )
+
+
+def test_fp16_mm(out, mat_a, mat_b):
+    _test_fp16_mm(
+        out,
+        mat_a,
+        mat_b,
     )

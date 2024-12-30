@@ -20,6 +20,9 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
                           torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
                           torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer);
 
+// test cutlass
+void test_fp16_mm(torch::Tensor& out, torch::Tensor& mat_a, torch::Tensor& mat_b);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // warp_reduce
   m.def("reduce", &warp_reduce, "Warp Reduce (CUDA)");
@@ -29,4 +32,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("all_reduce", &all_reduce, "custom all reduce (CUDA)");
   // moe_align_block_size
   m.def("moe_align_block_size", &moe_align_block_size, "MOE Align Block Size (CUDA)");
+  // test_fp16_mm
+  m.def("test_fp16_mm", &test_fp16_mm, "FP16 matmul");
 }
