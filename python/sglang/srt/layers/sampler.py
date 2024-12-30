@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, Optional, Union
+from typing import Union
 
 import torch
 from torch import nn
