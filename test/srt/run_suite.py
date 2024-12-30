@@ -49,6 +49,7 @@ suites = {
     "nightly": [
         "test_nightly_gsm8k_eval.py",
         "test_nightly_human_eval.py",
+        "test_nightly_math_eval.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
