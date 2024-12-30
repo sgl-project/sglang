@@ -517,6 +517,7 @@ class Scheduler:
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
+                custom_logit_processor=recv_req.custom_logit_processor,
             )
             req.tokenizer = self.tokenizer
 

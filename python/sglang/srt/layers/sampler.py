@@ -6,6 +6,7 @@ from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import crash_on_warnings, is_flashinfer_available
 
@@ -25,11 +26,6 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
-        self.custom_logits_processor: Optional[Callable] = None
-
-    def register_logit_processor(self, processor: Callable):
-        """Register a custom logit processor function."""
-        self.custom_logits_processor = processor
 
     def forward(
         self,
@@ -41,9 +37,14 @@ class Sampler(nn.Module):
 
         logits = logits.contiguous()
 
-        # Apply custom logit processor if registered
-        if self.custom_logits_processor is not None:
-            logits = self.custom_logits_processor(logits, sampling_info)
+        # Apply the custom logit processors if registered in the sampling info.
+        if sampling_info.custom_logit_processors is not None:
+            for (
+                processor_str,
+                batch_mask,
+            ) in sampling_info.custom_logit_processors.items():
+                processor = CustomLogitProcessor.from_str(processor_str)
+                logits = processor(logits, batch_mask, sampling_info.custom_params)
 
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
