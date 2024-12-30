@@ -19,7 +19,7 @@ class CustomLogitProcessor(ABC):
     def __call__(
         self,
         logits: torch.Tensor,
-        custom_params: Optional[List[Dict[str, Any]]] = None,
+        custom_param_list: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
         """Define the callable behavior."""
         raise NotImplementedError
