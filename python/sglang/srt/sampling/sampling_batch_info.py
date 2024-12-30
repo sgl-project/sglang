@@ -78,10 +78,12 @@ class SamplingBatchInfo:
 
         # Merge custom params as a dictionary for one batch of requests
         custom_params_list = [r.sampling_params.custom_params for r in reqs]
-        merged_custom_params = {
-            key: [d.get(key, None) for d in custom_params_list]
-            for key in set(key for d in custom_params_list for key in d)
-        }
+        merged_custom_params = {}
+        if custom_params_list:
+            merged_custom_params = {
+                key: [d.get(key, None) for d in custom_params_list]
+                for key in set(key for d in custom_params_list for key in d)
+            }
 
         # Merge the same type of customlogit processors together
         processor_dict = {}
@@ -94,9 +96,9 @@ class SamplingBatchInfo:
             processor_dict[processor_str].append(i)
 
         merged_custom_logit_processor = {
-            processor_str: torch.zeros(len(reqs), dtype=torch.bool).scatter_(
-                0, torch.tensor(true_indices), True
-            )
+            processor_str: torch.zeros(len(reqs), dtype=torch.bool)
+            .scatter_(0, torch.tensor(true_indices), True)
+            .to(device, non_blocking=True)
             for processor_str, true_indices in processor_dict.items()
         }
 
