@@ -48,6 +48,7 @@ class Sampler(nn.Module):
                 logits[batch_mask] = processor(
                     logits[batch_mask],
                     [sampling_info.custom_params[i] for i in batch_indices],
+                    sampling_info.device,
                 )
 
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
