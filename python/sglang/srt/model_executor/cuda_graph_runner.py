@@ -31,6 +31,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
+from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
@@ -275,6 +276,9 @@ class CudaGraphRunner:
                     ) = self.capture_one_batch_size(bs, forward)
                     self.graphs[bs] = graph
                     self.output_buffers[bs] = output_buffers
+
+                # Save gemlite cache after each capture
+                save_gemlite_cache()
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
