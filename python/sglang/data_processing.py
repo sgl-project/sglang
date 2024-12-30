@@ -173,8 +173,6 @@ def sample_ultrachat_requests(
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
-    # TODO: Add download or cache for ultrachat
-
     # Load the dataset
     dataset = []
     with open(dataset_path) as f:
@@ -218,12 +216,11 @@ def sample_loogle_requests(
     tokenizer: PreTrainedTokenizerBase,
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,
+    enable_shared_prefix: bool = False,
     fixed_output_len: Optional[int] = None,
 ) -> SampleOutput:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
-
-    # TODO: Add download or cache for loogle
 
     # Load the dataset
     dataset = []
@@ -240,8 +237,9 @@ def sample_loogle_requests(
     # NOTE: Now we preprocess it only for chat
     for data in dataset:
         chat = []
-        # TODO: Revisit summarization
-        if len(data["qa_pairs"]) == 0:
+        if ("qa_pairs" not in data or
+            data["qa_pairs"] == "none" or 
+            len(data["qa_pairs"]) == 0):
             # If Q is none (for summarization),
             # We add a question for summarization
             # And keep the summary up to 1024 words
@@ -258,13 +256,14 @@ def sample_loogle_requests(
         else:
             qa_pairs = eval(data["qa_pairs"])
             for i, qa in enumerate(qa_pairs):
-                if i == 0:
+                if i == 0 or enable_shared_prefix:
                     # Combine input with the first Q
                     chat.append(
                         ("Input: " + data["input"] + " Question: " + qa["Q"], qa["A"])
                     )
                 elif enable_multiturn:
                     chat.append((qa["Q"], qa["A"]))
+                
             new_dataset.append(chat)
 
     # Shuffle the dataset.
@@ -549,6 +548,7 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
+            enable_shared_prefix=args.enable_shared_prefix,
             fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "nextqa":

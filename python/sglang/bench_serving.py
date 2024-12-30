@@ -93,28 +93,36 @@ async def async_request_trt_llm(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    # TODO: Support multiturn chat
-    assert(len(request_func_input.prompts) == 1)
-
-    prompt, prompt_len, output_len = request_func_input.prompts[0]
-
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "accumulate_tokens": True,
-            "text_input": prompt,
             "temperature": 0.000001,
             "top_p": 1.0,
-            "max_tokens": output_len,
             "stream": True,
-            "min_length": output_len,
             "end_id": 1048576,
             **request_func_input.extra_request_body,
         }
+
+        prompt_idx = request_func_input.finished_prompts
+        messages = request_func_input.prev_messages
+        prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
+        prompt_len = sum(
+            prompt[1] + prompt[2]  # input_len + output_len
+            for prompt in request_func_input.prompts[: prompt_idx]
+        )
+        prompt_len += input_len
+
+        # TODO: Check out whether trt-llm supports native multiturn chat
+        messages.append(prompt)
+        payload["text_input"] = " ".join(messages)
+        payload["max_tokens"] = max_tokens
+        payload["min_length"] = max_tokens
+
         if args.disable_ignore_eos:
             del payload["min_length"]
             del payload["end_id"]
+
         output = RequestFuncOutput()
-        output.prompt_len.append(prompt_len)
 
         generated_text = ""
         ttft = 0.0
@@ -144,10 +152,27 @@ async def async_request_trt_llm(
 
                         most_recent_timestamp = timestamp
 
+                    output_len = len(tokenizer(generated_text).input_ids)
+                    output.prompt_len.append(prompt_len - 1) # truncate <s>
+                    output.output_len.append(output_len)
                     output.generated_text.append(generated_text)
                     output.latency.append(most_recent_timestamp - st)
                     output.success = True
-                    output.output_len.append(output_len)
+
+                    # Prepare for the new request
+                    request_func_input.prompts[prompt_idx] = (
+                        prompt,
+                        input_len,
+                        output_len,  # changes from max_tokens to output_len
+                    )
+                    prompt_idx += 1
+                    messages.append(generated_text)
+
+                    # Move the new request to the end of the queue
+                    if prompt_idx < len(request_func_input.prompts):
+                        request_func_input.finished_prompts = prompt_idx
+                        request_func_input.prev_messages = messages
+                        await queue.put(request_func_input)
 
                 else:
                     output.error = response.reason or ""
@@ -286,7 +311,6 @@ async def async_request_openai_completions(
         pbar.update(1)
     return output
 
-# TODO: Add multiturn support for truss
 async def async_request_truss(
     request_func_input: RequestFuncInput,
     queue: asyncio.Queue,
@@ -295,18 +319,11 @@ async def async_request_truss(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
 
-    # TODO: Support multiturn chat
-    assert(len(request_func_input.prompts) == 1)
-
-    prompt, prompt_len, output_len = request_func_input.prompts[0]
-
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "model": request_func_input.model,
-            "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
-            "max_tokens": output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
@@ -314,7 +331,20 @@ async def async_request_truss(
         headers = get_auth_headers()
 
         output = RequestFuncOutput()
-        output.prompt_len.append(prompt_len)
+
+        prompt_idx = request_func_input.finished_prompts
+        messages = request_func_input.prev_messages
+        prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
+        prompt_len = sum(
+            prompt[1] + prompt[2]  # input_len + output_len
+            for prompt in request_func_input.prompts[: prompt_idx]
+        )
+        prompt_len += input_len
+
+        # TODO: Checkout truss to see whether there is a another field
+        messages.append(prompt)
+        payload["prompt"] = " ".join(messages)
+        payload["max_tokens"] = max_tokens
 
         generated_text = ""
         ttft = 0.0
@@ -354,10 +384,27 @@ async def async_request_truss(
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["delta"]["content"]
 
+                    output_len = len(tokenizer(generated_text).input_ids)
+                    output.prompt_len.append(prompt_len - 1) # truncate <s>
+                    output.output_len.append(output_len)
                     output.generated_text.append(generated_text)
                     output.success = True
                     output.latency.append(latency)
-                    output.output_len.append(output_len)
+
+                    # Prepare for the new request
+                    request_func_input.prompts[prompt_idx] = (
+                        prompt,
+                        input_len,
+                        output_len,  # changes from max_tokens to output_len
+                    )
+                    prompt_idx += 1
+                    messages.append(generated_text)
+
+                    # Move the new request to the end of the queue
+                    if prompt_idx < len(request_func_input.prompts):
+                        request_func_input.finished_prompts = prompt_idx
+                        request_func_input.prev_messages = messages
+                        await queue.put(request_func_input)
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -713,6 +760,7 @@ async def benchmark(
     lora_name: str,
     extra_request_body: Dict[str, Any],
     profile: bool,
+    enable_shared_prefix: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -738,6 +786,13 @@ async def benchmark(
                 tokenizer=tokenizer,
                 pbar=pbar)
 
+    num_actual_requests = sum(len(r) for r in input_requests)
+    print(f"Num of shared prefixes or conversations: {len(input_requests)}")
+    print(f"Num of total requests: {num_actual_requests}")
+
+    # flatten the requests for shared prefix
+    if enable_shared_prefix:
+        input_requests = [[r] for requests in input_requests for r in requests]
     inputs_requests_queue = asyncio.Queue(maxsize=len(input_requests))
     print("Starting initial single prompt test run...")
     # NOTE: Just use the first request of the first conversation for warmup
@@ -786,9 +841,6 @@ async def benchmark(
             extra_request_body=extra_request_body,
         )
         inputs_requests_queue.put_nowait(request_func_input)
-    num_actual_requests = sum(len(r) for r in input_requests)
-    print(f"Num of shared prefixes or conversations: {len(input_requests)}")
-    print(f"Num of total requests: {num_actual_requests}")
     if (not args.enable_multiturn and
         not args.enable_shared_prefix and 
         not args.dataset_name == "generated-shared-prefix"):
@@ -1061,7 +1113,6 @@ def run_benchmark(args_: argparse.Namespace):
             else f"http://{args.host}:{args.port}/generate"
         )
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
-        # TODO: Verify lmdeploy
         api_url = (
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
@@ -1117,6 +1168,23 @@ def run_benchmark(args_: argparse.Namespace):
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
+    # Dataset compatibility check
+    if args.enable_multiturn:
+        # TODO: Support multiturn for random
+        if args.dataset_name not in ["sharegpt", "ultrachat", "loogle", "nextqa"]:
+            print(
+                "Multiturn conversation is only supported for sharegpt, ultrachat, loogle, and nextqa datasets."
+            )
+            sys.exit(1)
+
+    if args.enable_shared_prefix:
+        if args.dataset_name not in ["loogle", "nextqa"]:
+            print(
+                "Shared prefix is only supported for loogle and nextqa datasets."
+            )
+            sys.exit(1)
+
+
     print(f"{args}\n")
 
     # Read dataset
@@ -1143,6 +1211,7 @@ def run_benchmark(args_: argparse.Namespace):
                 lora_name=args.lora_name,
                 extra_request_body=extra_request_body,
                 profile=args.profile,
+                enable_shared_prefix=args.enable_shared_prefix,
             )
         )
     else:
@@ -1164,6 +1233,7 @@ def run_benchmark(args_: argparse.Namespace):
                     lora_name=args.lora_name,
                     extra_request_body=extra_request_body,
                     profile=args.profile,
+                    enable_shared_prefix=args.enable_shared_prefix,
                 )
             )
 
@@ -1207,7 +1277,7 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=["sharegpt", "random", "generated-shared-prefix",
-        "ultrachat", "loogle", "NextQA"],
+        "ultrachat", "loogle", "nextqa"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1297,14 +1367,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable multiturn chat for online serving benchmarking. "
         "This option is effective on the following datasets: "
-        "sharegpt, ultrachat, loogle, NextQA",
+        "sharegpt, ultrachat, loogle, nextqa",
     )
     parser.add_argument(
         "--enable-shared-prefix",
         action="store_true",
         help="Enable shared prefix for online serving benchmarking. "
         "This option is effective on the following datasets: "
-        "loogle, NextQA",
+        "loogle, nextqa",
     )
 
     parser.add_argument(
@@ -1396,7 +1466,11 @@ if __name__ == "__main__":
         type=int,
         default=sys.maxsize,
         help="The maximum number of frames to extract from each video. "
-        "This option is specific to the NextQA dataset (video benchmark). ",
+        "This option is specific to the nextqa dataset (video benchmark). ",
     )
     args = parser.parse_args()
+
+    if args.enable_multiturn and args.enable_shared_prefix:
+        parser.error("--enable-multiturn and --enable-shared-prefix cannot be set at the same time.")
+
     run_benchmark(args)
