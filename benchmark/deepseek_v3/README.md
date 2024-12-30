@@ -52,7 +52,7 @@ response = client.chat.completions.create(
 print(response)
 ```
 ### Example serving with 2 H20*8
-Have 2 H20 nodes, each with 8 GPUs. The first node's IP is 10.0.0.1 and the second node's IP is 10.0.0.2
+For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`.
 
 ```bash
 # node 1
