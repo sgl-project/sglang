@@ -1,26 +1,26 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
-
-from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
     requantize_with_max_scale,
 )
 from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
+
 from sglang.srt.layers.linear import LinearMethodBase
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 
 # Initialize logger for the module
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
@@ -68,7 +68,9 @@ class ModelOptFp8Config(QuantizationConfig):
 
         return cls(is_checkpoint_fp8_serialized=True)
 
-    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional["QuantizeMethodBase"]:
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional["QuantizeMethodBase"]:
         return ModelOptFp8LinearMethod(self) if isinstance(layer, LinearBase) else None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -105,7 +107,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         """Creates and registers weights, weight scales, and input scales for FP8 quantization."""
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
-        weight_dtype = torch.float8_e4m3fn if self.quant_config.is_checkpoint_fp8_serialized else params_dtype
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else params_dtype
+        )
 
         # Set layer attributes
         layer.logical_widths = output_partition_sizes
@@ -116,7 +122,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=weight_dtype),
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=weight_dtype,
+                ),
                 input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
@@ -129,19 +139,29 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 layer.register_parameter(
                     scale_name,
                     PerTensorScaleParameter(
-                        data=torch.full((len(output_partition_sizes),), torch.finfo(torch.float32).min),
+                        data=torch.full(
+                            (len(output_partition_sizes),),
+                            torch.finfo(torch.float32).min,
+                        ),
                         weight_loader=weight_loader,
                     ),
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
-        max_w_scale, quantized_weight = requantize_with_max_scale(layer.weight, layer.weight_scale, layer.logical_widths)
+        max_w_scale, quantized_weight = requantize_with_max_scale(
+            layer.weight, layer.weight_scale, layer.logical_widths
+        )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
 
-    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
         return apply_fp8_linear(
             input=x,
