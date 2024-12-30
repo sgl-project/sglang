@@ -5,7 +5,6 @@ Example: python server.py --model-path lmms-lab/LLaVA-NeXT-Video-7B --tokenizer-
 
 import argparse
 import multiprocessing as mp
-import argparse
 
 from sglang.srt.server import ServerArgs, launch_server
 
@@ -53,7 +52,6 @@ Example: python server.py --model-path lmms-lab/LLaVA-NeXT-Video-7B --tokenizer-
 
 import argparse
 import multiprocessing as mp
-import argparse
 
 from sglang.srt.server import ServerArgs, launch_server
 

@@ -1,12 +1,14 @@
-import av
-import os
-from typing import List, Tuple
-from datasets import load_dataset
-import sys
-from io import BytesIO
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 import base64
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from typing import List, Tuple
+
+import av
+import numpy as np
+from datasets import load_dataset
+
 
 # Adopt from SGLang
 def encode_frame(frame):
@@ -30,6 +32,7 @@ def encode_frame(frame):
 
     # Return the bytes of the frame
     return frame_bytes
+
 
 # Adopt from SGLang
 def encode_video_base64(video_path: str, num_frames: int = 16):
@@ -76,6 +79,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     video_base64 = "video:" + base64.b64encode(video_bytes).decode("utf-8")
 
     return video_base64
+
 
 def find_video_files(video_dir) -> List[str]:
     if os.path.isfile(video_dir):

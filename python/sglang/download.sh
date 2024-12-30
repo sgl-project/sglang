@@ -15,7 +15,7 @@ download() {
             ;;
         ultragpt)
             echo $1
-            # Questions about the world 
+            # Questions about the world
             wget https://cloud.tsinghua.edu.cn/seafhttp/files/be1d7b87-22ca-449e-a6a7-c61d1ea7e010/ultrachat_release_230407.json
             # Writing and Creation
             wget https://cloud.tsinghua.edu.cn/seafhttp/files/61742d2a-25e2-4d08-b2b9-15f47ae50ace/ultrachat_material_release_230417.json

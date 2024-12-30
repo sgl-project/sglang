@@ -29,6 +29,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 import aiohttp
 import numpy as np
 import requests
+from data_processing import SampleOutput, get_dataset
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoTokenizer,
@@ -36,8 +37,6 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
-
-from data_processing import get_dataset, SampleOutput
 from utils import MsgContent
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
@@ -55,7 +54,8 @@ class RequestFuncInput:
 
     # For multiturn chat, store the context
     prev_messages: List = field(default_factory=list)
-    finished_prompts: int = 0 
+    finished_prompts: int = 0
+
 
 @dataclass
 class RequestFuncOutput:
@@ -108,7 +108,7 @@ async def async_request_trt_llm(
         prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
         prompt_len = sum(
             prompt[1] + prompt[2]  # input_len + output_len
-            for prompt in request_func_input.prompts[: prompt_idx]
+            for prompt in request_func_input.prompts[:prompt_idx]
         )
         prompt_len += input_len
 
@@ -153,7 +153,7 @@ async def async_request_trt_llm(
                         most_recent_timestamp = timestamp
 
                     output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1) # truncate <s>
+                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
                     output.output_len.append(output_len)
                     output.generated_text.append(generated_text)
                     output.latency.append(most_recent_timestamp - st)
@@ -217,7 +217,7 @@ async def async_request_openai_completions(
         prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
         prompt_len = sum(
             prompt[1] + prompt[2]  # input_len + output_len
-            for prompt in request_func_input.prompts[: prompt_idx]
+            for prompt in request_func_input.prompts[:prompt_idx]
         )
         prompt_len += input_len
 
@@ -231,8 +231,8 @@ async def async_request_openai_completions(
         payload["messages"] = messages
         payload["max_tokens"] = max_tokens
 
-        #output.prompt_len = request_func_input.prompt_len
-        #print(payload)
+        # output.prompt_len = request_func_input.prompt_len
+        # print(payload)
 
         generated_text = ""
         ttft = 0.0
@@ -274,7 +274,7 @@ async def async_request_openai_completions(
                             most_recent_timestamp = timestamp
 
                     output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1) # truncate <s>
+                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
                     output.output_len.append(output_len)
                     output.generated_text.append(generated_text)
                     output.success = True
@@ -311,6 +311,7 @@ async def async_request_openai_completions(
         pbar.update(1)
     return output
 
+
 async def async_request_truss(
     request_func_input: RequestFuncInput,
     queue: asyncio.Queue,
@@ -337,7 +338,7 @@ async def async_request_truss(
         prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
         prompt_len = sum(
             prompt[1] + prompt[2]  # input_len + output_len
-            for prompt in request_func_input.prompts[: prompt_idx]
+            for prompt in request_func_input.prompts[:prompt_idx]
         )
         prompt_len += input_len
 
@@ -385,7 +386,7 @@ async def async_request_truss(
                                 generated_text += data["choices"][0]["delta"]["content"]
 
                     output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1) # truncate <s>
+                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
                     output.output_len.append(output_len)
                     output.generated_text.append(generated_text)
                     output.success = True
@@ -441,24 +442,23 @@ async def async_request_sglang_generate(
         headers = get_auth_headers()
 
         output = RequestFuncOutput()
-        
+
         prompt_idx = request_func_input.finished_prompts
         messages = request_func_input.prev_messages
         prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
         prompt_len = sum(
             prompt[1] + prompt[2]  # input_len + output_len
-            for prompt in request_func_input.prompts[: prompt_idx]
+            for prompt in request_func_input.prompts[:prompt_idx]
         )
         prompt_len += input_len
 
         # TODO: Make use of the new session field of the GenerateReqInput
-        # Now we simply concatenate all the prompts and responses in the 
+        # Now we simply concatenate all the prompts and responses in the
         # text field
-        
+
         messages.append(prompt)
         payload["text"] = " ".join(messages)
         payload["sampling_params"]["max_new_tokens"] = max_tokens
-        
 
         generated_text = ""
         ttft = 0.0
@@ -500,7 +500,7 @@ async def async_request_sglang_generate(
                             most_recent_timestamp = timestamp
 
                     output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1) # truncate <s>
+                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
                     output.output_len.append(output_len)
                     output.generated_text.append(generated_text)
                     output.success = True
@@ -681,18 +681,22 @@ def calculate_metrics(
     for i in range(len(outputs)):
         if outputs[i].success:
             output_success += 1
-            assert(len(outputs[i].generated_text) == len(outputs[i].latency))
-            assert(len(outputs[i].generated_text) == len(outputs[i].ttft))
+            assert len(outputs[i].generated_text) == len(outputs[i].latency)
+            assert len(outputs[i].generated_text) == len(outputs[i].ttft)
             for j in range(len(outputs[i].generated_text)):
                 output_len = outputs[i].output_len[j]
                 output_lens.append(output_len)
                 retokenized_output_len = len(
-                    tokenizer.encode(outputs[i].generated_text[j], add_special_tokens=False)
+                    tokenizer.encode(
+                        outputs[i].generated_text[j], add_special_tokens=False
+                    )
                 )
                 retokenized_output_lens.append(retokenized_output_len)
                 total_input += outputs[i].prompt_len[j]
                 if output_len > 1:
-                    tpots.append((outputs[i].latency[j] - outputs[i].ttft[j]) / (output_len - 1))
+                    tpots.append(
+                        (outputs[i].latency[j] - outputs[i].ttft[j]) / (output_len - 1)
+                    )
 
                 completed += 1
             itls += outputs[i].itl
@@ -771,20 +775,21 @@ async def benchmark(
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
-    async def limited_request_func(
-            request_func_input, queue, tokenizer, pbar):
+    async def limited_request_func(request_func_input, queue, tokenizer, pbar):
         if semaphore is None:
             return await request_func(
                 request_func_input=request_func_input,
                 queue=queue,
                 tokenizer=tokenizer,
-                pbar=pbar)
+                pbar=pbar,
+            )
         async with semaphore:
             return await request_func(
-                request_func_input=request_func_input, 
+                request_func_input=request_func_input,
                 queue=queue,
                 tokenizer=tokenizer,
-                pbar=pbar)
+                pbar=pbar,
+            )
 
     num_actual_requests = sum(len(r) for r in input_requests)
     print(f"Num of shared prefixes or conversations: {len(input_requests)}")
@@ -803,9 +808,9 @@ async def benchmark(
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
-    test_output = await request_func(request_func_input=test_input, 
-                                     queue=inputs_requests_queue,
-                                     tokenizer=tokenizer)
+    test_output = await request_func(
+        request_func_input=test_input, queue=inputs_requests_queue, tokenizer=tokenizer
+    )
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please make sure benchmark arguments "
@@ -813,9 +818,9 @@ async def benchmark(
         )
     else:
         print("Initial test run completed. Starting main benchmark run...")
-    
+
     # Check the states
-    assert(inputs_requests_queue.empty())
+    assert inputs_requests_queue.empty()
 
     # Flush cache
     if "sglang" in backend:
@@ -841,24 +846,28 @@ async def benchmark(
             extra_request_body=extra_request_body,
         )
         inputs_requests_queue.put_nowait(request_func_input)
-    if (not args.enable_multiturn and
-        not args.enable_shared_prefix and 
-        not args.dataset_name == "generated-shared-prefix"):
-        assert(len(input_requests) == num_actual_requests)
-    
-    pbar = None if disable_tqdm else tqdm(total=num_actual_requests) 
+    if (
+        not args.enable_multiturn
+        and not args.enable_shared_prefix
+        and not args.dataset_name == "generated-shared-prefix"
+    ):
+        assert len(input_requests) == num_actual_requests
+
+    pbar = None if disable_tqdm else tqdm(total=num_actual_requests)
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_requests(
-        inputs_requests_queue, request_rate, num_actual_requests):
+        inputs_requests_queue, request_rate, num_actual_requests
+    ):
         tasks.append(
             asyncio.create_task(
                 limited_request_func(
-                    request_func_input=request, 
+                    request_func_input=request,
                     queue=inputs_requests_queue,
                     tokenizer=tokenizer,
-                    pbar=pbar)
+                    pbar=pbar,
+                )
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
@@ -1179,11 +1188,8 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.enable_shared_prefix:
         if args.dataset_name not in ["loogle", "nextqa"]:
-            print(
-                "Shared prefix is only supported for loogle and nextqa datasets."
-            )
+            print("Shared prefix is only supported for loogle and nextqa datasets.")
             sys.exit(1)
-
 
     print(f"{args}\n")
 
@@ -1276,8 +1282,14 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "generated-shared-prefix",
-        "ultrachat", "loogle", "nextqa"],
+        choices=[
+            "sharegpt",
+            "random",
+            "generated-shared-prefix",
+            "ultrachat",
+            "loogle",
+            "nextqa",
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1471,6 +1483,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.enable_multiturn and args.enable_shared_prefix:
-        parser.error("--enable-multiturn and --enable-shared-prefix cannot be set at the same time.")
+        parser.error(
+            "--enable-multiturn and --enable-shared-prefix cannot be set at the same time."
+        )
 
     run_benchmark(args)
