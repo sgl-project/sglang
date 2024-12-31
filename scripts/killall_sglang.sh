@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euxo pipefail
 
 # Show current GPU status
 nvidia-smi
