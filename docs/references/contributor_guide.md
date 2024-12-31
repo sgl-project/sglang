@@ -123,4 +123,4 @@ python3 run_suite.py --suite minimal
 
 If you want to contribute but don’t have a specific idea in mind, start by picking up issues labeled [“good first issue” or “help wanted”](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase. Feel free to ask questions or request clarifications in the corresponding issue threads.
 
-Thank you again for your interest in SGLang! If you have any questions along the way, feel free to open an issue or start a thread[in our slack channel](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2um0ad92q-LkU19KQTxCGzlCgRiOiQEw). Happy coding!
+Thank you again for your interest in SGLang! If you have any questions along the way, feel free to open an issue or start a thread in our [slack channel](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2um0ad92q-LkU19KQTxCGzlCgRiOiQEw). Happy coding!
