@@ -28,7 +28,6 @@ find_package(Torch REQUIRED)
 
 # Warp Reduce library
 add_library(_kernels SHARED
-    src/sgl-kernel/csrc/warp_reduce_kernel.cu
     src/sgl-kernel/csrc/trt_reduce_internal.cu
     src/sgl-kernel/csrc/trt_reduce_kernel.cu
     src/sgl-kernel/csrc/moe_align_kernel.cu
