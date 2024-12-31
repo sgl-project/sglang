@@ -272,6 +272,10 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
+        self.custom_params = self.custom_params + other.custom_params
+        self.custom_logit_processor = SamplingBatchInfo.merge_custom_logit_processor(
+            self.custom_logit_processor, other.custom_logit_processor
+        )
 
     def apply_logits_bias(self, logits: torch.Tensor):
         # Apply logit_bias
@@ -293,7 +297,3 @@ class SamplingBatchInfo:
         # Apply regex vocab_mask
         if self.vocab_mask is not None:
             self.apply_mask(logits=logits, vocab_mask=self.vocab_mask)
-        self.custom_params = self.custom_params + other.custom_params
-        self.custom_logit_processor = SamplingBatchInfo.merge_custom_logit_processor(
-            self.custom_logit_processor, other.custom_logit_processor
-        )
