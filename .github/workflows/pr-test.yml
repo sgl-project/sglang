@@ -49,7 +49,7 @@ jobs:
 
   unit-test-backend-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 2-gpu-runner
+    runs-on: 1-gpu-runner
     strategy:
       matrix:
         range: [0-6, 6-16, 16-23, 23-30, 30-100]
@@ -62,10 +62,9 @@ jobs:
           FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
-          pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 25
         run: |
           cd test/srt
           RANGE=${{ matrix.range }}
