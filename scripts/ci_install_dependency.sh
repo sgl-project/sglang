@@ -14,8 +14,7 @@ pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu121/torch2
 
 # Force reinstall flashinfer
 pip install flashinfer==0.1.6 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
-# TODO use published version
-pip uninstall -y torch_memory_saver && pip install git+https://github.com/fzyzcjy/torch_memory_saver
+pip uninstall -y torch_memory_saver && pip install torch_memory_saver
 
 pip install transformers==4.45.2 sentence_transformers accelerate peft
 
