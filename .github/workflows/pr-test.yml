@@ -37,7 +37,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -59,7 +59,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -81,7 +81,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -92,7 +92,7 @@ jobs:
           python3 test_data_parallelism.py
 
       - name: Evaluate MLA accuracy (TP=2)
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_mla.py
@@ -120,7 +120,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -157,7 +157,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -188,7 +188,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -219,7 +219,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -243,7 +243,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 

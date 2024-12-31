@@ -5,7 +5,7 @@ You can install SGLang using any of the methods below.
 ## Method 1: With pip
 ```
 pip install --upgrade pip
-pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu121/torch2.4/flashinfer/
+pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
 
 Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
@@ -17,7 +17,7 @@ git clone -b v0.4.1.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
-pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu121/torch2.4/flashinfer/
+pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
 
 Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
