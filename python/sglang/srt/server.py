@@ -259,6 +259,10 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await tokenizer_manager.open_session(obj, request)
+        if session_id is None:
+            raise Exception(
+                "Failed to open the session. Check if a session with the same id is still open."
+            )
         return session_id
     except Exception as e:
         return _create_error_response(e)
@@ -574,6 +578,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    if "GLOO_SOCKET_IFNAME" not in os.environ:
+        os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
 
     # Set prometheus env vars
     if server_args.enable_metrics:

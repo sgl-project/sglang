@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -514,8 +514,10 @@ class Scheduler:
                 else:
                     self.stop_profile()
             elif isinstance(recv_req, OpenSessionReqInput):
-                session_id = self.open_session(recv_req)
-                self.send_to_tokenizer.send_pyobj(OpenSessionReqOutput(session_id))
+                session_id, success = self.open_session(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    OpenSessionReqOutput(session_id=session_id, success=success)
+                )
             elif isinstance(recv_req, CloseSessionReqInput):
                 self.close_session(recv_req)
             else:
@@ -526,7 +528,11 @@ class Scheduler:
         recv_req: TokenizedGenerateReqInput,
     ):
         # Create a new request
-        if recv_req.session_id is None or recv_req.session_id not in self.sessions:
+        if (
+            recv_req.session_params is None
+            or recv_req.session_params.id is None
+            or recv_req.session_params.id not in self.sessions
+        ):
 
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
@@ -548,15 +554,18 @@ class Scheduler:
             )
             req.tokenizer = self.tokenizer
 
-            if recv_req.session_id is not None:
+            if (
+                recv_req.session_params is not None
+                and recv_req.session_params.id is not None
+            ):
                 req.finished_reason = FINISH_ABORT(
-                    f"Invalid request: session id {recv_req.session_id} does not exist"
+                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
                 self.waiting_queue.append(req)
                 return
         else:
-            # Create a new request from a previsou session
-            session = self.sessions[recv_req.session_id]
+            # Create a new request from a previous session
+            session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.waiting_queue.append(req)
@@ -996,12 +1005,10 @@ class Scheduler:
                 logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             else:
                 # Move next_token_ids and logprobs to cpu
+                next_token_ids = next_token_ids.tolist()
                 if batch.return_logprob:
                     logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs[
-                            torch.arange(len(next_token_ids), device=self.device),
-                            next_token_ids,
-                        ].tolist()
+                        logits_output.next_token_logprobs.tolist()
                     )
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.tolist()
@@ -1009,7 +1016,6 @@ class Scheduler:
                     logits_output.normalized_prompt_logprobs = (
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
-                next_token_ids = next_token_ids.tolist()
 
             # Check finish conditions
             logprob_pt = 0
@@ -1086,13 +1092,9 @@ class Scheduler:
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
         else:
-            # Move next_token_ids and logprobs to cpu
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs[
-                    torch.arange(len(next_token_ids), device=self.device),
-                    next_token_ids,
-                ].tolist()
             next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob:
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool.free_group_begin()
 
@@ -1121,10 +1123,10 @@ class Scheduler:
                 req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs_val.append(
-                        logits_output.output_top_logprobs_val[i]
+                        logits_output.next_token_top_logprobs_val[i]
                     )
                     req.output_top_logprobs_idx.append(
-                        logits_output.output_top_logprobs_idx[i]
+                        logits_output.next_token_top_logprobs_idx[i]
                     )
 
             if req.grammar is not None:
@@ -1226,8 +1228,9 @@ class Scheduler:
                 req.output_top_logprobs_idx.extend(
                     output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
                 )
-            req.output_top_logprobs_val.append(output.output_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.output_top_logprobs_idx[i])
+
+            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
+            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
         return num_input_logprobs
 
@@ -1244,6 +1247,7 @@ class Scheduler:
             decode_ids_list = []
             read_offsets = []
             output_ids = []
+            origin_input_ids = []
 
             skip_special_tokens = []
             spaces_between_special_tokens = []
@@ -1295,8 +1299,14 @@ class Scheduler:
                     decode_ids, read_offset = req.init_incremental_detokenize()
                     decode_ids_list.append(decode_ids)
                     read_offsets.append(read_offset)
-                    if self.skip_tokenizer_init:
+                    if self.skip_tokenizer_init or self.server_args.return_token_ids:
                         output_ids.append(req.output_ids)
+                    else:
+                        output_ids = None
+                    if self.server_args.return_token_ids:
+                        origin_input_ids.append(req.origin_input_ids)
+                    else:
+                        origin_input_ids = None
                     skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                     spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
@@ -1328,6 +1338,7 @@ class Scheduler:
                         decoded_texts,
                         decode_ids_list,
                         read_offsets,
+                        origin_input_ids,
                         output_ids,
                         skip_special_tokens,
                         spaces_between_special_tokens,
@@ -1538,16 +1549,20 @@ class Scheduler:
         )
         logger.info("Profiler is done")
 
-    def open_session(self, recv_req: OpenSessionReqInput) -> str:
+    def open_session(self, recv_req: OpenSessionReqInput) -> Tuple[Optional[str], bool]:
         # handle error
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
+            return session_id, False
+        elif session_id is None:
+            logger.warning(f"session id is None, cannot open.")
+            return session_id, False
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len, session_id
             )
-        return session_id
+            return session_id, True
 
     def close_session(self, recv_req: CloseSessionReqInput):
         # handle error
