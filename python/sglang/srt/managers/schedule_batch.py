@@ -44,13 +44,11 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    SpeculativeAlgorithm,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
@@ -573,12 +571,12 @@ class ScheduleBatch:
     # Has grammar
     has_grammar: bool = False
 
-    # device
+    # Device
     device: str = "cuda"
 
-    # speculative decoding
-    spec_info: SpecInfo = None
-    spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
+    # Speculative decoding
+    spec_info: Optional[SpecInfo] = None
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
 
     @classmethod
     def init_new(
@@ -589,7 +587,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
-        speculative_algorithm=SpeculativeAlgorithm.NONE,
+        speculative_algorithm: Optional[SpeculativeAlgorithm] = None,
     ):
         return cls(
             reqs=reqs,
@@ -1012,7 +1010,7 @@ class ScheduleBatch:
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
-        if self.spec_algorithm.is_eagle():
+        if self.spec_algorithm == "EAGLE":
             return
 
         self.input_ids = self.output_ids
@@ -1232,11 +1230,12 @@ class ModelWorkerBatch:
     # Sampling info
     sampling_info: SamplingBatchInfo
 
-    # Speclulative decoding
-    spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
-    spec_info: SpecInfo = None
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
+
+    # Speculative decoding
+    spec_info: Optional[SpecInfo] = None
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
 
 
 @triton.jit

@@ -525,7 +525,7 @@ class ModelRunner:
                 4096,
             )
 
-        if self.server_args.speculative_algorithm.is_not_none():
+        if self.server_args.speculative_algorithm:
             if self.is_draft_runner:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
             else:

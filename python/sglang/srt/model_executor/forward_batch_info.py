@@ -45,28 +45,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.spec_info import SpecInfo
-
-
-class SpeculativeAlgorithm(IntEnum):
-    NONE = auto()
-    EAGLE = auto()
-
-    def is_not_none(self):
-        return self != SpeculativeAlgorithm.NONE
-
-    def is_eagle(self):
-        return self == SpeculativeAlgorithm.EAGLE
-
-    @staticmethod
-    def get_algorithm(algorithm):
-        if isinstance(algorithm, SpeculativeAlgorithm):
-            return algorithm
-        algorithm_map = {
-            "EAGLE": SpeculativeAlgorithm.EAGLE,
-            None: SpeculativeAlgorithm.NONE,
-        }
-        return algorithm_map[algorithm]
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 
 class ForwardMode(IntEnum):
@@ -197,6 +176,7 @@ class ForwardBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
 
+    # Speculative decoding
     spec_info: SpecInfo = None
     spec_algorithm: SpeculativeAlgorithm = None
 

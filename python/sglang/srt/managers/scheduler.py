@@ -201,10 +201,10 @@ class Scheduler:
         )
 
         # Launch Speculative worker if need
-        if self.server_args.speculative_algorithm.is_not_none():
-            self.draft_worker = spec_worker_factory.get(
-                self.server_args.speculative_algorithm
-            )(
+        if self.server_args.speculative_algorithm:
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
+            self.draft_worker = EAGLEWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 server_args=server_args,
@@ -898,7 +898,7 @@ class Scheduler:
         # Check if decode out of memory
         buf_multiplier = (
             self.server_args.speculative_num_draft_tokens
-            if self.server_args.speculative_algorithm.is_not_none()
+            if self.server_args.speculative_algorithm
             else 1
         )
         if not batch.check_decode_mem(buf_multiplier) or (
@@ -943,7 +943,7 @@ class Scheduler:
         self.forward_ct += 1
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                if self.server_args.speculative_algorithm.is_not_none():
+                if self.server_args.speculative_algorithm:
                     logits_output, next_token_ids, model_worker_batch, spec_info = (
                         self.draft_worker.forward_batch_speculative_generate(batch)
                     )
@@ -1107,7 +1107,7 @@ class Scheduler:
                 continue
 
             if (
-                not batch.spec_algorithm.is_not_none()
+                not batch.spec_algorithm
             ):  # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
 

@@ -3,15 +3,14 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    SpeculativeAlgorithm,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_utils import EAGLEDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import EAGLEDraftInput
 from sglang.srt.speculative.speculative_worker import (
     SpeculativeWorker,
     spec_worker_factory,
@@ -22,7 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-@spec_worker_factory.register(SpeculativeAlgorithm.EAGLE)
+@spec_worker_factory.register("EAGLE")
 class EAGLEWorker(SpeculativeWorker):
     def __init__(
         self,

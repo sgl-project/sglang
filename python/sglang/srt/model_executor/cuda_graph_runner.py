@@ -35,7 +35,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    SpeculativeAlgorithm,
 )
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
@@ -157,16 +156,20 @@ class CudaGraphRunner:
             if bs <= model_runner.req_to_token_pool.size
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
+
         self.capture_forward_mode = ForwardMode.DECODE
-        if model_runner.server_args.speculative_algorithm.is_eagle():
+        if model_runner.server_args.speculative_algorithm == "EAGLE":
             if self.model_runner.is_draft_runner:
-                expand_num = self.model_runner.server_args.speculative_eagle_topk
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_eagle_topk
+                )
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                expand_num = self.model_runner.server_args.speculative_num_draft_tokens
-            self.num_tokens = [bs * expand_num for bs in self.capture_bs]
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_num_draft_tokens
+                )
         else:
-            self.num_tokens = [bs for bs in self.capture_bs]
+            self.num_tokens_per_bs = 1
 
         self.compile_bs = (
             [
@@ -180,7 +183,7 @@ class CudaGraphRunner:
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = max(self.num_tokens)
+        self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -204,7 +207,7 @@ class CudaGraphRunner:
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
 
             # speculative_inference
-            if self.model_runner.server_args.speculative_algorithm.is_eagle():
+            if self.model_runner.server_args.speculative_algorithm == "EAGLE":
                 self.hidden_states = torch.zeros(
                     (self.max_num_token, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
@@ -252,6 +255,9 @@ class CudaGraphRunner:
             self.model_runner.model.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
+        if not forward_batch.forward_mode.is_cuda_graph():
+            return False
+
         if self.enable_dp_attention:
             min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
                 forward_batch.global_num_tokens
@@ -276,21 +282,17 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return (
-            is_bs_supported
-            and is_encoder_lens_supported
-            and forward_batch.forward_mode.is_cuda_graph()
-        )
+        return is_bs_supported and is_encoder_lens_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             capture_range = (
-                tqdm.tqdm(zip(self.capture_bs, self.num_tokens))
+                tqdm.tqdm(self.capture_bs)
                 if get_tensor_model_parallel_rank() == 0
-                else zip(self.capture_bs, self.num_tokens)
+                else self.capture_bs
             )
-            for bs, num_token in capture_range:
+            for bs in capture_range:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
@@ -300,13 +302,14 @@ class CudaGraphRunner:
                     (
                         graph,
                         output_buffers,
-                    ) = self.capture_one_batch_size(bs, num_token, forward)
+                    ) = self.capture_one_batch_size(bs, forward)
                     self.graphs[bs] = graph
                     self.output_buffers[bs] = output_buffers
 
-    def capture_one_batch_size(self, bs: int, num_token: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
+        num_token = bs * self.num_tokens_per_bs
 
         # Common inputs
         input_ids = self.input_ids[:num_token]
@@ -316,7 +319,7 @@ class CudaGraphRunner:
         positions = self.positions[:num_token]
 
         spec_info = None
-        if self.model_runner.server_args.speculative_algorithm.is_eagle():
+        if self.model_runner.server_args.speculative_algorithm == "EAGLE":
             from sglang.srt.speculative.eagle_utils import (
                 EAGLEDraftInput,
                 EagleVerifyInput,
@@ -420,8 +423,8 @@ class CudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
-        # In most case, raw_bs == num_token in decode stage.
-        # But for speculative, the token num maybe large than raw_bs
+        # In normal decoding case, raw_bs == raw_num_token
+        # But in speculative decoding, raw_num_token is raw_bs * self.num_tokens_per_bs
         raw_num_token = forward_batch.input_ids.numel()
 
         # Pad

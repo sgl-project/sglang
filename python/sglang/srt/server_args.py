@@ -23,7 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
-from sglang.srt.model_executor.forward_batch_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -150,15 +150,12 @@ class ServerArgs:
 
     # speculative decoding
     speculative_draft_model_path: Optional[str] = None
-    speculative_algorithm: Optional[SpeculativeAlgorithm] = None
+    speculative_algorithm: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     # should been set as 2^n
     speculative_num_draft_tokens: Optional[int] = None
     # should been set as [1, 2, 4, 8]
     speculative_eagle_topk: Optional[int] = None
-    # should not been set by cli, it is only a placeholder
-    # which would be set and used in model_runner
-    draft_runner_cache_size: Optional[int] = None
 
     def __post_init__(self):
         # Set missing default values
@@ -253,10 +250,7 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        self.speculative_algorithm = SpeculativeAlgorithm.get_algorithm(
-            self.speculative_algorithm
-        )
-        if self.speculative_algorithm.is_eagle():
+        if self.speculative_algorithm == "EAGLE":
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
@@ -698,6 +692,43 @@ class ServerArgs:
             help="Choose the backend for grammar-guided decoding.",
         )
 
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE"],
+            help="Speculative algorithm.",
+            required=False,
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            required=False,
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            required=False,
+            default=5,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            required=False,
+            default=64,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of token sampled from draft model in eagle2 each step.",
+            required=False,
+            choices=[1, 2, 4, 8],
+            default=8,
+        )
+
         # Optimization/debug options
         parser.add_argument(
             "--disable-radix-cache",
@@ -808,49 +839,6 @@ class ServerArgs:
             "The default value is 1, meaning only run one decoding step at a time.",
         )
         parser.add_argument(
-            "--speculative-draft-model-path",
-            type=str,
-            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
-            required=False,
-        )
-        parser.add_argument(
-            "--speculative-algorithm",
-            type=str,
-            choices=["EAGLE"],
-            help="Speculative algorithm.",
-            required=False,
-        )
-        parser.add_argument(
-            "--speculative-num-steps",
-            type=int,
-            help="The number of steps sampled from draft model in Speculative Decoding.",
-            required=False,
-            default=5,
-        )
-        parser.add_argument(
-            "--speculative-num-draft-tokens",
-            type=int,
-            help="The number of token sampled from draft model in Speculative Decoding.",
-            required=False,
-            default=64,
-        )
-        parser.add_argument(
-            "--speculative-eagle-topk",
-            type=int,
-            help="The number of token sampled from draft model in eagle2 each step.",
-            required=False,
-            choices=[1, 2, 4, 8],
-            default=8,
-        )
-        parser.add_argument(
-            "--draft-runner-cache-size",
-            type=int,
-            help="""It should not been set by cli, it is only a placeholder which
-            would be set and used in model_runner when using speculative inference.""",
-            required=False,
-            default=-1,
-        )
-        parser.add_argument(
             "--delete-ckpt-after-loading",
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
@@ -934,9 +922,7 @@ class PortArgs:
         while True:
             if is_port_available(port):
                 all_port.append(port)
-            if len(all_port) == (
-                2 if server_args.speculative_algorithm.is_not_none() else 1
-            ):
+            if len(all_port) == (2 if server_args.speculative_algorithm else 1):
                 break
             port += 42
 
