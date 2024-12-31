@@ -53,9 +53,9 @@ struct AllReduceParams {
 
 inline size_t GetMaxRequiredWorkspaceSize(int world_size) {
   if (world_size <= 2) {
-    return 16 * 1000 * 1000;
+    return 16 * 1024 * 1024;
   }
-  return 8 * 1000 * 1000;
+  return 8 * 1024 * 1024;
 }
 
 inline AllReduceStrategyType SelectImplementation(size_t message_size, int world_size) {
@@ -71,17 +71,15 @@ inline AllReduceStrategyType SelectImplementation(size_t message_size, int world
   }
 
   if (world_size <= 4) {
-    if (message_size < 1 * 1000 * 1000) {
+    if (message_size < 1 * 1024 * 1024) {
       return AllReduceStrategyType::ONESHOT;
     }
-    assert(false && "Custom allreduce do not twoshot currently");
     return AllReduceStrategyType::TWOSHOT;
   }
 
-  if (message_size < 500 * 1000) {
+  if (message_size < 512 * 1024) {
     return AllReduceStrategyType::ONESHOT;
   }
-  assert(false && "Custom allreduce do not twoshot currently");
   return AllReduceStrategyType::TWOSHOT;
 }
 
