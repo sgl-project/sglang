@@ -79,6 +79,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
 def _try_allocate_big_tensor(size: int = 20_000_000_000):
     try:
         torch.empty((size,), dtype=torch.uint8, device='cuda')
+        torch.cuda.empty_cache()
         return True
     except torch.cuda.OutOfMemoryError:
         return False
