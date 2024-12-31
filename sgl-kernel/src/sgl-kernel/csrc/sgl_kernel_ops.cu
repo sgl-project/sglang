@@ -1,13 +1,5 @@
 #include "utils.hpp"
 
-// warp_reduce
-torch::Tensor warp_reduce_cuda(torch::Tensor input);
-
-torch::Tensor warp_reduce(torch::Tensor input) {
-  CHECK_CUDA_INPUT(input);
-  return warp_reduce_cuda(input);
-}
-
 // trt_reduce
 using fptr_t = int64_t;
 fptr_t init_custom_ar(int64_t rank_id, int64_t world_size, const std::vector<fptr_t>& buffers,
@@ -21,8 +13,6 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
                           torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  // warp_reduce
-  m.def("reduce", &warp_reduce, "Warp Reduce (CUDA)");
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
   m.def("dispose", &dispose, "dispose custom allreduce meta");
