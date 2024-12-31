@@ -17,7 +17,7 @@ cd sglang
 
 Refer to [Install SGLang](https://sgl-project.github.io/start/install.html) documentation for more details on setting up the necessary dependencies.
 
-Install correct version of flashinfer according to your PyTorch and CUDA versions. Check your PyTorch and CUDA versions:
+Install correct version of flashinfer according to your PyTorch and CUDA versions.
 ```bash
 python -c "import torch; print('PyTorch Version:', torch.__version__); print('CUDA Version:', torch.version.cuda)"
 ```
