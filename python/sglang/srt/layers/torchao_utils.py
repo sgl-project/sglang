@@ -2,7 +2,29 @@
 Common utilities for torchao.
 """
 
+import logging
+import os
+import pwd
+
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def get_gemlite_cache_path() -> str:
+    return f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
+
+
+def save_gemlite_cache(print_error: bool = False) -> bool:
+    try:
+        from gemlite.core import GemLiteLinearTriton
+
+        GemLiteLinearTriton.cache_config(get_gemlite_cache_path())
+    except Exception:
+        if print_error:
+            logger.error("Failed to save the GemLite cache.")
+        return False
+    return True
 
 
 def apply_torchao_config_to_model(
@@ -50,27 +72,17 @@ def apply_torchao_config_to_model(
     elif "gemlite" in torchao_config:
         # gemlite-<packing_bitwidth>-<bit_width>-<group_size> or
         # gemlite-<bit_width>-<group_size> (packing_bitwidth defaults to 32)
-        import os
-        import pwd
-
-        import gemlite
-        from gemlite.core import GemLiteLinearTriton, set_autotune
-
-        try:
-            from torchao.quantization import gemlite_uintx_weight_only
-        except:
-            print(
-                f"import `gemlite_uintx_weight_only` failed, please use torchao nightly to use gemlite quantization"
-            )
-            return model
+        from gemlite.core import GemLiteLinearTriton
+        from torchao.quantization import gemlite_uintx_weight_only
 
         _quant_args = torchao_config.split("-")
         bit_width = int(_quant_args[-2])
         group_size = None if _quant_args[-1] == "None" else int(_quant_args[-1])
+
         try:
             packing_bitwidth = int(_quant_args[-3])
-        except:
-            # if only 2 inputs found, use default value
+        except (ValueError, IndexError):
+            # if only 2 inputs found or conversion fails, use default value
             packing_bitwidth = 32
 
         quantize_(
@@ -78,9 +90,7 @@ def apply_torchao_config_to_model(
         )
 
         # try to load gemlite kernel config
-        GemLiteLinearTriton.load_config(
-            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-        )
+        GemLiteLinearTriton.load_config(get_gemlite_cache_path())
 
     elif "fp8wo" in torchao_config:
         # this requires newer hardware

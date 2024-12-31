@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -22,43 +22,6 @@ class TorchNativeAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         pass
-
-    def init_cuda_graph_state(self, max_bs: int):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor] = None,
-    ):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor] = None,
-    ):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
 
     def _run_sdpa_forward_extend(
         self,

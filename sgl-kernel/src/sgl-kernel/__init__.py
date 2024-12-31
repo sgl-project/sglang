@@ -1,7 +1,12 @@
-from .ops import custom_dispose, custom_reduce, init_custom_reduce, warp_reduce
+from sgl_kernel.ops import (
+    custom_dispose,
+    custom_reduce,
+    init_custom_reduce,
+    moe_align_block_size,
+)
 
 __all__ = [
-    "warp_reduce",
+    "moe_align_block_size",
     "init_custom_reduce",
     "custom_dispose",
     "custom_reduce",

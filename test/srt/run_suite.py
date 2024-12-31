@@ -4,7 +4,7 @@ import glob
 from sglang.test.test_utils import run_unittest_files
 
 suites = {
-    "minimal": [
+    "per-commit": [
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
@@ -40,15 +40,22 @@ suites = {
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",
         "test_update_weights_from_disk.py",
+        "test_update_weights_from_tensor.py",
         "test_vision_chunked_prefill.py",
         "test_vision_openai_server.py",
         "test_session_control.py",
+        "test_engine_token_ids.py",
+    ],
+    "nightly": [
+        "test_nightly_gsm8k_eval.py",
+        "test_nightly_human_eval.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
     ),
 }
 
+# Expand suite
 for target_suite_name, target_tests in suites.items():
     for suite_name, tests in suites.items():
         if suite_name == target_suite_name:

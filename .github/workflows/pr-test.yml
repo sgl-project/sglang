@@ -37,7 +37,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -45,21 +45,21 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/lang
-          python3 run_suite.py --suite minimal
+          python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     strategy:
       matrix:
-        range: [0-6, 6-15, 15-23, 23-30, 30-100]
+        range: [0-6, 6-16, 16-23, 23-30, 30-100]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -70,7 +70,7 @@ jobs:
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
           range_end=${RANGE#*-}
-          python3 run_suite.py --suite minimal --range-begin ${range_begin} --range-end ${range_end}
+          python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
 
   unit-test-backend-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -81,7 +81,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -92,7 +92,7 @@ jobs:
           python3 test_data_parallelism.py
 
       - name: Evaluate MLA accuracy (TP=2)
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_mla.py
@@ -120,7 +120,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -157,7 +157,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -188,7 +188,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -219,7 +219,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -243,7 +243,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu121/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 

@@ -1,11 +1,7 @@
-from .custom_reduce_cuda import all_reduce as _all_reduce
-from .custom_reduce_cuda import dispose as _dispose
-from .custom_reduce_cuda import init_custom_ar as _init_custom_ar
-from .warp_reduce_cuda import reduce as _reduce
-
-
-def warp_reduce(input_tensor):
-    return _reduce(input_tensor)
+from sgl_kernel.ops._kernels import all_reduce as _all_reduce
+from sgl_kernel.ops._kernels import dispose as _dispose
+from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
+from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
 
 
 def init_custom_reduce(rank_id, num_devices, buffers, barrier_in, barrier_out):
@@ -18,3 +14,25 @@ def custom_dispose(fa):
 
 def custom_reduce(fa, inp, out):
     _all_reduce(fa, inp, out)
+
+
+def moe_align_block_size(
+    topk_ids,
+    num_experts,
+    block_size,
+    sorted_token_ids,
+    experts_ids,
+    num_tokens_post_pad,
+    token_cnts_buffer,
+    cumsum_buffer,
+):
+    _moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        experts_ids,
+        num_tokens_post_pad,
+        token_cnts_buffer,
+        cumsum_buffer,
+    )
