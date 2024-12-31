@@ -58,7 +58,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         self.assertEqual(outputs, expect_output)
 
         if _DEBUG_EXTRA:
-            time.sleep(5)
+            time.sleep(4)
 
         engine.shutdown()
 
