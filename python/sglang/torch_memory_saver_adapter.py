@@ -12,7 +12,9 @@ except ImportError:
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
     def create(enable: bool):
-        return _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
+        return (
+            _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
+        )
 
     def configure_subprocess(self):
         raise NotImplementedError

@@ -337,7 +337,9 @@ class Scheduler:
         t.start()
         self.parent_process = psutil.Process().parent()
 
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=server_args.memory_saver)
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.memory_saver
+        )
 
         # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":

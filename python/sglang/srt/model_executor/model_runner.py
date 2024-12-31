@@ -153,7 +153,9 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=self.server_args.memory_saver)
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.memory_saver
+        )
 
         # Load the model
         self.sampler = Sampler()

@@ -12,6 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -36,8 +37,14 @@ logger = logging.getLogger(__name__)
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
-    def __init__(self, size: int, max_context_len: int, device: str, use_records: bool,
-                 memory_saver_adapter: TorchMemorySaverAdapter):
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        use_records: bool,
+        memory_saver_adapter: TorchMemorySaverAdapter,
+    ):
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
