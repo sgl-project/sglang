@@ -31,6 +31,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
+from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
@@ -276,6 +277,9 @@ class CudaGraphRunner:
                     self.graphs[bs] = graph
                     self.output_buffers[bs] = output_buffers
 
+                # Save gemlite cache after each capture
+                save_gemlite_cache()
+
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
@@ -392,34 +396,7 @@ class CudaGraphRunner:
         self.graphs[bs].replay()
         next_token_logits = self.output_buffers[bs][:raw_bs]
 
-        # Extract logprobs
-        if forward_batch.return_logprob:
-            logits_metadata = LogitsMetadata(
-                forward_mode=ForwardMode.DECODE,
-                top_logprobs_nums=forward_batch.top_logprobs_nums,
-            )
-            next_token_logprobs = (
-                LogitsProcessor.compute_temp_top_p_normalized_logprobs(
-                    next_token_logits, logits_metadata
-                )
-            )
-            logits_output = LogitsProcessorOutput(
-                next_token_logits=next_token_logits,
-                next_token_logprobs=next_token_logprobs,
-            )
-            return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
-            if return_top_logprob:
-                (
-                    logits_output.output_top_logprobs_val,
-                    logits_output.output_top_logprobs_idx,
-                ) = LogitsProcessor.get_top_logprobs(
-                    next_token_logprobs, logits_metadata
-                )[
-                    2:4
-                ]
-        else:
-            logits_output = LogitsProcessorOutput(
-                next_token_logits=next_token_logits,
-            )
-
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=next_token_logits,
+        )
         return logits_output

@@ -39,10 +39,9 @@ The `sampling_params` follows this format
 ```python
 # The maximum number of output tokens
 max_new_tokens: int = 128,
-# Stop when hitting any of the strings in this list.
+# Stop when hitting any of the strings in this list
 stop: Optional[Union[str, List[str]]] = None,
-# Stop when hitting any of the token_ids in this list. Could be useful when mixed with
-# `min_new_tokens`.
+# Stop when hitting any of the token_ids in this list
 stop_token_ids: Optional[List[int]] = [],
 # Sampling temperature
 temperature: float = 1.0,
@@ -52,26 +51,26 @@ top_p: float = 1.0,
 top_k: int = -1,
 # Min-p sampling
 min_p: float = 0.0,
-# Whether to ignore EOS token.
+# Whether to ignore EOS token
 ignore_eos: bool = False,
-# Whether to skip the special tokens during detokenization.
+# Whether to skip the special tokens during detokenization
 skip_special_tokens: bool = True,
-# Whether to add spaces between special tokens during detokenization.
+# Whether to add spaces between special tokens during detokenization
 spaces_between_special_tokens: bool = True,
 # Do parallel sampling and return `n` outputs.
 n: int = 1,
 
 ## Structured Outputs
-# Only one of the below three can be set at a time:
+# Only one of the below three can be set for a request.
 
-# Constrains the output to follow a given regular expression.
-regex: Optional[str] = None,
-# Constrains the output to follow a given JSON schema.
+# Constrain the output to follow a given JSON schema.
 json_schema: Optional[str] = None,
-# Constrains the output to follow a given EBNF Grammar.
+# Constrain the output to follow a given regular expression.
+regex: Optional[str] = None,
+# Constrain the output to follow a given EBNF grammar.
 ebnf: Optional[str] = None,
 
-## Penalties. See [Performance Implications on Penalties] section below for more informations.
+## Penalties.
 
 # Float that penalizes new tokens based on their frequency in the generated text so far.
 # Values > 0 encourage the model to use new tokens, while values < 0 encourage the model to
@@ -185,17 +184,15 @@ The `image_data` can be a file name, a URL, or a base64 encoded string. See also
 Streaming is supported in a similar manner as [above](#streaming).
 
 ### Structured Outputs (JSON, Regex, EBNF)
-You can specify a JSON schema, Regular Expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints.
+You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request.
 
 SGLang supports two grammar backends:
 
-- [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and Regular Expression constraints.
+- [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and regular expression constraints.
 - [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema and EBNF constraints.
   - XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md)
 
-> 🔔 Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified at a time.
-
-Initialise xgrammar backend using `--grammar-backend xgrammar` flag
+Initialize the XGrammar backend using `--grammar-backend xgrammar` flag
 ```bash
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
 --port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: outlines)
