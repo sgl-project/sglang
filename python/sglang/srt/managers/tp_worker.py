@@ -173,7 +173,6 @@ class TpModelWorker:
             next_token_ids = None
         else:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        model_worker_batch.spec_info = forward_batch.spec_info
         return logits_output, next_token_ids
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
