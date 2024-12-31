@@ -58,6 +58,11 @@ def update_wheel_platform_tag():
     old_wheel.rename(new_wheel)
 
 
+cutlass = root / "3rdparty" / "cutlass"
+include_dirs = [
+    cutlass.resolve() / "include",
+    cutlass.resolve() / "tools" / "util" / "include",
+]
 nvcc_flags = [
     "-O3",
     "-Xcompiler",
@@ -82,6 +87,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
+        include_dirs=include_dirs,
         extra_compile_args={
             "nvcc": nvcc_flags,
             "cxx": cxx_flags,
