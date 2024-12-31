@@ -1,13 +1,13 @@
 import time
 import unittest
 
+import sglang as sgl
+import torch
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from transformers import AutoModelForCausalLM
 
-import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
-_DEBUG_EXTRA = False
+_DEBUG_EXTRA = True
 
 
 class TestReleaseGPUOccupation(unittest.TestCase):
@@ -34,6 +34,9 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         if _DEBUG_EXTRA:
             time.sleep(3)
 
+        self.assertEqual(_try_allocate_big_tensor(), False,
+                         'Should not be able to allocate big tensors before releasing')
+
         print("release_gpu_occupation start")
         t = time.time()
         engine.release_gpu_occupation()
@@ -43,11 +46,20 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         if _DEBUG_EXTRA:
             time.sleep(5)
 
+        self.assertEqual(_try_allocate_big_tensor(), True,
+                         'Should be able to allocate big tensors aftre releasing')
+
+        if _DEBUG_EXTRA:
+            time.sleep(5)
+
         print("resume_gpu_occupation start")
         t = time.time()
         engine.resume_gpu_occupation()
         if _DEBUG_EXTRA:
             print("resume_gpu_occupation", time.time() - t)
+
+        self.assertEqual(_try_allocate_big_tensor(), False,
+                         'Should not be able to allocate big tensors after resuming')
 
         print("update_weights_from_tensor")
         # As if: PPO has updated hf model's weights, and now we sync it to SGLang
@@ -62,6 +74,14 @@ class TestReleaseGPUOccupation(unittest.TestCase):
             time.sleep(4)
 
         engine.shutdown()
+
+
+def _try_allocate_big_tensor(size: int = 20_000_000_000):
+    try:
+        torch.empty((size,), dtype=torch.uint8, device='cuda')
+        return True
+    except torch.cuda.OutOfMemoryError:
+        return False
 
 
 if __name__ == "__main__":
