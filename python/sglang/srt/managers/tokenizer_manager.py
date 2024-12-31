@@ -716,7 +716,7 @@ class TokenizerManager:
                                 time.time() - state.created_time
                             )
                             # Compute time_per_output_token for the non-streaming case
-                            if not recv_obj.stream and completion_tokens >= 1:
+                            if not state.obj.stream and completion_tokens >= 1:
                                 self.metrics_collector.observe_time_per_output_token(
                                     (time.time() - state.created_time)
                                     / completion_tokens
