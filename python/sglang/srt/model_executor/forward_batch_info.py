@@ -86,6 +86,9 @@ class ForwardMode(IntEnum):
     def is_mixed(self):
         return self == ForwardMode.MIXED
 
+    def is_idle(self):
+        return self == ForwardMode.IDLE
+
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
@@ -95,26 +98,8 @@ class ForwardMode(IntEnum):
     def is_cuda_graph(self):
         return self == ForwardMode.DECODE or self == ForwardMode.TARGET_VERIFY
 
-    def is_idle(self):
-        return self == ForwardMode.IDLE
-
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
-
-
-class CaptureHiddenMode(IntEnum):
-    NULL = auto()
-    FULL = auto()
-    LAST = auto()
-
-    def need_capture(self):
-        return self != CaptureHiddenMode.NULL
-
-    def is_full(self):
-        return self == CaptureHiddenMode.FULL
-
-    def is_last(self):
-        return self == CaptureHiddenMode.LAST
 
 
 @dataclass
