@@ -96,7 +96,11 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DRAFT_EXTEND
 
     def is_cuda_graph(self):
-        return self == ForwardMode.DECODE or self == ForwardMode.TARGET_VERIFY
+        return (
+            self == ForwardMode.DECODE
+            or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.IDLE
+        )
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
