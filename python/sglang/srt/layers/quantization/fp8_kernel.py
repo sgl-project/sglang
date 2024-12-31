@@ -309,15 +309,14 @@ def w8a8_block_fp8_matmul(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_N must be divisable by block_size[0]
-        # BLOCK_SIZE_K must be divisable by block_size[1]
+        # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_size[0],
             "BLOCK_SIZE_K": block_size[1],
             "GROUP_SIZE_M": 32,
             "num_warps": 4,
-            "num_stages": 2,
+            "num_stages": 3,
         }
 
     def grid(META):

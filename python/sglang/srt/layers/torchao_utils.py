@@ -11,6 +11,22 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def get_gemlite_cache_path() -> str:
+    return f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
+
+
+def save_gemlite_cache(print_error: bool = False) -> bool:
+    try:
+        from gemlite.core import GemLiteLinearTriton
+
+        GemLiteLinearTriton.cache_config(get_gemlite_cache_path())
+    except Exception:
+        if print_error:
+            logger.error("Failed to save the GemLite cache.")
+        return False
+    return True
+
+
 def apply_torchao_config_to_model(
     model: torch.nn.Module, torchao_config: str, filter_fn=None
 ):
@@ -74,9 +90,7 @@ def apply_torchao_config_to_model(
         )
 
         # try to load gemlite kernel config
-        GemLiteLinearTriton.load_config(
-            f"/tmp/{pwd.getpwuid(os.getuid()).pw_gecos}_gemlite.json"
-        )
+        GemLiteLinearTriton.load_config(get_gemlite_cache_path())
 
     elif "fp8wo" in torchao_config:
         # this requires newer hardware

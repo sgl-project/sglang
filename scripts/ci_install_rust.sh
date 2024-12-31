@@ -1,3 +1,6 @@
+#!/bin/bash
+set -euxo pipefail
+
 # these are required for actix
 apt-get update
 apt-get install -y libssl-dev pkg-config
