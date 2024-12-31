@@ -58,36 +58,27 @@ def update_wheel_platform_tag():
     old_wheel.rename(new_wheel)
 
 
-nvcc_flags = [
-    "-O3",
-    "-Xcompiler",
-    "-fPIC",
-    "-gencode=arch=compute_75,code=sm_75",
-    "-gencode=arch=compute_80,code=sm_80",
-    "-gencode=arch=compute_89,code=sm_89",
-    "-gencode=arch=compute_90,code=sm_90",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF2_OPERATORS__",
+hipcc_flags = [
+    "-D__HIP_PLATFORM_AMD__=1",
+    "--amdgpu-target=gfx90a,gfx940,gfx941,gfx942",
 ]
-cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
 ext_modules = [
     CUDAExtension(
-        name="sgl_kernel.ops._kernels",
-        sources=[
-            "src/sgl-kernel/csrc/warp_reduce_kernel.cu",
-            "src/sgl-kernel/csrc/trt_reduce_internal.cu",
-            "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
+        "sgl_kernel.ops._kernels",
+        [
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
         extra_compile_args={
-            "nvcc": nvcc_flags,
-            "cxx": cxx_flags,
+            "nvcc": hipcc_flags
+            + [
+                "-O3",
+                "-fPIC",
+            ],
+            "cxx": ["-O3"],
         },
-        libraries=libraries,
-        extra_link_args=extra_link_args,
+        libraries=["hiprtc", "amdhip64", "c10", "torch", "torch_python"],
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
     ),
 ]
 

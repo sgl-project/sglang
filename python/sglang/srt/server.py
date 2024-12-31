@@ -578,8 +578,9 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
-    if "GLOO_SOCKET_IFNAME" not in os.environ:
-        os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+    # TODO(fix socket error with gpu backend)
+    # if "GLOO_SOCKET_IFNAME" not in os.environ:
+    #    os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
 
     # Set prometheus env vars
     if server_args.enable_metrics:
