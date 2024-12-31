@@ -51,7 +51,6 @@ from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
-from sglang.torch_memory_saver_adapter import TorchMemorySaver
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -1275,8 +1274,6 @@ def dataclass_to_string_truncated(data, max_length=2048):
     else:
         return str(data)
 
-
-primary_memory_saver = TorchMemorySaver()
 
 TOOLS_TAG_LIST = ["<|plugin|>", "<function=", "<tool_call>", "<|python_tag|>"]
 

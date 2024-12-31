@@ -34,7 +34,6 @@ from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
-from sglang import torch_memory_saver_adapter
 import aiohttp
 import orjson
 import requests

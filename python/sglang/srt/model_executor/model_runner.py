@@ -56,7 +56,6 @@ from sglang.srt.utils import (
     is_hip,
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
-    primary_memory_saver,
     set_cpu_offload_max_bytes,
 )
 

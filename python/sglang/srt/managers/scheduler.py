@@ -86,7 +86,6 @@ from sglang.srt.utils import (
     crash_on_warnings,
     get_bool_env_var,
     get_zmq_socket,
-    primary_memory_saver,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
