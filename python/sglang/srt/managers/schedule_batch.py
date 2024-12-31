@@ -46,10 +46,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
