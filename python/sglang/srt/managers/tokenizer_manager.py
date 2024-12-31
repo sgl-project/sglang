@@ -727,6 +727,7 @@ class TokenizerManager:
                             )
                         else:
                             if completion_tokens >= 2:
+                                # Compute time_per_output_token for the streaming case
                                 self.metrics_collector.observe_time_per_output_token(
                                     (time.time() - state.first_token_time)
                                     / (completion_tokens - 1)
@@ -742,7 +743,8 @@ class TokenizerManager:
                             self.metrics_collector.observe_e2e_request_latency(
                                 time.time() - state.created_time
                             )
-                            if completion_tokens >= 1:
+                            # Compute time_per_output_token for the non-streaming case
+                            if not state.obj.stream and completion_tokens >= 1:
                                 self.metrics_collector.observe_time_per_output_token(
                                     (time.time() - state.created_time)
                                     / completion_tokens
