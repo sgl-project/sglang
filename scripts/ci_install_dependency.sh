@@ -1,3 +1,6 @@
+#!/bin/bash
+set -euxo pipefail
+
 # Install the dependency in CI.
 
 # Use repo from environment variable, passed from GitHub Actions

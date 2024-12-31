@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euxo pipefail
 
 # This script is used for release.
 # It tags all remote branches starting with 'v' with the same name as the branch,
