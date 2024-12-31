@@ -146,7 +146,10 @@ class LogitsProcessor(nn.Module):
 
         # Compute logits
         last_logits = self._get_logits(last_hidden, lm_head)
-        if not logits_metadata.extend_return_logprob:
+        if (
+            not logits_metadata.extend_return_logprob
+            or logits_metadata.capture_hidden_mode.need_capture()
+        ):
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=last_logits,

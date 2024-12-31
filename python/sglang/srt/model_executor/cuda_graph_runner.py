@@ -375,9 +375,7 @@ class CudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
-        # In normal decoding case, raw_bs == raw_num_token
-        # But in speculative decoding, raw_num_token is raw_bs * self.num_tokens_per_bs
-        raw_num_token = forward_batch.input_ids.numel()
+        raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
         if self.enable_dp_attention:
