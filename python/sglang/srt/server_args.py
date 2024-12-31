@@ -112,17 +112,17 @@ class ServerArgs:
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
 
+    # Kernel backend
+    attention_backend: Optional[str] = None
+    sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
+
     # Speculative decoding
     speculative_draft_model_path: Optional[str] = None
     speculative_algorithm: Optional[str] = None
     speculative_num_steps: int = 5
     speculative_num_draft_tokens: int = 64
     speculative_eagle_topk: int = 8
-
-    # Kernel backend
-    attention_backend: Optional[str] = None
-    sampling_backend: Optional[str] = None
-    grammar_backend: Optional[str] = "outlines"
 
     # Double Sparsity
     enable_double_sparsity: bool = False
