@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import Sampler, get_top_logprobs
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -191,10 +191,9 @@ class ModelRunner:
         torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
-
-        # TODO(liangan1):Just use gloo to bypass the initilization fail
-        # Need to use xccl for xpu backend in the future
         elif self.device == "xpu":
+            # TODO(liangan1):Just use gloo to bypass the initilization fail
+            # Need to use xccl for xpu backend in the future
             backend = "gloo"
         elif self.device == "hpu":
             backend = "hccl"

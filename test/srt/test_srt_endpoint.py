@@ -227,7 +227,7 @@ class TestSRTEndpoint(unittest.TestCase):
                     "regex": "( Yes| No)",
                 },
                 "return_logprob": True,
-                "top_logprobs_num": 5,
+                "top_logprobs_num": 5,  # The grammar constraint allows all prefix tokens so we need to use a larger top_k.
                 "return_text_in_logprobs": True,
             },
         )
