@@ -25,14 +25,14 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.logits_processor import (
-    LogitsMetadata,
-    LogitsProcessor,
-    LogitsProcessorOutput,
-)
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
@@ -153,6 +153,10 @@ class CudaGraphRunner:
             if bs <= model_runner.req_to_token_pool.size
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
+
+        self.capture_forward_mode = ForwardMode.DECODE
+        self.num_tokens_per_bs = 1
+
         self.compile_bs = (
             [
                 bs
@@ -165,8 +169,8 @@ class CudaGraphRunner:
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
-
+        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -179,12 +183,13 @@ class CudaGraphRunner:
 
         # Common inputs
         with torch.device("cuda"):
-            self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int32)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
+            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
 
             if self.is_encoder_decoder:
@@ -229,6 +234,9 @@ class CudaGraphRunner:
             self.model_runner.model.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
+        if not forward_batch.forward_mode.is_cuda_graph():
+            return False
+
         if self.enable_dp_attention:
             min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
                 forward_batch.global_num_tokens
@@ -258,12 +266,12 @@ class CudaGraphRunner:
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
-            capture_bs = (
+            capture_range = (
                 tqdm.tqdm(self.capture_bs)
                 if get_tensor_model_parallel_rank() == 0
                 else self.capture_bs
             )
-            for bs in capture_bs:
+            for bs in capture_range:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
@@ -283,12 +291,15 @@ class CudaGraphRunner:
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
+        num_token = bs * self.num_tokens_per_bs
 
         # Common inputs
-        input_ids = self.input_ids[:bs]
+        input_ids = self.input_ids[:num_token]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
-        out_cache_loc = self.out_cache_loc[:bs]
+        out_cache_loc = self.out_cache_loc[:num_token]
+        positions = self.positions[:num_token]
+
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
         else:
@@ -304,37 +315,41 @@ class CudaGraphRunner:
             global_num_tokens = None
             gathered_buffer = None
 
+        forward_batch = ForwardBatch(
+            forward_mode=self.capture_forward_mode,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.model_runner.attn_backend,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens_sum,
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            top_logprobs_nums=[0] * num_token,
+            positions=positions,
+            global_num_tokens=global_num_tokens,
+            mrope_positions=mrope_positions,
+            gathered_buffer=gathered_buffer,
+        )
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
+            num_token,
             req_pool_indices,
             seq_lens,
             encoder_lens,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
         )
 
         # Run and capture
         def run_once():
-            forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.DECODE,
-                batch_size=bs,
-                input_ids=input_ids,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                req_to_token_pool=self.model_runner.req_to_token_pool,
-                token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=out_cache_loc,
-                seq_lens_sum=seq_lens_sum,
-                encoder_lens=encoder_lens,
-                return_logprob=False,
-                top_logprobs_nums=[0] * bs,
-                positions=clamp_position(seq_lens),
-                mrope_positions=mrope_positions,
-                global_num_tokens=global_num_tokens,
-                gathered_buffer=gathered_buffer,
-            )
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
-            return logits_output.next_token_logits
+            return logits_output.next_token_logits, logits_output.hidden_states
 
         for _ in range(2):
             torch.cuda.synchronize()
@@ -360,6 +375,9 @@ class CudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
+        # In normal decoding case, raw_bs == raw_num_token
+        # But in speculative decoding, raw_num_token is raw_bs * self.num_tokens_per_bs
+        raw_num_token = forward_batch.input_ids.numel()
 
         # Pad
         if self.enable_dp_attention:
@@ -374,10 +392,13 @@ class CudaGraphRunner:
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:raw_bs].copy_(forward_batch.input_ids)
+        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
+        self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+        positions = clamp_position(forward_batch.seq_lens)
+        self.positions[:raw_num_token].copy_(positions)
+
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
@@ -390,13 +411,18 @@ class CudaGraphRunner:
             self.seq_lens,
             forward_batch.seq_lens_sum + (bs - raw_bs),
             self.encoder_lens,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
         )
 
         # Replay
         self.graphs[bs].replay()
-        next_token_logits = self.output_buffers[bs][:raw_bs]
+        next_token_logits, hidden_states = self.output_buffers[bs]
 
         logits_output = LogitsProcessorOutput(
-            next_token_logits=next_token_logits,
+            next_token_logits=next_token_logits[:raw_num_token],
+            hidden_states=(
+                hidden_states[:raw_num_token] if hidden_states is not None else None
+            ),
         )
         return logits_output
