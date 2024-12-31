@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-from typing import List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -46,6 +46,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.spec_info import SpecInfo
+
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -565,8 +570,12 @@ class ScheduleBatch:
     # Has grammar
     has_grammar: bool = False
 
-    # device
+    # Device
     device: str = "cuda"
+
+    # Speculative decoding
+    spec_info: Optional[SpecInfo] = None
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
 
     @classmethod
     def init_new(
@@ -577,6 +586,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        speculative_algorithm: Optional[SpeculativeAlgorithm] = None,
     ):
         return cls(
             reqs=reqs,
@@ -589,6 +599,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
+            spec_algorithm=speculative_algorithm,
         )
 
     def batch_size(self):
@@ -1103,6 +1114,9 @@ class ScheduleBatch:
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
 
+        if self.spec_info:
+            self.spec_info.merge_batch(other.spec_info)
+
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode() or self.forward_mode.is_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
@@ -1144,6 +1158,8 @@ class ScheduleBatch:
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
         )
 
     def copy(self):
@@ -1213,6 +1229,10 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
+
+    # Speculative decoding
+    spec_info: Optional[SpecInfo] = None
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
 
 
 @triton.jit
