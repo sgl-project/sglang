@@ -109,6 +109,17 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
 
+    # LoRA
+    lora_paths: Optional[List[str]] = None
+    max_loras_per_batch: int = 8
+
+    # Speculative decoding
+    speculative_draft_model_path: Optional[str] = None
+    speculative_algorithm: Optional[str] = None
+    speculative_num_steps: Optional[int] = None
+    speculative_num_draft_tokens: Optional[int] = None
+    speculative_eagle_topk: Optional[int] = None
+
     # Double Sparsity
     enable_double_sparsity: bool = False
     ds_channel_config_path: str = None
@@ -116,10 +127,6 @@ class ServerArgs:
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
-
-    # LoRA
-    lora_paths: Optional[List[str]] = None
-    max_loras_per_batch: int = 8
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -148,15 +155,6 @@ class ServerArgs:
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
-
-    # speculative decoding
-    speculative_draft_model_path: Optional[str] = None
-    speculative_algorithm: Optional[str] = None
-    speculative_num_steps: Optional[int] = None
-    # should been set as 2^n
-    speculative_num_draft_tokens: Optional[int] = None
-    # should been set as [1, 2, 4, 8]
-    speculative_eagle_topk: Optional[int] = None
 
     def __post_init__(self):
         # Set missing default values
@@ -258,8 +256,9 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             self.chunked_prefill_size = -1
             logger.info(
-                "The radix cache, chunked_prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
+                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
             )
+
         # GGUF
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -623,43 +622,6 @@ class ServerArgs:
             default=ServerArgs.json_model_override_args,
         )
 
-        # Double Sparsity
-        parser.add_argument(
-            "--enable-double-sparsity",
-            action="store_true",
-            help="Enable double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-channel-config-path",
-            type=str,
-            default=ServerArgs.ds_channel_config_path,
-            help="The path of the double sparsity channel config",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-num",
-            type=int,
-            default=ServerArgs.ds_heavy_channel_num,
-            help="The number of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-token-num",
-            type=int,
-            default=ServerArgs.ds_heavy_token_num,
-            help="The number of heavy tokens in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-type",
-            type=str,
-            default=ServerArgs.ds_heavy_channel_type,
-            help="The type of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-sparse-decode-threshold",
-            type=int,
-            default=ServerArgs.ds_sparse_decode_threshold,
-            help="The type of heavy channels in double sparsity attention",
-        )
-
         # LoRA
         parser.add_argument(
             "--lora-paths",
@@ -734,6 +696,43 @@ class ServerArgs:
             required=False,
             choices=[1, 2, 4, 8],
             default=8,
+        )
+
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-channel-config-path",
+            type=str,
+            default=ServerArgs.ds_channel_config_path,
+            help="The path of the double sparsity channel config",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-num",
+            type=int,
+            default=ServerArgs.ds_heavy_channel_num,
+            help="The number of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-token-num",
+            type=int,
+            default=ServerArgs.ds_heavy_token_num,
+            help="The number of heavy tokens in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-type",
+            type=str,
+            default=ServerArgs.ds_heavy_channel_type,
+            help="The type of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-sparse-decode-threshold",
+            type=int,
+            default=ServerArgs.ds_sparse_decode_threshold,
+            help="The type of heavy channels in double sparsity attention",
         )
 
         # Optimization/debug options
