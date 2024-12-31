@@ -25,9 +25,9 @@
 
 namespace trt_llm {
 constexpr size_t WARP_SIZE = 32;
-constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
+constexpr size_t MAX_ALL_REDUCE_BLOCKS = 36;
 constexpr size_t MAX_RANKS_PER_NODE = 8;
-constexpr size_t DEFAULT_BLOCK_SIZE = 1024;
+constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 
 enum class AllReduceStrategyType : int8_t {
   RING = 0,
