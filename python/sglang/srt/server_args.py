@@ -113,12 +113,17 @@ class ServerArgs:
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
 
+    # Kernel backend
+    attention_backend: Optional[str] = None
+    sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
+
     # Speculative decoding
     speculative_draft_model_path: Optional[str] = None
     speculative_algorithm: Optional[str] = None
-    speculative_num_steps: Optional[int] = None
-    speculative_num_draft_tokens: Optional[int] = None
-    speculative_eagle_topk: Optional[int] = None
+    speculative_num_steps: int = 5
+    speculative_num_draft_tokens: int = 64
+    speculative_eagle_topk: int = 8
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -127,11 +132,6 @@ class ServerArgs:
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
-
-    # Kernel backend
-    attention_backend: Optional[str] = None
-    sampling_backend: Optional[str] = None
-    grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -667,35 +667,30 @@ class ServerArgs:
             type=str,
             choices=["EAGLE"],
             help="Speculative algorithm.",
-            required=False,
         )
         parser.add_argument(
             "--speculative-draft-model-path",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
-            required=False,
         )
         parser.add_argument(
             "--speculative-num-steps",
             type=int,
             help="The number of steps sampled from draft model in Speculative Decoding.",
-            required=False,
-            default=5,
+            default=ServerArgs.speculative_num_steps,
         )
         parser.add_argument(
             "--speculative-num-draft-tokens",
             type=int,
             help="The number of token sampled from draft model in Speculative Decoding.",
-            required=False,
-            default=64,
+            default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
             help="The number of token sampled from draft model in eagle2 each step.",
-            required=False,
             choices=[1, 2, 4, 8],
-            default=8,
+            default=ServerArgs.speculative_eagle_topk,
         )
 
         # Double Sparsity

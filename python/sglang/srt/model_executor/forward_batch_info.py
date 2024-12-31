@@ -96,7 +96,11 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DRAFT_EXTEND
 
     def is_cuda_graph(self):
-        return self == ForwardMode.DECODE or self == ForwardMode.TARGET_VERIFY
+        return (
+            self == ForwardMode.DECODE
+            or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.IDLE
+        )
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
@@ -161,14 +165,14 @@ class ForwardBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
 
-    # Speculative decoding
-    spec_info: SpecInfo = None
-    spec_algorithm: SpeculativeAlgorithm = None
-
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+
+    # Speculative decoding
+    spec_info: SpecInfo = None
+    spec_algorithm: SpeculativeAlgorithm = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None

@@ -53,6 +53,10 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
+if TYPE_CHECKING:
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
+
+
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 # Put some global args for easy access
@@ -1117,7 +1121,7 @@ class ScheduleBatch:
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
 
-        if self.spec_info is not None:
+        if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(self):
@@ -1163,6 +1167,8 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             input_embeds=self.input_embeds,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
         )
 
     def copy(self):
