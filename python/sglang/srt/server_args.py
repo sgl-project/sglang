@@ -108,6 +108,22 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
 
+    # LoRA
+    lora_paths: Optional[List[str]] = None
+    max_loras_per_batch: int = 8
+
+    # Speculative decoding
+    speculative_draft_model_path: Optional[str] = None
+    speculative_algorithm: Optional[str] = None
+    speculative_num_steps: int = 5
+    speculative_num_draft_tokens: int = 64
+    speculative_eagle_topk: int = 8
+
+    # Kernel backend
+    attention_backend: Optional[str] = None
+    sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
+
     # Double Sparsity
     enable_double_sparsity: bool = False
     ds_channel_config_path: str = None
@@ -115,15 +131,6 @@ class ServerArgs:
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
-
-    # LoRA
-    lora_paths: Optional[List[str]] = None
-    max_loras_per_batch: int = 8
-
-    # Kernel backend
-    attention_backend: Optional[str] = None
-    sampling_backend: Optional[str] = None
-    grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -602,43 +609,6 @@ class ServerArgs:
             default=ServerArgs.json_model_override_args,
         )
 
-        # Double Sparsity
-        parser.add_argument(
-            "--enable-double-sparsity",
-            action="store_true",
-            help="Enable double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-channel-config-path",
-            type=str,
-            default=ServerArgs.ds_channel_config_path,
-            help="The path of the double sparsity channel config",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-num",
-            type=int,
-            default=ServerArgs.ds_heavy_channel_num,
-            help="The number of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-token-num",
-            type=int,
-            default=ServerArgs.ds_heavy_token_num,
-            help="The number of heavy tokens in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-type",
-            type=str,
-            default=ServerArgs.ds_heavy_channel_type,
-            help="The type of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-sparse-decode-threshold",
-            type=int,
-            default=ServerArgs.ds_sparse_decode_threshold,
-            help="The type of heavy channels in double sparsity attention",
-        )
-
         # LoRA
         parser.add_argument(
             "--lora-paths",
@@ -676,6 +646,75 @@ class ServerArgs:
             choices=["xgrammar", "outlines"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
+        )
+
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE"],
+            help="Speculative algorithm.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of token sampled from draft model in eagle2 each step.",
+            choices=[1, 2, 4, 8],
+            default=ServerArgs.speculative_eagle_topk,
+        )
+
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-channel-config-path",
+            type=str,
+            default=ServerArgs.ds_channel_config_path,
+            help="The path of the double sparsity channel config",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-num",
+            type=int,
+            default=ServerArgs.ds_heavy_channel_num,
+            help="The number of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-token-num",
+            type=int,
+            default=ServerArgs.ds_heavy_token_num,
+            help="The number of heavy tokens in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-type",
+            type=str,
+            default=ServerArgs.ds_heavy_channel_type,
+            help="The type of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-sparse-decode-threshold",
+            type=int,
+            default=ServerArgs.ds_sparse_decode_threshold,
+            help="The type of heavy channels in double sparsity attention",
         )
 
         # Optimization/debug options

@@ -161,14 +161,14 @@ class ForwardBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
 
-    # Speculative decoding
-    spec_info: SpecInfo = None
-    spec_algorithm: SpeculativeAlgorithm = None
-
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+
+    # Speculative decoding
+    spec_info: SpecInfo = None
+    spec_algorithm: SpeculativeAlgorithm = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -258,6 +258,8 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
+            spec_algorithm=batch.spec_algorithm,
+            spec_info=batch.spec_info,
             input_embeds=batch.input_embeds,
         )
 
