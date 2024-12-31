@@ -51,7 +51,7 @@ from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
-from torch_memory_saver import TorchMemorySaver
+from sglang.torch_memory_saver_adapter import TorchMemorySaver
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,

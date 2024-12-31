@@ -32,10 +32,10 @@ from typing import AsyncIterator, Dict, List, Optional, Union
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+from sglang import torch_memory_saver_adapter
 import aiohttp
 import orjson
 import requests
-import torch_memory_saver
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -474,7 +474,7 @@ def launch_engine(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
             )
-            with torch_memory_saver.configure_subprocess():
+            with torch_memory_saver_adapter.configure_subprocess():
                 proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
@@ -492,7 +492,7 @@ def launch_engine(
             target=run_data_parallel_controller_process,
             args=(server_args, port_args, writer),
         )
-        with torch_memory_saver.configure_subprocess():
+        with torch_memory_saver_adapter.configure_subprocess():
             proc.start()
 
     # Launch detokenizer process
