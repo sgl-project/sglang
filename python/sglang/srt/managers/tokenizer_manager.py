@@ -303,7 +303,9 @@ class TokenizerManager:
         event = asyncio.Event()
         state = ReqState([], False, event, obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
-        self.send_to_scheduler.send_pyobj(tokenized_obj) # move send_to_scheduler after rid_to_state update
+        self.send_to_scheduler.send_pyobj(
+            tokenized_obj
+        )
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -348,9 +350,10 @@ class TokenizerManager:
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                # self.send_to_scheduler.send_pyobj(tokenized_obj)
                 generators.append(
-                    self._wait_one_response(tmp_obj, tokenized_obj, request, created_time)
+                    self._wait_one_response(
+                        tmp_obj, tokenized_obj, request, created_time
+                    )
                 )
                 rids.append(tmp_obj.rid)
         else:
@@ -387,9 +390,10 @@ class TokenizerManager:
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    # self.send_to_scheduler.send_pyobj(tokenized_obj)
                     generators.append(
-                        self._wait_one_response(tmp_obj, tokenized_obj, request, created_time)
+                        self._wait_one_response(
+                            tmp_obj, tokenized_obj, request, created_time
+                        )
                     )
                     rids.append(tmp_obj.rid)
 
