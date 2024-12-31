@@ -153,6 +153,8 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=self.server_args.memory_saver)
+
         # Load the model
         self.sampler = Sampler()
         self.load_model()
@@ -255,7 +257,7 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         # Load the model
-        with primary_memory_saver.region():
+        with self.memory_saver_adapter.region():
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -533,14 +535,12 @@ class ModelRunner:
                 4096,
             )
 
-        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=self.server_args.memory_saver)
-
         self.req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
             use_records=False,
-            memory_saver_adapter=memory_saver_adapter,
+            memory_saver_adapter=self.memory_saver_adapter,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -553,7 +553,7 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
-                memory_saver_adapter=memory_saver_adapter,
+                memory_saver_adapter=self.memory_saver_adapter,
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
@@ -564,7 +564,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
-                memory_saver_adapter=memory_saver_adapter,
+                memory_saver_adapter=self.memory_saver_adapter,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -574,7 +574,7 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
-                memory_saver_adapter=memory_saver_adapter,
+                memory_saver_adapter=self.memory_saver_adapter,
             )
         logger.info(
             f"Memory pool end. "
