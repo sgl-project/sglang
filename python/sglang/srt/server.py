@@ -35,13 +35,13 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import aiohttp
 import orjson
 import requests
+import torch_memory_saver
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from uvicorn.config import LOGGING_CONFIG
-import torch_memory_saver
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -171,7 +171,7 @@ async def flush_cache():
     tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-                "(When there are running or waiting requests, the operation will not be performed.)\n",
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -769,7 +769,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -819,7 +819,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
