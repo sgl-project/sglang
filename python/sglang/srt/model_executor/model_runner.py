@@ -58,6 +58,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -532,11 +533,14 @@ class ModelRunner:
                 4096,
             )
 
+        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=self.server_args.memory_saver)
+
         self.req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
             use_records=False,
+            memory_saver_adapter=memory_saver_adapter,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -549,6 +553,7 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+                memory_saver_adapter=memory_saver_adapter,
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
@@ -559,6 +564,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
+                memory_saver_adapter=memory_saver_adapter,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -568,6 +574,7 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+                memory_saver_adapter=memory_saver_adapter,
             )
         logger.info(
             f"Memory pool end. "

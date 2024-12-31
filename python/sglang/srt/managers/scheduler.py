@@ -90,6 +90,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -335,6 +336,8 @@ class Scheduler:
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
+
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=server_args.memory_saver)
 
         # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
@@ -1511,11 +1514,11 @@ class Scheduler:
         self.stashed_model_static_state = (
             self.tp_worker.worker.model_runner.model.export_static_state()
         )
-        primary_memory_saver.pause()
+        self.memory_saver_adapter.pause()
         self.flush_cache()
 
     def resume_gpu_occupation(self):
-        primary_memory_saver.resume()
+        self.memory_saver_adapter.resume()
         self.tp_worker.worker.model_runner.model.import_static_state(
             self.stashed_model_static_state
         )

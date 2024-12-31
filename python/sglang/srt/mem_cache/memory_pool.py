@@ -12,6 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
 Memory pool.
@@ -35,11 +36,12 @@ logger = logging.getLogger(__name__)
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
-    def __init__(self, size: int, max_context_len: int, device: str, use_records: bool):
+    def __init__(self, size: int, max_context_len: int, device: str, use_records: bool,
+                 memory_saver_adapter: TorchMemorySaverAdapter):
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with primary_memory_saver.region():
+        with memory_saver_adapter.region():
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -183,15 +185,17 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         head_dim: int,
         layer_num: int,
         device: str,
+        memory_saver_adapter: TorchMemorySaverAdapter,
     ):
         super().__init__(size, dtype, device)
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
+        self.memory_saver_adapter = memory_saver_adapter
         self._create_buffers()
 
     def _create_buffers(self):
-        with primary_memory_saver.region():
+        with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
@@ -264,12 +268,13 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         qk_rope_head_dim: int,
         layer_num: int,
         device: str,
+        memory_saver_adapter: TorchMemorySaverAdapter,
     ):
         super().__init__(size, dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
 
-        with primary_memory_saver.region():
+        with memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
                 torch.empty(
@@ -319,10 +324,11 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         layer_num: int,
         device: str,
         heavy_channel_num: int,
+        memory_saver_adapter: TorchMemorySaverAdapter,
     ):
         super().__init__(size, dtype, device)
 
-        with primary_memory_saver.region():
+        with memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
                 torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
