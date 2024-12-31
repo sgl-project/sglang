@@ -56,7 +56,7 @@ The core features include:
    references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
    references/custom_chat_template.md
-   references/contributor_guide.md
+   references/contribution_guide.md
    references/troubleshooting.md
    references/faq.md
    references/learn_more.md
