@@ -155,6 +155,7 @@ class CudaGraphRunner:
         ]
 
         self.capture_forward_mode = ForwardMode.DECODE
+        self.num_tokens_per_bs = 1
         if model_runner.server_args.speculative_algorithm == "EAGLE":
             if self.model_runner.is_draft_runner:
                 self.num_tokens_per_bs = (
@@ -165,8 +166,6 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
-        else:
-            self.num_tokens_per_bs = 1
 
         self.compile_bs = (
             [
@@ -474,12 +473,11 @@ class CudaGraphRunner:
         # Replay
         self.graphs[bs].replay()
         next_token_logits, hidden_states = self.output_buffers[bs]
-        next_token_logits = next_token_logits[:raw_num_token]
-        if hidden_states is not None:
-            hidden_states = hidden_states[:raw_num_token]
 
         logits_output = LogitsProcessorOutput(
-            next_token_logits=next_token_logits,
-            hidden_states=hidden_states,
+            next_token_logits=next_token_logits[:raw_num_token],
+            hidden_states=(
+                hidden_states[:raw_num_token] if hidden_states is not None else None
+            ),
         )
         return logits_output
