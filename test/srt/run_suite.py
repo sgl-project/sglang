@@ -5,7 +5,6 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "per-commit": [
-        "test_eagle_infer.py",
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
@@ -14,6 +13,7 @@ suites = {
         "test_abort.py",
         "test_chunked_prefill.py",
         "test_double_sparsity.py",
+        "test_eagle_infer.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
         "test_get_weights_by_name.py",

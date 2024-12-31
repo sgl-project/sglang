@@ -403,7 +403,9 @@ class CudaGraphRunner:
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
+
             run_once()
+
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
 

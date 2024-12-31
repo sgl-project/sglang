@@ -1,19 +1,6 @@
-"""
-Usage:
-python3 -m unittest test_srt_engine.TestSRTEngine.test_3_sync_streaming_combination
-"""
-
-import asyncio
-import gc
-import json
 import unittest
-from types import SimpleNamespace
-
-import torch
 
 import sglang as sgl
-from sglang.bench_offline_throughput import BenchArgs, throughput_test
-from sglang.srt.server_args import ServerArgs
 
 
 class TestEAGLEEngine(unittest.TestCase):
