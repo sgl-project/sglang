@@ -29,6 +29,8 @@ import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -458,6 +460,8 @@ def launch_engine(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    memory_saver_adapter = TorchMemorySaverAdapter.create(enable=server_args.memory_saver)
+
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
@@ -474,7 +478,7 @@ def launch_engine(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
             )
-            with torch_memory_saver_adapter.configure_subprocess():
+            with memory_saver_adapter.configure_subprocess():
                 proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
@@ -492,7 +496,7 @@ def launch_engine(
             target=run_data_parallel_controller_process,
             args=(server_args, port_args, writer),
         )
-        with torch_memory_saver_adapter.configure_subprocess():
+        with memory_saver_adapter.configure_subprocess():
             proc.start()
 
     # Launch detokenizer process
