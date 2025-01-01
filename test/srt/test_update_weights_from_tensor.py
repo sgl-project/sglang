@@ -1,8 +1,9 @@
 import time
 import unittest
 
-import sglang as sgl
 import torch
+
+import sglang as sgl
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
@@ -12,13 +13,15 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
 
         param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
 
-        _check_param(engine, param_names[0], [-0.0140, -0.0176, 0.0093, -0.0105, 0.0015])
+        _check_param(
+            engine, param_names[0], [-0.0140, -0.0176, 0.0093, -0.0105, 0.0015]
+        )
 
         new_tensor = torch.full((28672, 4096), 1.5)
 
         time_start = time.time()
         engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
-        print(f'Time delta: {time.time() - time_start:.03f}')
+        print(f"Time delta: {time.time() - time_start:.03f}")
 
         for param_name in param_names[:3]:
             _check_param(engine, param_name, [1.5] * 5)

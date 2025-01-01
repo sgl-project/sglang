@@ -17,10 +17,17 @@ import gc
 import json
 import logging
 import time
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from vllm.distributed import (
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+    set_custom_all_reduce,
+)
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -50,12 +57,6 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
-)
-from vllm.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-    set_custom_all_reduce,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,7 +147,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -617,7 +618,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
