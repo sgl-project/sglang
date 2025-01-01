@@ -341,6 +341,14 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
+class ToolCallItem(BaseModel):
+    """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
+
+    tool_index: int
+    name: str
+    parameters: str  # JSON string
+
+
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
@@ -367,6 +375,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    function_call: Optional[FunctionResponse] = None
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
