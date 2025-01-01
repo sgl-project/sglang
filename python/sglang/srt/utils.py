@@ -1342,8 +1342,11 @@ class MultiprocessingSerializer:
     def serialize(obj):
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
-        return buf.read()
+        buf.seek(0)
+        ans = buf.read()
+        print(f'{obj=} {ans=}')
+        return ans
 
     @staticmethod
-    def deserialize(obj):
-        return ForkingPickler.loads(obj)
+    def deserialize(data):
+        return ForkingPickler.loads(data)
