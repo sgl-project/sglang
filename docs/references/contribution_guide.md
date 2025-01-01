@@ -2,9 +2,9 @@
 
 Welcome to **SGLang**! We appreciate your interest in contributing. This guide provides a concise overview of how to set up your environment, run tests, build documentation, and open a Pull Request (PR). Whether you’re fixing a small bug or developing a major feature, we encourage following these steps for a smooth contribution process.
 
-## 1. Setting Up & Building from Source
+## Setting Up & Building from Source
 
-### 1.1 Fork and Clone the Repository
+### Fork and Clone the Repository
 
 **Note**: SGLang does **not** accept PRs on the main repo. Please fork the repository under your GitHub account, then clone your fork locally.
 
@@ -13,7 +13,7 @@ git clone https://github.com/<your_user_name>/sglang.git
 cd sglang
 ```
 
-### 1.2 Install Dependencies & Build
+### Install Dependencies & Build
 
 Refer to [Install SGLang](https://sgl-project.github.io/start/install.html) documentation for more details on setting up the necessary dependencies.
 
@@ -32,7 +32,7 @@ cd sglang/python
 pip install .
 ```
 
-## 2. Code Formatting with Pre-Commit
+## Code Formatting with Pre-Commit
 
 We use [pre-commit](https://pre-commit.com/) to maintain consistent code style checks. Before pushing your changes, please run:
 
@@ -45,11 +45,11 @@ pre-commit run --all-files
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
 - **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
 
-## 3. Writing Documentation & Running Docs CI
+## Writing Documentation & Running Docs CI
 
 Most documentation files are located under the `docs/` folder. We prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline.
 
-### 3.1 Docs Workflow
+### Docs Workflow
 
 Add or update your Jupyter notebooks in the appropriate subdirectories under `docs/`. If you add new files, remember to update `index.rst` (or relevant `.rst` files) accordingly.
 
@@ -114,11 +114,11 @@ llm.shutdown()
 ```
 
 
-## 4. Running Unit Tests & Adding to CI
+## Running Unit Tests & Adding to CI
 
 SGLang uses Python’s built-in [unittest](https://docs.python.org/3/library/unittest.html) framework. You can run tests either individually or in suites.
 
-### 4.1 Test Backend Runtime
+### Test Backend Runtime
 
 ```bash
 cd sglang/test/srt
@@ -133,7 +133,7 @@ python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
 python3 run_suite.py --suite minimal
 ```
 
-### 4.2 Test Frontend Language
+### Test Frontend Language
 
 ```bash
 cd sglang/test/lang
@@ -149,13 +149,13 @@ python3 -m unittest test_openai_backend.TestOpenAIBackend.test_few_shot_qa
 python3 run_suite.py --suite minimal
 ```
 
-### 4.3 Adding or Updating Tests in CI
+### Adding or Updating Tests in CI
 
 - Create new test files under `test/srt` or `test/lang` depending on the type of test.
 - Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py` or `test/lang/run_suite.py`) so they’re picked up in CI.
 - In CI, all tests run automatically. You may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows) to add custom test groups or extra checks.
 
-### 4.4 Writing Elegant Test Cases
+### Writing Elegant Test Cases
 
 - Examine existing tests in [sglang/test](https://github.com/sgl-project/sglang/tree/main/test) for practical examples.
 - Keep each test function focused on a single scenario or piece of functionality.
@@ -164,7 +164,7 @@ python3 run_suite.py --suite minimal
 - Clean up resources to avoid side effects and preserve test independence.
 
 
-## 5. Tips for Newcomers
+## Tips for Newcomers
 
 If you want to contribute but don’t have a specific idea in mind, pick issues labeled [“good first issue” or “help wanted”](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase. Also check out this [code walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
 
