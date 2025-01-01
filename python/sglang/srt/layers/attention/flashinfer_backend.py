@@ -151,7 +151,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
-                model_layer: RadixAttention,
+                model_layer,
                 decode_wrappers=self.decode_wrappers,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
@@ -201,7 +201,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
                 prefix_lens,
-                model_layer: RadixAttention,
+                extend_no_prefix,
+                model_layer,
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
@@ -244,16 +245,18 @@ class FlashInferAttnBackend(AttentionBackend):
             decode_wrappers = []
             for i in range(self.num_wrappers):
                 decode_wrappers.append(
-                        MultiLevelCascadeAttentionWrapper(
-                    self.num_cascade_levels,
-                    self.workspace_buffer,
-                    "NHD",
+                    MultiLevelCascadeAttentionWrapper(
+                        self.num_cascade_levels,
+                        self.workspace_buffer,
+                        "NHD",
+                    )
                 )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
                 seq_lens,
                 seq_lens_sum,
+                model_layer,
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
@@ -445,7 +448,6 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.decode_wrappers = attn_backend.decode_wrappers
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -500,8 +502,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[MultiLevelCascadeAttentionWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
-        decode_wrappers = decode_wrappers or self.decode_wrappers
-
+    ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Sliding window attention
@@ -538,8 +539,6 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
-
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Normal attention
@@ -634,7 +633,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
-        self.decode_wrappers = attn_backend.decode_wrappers
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -683,7 +681,7 @@ class FlashInferIndicesUpdaterPrefill:
 
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
-            self.decode_wrappers[0],
+            prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
             paged_kernel_lens_sum,
@@ -728,7 +726,7 @@ class FlashInferIndicesUpdaterPrefill:
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
-                self.decode_wrappers[wrapper_id],
+                prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
                 paged_kernel_lens_sum,
@@ -770,7 +768,7 @@ class FlashInferIndicesUpdaterPrefill:
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
-                self.decode_wrappers[wrapper_id],
+                prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
                 paged_kernel_lens_sum,
