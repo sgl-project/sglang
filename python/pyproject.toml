@@ -27,7 +27,7 @@ srt = ["sglang[runtime_common]", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1", "cu
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20241022, not from public vllm whl
-srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.3.dev13"]
+srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.3.post2.dev1"]
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
 srt_xpu = ["sglang[runtime_common]"]
