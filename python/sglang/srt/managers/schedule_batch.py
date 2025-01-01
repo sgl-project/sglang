@@ -68,7 +68,6 @@ global_server_args_dict = {
     "enable_ep_moe": ServerArgs.enable_ep_moe,
 }
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +99,18 @@ class FINISH_MATCHED_STR(BaseFinishReason):
     def to_json(self):
         return {
             "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISH_MATCHED_REGEX(BaseFinishReason):
+    def __init__(self, matched: str):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop_regex",
             "matched": self.matched,
         }
 
@@ -423,22 +434,27 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
 
-        if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
-        ):
-            self.stop_check_text += self.tokenizer.decode(last_token_id)
-
         # Check stop strings
-        for stop_str in self.sampling_params.stop_strs:
-            if stop_str in self.stop_check_text or stop_str in self.decoded_text:
-                self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                return
+        if len(self.sampling_params.stop_strs) > 0:
+            tail_str = self.tokenizer.decode(
+                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+            )
 
-        for stop_regex_str in self.sampling_params.stop_regex_strs:
-            if re.search(stop_regex_str, self.stop_check_text):
-                self.finished_reason = FINISH_MATCHED_STR(matched=stop_regex_str)
-                return
+            for stop_str in self.sampling_params.stop_strs:
+                if stop_str in tail_str or stop_str in self.decoded_text:
+                    self.finished_reason = FINISH_MATCHED_REGEX(matched=stop_str)
+                    return
+
+        # Check stop regex
+        if self.sampling_params.stop_regex_strs:
+            decode_res, new_text = self.get_next_inc_detokenization()
+            if decode_res:
+                for stop_regex_str in self.sampling_params.stop_regex_strs:
+                    if re.search(stop_regex_str, new_text):
+                        self.finished_reason = FINISH_MATCHED_STR(
+                            matched=stop_regex_str
+                        )
+                        return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
         if self.origin_input_text is None:
@@ -471,7 +487,7 @@ class Req:
         self.surr_offset = prompt_tokens
         self.read_offset = len(all_ids)
 
-        # NOTE: A trick to reduce the surrouding tokens decoding overhead
+        # NOTE: A trick to reduce the surrounding tokens decoding overhead
         for i in range(0, INIT_INCREMENTAL_DETOKENIZATION_OFFSET):
             surr_text_ = self.tokenizer.decode(
                 all_ids[self.read_offset - i : self.read_offset]

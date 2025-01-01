@@ -127,6 +127,13 @@ class TestMatchedStop(unittest.TestCase):
             finish_reason="stop",
             matched_stop=stop_regex,
         )
+        stop_regex = r"[.!?]\s*$"
+        self.run_chat_completions_generation(
+            max_tokens=1000,
+            stop_regex=stop_regex,
+            finish_reason="stop",
+            matched_stop=stop_regex,
+        )
 
     def test_finish_stop_eos(self):
         llama_format_prompt = """

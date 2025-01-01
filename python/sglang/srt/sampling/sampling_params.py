@@ -49,7 +49,6 @@ class SamplingParams:
         no_stop_trim: bool = False,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
-        stop_regex: Optional[Union[str, List[str]]] = None,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -152,6 +151,5 @@ class SamplingParams:
 
         if self.stop_regex_strs is None:
             self.stop_regex_strs = []
-        else:
-            if isinstance(self.stop_regex_strs, str):
-                self.stop_regex_strs = [self.stop_regex_strs]
+        elif isinstance(self.stop_regex_strs, str):
+            self.stop_regex_strs = [self.stop_regex_strs]
