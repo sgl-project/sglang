@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 class TestEvalAccuracyLarge(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not is_in_ci():
+        if is_in_ci():
             cls.model_groups = [([DEFAULT_MODEL_NAME_FOR_TEST], False, False)]
         else:
             cls.model_groups = [
