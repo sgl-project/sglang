@@ -88,7 +88,7 @@ from sglang.srt.utils import (
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
-    set_ulimit,
+    set_ulimit, MultiprocessingSerializer,
 )
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -876,7 +876,7 @@ class Engine:
 
     def update_weights_from_tensor(self, name, tensor):
         """Update weights from distributed source."""
-        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
+        obj = UpdateWeightsFromTensorReqInput(name=name, serialized_tensor=MultiprocessingSerializer.serialize(tensor))
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             tokenizer_manager.update_weights_from_tensor(obj, None)

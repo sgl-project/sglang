@@ -15,6 +15,7 @@
 
 import base64
 import dataclasses
+import io
 import ipaddress
 import itertools
 import json
@@ -34,6 +35,7 @@ import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
@@ -59,7 +61,6 @@ from triton.runtime.cache import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 show_time_cost = False
 time_infos = {}
@@ -556,7 +557,7 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
         # Reshape
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1:]
         )
         return output_tensor
 
@@ -782,10 +783,10 @@ def first_rank_print(*args, **kwargs):
 
 def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
     mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    total_mem = mem.total / 1024 ** 3
+    available_mem = mem.available / 1024 ** 3
     if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
+        buf_size = int(0.5 * 1024 ** 3)
     else:
         buf_size = -1
 
@@ -1206,7 +1207,6 @@ def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> 
     # https://github.com/pytorch/pytorch/blob/
     # c1cd946818442aca8c7f812b16d187ce1586c3bc/
     # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.cuda
     import torch.version
 
     if not torch.cuda._is_compiled():
@@ -1256,9 +1256,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             "{"
             + ", ".join(
-                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-            )
+            f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+            for k, v in data.items()
+        )
             + "}"
         )
     elif dataclasses.is_dataclass(data):
@@ -1266,9 +1266,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-            )
+            f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+            for f in fields
+        )
             + ")"
         )
     else:
@@ -1288,7 +1288,7 @@ def parse_tool_response(text, tools, **kwargs):
     if "<|plugin|>" in text:  # internlm2
         text, action = text.split("<|action_start|><|plugin|>")
         action = action.split("<|action_end|>".strip())[0]
-        action = action[action.find("{") :]
+        action = action[action.find("{"):]
         action = json.loads(action)
         name, parameters = action["name"], json.dumps(
             action.get("parameters", action.get("arguments", {})), ensure_ascii=False
@@ -1296,7 +1296,7 @@ def parse_tool_response(text, tools, **kwargs):
         call_info_list = [(name, parameters)]
     elif "<function=" in text:  # llama3.1
         action, _ = text.split("</function>")
-        parameters = action[action.find("{") :]
+        parameters = action[action.find("{"):]
         name = action.split("<function=")[1].split(">{")[0]
         call_info_list = [(name, parameters)]
     elif "<tool_call>" in text and "</tool_call>" in text:  # qwen2.5
@@ -1313,7 +1313,7 @@ def parse_tool_response(text, tools, **kwargs):
         if not text.startswith("<tool_call>"):
             text = text[: text.find("<tool_call>")]
         elif not text.endswith("</tool_call>"):
-            text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
+            text = text[text.rfind("</tool_call>") + len("</tool_call>"):]
         else:
             text = ""
     elif "<|python_tag|>" in text:  # llama3.2
@@ -1335,3 +1335,15 @@ def parse_tool_response(text, tools, **kwargs):
         for call_info in call_info_list
     ]
     return text, call_info_list
+
+
+class MultiprocessingSerializer:
+    @staticmethod
+    def serialize(obj):
+        buf = io.BytesIO()
+        ForkingPickler(buf).dump(obj)
+        return buf.read()
+
+    @staticmethod
+    def deserialize(obj):
+        return ForkingPickler.loads(obj)

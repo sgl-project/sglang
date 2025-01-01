@@ -427,7 +427,7 @@ class UpdateWeightsFromDistributedReqOutput:
 @dataclass
 class UpdateWeightsFromTensorReqInput:
     name: str
-    tensor: torch.Tensor
+    serialized_tensor: bytes
 
 
 @dataclass
