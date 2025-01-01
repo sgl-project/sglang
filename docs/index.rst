@@ -30,6 +30,7 @@ The core features include:
    backend/offline_engine_api.ipynb
    backend/structured_outputs.ipynb
    backend/backend.md
+   backend/quantization.ipynb
 
 
 .. toctree::
