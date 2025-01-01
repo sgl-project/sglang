@@ -17,7 +17,7 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
         new_tensor = torch.full((28672, 4096), 1.5)
 
         time_start = time.time()
-        engine.update_weights_from_tensor(param_name, new_tensor)
+        engine.update_weights_from_tensor([(param_name, new_tensor)])
         print(f'Time delta: {time.time() - time_start:.03f}')
 
         _check_param(engine, param_name, [1.5] * 5)
