@@ -1013,7 +1013,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
-        assert param_data.shape == loaded_weight.shape, f'{param_data.shape=} != {loaded_weight.shape=}'
+        assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
 
