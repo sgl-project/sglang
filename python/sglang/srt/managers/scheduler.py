@@ -812,7 +812,7 @@ class Scheduler:
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if req.last_node.loading:
+            if req.last_node and req.last_node.loading:
                 if not self.tree_cache.loading_complete(req.last_node):
                     continue
             if (
@@ -835,8 +835,12 @@ class Scheduler:
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    # todo: to be aware of the locked memory for hierarchical cache
-                    # self.batch_is_full = True
+                    # do not set batch_is_full when no request can be served due to protected memory
+                    if len(adder.can_run_list) > 0 or (
+                        self.running_batch is not None
+                        and not self.running_batch.is_empty()
+                    ):
+                        self.batch_is_full = True
                     pass
                 break
             if self.server_args.prefill_only_one_req:
