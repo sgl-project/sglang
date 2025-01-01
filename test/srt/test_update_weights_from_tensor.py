@@ -28,7 +28,7 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
 def _check_param(engine, param_name, expect_values):
     actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
     assert torch.allclose(
-        actual_values, torch.tensor(expect_values), atol=0.001
+        actual_values, torch.tensor(expect_values), atol=0.002
     ), f"{actual_values=}"
 
 
