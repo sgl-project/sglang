@@ -27,7 +27,10 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 if is_flashinfer_available():
-    from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+    from flashinfer import (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    )
     from flashinfer.cascade import MultiLevelCascadeAttentionWrapper, merge_state
 
 
@@ -366,9 +369,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if self.forward_metadata.extend_no_prefix:
                 o = o1
             else:
-                o2, s2 = prefill_wrapper_paged._batch_prefill_wrappers[
-                    0
-                ].forward_return_lse(
+                o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
@@ -832,10 +833,10 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         plan_args = {
-            "qo_indptr_arr": [qo_indptr],
-            "paged_kv_indptr_arr": [kv_indptr],
-            "paged_kv_indices_arr": [kv_indices],
-            "paged_kv_last_page_len": [self.kv_last_page_len[:bs]],
+            "qo_indptr": qo_indptr,
+            "paged_kv_indptr": kv_indptr,
+            "paged_kv_indices": kv_indices,
+            "paged_kv_last_page_len": self.kv_last_page_len[:bs],
             "num_qo_heads": self.num_qo_heads,
             "num_kv_heads": self.num_kv_heads,
             "head_dim": self.head_dim,
