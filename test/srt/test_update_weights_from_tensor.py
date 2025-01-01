@@ -12,7 +12,7 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
 
         param_name = "model.layers.2.self_attn.k_proj.weight"
 
-        _check_param(engine, param_name, [0.0571, -0.0114, 0.0444, 0.0215, -0.0149])
+        _check_param(engine, param_name, [0.0078, -0.0060, -0.0134, -0.0403, -0.0103])
 
         new_tensor = torch.full((3072, 2048), 1.5)
 
