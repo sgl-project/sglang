@@ -1,3 +1,4 @@
+import time
 import unittest
 
 import sglang as sgl
@@ -14,7 +15,10 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
         _check_param(engine, param_name, [0.0571, -0.0114, 0.0444, 0.0215, -0.0149])
 
         new_tensor = torch.full((3072, 2048), 1.5)
+
+        time_start = time.time()
         engine.update_weights_from_tensor(param_name, new_tensor)
+        print(f'Time delta: {time.time() - time_start:.03f}')
 
         _check_param(engine, param_name, [1.5] * 5)
 
