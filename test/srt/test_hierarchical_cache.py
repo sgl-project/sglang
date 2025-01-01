@@ -1,15 +1,12 @@
-import torch
 import time
 
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPoolHost,
-)
+import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPoolHost
 
 if __name__ == "__main__":
-
+    # todo: update the test according to the latest changes in the cache controller
     mem_pool_device = MHATokenToKVPool(
         size=10000,
         dtype=torch.float16,

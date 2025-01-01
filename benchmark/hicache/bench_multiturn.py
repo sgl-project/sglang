@@ -1,10 +1,10 @@
 import argparse
 import asyncio
-import aiohttp
 import random
 import time
-import requests
 
+import aiohttp
+import requests
 from lorem_text import lorem
 from tqdm.asyncio import tqdm
 

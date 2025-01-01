@@ -26,13 +26,13 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
     BaseTokenToKVPool,
-    ReqToTokenPool,
     MLATokenToKVPoolHost,
+    ReqToTokenPool,
 )
-from sglang.srt.managers.cache_controller import HiCacheController
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req

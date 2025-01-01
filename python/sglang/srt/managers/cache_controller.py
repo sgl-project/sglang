@@ -1,16 +1,16 @@
-import torch
+import logging
+import queue
 import threading
 import time
-import queue
 from queue import PriorityQueue, Queue
 from typing import Optional
-import logging
 
+import torch
 
 from sglang.srt.mem_cache.memory_pool import (
+    MemoryStateInt,
     MHATokenToKVPool,
     MLATokenToKVPoolHost,
-    MemoryStateInt,
 )
 
 logger = logging.getLogger(__name__)

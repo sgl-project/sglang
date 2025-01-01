@@ -22,12 +22,12 @@ BaseTokenToKVPool maps a token location to its KV cache data.
 """
 
 import logging
-from typing import List, Tuple, Union
 import threading
-import psutil
 from enum import IntEnum
 from functools import wraps
+from typing import List, Tuple, Union
 
+import psutil
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
