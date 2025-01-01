@@ -10,17 +10,18 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
     def test_update_weights_from_tensor(self):
         engine = sgl.Engine(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
 
-        param_name = "model.layers.6.mlp.up_proj.weight"
+        param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
 
-        _check_param(engine, param_name, [-0.0140, -0.0176, 0.0093, -0.0105, 0.0015])
+        _check_param(engine, param_names[0], [-0.0140, -0.0176, 0.0093, -0.0105, 0.0015])
 
         new_tensor = torch.full((28672, 4096), 1.5)
 
         time_start = time.time()
-        engine.update_weights_from_tensor([(param_name, new_tensor)])
+        engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
         print(f'Time delta: {time.time() - time_start:.03f}')
 
-        _check_param(engine, param_name, [1.5] * 5)
+        for param_name in param_names:
+            _check_param(engine, param_name, [1.5] * 5)
 
         engine.shutdown()
 
