@@ -197,7 +197,7 @@ class TpModelWorker:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.update_weights_from_tensor(
-            recv_req.name, MultiprocessingSerializer.deserialize(recv_req.serialized_tensor)
+            recv_req.name, MultiprocessingSerializer.deserialize(recv_req.serialized_named_tensors)
         )
         return success, message
 

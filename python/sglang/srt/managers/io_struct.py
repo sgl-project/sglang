@@ -426,8 +426,7 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    name: str
-    serialized_tensor: bytes
+    serialized_named_tensors: bytes # indeed Dict[str, torch.Tensor]
 
 
 @dataclass

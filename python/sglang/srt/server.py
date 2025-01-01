@@ -27,7 +27,8 @@ import signal
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Dict, List, Optional, Union
+from typing import AsyncIterator, Dict, List, Optional, Union, Tuple
+import torch
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -874,9 +875,9 @@ class Engine:
             tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
-    def update_weights_from_tensor(self, name, tensor):
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
         """Update weights from distributed source."""
-        obj = UpdateWeightsFromTensorReqInput(name=name, serialized_tensor=MultiprocessingSerializer.serialize(tensor))
+        obj = UpdateWeightsFromTensorReqInput(serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors))
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             tokenizer_manager.update_weights_from_tensor(obj, None)
