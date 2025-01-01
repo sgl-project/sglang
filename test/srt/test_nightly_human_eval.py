@@ -90,6 +90,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
     def test_human_eval_all_models(self):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
+                # NOTE: only Llama for now
                 if "Llama" in model:
                     with self.subTest(model=model):
                         self.process = launch_server(
