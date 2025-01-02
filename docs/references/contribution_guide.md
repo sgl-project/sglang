@@ -15,7 +15,7 @@ cd sglang
 
 ### Install Dependencies & Build
 
-Refer to [Install SGLang](https://sgl-project.github.io/start/install.html) documentation for more details on setting up the necessary dependencies.
+Refer to [Install SGLang from Source](https://sgl-project.github.io/start/install.html#method-2-from-source) documentation for more details on setting up the necessary dependencies.
 
 ## Code Formatting with Pre-Commit
 
@@ -34,17 +34,9 @@ pre-commit run --all-files
 
 SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework. For detailed instructions on running tests and adding them to CI, please refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
-### Writing Elegant Test Cases
-
-- Examine existing tests in [sglang/test](https://github.com/sgl-project/sglang/tree/main/test) for practical examples.
-- Keep each test function focused on a single scenario or piece of functionality.
-- Give tests descriptive names reflecting their purpose.
-- Use robust assertions (e.g., assert, unittest methods) to validate outcomes.
-- Clean up resources to avoid side effects and preserve test independence.
-
 ## Writing Documentation & Running Docs CI
 
-We recommend new contributors start from writing documentation. Most documentation files are located under the `docs/` folder. We prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline. For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
+We recommend new contributors start from writing documentation. For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
 
 
 ## Tips for Newcomers
