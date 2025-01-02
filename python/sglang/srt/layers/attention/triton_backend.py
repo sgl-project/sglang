@@ -26,6 +26,8 @@ class TritonAttnBackend(AttentionBackend):
 
         super().__init__()
 
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
@@ -132,6 +134,9 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        # int8 -> get scale, other -> None
+        k_scale, v_scale = forward_batch.token_to_kv_pool.get_kv_scales_buffer(layer.layer_id)
+
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -140,6 +145,8 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_scale,
+            v_scale,
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
@@ -147,7 +154,7 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.extend_start_loc,
             max_extend_len,
             layer.scaling,
-            layer.logit_cap,
+            layer.logit_cap, 
         )
         return o
 
@@ -176,11 +183,16 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
+            
+        # int8 -> get scale, other -> None
+        k_scale, v_scale = forward_batch.token_to_kv_pool.get_kv_scales_buffer(layer.layer_id)
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_scale,
+            v_scale,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,

@@ -48,6 +48,8 @@ def _fwd_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
+    K_Scale_Buffer,
+    V_Scale_Buffer,
     sm_scale,
     Req_to_tokens,
     B_req_idx,
@@ -58,8 +60,12 @@ def _fwd_kernel_stage1(
     stride_qh,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_scale_kbs,
+    stride_scale_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_scale_vbs,
+    stride_scale_vh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -71,10 +77,12 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    USE_INT8_KV: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
+    scale_dtype = K_Scale_Buffer.dtype.element_ty
 
     cur_kv_head = cur_head // kv_group_num
 
@@ -109,11 +117,30 @@ def _fwd_kernel_stage1(
                 + cur_kv_head * stride_buf_kh
                 + offs_d[None, :]
             )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
-                other=0.0,
-            )
+            if not USE_INT8_KV:
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                    other=0.0,
+                )
+            else:
+                # load quantized k
+                k_int8 = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                    other=0.0,
+                )
+                # load k scale
+                offs_scale_k = (
+                    kv_loc[:, None] * stride_scale_kbs + cur_kv_head * stride_buf_kh
+                )
+                k_scales = tl.load(
+                    K_Scale_Buffer + offs_scale_k,
+                    mask=offs_n[:, None] < split_kv_end,
+                    other=1.0
+                )
+                k = (k_int8.to(scale_dtype) * k_scales).to(tl.float32)
+                
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
 
@@ -127,11 +154,28 @@ def _fwd_kernel_stage1(
                 + cur_kv_head * stride_buf_vh
                 + offs_dv[None, :]
             )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                other=0.0,
-            )
+            if not USE_INT8_KV:
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
+            else:
+                v_int8 = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
+                # load v scale
+                offs_scale_v = (
+                    kv_loc[:, None] * stride_scale_vbs + cur_kv_head * stride_buf_vh
+                )
+                v_scales = tl.load(
+                    V_Scale_Buffer + offs_scale_v,
+                    mask=offs_n[:, None] < split_kv_end,
+                    other=1.0
+                )
+                v = (v_int8.to(scale_dtype) * v_scales).to(tl.float32)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -172,6 +216,8 @@ def _decode_att_m_fwd(
     q,
     k_buffer,
     v_buffer,
+    k_scale_buffer,
+    v_scale_buffer,
     att_out,
     Req_to_tokens,
     B_req_idx,
@@ -184,6 +230,9 @@ def _decode_att_m_fwd(
     NUM_KV_SPLITS = num_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
+    
+    # assert kv dtype
+    USE_INT8_KV = k_buffer[0].dtype == torch.int8
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -198,10 +247,23 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
+    if USE_INT8_KV:
+        k_scale_stride0 = k_scale.stride(0)
+        k_scale_stride1 = k_scale.stride(1)
+        v_scale_stride0 = v_scale.stride(0)
+        v_scale_stride1 = v_scale.stride(1)
+    else:
+        k_scale_stride0 = None
+        k_scale_stride1 = None
+        v_scale_stride0 = None
+        v_scale_stride1 = None
+
     _fwd_kernel_stage1[grid](
         q,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         sm_scale,
         Req_to_tokens,
         B_req_idx,
@@ -212,8 +274,12 @@ def _decode_att_m_fwd(
         q.stride(1),
         k_buffer.stride(0),
         k_buffer.stride(1),
+        k_scale_stride0,
+        k_scale_stride1,
         v_buffer.stride(0),
         v_buffer.stride(1),
+        v_scale_stride0,
+        v_scale_stride1,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -227,6 +293,7 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        USE_INT8_KV=USE_INT8_KV
     )
 
 
@@ -235,6 +302,8 @@ def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
+    K_Scale_Buffer,
+    V_Scale_Buffer,
     sm_scale,
     Req_to_tokens,
     B_req_idx,
@@ -245,8 +314,12 @@ def _fwd_grouped_kernel_stage1(
     stride_qh,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_scale_kbs,
+    stride_scale_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_scale_vbs,
+    stride_scale_vh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -266,6 +339,7 @@ def _fwd_grouped_kernel_stage1(
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
+    scales_dtype = K_Scales_Buffer.dtype.element_ty
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -316,11 +390,28 @@ def _fwd_grouped_kernel_stage1(
                 + cur_kv_head * stride_buf_kh
                 + offs_d[:, None]
             )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-            )
+            if not USE_INT8_KV:
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                    other=0.0,
+                )
+            else:
+                k_int8 = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                    other=0.0,
+                )
+                offs_scale_k = (
+                    kv_loc[None, :] * stride_scale_kbs + cur_kv_head * stride_scale_kh
+                )
+                k_scale = tl.load(
+                    K_Scale_Buffer + offs_scale_k,
+                    mask=offs_n[None, :] < split_kv_end,
+                    other=1.0,
+                )
+                k = (k_int8.to(scales_dtype) * k_scale).to(tl.float32)
+                
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
@@ -328,11 +419,22 @@ def _fwd_grouped_kernel_stage1(
                     + cur_kv_head * stride_buf_kh
                     + offs_dpe[:, None]
                 )
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
-                    other=0.0,
-                )
+                if not USE_INT8_KV:
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
+                    )
+                else:
+                    kpe_int8 = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
+                    )
+                    offs_scale_kpe = (
+                        kv_loc[None, :] * stride_scale_kbs + cur_kv_head * stride_scale_kh
+                    )
+                    
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
 
@@ -394,6 +496,8 @@ def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
     v_buffer,
+    k_scale_buffer,
+    v_scale_buffer,
     att_out,
     Req_to_tokens,
     B_req_idx,
@@ -405,6 +509,9 @@ def _decode_grouped_att_m_fwd(
     BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
+    
+    # assert kv dtype
+    USE_INT8_KV = k_buffer[0].dtype == torch.int8
 
     # [TODO] work around shmem limit on MI3xx
     if is_hip_ and Lk >= 576:
@@ -438,10 +545,23 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    if USE_INT8_KV:
+        k_scale_stride0 = k_scale.stride(0)
+        k_scale_stride1 = k_scale.stride(1)
+        v_scale_stride0 = v_scale.stride(0)
+        v_scale_stride1 = v_scale.stride(1)
+    else:
+        k_scale_stride0 = None
+        k_scale_stride1 = None
+        v_scale_stride0 = None
+        v_scale_stride1 = None
+
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         sm_scale,
         Req_to_tokens,
         B_req_idx,
@@ -452,8 +572,12 @@ def _decode_grouped_att_m_fwd(
         q.stride(1),
         k_buffer.stride(0),
         k_buffer.stride(1),
+        k_scale_stride0,
+        k_scale_stride1,
         v_buffer.stride(0),
         v_buffer.stride(1),
+        v_scale_stride0,
+        v_scale_stride1,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -470,6 +594,7 @@ def _decode_grouped_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        USE_INT8_KV,
         **extra_kargs,
     )
 
@@ -573,6 +698,8 @@ def decode_attention_fwd_normal(
     q,
     k_buffer,
     v_buffer,
+    k_scale_buffer,
+    v_scale_buffer,
     o,
     req_to_token,
     b_req_idx,
@@ -586,6 +713,8 @@ def decode_attention_fwd_normal(
         q,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         attn_logits,
         req_to_token,
         b_req_idx,
@@ -614,6 +743,8 @@ def decode_attention_fwd_grouped(
         q,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         attn_logits,
         req_to_token,
         b_req_idx,
@@ -629,6 +760,8 @@ def decode_attention_fwd(
     q,
     k_buffer,
     v_buffer,
+    k_scale_buffer,
+    v_scale_buffer,
     o,
     req_to_token,
     b_req_idx,
@@ -647,6 +780,8 @@ def decode_attention_fwd(
             q,
             k_buffer,
             v_buffer,
+            k_scale_buffer,
+            v_scale_buffer,
             o,
             req_to_token,
             b_req_idx,
@@ -662,6 +797,8 @@ def decode_attention_fwd(
             q,
             k_buffer,
             v_buffer,
+            k_scale_buffer,
+            v_scale_buffer,
             o,
             req_to_token,
             b_req_idx,
