@@ -68,13 +68,12 @@ from sglang.srt.openai_api.protocol import (
     FunctionResponse,
     LogProbs,
     ToolCall,
-    ToolCallItem,
     TopLogprob,
     UsageInfo,
 )
 from sglang.srt.utils import TOOLS_TAG_LIST, parse_tool_response
 from sglang.utils import get_exception_traceback
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.openai_api.function_call_parser import FunctionCallParser
 
 logger = logging.getLogger(__name__)
 
@@ -1071,7 +1070,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                     ToolCall(
                         id=str(call_info.tool_index),
                         function=FunctionResponse(
-                            name=call_info.name, arguments=call_info.arguments
+                            name=call_info.name, arguments=call_info.parameters
                         ),
                     )
                     for call_info in call_info_list
@@ -1298,7 +1297,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                                 id=str(call_item.tool_index),
                                 function=FunctionResponse(
                                     name=call_item.name,
-                                    arguments=call_item.arguments,
+                                    arguments=call_item.parameters,
                                 ),
                             )
                             choice_data = ChatCompletionResponseStreamChoice(

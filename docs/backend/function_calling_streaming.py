@@ -32,7 +32,7 @@ messages = [
 ]
 
 # Initialize OpenAI-like client
-client = OpenAI(api_key="YOUR_API_KEY", base_url="http://0.0.0.0:30520/v1")
+client = OpenAI(api_key="YOUR_API_KEY", base_url="http://0.0.0.0:30000/v1")
 
 # Use the first available model from the backend
 model_name = client.models.list().data[0].id
