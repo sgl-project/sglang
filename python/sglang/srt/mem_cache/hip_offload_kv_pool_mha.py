@@ -4,6 +4,7 @@ from torch import Tensor
 from typing import Dict, Optional, Set, Tuple, Union
 import threading
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
     BaseTokenToKVPool
@@ -39,6 +40,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         #TODO: derive token sizes from size
         self.head_num = head_num
         self.head_dim = head_dim
+        self.layer_num = layer_num
         self.max_mask_cache_token_size = max_mask_cache_token_size * head_num
         self.max_sa_cache_token_size = max_sa_cache_token_size * head_num
         
@@ -99,26 +101,30 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         hip_offload_cache = self.get_kv_buffer(layer_id)
         
         handle_id = (layer_id, batch_id)
-        # print(threading.current_thread().native_id, 'start prefetch')
-        # start_event = torch.cuda.Event()
+        assert handle_id not in self.prefetch_threads, handle_id
+        assert handle_id not in self.prefetched_kv, handle_id
+
+        start_event = torch.cuda.Event()
+        start_event.record()
+
         def thread_main():
-            torch.cuda.synchronize(device=self.device)
-            # print(threading.current_thread().native_id, 'start copy')
-            stream = torch.cuda.Stream(device=self.device, priority=0)
-            stream.wait_stream(torch.cuda.default_stream(device=self.device))
-            # t_local = time.time()
-            with torch.cuda.stream(stream):
-                # start_event.synchronize()
-                k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
-                    table=table,
-                    device=self.device,
-                )
-                assert k.device == self.device
-                assert v.device == self.device
+            try:
+                stream = torch.cuda.Stream(device=self.device, priority=0)
+                stream.wait_event(start_event)
+
+                with torch.cuda.stream(stream):
+                    k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
+                        table=table,
+                        device=self.device,
+                    )
+                    assert k.device == self.device
+                    assert v.device == self.device
+                
+                stream.synchronize()
                 self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
-            stream.synchronize()
-            self.prefetch_threads.pop(handle_id)
-            # print(threading.current_thread().native_id, 'done copy', (time.time() - t_local) * 1000, (k.numel() * k.element_size()) * 2 / 1024 / 1024)
+            finally:
+                self.prefetch_threads.pop(handle_id)
+        
         t = threading.Thread(target=thread_main, daemon=True)
         self.prefetch_threads[handle_id] = t
         t.start()
@@ -195,25 +201,29 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             cache_v = cache_v.to(self.dtype)
         
         if async_copy:
-            # start_event = torch.cuda.Event()
+            start_event = torch.cuda.Event()
+            start_event.record()
+
             def thread_main():
-                torch.cuda.synchronize(device=self.device)
-                stream = torch.cuda.Stream(device=self.device)
-                stream.wait_stream(torch.cuda.default_stream(device=self.device))
-                with torch.cuda.stream(stream):
-                    # start_event.synchronize()
-                    table_gpu = table
-                    table_cpu = table.to('cpu', non_blocking=False)
-                    cache_k_cpu = cache_k.to('cpu', non_blocking=False)
-                    cache_v_cpu = cache_v.to('cpu', non_blocking=False)
-                    self.layer_buffer[layer_id].set_kv_buffer(
-                        table=table_cpu,
-                        table_gpu=table_gpu,
-                        cache_k=cache_k_cpu,
-                        cache_v=cache_v_cpu,
-                    )
-                stream.synchronize()
-                self.async_set_threads.remove(t)
+                try:
+                    stream = torch.cuda.Stream(device=self.device)
+                    stream.wait_event(start_event)
+
+                    with torch.cuda.stream(stream):
+                        table_gpu = table
+                        table_cpu = table.to('cpu', non_blocking=False)
+                        cache_k_cpu = cache_k.to('cpu', non_blocking=False)
+                        cache_v_cpu = cache_v.to('cpu', non_blocking=False)
+                        self.layer_buffer[layer_id].set_kv_buffer(
+                            table=table_cpu,
+                            table_gpu=table_gpu,
+                            cache_k=cache_k_cpu,
+                            cache_v=cache_v_cpu,
+                        )
+                    stream.synchronize()
+                finally:
+                    self.async_set_threads.remove(t)
+            
             t = threading.Thread(target=thread_main, daemon=True)
             self.async_set_threads.add(t)
             t.start()
@@ -236,3 +246,49 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         assert len(self.prefetched_kv) == 0
         elapsed = time.time() - t
         logger.debug(f'Final layer sync took {elapsed * 1024:.4f} ms')
+    
+    def prefetch_layer(self, forward_batch: ForwardBatch, layer_id: int):
+        assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
+        assert forward_batch.token_to_kv_pool == self
+
+        for ibatch in range(forward_batch.batch_size):
+            req_to_tokens = forward_batch.req_to_token_pool.req_to_token
+            req_pool_indices = forward_batch.req_pool_indices[ibatch:ibatch+1]
+            block_table = req_to_tokens.index_select(
+                dim=0, index=req_pool_indices
+            )[0, :forward_batch.extend_prefix_lens_cpu[ibatch] + forward_batch.extend_seq_lens_cpu[ibatch]]
+            # print(block_table, block_table.shape)
+            self.prefetch_prefix_kv_buffer(
+                layer_id=layer_id, 
+                batch_id=ibatch,
+                table=block_table,
+                prefix_seq_len=forward_batch.extend_prefix_lens_cpu[ibatch]
+            )
+    
+    def on_model_start(self, forward_batch: ForwardBatch):
+        require_prefetch = forward_batch.forward_mode.is_extend()
+        assert forward_batch.token_to_kv_pool == self
+
+        if require_prefetch:
+            self.prefetch_layer(forward_batch, 0)
+
+    def on_model_end(self, forward_batch: ForwardBatch):
+        require_prefetch = forward_batch.forward_mode.is_extend()
+        assert forward_batch.token_to_kv_pool == self
+        
+        if require_prefetch:
+            self.synchronize()
+
+    def on_layer_start(self, forward_batch: ForwardBatch, layer_id: int):
+        require_prefetch = forward_batch.forward_mode.is_extend()
+        assert forward_batch.token_to_kv_pool == self
+
+        if require_prefetch and (layer_id < (self.layer_num - 1)):
+            self.prefetch_layer(forward_batch, layer_id + 1)
+
+    def on_layer_end(self, forward_batch: ForwardBatch, layer_id: int):
+        require_prefetch = forward_batch.forward_mode.is_extend()
+        assert forward_batch.token_to_kv_pool == self
+
+        if require_prefetch and (layer_id < (self.layer_num - 1)):
+            torch.cuda.current_stream(self.device).synchronize()

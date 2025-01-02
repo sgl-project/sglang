@@ -287,33 +287,10 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        
-        def prefetch_layer(layer_id: int):
-            assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
-            for ibatch in range(forward_batch.batch_size):
-                req_to_tokens = forward_batch.req_to_token_pool.req_to_token
-                req_pool_indices = forward_batch.req_pool_indices[ibatch:ibatch+1]
-                block_table = req_to_tokens.index_select(
-                    dim=0, index=req_pool_indices
-                )[0, :forward_batch.extend_prefix_lens_cpu[ibatch] + forward_batch.extend_seq_lens_cpu[ibatch]]
-                # print(block_table, block_table.shape)
-                forward_batch.token_to_kv_pool.prefetch_prefix_kv_buffer(
-                    layer_id=layer_id, 
-                    batch_id=ibatch,
-                    table=block_table,
-                    prefix_seq_len=forward_batch.extend_prefix_lens_cpu[ibatch]
-                )
-        
-        require_prefetch = forward_batch.forward_mode.is_extend() and\
-            isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
-        if require_prefetch:
-            prefetch_layer(0)
-        
+        forward_batch.on_model_start()
         for i in range(len(self.layers)):
-            if require_prefetch:
-                if i < (len(self.layers) - 1):
-                    prefetch_layer(i+1)
+            forward_batch.on_layer_start(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -321,13 +298,10 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-            if require_prefetch:
-                torch.cuda.current_stream(hidden_states.device).synchronize()
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
         
         hidden_states, _ = self.norm(hidden_states, residual)
-        
-        if require_prefetch:
-            forward_batch.token_to_kv_pool.synchronize()
         
         return hidden_states
 

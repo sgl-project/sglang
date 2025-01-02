@@ -292,6 +292,17 @@ class ForwardBatch:
 
         return ret
 
+    def on_model_start(self):
+        self.token_to_kv_pool.on_model_start(self)
+
+    def on_model_end(self):
+        self.token_to_kv_pool.on_model_end(self)
+
+    def on_layer_start(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_start(self, layer_id)
+
+    def on_layer_end(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_end(self, layer_id)
 
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum

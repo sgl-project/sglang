@@ -91,7 +91,7 @@ class HiPModelRunner(ModelRunner):
         else:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
     
-        if forward_batch.hip_metadata_cache_pool is not None:
+        if (forward_batch.hip_metadata_cache_pool is not None) and forward_batch.forward_mode.is_decode():
             cache = forward_batch.hip_metadata_cache_pool
             statistics = cache.compute_cache_statistics(forward_batch.batch_size)
             statistics = dict(map(lambda x: (x[0], x[1].item()), statistics.items()))
