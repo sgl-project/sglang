@@ -1,9 +1,9 @@
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
 from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
+from sgl_kernel.ops._kernels import int8_scaled_mm as _int8_scaled_mm
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
 from sgl_kernel.ops._kernels import reduce as _reduce
-from sgl_kernel.ops._kernels import test_fp16_mm as _test_fp16_mm
 
 
 def warp_reduce(input_tensor):
@@ -44,9 +44,12 @@ def moe_align_block_size(
     )
 
 
-def test_fp16_mm(out, mat_a, mat_b):
-    _test_fp16_mm(
+def int8_scaled_mm(out, mat_a, mat_b, scales_a, scales_b, bias):
+    _int8_scaled_mm(
         out,
         mat_a,
         mat_b,
+        scales_a,
+        scales_b,
+        bias,
     )
