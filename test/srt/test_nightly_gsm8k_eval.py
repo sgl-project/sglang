@@ -16,7 +16,8 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
+    launch_server_in_nightly_test,
+    parse_models,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -38,38 +39,6 @@ MODEL_SCORE_THRESHOLDS = {
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.84,
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.83,
 }
-
-
-def parse_models(model_string):
-    return [model.strip() for model in model_string.split(",") if model.strip()]
-
-
-def launch_server(base_url, model, is_fp8, is_tp2):
-    other_args = ["--log-level-http", "warning", "--trust-remote-code"]
-    if is_fp8:
-        if "Llama-3" in model or "gemma-2" in model:
-            other_args.extend(["--kv-cache-dtype", "fp8_e5m2"])
-        elif "Qwen2-72B-Instruct-FP8" in model:
-            other_args.extend(["--quantization", "fp8"])
-        else:
-            other_args.extend(["--quantization", "fp8", "--kv-cache-dtype", "fp8_e5m2"])
-    if is_tp2:
-        other_args.extend(["--tp", "2"])
-    if "DeepSeek" in model:
-        other_args.extend(["--mem-frac", "0.85"])
-    if "AWQ" in model:
-        other_args.extend(["--quantization", "awq"])
-    elif "GPTQ" in model:
-        other_args.extend(["--quantization", "gptq"])
-
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-        return_stdout_stderr=(subprocess.DEVNULL, subprocess.DEVNULL),
-    )
-    return process
 
 
 def write_results_to_json(model, metrics, mode="a"):
@@ -144,7 +113,9 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    self.process = launch_server(self.base_url, model, is_fp8, is_tp2)
+                    self.process = launch_server_with_fp8_tp2(
+                        self.base_url, model, is_fp8, is_tp2
+                    )
 
                     args = SimpleNamespace(
                         base_url=self.base_url,

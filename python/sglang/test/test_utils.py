@@ -822,3 +822,59 @@ def run_mulit_request_test(
 def write_github_step_summary(content):
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
         f.write(content)
+
+
+def launch_server_in_nightly_test(base_url, model, is_fp8, is_tp2, logging_detail=False):
+    other_args = ["--log-level-http", "warning", "--trust-remote-code"]
+    if is_fp8:
+        if "Llama-3" in model or "gemma-2" in model:
+            other_args.extend(["--kv-cache-dtype", "fp8_e5m2"])
+        elif "Qwen2-72B-Instruct-FP8" in model:
+            other_args.extend(["--quantization", "fp8"])
+        else:
+            other_args.extend(["--quantization", "fp8", "--kv-cache-dtype", "fp8_e5m2"])
+    if is_tp2:
+        other_args.extend(["--tp", "2"])
+    if "DeepSeek" in model:
+        other_args.extend(["--mem-frac", "0.85"])
+    if "AWQ" in model:
+        other_args.extend(["--quantization", "awq"])
+    elif "GPTQ" in model:
+        other_args.extend(["--quantization", "gptq"])
+
+    stdout_stderr = None if logging_detail else (subprocess.DEVNULL, subprocess.DEVNULL)
+
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        return_stdout_stderr=stdout_stderr,
+        other_args=other_args,
+    )
+    return process
+
+
+def parse_models(model_string):
+    return [model.strip() for model in model_string.split(",") if model.strip()]
+
+
+def get_available_url(url: str) -> str:
+    """Get URL with available port. If original port is occupied, return URL with new port."""
+    import socket
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    if not parsed.port:
+        return url
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("", parsed.port))
+        sock.close()
+        return url
+    except OSError:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("", 0))
+        _, new_port = sock.getsockname()
+        sock.close()
+        return f"{parsed.scheme}://{parsed.hostname}:{new_port}"
