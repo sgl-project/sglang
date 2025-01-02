@@ -70,7 +70,7 @@ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --di
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
 
 ### Example serving with Docker two H200*8 nodes
-Having two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configuring the endpoint to expose it to another docker container with `--host 0.0.0.0` and `--port 40000` and configuring nccl comms with `--nccl-init 192.168.114.10:20000`.
+Having two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configuring the endpoint to expose it to another docker container with `--host 0.0.0.0` and `--port 40000` and configuring nccl comms with `--dist-init-addr 192.168.114.10:20000`.
 
 ```bash
 # node 1
