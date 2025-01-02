@@ -125,17 +125,17 @@ def run_program_batch(
                 )
         else:
             pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
-            
+
             # Process in chunks to avoid overwhelming ThreadPoolExecutor
             # Otherwise, ThreadPoolExecutor.submit will block after adding certain number of tasks
             # so we will never reach "yield" until all tasks are done which defeat the purpose of generator style
             chunk_size = len(batch_arguments) if not generator_style else 200
-            
+
             with ThreadPoolExecutor(num_threads) as executor:
                 for chunk_start in range(0, len(batch_arguments), chunk_size):
                     chunk_end = min(chunk_start + chunk_size, len(batch_arguments))
                     chunk_futures = []
-                    
+
                     # Submit chunk of tasks
                     for i in range(chunk_start, chunk_end):
                         future = executor.submit(
@@ -151,7 +151,7 @@ def run_program_batch(
                         if pbar:
                             future.add_done_callback(lambda _: pbar.update())
                         chunk_futures.append(future)
-                    
+
                     # Yield results from this chunk as they complete
                     for future in chunk_futures:
                         yield future.result()
