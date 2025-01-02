@@ -202,12 +202,17 @@ class ModelRunner:
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
+
         if self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr[1 if self.is_draft_runner else 0]}"
+            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
-            dist_init_method = (
-                f"tcp://127.0.0.1:{self.dist_port[1 if self.is_draft_runner else 0]}"
-            )
+            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+
+        if self.is_draft_runner:
+            first_part, port = dist_init_method.rsplit(":", 1)
+            # The draft model use another port.
+            dist_init_method = first_part + ":" + str(int(port) + 1)
+
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         init_distributed_environment(
             backend=backend,

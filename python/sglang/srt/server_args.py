@@ -102,7 +102,7 @@ class ServerArgs:
     ep_size: int = 1
 
     # Multi-node distributed serving
-    dist_init_addr: Optional[List[str]] = None
+    dist_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
 
@@ -602,10 +602,8 @@ class ServerArgs:
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
-            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
             type=str,
-            help="""The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). Shoule provide
-                two host address if use speculative decoding""",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
         parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
@@ -913,17 +911,13 @@ class PortArgs:
     detokenizer_ipc_name: str
 
     # The port for nccl initialization (torch.dist)
-    # [port] if don't use speculative decoding else [tp worker port, draft worker, port]
-    nccl_port: List[int]
+    nccl_port: int
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
-        all_port = []
         port = server_args.port + random.randint(100, 1000)
         while True:
             if is_port_available(port):
-                all_port.append(port)
-            if len(all_port) == (2 if server_args.speculative_algorithm else 1):
                 break
             port += 42
 
@@ -931,7 +925,7 @@ class PortArgs:
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            nccl_port=all_port,
+            nccl_port=port,
         )
 
 

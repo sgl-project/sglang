@@ -50,9 +50,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.spec_info import SpecInfo
-
-if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 
