@@ -76,7 +76,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.speculative.speculative_worker import spec_worker_factory
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
@@ -117,6 +117,9 @@ class Scheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -200,8 +203,8 @@ class Scheduler:
             nccl_port=port_args.nccl_port,
         )
 
-        # Launch Speculative worker if need
-        if self.server_args.speculative_algorithm:
+        # Launch worker for speculative decoding if need
+        if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
@@ -871,7 +874,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            self.server_args.speculative_algorithm,
+            self.spec_algorithm,
         )
         new_batch.prepare_for_extend()
 
@@ -907,7 +910,7 @@ class Scheduler:
         # Check if decode out of memory
         buf_multiplier = (
             self.server_args.speculative_num_draft_tokens
-            if self.server_args.speculative_algorithm
+            if not self.spec_algorithm.is_none()
             else 1
         )
         if not batch.check_decode_mem(buf_multiplier) or (
@@ -952,16 +955,16 @@ class Scheduler:
         self.forward_ct += 1
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                if self.server_args.speculative_algorithm:
-                    logits_output, next_token_ids, model_worker_batch, spec_info = (
-                        self.draft_worker.forward_batch_speculative_generate(batch)
-                    )
-                    batch.spec_info = spec_info
-                else:
+                if self.spec_algorithm.is_none():
                     model_worker_batch = batch.get_model_worker_batch()
                     logits_output, next_token_ids = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
+                else:
+                    logits_output, next_token_ids, model_worker_batch, spec_info = (
+                        self.draft_worker.forward_batch_speculative_generation(batch)
+                    )
+                    batch.spec_info = spec_info
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -1108,9 +1111,8 @@ class Scheduler:
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
-            if (
-                not batch.spec_algorithm
-            ):  # speculative worker will solve the output_ids in speculative decoding
+            if batch.spec_algorithm.is_none():
+                # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
 
             req.check_finished()

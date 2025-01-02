@@ -39,8 +39,6 @@ logger = logging.getLogger(__name__)
 class TpModelWorker:
     """A tensor parallel model worker."""
 
-    is_draft_worker = False
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -48,11 +46,11 @@ class TpModelWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        is_draft_worker: bool = False,
     ):
         # Parse args
         self.tp_rank = tp_rank
         self.server_args = server_args
-        is_draft_worker = self.is_draft_worker
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -78,7 +76,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
-            is_draft_runner=is_draft_worker,
+            is_draft_worker=is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None

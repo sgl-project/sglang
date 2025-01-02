@@ -1,28 +1,22 @@
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_utils import EAGLEDraftInput
-from sglang.srt.speculative.speculative_worker import (
-    SpeculativeWorker,
-    spec_worker_factory,
-)
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-@spec_worker_factory.register("EAGLE")
-class EAGLEWorker(SpeculativeWorker):
+class EAGLEWorker(TpModelWorker):
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -30,21 +24,26 @@ class EAGLEWorker(SpeculativeWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
-        target_worker: "TpModelWorker",
+        target_worker: TpModelWorker,
     ):
-        disable_cuda_graph = server_args.disable_cuda_graph
+        # Do not capture cuda graph in `super().__init__()`
+        # We will capture it later
+        backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
         super().__init__(
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             server_args=server_args,
             nccl_port=nccl_port,
-            target_worker=target_worker,
             dp_rank=dp_rank,
+            is_draft_worker=True,
         )
+        self.target_worker = target_worker
+
+        # Share the embedding and lm_head
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         self.model_runner.model.set_embed_and_head(embed, head)
-        self.model_runner.server_args.disable_cuda_graph = disable_cuda_graph
+        self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.model_runner.init_cuda_graphs()
         self.finish_extend_len = None
 
@@ -66,7 +65,7 @@ class EAGLEWorker(SpeculativeWorker):
         self.capture_for_decode(logits_output, forward_batch)
         self._swap_mem_pool(batch, self.target_worker.model_runner)
 
-    def forward_batch_speculative_generate(self, batch: ScheduleBatch):
+    def forward_batch_speculative_generation(self, batch: ScheduleBatch):
         if batch.forward_mode.is_decode():
             prev_spec_info = batch.spec_info
             self._swap_mem_pool(batch, self.model_runner)
@@ -120,7 +119,7 @@ class EAGLEWorker(SpeculativeWorker):
         batch.forward_mode = ForwardMode.DECODE
         return res + (model_worker_batch,)
 
-    def _swap_mem_pool(self, batch: ScheduleBatch, runner: "ModelRunner"):
+    def _swap_mem_pool(self, batch: ScheduleBatch, runner: ModelRunner):
         batch.token_to_kv_pool = runner.token_to_kv_pool
         batch.req_to_token_pool = runner.req_to_token_pool
 

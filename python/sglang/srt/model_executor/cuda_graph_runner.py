@@ -156,8 +156,8 @@ class CudaGraphRunner:
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.num_tokens_per_bs = 1
-        if model_runner.server_args.speculative_algorithm == "EAGLE":
-            if self.model_runner.is_draft_runner:
+        if model_runner.spec_algorithm.is_eagle():
+            if self.model_runner.is_draft_worker:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_eagle_topk
                 )
@@ -324,7 +324,7 @@ class CudaGraphRunner:
                 EagleVerifyInput,
             )
 
-            if self.model_runner.is_draft_runner:
+            if self.model_runner.is_draft_worker:
                 spec_info = EAGLEDraftInput()
                 spec_info.hidden_states = self.hidden_states[:num_token]
                 spec_info.positions = positions

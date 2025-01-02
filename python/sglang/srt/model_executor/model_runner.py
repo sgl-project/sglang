@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
@@ -74,7 +75,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
-        is_draft_runner: bool = False,
+        is_draft_worker: bool = False,
     ):
         # Parse args
         self.model_config = model_config
@@ -85,9 +86,12 @@ class ModelRunner:
         self.tp_size = tp_size
         self.dist_port = nccl_port
         self.server_args = server_args
-        self.is_draft_runner = is_draft_runner
+        self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
 
         # Model-specific adjustment
         if (
@@ -208,22 +212,19 @@ class ModelRunner:
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
 
-        if self.is_draft_runner:
-            first_part, port = dist_init_method.rsplit(":", 1)
-            # The draft model use another port.
-            dist_init_method = first_part + ":" + str(int(port) + 1)
-
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
-        init_distributed_environment(
-            backend=backend,
-            world_size=self.tp_size,
-            rank=self.tp_rank,
-            local_rank=self.gpu_id,
-            distributed_init_method=dist_init_method,
-        )
-        # draft model is not support parallel currently
-        if not self.is_draft_runner:
+
+        if not self.is_draft_worker:
+            # Only initilzie the distributed environment on the target model worker.
+            init_distributed_environment(
+                backend=backend,
+                world_size=self.tp_size,
+                rank=self.tp_rank,
+                local_rank=self.gpu_id,
+                distributed_init_method=dist_init_method,
+            )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
@@ -418,7 +419,6 @@ class ModelRunner:
         target_dtype = (
             dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
         )
-        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
 
         assert (
             self._model_update_group is not None
@@ -529,8 +529,8 @@ class ModelRunner:
                 4096,
             )
 
-        if self.server_args.speculative_algorithm:
-            if self.is_draft_runner:
+        if not self.spec_algorithm.is_none():
+            if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
             else:
                 self.server_args.draft_runner_cache_size = (
