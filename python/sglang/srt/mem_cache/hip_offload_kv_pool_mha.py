@@ -1,3 +1,4 @@
+import os
 import time
 import torch
 from torch import Tensor
@@ -63,6 +64,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         
         self.async_set_threads: Set[threading.Thread] = set()
         
+        self.enable_async = os.getenv('HIP_DISABLE_AYSNC', '0') == '0'
+        
         uvm_allocated_bytes = 0
         gpu_allocated_bytes = 0
         for cache in self.layer_buffer:
@@ -107,29 +110,38 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         start_event = torch.cuda.Event()
         start_event.record()
 
-        def thread_main():
-            try:
-                stream = torch.cuda.Stream(device=self.device, priority=0)
-                stream.wait_event(start_event)
+        if self.enable_async:
+            def thread_main():
+                try:
+                    stream = torch.cuda.Stream(device=self.device, priority=0)
+                    stream.wait_event(start_event)
 
-                with torch.cuda.stream(stream):
-                    k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
-                        table=table,
-                        device=self.device,
-                    )
-                    assert k.device == self.device
-                    assert v.device == self.device
-                
-                stream.synchronize()
-                self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
-            finally:
-                self.prefetch_threads.pop(handle_id)
-        
-        t = threading.Thread(target=thread_main, daemon=True)
-        self.prefetch_threads[handle_id] = t
-        t.start()
-        
-        return t
+                    with torch.cuda.stream(stream):
+                        k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
+                            table=table,
+                            device=self.device,
+                        )
+                        assert k.device == self.device
+                        assert v.device == self.device
+                    
+                    stream.synchronize()
+                    self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
+                finally:
+                    self.prefetch_threads.pop(handle_id)
+            
+            t = threading.Thread(target=thread_main, daemon=True)
+            self.prefetch_threads[handle_id] = t
+            t.start()
+        else:
+            k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
+                table=table,
+                device=self.device,
+            )
+            assert k.device == self.device
+            assert v.device == self.device
+            self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
+            torch.cuda.synchronize()
+        return
     
     def get_fetched_prefix_kv_buffer(
         self,
@@ -192,6 +204,9 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         async_copy: bool = False,
         push_to_gpu_cache: bool = False,
     ):
+        if not self.enable_async:
+            async_copy = False
+        
         layer_id = layer.layer_id
         # pass async_copy=True when only prefill (eager mode)
         assert (not async_copy) or (async_copy and (not torch.cuda.is_current_stream_capturing()))
