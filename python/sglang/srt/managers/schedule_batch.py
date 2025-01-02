@@ -1174,6 +1174,7 @@ class ScheduleBatch:
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def __str__(self):

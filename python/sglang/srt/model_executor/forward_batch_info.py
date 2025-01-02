@@ -38,6 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.utils import maybe_torch_compile
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
@@ -279,7 +280,9 @@ class ForwardBatch:
             return ret
 
         # Init position information
-        if not ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode():
+            ret.positions = clamp_position(batch.seq_lens)
+        else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -387,6 +390,11 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
+
+
+@maybe_torch_compile(dynamic=True)
+def clamp_position(seq_lens):
+    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
 class CaptureHiddenMode(IntEnum):

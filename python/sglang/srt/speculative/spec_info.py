@@ -13,7 +13,10 @@ class SpeculativeAlgorithm(IntEnum):
 
     @staticmethod
     def from_string(name: str):
-        name_map = {"EAGLE": SpeculativeAlgorithm.EAGLE, "": SpeculativeAlgorithm.NONE}
+        name_map = {
+            "EAGLE": SpeculativeAlgorithm.EAGLE,
+            None: SpeculativeAlgorithm.NONE,
+        }
         return name_map[name]
 
 
