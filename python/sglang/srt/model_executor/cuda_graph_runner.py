@@ -348,8 +348,8 @@ class CudaGraphRunner:
             global_num_tokens=global_num_tokens,
             mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
+            spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=self.get_spec_info(num_tokens, positions),
-            spec_algorithm=self.model_runner.server_args.speculative_algorithm,
         )
 
         # Attention backend

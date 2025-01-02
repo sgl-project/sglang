@@ -49,7 +49,6 @@ class TpModelWorker:
     ):
         # Parse args
         self.tp_rank = tp_rank
-        self.server_args = server_args
 
         # Init model and tokenizer
         self.model_config = ModelConfig(

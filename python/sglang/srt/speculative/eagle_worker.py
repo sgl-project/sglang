@@ -39,13 +39,13 @@ class EAGLEWorker(TpModelWorker):
             is_draft_worker=True,
         )
         self.target_worker = target_worker
+        self.server_args = server_args
 
         # Share the embedding and lm_head
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         self.model_runner.model.set_embed_and_head(embed, head)
         self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.model_runner.init_cuda_graphs()
-        self.finish_extend_len = None
 
     def forward_draft_decode(self, batch: ScheduleBatch):
         batch.spec_info.prepare_for_decode(batch)
