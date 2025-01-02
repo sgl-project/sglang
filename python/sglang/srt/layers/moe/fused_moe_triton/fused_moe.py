@@ -854,11 +854,17 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
 
-        torch.sum(
-            intermediate_cache3.view(*intermediate_cache3.shape),
-            dim=1,
-            out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-        )
+        if not_hip:
+            torch.sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                dim=1,
+                out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            )
+        else:
+            ops.moe_sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            )
     return out_hidden_states
 
 
