@@ -16,7 +16,7 @@ def to_int8(tensor: torch.Tensor) -> torch.Tensor:
         line_arg="provider",
         line_vals=["vllm", "sgl-kernel"],
         line_names=["vllm", "sgl-kernel"],
-        styles=[("blue", "-"), ("green", "-")],
+        styles=[("blue", "-"), ("orange", "-")],
         ylabel="GB/s",
         plot_name="int8 scaled matmul",
         args={},
@@ -26,9 +26,9 @@ def benchmark(batch_size, provider):
     M, N, K = batch_size, 8192, 21760
     a = to_int8(torch.randn((M, K), device="cuda") * 5)
     b = to_int8(torch.randn((N, K), device="cuda").t() * 5)
-    o = torch.empty((M, N), device="cuda", dtype=torch.float16)
-    scale_a = torch.ones((M,), device="cuda", dtype=torch.float32)
-    scale_b = torch.ones((N,), device="cuda", dtype=torch.float32)
+    o = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
+    scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
     # bias = torch.zeros((N,), device="cuda", dtype=torch.bfloat16)
 
     bias = None
@@ -39,7 +39,7 @@ def benchmark(batch_size, provider):
         )
     if provider == "vllm":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: vllm_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias=bias),
+            lambda: vllm_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, bias=bias),
             quantiles=quantiles,
         )
     gbps = lambda ms: (2 * M * N * K - M * N) * a.element_size() * 1e-9 / (ms * 1e-3)

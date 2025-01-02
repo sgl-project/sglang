@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "../epilogue/epilogue_per_row_per_col_scale.h"
 #include "cutlass/complex.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
@@ -10,9 +11,6 @@
 #include "cutlass/matrix_coord.h"
 #include "cutlass/semaphore.h"
 #include "cutlass/trace.h"
-#include "cutlass_extensions/epilogue/threadblock/epilogue_per_row_per_col_scale.h"
-
-namespace tk = tensorrt_llm::common;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -91,7 +89,6 @@ struct GemmWithEpilogueVisitor {
 
     TensorRefA ref_A;
     TensorRefB ref_B;
-    tk::QuantMode quant_option;
     TensorRefAlphaCol ref_alpha_col;
     TensorRefAlphaRow ref_alpha_row;
     TensorRefC ref_C;
@@ -111,15 +108,13 @@ struct GemmWithEpilogueVisitor {
 
     /// constructs an arguments structure
     Arguments(GemmUniversalMode mode_, GemmCoord problem_size_, int batch_count_, TensorRefA ref_A_, TensorRefB ref_B_,
-              tk::QuantMode quant_option_, TensorRefAlphaCol ref_alpha_col_, TensorRefAlphaRow ref_alpha_row_,
-              TensorRefC ref_C_, TensorRefC ref_D_, int64_t batch_stride_A_, int64_t batch_stride_B_,
-              typename EpilogueVisitor::Arguments epilogue_visitor_)
+              TensorRefAlphaCol ref_alpha_col_, TensorRefAlphaRow ref_alpha_row_, TensorRefC ref_C_, TensorRefC ref_D_,
+              int64_t batch_stride_A_, int64_t batch_stride_B_, typename EpilogueVisitor::Arguments epilogue_visitor_)
         : mode(mode_),
           problem_size(problem_size_),
           batch_count(batch_count_),
           ref_A(ref_A_),
           ref_B(ref_B_),
-          quant_option(quant_option_),
           ref_alpha_col(ref_alpha_col_),
           ref_alpha_row(ref_alpha_row_),
           ref_C(ref_C_),
@@ -153,7 +148,6 @@ struct GemmWithEpilogueVisitor {
 
     void* ptr_A;
     void* ptr_B;
-    tk::QuantMode quant_option;
     typename EpilogueVisitor::ScaleTileIterator::Element* ptr_alpha_col;
     typename EpilogueVisitor::ScaleTileIterator::Element* ptr_alpha_row;
     ElementC* ptr_C;
@@ -202,7 +196,6 @@ struct GemmWithEpilogueVisitor {
           gemm_k_size(args.problem_size.k()),
           ptr_A(args.ref_A.data()),
           ptr_B(args.ref_B.data()),
-          quant_option(args.quant_option),
           ptr_alpha_col(args.ref_alpha_col.data()),
           ptr_alpha_row(args.ref_alpha_row.data()),
           ptr_C(args.ref_C.data()),
@@ -415,7 +408,7 @@ struct GemmWithEpilogueVisitor {
 
     EpilogueVisitor epilogue_visitor(
         params.epilogue_visitor, shared_storage.epilogue.visitor, params.problem_size.mn(), thread_idx, warp_idx,
-        lane_idx, params.params_alpha_col, params.params_C, params.params_D, params.quant_option, params.ptr_alpha_row,
+        lane_idx, params.params_alpha_col, params.params_C, params.params_D, true, true, params.ptr_alpha_row,
         params.ptr_alpha_col, params.ptr_C, params.ptr_D, threadblock_offset, blockIdx.y * params.problem_size.m());
 
     if (params.mode == GemmUniversalMode::kGemm) {
@@ -449,9 +442,7 @@ struct GemmWithEpilogueVisitor {
   CUTLASS_DEVICE
   void operator()(Params const& params, SharedStorage& shared_storage) {
 #if defined(__CUDA_ARCH__)
-#if (__CUDA_ARCH__ >= 720) && (__CUDA_ARCH__ < 750)
-    run_kernel<arch::Sm72>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
+#if (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
     run_kernel<arch::Sm75>(params, shared_storage);
 #elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
     run_kernel<arch::Sm80>(params, shared_storage);

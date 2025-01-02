@@ -14,21 +14,22 @@ class TestInt8Gemm(unittest.TestCase):
         a = to_int8(torch.randn((M, K), device=device) * 5)
         b = to_int8(torch.randn((N, K), device=device).t() * 5)
         o = torch.empty((M, N), device=device, dtype=out_dtype)
-        scale_a = torch.ones((M,), device="cuda", dtype=torch.float32)
-        scale_b = torch.ones((N,), device="cuda", dtype=torch.float32)
+        scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
+        scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
         if with_bias:
             bias = torch.zeros((N,), device="cuda", dtype=out_dtype)
         else:
             bias = None
 
-        int8_scaled_mm(o, a, b, scale_a, scale_b, bias)
+        int8_scaled_mm(o, a, b, scale_b, scale_a, bias)
         print(o)
         o1 = vllm_scaled_mm(a, b, scale_a, scale_b, out_dtype)
         print(o1)
-        self.assertTrue(torch.allclose(o, o1))
+        torch.testing.assert_close(o, o1)
 
     def test_accuracy(self):
-        M, N, K = 1024, 2048, 1024
+        M, N, K = 1024, 8192, 16384
+        # M, N, K = 64, 64, 64
         out_dtypes = [torch.float16, torch.bfloat16]
         for out_dtype in out_dtypes:
             self._test_accuracy_once(M, N, K, False, out_dtype, "cuda")
