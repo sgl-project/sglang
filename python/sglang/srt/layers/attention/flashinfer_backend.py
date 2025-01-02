@@ -227,7 +227,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_token: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
@@ -243,9 +243,11 @@ class FlashInferAttnBackend(AttentionBackend):
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=self.decode_use_tensor_cores,
-                        paged_kv_indptr_buffer=self.kv_indptr[i][: num_token + 1],
+                        paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
                         paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_token],
+                        paged_kv_last_page_len_buffer=self.kv_last_page_len[
+                            :num_tokens
+                        ],
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
