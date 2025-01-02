@@ -917,10 +917,9 @@ class Runtime:
         atexit.register(self.shutdown)
 
         # Pre-allocate ports
-        for port in range(10000, 40000):
+        for port in range(self.server_args.port, 40000):
             if is_port_available(port):
                 break
-            port += 1
         self.server_args.port = port
 
         self.url = self.server_args.url()
