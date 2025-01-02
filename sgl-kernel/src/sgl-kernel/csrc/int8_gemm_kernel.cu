@@ -5,14 +5,15 @@
 
 #include "utils.hpp"
 
-using ElementAccumulator = int32_t;     // <- data type of accumulator
-using ElementCompute = float;           // <- data type of epilogue operations
-using ElementInputA = int8_t;           // <- data type of elements in input matrix A
-using ElementInputB = int8_t;           // <- data type of elements in input matrix B
-using ElementOutput = cutlass::half_t;  // <- data type of elements in output matrix D
-
+template <typename OutputType>
 void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b, int m, int n,
                             int k, int64_t lda, int64_t ldb, int64_t ldc) {
+  using ElementAccumulator = int32_t;
+  using ElementCompute = float;
+  using ElementInputA = int8_t;
+  using ElementInputB = int8_t;
+  using ElementOutput = OutputType;
+
   using EpilogueOutputOp =
       cutlass::epilogue::thread::LinearCombination<ElementOutput,  // Output data type
                                                    128 / cutlass::sizeof_bits<ElementOutput>::value,
@@ -34,9 +35,9 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   Gemm gemm_op;
   cutlass::Status status;
 
-  auto a_ptr = static_cast<const int8_t*>(mat_a.data_ptr());
-  auto b_ptr = static_cast<const int8_t*>(mat_b.data_ptr());
-  auto o_ptr = static_cast<cutlass::half_t*>(out.data_ptr());
+  auto a_ptr = static_cast<const ElementInputA*>(mat_a.data_ptr());
+  auto b_ptr = static_cast<const ElementInputB*>(mat_b.data_ptr());
+  auto o_ptr = static_cast<ElementOutput*>(out.data_ptr());
 
   float alpha = 1.0f;
   float beta = 0.0f;
@@ -65,5 +66,11 @@ void int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch:
   int k = mat_a.size(1);
   int n = mat_b.size(1);
 
-  cutlass_int8_scaled_mm(out, mat_a, mat_b, m, n, k, mat_a.stride(0), mat_b.stride(1), out.stride(0));
+  if (out.scalar_type() == torch::kBFloat16) {
+    cutlass_int8_scaled_mm<cutlass::bfloat16_t>(out, mat_a, mat_b, m, n, k, mat_a.stride(0), mat_b.stride(1),
+                                                out.stride(0));
+  } else {
+    cutlass_int8_scaled_mm<cutlass::half_t>(out, mat_a, mat_b, m, n, k, mat_a.stride(0), mat_b.stride(1),
+                                            out.stride(0));
+  }
 }
