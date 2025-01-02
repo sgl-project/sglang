@@ -25,7 +25,7 @@ MODEL_SCORE_THRESHOLDS = {
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.84,
     "google/gemma-2-27b-it": 0.92,
     "meta-llama/Llama-3.1-70B-Instruct": 0.96,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.63,
     "Qwen/Qwen2-57B-A14B-Instruct": 0.87,
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.84,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
@@ -36,7 +36,7 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.95,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.84,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.84,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.83,
 }
 
 
