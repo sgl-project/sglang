@@ -113,7 +113,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    self.process = launch_server_with_fp8_tp2(
+                    self.process = launch_server_in_nightly_test(
                         self.base_url, model, is_fp8, is_tp2
                     )
 

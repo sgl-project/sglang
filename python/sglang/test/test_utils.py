@@ -824,7 +824,9 @@ def write_github_step_summary(content):
         f.write(content)
 
 
-def launch_server_in_nightly_test(base_url, model, is_fp8, is_tp2, logging_detail=False):
+def launch_server_in_nightly_test(
+    base_url, model, is_fp8, is_tp2, logging_details=False
+):
     other_args = ["--log-level-http", "warning", "--trust-remote-code"]
     if is_fp8:
         if "Llama-3" in model or "gemma-2" in model:
@@ -842,7 +844,7 @@ def launch_server_in_nightly_test(base_url, model, is_fp8, is_tp2, logging_detai
     elif "GPTQ" in model:
         other_args.extend(["--quantization", "gptq"])
 
-    stdout_stderr = None if logging_detail else (subprocess.DEVNULL, subprocess.DEVNULL)
+    stdout_stderr = None if logging_details else (subprocess.PIPE, subprocess.PIPE)
 
     process = popen_launch_server(
         model,

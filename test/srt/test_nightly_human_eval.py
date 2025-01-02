@@ -10,17 +10,33 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     get_available_url,
+    is_in_ci,
     launch_server_in_nightly_test,
     parse_models,
-    write_github_step_summary,
 )
+
+
+def parse_humaneval_results(output_text):
+    results = {}
+    for line in output_text.split("\n"):
+        if "pass@1" in line:
+            test_type = (
+                "base"
+                if "base tests"
+                in output_text.split("\n")[output_text.split("\n").index(line) - 1]
+                else "extra"
+            )
+            score = float(line.split("\t")[1])
+            results[test_type] = score
+    return results
 
 
 class TestEvalAccuracyLarge(unittest.TestCase):
 
-    def run_evalplus(self, model, logging_details=False):
+    def run_evalplus(self, model, is_tp2, logging_details=False):
         print("Delete evalplus results")
         shutil.rmtree("evalplus_results", ignore_errors=True)
         cmd = [
@@ -36,19 +52,20 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             "--greedy",
         ]
 
-        stdout_stderr = (
-            None if logging_details else (subprocess.DEVNULL, subprocess.DEVNULL)
-        )
+        stdout_stderr = None if logging_details else (subprocess.PIPE, subprocess.PIPE)
 
         try:
             self.eval_process = subprocess.Popen(
                 cmd,
                 text=True,
-                return_stdout_stderr=stdout_stderr,
+                stdout=stdout_stderr[0] if stdout_stderr else None,
+                stderr=stdout_stderr[1] if stdout_stderr else None,
                 preexec_fn=os.setsid,
             )
 
-            stdout, stderr = self.eval_process.communicate(timeout=600)
+            stdout, stderr = self.eval_process.communicate(
+                timeout=1200 if is_tp2 else 600
+            )
 
             assert (
                 self.eval_process.returncode == 0
@@ -88,10 +105,9 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             for model in model_group:
                 if "Llama" not in model:
                     continue
-
                 self.server_process = None
                 self.eval_process = None
-                logging_details = True
+                logging_details = False
                 try:
                     self.server_process = launch_server_in_nightly_test(
                         self.base_url,
@@ -100,8 +116,10 @@ class TestEvalAccuracyLarge(unittest.TestCase):
                         is_tp2,
                         logging_details=logging_details,
                     )
-                    self.model_results[model] = self.run_evalplus(
-                        model, logging_details=logging_details
+                    self.model_results[model] = parse_humaneval_results(
+                        self.run_evalplus(
+                            model, is_tp2=is_tp2, logging_details=logging_details
+                        )
                     )
 
                 except Exception as e:
@@ -115,8 +133,11 @@ class TestEvalAccuracyLarge(unittest.TestCase):
                                 kill_process_tree(process.pid)
                             except Exception as cleanup_error:
                                 errors.append(f"Cleanup error: {cleanup_error}")
+        print(self.model_results)
+        if is_in_ci():
+            from sglang.test.test_utils import write_github_step_summary
 
-        write_github_step_summary(self.model_results)
+            write_github_step_summary(self.model_results)
         if errors:
             raise Exception("\n".join(errors))
 
