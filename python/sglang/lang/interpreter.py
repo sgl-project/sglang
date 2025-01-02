@@ -110,37 +110,11 @@ def run_program_batch(
         num_threads = max(96, multiprocessing.cpu_count() * 16)
     num_threads = min(num_threads, len(batch_arguments))
 
-    rets = []
-    if num_threads == 1:
-        if progress_bar and not generator_style:
-            iterator = tqdm.tqdm(batch_arguments)
-        else:
-            iterator = batch_arguments
-
-        for arguments in iterator:
-            result = run_program(
-                program,
-                backend,
-                (),
-                arguments,
-                default_sampling_para,
-                False,
-                True,
-            )
-            if generator_style:
-                yield result
-            else:
-                rets.append(result)
-
-    else:
-        if progress_bar and not generator_style:
-            pbar = tqdm.tqdm(total=len(batch_arguments))
-
-        futures = []
-        with ThreadPoolExecutor(num_threads) as executor:
-            for arguments in batch_arguments:
-                future = executor.submit(
-                    run_program,
+    def generate_results():
+        if num_threads == 1:
+            iterator = tqdm.tqdm(batch_arguments) if progress_bar else batch_arguments
+            for arguments in iterator:
+                yield run_program(
                     program,
                     backend,
                     (),
@@ -149,23 +123,39 @@ def run_program_batch(
                     False,
                     True,
                 )
-                futures.append(future)
-                if progress_bar and not generator_style:
-                    future.add_done_callback(lambda _: pbar.update())
+        else:
+            pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
+            futures = []
+            
+            with ThreadPoolExecutor(num_threads) as executor:
+                for arguments in batch_arguments:
+                    future = executor.submit(
+                        run_program,
+                        program,
+                        backend,
+                        (),
+                        arguments,
+                        default_sampling_para,
+                        False,
+                        True,
+                    )
+                    futures.append(future)
+                    if pbar:
+                        future.add_done_callback(lambda _: pbar.update())
 
-        if generator_style:
             # Wait for each future in order to maintain input order
             for future in futures:
                 yield future.result()
-        else:
-            rets = [f.result() for f in futures]
-            rets[-1].sync()
 
-        if progress_bar and not generator_style:
-            pbar.close()
+            if pbar:
+                pbar.close()
 
+    results = generate_results()
     if not generator_style:
-        return rets
+        results = list(results)
+        if results:  # Only sync if we have results
+            results[-1].sync()
+    return results
 
 
 def cache_program(program, backend):
