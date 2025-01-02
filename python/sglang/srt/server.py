@@ -27,7 +27,9 @@ import signal
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Dict, List, Optional, Union
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
+
+import torch
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -78,6 +80,7 @@ from sglang.srt.openai_api.adapter import (
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     assert_pkg_version,
@@ -874,9 +877,11 @@ class Engine:
             tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
-    def update_weights_from_tensor(self, name, tensor):
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
         """Update weights from distributed source."""
-        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
+        )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             tokenizer_manager.update_weights_from_tensor(obj, None)
