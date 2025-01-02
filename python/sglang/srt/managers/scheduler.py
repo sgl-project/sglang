@@ -1424,6 +1424,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
+            self.spec_algorithm,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
