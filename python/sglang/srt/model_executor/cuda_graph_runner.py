@@ -33,7 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
+from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -106,11 +106,6 @@ def set_torch_compile_config():
         torch._dynamo.config.cache_size_limit = 1024
 
 
-@maybe_torch_compile(dynamic=True)
-def clamp_position(seq_lens):
-    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
-
-
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -157,6 +152,17 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.num_tokens_per_bs = 1
 
+        if model_runner.spec_algorithm.is_eagle():
+            if self.model_runner.is_draft_worker:
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_eagle_topk
+                )
+            else:
+                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_num_draft_tokens
+                )
+
         self.compile_bs = (
             [
                 bs
@@ -191,6 +197,13 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
+
+            # Speculative_inference
+            if model_runner.spec_algorithm.is_eagle():
+                self.hidden_states = torch.zeros(
+                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                )
 
             if self.is_encoder_decoder:
                 # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
@@ -234,9 +247,6 @@ class CudaGraphRunner:
             self.model_runner.model.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        if not forward_batch.forward_mode.is_cuda_graph():
-            return False
-
         if self.enable_dp_attention:
             min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
                 forward_batch.global_num_tokens
@@ -291,21 +301,18 @@ class CudaGraphRunner:
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
-        num_token = bs * self.num_tokens_per_bs
+        num_tokens = bs * self.num_tokens_per_bs
 
         # Common inputs
-        input_ids = self.input_ids[:num_token]
+        input_ids = self.input_ids[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
-        out_cache_loc = self.out_cache_loc[:num_token]
-        positions = self.positions[:num_token]
-
+        out_cache_loc = self.out_cache_loc[:num_tokens]
+        positions = self.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
         else:
             encoder_lens = None
-
-        seq_lens_sum = seq_lens.sum().item()
         mrope_positions = self.mrope_positions[:, :bs]
 
         if self.enable_dp_attention:
@@ -325,20 +332,22 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens_sum,
+            seq_lens_sum=seq_lens.sum(),
             encoder_lens=encoder_lens,
             return_logprob=False,
-            top_logprobs_nums=[0] * num_token,
+            top_logprobs_nums=[0] * bs,
             positions=positions,
             global_num_tokens=global_num_tokens,
             mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=self.get_spec_info(num_tokens, positions),
         )
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
-            num_token,
+            num_tokens,
             req_pool_indices,
             seq_lens,
             encoder_lens,
@@ -394,13 +403,15 @@ class CudaGraphRunner:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-        positions = clamp_position(forward_batch.seq_lens)
-        self.positions[:raw_num_token].copy_(positions)
+        self.positions[:raw_num_token].copy_(forward_batch.positions)
 
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
+
+        if hasattr(forward_batch.spec_info, "hidden_states"):
+            self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -424,3 +435,36 @@ class CudaGraphRunner:
             ),
         )
         return logits_output
+
+    def get_spec_info(self, num_tokens: int, positions: torch.Tensor):
+        spec_info = None
+        if self.model_runner.spec_algorithm.is_eagle():
+            from sglang.srt.speculative.eagle_utils import (
+                EAGLEDraftInput,
+                EagleVerifyInput,
+            )
+
+            if self.model_runner.is_draft_worker:
+                spec_info = EAGLEDraftInput()
+                spec_info.hidden_states = self.hidden_states[:num_tokens]
+                spec_info.positions = positions
+                spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+                spec_info.init(self.model_runner.server_args)
+            else:
+                spec_info = EagleVerifyInput(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.model_runner.server_args.speculative_num_draft_tokens,
+                )
+                spec_info.custom_mask = torch.zeros(
+                    (num_tokens * self.model_runner.model_config.context_len),
+                    dtype=torch.bool,
+                    device="cuda",
+                )
+                spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        return spec_info
