@@ -252,9 +252,6 @@ class CudaGraphRunner:
             self.model_runner.model.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        if not forward_batch.forward_mode.is_cuda_graph():
-            return False
-
         if self.enable_dp_attention:
             min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
                 forward_batch.global_num_tokens
@@ -411,10 +408,7 @@ class CudaGraphRunner:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-        positions = forward_batch.positions
-        if positions is None:
-            positions = clamp_position(forward_batch.seq_lens)
-        self.positions[:raw_num_token].copy_(positions)
+        self.positions[:raw_num_token].copy_(forward_batch.positions)
 
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
