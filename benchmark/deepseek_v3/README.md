@@ -71,6 +71,7 @@ If you have two H100 nodes, the usage is similar to the aforementioned H20.
 
 ### Example serving with Docker two H200*8 nodes
 There are two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 192.168.114.10:20000`.
+A single H200 with 8 devices can run DeepSeek V3, the dual H200 setup is just to demonstrate multi-node usage.
 
 ```bash
 # node 1
