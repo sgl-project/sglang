@@ -6,6 +6,8 @@ from json import JSONDecodeError, JSONDecoder
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 
+from sglang.srt.openai_api.protocol import ToolCallItem
+
 
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
@@ -34,15 +36,6 @@ def _is_complete_json(input_str: str) -> bool:
         return True
     except JSONDecodeError:
         return False
-
-
-class ToolCallItem:
-    """Used to store information about a single recognized function/tool call."""
-
-    def __init__(self, tool_index: Optional[int], name: Optional[str], arguments: Optional[str]):
-        self.tool_index = tool_index
-        self.name = name
-        self.arguments = arguments
 
 
 class StreamingParseResult:
@@ -120,12 +113,17 @@ class Qwen25Detector(BaseFormatDetector):
         calls = []
         for match_result in match_result_list:
             action = json.loads(match_result)
-            name, parameters = action["name"], json.dumps(action.get("parameters", action.get("arguments", {})), ensure_ascii=False)
+            name, parameters = action["name"], json.dumps(
+                action.get("parameters", action.get("arguments", {})),
+                ensure_ascii=False,
+            )
             tool_index = [tool.function.name for tool in tools].index(name)
-            tool_call_item = ToolCallItem(tool_index=tool_index, name=name, arguments=parameters)
+            tool_call_item = ToolCallItem(
+                tool_index=tool_index, name=name, parameters=parameters
+            )
             calls.append(tool_call_item)
         return calls
-    
+
     def parse_streaming_increment(
         self, new_text: str, tools: List["Tool"]
     ) -> StreamingParseResult:
@@ -214,7 +212,7 @@ class Qwen25Detector(BaseFormatDetector):
                                 ToolCallItem(
                                     tool_index=self.current_tool_id,
                                     name="",
-                                    arguments=argument_diff,
+                                    parameters=argument_diff,
                                 )
                             ],
                         )
@@ -243,7 +241,7 @@ class Qwen25Detector(BaseFormatDetector):
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
                                 name=function_name,
-                                arguments="",
+                                parameters="",
                             )
                         ],
                     )
@@ -280,7 +278,7 @@ class Qwen25Detector(BaseFormatDetector):
                                 ToolCallItem(
                                     tool_index=self.current_tool_id,
                                     name="",
-                                    arguments=argument_diff,
+                                    parameters=argument_diff,
                                 )
                             ],
                         )
@@ -295,9 +293,8 @@ class Qwen25Detector(BaseFormatDetector):
             print("Error trying to handle streaming tool call.")
             print("Skipping chunk as a result of tool streaming extraction " "error")
             return StreamingParseResult()
-    
-    
-    
+
+
 class Llama32Detector(BaseFormatDetector):
     """
     Detector for Llama 3.2 models.
@@ -344,7 +341,9 @@ class Llama32Detector(BaseFormatDetector):
             ensure_ascii=False,
         )
         tool_index = [tool.function.name for tool in tools].index(name)
-        tool_call_item = ToolCallItem(tool_index=tool_index, name=name, arguments=parameters)
+        tool_call_item = ToolCallItem(
+            tool_index=tool_index, name=name, parameters=parameters
+        )
         calls = [tool_call_item]
         return calls
 
@@ -430,7 +429,7 @@ class Llama32Detector(BaseFormatDetector):
                                 ToolCallItem(
                                     tool_index=self.current_tool_id,
                                     name="",
-                                    arguments=argument_diff,
+                                    parameters=argument_diff,
                                 )
                             ],
                         )
@@ -459,7 +458,7 @@ class Llama32Detector(BaseFormatDetector):
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
                                 name=function_name,
-                                arguments="",
+                                parameters="",
                             )
                         ],
                     )
@@ -496,7 +495,7 @@ class Llama32Detector(BaseFormatDetector):
                                 ToolCallItem(
                                     tool_index=self.current_tool_id,
                                     name="",
-                                    arguments=argument_diff,
+                                    parameters=argument_diff,
                                 )
                             ],
                         )
@@ -677,7 +676,9 @@ class FunctionCallParser:
         """
         Non-streaming call: one-time parsing
         """
-        full_normal_text, calls = self.multi_format_parser.parse_once(full_text, self.tools)
+        full_normal_text, calls = self.multi_format_parser.parse_once(
+            full_text, self.tools
+        )
         return full_normal_text, calls
 
     def parse_stream_chunk(self, chunk_text: str):
