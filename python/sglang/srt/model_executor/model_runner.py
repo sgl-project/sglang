@@ -259,6 +259,7 @@ class ModelRunner:
             load_config=self.load_config,
             device_config=DeviceConfig(self.device),
         )
+        self.model_layer = self.model.model.layers[0].self_attn.attn
 
         # Parse other args
         self.sliding_window_size = (
@@ -639,7 +640,7 @@ class ModelRunner:
 
         tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        self.cuda_graph_runner = CudaGraphRunner(self, self.model_layer)
         logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
@@ -654,13 +655,19 @@ class ModelRunner:
             return self.cuda_graph_runner.replay(forward_batch)
 
         forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
-        self.attn_backend.init_forward_metadata(forward_batch)
+        if isinstance(self.attn_backend, FlashInferAttnBackend):
+            self.attn_backend.init_forward_metadata(forward_batch, self.model_layer)
+        else:
+            self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
-        self.attn_backend.init_forward_metadata(forward_batch)
+        if isinstance(self.attn_backend, FlashInferAttnBackend):
+            self.attn_backend.init_forward_metadata(forward_batch, self.model_layer)
+        else:
+            self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
             if forward_batch.input_embeds is None:
                 return self.model.forward(
