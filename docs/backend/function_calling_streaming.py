@@ -1,35 +1,50 @@
 from openai import OpenAI
 import json
 
-# Define tools
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_weather",
-            "description": "Get the current weather in a given location",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "The city and state, e.g. San Francisco, CA",
-                    },
-                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_current_weather",
+        "description": "Get the current weather in a given location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type":
+                    "string",
+                    "description":
+                    "The city to find the weather for, e.g. 'San Francisco'"
                 },
-                "required": ["location"],
+                "state": {
+                    "type":
+                    "string",
+                    "description":
+                    "the two-letter abbreviation for the state that the city is"
+                    " in, e.g. 'CA' which would mean 'California'"
+                },
+                "unit": {
+                    "type": "string",
+                    "description": "The unit to fetch the temperature in",
+                    "enum": ["celsius", "fahrenheit"]
+                }
             },
-        },
+            "required": ["city", "state", "unit"]
+        }
     }
-]
+}]
 
-# Messages from the user
-messages = [
-    {
-        "role": "user",
-        "content": "What's the weather like in Boston today? Please respond with the format: Today's weather is :{function call result}",
-    }
-]
+messages = [{
+    "role": "user",
+    "content": "Hi! How are you doing today?"
+}, {
+    "role": "assistant",
+    "content": "I'm doing well! How can I help you?"
+}, {
+    "role":
+    "user",
+    "content":
+    "Can you tell me what the temperate will be in Dallas, in fahrenheit?"
+}]
 
 # Initialize OpenAI-like client
 client = OpenAI(api_key="YOUR_API_KEY", base_url="http://0.0.0.0:30000/v1")
@@ -94,10 +109,10 @@ messages.append(
 )
 
 
-# Define the actual function for getting current weather
-def get_current_weather(location: str, unit: str):
-    # Here you can integrate an actual weather API
-    return f"The weather in {location} is 85 degrees {unit}. It is partly cloudy, with highs in the 90's."
+# Now, simulate a tool call
+def get_current_weather(city: str, state: str, unit: 'str'):
+    return ("The weather in Dallas, Texas is 85 degrees fahrenheit. It is "
+            "partly cloudly, with highs in the 90's.")
 
 
 # Simulate tool call
@@ -124,16 +139,3 @@ else:
     print("Function call name not found.")
 
 print(f"Messages: {messages}")
-
-# Use the function call result to continue the conversation
-chat_completion_final = client.chat.completions.create(
-    model=model_name,
-    messages=messages,
-    temperature=0.8,
-    top_p=0.8,
-    stream=False,
-    tools=tools,
-)
-
-print("\nFinal Chat Completion:")
-print(chat_completion_final)
