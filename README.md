@@ -46,9 +46,10 @@ The core features include:
 
 ## Getting Started
 - [Install SGLang](https://sgl-project.github.io/start/install.html)
-- [Send requests](https://sgl-project.github.io/start/send_request.html)
-- [Backend: SGLang Runtime (SRT)](https://sgl-project.github.io/backend/backend.html)
-- [Frontend: Structured Generation Language (SGLang)](https://sgl-project.github.io/frontend/frontend.html)
+- [Quick Start](https://sgl-project.github.io/start/send_request.html)
+- [Backend Tutorial](https://sgl-project.github.io/backend/openai_api_completions.html)
+- [Frontend Tutorial](https://sgl-project.github.io/frontend/frontend.html)
+- [Contribution Guide](https://sgl-project.github.io/references/contribution_guide.html)
 
 ## Benchmark and Performance
 Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
