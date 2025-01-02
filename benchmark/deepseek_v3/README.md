@@ -56,6 +56,19 @@ response = client.chat.completions.create(
 )
 print(response)
 ```
+### Example serving with 2 H20*8
+For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`.
+
+```bash
+# node 1
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
+
+# node 2
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
+```
+
+If you have two H100 nodes, the usage is similar to the aforementioned H20.
+
 ### Example serving with Docker two H200*8 nodes
 Having two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configuring the endpoint to expose it to another docker container with `--host 0.0.0.0` and `--port 40000` and configuring nccl comms with `--nccl-init 192.168.114.10:20000`.
 
