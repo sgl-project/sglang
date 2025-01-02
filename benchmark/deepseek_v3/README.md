@@ -102,7 +102,7 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 1 --trust-remote-code --host 0.0.0.0 --port 40000
 ```
 
-To ensure the functionality, we include a testing from a client docker container:
+To ensure functionality, we include a test from a client Docker container.
 ```bash
 docker run --gpus all \
     --shm-size 32g \
