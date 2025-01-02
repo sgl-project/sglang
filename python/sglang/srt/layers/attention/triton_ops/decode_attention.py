@@ -434,6 +434,12 @@ def _fwd_grouped_kernel_stage1(
                     offs_scale_kpe = (
                         kv_loc[None, :] * stride_scale_kbs + cur_kv_head * stride_scale_kh
                     )
+                    k_scale = tl.load(
+                        K_Scale_Buffer + offs_scale_kpe,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
+                    )
+                    kpe = (kpe_int8.to(scales_dtype) * k_scale).to(tl.float32)
                     
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
@@ -450,11 +456,27 @@ def _fwd_grouped_kernel_stage1(
                 + cur_kv_head * stride_buf_vh
                 + offs_dv[None, :]
             )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                other=0.0,
-            )
+            if not USE_INT8_KV:
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
+            else:
+                v_int8 = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
+                offs_scale_v = (
+                    kv_loc[None, :] * stride_scale_vbs + cur_kv_head * stride_scale_vh
+                )
+                v_scale = tl.load(
+                    V_Scale_Buffer + offs_scale_v,
+                    mask=offs_n[None, :] < split_kv_end,
+                    other=1.0,
+                )
+                v = (v_int8.to(scales_dtype) * v_scale).to(tl.float32)
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
