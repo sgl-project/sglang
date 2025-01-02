@@ -470,14 +470,12 @@ def _prepare_presharded_weights(
     import glob
     import os
 
-    from sglang.srt.model_loader.weight_utils import download_weights_from_hf
-
     if get_tensor_model_parallel_world_size() == 1:
         return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
 
-    is_local = os.path.isdir(model_name_or_path)
+    if not os.path.isdir(model_name_or_path):
+        from sglang.srt.model_loader.weight_utils import download_weights_from_hf
 
-    if not is_local:
         allow_patterns = ["*.safetensors", "*.bin"]
         hf_folder = download_weights_from_hf(
             model_name_or_path,
