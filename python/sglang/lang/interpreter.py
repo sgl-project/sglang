@@ -126,7 +126,7 @@ def run_program_batch(
         else:
             pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
             futures = []
-            
+
             with ThreadPoolExecutor(num_threads) as executor:
                 for arguments in batch_arguments:
                     future = executor.submit(
