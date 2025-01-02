@@ -23,7 +23,9 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
 
     def __init__(
         self,
-        size: int,
+        max_token_size: int,
+        max_mask_cache_token_size: int,
+        max_sa_cache_token_size: int,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
@@ -32,18 +34,17 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
     ):
         assert isinstance(device, torch.device)
         assert device.index is not None
-        
-        super().__init__(size, dtype, device)
+        super().__init__(max_token_size, dtype, device)
         
         #TODO: derive token sizes from size
         self.head_num = head_num
         self.head_dim = head_dim
-        self.max_mask_cache_token_size = 32 * 1024
-        self.max_sa_cache_token_size = 4 * 1024
+        self.max_mask_cache_token_size = max_mask_cache_token_size * head_num
+        self.max_sa_cache_token_size = max_sa_cache_token_size * head_num
         
         self.layer_buffer = [
             HiPOffloadCache(
-                max_token_size=size + 1,
+                max_token_size=max_token_size + 1,
                 max_mask_cache_token_size=self.max_mask_cache_token_size,
                 max_sa_cache_token_size=self.max_sa_cache_token_size,
                 head_num=head_num,
@@ -132,7 +133,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         cache_k: Tensor,
         cache_v: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-        return cache_k, cache_v
+        # return cache_k, cache_v
     
         # Use this function for prefill
         handle_id = (layer_id, batch_id)

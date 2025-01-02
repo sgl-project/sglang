@@ -135,12 +135,13 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
                     # print(k_chunk.shape)
 
-                    _k_chunk = torch.zeros((1, 196608, k_chunk.shape[2], 128), dtype=k_chunk.dtype, device=k_chunk.device)
-                    _v_chunk = torch.zeros((1, 196608, k_chunk.shape[2], 128), dtype=k_chunk.dtype, device=k_chunk.device)
-                    _k_chunk[:, :k_chunk.shape[1], :, :] = k_chunk
-                    _v_chunk[:, :v_chunk.shape[1], :, :] = v_chunk
-                    k_chunk = _k_chunk
-                    v_chunk = _v_chunk
+                    # BUG: test padding...
+                    # _k_chunk = torch.zeros((1, 196608, k_chunk.shape[2], k_chunk.shape[3]), dtype=k_chunk.dtype, device=k_chunk.device)
+                    # _v_chunk = torch.zeros((1, 196608, k_chunk.shape[2], k_chunk.shape[3]), dtype=k_chunk.dtype, device=k_chunk.device)
+                    # _k_chunk[:, :k_chunk.shape[1], :, :] = k_chunk
+                    # _v_chunk[:, :v_chunk.shape[1], :, :] = v_chunk
+                    # k_chunk = _k_chunk
+                    # v_chunk = _v_chunk
 
                     # print(k_chunk.shape)
 
@@ -221,7 +222,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
         metadata = None
         if forward_batch.hip_use_cached_mask:
             metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
-                layer.layer_id, q.shape[0], forward_batch.batch_size)
+                layer.layer_id, q.shape[0], forward_batch.batch_size
+            )
 
         o, metadata = self.forward_paged_hip(
             query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -243,7 +245,14 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
-            layer.layer_id, q.shape[0], forward_batch.batch_size, metadata)
+            layer_id=layer.layer_id, 
+            size=q.shape[0],
+            batch_size=forward_batch.batch_size, 
+            metadata=metadata,
+        )
+
+        if is_offload_cache:
+            offload_cache.handle_cache_miss(metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

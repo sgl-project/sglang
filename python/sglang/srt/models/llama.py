@@ -289,10 +289,6 @@ class LlamaModel(nn.Module):
         residual = None
         
         def prefetch_layer(layer_id: int):
-            if not forward_batch.forward_mode.is_extend():
-                return
-            return
-
             assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
             for ibatch in range(forward_batch.batch_size):
                 req_to_tokens = forward_batch.req_to_token_pool.req_to_token
@@ -308,11 +304,14 @@ class LlamaModel(nn.Module):
                     prefix_seq_len=forward_batch.extend_prefix_lens_cpu[ibatch]
                 )
         
-        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+        require_prefetch = forward_batch.forward_mode.is_extend() and\
+            isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
+
+        if require_prefetch:
             prefetch_layer(0)
         
         for i in range(len(self.layers)):
-            if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+            if require_prefetch:
                 if i < (len(self.layers) - 1):
                     prefetch_layer(i+1)
             layer = self.layers[i]
@@ -322,14 +321,12 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-            if forward_batch.forward_mode.is_extend() and\
-                isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+            if require_prefetch:
                 torch.cuda.current_stream(hidden_states.device).synchronize()
         
         hidden_states, _ = self.norm(hidden_states, residual)
         
-        if forward_batch.forward_mode.is_extend() and\
-            isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool):
+        if require_prefetch:
             forward_batch.token_to_kv_pool.synchronize()
         
         return hidden_states

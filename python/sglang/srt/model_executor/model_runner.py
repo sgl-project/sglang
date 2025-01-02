@@ -568,7 +568,9 @@ class ModelRunner:
             )
         elif self.server_args.enable_hip_attention and self.server_args.enable_hip_offload:
             self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
-                self.max_total_num_tokens,
+                max_token_size=self.max_total_num_tokens,
+                max_mask_cache_token_size=self.server_args.hip_max_mask_cache_token_size,
+                max_sa_cache_token_size=self.server_args.hip_max_sa_cache_token_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
                 head_dim=self.model_config.head_dim,

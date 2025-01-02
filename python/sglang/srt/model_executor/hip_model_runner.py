@@ -9,6 +9,8 @@ from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +71,7 @@ class HiPModelRunner(ModelRunner):
         
         if self.server_args.enable_hip_attention:
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
-                self.max_total_num_tokens,
-                head_num=self.model_config.num_attention_heads // self.server_args.tp_size,
+                query_head_num=self.model_config.num_attention_heads // self.server_args.tp_size,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 hip_config=self.hip_attention_config,
@@ -79,3 +80,21 @@ class HiPModelRunner(ModelRunner):
             f"Memory + HiP pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+    
+    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        if forward_batch.forward_mode.is_decode():
+            result = self.forward_decode(forward_batch)
+        elif forward_batch.forward_mode.is_extend():
+            result = self.forward_extend(forward_batch)
+        elif forward_batch.forward_mode.is_idle():
+            result = self.forward_idle(forward_batch)
+        else:
+            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
+    
+        if forward_batch.hip_metadata_cache_pool is not None:
+            cache = forward_batch.hip_metadata_cache_pool
+            statistics = cache.compute_cache_statistics(forward_batch.batch_size)
+            statistics = dict(map(lambda x: (x[0], x[1].item()), statistics.items()))
+            logger.info(f'cache statistics {statistics}')
+
+        return result
