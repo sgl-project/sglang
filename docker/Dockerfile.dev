@@ -21,6 +21,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+RUN apt update -y \
+    && apt install -y --no-install-recommends gnupg \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+    && apt update -y \
+    && apt install nsight-systems-cli -y
+
 # Set up locale
 RUN locale-gen en_US.UTF-8
 ENV LANG en_US.UTF-8

@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -149,12 +150,18 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
+        skip_sample: bool = False,
     ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:
             launch_done.set()
-        next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+
+        if skip_sample:
+            next_token_ids = None
+        else:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+
         return logits_output, next_token_ids
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
@@ -185,6 +192,12 @@ class TpModelWorker:
     ):
         success, message = self.model_runner.update_weights_from_distributed(
             recv_req.name, recv_req.dtype, recv_req.shape
+        )
+        return success, message
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        success, message = self.model_runner.update_weights_from_tensor(
+            recv_req.name, recv_req.tensor
         )
         return success, message
 

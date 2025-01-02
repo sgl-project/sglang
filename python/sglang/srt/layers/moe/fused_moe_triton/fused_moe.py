@@ -11,12 +11,17 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import direct_register_custom_op, get_device_name
+from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
+
+not_hip = False
+if not is_hip():
+    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+    not_hip = True
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
@@ -267,8 +272,14 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    # FIXME(zhyncs)
-    if num_experts >= 256:
+    if not_hip and num_experts >= 224:
+        token_cnts_buffer = torch.empty(
+            (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
+        )
+        cumsum_buffer = torch.empty(
+            num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        )
+
         sgl_moe_align_block_size(
             topk_ids,
             num_experts,
@@ -276,6 +287,8 @@ def moe_align_block_size(
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
+            token_cnts_buffer,
+            cumsum_buffer,
         )
     else:
         ops.moe_align_block_size(
@@ -379,14 +392,25 @@ def invoke_fused_moe_kernel(
     )
 
 
-def get_config_file_name(E: int, N: int, dtype: Optional[str]) -> str:
+def get_config_file_name(
+    E: int, N: int, dtype: Optional[str], block_shape: Optional[int] = None
+) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}.json"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    )
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"
 
 
 @functools.lru_cache
-def get_moe_configs(E: int, N: int, dtype: Optional[str]) -> Optional[Dict[int, Any]]:
+def get_moe_configs(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_n: Optional[int] = 0,
+    block_k: Optional[int] = 0,
+) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
 
@@ -398,7 +422,7 @@ def get_moe_configs(E: int, N: int, dtype: Optional[str]) -> Optional[Dict[int, 
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    json_file_name = get_config_file_name(E, N, dtype)
+    json_file_name = get_config_file_name(E, N, dtype, [block_n, block_k])
 
     config_file_path = os.path.join(
         os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
@@ -429,24 +453,36 @@ def get_default_config(
     topk: int,
     dtype: Optional[str],
     is_marlin: bool,
+    block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
     if dtype == "fp8_w8a8":
-        config = {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 32,
-            "num_warps": 8,
-            "num_stages": 4,
-        }
-        if M <= E:
+        if block_shape is None:
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 32,
+                "num_warps": 8,
+                "num_stages": 4,
+            }
+            if M <= E:
+                config = {
+                    "BLOCK_SIZE_M": 64,
+                    "BLOCK_SIZE_N": 128,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 4,
+                    "num_stages": 4,
+                }
+        else:
+            # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
             config = {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
+                "BLOCK_SIZE_N": block_shape[0],
+                "BLOCK_SIZE_K": block_shape[1],
+                "GROUP_SIZE_M": 32,
                 "num_warps": 4,
-                "num_stages": 4,
+                "num_stages": 3,
             }
     else:
         config = {
@@ -483,7 +519,9 @@ def try_get_optimal_moe_config(
     else:
         # First try to load optimal config from the file
         E, _, N = w2_shape
-        configs = get_moe_configs(E, N, dtype)
+        block_n = block_shape[0] if block_shape else 0
+        block_k = block_shape[1] if block_shape else 0
+        configs = get_moe_configs(E, N, dtype, block_n, block_k)
 
         if configs:
             # If an optimal configuration map has been found, look up the
@@ -491,14 +529,9 @@ def try_get_optimal_moe_config(
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         else:
             # Else use the default config
-            config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, is_marlin)
-    # TODO(HandH1998): Optimize the configs of block-wise quant.
-    # NOTE(HandH1998): For block-wise quant,
-    # BLOCK_K must be divisable by block_shape[1]
-    # BLOCK_N and BLOCK_M has no requirements
-    if block_shape is not None:
-        config["BLOCK_SIZE_N"] = block_shape[0]
-        config["BLOCK_SIZE_K"] = block_shape[1]
+            config = get_default_config(
+                M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
+            )
     return config
 
 
