@@ -1,67 +1,5 @@
-# Backend: SGLang Runtime (SRT)
-The SGLang Runtime (SRT) is an efficient serving engine.
+# Server Arguments
 
-## Quick Start
-Launch a server
-```
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
-```
-
-Send a request
-```
-curl http://localhost:30000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Once upon a time,",
-    "sampling_params": {
-      "max_new_tokens": 16,
-      "temperature": 0
-    }
-  }'
-```
-
-Learn more about the argument specification, streaming, and multi-modal support [here](../references/sampling_params.md).
-
-## OpenAI Compatible API
-In addition, the server supports OpenAI-compatible APIs.
-
-```python
-import openai
-client = openai.Client(
-    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
-
-# Text completion
-response = client.completions.create(
-	model="default",
-	prompt="The capital of France is",
-	temperature=0,
-	max_tokens=32,
-)
-print(response)
-
-# Chat completion
-response = client.chat.completions.create(
-    model="default",
-    messages=[
-        {"role": "system", "content": "You are a helpful AI assistant"},
-        {"role": "user", "content": "List 3 countries and their capitals."},
-    ],
-    temperature=0,
-    max_tokens=64,
-)
-print(response)
-
-# Text embedding
-response = client.embeddings.create(
-    model="default",
-    input="How are you today",
-)
-print(response)
-```
-
-It supports streaming, vision, and almost all features of the Chat/Completions/Models/Batch endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
-
-## Additional Server Arguments
 - To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 2
@@ -93,35 +31,6 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 # Node 1
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 1
 ```
-
-## Engine Without HTTP Server
-
-We also provide an inference engine **without a HTTP server**. For example,
-
-```python
-import sglang as sgl
-
-def main():
-    prompts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    sampling_params = {"temperature": 0.8, "top_p": 0.95}
-    llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
-
-    outputs = llm.generate(prompts, sampling_params)
-    for prompt, output in zip(prompts, outputs):
-        print("===============================")
-        print(f"Prompt: {prompt}\nGenerated text: {output['text']}")
-
-if __name__ == "__main__":
-    main()
-```
-
-This can be used for offline batch inference and building custom servers.
-You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine).
 
 ## Use Models From ModelScope
 <details>
