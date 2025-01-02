@@ -125,27 +125,36 @@ def run_program_batch(
                 )
         else:
             pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
-            futures = []
-
+            
+            # Process in chunks to avoid overwhelming ThreadPoolExecutor
+            # Otherwise, ThreadPoolExecutor.submit will block after adding certain number of tasks
+            # so we will never reach "yield" until all tasks are done which defeat the purpose of generator style
+            chunk_size = len(batch_arguments) if not generator_style else 200
+            
             with ThreadPoolExecutor(num_threads) as executor:
-                for arguments in batch_arguments:
-                    future = executor.submit(
-                        run_program,
-                        program,
-                        backend,
-                        (),
-                        arguments,
-                        default_sampling_para,
-                        False,
-                        True,
-                    )
-                    futures.append(future)
-                    if pbar:
-                        future.add_done_callback(lambda _: pbar.update())
-
-                # Wait for each future in order to maintain input order
-                for future in futures:
-                    yield future.result()
+                for chunk_start in range(0, len(batch_arguments), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(batch_arguments))
+                    chunk_futures = []
+                    
+                    # Submit chunk of tasks
+                    for i in range(chunk_start, chunk_end):
+                        future = executor.submit(
+                            run_program,
+                            program,
+                            backend,
+                            (),
+                            batch_arguments[i],
+                            default_sampling_para,
+                            False,
+                            True,
+                        )
+                        if pbar:
+                            future.add_done_callback(lambda _: pbar.update())
+                        chunk_futures.append(future)
+                    
+                    # Yield results from this chunk as they complete
+                    for future in chunk_futures:
+                        yield future.result()
 
             if pbar:
                 pbar.close()
