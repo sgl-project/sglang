@@ -56,18 +56,53 @@ response = client.chat.completions.create(
 )
 print(response)
 ```
-### Example serving with 2 H20*8
-For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`.
+### Example serving with Docker two H200*8 nodes
+Having two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configuring the endpoint to expose it to another docker container with `--host 0.0.0.0` and `--port 40000` and configuring nccl comms with `--nccl-init 192.168.114.10:20000`.
 
 ```bash
 # node 1
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
-
-# node 2
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
+docker run --gpus all \
+    --shm-size 32g \
+    --network=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --name sglang_multinode1 \
+    -it \
+    --rm \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 192.168.114.10:20000 --nnodes 2 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 40000
 ```
 
-If you have two H100 nodes, the usage is similar to the aforementioned H20.
+```bash
+# node 2
+docker run --gpus all \
+    --shm-size 32g \
+    --network=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --name sglang_multinode2 \
+    -it \
+    --rm \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 192.168.114.10:20000 --nnodes 2 --node-rank 1 --trust-remote-code --host 0.0.0.0 --port 40000
+```
+
+To ensure the functionality, we include a testing from a client docker container:
+```bash
+docker run --gpus all \
+    --shm-size 32g \
+    --network=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --name sglang_multinode_client \
+    -it \
+    --rm \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1 --random-output 512 --random-range-ratio 1 --num-prompts 1 --host 0.0.0.0 --port 40000 --output-file "deepseekv3_multinode.jsonl"
+```
 
 ## DeepSeek V3 Optimization Plan
 
