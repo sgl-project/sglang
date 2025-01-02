@@ -38,6 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.utils import maybe_torch_compile
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
@@ -276,10 +277,21 @@ class ForwardBatch:
             )
 
         if ret.forward_mode.is_idle():
+            ret.positions = torch.empty((0,), device=device)
             return ret
 
+        # Override the positions with spec_info
+        if (
+            ret.spec_info is not None
+            and getattr(ret.spec_info, "positions", None) is not None
+        ):
+            ret.positions = ret.spec_info.positions
+
         # Init position information
-        if not ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode():
+            if ret.positions is None:
+                ret.positions = clamp_position(batch.seq_lens)
+        else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -288,13 +300,15 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
             if model_runner.server_args.attention_backend != "torch_native":
                 ret.extend_num_tokens = batch.extend_num_tokens
-                ret.positions, ret.extend_start_loc = compute_position_triton(
+                positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
                 )
             else:
-                ret.positions, ret.extend_start_loc = compute_position_torch(
+                positions, ret.extend_start_loc = compute_position_torch(
                     ret.extend_prefix_lens, ret.extend_seq_lens
                 )
+            if ret.positions is None:
+                ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
@@ -381,6 +395,11 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
+
+
+@maybe_torch_compile(dynamic=True)
+def clamp_position(seq_lens):
+    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
 class CaptureHiddenMode(IntEnum):

@@ -45,13 +45,18 @@ class TpModelWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        is_draft_worker: bool = False,
     ):
         # Parse args
         self.tp_rank = tp_rank
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path,
+            (
+                server_args.model_path
+                if not is_draft_worker
+                else server_args.speculative_draft_model_path
+            ),
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.context_length,
@@ -68,6 +73,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            is_draft_worker=is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
