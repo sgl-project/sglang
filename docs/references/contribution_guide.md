@@ -10,7 +10,6 @@ Welcome to **SGLang**! We appreciate your interest in contributing. This guide p
 
 ```bash
 git clone https://github.com/<your_user_name>/sglang.git
-cd sglang
 ```
 
 ### Install Dependencies & Build
@@ -23,7 +22,6 @@ We use [pre-commit](https://pre-commit.com/) to maintain consistent code style c
 
 ```bash
 pip3 install pre-commit
-cd sglang
 pre-commit run --all-files
 ```
 
@@ -36,7 +34,7 @@ SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unitt
 
 ## Writing Documentation & Running Docs CI
 
-We recommend new contributors start from writing documentation. For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
+We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase. For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
 
 
 ## Tips for Newcomers
