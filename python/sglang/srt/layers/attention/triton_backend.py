@@ -81,7 +81,7 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_token: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],

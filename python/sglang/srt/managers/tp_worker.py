@@ -13,7 +13,6 @@
 # ==============================================================================
 """A tensor parallel worker."""
 
-
 import logging
 import threading
 from typing import Optional
@@ -67,7 +66,6 @@ class TpModelWorker:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
-
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,

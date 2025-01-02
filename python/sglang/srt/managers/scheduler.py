@@ -120,6 +120,11 @@ class Scheduler:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.decode_mem_cache_buf_multiplier = (
+            self.server_args.speculative_num_draft_tokens
+            if not self.spec_algorithm.is_none()
+            else 1
+        )
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -908,19 +913,14 @@ class Scheduler:
             return None
 
         # Check if decode out of memory
-        buf_multiplier = (
-            self.server_args.speculative_num_draft_tokens
-            if not self.spec_algorithm.is_none()
-            else 1
-        )
-        if not batch.check_decode_mem(buf_multiplier) or (
+        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
             test_retract and batch.batch_size() > 10
         ):
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
             self.new_token_ratio = new_token_ratio
-            if self.draft_worker is not None:
+            if self.draft_worker:
                 self.draft_worker.finish_request(retracted_reqs)
 
             logger.info(
@@ -953,6 +953,7 @@ class Scheduler:
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
         self.forward_ct += 1
+
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 if self.spec_algorithm.is_none():
@@ -1289,7 +1290,7 @@ class Scheduler:
                     # If not stream, we still want to output some tokens to get the benefit of incremental decoding.
                     or (not req.stream and len(req.output_ids) % 50 == 0)
                 ):
-                    if req.finished() and self.draft_worker is not None:
+                    if self.draft_worker and req.finished():
                         self.draft_worker.finish_request(req)
 
                     rids.append(req.rid)
