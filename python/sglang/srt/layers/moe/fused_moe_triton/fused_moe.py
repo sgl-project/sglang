@@ -17,17 +17,19 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
-not_hip = False
+is_hip_flag = False
 if not is_hip():
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
-    not_hip = True
+    is_hip_flag = False
+else:
+    is_hip_flag = True
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
-enable_moe_align_block_size_triton = (
-    True if bool(int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))) else False
+enable_moe_align_block_size_triton = bool(
+    int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
 
 
@@ -410,7 +412,7 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     if num_experts >= 224:
-        if enable_moe_align_block_size_triton or not not_hip:
+        if enable_moe_align_block_size_triton or is_hip_flag:
             moe_align_block_size_triton(
                 topk_ids,
                 num_experts,
@@ -1003,17 +1005,18 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
 
-        if not_hip:
+        if is_hip_flag:
+            ops.moe_sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            )
+        else:
             torch.sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 dim=1,
                 out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
-        else:
-            ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
+
     return out_hidden_states
 
 
