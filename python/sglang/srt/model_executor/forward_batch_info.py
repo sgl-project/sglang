@@ -277,11 +277,20 @@ class ForwardBatch:
             )
 
         if ret.forward_mode.is_idle():
+            ret.positions = torch.empty((0,), device=device)
             return ret
+
+        # Override the positions with spec_info
+        if (
+            ret.spec_info is not None
+            and getattr(ret.spec_info, "positions", None) is not None
+        ):
+            ret.positions = ret.spec_info.positions
 
         # Init position information
         if ret.forward_mode.is_decode():
-            ret.positions = clamp_position(batch.seq_lens)
+            if ret.positions is None:
+                ret.positions = clamp_position(batch.seq_lens)
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
@@ -291,13 +300,15 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
             if model_runner.server_args.attention_backend != "torch_native":
                 ret.extend_num_tokens = batch.extend_num_tokens
-                ret.positions, ret.extend_start_loc = compute_position_triton(
+                positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
                 )
             else:
-                ret.positions, ret.extend_start_loc = compute_position_torch(
+                positions, ret.extend_start_loc = compute_position_torch(
                     ret.extend_prefix_lens, ret.extend_seq_lens
                 )
+            if ret.positions is None:
+                ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
@@ -313,12 +324,6 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
-
-        if (
-            ret.spec_info is not None
-            and getattr(ret.spec_info, "positions", None) is not None
-        ):
-            ret.positions = ret.spec_info.positions
 
         return ret
 
