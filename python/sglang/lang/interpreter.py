@@ -143,9 +143,9 @@ def run_program_batch(
                     if pbar:
                         future.add_done_callback(lambda _: pbar.update())
 
-            # Wait for each future in order to maintain input order
-            for future in futures:
-                yield future.result()
+                # Wait for each future in order to maintain input order
+                for future in futures:
+                    yield future.result()
 
             if pbar:
                 pbar.close()
