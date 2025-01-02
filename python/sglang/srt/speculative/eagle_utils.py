@@ -601,11 +601,11 @@ class EagleVerifyInput(SpecInfo):
             req.check_finished()
             if req.finished():
                 draft_input.has_finished = True
-                finished_extend_len[req.rid] = verified_len + 1
             else:
                 new_accept_index.append(accept_index[low : low + verified_len + 1])
                 unfinished_index.append(i)
             low += verified_len + 1
+            finished_extend_len[req.rid] = verified_len + 1
 
         if len(new_accept_index) > 0:
             new_accept_index = torch.cat(new_accept_index, dim=0)
