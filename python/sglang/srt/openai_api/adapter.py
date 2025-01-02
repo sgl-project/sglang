@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -698,6 +698,14 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    if "extra_body" in request_json:
+        extra = request_json["extra_body"]
+        if "ebnf" in extra:
+            request_json["ebnf"] = extra["ebnf"]
+        if "regex" in extra:
+            request_json["regex"] = extra["regex"]
+        # remove extra_body to avoid pydantic conflict
+        del request_json["extra_body"]
     all_requests = [CompletionRequest(**request_json)]
     adapted_request, request = v1_generate_request(all_requests)
 
@@ -1065,12 +1073,13 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:
-                text, call_info_list = parse_tool_response(text, tools)  # noqa
+                parser = FunctionCallParser(tools)
+                full_normal_text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = [
                     ToolCall(
-                        id=str(call_info[0]),
+                        id=str(call_info.tool_index),
                         function=FunctionResponse(
-                            name=call_info[1], arguments=call_info[2]
+                            name=call_info.name, arguments=call_info.arguments
                         ),
                     )
                     for call_info in call_info_list
@@ -1302,14 +1311,19 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         # 2) if we found calls, we output them as separate chunk(s)
                         for call_item in calls:
                             # transform call_item -> FunctionResponse + ToolCall
-                            func_resp = FunctionResponse(
-                                name=call_item.name,
-                                arguments=call_item.parameters,
+                            tool_call = ToolCall(
+                                id=str(call_item.tool_index),
+                                function=FunctionResponse(
+                                    name=call_item.name,
+                                    arguments=call_item.arguments,
+                                ),
                             )
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(function_call=func_resp),
-                                finish_reason="function_call",
+                                delta=DeltaMessage(
+                                    role="assistant", tool_calls=[tool_call]
+                                ),
+                                finish_reason="tool_call",
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],

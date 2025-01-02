@@ -171,15 +171,15 @@ class CompletionRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     min_tokens: int = 0
-    json_schema: Optional[str] = None
     regex: Optional[str] = None
-    ebnf: Optional[str] = None
+    json_schema: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    ebnf: Optional[str] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -261,7 +261,7 @@ class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: str
+    name: Optional[str] = None
     parameters: Optional[object] = None
 
 
@@ -275,7 +275,7 @@ class Tool(BaseModel):
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
-    name: str
+    name: Optional[str] = None
 
 
 class ToolChoice(BaseModel):
@@ -315,20 +315,20 @@ class ChatCompletionRequest(BaseModel):
     min_p: float = 0.0
     min_tokens: int = 0
     regex: Optional[str] = None
-    ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    ebnf: Optional[str] = None
 
 
 class FunctionResponse(BaseModel):
     """Function response."""
 
-    name: str
-    arguments: str
+    name: Optional[str] = None
+    arguments: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -343,7 +343,7 @@ class ToolCallItem(BaseModel):
     """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
 
     tool_index: int
-    name: str
+    name: Optional[str] = None
     parameters: str  # JSON string
 
 
@@ -373,7 +373,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
-    function_call: Optional[FunctionResponse] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
