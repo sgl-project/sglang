@@ -1364,11 +1364,11 @@ class Scheduler:
             embeddings = []
             prompt_tokens = []
             for req in reqs:
-                assert req.finished()
-                rids.append(req.rid)
-                finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
+                if req.finished():
+                    rids.append(req.rid)
+                    finished_reasons.append(req.finished_reason.to_json())
+                    embeddings.append(req.embedding)
+                    prompt_tokens.append(len(req.origin_input_ids))
             self.send_to_detokenizer.send_pyobj(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
