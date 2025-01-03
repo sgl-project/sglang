@@ -71,7 +71,7 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out) {
   AllReduceStrategyType strategy = SelectImplementation(num_elements * ((get_bits(dtype) + 7) / 8), m->world_size);
 
   // should be gurantee in python code
-  assert(strategy == AllReduceStrategyType::ONESHOT);
+  assert(strategy == AllReduceStrategyType::ONESHOT || strategy == AllReduceStrategyType::TWOSHOT);
   assert(CanApplyCustomAllReduce(num_elements, dtype));
 
   // Initialize the all-reduce kernel arguments.
