@@ -26,11 +26,12 @@ I'm going to the
 import argparse
 
 import requests
-from PIL import Image
-
 import torch
+from PIL import Image
 from transformers import (
-    AutoModelForCausalLM, AutoProcessor, AutoModelForImageTextToText
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
 )
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -39,8 +40,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 @torch.no_grad()
 def vlm_text_with_image(args):
     # Load the processor and model for ImageTextToText tasks
-    processor = AutoProcessor.from_pretrained(
-        args.model_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_path,
         torch_dtype=args.dtype,
@@ -64,11 +64,8 @@ def vlm_text_with_image(args):
                 {
                     "type": "image",
                 },
-                {
-                    "type": "text",
-                    "text": "Describe this image."
-                }
-            ]
+                {"type": "text", "text": "Describe this image."},
+            ],
         }
     ]
 
@@ -84,11 +81,13 @@ def vlm_text_with_image(args):
         if not hasattr(processor, "apply_chat_template"):
             raise ValueError("The processor does not support chat templates.")
         text_prompt = processor.apply_chat_template(
-            conversation, add_generation_prompt=True)
+            conversation, add_generation_prompt=True
+        )
 
         # Prepare inputs for the model
-        inputs = processor(text=[text_prompt], images=[image],
-                           return_tensors="pt").to("cuda:0")
+        inputs = processor(text=[text_prompt], images=[image], return_tensors="pt").to(
+            "cuda:0"
+        )
 
         # Generate output from the model
         output_ids = model.generate(
