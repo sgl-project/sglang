@@ -11,8 +11,8 @@ def to_int8(tensor: torch.Tensor) -> torch.Tensor:
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=[64, 128, 256, 512, 1024],
-        x_log=True,
+        x_vals=[1, 16, 64, 128, 256, 512, 1024, 2048],
+        x_log=False,
         line_arg="provider",
         line_vals=["vllm", "sgl-kernel"],
         line_names=["vllm", "sgl-kernel"],
