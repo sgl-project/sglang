@@ -1,12 +1,13 @@
-import json, re
+import json
+import re
 from abc import ABC, abstractmethod
-from typing import Tuple, List, Dict, Optional, Any
-
 from json import JSONDecodeError, JSONDecoder
+from typing import Any, Dict, List, Optional, Tuple
+
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 
-from sglang.srt.openai_api.protocol import ToolCallItem
+from sglang.srt.openai_api.protocol import Tool, ToolCallItem
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -37,6 +38,7 @@ def _is_complete_json(input_str: str) -> bool:
     except JSONDecodeError:
         return False
 
+
 def _find_common_suffix(s1: str, s2: str) -> str:
     """
     Finds a common suffix shared between two strings, if there is one. Order of
@@ -45,7 +47,7 @@ def _find_common_suffix(s1: str, s2: str) -> str:
 
     e.g. find_common_suffix('{"fruit": "ap"}', '{"fruit": "apple"}') -> '"}'
     """
-    suffix = ''
+    suffix = ""
     min_length = min(len(s1), len(s2))
     for i in range(1, min_length + 1):
         if s1[-i] == s2[-i] and not s1[-i].isalnum():
@@ -53,6 +55,7 @@ def _find_common_suffix(s1: str, s2: str) -> str:
         else:
             break
     return suffix
+
 
 def _extract_intermediate_diff(curr: str, old: str) -> str:
     """
@@ -74,15 +77,15 @@ def _extract_intermediate_diff(curr: str, old: str) -> str:
     """
     suffix = _find_common_suffix(curr, old)
 
-    old = old[::-1].replace(suffix[::-1], '', 1)[::-1]
+    old = old[::-1].replace(suffix[::-1], "", 1)[::-1]
     prefix = _find_common_prefix(curr, old)
     diff = curr
     if len(suffix):
-        diff = diff[::-1].replace(suffix[::-1], '', 1)[::-1]
+        diff = diff[::-1].replace(suffix[::-1], "", 1)[::-1]
 
     if len(prefix):
         # replace the prefix only once in case it's mirrored
-        diff = diff.replace(prefix, '', 1)
+        diff = diff.replace(prefix, "", 1)
 
     return diff
 
@@ -101,7 +104,7 @@ class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     @abstractmethod
-    def detect_and_parse(self, text: str, tools: List["Tool"]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
@@ -110,7 +113,7 @@ class BaseFormatDetector(ABC):
 
     @abstractmethod
     def parse_streaming_increment(
-        self, new_text: str, tools: List["Tool"]
+        self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing, internally maintains a buffer or state.
@@ -146,7 +149,7 @@ class Qwen25Detector(BaseFormatDetector):
 
         self.tool_call_regex = re.compile(r"\[{.*?}\]", re.DOTALL)
 
-    def detect_and_parse(self, text: str, tools: List["Tool"]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -174,7 +177,7 @@ class Qwen25Detector(BaseFormatDetector):
         return calls
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List["Tool"]
+        self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing, referencing the logic of Llama32Detector.
@@ -362,10 +365,12 @@ class MistralDetector(BaseFormatDetector):
         self.prev_tool_call_arr: List[Dict] = []
         self.current_tool_id: int = -1
         self.current_tool_name_sent: bool = False
-        self.streamed_args_for_tool: List[str] = []  # map what has been streamed for each tool so far to a list
+        self.streamed_args_for_tool: List[str] = (
+            []
+        )  # map what has been streamed for each tool so far to a list
         self.bot_token = "[TOOL_CALLS]"
         self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
-    
+
     def _clean_text(self, text: str) -> str:
         """
         clean text to only leave ''[TOOL_CALLS] [{"name": xxx, "arguments": {xxx}}]'
@@ -375,9 +380,8 @@ class MistralDetector(BaseFormatDetector):
         The key pattern is [TOOL_CALLS] [...]
         """
         return re.findall(r"\[TOOL_CALLS\] \[.*?\]", text, re.DOTALL)[0]
-        
 
-    def detect_and_parse(self, text: str, tools: List["Tool"]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -392,34 +396,35 @@ class MistralDetector(BaseFormatDetector):
         calls = []
         for match_result in function_call_arr:
             action = match_result
-            name, parameters = action["name"], json.dumps(action.get("parameters", action.get("arguments", {})), ensure_ascii=False)
+            name, parameters = action["name"], json.dumps(
+                action.get("parameters", action.get("arguments", {})),
+                ensure_ascii=False,
+            )
             tool_index = [tool.function.name for tool in tools].index(name)
-            tool_call_item = ToolCallItem(tool_index=tool_index, name=name, parameters=parameters)
+            tool_call_item = ToolCallItem(
+                tool_index=tool_index, name=name, parameters=parameters
+            )
             calls.append(tool_call_item)
         return calls
-        
-        
-        
+
     def parse_streaming_increment(
-        self, new_text: str, tools: List["Tool"]
+        self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        
+
         delta_text = new_text
         self.buffer += delta_text
         current_text = self.buffer
-        
+
         # if the tool call token is not in the tokens generated so far, append
         # output to contents since it's not a tool
         if self.bot_token not in current_text:
             return StreamingParseResult(normal_text=delta_text)
 
-
         # bit mask flags for partial JSON parsing. If the name hasn't been
         # sent yet, don't allow sending
         # an incomplete string since OpenAI only ever (as far as I have
         # seen) allows sending the entire tool/ function name at once.
-        flags = Allow.ALL if self.current_tool_name_sent \
-            else Allow.ALL & ~Allow.STR
+        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
         try:
 
             # replace BOT token with empty string, and convert single quotes
@@ -430,15 +435,18 @@ class MistralDetector(BaseFormatDetector):
             # tool calls are generated in an array, so do partial JSON
             # parsing on the entire array
             try:
-                tool_call_arr: List[Dict] = partial_json_parser.loads(parsable_arr, flags)
+                tool_call_arr: List[Dict] = partial_json_parser.loads(
+                    parsable_arr, flags
+                )
             except partial_json_parser.core.exceptions.MalformedJSON:
-                print('not enough tokens to parse into JSON yet')
+                print("not enough tokens to parse into JSON yet")
                 return StreamingParseResult()
 
             # select as the current tool call the one we're on the state at
 
-            current_tool_call: Dict = tool_call_arr[self.current_tool_id] \
-                if len(tool_call_arr) > 0 else {}
+            current_tool_call: Dict = (
+                tool_call_arr[self.current_tool_id] if len(tool_call_arr) > 0 else {}
+            )
 
             # case -- if no tokens have been streamed for the tool, e.g.
             #   only the array brackets, stream nothing
@@ -447,7 +455,9 @@ class MistralDetector(BaseFormatDetector):
 
             # case: we are starting a new tool in the array
             #   -> array has > 0 length AND length has moved past cursor
-            elif (len(tool_call_arr) > 0 and len(tool_call_arr) > self.current_tool_id + 1):
+            elif (
+                len(tool_call_arr) > 0 and len(tool_call_arr) > self.current_tool_id + 1
+            ):
 
                 # if we're moving on to a new call, first make sure we
                 # haven't missed anything in the previous one that was
@@ -458,17 +468,18 @@ class MistralDetector(BaseFormatDetector):
 
                     if diff:
                         diff = json.dumps(diff, ensure_ascii=False).replace(
-                            self.streamed_args_for_tool[self.current_tool_id],
-                            "")
-                        delta = StreamingParseResult(calls=[
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name="",
-                                parameters=diff,
-                            )
-                        ])
-                        self.streamed_args_for_tool[
-                            self.current_tool_id] += diff
+                            self.streamed_args_for_tool[self.current_tool_id], ""
+                        )
+                        delta = StreamingParseResult(
+                            calls=[
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    name="",
+                                    parameters=diff,
+                                )
+                            ]
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] += diff
                     else:
                         delta = StreamingParseResult()
                 else:
@@ -488,13 +499,15 @@ class MistralDetector(BaseFormatDetector):
                 function_name = current_tool_call.get("name")
                 if function_name:
 
-                    delta = StreamingParseResult(calls=[
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=function_name,
-                            parameters="",
-                        )
-                    ])
+                    delta = StreamingParseResult(
+                        calls=[
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=function_name,
+                                parameters="",
+                            )
+                        ]
+                    )
                     self.current_tool_name_sent = True
                 else:
                     delta = StreamingParseResult()
@@ -503,12 +516,14 @@ class MistralDetector(BaseFormatDetector):
             # arguments
             else:
 
-                prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+                prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get(
+                    "arguments"
+                )
                 cur_arguments = current_tool_call.get("arguments")
 
-                new_text = delta_text.replace("\'", "\"")
-                if ('"}' in new_text):
-                    new_text = new_text[:new_text.rindex('"}')]
+                new_text = delta_text.replace("'", '"')
+                if '"}' in new_text:
+                    new_text = new_text[: new_text.rindex('"}')]
 
                 if not cur_arguments and not prev_arguments:
 
@@ -516,57 +531,61 @@ class MistralDetector(BaseFormatDetector):
                 elif not cur_arguments and prev_arguments:
                     print(
                         "INVARIANT - impossible to have arguments reset "
-                        "mid-arguments")
+                        "mid-arguments"
+                    )
                     delta = StreamingParseResult()
                 elif cur_arguments and not prev_arguments:
-                    cur_arguments_json = json.dumps(cur_arguments,
-                                                    ensure_ascii=False)[:-2]
-                    print("finding %s in %s", new_text,
-                                 cur_arguments_json)
+                    cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)[
+                        :-2
+                    ]
+                    print("finding %s in %s", new_text, cur_arguments_json)
 
-                    if (new_text not in cur_arguments_json):
+                    if new_text not in cur_arguments_json:
                         return StreamingParseResult()
-                    arguments_delta = cur_arguments_json[:cur_arguments_json.
-                                                         rindex(new_text) +
-                                                         len(new_text)]
-                    print("First tokens in arguments received: %s",
-                                 arguments_delta)
-                    delta = StreamingParseResult(calls=[
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name="",
-                            parameters=arguments_delta,
-                        )
-                    ])
-                    self.streamed_args_for_tool[
-                        self.current_tool_id] += arguments_delta
+                    arguments_delta = cur_arguments_json[
+                        : cur_arguments_json.rindex(new_text) + len(new_text)
+                    ]
+                    print("First tokens in arguments received: %s", arguments_delta)
+                    delta = StreamingParseResult(
+                        calls=[
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name="",
+                                parameters=arguments_delta,
+                            )
+                        ]
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
 
                 elif cur_arguments and prev_arguments:
-                    cur_args_json = json.dumps(cur_arguments,
-                                               ensure_ascii=False)
-                    prev_args_json = json.dumps(prev_arguments,
-                                                ensure_ascii=False)
-                    print("Searching for diff between \n%s\n%s",
-                                 cur_args_json, prev_args_json)
+                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
+                    prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
+                    print(
+                        "Searching for diff between \n%s\n%s",
+                        cur_args_json,
+                        prev_args_json,
+                    )
 
                     argument_diff = _extract_intermediate_diff(
-                        cur_args_json, prev_args_json)
+                        cur_args_json, prev_args_json
+                    )
                     print("got arguments diff: %s", argument_diff)
-                    delta = StreamingParseResult(calls=[
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name="",
-                            parameters=argument_diff,
-                        )
-                    ])
-                    self.streamed_args_for_tool[
-                        self.current_tool_id] += argument_diff
+                    delta = StreamingParseResult(
+                        calls=[
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name="",
+                                parameters=argument_diff,
+                            )
+                        ]
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
                 else:
                     # try parsing it with regular JSON - if it works we're
                     # at the end, and we need to send the difference between
                     # tokens streamed so far and the valid JSON
                     delta = StreamingParseResult()
-            
+
             # check to see if the name is defined and has been sent. if so,
             # stream the name - otherwise keep waiting
             # finish by setting old and returning None as base case
@@ -575,28 +594,10 @@ class MistralDetector(BaseFormatDetector):
 
         except Exception:
             print("Error trying to handle streaming tool call.")
-            print(
-                "Skipping chunk as a result of tool streaming extraction "
-                "error")
+            print("Skipping chunk as a result of tool streaming extraction " "error")
             return StreamingParseResult()
-        
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
+
 class Llama32Detector(BaseFormatDetector):
     """
     Detector for Llama 3.2 models.
@@ -625,7 +626,7 @@ class Llama32Detector(BaseFormatDetector):
 
         self.tool_call_regex = re.compile(r"\[{.*?}\]", re.DOTALL)
 
-    def detect_and_parse(self, text: str, tools: List["Tool"]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -650,7 +651,7 @@ class Llama32Detector(BaseFormatDetector):
         return calls
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List["Tool"]
+        self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         self._buffer += new_text
         current_text = self._buffer
@@ -821,7 +822,7 @@ class MultiFormatParser:
         """
         self.detectors = detectors
 
-    def parse_once(self, text: str, tools: List["Tool"]):
+    def parse_once(self, text: str, tools: List[Tool]):
         """
         One-time parsing: Loop through detectors until there are no new matches or text is exhausted
         Return: (final_text, all_calls)
@@ -837,7 +838,7 @@ class MultiFormatParser:
         # leftover_text is the normal text not consumed by any Detector
         return final_normal_text, final_calls
 
-    def parse_streaming_increment(self, new_text: str, tools: List["Tool"]):
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]):
         """
         Streaming incremental parsing: Feed new_text to each detector's parse_streaming_increment
         and merge their produced normal_text/calls to return.
@@ -862,106 +863,13 @@ class MultiFormatParser:
         return final_normal_text, final_calls
 
 
-class StreamingJSONParser:
-    """
-    Maintains a buffer and attempts to parse complete JSON strings from it.
-    Each time parse_increment() is called, new text is appended to the buffer and an attempt is made to parse.
-    If one or more complete JSONs are present in the buffer, they are removed from the buffer and returned.
-    Remaining (incomplete or non-JSON) text is retained in the buffer or returned as normal text.
-    """
-
-    def __init__(self):
-        self.buffer = ""
-
-    def parse_increment(self, new_text: str):
-        """
-        :param new_text: New text increment
-        :return: (normal_text, list_of_parsed_json)
-
-         normal_text:  The part confirmed this time that can be output as "normal text"
-         list_of_parsed_json: Array of JSON objects successfully parsed from the buffer
-        """
-        self.buffer += new_text
-
-        # First separate the 'successfully extracted JSON' from the buffer
-        # The buffer may also contain some normal strings not inside JSON, so need to distinguish
-        normal_text_segments = []
-        parsed_json_objs = []
-
-        # A simple idea:
-        #   - Scan the entire buffer, continuously finding { ... } to extract JSON objects
-        #   - If braces do not match => indicates incomplete JSON => need to wait for next increment
-        #   - If JSON deserialization fails => either incomplete or parsing error (incorrect format)
-        # Below is just a minimal implementation; for complex scenarios, refer to the more complete handling logic in vLLM
-
-        idx = 0
-        while idx < len(self.buffer):
-            # Find the first '{' in the buffer
-            start_brace = self.buffer.find("{", idx)
-            if start_brace == -1:
-                # No more '{' found, the rest is all normal text
-                normal_text_segments.append(self.buffer[idx:])
-                idx = len(self.buffer)
-                break
-
-            # First, add the normal text before start_brace to normal_text_segments
-            if start_brace > idx:
-                normal_text_segments.append(self.buffer[idx:start_brace])
-
-            # Now try to find the matching '}' for this '{'
-            # Using a simple brace count here. A more robust JSON decoding + exception catching can also be used.
-            brace_count = 0
-            end_pos = start_brace
-            while end_pos < len(self.buffer):
-                if self.buffer[end_pos] == "{":
-                    brace_count += 1
-                elif self.buffer[end_pos] == "}":
-                    brace_count -= 1
-                    if brace_count == 0:
-                        # Found matching '}', indicating a complete JSON
-                        break
-                end_pos += 1
-
-            if brace_count != 0:
-                # Indicates that no matching '}' was found up to the end of the buffer -> incomplete -> wait for next increment
-                # Then the normal text ends before start_brace
-                idx = start_brace
-                break
-
-            # Extract this complete JSON string
-            json_str = self.buffer[start_brace : end_pos + 1]
-            try:
-                json_obj = json.loads(json_str)
-                # Successfully parsed -> record it
-                parsed_json_objs.append(json_obj)
-            except json.JSONDecodeError:
-                # In some cases braces match, but parsing fails -> consider it incomplete or incorrectly formatted
-                # If incomplete, still set idx back to start_brace, allowing subsequent increments to retry
-                idx = start_brace
-                break
-
-            # After successfully parsing JSON, move the pointer to after end_pos to continue
-            idx = end_pos + 1
-
-        # After processing, content after idx remains in the buffer (not yet recognized)
-        # normal_text is the concatenation of normal_text_segments
-        # parsed_json_objs are the successfully recognized JSON objects
-
-        normal_text = "".join(normal_text_segments)
-        leftover = self.buffer[idx:]
-        # Update self.buffer to the leftover that wasn't consumed this time
-        self.buffer = leftover
-
-        return normal_text, parsed_json_objs
-
-
 class FunctionCallParser:
     """
     In streaming scenarios, each time new_text is received, it calls multi_format_parser.parse_streaming_increment
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    def __init__(self, tools: List["Tool"]):
+    def __init__(self, tools: List[Tool]):
         # Inject a set of Detectors here. To support Qwen25, InternLM2 in the future,
         # simply instantiate the corresponding Detector and add it to the list:
         self.multi_format_parser = MultiFormatParser(
