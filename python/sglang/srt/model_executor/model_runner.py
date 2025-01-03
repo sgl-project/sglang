@@ -153,6 +153,17 @@ class ModelRunner:
             }
         )
 
+        if server_args.enable_te:
+            global_server_args_dict.update(
+                {
+                    "TELLaMAForCausalLM": (
+                        "llama",
+                        "LlamaForCausalLM",
+                    ),  # TODO update TELLaMAForCausalLM with TE integreated (zhuohaol)
+                }
+            )
+
+        # Init componnets
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
