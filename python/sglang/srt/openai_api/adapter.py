@@ -41,6 +41,7 @@ from sglang.srt.conversation import (
     register_conv_template,
 )
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.openai_api.function_call_parser import FunctionCallParser
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
     BatchResponse,
@@ -73,7 +74,6 @@ from sglang.srt.openai_api.protocol import (
 )
 from sglang.srt.utils import TOOLS_TAG_LIST, parse_tool_response
 from sglang.utils import get_exception_traceback
-from sglang.srt.openai_api.function_call_parser import FunctionCallParser
 
 logger = logging.getLogger(__name__)
 
@@ -915,14 +915,14 @@ def v1_chat_generate_request(
                         tools=tools,
                     )
                 except:
-                    tools = [{"function":tools[0]}]
+                    tools = [{"function": tools[0]}]
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
                     )
-                    
+
                 if assistant_prefix:
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
                 stop = request.stop
@@ -1305,18 +1305,31 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         for call_item in calls:
                             # transform call_item -> FunctionResponse + ToolCall
 
-                            if content["meta_info"]["finish_reason"] and content["meta_info"]["finish_reason"]['type'] == "stop":
+                            if (
+                                content["meta_info"]["finish_reason"]
+                                and content["meta_info"]["finish_reason"]["type"]
+                                == "stop"
+                            ):
                                 latest_delta_len = 0
-                                if (isinstance(call_item.arguments, str)):
-                                    latest_delta_len = len(call_item.arguments)
-                      
-                                expected_call = json.dumps(parser.multi_format_parser.detectors[0].prev_tool_call_arr[index].get("arguments", {}),ensure_ascii=False)
-                                actual_call = parser.multi_format_parser.detectors[0].streamed_args_for_tool[index]
-                                if (latest_delta_len > 0):
+                                if isinstance(call_item.parameters, str):
+                                    latest_delta_len = len(call_item.parameters)
+
+                                expected_call = json.dumps(
+                                    parser.multi_format_parser.detectors[0]
+                                    .prev_tool_call_arr[index]
+                                    .get("arguments", {}),
+                                    ensure_ascii=False,
+                                )
+                                actual_call = parser.multi_format_parser.detectors[
+                                    0
+                                ].streamed_args_for_tool[index]
+                                if latest_delta_len > 0:
                                     actual_call = actual_call[:-latest_delta_len]
-                                remaining_call = expected_call.replace(actual_call, "", 1)
-                                call_item.arguments = remaining_call
-                                          
+                                remaining_call = expected_call.replace(
+                                    actual_call, "", 1
+                                )
+                                call_item.parameters = remaining_call
+
                             tool_call = ToolCall(
                                 id=str(call_item.tool_index),
                                 function=FunctionResponse(
