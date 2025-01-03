@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from types import SimpleNamespace
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -52,6 +52,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -74,6 +76,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
@@ -88,7 +91,7 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
-# Test retract decode
+# Test retract decode for debugging purposes
 test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
 
 
@@ -114,6 +117,14 @@ class Scheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        self.decode_mem_cache_buf_multiplier = (
+            self.server_args.speculative_num_draft_tokens
+            if not self.spec_algorithm.is_none()
+            else 1
+        )
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -127,12 +138,12 @@ class Scheduler:
             )
 
             if server_args.skip_tokenizer_init:
-                # Directly send to the tokenizer/api
+                # Directly send to the TokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name
                 )
             else:
-                # Send to the detokenizer
+                # Send to the DetokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name
                 )
@@ -196,6 +207,21 @@ class Scheduler:
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
+
+        # Launch worker for speculative decoding if need
+        if self.spec_algorithm.is_eagle():
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
+            self.draft_worker = EAGLEWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        else:
+            self.draft_worker = None
 
         # Get token and memory info from the model worker
         (
@@ -383,7 +409,8 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
-            if self.server_args.enable_dp_attention:
+
+            if self.server_args.enable_dp_attention:  # TODO: simplify this
                 batch = self.prepare_dp_attn_batch(batch)
 
             self.cur_batch = batch
@@ -392,7 +419,7 @@ class Scheduler:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # Self-check and re-init some states when the server is idle
+                # When the server is idle, so self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -409,12 +436,13 @@ class Scheduler:
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
             if batch:
                 result = self.run_batch(batch)
                 result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
-                    # A dummy first batch to start the pipeline for overlap scheduler.
+                    # Create a dummy first batch to start the pipeline for overlap scheduler.
                     # It is now used for triggering the sampling_info_done event.
                     tmp_batch = ScheduleBatch(
                         reqs=None,
@@ -424,19 +452,21 @@ class Scheduler:
                     self.process_batch_result(tmp_batch, None)
 
             if self.last_batch:
+                # Process the results of the last batch
                 tmp_batch, tmp_result = result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
-                # Self-check and re-init some states when the server is idle
+                # When the server is idle, so self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
-    def recv_requests(self):
+    def recv_requests(self) -> List[Req]:
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
@@ -478,6 +508,11 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success, message)
                 )
+            elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
+                success, message = self.update_weights_from_tensor(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightsFromTensorReqOutput(success, message)
+                )
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
@@ -487,8 +522,10 @@ class Scheduler:
                 else:
                     self.stop_profile()
             elif isinstance(recv_req, OpenSessionReqInput):
-                session_id = self.open_session(recv_req)
-                self.send_to_tokenizer.send_pyobj(OpenSessionReqOutput(session_id))
+                session_id, success = self.open_session(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    OpenSessionReqOutput(session_id=session_id, success=success)
+                )
             elif isinstance(recv_req, CloseSessionReqInput):
                 self.close_session(recv_req)
             else:
@@ -499,7 +536,11 @@ class Scheduler:
         recv_req: TokenizedGenerateReqInput,
     ):
         # Create a new request
-        if recv_req.session_id is None or recv_req.session_id not in self.sessions:
+        if (
+            recv_req.session_params is None
+            or recv_req.session_params.id is None
+            or recv_req.session_params.id not in self.sessions
+        ):
 
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
@@ -517,18 +558,22 @@ class Scheduler:
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
+                eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
 
-            if recv_req.session_id is not None:
+            if (
+                recv_req.session_params is not None
+                and recv_req.session_params.id is not None
+            ):
                 req.finished_reason = FINISH_ABORT(
-                    f"Invalid request: session id {recv_req.session_id} does not exist"
+                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
                 self.waiting_queue.append(req)
                 return
         else:
-            # Create a new request from a previsou session
-            session = self.sessions[recv_req.session_id]
+            # Create a new request from a previous session
+            session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.waiting_queue.append(req)
@@ -804,6 +849,8 @@ class Scheduler:
                 if res == AddReqResult.NO_TOKEN:
                     self.batch_is_full = True
                 break
+            if self.server_args.prefill_only_one_req:
+                break
 
         # Update waiting queue
         can_run_list = adder.can_run_list
@@ -832,6 +879,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
+            self.spec_algorithm,
         )
         new_batch.prepare_for_extend()
 
@@ -865,11 +913,15 @@ class Scheduler:
             return None
 
         # Check if decode out of memory
-        if not batch.check_decode_mem() or (test_retract and batch.batch_size() > 10):
+        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
+            test_retract and batch.batch_size() > 10
+        ):
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
             self.new_token_ratio = new_token_ratio
+            if self.draft_worker:
+                self.draft_worker.finish_request(retracted_reqs)
 
             logger.info(
                 "Decode out of memory happened. "
@@ -903,11 +955,17 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
+                if self.spec_algorithm.is_none():
+                    model_worker_batch = batch.get_model_worker_batch()
+                    logits_output, next_token_ids = (
+                        self.tp_worker.forward_batch_generation(model_worker_batch)
+                    )
+                else:
+                    logits_output, next_token_ids, model_worker_batch, spec_info = (
+                        self.draft_worker.forward_batch_speculative_generation(batch)
+                    )
+                    batch.spec_info = spec_info
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -951,12 +1009,10 @@ class Scheduler:
                 logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             else:
                 # Move next_token_ids and logprobs to cpu
+                next_token_ids = next_token_ids.tolist()
                 if batch.return_logprob:
                     logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs[
-                            torch.arange(len(next_token_ids), device=self.device),
-                            next_token_ids,
-                        ].tolist()
+                        logits_output.next_token_logprobs.tolist()
                     )
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.tolist()
@@ -964,7 +1020,6 @@ class Scheduler:
                     logits_output.normalized_prompt_logprobs = (
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
-                next_token_ids = next_token_ids.tolist()
 
             # Check finish conditions
             logprob_pt = 0
@@ -1041,13 +1096,9 @@ class Scheduler:
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
         else:
-            # Move next_token_ids and logprobs to cpu
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs[
-                    torch.arange(len(next_token_ids), device=self.device),
-                    next_token_ids,
-                ].tolist()
             next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob:
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool.free_group_begin()
 
@@ -1061,7 +1112,10 @@ class Scheduler:
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
-            req.output_ids.append(next_token_id)
+            if batch.spec_algorithm.is_none():
+                # speculative worker will solve the output_ids in speculative decoding
+                req.output_ids.append(next_token_id)
+
             req.check_finished()
 
             if req.finished():
@@ -1072,10 +1126,10 @@ class Scheduler:
                 req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs_val.append(
-                        logits_output.output_top_logprobs_val[i]
+                        logits_output.next_token_top_logprobs_val[i]
                     )
                     req.output_top_logprobs_idx.append(
-                        logits_output.output_top_logprobs_idx[i]
+                        logits_output.next_token_top_logprobs_idx[i]
                     )
 
             if req.grammar is not None:
@@ -1177,8 +1231,9 @@ class Scheduler:
                 req.output_top_logprobs_idx.extend(
                     output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
                 )
-            req.output_top_logprobs_val.append(output.output_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.output_top_logprobs_idx[i])
+
+            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
+            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
         return num_input_logprobs
 
@@ -1195,6 +1250,7 @@ class Scheduler:
             decode_ids_list = []
             read_offsets = []
             output_ids = []
+            origin_input_ids = []
 
             skip_special_tokens = []
             spaces_between_special_tokens = []
@@ -1234,6 +1290,9 @@ class Scheduler:
                     # If not stream, we still want to output some tokens to get the benefit of incremental decoding.
                     or (not req.stream and len(req.output_ids) % 50 == 0)
                 ):
+                    if self.draft_worker and req.finished():
+                        self.draft_worker.finish_request(req)
+
                     rids.append(req.rid)
                     finished_reasons.append(
                         req.finished_reason.to_json() if req.finished_reason else None
@@ -1243,8 +1302,14 @@ class Scheduler:
                     decode_ids, read_offset = req.init_incremental_detokenize()
                     decode_ids_list.append(decode_ids)
                     read_offsets.append(read_offset)
-                    if self.skip_tokenizer_init:
+                    if self.skip_tokenizer_init or self.server_args.return_token_ids:
                         output_ids.append(req.output_ids)
+                    else:
+                        output_ids = None
+                    if self.server_args.return_token_ids:
+                        origin_input_ids.append(req.origin_input_ids)
+                    else:
+                        origin_input_ids = None
                     skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                     spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
@@ -1276,6 +1341,7 @@ class Scheduler:
                         decoded_texts,
                         decode_ids_list,
                         read_offsets,
+                        origin_input_ids,
                         output_ids,
                         skip_special_tokens,
                         spaces_between_special_tokens,
@@ -1298,11 +1364,11 @@ class Scheduler:
             embeddings = []
             prompt_tokens = []
             for req in reqs:
-                assert req.finished()
-                rids.append(req.rid)
-                finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
+                if req.finished():
+                    rids.append(req.rid)
+                    finished_reasons.append(req.finished_reason.to_json())
+                    embeddings.append(req.embedding)
+                    prompt_tokens.append(len(req.origin_input_ids))
             self.send_to_detokenizer.send_pyobj(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
@@ -1358,6 +1424,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
+            self.spec_algorithm,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -1457,6 +1524,17 @@ class Scheduler:
             logger.error(message)
         return success, message
 
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        """Update the online model parameter from tensors."""
+        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
+        # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        return success, message
+
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return parameter
@@ -1475,16 +1553,20 @@ class Scheduler:
         )
         logger.info("Profiler is done")
 
-    def open_session(self, recv_req: OpenSessionReqInput) -> str:
+    def open_session(self, recv_req: OpenSessionReqInput) -> Tuple[Optional[str], bool]:
         # handle error
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
+            return session_id, False
+        elif session_id is None:
+            logger.warning(f"session id is None, cannot open.")
+            return session_id, False
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len, session_id
             )
-        return session_id
+            return session_id, True
 
     def close_session(self, recv_req: CloseSessionReqInput):
         # handle error
@@ -1509,18 +1591,20 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
+    # Configue the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
         configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
+    suppress_other_loggers()
 
-    # set cpu affinity to this gpu process
+    # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
-    suppress_other_loggers()
     parent_process = psutil.Process().parent()
 
+    # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send(
