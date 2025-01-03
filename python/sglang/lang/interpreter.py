@@ -179,6 +179,7 @@ def run_program_batch(
 
     return rets
 
+
 def _run_program_batch_generator(
     program,
     backend,
@@ -235,8 +236,6 @@ def _run_program_batch_generator(
 
         if pbar:
             pbar.close()
-
-
 
 
 def cache_program(program, backend):
