@@ -716,5 +716,147 @@ class TestOpenAIEmbedding(unittest.TestCase):
         self.assertTrue(len(response.data[1].embedding) > 0)
 
 
+def test_function_calling_streaming_simple(self):
+    """
+    Test a simple Function Calling scenario in streaming mode.
+    Verify if the function name is correctly returned and if the response contains multiple chunks.
+    """
+    client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "description": "Get the current weather in a given location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "description": "The city to find the weather for",
+                        },
+                        "unit": {
+                            "type": "string",
+                            "description": "Weather unit (celsius or fahrenheit)",
+                            "enum": ["celsius", "fahrenheit"],
+                        },
+                    },
+                    "required": ["city", "unit"],
+                },
+            },
+        }
+    ]
+
+    messages = [{"role": "user", "content": "What is the temperature in Paris?"}]
+
+    # Enable streaming mode
+    response_stream = client.chat.completions.create(
+        model=self.model,
+        messages=messages,
+        temperature=0.8,
+        top_p=0.8,
+        stream=True,
+        tools=tools,
+    )
+
+    chunks = []
+    for chunk in response_stream:
+        chunks.append(chunk)
+
+    self.assertTrue(len(chunks) > 0, "Streaming should return at least one chunk")
+    # Attempt to find function call information from the streaming chunks
+    found_function_name = False
+    for chunk in chunks:
+        choice = chunk.choices[0]
+        if choice.delta.tool_calls:
+            tool_call = choice.delta.tool_calls[0]
+            if tool_call.function.name:
+                self.assertEqual(tool_call.function.name, "get_current_weather")
+                found_function_name = True
+                break
+
+    self.assertTrue(
+        found_function_name,
+        "Target function name 'get_current_weather' not found in streaming chunks",
+    )
+
+
+def test_function_calling_streaming_args_parsing(self):
+    """
+    Test the ability of streaming responses to handle argument assembly for Function Calling:
+    - The user's request requires multiple arguments
+    - AI may return these arguments in chunks, requiring us to assemble them
+    """
+    client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "add",
+                "description": "Compute the sum of two integers",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {
+                            "type": "int",
+                            "description": "First integer",
+                        },
+                        "b": {
+                            "type": "int",
+                            "description": "Second integer",
+                        },
+                    },
+                    "required": ["a", "b"],
+                },
+            },
+        }
+    ]
+
+    messages = [
+        {"role": "user", "content": "Please sum 5 and 7, just call the function."}
+    ]
+
+    # Enable streaming API
+    response_stream = client.chat.completions.create(
+        model=self.model,
+        messages=messages,
+        temperature=0.9,
+        top_p=0.9,
+        stream=True,
+        tools=tools,
+    )
+
+    argument_fragments = []
+    function_name = None
+    for chunk in response_stream:
+        choice = chunk.choices[0]
+        # If the chunk contains function call information
+        if choice.delta.tool_calls:
+            tool_call = choice.delta.tool_calls[0]
+            function_name = tool_call.function.name or function_name
+            # Arguments may be returned in chunks
+            if tool_call.function.arguments:
+                argument_fragments.append(tool_call.function.arguments)
+
+    self.assertEqual(function_name, "add", "Function name should be 'add'")
+    # Combine all argument fragments
+    joined_args = "".join(argument_fragments)
+    self.assertTrue(len(joined_args) > 0, "No argument content found in function calls")
+    # Test if it can be parsed as JSON
+    import json
+
+    try:
+        args_obj = json.loads(joined_args)
+    except json.JSONDecodeError:
+        self.fail("Arguments returned from streaming cannot be parsed as valid JSON")
+
+    self.assertIn("a", args_obj, "Parameter 'a' is missing from JSON")
+    self.assertIn("b", args_obj, "Parameter 'b' is missing from JSON")
+    self.assertEqual(args_obj["a"], "5", "Value of 'a' should be '5'")
+    self.assertEqual(args_obj["b"], "7", "Value of 'b' should be '7'")
+
+
 if __name__ == "__main__":
     unittest.main()
