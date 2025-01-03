@@ -9,6 +9,7 @@ import unittest
 import numpy as np
 import requests
 
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -247,6 +248,51 @@ class TestSRTEndpoint(unittest.TestCase):
             logprobs[idx] = output_top_logprobs[i][0]
 
         self.assertTrue(all(x is not None for x in logprobs))
+
+    def test_custom_logit_processor(self):
+        """Test custom logit processor with custom params."""
+
+        class AddLogitProcessor(CustomLogitProcessor):
+            def __call__(self, logits, custom_param_list, device):
+                import torch
+
+                assert logits.shape[0] == len(custom_param_list)
+                key = "arg1"
+                merged_params = {
+                    key: torch.tensor(
+                        [
+                            custom_param_list[i][key]
+                            for i in range(len(custom_param_list))
+                        ],
+                        dtype=torch.float,
+                    ).to(device=device, non_blocking=True)
+                }
+                return logits + merged_params[key]
+
+        prompts = "Question: Is Paris the Capital of France? Answer:"
+
+        # Base case json data to be posted to the server.
+        base_json = {
+            "text": prompts,
+            "sampling_params": {"temperature": 1.0},
+        }
+
+        # Custom json data with custom logit processor and params.
+        custom_json = base_json.copy()
+        custom_json["custom_logit_processor"] = AddLogitProcessor().to_str()
+        custom_json["sampling_params"]["custom_params"] = {"arg1": 5.0}
+
+        base_response = requests.post(
+            self.base_url + "/generate",
+            json=base_json,
+        ).json()["text"]
+
+        custom_response = requests.post(
+            self.base_url + "/generate",
+            json=custom_json,
+        ).json()["text"]
+
+        self.assertNotEqual(base_response, custom_response)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")

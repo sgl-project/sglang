@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -46,6 +46,12 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
+    # Custom Parameters
+    custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # Custom Logit Processor
+    custom_logit_processor: Optional[Dict[str, torch.Tensor]] = None
+
     @classmethod
     def from_schedule_batch(
         cls, batch: ScheduleBatch, vocab_size: int, enable_overlap_schedule: bool
@@ -70,6 +76,25 @@ class SamplingBatchInfo:
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
 
+        custom_params_list = [r.sampling_params.custom_params for r in reqs]
+
+        # Merge the same type of customlogit processors together
+        processor_dict = {}
+        for i, r in enumerate(reqs):
+            if r.custom_logit_processor is None:
+                continue
+            processor_str = r.custom_logit_processor
+            if processor_str not in processor_dict:
+                processor_dict[processor_str] = []
+            processor_dict[processor_str].append(i)
+
+        merged_custom_logit_processor = {
+            processor_str: torch.zeros(len(reqs), dtype=torch.bool)
+            .scatter_(0, torch.tensor(true_indices), True)
+            .to(device, non_blocking=True)
+            for processor_str, true_indices in processor_dict.items()
+        }
+
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -79,6 +104,8 @@ class SamplingBatchInfo:
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             vocab_size=vocab_size,
             device=device,
+            custom_params=custom_params_list,
+            custom_logit_processor=merged_custom_logit_processor,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
@@ -215,6 +242,19 @@ class SamplingBatchInfo:
 
         return None
 
+    @staticmethod
+    def merge_custom_logit_processor(
+        lhs: Dict[str, torch.Tensor], rhs: Dict[str, torch.Tensor]
+    ):
+        keys = set(lhs.keys()).union(set(rhs.keys()))
+        merged_dict = {}
+
+        for k in keys:
+            left_values = lhs.get(k, torch.zeros(len(lhs), dtype=torch.bool))
+            right_values = rhs.get(k, torch.zeros(len(rhs), dtype=torch.bool))
+            merged_dict[k] = torch.cat([left_values, right_values])
+        return merged_dict
+
     def merge_batch(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
@@ -231,6 +271,10 @@ class SamplingBatchInfo:
         self.is_all_greedy = self.is_all_greedy and other.is_all_greedy
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
+        )
+        self.custom_params = self.custom_params + other.custom_params
+        self.custom_logit_processor = SamplingBatchInfo.merge_custom_logit_processor(
+            self.custom_logit_processor, other.custom_logit_processor
         )
 
     def apply_logits_bias(self, logits: torch.Tensor):

@@ -6,6 +6,7 @@ from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import crash_on_warnings, is_flashinfer_available
 
@@ -34,6 +35,24 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
     ):
         logits = logits_output.next_token_logits
+
+        # Apply the custom logit processors if registered in the sampling info.
+        if sampling_info.custom_logit_processor is not None:
+            for (
+                processor_str,
+                batch_mask,
+            ) in sampling_info.custom_logit_processor.items():
+                processor = CustomLogitProcessor.from_str(processor_str)
+                batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+                logits[batch_mask] = processor(
+                    logits[batch_mask],
+                    [sampling_info.custom_params[i] for i in batch_indices],
+                    sampling_info.device,
+                )
+
+                logger.debug(
+                    f"Custom logit processor {processor.__class__.__name__} is applied."
+                )
 
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
