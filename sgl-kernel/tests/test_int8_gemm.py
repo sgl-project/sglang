@@ -11,7 +11,10 @@ def to_int8(tensor: torch.Tensor) -> torch.Tensor:
 
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
     o = torch.matmul(a.to(torch.float32), b.to(torch.float32))
-    o = o.to(torch.float32) * scale_a.view(-1, 1) * scale_b.view(1, -1) + bias
+    if bias is not None:
+        o = o.to(torch.float32) * scale_a.view(-1, 1) * scale_b.view(1, -1) + bias
+    else:
+        o = o.to(torch.float32) * scale_a.view(-1, 1) * scale_b.view(1, -1)
     return o.to(out_dtype)
 
 
@@ -23,7 +26,7 @@ class TestInt8Gemm(unittest.TestCase):
         scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
         scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
         if with_bias:
-            bias = torch.ones((N,), device="cuda", dtype=out_dtype)
+            bias = torch.zeros((N,), device="cuda", dtype=out_dtype)
         else:
             bias = None
 

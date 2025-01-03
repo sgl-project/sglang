@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include "../epilogue/epilogue_per_row_per_col_scale.h"
 #include "cutlass/complex.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
@@ -11,6 +10,7 @@
 #include "cutlass/matrix_coord.h"
 #include "cutlass/semaphore.h"
 #include "cutlass/trace.h"
+#include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -434,28 +434,10 @@ struct GemmWithEpilogueVisitor {
     }
   }
 
-  /*
-      To improve compilation speed, we do not compile the device operator if the CUDA_ARCH does not correspond
-      to the ArchTag of the cutlass kernel operator.
-    */
   /// Executes one GEMM
   CUTLASS_DEVICE
   void operator()(Params const& params, SharedStorage& shared_storage) {
-#if defined(__CUDA_ARCH__)
-#if (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
-    run_kernel<arch::Sm75>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
-    run_kernel<arch::Sm80>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 900)
-    // TODO - replace with CUTLASS_NOT_IMPLEMENTED() and upgrade to 3.x kernels.
-    run_kernel<arch::Sm80>(params, shared_storage);
-#else
-    static_assert(false,
-                  "Invalid architecture being compiled. Only Volta+ supported in weight-only quantization kernels.");
-#endif
-#else
-    CUTLASS_NOT_IMPLEMENTED();
-#endif
+    run_kernel<ArchTag>(params, shared_storage);
   }
 };
 

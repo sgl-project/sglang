@@ -62,6 +62,7 @@ cutlass = root / "3rdparty" / "cutlass"
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
+    root / "src" / "sgl-kernel" / "csrc",
 ]
 nvcc_flags = [
     "-O3",
