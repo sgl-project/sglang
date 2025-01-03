@@ -107,20 +107,20 @@ struct GemmWithEpilogueVisitor {
     Arguments() : mode(GemmUniversalMode::kGemm), batch_count(1) {}
 
     /// constructs an arguments structure
-    Arguments(GemmUniversalMode mode_, GemmCoord problem_size_, int batch_count_, TensorRefA ref_A_, TensorRefB ref_B_,
-              TensorRefAlphaCol ref_alpha_col_, TensorRefAlphaRow ref_alpha_row_, TensorRefC ref_C_, TensorRefC ref_D_,
-              int64_t batch_stride_A_, int64_t batch_stride_B_, typename EpilogueVisitor::Arguments epilogue_visitor_)
-        : mode(mode_),
+    Arguments(GemmCoord problem_size_, TensorRefA ref_A_, TensorRefB ref_B_, TensorRefAlphaCol ref_alpha_col_,
+              TensorRefAlphaRow ref_alpha_row_, TensorRefC ref_C_, TensorRefC ref_D_,
+              typename EpilogueVisitor::Arguments epilogue_visitor_)
+        : mode(GemmUniversalMode::kGemm),
           problem_size(problem_size_),
-          batch_count(batch_count_),
+          batch_count(1),
           ref_A(ref_A_),
           ref_B(ref_B_),
           ref_alpha_col(ref_alpha_col_),
           ref_alpha_row(ref_alpha_row_),
           ref_C(ref_C_),
           ref_D(ref_D_),
-          batch_stride_A(batch_stride_A_),
-          batch_stride_B(batch_stride_B_),
+          batch_stride_A(0),
+          batch_stride_B(0),
           batch_stride_D(0),
           epilogue_visitor(epilogue_visitor_) {}
   };
