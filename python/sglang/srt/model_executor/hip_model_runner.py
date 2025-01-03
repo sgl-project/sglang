@@ -2,6 +2,8 @@ import json
 import logging
 from typing import Optional
 
+import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.hip_attention import HiPRadixAttentionBackend
 from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
@@ -83,6 +85,10 @@ class HiPModelRunner(ModelRunner):
     
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if forward_batch.forward_mode.is_decode():
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            
+        if forward_batch.forward_mode.is_decode():
             result = self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
             result = self.forward_extend(forward_batch)
@@ -90,11 +96,20 @@ class HiPModelRunner(ModelRunner):
             result = self.forward_idle(forward_batch)
         else:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
-    
+
+        if forward_batch.forward_mode.is_decode():
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            
+            end_event.synchronize()
+            elapsed = start_event.elapsed_time(end_event)
+        
         if (forward_batch.hip_metadata_cache_pool is not None) and forward_batch.forward_mode.is_decode():
             cache = forward_batch.hip_metadata_cache_pool
             statistics = cache.compute_cache_statistics(forward_batch.batch_size)
             statistics = dict(map(lambda x: (x[0], x[1].item()), statistics.items()))
-            logger.info(f'cache statistics {statistics}')
+            logger.info(f'took {elapsed} ms, cache statistics {statistics}')
+        elif forward_batch.forward_mode.is_decode():
+            logger.info(f'took {elapsed} ms')
 
         return result

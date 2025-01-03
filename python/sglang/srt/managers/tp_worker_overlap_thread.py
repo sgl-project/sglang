@@ -128,10 +128,10 @@ class TpModelWorkerClient:
                 if self.hip_mask_refresh_interval is not None:
                     if decode_index % self.hip_mask_refresh_interval == 0:
                         model_worker_batch.hip_use_cached_mask = False
-                        logger.info(f"Refreshing attention mask for decode index {decode_index}.")
+                        # logger.info(f"Refreshing attention mask for decode index {decode_index}.")
                     else:
                         model_worker_batch.hip_use_cached_mask = True
-                        logger.info(f"Using cached attention mask for decode index {decode_index}.")
+                        # logger.info(f"Using cached attention mask for decode index {decode_index}.")
                 decode_index += 1
             elif model_worker_batch.forward_mode.is_extend():
                 decode_index = 0
