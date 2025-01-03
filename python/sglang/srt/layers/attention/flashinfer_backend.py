@@ -791,7 +791,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
-                kv_indices,
+                kv_indices[:paged_kernel_lens_sum],
                 self.req_to_token.shape[1],
             )
 
