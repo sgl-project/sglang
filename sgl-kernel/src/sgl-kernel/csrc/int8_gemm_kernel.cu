@@ -1,6 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/threadblock/epilogue_with_visitor.h>
+#include <cutlass/gemm/device/gemm.h>
 #include <cutlass/numeric_types.h>
 
 #include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
