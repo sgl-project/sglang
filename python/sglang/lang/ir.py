@@ -19,6 +19,7 @@ class SglSamplingParams:
     max_new_tokens: int = 128
     min_new_tokens: int = 0
     stop: Union[str, List[str]] = ()
+    stop_regex: Union[str, List[str]] = ()
     stop_token_ids: Optional[List[int]] = ()
     temperature: float = 1.0
     top_p: float = 1.0
@@ -42,6 +43,7 @@ class SglSamplingParams:
             self.max_new_tokens,
             self.min_new_tokens,
             self.stop,
+            self.stop_regex,
             self.stop_token_ids,
             self.temperature,
             self.top_p,
@@ -117,6 +119,7 @@ class SglSamplingParams:
             "max_new_tokens": self.max_new_tokens,
             "min_new_tokens": self.min_new_tokens,
             "stop": self.stop,
+            "stop_regex": self.stop_regex,
             "stop_token_ids": self.stop_token_ids,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -154,6 +157,7 @@ class SglFunction:
         *args,
         max_new_tokens: int = 128,
         stop: Optional[Union[str, List[str]]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -178,10 +182,13 @@ class SglFunction:
             stop = []
         if stop_token_ids is None:
             stop_token_ids = []
+        if stop_regex is None:
+            stop_regex = []
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
+            stop_regex=stop_regex,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
@@ -212,6 +219,7 @@ class SglFunction:
         *,
         max_new_tokens: int = 128,
         stop: Optional[Union[str, List[str]]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -234,6 +242,8 @@ class SglFunction:
             stop = []
         if stop_token_ids is None:
             stop_token_ids = []
+        if stop_regex is None:
+            stop_regex = []
 
         assert isinstance(batch_kwargs, (list, tuple))
         if len(batch_kwargs) == 0:
@@ -256,6 +266,7 @@ class SglFunction:
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
+            stop_regex=stop_regex,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
@@ -438,6 +449,7 @@ class SglGen(SglExpr):
         max_new_tokens: Optional[int] = None,
         min_new_tokens: Optional[int] = None,
         stop: Optional[Union[str, List[str]]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -461,6 +473,7 @@ class SglGen(SglExpr):
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             stop=stop,
+            stop_regex=stop_regex,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
