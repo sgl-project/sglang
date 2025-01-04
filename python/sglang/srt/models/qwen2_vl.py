@@ -661,7 +661,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
         )
 
         if not get_embedding:

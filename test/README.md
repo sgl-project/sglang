@@ -25,7 +25,7 @@ export OPENAI_API_KEY=sk-*****
 python3 test_openai_backend.py
 
 # Run a single test
-python3 -m unittest test_openai_backend.TestOpenAIBackend.test_few_shot_qa
+python3 -m unittest test_openai_backend.TestOpenAIServer.test_few_shot_qa
 
 # Run a suite with multiple files
 python3 run_suite.py --suite per-commit

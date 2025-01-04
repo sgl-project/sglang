@@ -897,7 +897,7 @@ def v1_chat_generate_request(
                             {"role": message.role, "content": message.content}
                         )
                     else:
-                        content_list = message.dict()["content"]
+                        content_list = message["content"]
                         for content in content_list:
                             if content["type"] == "text":
                                 openai_compatible_messages.append(

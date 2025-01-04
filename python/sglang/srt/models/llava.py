@@ -403,7 +403,7 @@ class LlavaBaseForCausalLM(nn.Module):
                     pt += 1
 
             return self.language_model(
-                input_ids, positions, forward_batch, input_embeds=input_embeds
+                input_ids, positions, forward_batch, inputs_embeds=input_embeds
             )
         elif forward_batch.forward_mode.is_decode():
             return self.language_model(input_ids, positions, forward_batch)
