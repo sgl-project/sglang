@@ -262,7 +262,9 @@ class EAGLEDraftInput(SpecInfo):
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
             self.scores = topk_cs_p
 
-            selected_input_index = topk_cs_index.flatten() // self.topk  # b* topk
+            selected_input_index = topk_cs_index.flatten() // self.topk + torch.arange(
+                0, batch.batch_size() * self.topk, step=self.topk, device="cuda"
+            ).repeat_interleave(self.topk)
 
             batch.spec_info.hidden_states = batch.spec_info.hidden_states[
                 selected_input_index, :
@@ -347,6 +349,7 @@ class EAGLEDraftInput(SpecInfo):
             triton.next_power_of_2(self.spec_steps + 1),
         )
 
+        batch.seq_lens_sum = sum(batch.seq_lens)
         batch.input_ids = self.verified_id
         self.verified_id = new_verified_id
 
@@ -455,13 +458,25 @@ class EAGLEDraftInput(SpecInfo):
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def merge_batch(self, spec_info: EAGLEDraftInput):
-
+        if self.hidden_states is None:
+            self.hidden_states = spec_info.hidden_states
+            self.verified_id = spec_info.verified_id
+            self.sample_output = spec_info.sample_output
+            self.prev_mode = spec_info.prev_mode
+            return
+        if spec_info.hidden_states is None:
+            return
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         # self.positions = torch.cat([self.positions, spec_info.positions], axis=0)
         self.sample_output = torch.cat([self.sample_output, spec_info.sample_output])
+
+    def filter_batch(self, keep_indices):
+        self.hidden_states = self.hidden_states[keep_indices]
+        self.verified_id = self.verified_id[keep_indices]
+        self.sample_output = self.sample_output[keep_indices]
 
 
 class EagleVerifyInput(SpecInfo):
