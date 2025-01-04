@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,10 @@ class ModelRunner:
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.memory_saver
+        )
 
         # Load the model
         self.sampler = Sampler()
@@ -264,11 +269,12 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         # Load the model
-        self.model = get_model(
-            model_config=self.model_config,
-            load_config=self.load_config,
-            device_config=DeviceConfig(self.device),
-        )
+        with self.memory_saver_adapter.region():
+            self.model = get_model(
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device_config=DeviceConfig(self.device),
+            )
 
         # Parse other args
         self.sliding_window_size = (
@@ -386,7 +392,7 @@ class ModelRunner:
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
         try:
@@ -556,6 +562,7 @@ class ModelRunner:
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
             use_records=False,
+            memory_saver_adapter=self.memory_saver_adapter,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -568,6 +575,7 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+                memory_saver_adapter=self.memory_saver_adapter,
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
@@ -578,6 +586,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
+                memory_saver_adapter=self.memory_saver_adapter,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -587,6 +596,7 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+                memory_saver_adapter=self.memory_saver_adapter,
             )
         logger.info(
             f"Memory pool end. "

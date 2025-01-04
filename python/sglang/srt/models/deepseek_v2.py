@@ -56,6 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.utils import is_flashinfer_available, is_hip
 
 is_hip_ = is_hip()
@@ -823,7 +824,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
-class DeepseekV2ForCausalLM(nn.Module):
+class DeepseekV2ForCausalLM(BaseCausalLM):
 
     def __init__(
         self,

@@ -46,6 +46,10 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
+    ReleaseGPUOccupationReqInput,
+    ReleaseGPUOccupationReqOutput,
+    ResumeGPUOccupationReqInput,
+    ResumeGPUOccupationReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -87,6 +91,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -356,6 +361,10 @@ class Scheduler:
         t.start()
         self.parent_process = psutil.Process().parent()
 
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.memory_saver
+        )
+
         # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
             self.profiler = None
@@ -516,6 +525,12 @@ class Scheduler:
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+            elif isinstance(recv_req, ReleaseGPUOccupationReqInput):
+                self.release_gpu_occupation()
+                self.send_to_tokenizer.send_pyobj(ReleaseGPUOccupationReqOutput())
+            elif isinstance(recv_req, ResumeGPUOccupationReqInput):
+                self.resume_gpu_occupation()
+                self.send_to_tokenizer.send_pyobj(ResumeGPUOccupationReqOutput())
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
                     self.start_profile()
@@ -1538,6 +1553,20 @@ class Scheduler:
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return parameter
+
+    def release_gpu_occupation(self):
+        self.stashed_model_static_state = (
+            self.tp_worker.worker.model_runner.model.export_static_state()
+        )
+        self.memory_saver_adapter.pause()
+        self.flush_cache()
+
+    def resume_gpu_occupation(self):
+        self.memory_saver_adapter.resume()
+        self.tp_worker.worker.model_runner.model.import_static_state(
+            self.stashed_model_static_state
+        )
+        del self.stashed_model_static_state
 
     def start_profile(self) -> None:
         if self.profiler is None:

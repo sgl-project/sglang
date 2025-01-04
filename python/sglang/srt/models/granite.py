@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -295,7 +296,7 @@ class GraniteModel(nn.Module):
         return hidden_states
 
 
-class GraniteForCausalLM(nn.Module):
+class GraniteForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: GraniteConfig,

@@ -62,6 +62,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.utils import get_compiler_backend, set_weight_attrs
 
 
@@ -313,7 +314,7 @@ class CohereModel(nn.Module):
         return hidden_states
 
 
-class CohereForCausalLM(nn.Module):
+class CohereForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,
