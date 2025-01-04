@@ -582,7 +582,9 @@ class Scheduler:
         # Handle image inputs
         if recv_req.image_inputs is not None:
             image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            print(image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
+            print(req.origin_input_ids)
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
             )

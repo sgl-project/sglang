@@ -15,6 +15,7 @@ from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_image
 from sglang.utils import get_exception_traceback
+from sglang.srt.models.internvl2 import image_to_pixel_values
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +344,103 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         }
 
 
+class InternVL2ImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
+    
+    async def process_images_async(self, *args, **kwargs):
+        return None
+    
+    @staticmethod
+    def _process_single_image_task(
+        image_data: Union[str, bytes],
+        image_processor=None,
+    ):
+        try:
+            image, image_size = load_image(image_data)
+            if image_size is not None:
+                # It is a video with multiple images
+                image_hash = hash(image_data)
+                # process_result = image_processor(image)
+                pixel_values = image_to_pixel_values(image)
+                # pixel_values = process_result["pixel_values"]
+                for _ in range(len(pixel_values)):
+                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                pixel_values = np.stack(pixel_values, axis=0)
+                return pixel_values, image_hash, image_size
+            else:
+                # It is an image
+                image_hash = hash(image_data)
+                # process_result = image_processor(image)
+                pixel_values = image_to_pixel_values(image)
+                if isinstance(pixel_values, np.ndarray):
+                    pixel_values = pixel_values.astype(np.float16)
+
+                return pixel_values, image_hash, image.size
+        except Exception:
+            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+
+    async def _process_single_image(self, image_data: Union[bytes, str]):
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.executor,
+                InternVL2ImageProcessor._process_single_image_task,
+                image_data,
+            )
+        else:
+            return self._process_single_image_task(image_data)
+
+    async def process_images_async(
+        self, image_data: List[Union[str, bytes]], input_text, request_obj
+    ):
+        if not image_data:
+            return None
+
+        if isinstance(image_data, list) and len(image_data) > 0:
+            # Multiple images
+            if len(image_data) > 1:
+                pixel_values, image_hashes, image_sizes = (
+                    [],
+                    [],
+                    [],
+                )
+                res = []
+                for img_data in image_data:
+                    res.append(self._process_single_image(img_data))
+                res = await asyncio.gather(*res)
+                for pixel_v, image_h, image_s in res:
+                    pixel_values.append(pixel_v)
+                    image_hashes.append(image_h)
+                    image_sizes.append(image_s)
+
+                if isinstance(pixel_values[0], np.ndarray):
+                    pixel_values = np.concatenate(pixel_values, axis=0)
+            else:
+                # A single image
+                pixel_values, image_hash, image_size = (
+                    await self._process_single_image(image_data[0])
+                )
+                image_hashes = [image_hash]
+                image_sizes = [image_size]
+        elif isinstance(image_data, str):
+            # A single image
+            pixel_values, image_hash, image_size = (
+                await self._process_single_image(image_data)
+            )
+            image_hashes = [image_hash]
+            image_sizes = [image_size]
+        else:
+            raise ValueError(f"Invalid image data: {image_data}")
+
+        return {
+            "pixel_values": pixel_values,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "modalities": request_obj.modalities or ["image"],
+        }
+    
+
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor
 ) -> BaseImageProcessor:
@@ -350,6 +448,8 @@ def get_image_processor(
         return MllamaImageProcessor(hf_config, server_args, processor)
     elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
         return Qwen2VLImageProcessor(hf_config, server_args, processor.image_processor)
+    elif "InternVLChatModel" in hf_config.architectures:
+        return InternVL2ImageProcessor(hf_config, server_args, processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
 

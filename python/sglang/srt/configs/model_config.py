@@ -88,6 +88,7 @@ class ModelConfig:
             self.context_len = derived_context_len
 
         # Unify the config keys for hf_text_config
+        # print(self.hf_text_config)
         self.head_dim = getattr(
             self.hf_text_config,
             "head_dim",
@@ -300,6 +301,12 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+    if hasattr(config, "llm_config"):
+        # The code operates under the assumption that llm_config should have
+        # `num_attention_heads` (among others). Assert here to fail early
+        # if transformers config doesn't align with this assumption.
+        assert hasattr(config.llm_config, "num_attention_heads")
+        return config.llm_config
     else:
         return config
 
@@ -393,6 +400,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaVidForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
+        or "InternVLChatModel" in model_architectures
     ):
         return True
     else:

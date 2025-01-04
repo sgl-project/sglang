@@ -27,19 +27,21 @@ from transformers import (
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
+    ProcessorMixin,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
 
-    from sglang.srt.configs import ExaoneConfig, Qwen2VLConfig
+    from sglang.srt.configs import ExaoneConfig, Qwen2VLConfig, InternVLChatConfig
 
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         ChatGLMConfig.model_type: ChatGLMConfig,
         DbrxConfig.model_type: DbrxConfig,
         ExaoneConfig.model_type: ExaoneConfig,
         Qwen2VLConfig.model_type: Qwen2VLConfig,
+        # InternVLChatConfig.model_type: InternVLChatConfig,
     }
 except ImportError:
     # We want this file to run without vllm dependency
@@ -74,7 +76,9 @@ def get_config(
     )
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
+        print(config_class)
         config = config_class.from_pretrained(model, revision=revision)
+        print(config)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
     if model_override_args:
@@ -198,13 +202,25 @@ def get_processor(
     tokenizer_revision: Optional[str] = None,
     **kwargs,
 ):
-    processor = AutoProcessor.from_pretrained(
-        tokenizer_name,
-        *args,
-        trust_remote_code=trust_remote_code,
-        tokenizer_revision=tokenizer_revision,
-        **kwargs,
-    )
+    if "InternVL" in tokenizer_name:
+        # tokenizer = get_tokenizer(tokenizer_name, *args, tokenizer_mode, trust_remote_code, tokenizer_revision, **kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            tokenizer_revision=tokenizer_revision,
+            clean_up_tokenization_spaces=False,
+            **kwargs,
+        )
+        processor = DummyProcessor(tokenizer=tokenizer)
+    else:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            tokenizer_revision=tokenizer_revision,
+            **kwargs,
+        )
 
     attach_additional_stop_token_ids(processor.tokenizer)
     return processor
@@ -231,3 +247,21 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+
+class DummyProcessor(ProcessorMixin):
+    attributes = ["tokenizer", "image_processor"]
+    image_processor_class = None
+    tokenizer_class = "PreTrainedTokenizerFast"
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.image_processor = None
+
+    def save_pretrained(self, save_directory):
+        self.tokenizer.save_pretrained(save_directory)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        return cls(tokenizer=tokenizer)
