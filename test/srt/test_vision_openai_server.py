@@ -171,7 +171,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         text = response.choices[0].message.content
         assert isinstance(text, str)
         print(text)
-        assert "man" in text or "cab" in text, text
+        assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
         assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
         assert response.created
@@ -442,6 +442,25 @@ class TestMllamaServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
+
+class TestMinicpmvServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-V-2_6"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "minicpmv",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
