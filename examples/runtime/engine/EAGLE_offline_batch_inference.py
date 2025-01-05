@@ -21,6 +21,7 @@ def main():
         speculative_num_steps=3,
         speculative_eagle_topk=4,
         speculative_num_draft_tokens=16,
+        cuda_graph_max_bs=8,
     )
 
     outputs = llm.generate(prompts, sampling_params)

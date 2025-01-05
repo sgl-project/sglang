@@ -322,6 +322,8 @@ class CudaGraphRunner:
             global_num_tokens = None
             gathered_buffer = None
 
+        spec_info = self.get_spec_info(num_tokens, positions)
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -341,7 +343,8 @@ class CudaGraphRunner:
             mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=self.get_spec_info(num_tokens, positions),
+            spec_info=spec_info,
+            capture_hidden_mode=spec_info.capture_hidden_mode,
         )
 
         # Attention backend
