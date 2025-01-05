@@ -36,7 +36,6 @@ def multi_process_parallel(
     cls: Any,
     test_target: Any,
 ) -> None:
-
     # Using ray helps debugging the error when it failed
     # as compared to multiprocessing.
     # NOTE: We need to set working_dir for distributed tests,
