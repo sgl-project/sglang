@@ -129,7 +129,7 @@ class CudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
 
         # Batch sizes to capture
-        max_batch_size_to_capture = os.getenv('SRT_MAX_BATCH', '1024')
+        max_batch_size_to_capture = int(os.getenv('SRT_MAX_BATCH', '1024'))
         if model_runner.server_args.disable_cuda_graph_padding:
             self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
