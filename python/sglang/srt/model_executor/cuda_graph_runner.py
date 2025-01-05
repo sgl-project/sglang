@@ -449,10 +449,10 @@ class CudaGraphRunner:
 
             if self.model_runner.is_draft_worker:
                 spec_info = EAGLEDraftInput()
+                spec_info.load_server_args(self.model_runner.server_args)
                 spec_info.hidden_states = self.hidden_states[:num_tokens]
                 spec_info.positions = positions
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
-                spec_info.init(self.model_runner.server_args)
             else:
                 spec_info = EagleVerifyInput(
                     None,

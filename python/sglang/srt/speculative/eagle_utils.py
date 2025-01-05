@@ -179,19 +179,10 @@ def generate_draft_decode_kv_indices(
 
 
 class EAGLEDraftInput(SpecInfo):
-    hidden_states: torch.Tensor = None
-    verified_id: torch.Tensor = None
-    positions: torch.Tensor = None
-    accept_length: torch.Tensor = None
-    has_finished: bool = False
-    unfinished_index: List[int] = None
-
-    def init(self, server_args: ServerArgs):
+    def __init__(self):
+        # States
         self.prev_mode = ForwardMode.DECODE
         self.sample_output = None
-        self.topk: int = server_args.speculative_eagle_topk
-        self.num_verify_token: int = server_args.speculative_num_draft_tokens
-        self.spec_steps = server_args.speculative_num_steps
 
         self.scores: torch.Tensor = None
         self.score_list: List[torch.Tensor] = []
@@ -202,7 +193,17 @@ class EAGLEDraftInput(SpecInfo):
         self.iter = 0
         self.root_token: int = None
 
-        assert self.topk <= 10, "topk should <= 10"
+        self.hidden_states: torch.Tensor = None
+        self.verified_id: torch.Tensor = None
+        self.positions: torch.Tensor = None
+        self.accept_length: torch.Tensor = None
+        self.has_finished: bool = False
+        self.unfinished_index: List[int] = None
+
+    def load_server_args(self, server_args: ServerArgs):
+        self.topk: int = server_args.speculative_eagle_topk
+        self.num_verify_token: int = server_args.speculative_num_draft_tokens
+        self.spec_steps = server_args.speculative_num_steps
 
     def prepare_for_extend(self, batch: ForwardBatch):
         req_pool_indices = batch.alloc_req_slots(len(batch.reqs))

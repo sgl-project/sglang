@@ -80,7 +80,7 @@ class EAGLEWorker(TpModelWorker):
                 self.finish_extend_len,
                 model_worker_batch,
             ) = self.verify(batch)
-            next_draft_input.init(self.server_args)
+            next_draft_input.load_server_args(self.server_args)
             batch.spec_info = next_draft_input
             # if it is None, means all requsets are finished
             if batch.spec_info.verified_id is not None:
@@ -89,20 +89,21 @@ class EAGLEWorker(TpModelWorker):
             return logits_output, verified_id, model_worker_batch, next_draft_input
 
         else:
+            # Forward with the target model and get hidden states.
+            # We need the full hidden states to prefill the KV cache of the draft model.
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             logits_output, next_token_ids = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
 
+            # Forward with the draft model.
             spec_info = EAGLEDraftInput()
-            spec_info.init(self.server_args)
-            model_worker_batch.spec_info = spec_info
-            model_worker_batch.spec_info.verified_id = next_token_ids
-            model_worker_batch.spec_info.hidden_states = logits_output.hidden_states
+            spec_info.load_server_args(self.server_args)
+            spec_info.verified_id = next_token_ids
+            spec_info.hidden_states = logits_output.hidden_states
             batch.spec_info = spec_info
             self.forward_draft_extend(batch)
-            batch.spec_info = None
             return logits_output, next_token_ids, model_worker_batch, spec_info
 
     def verify(self, batch: ScheduleBatch):
