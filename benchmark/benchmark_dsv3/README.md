@@ -11,7 +11,7 @@ For the benchmarking, we choose as baseline parameters:
 - `--random-input 1024` 
 - `--random-output 1024`
 
-Complete results and logs for benchmarks are in https://github.com/datacrunch-research/h200-benchmarks
+Complete results and logs for benchmarks are in [https://github.com/datacrunch-research/h200-benchmarks](https://github.com/datacrunch-research/h200-benchmarks/commit/700675be3e55a62925f9c1a80f0b68ecf724ec13)
 
 ## DeepSeek V3 on 8xH200 (single-node) 
 
