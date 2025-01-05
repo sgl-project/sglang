@@ -33,9 +33,7 @@ import numpy as np
 import psutil
 import torch
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
-    destindex_copy_quantize_kv,
-)
+from sglang.srt.layers.attention.triton_ops.decode_attention import quantize_cache_kv
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
 
@@ -103,7 +101,7 @@ class BaseTokenToKVPool:
     ):
         self.size = size
         self.dtype = kv_cache_dtype
-        if kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+        if kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn,torch.int8):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -306,7 +304,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         else:
             return None
 
-    def get_kv_scales_buffer(self, layer_id: int):
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
         if self.cache_type == torch.int8:
             return self.get_key_scales_zeros_buffer(
                 layer_id
@@ -324,14 +322,26 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         v_scale: Optional[float] = None,
     ):
         layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
+        if self.cache_type in (torch.float8_e5m2, torch.float8_e4m3fn):
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
-        if self.store_dtype != self.dtype:
+        # For handling fp8 situations, When float8_e5m2 is enabled, cache_k.dtype is fp16, self.cache_type is float8_e5m2, and store_dtype is uint8.
+        elif self.cache_type == torch.int8:
+            quantize_cache_kv(
+                cache_k,
+                cache_v,
+                loc,
+                self.k_buffer[layer_id],
+                self.k_scales_zeros[layer_id],
+                self.v_buffer[layer_id],
+                self.v_scales_zeros[layer_id]
+            )
+
+        if self.store_dtype != self.cache_type:
             self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
             self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
         else:

@@ -46,6 +46,8 @@ def _fwd_kernel(
     O_Extend,
     K_Buffer,
     V_Buffer,
+    K_Scale_Zeros_Buffer,
+    V_Scale_Zeros_Buffer,
     Req_to_tokens,
     B_req_idx,
     B_Seq_Len,
@@ -63,8 +65,12 @@ def _fwd_kernel(
     stride_oh,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_scale_kbs,
+    stride_scale_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_scale_vbs,
+    stride_scale_vh,
     stride_req_to_tokens_b,
     logit_cap: tl.constexpr,
     Lq: tl.constexpr,
@@ -74,11 +80,13 @@ def _fwd_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_INT8_KV: tl.constexpr
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
     cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
+    scale_dtype = K_Scale_Zeros_Buffer.dtype.element_ty
 
     cur_seq_len = tl.load(B_Seq_Len + cur_seq)
     cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq)
@@ -116,7 +124,7 @@ def _fwd_kernel(
         )
         qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
-    # stage 1: compute scores with prefix
+    # stage 1: compute scores with prefix, dequant kv buffer
     offs_n = tl.arange(0, BLOCK_N)
 
     acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
@@ -137,9 +145,30 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_kh
             + offs_d[:, None]
         )
-        k = tl.load(
-            K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-        )
+        if not USE_INT8_KV:
+            k = tl.load(
+                K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+            )
+        else:
+            k_int8 = tl.load(
+                K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+            )
+            offs_scales_k = (
+                offs_kv_loc[None, :] * stride_scale_kbs * 2
+                + cur_kv_head * stride_scale_kh * 2
+            )
+            k_scales = tl.load(
+                K_Scale_Zeros_Buffer + offs_scales_k, mask=mask_n[None, :], other=1.0
+            )
+            offs_zeros_k = (
+                offs_kv_loc[None, :] * stride_scale_kbs * 2
+                + cur_kv_head * stride_scale_kh * 2
+                + 1
+            )
+            k_zeros = tl.load(
+                K_Scale_Zeros_Buffer + offs_zeros_k, mask=mask_n[None, :], other=0
+            )
+            k = (k_int8 - k_zeros).to(scale_dtype) * k_scales
 
         qk = tl.dot(q.to(k.dtype), k)
         if BLOCK_DPE > 0:
@@ -148,11 +177,34 @@ def _fwd_kernel(
                 + cur_kv_head * stride_buf_kh
                 + offs_dpe[:, None]
             )
-            kpe = tl.load(
-                K_Buffer + offs_kpe,
-                mask=mask_n[None, :],
-                other=0.0,
-            )
+            if not USE_INT8_KV: 
+                kpe = tl.load(
+                    K_Buffer + offs_kpe,
+                    mask=mask_n[None, :],
+                    other=0.0,
+                )
+            else:
+                kpe_int8 = tl.load(
+                    K_Buffer + offs_kpe,
+                    mask=mask_n[None, :],
+                    other=0.0,
+                )
+                offs_scales_kpe = (
+                    offs_kv_loc[None, :] * stride_scale_kbs * 2
+                    + cur_kv_head * stride_scale_kh * 2
+                )
+                kpe_scales = tl.load(
+                    K_Scale_Zeros_Buffer + offs_scales_kpe, mask=mask_n[None, :], other=1.0
+                )
+                offs_zeros_kpe = (
+                    offs_kv_loc[None, :] * stride_scale_kbs * 2
+                    + cur_kv_head * stride_scale_kh * 2
+                    + 1
+                )
+                kpe_zeros = tl.load(
+                    K_Scale_Zeros_Buffer + offs_zeros_kpe, mask=mask_n[None, :], other=0
+                )
+                kpe = (kpe_int8 - kpe_zeros).to(scale_dtype) * kpe_scales
             qk += tl.dot(qpe.to(kpe.dtype), kpe)
         qk *= sm_scale
 
@@ -171,9 +223,30 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_vh
             + offs_dv[None, :]
         )
-        v = tl.load(
-            V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-        )
+        if not USE_INT8_KV:
+            v = tl.load(
+                V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+            )
+        else:
+            v_int8 = tl.load(
+                V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+            )
+            offs_scales_v = (
+                offs_kv_loc[:, None] * stride_scale_vbs * 2
+                + cur_kv_head * stride_scale_vh * 2
+            )
+            v_scales = tl.load(
+                V_Scale_Zeros_Buffer + offs_scales_v, mask=mask_n[:, None], other=1.0
+            )
+            offs_zeros_v = (
+                offs_kv_loc[None, :] * stride_scale_vbs * 2
+                + cur_kv_head * stride_scale_vh * 2
+                + 1
+            )
+            v_zeros = tl.load(
+                V_Scale_Zeros_Buffer + offs_zeros_v, mask=mask_n[None, :], other=0
+            )
+            v = (v_int8 - v_zeros).to(scale_dtype) * v_scales
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -258,6 +331,8 @@ def extend_attention_fwd(
     o_extend,
     k_buffer,
     v_buffer,
+    k_scale_zeros_buffer,
+    v_scale_zeros_buffer,
     req_to_tokens,
     b_req_idx,
     b_seq_len,
@@ -272,6 +347,10 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
+    
+    # assert kv dtype
+    USE_INT8_KV = k_buffer[0].dtype == torch.int8
+    
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
@@ -325,6 +404,17 @@ def extend_attention_fwd(
     if is_hip_:
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    if USE_INT8_KV:
+        k_scale_zeros_stride0 = k_scale_zeros_buffer.stride(0)
+        k_scale_zeros_stride1 = k_scale_zeros_buffer.stride(1)
+        v_scale_zeros_stride0 = v_scale_zeros_buffer.stride(0)
+        v_scale_zeros_stride1 = v_scale_zeros_buffer.stride(1)
+    else:
+        k_scale_zeros_stride0 = None
+        k_scale_zeros_stride1 = None
+        v_scale_zeros_stride0 = None
+        v_scale_zeros_stride1 = None
+
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -349,8 +439,12 @@ def extend_attention_fwd(
         o_extend.stride(1),
         k_buffer.stride(0),
         k_buffer.stride(1),
+        k_scale_zeros_stride0,
+        k_scale_zeros_stride1,
         v_buffer.stride(0),
         v_buffer.stride(1),
+        v_scale_zeros_stride0,
+        v_scale_zeros_stride1,
         req_to_tokens.stride(0),
         logit_cap=logit_cap,
         BLOCK_DMODEL=BLOCK_DMODEL,

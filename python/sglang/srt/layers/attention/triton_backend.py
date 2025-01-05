@@ -135,7 +135,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # int8 -> get scale, other -> None
-        k_scale, v_scale = forward_batch.token_to_kv_pool.get_kv_scales_buffer(layer.layer_id)
+        k_scale_zeros, v_scale_zeros = forward_batch.token_to_kv_pool.get_kv_scales_zeros_buffer(layer.layer_id)
 
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
@@ -145,8 +145,8 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            k_scale,
-            v_scale,
+            k_scale_zeros,
+            v_scale_zeros,
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
@@ -185,14 +185,14 @@ class TritonAttnBackend(AttentionBackend):
             )
             
         # int8 -> get scale, other -> None
-        k_scale, v_scale = forward_batch.token_to_kv_pool.get_kv_scales_buffer(layer.layer_id)
+        k_scale_zeros, v_scale_zeros = forward_batch.token_to_kv_pool.get_kv_scales_zeros_buffer(layer.layer_id)
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            k_scale,
-            v_scale,
+            k_scale_zeros,
+            v_scale_zeros,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
