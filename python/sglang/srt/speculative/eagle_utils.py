@@ -180,7 +180,6 @@ def generate_draft_decode_kv_indices(
 
 class EAGLEDraftInput(SpecInfo):
     def __init__(self):
-        # States
         self.prev_mode = ForwardMode.DECODE
         self.sample_output = None
 
@@ -205,7 +204,7 @@ class EAGLEDraftInput(SpecInfo):
         self.num_verify_token: int = server_args.speculative_num_draft_tokens
         self.spec_steps = server_args.speculative_num_steps
 
-    def prepare_for_extend(self, batch: ForwardBatch):
+    def prepare_for_extend(self, batch: ScheduleBatch):
         req_pool_indices = batch.alloc_req_slots(len(batch.reqs))
         out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
         batch.out_cache_loc = out_cache_loc
@@ -217,37 +216,20 @@ class EAGLEDraftInput(SpecInfo):
             assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
-                batch.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    :pre_len
-                ] = req.prefix_indices
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+                )
 
             batch.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
                 out_cache_loc[pt : pt + req.extend_input_len]
             )
 
             pt += req.extend_input_len
+            # TODO: support logprob, see ScheduleBatch::prepare_for_extend
 
-        seq_lens = [0] + batch.extend_lens
-        input_ids = batch.input_ids.tolist()
-        verified_id = batch.spec_info.verified_id.tolist()
-        model_input_ids = []
-        for i in range(len(seq_lens) - 1):
-            model_input_ids.extend(
-                input_ids[seq_lens[i] + 1 : seq_lens[i + 1]] + [verified_id[i]]
-            )
-        batch.input_ids = torch.tensor(
-            model_input_ids, dtype=torch.int32, device="cuda"
-        )
-
-    def capture_for_decode(
-        self,
-        sample_output: SampleOutput,
-        hidden_states: torch.Tensor,
-        prev_mode: ForwardMode,
-    ):
-        self.sample_output = sample_output
-        self.prev_mode = prev_mode
-        self.hidden_states = hidden_states
+        # TODO: support batching inputs
+        assert len(batch.extend_lens) == 1
+        batch.input_ids = torch.concat((batch.input_ids[1:], self.verified_id))
 
     def prepare_for_decode(self, batch: ScheduleBatch):
         prob = self.sample_output  # b * (1/topk), vocab
