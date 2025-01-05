@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import bisect
 from contextlib import contextmanager
+import os
 from typing import TYPE_CHECKING, Callable
 
 import torch
@@ -128,10 +129,12 @@ class CudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
 
         # Batch sizes to capture
+        max_batch_size_to_capture = os.getenv('SRT_MAX_BATCH', '1024')
         if model_runner.server_args.disable_cuda_graph_padding:
             self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+        self.capture_bs = list(filter(lambda x: x <= max_batch_size_to_capture, self.capture_bs))
 
         if max(self.capture_bs) > model_runner.req_to_token_pool.size:
             # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
