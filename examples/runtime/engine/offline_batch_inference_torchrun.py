@@ -3,7 +3,6 @@ import os
 import sys
 
 from sglang import Engine
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerFragmentArgs
 
 
@@ -104,7 +103,7 @@ def run():
     # generate sequence, it would be better if the output is a list of Tensor not list of list[str]
     output = inference_engine.generate(
         prompt=input_text,
-        sampling_params=SamplingParams(max_new_tokens=16),
+        # sampling_params=SamplingParams(max_new_tokens=16),
     )
     print(f'{output=}')
 
