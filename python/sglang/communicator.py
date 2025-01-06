@@ -5,6 +5,15 @@ import zmq
 from sglang.srt.utils import get_zmq_socket
 
 
+# TODO should implement in-process send & recv, if ZMQ is too slow
+def create_sender(endpoint: str) -> 'Sender':
+    return _ZMQSender(endpoint=endpoint)
+
+
+def create_receiver(endpoint: str) -> 'Receiver':
+    return _ZMQReceiver(endpoint=endpoint)
+
+
 class Sender(ABC):
     def send(self, obj):
         raise NotImplementedError
@@ -29,16 +38,6 @@ class _ZMQReceiver(Receiver):
 
     def recv(self):
         return self._socket.recv_pyobj()
-
-
-class _QueueSender(Sender):
-    def send(self, obj):
-        TODO
-
-
-class _QueueReceiver(Receiver):
-    def recv(self):
-        return TODO
 
 
 class TypeBasedDispatcher:
