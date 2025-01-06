@@ -8,10 +8,10 @@
 #include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
 #include "cutlass_extensions/gemm/gemm_universal_base_compat.h"
 #include "cutlass_extensions/gemm/gemm_with_epilogue_visitor.h"
-#include "iostream"
 #include "utils.hpp"
 
-template <typename OutputType>
+template <typename ElementOutput, typename ArchTag, typename ThreadblockShape, typename WarpShape,
+          typename InstructionShape, int NumStages>
 void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
                             const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                             const c10::optional<torch::Tensor>& bias) {
@@ -19,16 +19,9 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   using ElementCompute = float;
   using ElementInputA = int8_t;
   using ElementInputB = int8_t;
-  using ElementOutput = OutputType;
 
-  using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
-  using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
-  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using ArchTag = cutlass::arch::Sm80;
   using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
-
-  constexpr int NumStages = 5;
 
   using DefaultGemmConf = cutlass::gemm::device::DefaultGemmConfiguration<OperatorClass, ArchTag, ElementInputA,
                                                                           ElementInputB, ElementOutput, ElementCompute>;
@@ -101,6 +94,67 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
+template <typename ElementOutput, typename ArchTag, typename InstructionShape>
+void sm75_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                         const c10::optional<torch::Tensor>& bias) {
+  int m = mat_a.size(0);
+  if (m <= 32) {
+    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<32, 128, 64>,
+                           cutlass::gemm::GemmShape<32, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
+                                                                                      scales_b, bias);
+  } else if (m <= 64) {
+    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<64, 128, 128>,
+                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
+                                                                                      scales_b, bias);
+  } else if (m <= 256) {
+    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<128, 128, 128>,
+                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
+                                                                                      scales_b, bias);
+  } else {
+    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<128, 128, 64>,
+                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
+                                                                                      scales_b, bias);
+  }
+}
+
+template <typename ElementOutput, typename ArchTag, typename InstructionShape>
+void sm80_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                         const c10::optional<torch::Tensor>& bias) {
+  int m = mat_a.size(0);
+  int n = mat_b.size(1);
+  if (m <= 16) {
+    if (n <= 4096) {
+      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<16, 64, 128>,
+                             cutlass::gemm::GemmShape<16, 64, 64>, InstructionShape, 6>(out, mat_a, mat_b, scales_a,
+                                                                                        scales_b, bias);
+    } else {
+      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<16, 64, 128>,
+                             cutlass::gemm::GemmShape<16, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
+                                                                                        scales_b, bias);
+    }
+  } else if (m <= 32) {
+    if (n <= 4096) {
+      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<32, 64, 128>,
+                             cutlass::gemm::GemmShape<32, 64, 64>, InstructionShape, 6>(out, mat_a, mat_b, scales_a,
+                                                                                        scales_b, bias);
+    } else {
+      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<32, 64, 128>,
+                             cutlass::gemm::GemmShape<32, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
+                                                                                        scales_b, bias);
+    }
+  } else if (m <= 64 || (m <= 128 && n < 8192)) {
+    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<64, 128, 128>,
+                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
+                                                                                      scales_b, bias);
+  } else {
+    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<128, 128, 64>,
+                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
+                                                                                      scales_b, bias);
+  }
+}
+
 torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                              const c10::optional<torch::Tensor>& bias) {
@@ -111,9 +165,9 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
   TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
   TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
-  TORCH_CHECK(mat_a.size(1) % 16 == 0, "mat_a.size(1) must be multiple of 16 for memory alignment")  // mat_a.stride(0)
-  TORCH_CHECK(mat_b.size(0) % 16 == 0, "mat_b.size(0) must be multiple of 16 for memory alignment")  // mat_b.stride(1)
-  TORCH_CHECK(mat_b.size(1) % 8 == 0, "mat_b.size(1) must be multiple of 8 for memory alignment")    // out.stride(0)
+  TORCH_CHECK(mat_a.size(1) % 16 == 0, "mat_a.size(1) must be multiple of 16 for memory alignment");
+  TORCH_CHECK(mat_b.size(0) % 16 == 0, "mat_b.size(0) must be multiple of 16 for memory alignment");
+  TORCH_CHECK(mat_b.size(1) % 8 == 0, "mat_b.size(1) must be multiple of 8 for memory alignment");  // out.stride(0)
   TORCH_CHECK(mat_a.scalar_type() == torch::kInt8, "mat_a must be Int8");
   TORCH_CHECK(mat_b.scalar_type() == torch::kInt8, "mat_b must be Int8");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
@@ -126,16 +180,29 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
   if (bias) {
-    TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched")
-    TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous")
+    TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched");
+    TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
+    TORCH_CHECK(bias->dtype() == out_dtype, "bias dtype must match output dtype");
   }
 
   torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
 
-  if (out_dtype == torch::kBFloat16) {
-    cutlass_int8_scaled_mm<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+  auto sm_version = getSMVersion();
+
+  if (sm_version >= 75 && sm_version < 80) {
+    TORCH_CHECK(out_dtype == torch::kHalf, "out_dtype must be Half for SM75");
+    sm75_dispatch_shape<cutlass::half_t, cutlass::arch::Sm75, cutlass::gemm::GemmShape<8, 8, 16>>(
+        out, mat_a, mat_b, scales_a, scales_b, bias);
+  } else if (sm_version >= 80 && sm_version <= 90) {
+    if (out_dtype == torch::kBFloat16) {
+      sm80_dispatch_shape<cutlass::bfloat16_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      sm80_dispatch_shape<cutlass::half_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
   } else {
-    cutlass_int8_scaled_mm<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability.");
   }
 
   return out;
