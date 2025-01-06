@@ -197,6 +197,16 @@ class Engine:
                 # but for backward compatibility we do so
                 return create_error_response(e)
 
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+    ):
+        obj = EmbeddingReqInput(text=prompt)
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self._encode_impl(obj, None))
+
     async def _encode_impl(self, obj: EmbeddingReqInput, request: Request):
         try:
             ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
@@ -214,16 +224,6 @@ class Engine:
             raise ReferenceError("Tokenizer Manager is not initialized.")
         else:
             return self.tokenizer_manager.tokenizer
-
-    def encode(
-        self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-    ):
-        obj = EmbeddingReqInput(text=prompt)
-
-        # get the current event loop
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self._encode_impl(obj, None))
 
     def start_profile(self):
         self.tokenizer_manager.start_profile()
