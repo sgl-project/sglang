@@ -239,7 +239,7 @@ def _fwd_kernel(
                 V_Scale_Zeros_Buffer + offs_scales_v, mask=mask_n[:, None], other=1.0
             )
             offs_zeros_v = (
-                offs_kv_loc[None, :] * stride_scale_vbs
+                offs_kv_loc[:, None] * stride_scale_vbs
                 + cur_kv_head * stride_scale_vh
                 + 1
             )
