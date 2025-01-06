@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from typing import List
 
 import zmq
+from sglang.communicator import TypeBasedDispatcher
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -74,6 +75,21 @@ class SchedulerCommunicator:
             on_output=self._send_to_detokenizer.send_pyobj,
             on_event_loop_iteration=lambda: self._process_input_requests(self._recv_requests()),
         )
+
+        self._dispatcher = TypeBasedDispatcher([
+            (TokenizedGenerateReqInput, self.core.handle_generate_request),
+            (TokenizedEmbeddingReqInput, self.core.handle_embedding_request),
+            (FlushCacheReq, self.core.flush_cache),
+            (AbortReq, self.core.abort_request),
+            # TODO things with ret type?
+            (TODO, self.core.TODO),
+            (TODO, self.core.TODO),
+            (TODO, self.core.TODO),
+            (TODO, self.core.TODO),
+            (TODO, self.core.TODO),
+            (TODO, self.core.TODO),
+            (TODO, self.core.TODO),
+        ])
 
     def _recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
