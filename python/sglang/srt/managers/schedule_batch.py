@@ -44,7 +44,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -1163,6 +1163,11 @@ class ScheduleBatch:
             input_embeds=self.input_embeds,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            capture_hidden_mode=(
+                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
+                if self.spec_info
+                else CaptureHiddenMode.NULL
+            ),
         )
 
     def copy(self):
@@ -1237,6 +1242,7 @@ class ModelWorkerBatch:
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
+    capture_hidden_mode: CaptureHiddenMode = None
 
 
 @triton.jit
