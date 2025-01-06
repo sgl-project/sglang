@@ -132,7 +132,7 @@ class Scheduler:
         if (
             self.tp_rank == 0
             or self.server_args.enable_dp_attention
-            or self.server_args.fragment
+            or (self.server_args.fragment_nccl_port is not None)
         ):
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
@@ -474,7 +474,7 @@ class Scheduler:
         if (
             self.tp_rank == 0
             or self.server_args.enable_dp_attention
-            or self.server_args.fragment
+            or (self.server_args.fragment_nccl_port is not None)
         ):
             recv_reqs = []
 
@@ -490,7 +490,7 @@ class Scheduler:
         if (
             self.tp_size != 1
             and not self.server_args.enable_dp_attention
-            and not self.server_args.fragment
+            and (self.server_args.fragment_nccl_port is None)
         ):
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs

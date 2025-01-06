@@ -433,8 +433,8 @@ def launch_engine(
 
     # Allocate ports for inter-process communications
     port_args = PortArgs.init_new(server_args)
-    if server_args.fragment is not None:
-        port_args.nccl_port = server_args.fragment.nccl_port
+    if server_args.fragment_nccl_port is not None:
+        port_args.nccl_port = server_args.fragment_nccl_port
 
     logger.info(f"{server_args=}")
 
@@ -489,12 +489,12 @@ def launch_engine(
 def _start_scheduler_or_dp_controller_processes(port_args, server_args):
     tp_size_per_node = server_args.tp_size // server_args.nnodes
 
-    if server_args.fragment is not None:
+    if server_args.fragment_nccl_port is not None:
         assert server_args.nnodes == 1, "Has not tested multi-node TP yet"
         proc, reader = _start_one_scheduler_process(
             port_args,
             server_args,
-            tp_rank=server_args.fragment.tp_rank,
+            tp_rank=server_args.fragment_tp_rank,
             tp_size_per_node=tp_size_per_node,
         )
         scheduler_procs, scheduler_pipe_readers = [proc], [reader]
