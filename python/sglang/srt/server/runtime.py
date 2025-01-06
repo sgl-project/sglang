@@ -57,7 +57,7 @@ class Runtime:
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
 
         proc = mp.Process(
-            target=launch_server,
+            target=_launch_server,
             args=(self.server_args, pipe_writer),
         )
         proc.start()
@@ -177,7 +177,7 @@ class Runtime:
         self.shutdown()
 
 
-def launch_server(
+def _launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
