@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import dataclasses
 import json
+import logging
 import multiprocessing as mp
 import os
 import signal
@@ -40,6 +41,8 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.version import __version__
+
+logger = logging.getLogger(__name__)
 
 
 class Engine:
