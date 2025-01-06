@@ -94,6 +94,4 @@ from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 
-STREAM_END_SYMBOL = b"data: [DONE]"
-STREAM_CHUNK_START_SYMBOL = b"data:"
 

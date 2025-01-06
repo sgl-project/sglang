@@ -1,42 +1,18 @@
-import dataclasses
 import multiprocessing as mp
-import signal
-from http import HTTPStatus
-
-import orjson
-import uvloop
-
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
-from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import (
-    load_chat_template_for_openai_api,
-    v1_batches,
-    v1_cancel_batch,
-    v1_retrieve_batch,
-)
-from sglang.srt.server_args import PortArgs
-from sglang.srt.utils import (
-    assert_pkg_version,
-    configure_logger,
-    maybe_set_triton_cache_manager,
-    prepare_model_and_tokenizer,
-    set_prometheus_multiproc_dir,
-    set_ulimit,
-)
-
 import asyncio
 import atexit
 import dataclasses
 import json
+import multiprocessing as mp
 import os
+import signal
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-
+from sglang.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
+)
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -45,10 +21,24 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.openai_api.adapter import (
+    load_chat_template_for_openai_api,
+)
+from sglang.srt.server_args import PortArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     kill_process_tree,
+)
+from sglang.srt.utils import (
+    assert_pkg_version,
+    configure_logger,
+    maybe_set_triton_cache_manager,
+    prepare_model_and_tokenizer,
+    set_prometheus_multiproc_dir,
+    set_ulimit,
 )
 from sglang.version import __version__
 
@@ -109,10 +99,10 @@ class Engine:
                 while True:
                     chunk = loop.run_until_complete(generator.__anext__())
 
-                    if chunk.startswith(STREAM_END_SYMBOL):
+                    if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -159,10 +149,10 @@ class Engine:
                 while True:
                     chunk = await generator.__anext__()
 
-                    if chunk.startswith(STREAM_END_SYMBOL):
+                    if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -392,3 +382,8 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+# TODO refactor
+_STREAM_END_SYMBOL = b"data: [DONE]"
+_STREAM_CHUNK_START_SYMBOL = b"data:"
