@@ -185,46 +185,12 @@ class TokenizerManager:
                 },
             )
 
-        if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
-            self._handle_batch_output(recv_obj)
-        elif isinstance(recv_obj, OpenSessionReqOutput):
-            self.session_futures[recv_obj.session_id].set_result(
-                recv_obj.session_id if recv_obj.success else None
-            )
-        elif isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
-            if self.server_args.dp_size == 1:
-                self.model_update_result.set_result(recv_obj)
-            else:  # self.server_args.dp_size > 1
-                self.model_update_tmp.append(recv_obj)
-                # set future if the all results are recevied
-                if len(self.model_update_tmp) == self.server_args.dp_size:
-                    self.model_update_result.set_result(self.model_update_tmp)
-        elif isinstance(recv_obj, InitWeightsUpdateGroupReqOutput):
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for init parameter update group"
-            self.init_weights_update_group_communicator.handle_recv(recv_obj)
-        elif isinstance(recv_obj, UpdateWeightsFromDistributedReqOutput):
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for update weights from distributed"
-            self.update_weights_from_distributed_communicator.handle_recv(recv_obj)
-        elif isinstance(recv_obj, UpdateWeightsFromTensorReqOutput):
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for update weights from distributed"
-            self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
-        elif isinstance(recv_obj, GetWeightsByNameReqOutput):
-            self.get_weights_by_name_communicator.handle_recv(recv_obj)
-        else:
-            raise ValueError(f"Invalid object: {recv_obj=}")
-
         self._dispatcher = TypeBasedDispatcher([
             (BatchStrOut, self._handle_batch_output),
             (BatchEmbeddingOut, self._handle_batch_output),
             (BatchTokenIDOut, self._handle_batch_output),
-            (OpenSessionReqOutput, self.TODO),
-            (UpdateWeightFromDiskReqOutput, self.TODO),
+            (OpenSessionReqOutput, self._handle_open_session_req_output),
+            (UpdateWeightFromDiskReqOutput, self._handle_update_weights_from_disk_req_output),
             (InitWeightsUpdateGroupReqOutput, self.init_weights_update_group_communicator.handle_recv),
             (UpdateWeightsFromDistributedReqOutput, self.update_weights_from_distributed_communicator.handle_recv),
             (UpdateWeightsFromTensorReqOutput, self.update_weights_from_tensor_communicator.handle_recv),
@@ -817,6 +783,20 @@ class TokenizerManager:
             else:
                 ret.append(None)
         return ret
+
+    def _handle_open_session_req_output(self, recv_obj):
+        self.session_futures[recv_obj.session_id].set_result(
+            recv_obj.session_id if recv_obj.success else None
+        )
+
+    def _handle_update_weights_from_disk_req_output(self, recv_obj):
+        if self.server_args.dp_size == 1:
+            self.model_update_result.set_result(recv_obj)
+        else:  # self.server_args.dp_size > 1
+            self.model_update_tmp.append(recv_obj)
+            # set future if the all results are recevied
+            if len(self.model_update_tmp) == self.server_args.dp_size:
+                self.model_update_result.set_result(self.model_update_tmp)
 
 
 class SignalHandler:
