@@ -265,6 +265,9 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        assert (self.fragment_tp_rank is not None) == (
+                self.fragment_nccl_port is not None), 'fragment_tp_rank must be used with fragment_nccl_port'
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
