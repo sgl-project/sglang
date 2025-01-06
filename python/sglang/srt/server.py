@@ -510,12 +510,13 @@ def _start_scheduler_processes(port_args, server_args):
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers = [reader]
         proc = mp.Process(
             target=run_data_parallel_controller_process,
             args=(server_args, port_args, writer),
         )
         proc.start()
+        scheduler_procs = [proc]
+        scheduler_pipe_readers = [reader]
     return scheduler_pipe_readers, scheduler_procs
 
 
