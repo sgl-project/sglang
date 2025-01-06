@@ -26,8 +26,6 @@ from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar
 
 import fastapi
 import uvloop
-import zmq
-import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
@@ -68,7 +66,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
-    get_zmq_socket,
     kill_process_tree,
 )
 
@@ -100,20 +97,10 @@ class TokenizerManager:
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
     ):
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
-
-        # Init inter-process communication
-        context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name
-        )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name
-        )
 
         # Read model args
         self.model_path = server_args.model_path
