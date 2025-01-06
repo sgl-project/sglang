@@ -55,7 +55,6 @@ def run_scheduler_process(
         communication = SchedulerCommunication(
             core=core, server_args=server_args, port_args=port_args, tp_rank=tp_rank,
         )
-        core.callback = communication
 
         pipe_writer.send(
             {"status": "ready", "max_total_num_tokens": core.max_total_num_tokens}

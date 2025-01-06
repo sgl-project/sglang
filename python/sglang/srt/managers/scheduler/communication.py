@@ -33,7 +33,7 @@ from sglang.srt.utils import (
 )
 
 
-class SchedulerCommunication(SchedulerCoreCallback):
+class SchedulerCommunication:
     def __init__(
         self,
         core: SchedulerCore,
@@ -70,11 +70,10 @@ class SchedulerCommunication(SchedulerCoreCallback):
             self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
-    def _on_output(self, obj):
-        self._send_to_detokenizer.send_pyobj(obj)
-
-    def _on_event_loop_iteration(self):
-        self._process_input_requests(self._recv_requests())
+        core.callback = SchedulerCoreCallback(
+            on_output=self._send_to_detokenizer.send_pyobj,
+            on_event_loop_iteration=lambda: self._process_input_requests(self._recv_requests()),
+        )
 
     def _recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""

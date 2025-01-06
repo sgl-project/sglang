@@ -19,10 +19,10 @@ import signal
 import threading
 import time
 import warnings
-from abc import ABC
 from collections import deque
 from concurrent import futures
-from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import psutil
 import torch
@@ -1478,9 +1478,7 @@ class SchedulerCore:
             del self.sessions[session_id]
 
 
-class SchedulerCoreCallback(ABC):
-    def on_output(self, obj):
-        raise NotImplementedError
-
-    def on_event_loop_iteration(self):
-        raise NotImplementedError
+@dataclass
+class SchedulerCoreCallback:
+    on_output: Callable
+    on_event_loop_iteration: Callable
