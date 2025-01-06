@@ -903,7 +903,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 @dataclasses.dataclass
 class ServerFragmentArgs:
-    pass
+    tp_rank: int
 
 
 @dataclasses.dataclass

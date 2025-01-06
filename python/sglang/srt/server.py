@@ -171,7 +171,7 @@ async def flush_cache():
     tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -486,7 +486,8 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args):
 
     if server_args.fragment is not None:
         assert server_args.nnodes == 1, 'Has not tested multi-node TP yet'
-        proc, reader = _start_one_scheduler_process(port_args, server_args, tp_rank, tp_size_per_node)
+        proc, reader = _start_one_scheduler_process(
+            port_args, server_args, tp_rank=server_args.fragment.tp_rank, tp_size_per_node=tp_size_per_node)
         scheduler_procs, scheduler_pipe_readers = [proc], [reader]
 
     elif server_args.dp_size == 1:
@@ -498,7 +499,8 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args):
             tp_size_per_node * (server_args.node_rank + 1),
         )
         for tp_rank in tp_rank_range:
-            proc, reader = _start_one_scheduler_process(port_args, server_args, tp_rank, tp_size_per_node)
+            proc, reader = _start_one_scheduler_process(
+                port_args, server_args, tp_rank=tp_rank, tp_size_per_node=tp_size_per_node)
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
@@ -507,8 +509,8 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args):
             # so they can just wait here.
             for proc in scheduler_procs:
                 proc.join()
-    else:
 
+    else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
         proc = mp.Process(
@@ -765,7 +767,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -815,7 +817,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
