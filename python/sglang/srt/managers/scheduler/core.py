@@ -22,7 +22,7 @@ import warnings
 from abc import ABC
 from collections import deque
 from concurrent import futures
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -421,6 +421,16 @@ class SchedulerCore:
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
+
+    def handle_generate_or_embedding_request(
+        self,
+        recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ):
+        if isinstance(recv_req, TokenizedGenerateReqInput):
+            return self.handle_generate_request(recv_req)
+        if isinstance(recv_req, TokenizedEmbeddingReqInput):
+            return self.handle_embedding_request(recv_req)
+        raise NotImplementedError
 
     def handle_generate_request(
         self,
