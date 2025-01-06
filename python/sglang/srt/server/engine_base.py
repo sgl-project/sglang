@@ -1,12 +1,9 @@
 import asyncio
 import atexit
-import dataclasses
 import json
 import logging
 import multiprocessing as mp
-import os
-import signal
-from typing import Dict, List, Optional, Tuple, Union, AsyncIterator
+from typing import Dict, List, Optional, Union, AsyncIterator
 
 import orjson
 import torch
@@ -14,7 +11,6 @@ from fastapi import Request
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -29,27 +25,17 @@ from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
 )
 from sglang.srt.server.utils import create_error_response
-from sglang.srt.server_args import PortArgs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    MultiprocessingSerializer,
-    kill_process_tree,
-)
-from sglang.srt.utils import (
-    assert_pkg_version,
-    configure_logger,
-    maybe_set_triton_cache_manager,
-    prepare_model_and_tokenizer,
-    set_prometheus_multiproc_dir,
-    set_ulimit,
-)
 from sglang.version import __version__
 from starlette.responses import StreamingResponse
 from abc import ABC
 
+logger = logging.getLogger(__name__)
+
 
 class EngineBase(ABC):
     """Common API and logic for both Engine and EngineFragment"""
+
     # TODO refactor these later
     def generate(
         self,
@@ -77,7 +63,7 @@ class EngineBase(ABC):
 
         # get the current event loop
         loop = asyncio.get_event_loop()
-        ret = loop.run_until_complete(self._generate_impl(obj, None))
+        ret = loop.run_until_complete(self._generate_raw(obj, None))
 
         if stream is True:
             def generator_wrapper():
@@ -124,10 +110,11 @@ class EngineBase(ABC):
             stream=stream,
         )
 
-        ret = await self._generate_impl(obj, None)
+        ret = await self._generate_raw(obj, None)
 
         if stream is True:
             generator = ret.body_iterator
+
             async def generator_wrapper():
                 offset = 0
                 while True:
@@ -144,7 +131,7 @@ class EngineBase(ABC):
         else:
             return ret
 
-    async def _generate_impl(self, obj: GenerateReqInput, request: Request):
+    async def _generate_raw(self, obj: GenerateReqInput, request: Request):
         if obj.stream:
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
@@ -173,6 +160,7 @@ class EngineBase(ABC):
                 # TODO: maybe we should not return such ORJSONResponse for engine API,
                 # but for backward compatibility we do so
                 return create_error_response(e)
+
 
 # TODO refactor
 _STREAM_END_SYMBOL = b"data: [DONE]"

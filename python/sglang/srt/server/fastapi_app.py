@@ -233,14 +233,14 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    return _global_state.engine._generate_impl(obj, request)
+    return _global_state.engine._generate_raw(obj, request)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
-    return _global_state.engine._encode_impl(obj, request)
+    return _global_state.engine._encode_raw(obj, request)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
