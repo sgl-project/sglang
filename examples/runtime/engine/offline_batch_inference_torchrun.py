@@ -3,7 +3,6 @@ import os
 import sys
 
 from sglang import Engine
-from sglang.srt.server_args import ServerFragmentArgs
 
 
 def run():
@@ -61,10 +60,8 @@ def run():
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
         tp_size=tp_size,
-        fragment=ServerFragmentArgs(
-            tp_rank=tp_rank,
-            nccl_port=23456,
-        ),
+        fragment_tp_rank=tp_rank,
+        fragment_nccl_port=23456,
     )
     _log(f"{engine=}")
 
