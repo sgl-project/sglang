@@ -69,8 +69,8 @@ def run():
     _log(f"{engine=}")
 
     output = engine.generate(
-        prompt="Today is a sunny day and I like",
-        sampling_params=dict(max_new_tokens=16),
+        prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
+        sampling_params=dict(max_new_tokens=16, temperature=0.0),
     )
     _log(f"{output=}")
 
