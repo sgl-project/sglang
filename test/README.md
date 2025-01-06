@@ -13,7 +13,7 @@ python3 test_srt_endpoint.py
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
 
 # Run a suite with multiple files
-python3 run_suite.py --suite minimal
+python3 run_suite.py --suite per-commit
 ```
 
 ## Test Frontend Language
@@ -28,14 +28,14 @@ python3 test_openai_backend.py
 python3 -m unittest test_openai_backend.TestOpenAIBackend.test_few_shot_qa
 
 # Run a suite with multiple files
-python3 run_suite.py --suite minimal
+python3 run_suite.py --suite per-commit
 ```
 
 ## Adding or Updating Tests in CI
 
 - Create new test files under `test/srt` or `test/lang` depending on the type of test.
-- Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py` or `test/lang/run_suite.py`) so they’re picked up in CI.
-- In CI, all tests run automatically. You may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows) to add custom test groups or extra checks.
+- Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py` or `test/lang/run_suite.py`) so they’re picked up in CI. For most small test cases, they can be added to the `per-commit` suite.
+- The CI will run the `per-commit` and `nightly` automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows).
 
 
 ## Writing Elegant Test Cases
