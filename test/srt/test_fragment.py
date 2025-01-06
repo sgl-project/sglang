@@ -48,7 +48,7 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
     )
     print(f"{tp_rank=} {output=}")
 
-    writer.send(output.text)
+    writer.send(output['text'])
     writer.close()
 
     print(f'run_subprocess[{tp_rank=}] engine.shutdown')
