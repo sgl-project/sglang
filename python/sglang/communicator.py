@@ -31,6 +31,16 @@ class _ZMQReceiver(Receiver):
         return self._socket.recv_pyobj()
 
 
+class _QueueSender(Sender):
+    def send(self, obj):
+        TODO
+
+
+class _QueueReceiver(Receiver):
+    def recv(self):
+        return TODO
+
+
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
