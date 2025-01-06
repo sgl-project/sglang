@@ -239,11 +239,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
-    try:
-        ret = await _global_state.engine.tokenizer_manager.generate_request(obj, request).__anext__()
-        return ret
-    except ValueError as e:
-        return _create_error_response(e)
+    return TODO
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
