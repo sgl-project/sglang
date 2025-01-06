@@ -53,7 +53,7 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
     ]:
         output = engine.generate(
             prompt=prompt,
-            sampling_params=dict(max_new_tokens=16, temperature=0.0),
+            sampling_params=[dict(max_new_tokens=16)] * len(prompt),
         )
         print(f"{tp_rank=} {prompt=} {output=} {output['text']=}")
         ans.append(output['text'])
