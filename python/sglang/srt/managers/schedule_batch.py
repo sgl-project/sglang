@@ -558,6 +558,7 @@ class ScheduleBatch:
     extend_num_tokens: int = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
+    decode_start_idx: int = 0
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -1100,6 +1101,7 @@ class ScheduleBatch:
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
+        self.decode_start_idx = len(self.seq_lens)
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
@@ -1163,6 +1165,7 @@ class ScheduleBatch:
             input_embeds=self.input_embeds,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            decode_start_idx=self.decode_start_idx,
         )
 
     def copy(self):
@@ -1215,6 +1218,9 @@ class ModelWorkerBatch:
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
+
+    # For mixed chunked prefill
+    decode_start_idx: int = 0
 
     # For multimodal
     image_inputs: Optional[List[ImageInputs]]

@@ -171,6 +171,9 @@ class ForwardBatch:
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
 
+    # For mixed chunked prefill
+    decode_start_idx: int = 0
+
     # Speculative decoding
     spec_info: SpecInfo = None
     spec_algorithm: SpeculativeAlgorithm = None
@@ -266,6 +269,7 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             input_embeds=batch.input_embeds,
+            decode_start_idx=self.decode_start_idx,
         )
 
         if ret.global_num_tokens is not None:
