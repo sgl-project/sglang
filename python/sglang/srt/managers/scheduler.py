@@ -1607,9 +1607,11 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        print('hi run_scheduler_process after create Scheduler')
         pipe_writer.send(
             {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
         )
+        print('hi run_scheduler_process after pipe_writer.send')
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:
