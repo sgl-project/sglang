@@ -5,7 +5,6 @@ import sys
 from sglang import Engine
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerFragmentArgs
-from transformers import AutoTokenizer
 
 
 # TODO big refactor sglang system after poc
@@ -30,11 +29,11 @@ def run():
     dp_rank, tp_rank = divmod(rank, tp_size)
     _log(f'{dp_rank=} {tp_rank=}')
 
-    # model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
-    model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9
+    model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
+    # model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9
 
-    hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
-
+    # hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    #
     # `sync_model_weights` not in this PR
     # # build device mesh for training engine.
     # device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
