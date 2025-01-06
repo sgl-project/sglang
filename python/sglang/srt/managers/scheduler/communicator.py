@@ -24,10 +24,10 @@ from sglang.srt.managers.scheduler.core import SchedulerCore, SchedulerCoreCallb
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
-    get_zmq_socket,
 )
 
 
+# TODO merge back?
 class SchedulerCommunicator:
     def __init__(
         self,
