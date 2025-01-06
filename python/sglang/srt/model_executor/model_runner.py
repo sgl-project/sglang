@@ -16,7 +16,6 @@
 import gc
 import json
 import logging
-import sys
 import time
 from typing import List, Optional, Tuple
 
@@ -193,7 +192,6 @@ class ModelRunner:
             self.init_attention_backend()
 
     def init_torch_distributed(self):
-        logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
         logger.info("Init torch distributed begin.")
         # Init torch distributed
         torch.get_device_module(self.device).set_device(self.gpu_id)
