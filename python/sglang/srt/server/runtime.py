@@ -1,5 +1,6 @@
 import atexit
 import json
+import logging
 import multiprocessing as mp
 import os
 import threading
@@ -15,10 +16,12 @@ from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     is_port_available,
-    kill_process_tree, add_api_key_middleware, add_prometheus_middleware,
+    kill_process_tree, add_api_key_middleware, add_prometheus_middleware, delete_directory,
 )
 from sglang.utils import get_exception_traceback
 from uvicorn.config import LOGGING_CONFIG
+
+logger = logging.getLogger(__name__)
 
 
 class Runtime:
