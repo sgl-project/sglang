@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import unittest
 from multiprocessing import Process
 
@@ -11,18 +12,24 @@ _TP_SIZE = 2
 
 class TestFragment(unittest.TestCase):
     def test_fragment(self):
-
         processes = []
+        readers = []
         for tp_rank in range(_TP_SIZE):
-            p = Process(target=_run_subprocess, args=(tp_rank,))
+            reader, writer = mp.Pipe(duplex=False)
+            p = Process(target=_run_subprocess, args=(tp_rank, writer))
             p.start()
             processes.append(p)
+            readers.append(reader)
+
+        for reader in readers:
+            output_text = reader.recv()
+            self.assertEqual(output_text, '5, 1+5=6, 1+6=7,')
 
         for p in processes:
             p.join()
 
 
-def _run_subprocess(tp_rank: int):
+def _run_subprocess(tp_rank: int, writer):
     engine = Engine(
         model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         mem_fraction_static=0.1,
@@ -37,7 +44,7 @@ def _run_subprocess(tp_rank: int):
     )
     print(f'{tp_rank=} {output=}')
 
-    assert output.text == '5, 1+5=6, 1+6=7,'
+    writer.send(output.text)
 
     engine.shutdown()
 
