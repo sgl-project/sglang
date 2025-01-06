@@ -129,13 +129,17 @@ class Scheduler:
         # Init inter-process communication
         context = zmq.Context(2)
 
+        print('hi Scheduler.init 1')
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
+            print('hi Scheduler.init 2')
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
+            print('hi Scheduler.init 3')
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name
             )
+            print('hi Scheduler.init 4')
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
@@ -148,10 +152,12 @@ class Scheduler:
                     context, zmq.PUSH, port_args.detokenizer_ipc_name
                 )
         else:
+            print('hi Scheduler.init 5')
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
+        print('hi Scheduler.init 6')
         # Init tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -165,6 +171,7 @@ class Scheduler:
         )
         self.is_generation = self.model_config.is_generation
 
+        print('hi Scheduler.init 7')
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -182,6 +189,7 @@ class Scheduler:
                     trust_remote_code=server_args.trust_remote_code,
                 )
 
+        print('hi Scheduler.init 8')
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
@@ -194,6 +202,7 @@ class Scheduler:
         if self.enable_overlap:
             self.disable_jump_forward = True
 
+        print('hi Scheduler.init 9')
         # Launch a tensor parallel worker
         if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient
@@ -208,6 +217,7 @@ class Scheduler:
             nccl_port=port_args.nccl_port,
         )
 
+        print('hi Scheduler.init 10')
         # Launch worker for speculative decoding if need
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -223,6 +233,7 @@ class Scheduler:
         else:
             self.draft_worker = None
 
+        print('hi Scheduler.init 11')
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
@@ -250,6 +261,7 @@ class Scheduler:
             f"context_len={self.model_config.context_len}"
         )
 
+        print('hi Scheduler.init 12')
         # Init memory pool and cache
         self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
 
@@ -285,6 +297,7 @@ class Scheduler:
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
 
+        print('hi Scheduler.init 13')
         # Session info
         self.sessions: Dict[str, Session] = {}
 
@@ -330,6 +343,7 @@ class Scheduler:
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
 
+        print('hi Scheduler.init 14')
         self.init_new_token_ratio = min(
             global_config.default_init_new_token_ratio
             * server_args.schedule_conservativeness,
@@ -382,6 +396,8 @@ class Scheduler:
                     # TODO: Add lora name/path in the future,
                 },
             )
+
+        print('hi Scheduler.init 15')
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one batch takes too long."""
