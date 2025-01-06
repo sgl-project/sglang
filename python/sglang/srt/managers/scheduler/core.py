@@ -89,7 +89,6 @@ class SchedulerCore:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
-        callback: 'SchedulerCoreCallback',
     ):
         # Parse args
         self.server_args = server_args
@@ -110,7 +109,7 @@ class SchedulerCore:
             if not self.spec_algorithm.is_none()
             else 1
         )
-        self.callback = callback
+        self.callback: Optional['SchedulerCoreCallback'] = None
 
         # Init tokenizer
         self.model_config = ModelConfig(

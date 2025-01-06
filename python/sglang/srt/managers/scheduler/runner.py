@@ -99,14 +99,13 @@ def run_scheduler_process(
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
-            callback=TODO,
         )
-
         communication = SchedulerCommunication(
             core=core,
             server_args=server_args, port_args=port_args,
             tp_rank=TODO, tp_size=TODO, tp_cpu_group=TODO,
         )
+        core.callback = communication
 
         pipe_writer.send(
             {"status": "ready", "max_total_num_tokens": core.max_total_num_tokens}
