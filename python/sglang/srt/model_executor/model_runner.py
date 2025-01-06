@@ -226,7 +226,8 @@ class ModelRunner:
         print(f'hi {self.__class__} init_torch_distributed 4')
 
         if not self.is_draft_worker:
-            print(f'hi {self.__class__} init_torch_distributed 5')
+            print(
+                f'hi {self.__class__} init_torch_distributed 5 {self.tp_size=} {self.tp_rank=} {self.gpu_id=} {dist_init_method=}')
             # Only initilzie the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
