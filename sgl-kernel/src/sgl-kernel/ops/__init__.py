@@ -3,6 +3,7 @@ from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
 
+
 def init_custom_reduce(rank_id, num_devices, buffers, barrier_in, barrier_out):
     return _init_custom_ar(rank_id, num_devices, buffers, barrier_in, barrier_out)
 

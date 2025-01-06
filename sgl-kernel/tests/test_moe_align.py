@@ -5,7 +5,9 @@ from sgl_kernel import moe_align_block_size
 def test_moe_align_block_size():
     num_experts = 256
     block_size = 128
-    topk_ids = torch.randint(0, num_experts, (128, 4096), dtype=torch.int32, device="cuda")
+    topk_ids = torch.randint(
+        0, num_experts, (128, 4096), dtype=torch.int32, device="cuda"
+    )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids = torch.empty(
@@ -18,7 +20,6 @@ def test_moe_align_block_size():
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-
     moe_align_block_size(
         topk_ids,
         num_experts,
@@ -27,5 +28,6 @@ def test_moe_align_block_size():
         expert_ids,
         num_tokens_post_pad,
     )
+
 
 test_moe_align_block_size()
