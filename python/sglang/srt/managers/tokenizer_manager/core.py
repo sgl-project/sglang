@@ -223,12 +223,12 @@ class TokenizerManager:
             (BatchStrOut, self._handle_batch_output),
             (BatchEmbeddingOut, self._handle_batch_output),
             (BatchTokenIDOut, self._handle_batch_output),
-            (TODO, self.TODO),
-            (TODO, self.TODO),
-            (TODO, self.TODO),
-            (TODO, self.TODO),
-            (TODO, self.TODO),
-            (TODO, self.TODO),
+            (OpenSessionReqOutput, self.TODO),
+            (UpdateWeightFromDiskReqOutput, self.TODO),
+            (InitWeightsUpdateGroupReqOutput, self.init_weights_update_group_communicator.handle_recv),
+            (UpdateWeightsFromDistributedReqOutput, self.update_weights_from_distributed_communicator.handle_recv),
+            (UpdateWeightsFromTensorReqOutput, self.update_weights_from_tensor_communicator.handle_recv),
+            (GetWeightsByNameReqOutput, self.get_weights_by_name_communicator.handle_recv),
         ])
 
     async def generate_request(
