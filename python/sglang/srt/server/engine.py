@@ -201,14 +201,7 @@ def _launch_subprocesses(
         proc.start()
 
     # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-        ),
-    )
-    detoken_proc.start()
+    launch_detoken_proc()
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
