@@ -1,4 +1,3 @@
-import multiprocessing as mp
 import asyncio
 import atexit
 import dataclasses
@@ -165,10 +164,10 @@ class Engine:
         kill_process_tree(os.getpid(), include_parent=False)
 
     def get_tokenizer(self):
-        if tokenizer_manager is None:
+        if self.tokenizer_manager is None:
             raise ReferenceError("Tokenizer Manager is not initialized.")
         else:
-            return tokenizer_manager.tokenizer
+            return self.tokenizer_manager.tokenizer
 
     def encode(
         self,
@@ -181,15 +180,15 @@ class Engine:
         return loop.run_until_complete(encode_request(obj, None))
 
     def start_profile(self):
-        tokenizer_manager.start_profile()
+        self.tokenizer_manager.start_profile()
 
     def stop_profile(self):
-        tokenizer_manager.stop_profile()
+        self.tokenizer_manager.stop_profile()
 
     def get_server_info(self):
         return {
-            **dataclasses.asdict(tokenizer_manager.server_args),  # server args
-            **scheduler_info,
+            **dataclasses.asdict(self.tokenizer_manager.server_args),  # server args
+            **self.scheduler_info,
             "version": __version__,
         }
 
@@ -213,7 +212,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            tokenizer_manager.init_weights_update_group(obj, None)
+            self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
     def update_weights_from_distributed(self, name, dtype, shape):
@@ -225,7 +224,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            tokenizer_manager.update_weights_from_distributed(obj, None)
+            self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
     def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
@@ -235,14 +234,14 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            tokenizer_manager.update_weights_from_tensor(obj, None)
+            self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
     def get_weights_by_name(self, name, truncate_size=100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
+        return loop.run_until_complete(self.tokenizer_manager.get_weights_by_name(obj, None))
 
 
 def _launch_subprocesses(
