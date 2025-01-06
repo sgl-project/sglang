@@ -43,6 +43,8 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler.core import SchedulerCore
+from sglang.srt.managers.scheduler.communication import SchedulerCommunication
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
@@ -61,6 +63,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
+
 
 def run_scheduler_process(
     server_args: ServerArgs,
@@ -91,17 +94,28 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
-        pipe_writer.send(
-            {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
+        core = SchedulerCore(
+            server_args=server_args, port_args=port_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            callback=TODO,
         )
-        if scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
+
+        communication = SchedulerCommunication(
+            core=core,
+            server_args=server_args, port_args=port_args,
+            tp_rank=TODO, tp_size=TODO, tp_cpu_group=TODO,
+        )
+
+        pipe_writer.send(
+            {"status": "ready", "max_total_num_tokens": core.max_total_num_tokens}
+        )
+        if core.enable_overlap:
+            core.event_loop_overlap()
         else:
-            scheduler.event_loop_normal()
+            core.event_loop_normal()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
-
-
