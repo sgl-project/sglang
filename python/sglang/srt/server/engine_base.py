@@ -80,14 +80,12 @@ class EngineBase(ABC):
         ret = loop.run_until_complete(self._generate_impl(obj, None))
 
         if stream is True:
-
             def generator_wrapper():
                 offset = 0
                 loop = asyncio.get_event_loop()
                 generator = ret.body_iterator
                 while True:
                     chunk = loop.run_until_complete(generator.__anext__())
-
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
@@ -130,14 +128,10 @@ class EngineBase(ABC):
 
         if stream is True:
             generator = ret.body_iterator
-
             async def generator_wrapper():
-
                 offset = 0
-
                 while True:
                     chunk = await generator.__anext__()
-
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
