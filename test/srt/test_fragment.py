@@ -28,6 +28,8 @@ class TestFragment(unittest.TestCase):
 
 
 def _run_subprocess(tp_rank: int, writer):
+    print(f'run_subprocess[{tp_rank=}] Start')
+
     engine = Engine(
         model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         mem_fraction_static=0.1,
@@ -35,6 +37,7 @@ def _run_subprocess(tp_rank: int, writer):
         fragment_tp_rank=tp_rank,
         fragment_nccl_port=23456,
     )
+    print(f'run_subprocess[{tp_rank=}] Initialized {engine=}')
 
     output = engine.generate(
         prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
@@ -44,6 +47,7 @@ def _run_subprocess(tp_rank: int, writer):
 
     writer.send(output.text)
 
+    print(f'run_subprocess[{tp_rank=}] engine.shutdown')
     engine.shutdown()
 
 
