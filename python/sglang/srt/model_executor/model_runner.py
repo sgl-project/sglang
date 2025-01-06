@@ -16,6 +16,7 @@
 import gc
 import json
 import logging
+import sys
 import time
 from typing import List, Optional, Tuple
 
@@ -201,6 +202,7 @@ class ModelRunner:
         print(f'hi {self.__class__} 9')
 
     def init_torch_distributed(self):
+        logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
         print(f'hi {self.__class__} init_torch_distributed {self.device=} {self.gpu_id=}')
         logger.info("Init torch distributed begin.")
         # Init torch distributed
