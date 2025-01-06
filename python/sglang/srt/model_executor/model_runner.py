@@ -16,6 +16,7 @@
 import gc
 import json
 import logging
+import os
 import sys
 import time
 from typing import List, Optional, Tuple
@@ -229,7 +230,8 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             print(
-                f'hi {self.__class__} init_torch_distributed 5 {self.tp_size=} {self.tp_rank=} {self.gpu_id=} {dist_init_method=}')
+                f'hi {self.__class__} init_torch_distributed 5 {self.tp_size=} {self.tp_rank=} {self.gpu_id=} {dist_init_method=} '
+                f'{dict(os.environ)=}')
             # Only initilzie the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
