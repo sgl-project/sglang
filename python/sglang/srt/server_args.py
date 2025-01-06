@@ -940,7 +940,7 @@ class PortArgs:
         )
 
 
-def get_random_available_port(base_port: int):
+def get_random_available_port(base_port: int = 10000):
     port = base_port + random.randint(100, 1000)
     while True:
         if is_port_available(port):
