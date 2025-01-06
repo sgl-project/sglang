@@ -3,9 +3,7 @@ import unittest
 from multiprocessing import Process
 
 from sglang import Engine
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-)
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 _TP_SIZE = 2
 
@@ -23,7 +21,7 @@ class TestFragment(unittest.TestCase):
 
         for reader in readers:
             output_text = reader.recv()
-            self.assertEqual(output_text, '5, 1+5=6, 1+6=7,')
+            self.assertEqual(output_text, "5, 1+5=6, 1+6=7,")
 
         for p in processes:
             p.join()
@@ -42,7 +40,7 @@ def _run_subprocess(tp_rank: int, writer):
         prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
         sampling_params=dict(max_new_tokens=16, temperature=0.0),
     )
-    print(f'{tp_rank=} {output=}')
+    print(f"{tp_rank=} {output=}")
 
     writer.send(output.text)
 
