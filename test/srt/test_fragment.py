@@ -11,11 +11,13 @@ _TP_SIZE = 2
 
 class TestFragment(unittest.TestCase):
     def test_fragment(self):
+        fragment_nccl_port = get_random_available_port()
+
         processes = []
         readers = []
         for tp_rank in range(_TP_SIZE):
             reader, writer = mp.Pipe(duplex=False)
-            p = Process(target=_run_subprocess, args=(tp_rank, writer))
+            p = Process(target=_run_subprocess, args=(tp_rank, fragment_nccl_port, writer))
             p.start()
             processes.append(p)
             readers.append(reader)
@@ -28,7 +30,7 @@ class TestFragment(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(tp_rank: int, writer):
+def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
     print(f'run_subprocess[{tp_rank=}] Start')
 
     engine = Engine(
@@ -36,7 +38,7 @@ def _run_subprocess(tp_rank: int, writer):
         mem_fraction_static=0.1,
         tp_size=_TP_SIZE,
         fragment_tp_rank=tp_rank,
-        fragment_nccl_port=get_random_available_port(),
+        fragment_nccl_port=fragment_nccl_port,
     )
     print(f'run_subprocess[{tp_rank=}] Initialized {engine=}')
 
