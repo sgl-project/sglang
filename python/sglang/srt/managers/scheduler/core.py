@@ -364,7 +364,7 @@ class SchedulerCore:
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            self.callback.recv_and_process_requests()
+            self.callback.on_event_loop_iteration()
 
             batch = self.get_next_batch_to_run()
 
@@ -389,7 +389,7 @@ class SchedulerCore:
         result_queue = deque()
 
         while True:
-            self.callback.recv_and_process_requests()
+            self.callback.on_event_loop_iteration()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1234,7 +1234,7 @@ class SchedulerCore:
 
             # Send to detokenizer
             if rids:
-                self.callback.handle_output(
+                self.callback.on_output(
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
@@ -1270,7 +1270,7 @@ class SchedulerCore:
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
-            self.callback.handle_output(
+            self.callback.on_output(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
@@ -1479,8 +1479,8 @@ class SchedulerCore:
 
 
 class SchedulerCoreCallback(ABC):
-    def handle_output(self, obj):
+    def on_output(self, obj):
         raise NotImplementedError
 
-    def recv_and_process_requests(self):
+    def on_event_loop_iteration(self):
         raise NotImplementedError

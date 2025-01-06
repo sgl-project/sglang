@@ -70,9 +70,11 @@ class SchedulerCommunication(SchedulerCoreCallback):
             self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
-    def recv_and_process_requests(self):
-        recv_reqs = self._recv_requests()
-        self._process_input_requests(recv_reqs)
+    def _on_output(self, obj):
+        self._send_to_detokenizer.send_pyobj(obj)
+
+    def _on_event_loop_iteration(self):
+        self._process_input_requests(self._recv_requests())
 
     def _recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -139,6 +141,3 @@ class SchedulerCommunication(SchedulerCoreCallback):
                 self.core.close_session(recv_req)
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
-
-    def handle_output(self, obj):
-        self._send_to_detokenizer.send_pyobj(obj)
