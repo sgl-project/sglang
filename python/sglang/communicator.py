@@ -1,6 +1,9 @@
 from abc import ABC
 from typing import Any, Type, List, Tuple, Callable
 
+import zmq
+from sglang.srt.utils import get_zmq_socket
+
 
 class Sender(ABC):
     def send(self, obj):
@@ -13,13 +16,19 @@ class Receiver(ABC):
 
 
 class _ZMQSender(Sender):
+    def __init__(self, endpoint: str):
+        self._socket = get_zmq_socket(zmq.Context(1), zmq.PUSH, endpoint)
+
     def send(self, obj):
-        TODO
+        self._socket.send_pyobj(obj)
 
 
 class _ZMQReceiver(Receiver):
+    def __init__(self, endpoint: str):
+        self._socket = get_zmq_socket(zmq.Context(1), zmq.PULL, endpoint)
+
     def recv(self):
-        TODO
+        return self._socket.recv_pyobj()
 
 
 class TypeBasedDispatcher:
