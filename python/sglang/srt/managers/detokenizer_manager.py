@@ -23,6 +23,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.communicator import create_sender, create_receiver
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
@@ -56,13 +57,8 @@ class DetokenizerManager:
         port_args: PortArgs,
     ):
         # Init inter-process communication
-        context = zmq.Context(2)
-        self.recv_from_scheduler = get_zmq_socket(
-            context, zmq.PULL, port_args.detokenizer_ipc_name
-        )
-        self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name
-        )
+        self.recv_from_scheduler = create_receiver(port_args.detokenizer_ipc_name)
+        self.send_to_tokenizer = create_sender(port_args.tokenizer_ipc_name)
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = None

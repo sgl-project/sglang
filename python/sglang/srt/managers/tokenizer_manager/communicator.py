@@ -15,6 +15,7 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.communicator import create_receiver, create_sender
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -34,10 +35,5 @@ from sglang.srt.utils import (
 class TokenizerManagerCommunicator:
     def __init__(self, port_args: PortArgs):
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name
-        )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name
-        )
+        self.recv_from_detokenizer = create_receiver(port_args.tokenizer_ipc_name)
+        self.send_to_scheduler = create_sender(port_args.scheduler_input_ipc_name)

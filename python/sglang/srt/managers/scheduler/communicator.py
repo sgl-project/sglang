@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from typing import List
 
 import zmq
-from sglang.communicator import TypeBasedDispatcher
+from sglang.communicator import TypeBasedDispatcher, create_receiver, create_sender
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -40,26 +40,16 @@ class SchedulerCommunicator:
         self.server_args = server_args
         self.tp_rank = tp_rank
 
-        context = zmq.Context(2)
-
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
-            self._recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name
-            )
-            self._send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name
-            )
+            self._recv_from_tokenizer = create_receiver(port_args.scheduler_input_ipc_name)
+            self._send_to_tokenizer = create_sender(port_args.tokenizer_ipc_name)
 
             if self.server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
-                self._send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_ipc_name
-                )
+                self._send_to_detokenizer = create_sender(port_args.tokenizer_ipc_name)
             else:
                 # Send to the DetokenizerManager
-                self._send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name
-                )
+                self._send_to_detokenizer = create_sender(port_args.detokenizer_ipc_name)
         else:
             self._recv_from_tokenizer = None
             self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
