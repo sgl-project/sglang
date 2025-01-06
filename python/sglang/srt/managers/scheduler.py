@@ -128,7 +128,7 @@ class Scheduler:
         # Init inter-process communication
         context = zmq.Context(2)
 
-        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention or self.server_args.fragment:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
