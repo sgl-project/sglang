@@ -9,8 +9,9 @@ from sglang.srt.server_args import ServerFragmentArgs
 
 # TODO big refactor sglang system after poc
 def run():
-    # build distributed world
-    local_rank, rank, world_size = initialize_global_process_group()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
 
     def _log(text):
         t = datetime.datetime.now().strftime('%H:%M:%S')
@@ -58,7 +59,7 @@ def run():
         dp_size=dp_size,
         fragment=ServerFragmentArgs(
             tp_rank=tp_rank,
-            nccl_port=12345,
+            nccl_port=23456,
         ),
     )
     _log(f'{inference_engine=}')
@@ -87,19 +88,20 @@ def run():
     # inference_engine.offload_model_weights()  # inference_engine.load_model_weights(), we can simply re-init them
 
 
-# NOTE COPIED FROM verl
-def initialize_global_process_group(timeout_second=36000):
-    import torch.distributed
-    from datetime import timedelta
-    torch.distributed.init_process_group('nccl', timeout=timedelta(seconds=timeout_second))
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-
-    if torch.distributed.is_initialized():
-        print(f'call torch.cuda.set_device({local_rank=})')
-        torch.cuda.set_device(local_rank)
-    return local_rank, rank, world_size
+# TODO try rm
+# # NOTE COPIED FROM verl
+# def initialize_global_process_group(timeout_second=36000):
+#     import torch.distributed
+#     from datetime import timedelta
+#     torch.distributed.init_process_group('nccl', timeout=timedelta(seconds=timeout_second))
+#     local_rank = int(os.environ["LOCAL_RANK"])
+#     rank = int(os.environ["RANK"])
+#     world_size = int(os.environ["WORLD_SIZE"])
+#
+#     if torch.distributed.is_initialized():
+#         print(f'call torch.cuda.set_device({local_rank=})')
+#         torch.cuda.set_device(local_rank)
+#     return local_rank, rank, world_size
 
 
 if __name__ == '__main__':
