@@ -280,9 +280,6 @@ class HiCacheController:
                         .contiguous()
                         .pin_memory()
                     )
-                    buffer.device_indices.to(
-                        device=self.mem_pool_device.device, copy=True
-                    )
                     self.load_buffer.put(buffer)
                     buffer = None
             except queue.Empty:

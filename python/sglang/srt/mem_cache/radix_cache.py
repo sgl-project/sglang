@@ -589,7 +589,10 @@ class HiRadixCache(RadixCache):
             if load_cache:
                 loading_values = self.load_back(last_node)
                 if loading_values is not None:
-                    value = torch.cat([value, loading_values])
+                    if len(value) == 0:
+                        value = loading_values
+                    else:
+                        value = torch.cat([value, loading_values])
 
             while last_node.evicted:
                 last_node = last_node.parent
