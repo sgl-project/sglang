@@ -9,12 +9,11 @@ import triton.language as tl
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel
 from sglang.srt.speculative.spec_info import SpecInfo
 
 if TYPE_CHECKING:
-    from python.sglang.srt.layers.sampler import SampleOutput
     from python.sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
@@ -232,58 +231,67 @@ class EAGLEDraftInput(SpecInfo):
         batch.input_ids = torch.concat((batch.input_ids[1:], self.verified_id))
 
     def prepare_for_decode(self, batch: ScheduleBatch):
-        prob = self.sample_output  # b * (1/topk), vocab
+        prob = self.sample_output  # shape: (b * top_k, vocab) or (b, vocab)
         top = torch.topk(prob, self.topk, dim=-1)
-        topk_index, topk_p = top.indices, top.values  # b * (1/topk), topk
-        if self.prev_mode == ForwardMode.DECODE:
+        topk_index, topk_p = (
+            top.indices,
+            top.values,
+        )  # shape: (b * top_k, top_k) or (b, top_k)
+
+        if self.prev_mode.is_decode():
             scores = torch.mul(
                 self.scores.unsqueeze(2), topk_p.reshape(-1, self.topk, self.topk)
-            )  # (b, topk) mul (b * topk ,topk) -> b, topk, topk
+            )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
             topk_cs = torch.topk(
                 scores.flatten(start_dim=1), self.topk, dim=-1
             )  # (b, topk)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            self.scores = topk_cs_p
 
-            selected_input_index = topk_cs_index.flatten() // self.topk  # b* topk
-
+            selected_input_index = (
+                topk_cs_index.flatten() // self.topk
+            )  # shape: (b * topk)
             batch.spec_info.hidden_states = batch.spec_info.hidden_states[
                 selected_input_index, :
             ]
+
             topk_index = topk_index.reshape(-1, self.topk**2)
             batch.input_ids = torch.gather(
                 topk_index, index=topk_cs_index, dim=1
             ).flatten()
-            batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
-            self.score_list.append(scores)  # b, topk, topk
-            self.token_list.append(topk_index)  # b, topk*topk
+            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
+
+            self.scores = topk_cs_p
+            self.score_list.append(scores)  # (b, topk, topk)
+            self.token_list.append(topk_index)  # (b, topk * topk)
             self.origin_score_list.append(topk_p.reshape(topk_index.shape))
             self.parents_list.append(
                 topk_cs_index + (self.topk**2 * (self.iter - 1) + self.topk)
-            )  # b, topk
-
-        elif self.prev_mode in (ForwardMode.EXTEND, ForwardMode.DRAFT_EXTEND):
-            self.scores = topk_p  # b, top_k
-            self.score_list.append(topk_p.unsqueeze(1))
-            self.token_list.append(topk_index)
-            self.origin_score_list.append(topk_p)
+            )  # shape: (b, topk)
+        else:
+            # ForwardMode.EXTEND or ForwardMode.DRAFT_EXTEND
             batch.spec_info.hidden_states = (
-                batch.spec_info.hidden_states.repeat_interleave(self.topk, 0)
+                batch.spec_info.hidden_states.repeat_interleave(self.topk, dim=0)
             )
+
             batch.input_ids = topk_index.flatten()
             batch.out_cache_loc = batch.alloc_token_slots(topk_index.numel())
+
+            self.scores = topk_p  # shape: (b, topk)
+            self.score_list.append(topk_p.unsqueeze(1))  # shape: (b, 1, topk)
+            self.token_list.append(topk_index)  # shape: (b, topk)
+            self.origin_score_list.append(topk_p)
             self.parents_list.append(
                 torch.arange(-1, self.topk, dtype=torch.long, device="cuda")
                 .unsqueeze(0)
                 .repeat(self.scores.shape[0], 1)
-            )  # b, topk+1
+            )  # shape: (b, topk + 1)
         self.cache_list.append(batch.out_cache_loc)
         self.positions = (
             batch.seq_lens[:, None]
             + torch.ones([1, self.topk], device="cuda", dtype=torch.long) * self.iter
         ).flatten()
 
-        bs = batch.seq_lens.numel()
+        bs = len(batch.seq_lens)
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
