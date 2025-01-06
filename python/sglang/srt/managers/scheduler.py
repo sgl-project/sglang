@@ -478,7 +478,7 @@ class Scheduler:
         else:
             recv_reqs = None
 
-        if self.tp_size != 1 and not self.server_args.enable_dp_attention or self.server_args.fragment:
+        if self.tp_size != 1 and not self.server_args.enable_dp_attention and not self.server_args.fragment:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
