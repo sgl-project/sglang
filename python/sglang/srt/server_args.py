@@ -849,7 +849,10 @@ class ServerArgs:
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        blacklist_attrs = {"fragment"}  # It is usually not meaningful to set it in CLI
+        attrs = [
+            attr.name for attr in dataclasses.fields(cls) if attr not in blacklist_attrs
+        ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
