@@ -2,28 +2,16 @@ import logging
 import os
 import signal
 import threading
-import time
-from abc import ABC
-from collections import deque
-from concurrent import futures
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import psutil
 import setproctitle
 import torch
-from sglang.global_config import global_config
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.scheduler.core import SchedulerCore
 from sglang.srt.managers.scheduler.communication import SchedulerCommunication
-from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
@@ -32,6 +20,8 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
+
+logger = logging.getLogger(__name__)
 
 
 def run_scheduler_process(
