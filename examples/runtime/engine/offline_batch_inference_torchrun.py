@@ -9,8 +9,8 @@ from sglang.srt.server_args import ServerFragmentArgs
 
 # TODO big refactor sglang system after poc
 def run():
-    print('environ', '\n\n', '\n'.join(f'{k}\t{v}' for k, v in sorted(os.environ.items())))
-    exit(1)
+    # print('environ', '\n\n', '\n'.join(f'{k}\t{v}' for k, v in sorted(os.environ.items())))
+    # exit(1)
 
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
@@ -56,8 +56,8 @@ def run():
     for k in [
         'GROUP_RANK',
         'GROUP_WORLD_SIZE',
-        'HF_HUB_ENABLE_HF_TRANSFER',
-        'HF_TOKEN',
+        # 'HF_HUB_ENABLE_HF_TRANSFER',
+        # 'HF_TOKEN',
         'LOCAL_RANK',
         'LOCAL_WORLD_SIZE',
         'MASTER_ADDR',
