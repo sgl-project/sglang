@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Union, AsyncIterator
 import orjson
 from fastapi import Request
 from sglang.srt.managers.io_struct import (
-    GenerateReqInput,
+    GenerateReqInput, EmbeddingReqInput,
 )
 from sglang.srt.server.utils import create_error_response
 from starlette.responses import StreamingResponse
@@ -143,7 +143,26 @@ class EngineBase(ABC):
                 # but for backward compatibility we do so
                 return create_error_response(e)
 
-    async def _generate_request_impl(self, obj: GenerateReqInput, request: Request):
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+    ):
+        obj = EmbeddingReqInput(text=prompt)
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self._encode_raw(obj, None))
+
+    async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
+        try:
+            ret = await self._generate_request_impl(obj, request).__anext__()
+            return ret
+        except ValueError as e:
+            # TODO: maybe we should not return such ORJSONResponse for engine API,
+            # but for backward compatibility we do so
+            return create_error_response(e)
+
+    async def _generate_request_impl(self, obj: Union[GenerateReqInput, EmbeddingReqInput], request: Request):
         raise NotImplementedError
 
     def _create_abort_task_impl(self, obj: GenerateReqInput):

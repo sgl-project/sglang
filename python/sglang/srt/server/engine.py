@@ -5,7 +5,7 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-from typing import Dict, List, Tuple, Union
+from typing import List, Tuple
 
 import torch
 from fastapi import Request
@@ -14,7 +14,6 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
-    EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -27,7 +26,6 @@ from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
 )
 from sglang.srt.server.engine_base import EngineBase
-from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import PortArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -65,25 +63,6 @@ class Engine(EngineBase):
         tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
-
-    def encode(
-        self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-    ):
-        obj = EmbeddingReqInput(text=prompt)
-
-        # get the current event loop
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self._encode_raw(obj, None))
-
-    async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
-        try:
-            ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
-            return ret
-        except ValueError as e:
-            # TODO: maybe we should not return such ORJSONResponse for engine API,
-            # but for backward compatibility we do so
-            return create_error_response(e)
 
     def shutdown(self):
         kill_process_tree(os.getpid(), include_parent=False)
