@@ -184,14 +184,14 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             assert cache_k.dtype == self.dtype
         else:
             if cache_k.dtype != self.dtype:
-                cache_k = cache_k.to(self.dtype, non_blocking=True)
-                cache_v = cache_v.to(self.dtype, non_blocking=True)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
         
         if prefix_seq_len == 0:
             return cache_k, cache_v
         else:
-            k[:, prefix_seq_len:, :, :].copy_(cache_k, non_blocking=True)
-            v[:, prefix_seq_len:, :, :].copy_(cache_v, non_blocking=True)
+            k[:, prefix_seq_len:, :, :].copy_(cache_k)
+            v[:, prefix_seq_len:, :, :].copy_(cache_v)
             
             return k, v
 
