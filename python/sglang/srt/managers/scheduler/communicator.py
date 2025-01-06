@@ -33,7 +33,7 @@ from sglang.srt.utils import (
 )
 
 
-class SchedulerCommunication:
+class SchedulerCommunicator:
     def __init__(
         self,
         core: SchedulerCore,

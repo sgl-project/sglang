@@ -5,7 +5,7 @@ from typing import Optional
 
 import psutil
 import setproctitle
-from sglang.srt.managers.scheduler.communication import SchedulerCommunication
+from sglang.srt.managers.scheduler.communicator import SchedulerCommunicator
 from sglang.srt.managers.scheduler.core import SchedulerCore
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -52,7 +52,7 @@ def run_scheduler_process(
             server_args=server_args, nccl_port=port_args.nccl_port,
             gpu_id=gpu_id, tp_rank=tp_rank, dp_rank=dp_rank,
         )
-        communication = SchedulerCommunication(
+        communicator = SchedulerCommunicator(
             core=core, server_args=server_args, port_args=port_args, tp_rank=tp_rank,
         )
 
