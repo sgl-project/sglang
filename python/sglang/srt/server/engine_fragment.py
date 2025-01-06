@@ -19,7 +19,7 @@ class EngineFragment(EngineBase):
         log_level: str = "error",
         *args,
         nccl_port: int,  # TODO maybe hide this into an opaque struct etc from API
-        gpu_id: int, # TODO do we need ALL these several args?
+        gpu_id: int,  # TODO do we need ALL these several args?
         tp_rank: int,
         dp_rank: int,
         **kwargs,
@@ -32,6 +32,7 @@ class EngineFragment(EngineBase):
         self._scheduler_core.callback = TODO
 
     async def _generate_request_impl(self, obj: Union[GenerateReqInput, EmbeddingReqInput], request: Request):
+        TODO  # TODO wrong, we need TokenizedGenerateReqInput, not GenerateReqInput, thus call tokenizer
         self._scheduler_core.handle_generate_request(TODO)
         self._scheduler_core.handle_embedding_request(TODO)
         return TODO
