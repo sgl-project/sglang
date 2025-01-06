@@ -138,7 +138,7 @@ def _fwd_kernel_stage1(
                 k_scales = tl.load(
                     K_Scale_Zeros_Buffer + offs_scale_k,
                     mask=offs_n[:, None] < split_kv_end,
-                    other=1.0
+                    other=1.0,
                 )
                 offs_zeros_k = (
                     kv_loc[:, None] * stride_sz_kbs * 2
@@ -146,12 +146,12 @@ def _fwd_kernel_stage1(
                     + 1
                 )
                 k_zeros = tl.load(
-                    K_Scale_Zeros_Buffer + offs_zeros_k, 
+                    K_Scale_Zeros_Buffer + offs_zeros_k,
                     mask=offs_n[:, None] < split_kv_end,
-                    other=0
+                    other=0,
                 )
                 k = (k_int8 - k_zeros).to(scale_dtype) * k_scales
-                
+
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
 
@@ -185,7 +185,7 @@ def _fwd_kernel_stage1(
                 v_scales = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
                     mask=offs_n[:, None] < split_kv_end,
-                    other=1.0
+                    other=1.0,
                 )
                 offs_zeros_v = (
                     kv_loc[:, None] * stride_sz_vbs * 2
@@ -195,7 +195,7 @@ def _fwd_kernel_stage1(
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
                     mask=offs_n[:, None] < split_kv_end,
-                    other=0
+                    other=0,
                 )
                 v = (v_int8 - v_zeros).to(scale_dtype) * v_scales
 
@@ -252,7 +252,7 @@ def _decode_att_m_fwd(
     NUM_KV_SPLITS = num_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
-    
+
     # assert kv dtype
     USE_INT8_KV = k_buffer[0].dtype == torch.int8
 
@@ -315,7 +315,7 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
-        USE_INT8_KV=USE_INT8_KV
+        USE_INT8_KV=USE_INT8_KV,
     )
 
 
@@ -356,7 +356,7 @@ def _fwd_grouped_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
-    USE_INT8_KV: tl.constexpr
+    USE_INT8_KV: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -426,8 +426,7 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                 )
                 offs_scale_k = (
-                    kv_loc[None, :] * stride_sz_kbs * 2
-                    + cur_kv_head * stride_sz_kh * 2
+                    kv_loc[None, :] * stride_sz_kbs * 2 + cur_kv_head * stride_sz_kh * 2
                 )
                 k_scale = tl.load(
                     K_Scale_Zeros_Buffer + offs_scale_k,
@@ -440,12 +439,12 @@ def _fwd_grouped_kernel_stage1(
                     + 1
                 )
                 k_zeros = tl.load(
-                    K_Scale_Zeros_Buffer + offs_zeros_k, 
+                    K_Scale_Zeros_Buffer + offs_zeros_k,
                     mask=offs_n[None, :] < split_kv_end,
-                    other=0
+                    other=0,
                 )
                 k = (k_int8 - k_zeros).to(scales_dtype) * k_scale
-                
+
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
@@ -480,12 +479,12 @@ def _fwd_grouped_kernel_stage1(
                         + 1
                     )
                     kpe_zeros = tl.load(
-                        K_Scale_Zeros_Buffer + offs_zeros_kpe, 
+                        K_Scale_Zeros_Buffer + offs_zeros_kpe,
                         mask=offs_n[None, :] < split_kv_end,
-                        other=0
+                        other=0,
                     )
                     kpe = (kpe_int8 - kpe_zeros).to(scales_dtype) * kpe_scale
-                    
+
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
 
@@ -514,8 +513,7 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                 )
                 offs_scale_v = (
-                    kv_loc[None, :] * stride_sz_vbs * 2
-                    + cur_kv_head * stride_sz_vh * 2
+                    kv_loc[None, :] * stride_sz_vbs * 2 + cur_kv_head * stride_sz_vh * 2
                 )
                 v_scale = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
@@ -528,9 +526,9 @@ def _fwd_grouped_kernel_stage1(
                     + 1
                 )
                 v_zeros = tl.load(
-                    V_Scale_Zeros_Buffer + offs_zeros_v, 
-                     mask=offs_n[None, :] < split_kv_end,
-                    other=0
+                    V_Scale_Zeros_Buffer + offs_zeros_v,
+                    mask=offs_n[None, :] < split_kv_end,
+                    other=0,
                 )
                 v = (v_int8 - v_zeros).to(scales_dtype) * v_scale
 
@@ -587,7 +585,7 @@ def _decode_grouped_att_m_fwd(
     BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
-    
+
     # assert kv dtype
     USE_INT8_KV = k_buffer[0].dtype == torch.int8
 
@@ -901,6 +899,58 @@ def _quant_int8(val):
 
 
 @triton.jit
+def quantize_and_store(
+    cur_index,
+    data_ptr,
+    cache_ptr,
+    scale_zeros_ptr,
+    stride_bs,
+    stride_h,
+    stride_d,
+    stride_c_bs,
+    stride_c_h,
+    stride_c_d,
+    dest_index,
+    offs_h,
+    offs_d,
+    head_num,
+    szd_off,
+):
+    data = tl.load(
+        data_ptr
+        + cur_index * stride_bs
+        + offs_h[:, None] * stride_h
+        + offs_d[None, :] * stride_d,
+        mask=offs_h[:, None] < head_num,
+        other=0.0,
+    )
+
+    quant, scales, zeros = _quant_int8(data)
+    o_ptrs = (
+        cache_ptr
+        + dest_index * stride_bs
+        + offs_h[:, None] * stride_h
+        + offs_d[None, :] * stride_d
+    )
+    sz_ptrs_k = (
+        scale_zeros_ptr
+        + dest_index * stride_c_bs
+        + stride_c_h * offs_h[:, None] * stride_c_d
+    )
+    tl.store(o_ptrs, quant, mask=offs_h[:, None] < head_num)
+    tl.store(
+        sz_ptrs_k + szd_off[None, :] * 1,
+        scales[:, None],
+        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] < 1),
+    )
+    tl.store(
+        sz_ptrs_k + szd_off[None, :] * 1,
+        zeros[:, None],
+        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] == 1),
+    )
+
+
+@triton.jit
 def _fwd_kernel_quantize_cache_kv(
     K_Status,
     V_Status,
@@ -915,18 +965,9 @@ def _fwd_kernel_quantize_cache_kv(
     stride_v_bs,
     stride_v_h,
     stride_v_d,
-    stride_k_c_bs,
-    stride_k_c_h,
-    stride_k_c_d,
-    stride_v_c_bs,
-    stride_v_c_h,
-    stride_v_c_d,
-    stride_k_sz_bs,
-    stride_k_sz_h,
-    stride_k_sz_d,
-    stride_v_sz_bs,
-    stride_v_sz_h,
-    stride_v_sz_d,
+    stride_kv_sz_bs,
+    stride_kv_sz_h,
+    stride_kv_sz_d,
     head_num,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_HEAD: tl.constexpr,
@@ -934,82 +975,53 @@ def _fwd_kernel_quantize_cache_kv(
     cur_index = tl.program_id(0)
     offs_h = tl.arange(0, BLOCK_HEAD)
     offs_d = tl.arange(0, BLOCK_DMODEL)
-
     dest_index = tl.load(Dest_Idx + cur_index)
-    # k
-    k_data = tl.load(
-        K_Status
-        + cur_index * stride_k_bs
-        + offs_h[:, None] * stride_k_h
-        + offs_d[None, :] * stride_k_d,
-        mask=offs_h[:, None] < head_num,
-        other=0.0,
-    )
-    
-    k_quant, k_scales, k_zeros = _quant_int8(k_data)
-    
     szd_off = tl.arange(0, 2)
-    
-    o_ptrs = (
-        K_Cache
-        + dest_index * stride_k_c_bs
-        + offs_h[:, None] * stride_k_c_h
-        + offs_d[None, :] * stride_k_c_d
+
+    # Process K
+    quantize_and_store(
+        cur_index,
+        K_Status,
+        K_Cache,
+        K_Scale_Zeros,
+        stride_k_bs,
+        stride_k_h,
+        stride_k_d,
+        stride_kv_sz_bs,
+        stride_kv_sz_h,
+        stride_kv_sz_d,
+        dest_index,
+        offs_h,
+        offs_d,
+        head_num,
+        szd_off,
     )
-    sz_ptrs_k = K_Scale_Zeros + dest_index * stride_k_sz_bs * 2 + stride_k_sz_h * offs_h[:, None] * 2
-    
-    tl.store(o_ptrs, k_quant, mask=offs_h[:, None] < head_num)
-    
-    tl.store(
-        sz_ptrs_k + szd_off[None, :] * 1, 
-        k_scales, 
-        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] < 1)
-    )
-    tl.store(
-        sz_ptrs_k + szd_off[None, :] * 1,
-        k_zeros[:, None],
-        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] == 1)
-    )
-    
-    # v
-    v_data = tl.load(
-        V_Status
-        + cur_index * stride_v_bs
-        + offs_h[:, None] * stride_v_h
-        + offs_d[None, :] * stride_v_d,
-        mask=offs_h[:, None] < head_num,
-        other=0.0,
-    )
-    
-    v_quant, v_scales, v_zeros = _quant_int8(v_data)
-    
-    o_ptrs = (
-        V_Cache
-        + dest_index * stride_v_c_bs
-        + offs_h[:, None] * stride_v_c_h
-        + offs_d[None, :] * stride_v_c_d
-    )
-    sz_ptrs_v = V_Scale_Zeros + dest_index * stride_v_sz_bs * 2 + stride_v_sz_h * offs_h[:, None] * 2
-    
-    tl.store(o_ptrs, v_quant, mask=offs_h[:, None] < head_num)
-    tl.store(
-        sz_ptrs_v + szd_off[None, :] * 1, 
-        v_scales, 
-        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] < 1)
-    )
-    tl.store(
-        sz_ptrs_v + szd_off[None, :] * 1,
-        v_zeros[:, None],
-        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] == 1)
+
+    # Process V
+    quantize_and_store(
+        cur_index,
+        V_Status,
+        V_Cache,
+        V_Scale_Zeros,
+        stride_v_bs,
+        stride_v_h,
+        stride_v_d,
+        stride_kv_sz_bs,
+        stride_kv_sz_h,
+        stride_kv_sz_d,
+        dest_index,
+        offs_h,
+        offs_d,
+        head_num,
+        szd_off,
     )
 
 
-@torch.no_grad()
 def quantize_cache_kv(
-    k_status, 
-    v_status, 
-    dest_idx, 
-    k_quantized_out, 
+    k_status,
+    v_status,
+    dest_idx,
+    k_quantized_out,
     k_scale_zeros,
     v_quantized_out,
     v_scale_zeros,
@@ -1017,10 +1029,29 @@ def quantize_cache_kv(
     bs = dest_idx.shape[0]
     k_head_num = k_status.shape[1]
     k_head_dim = k_status.shape[2]
-    assert k_status.shape[1] == k_quantized_out.shape[1] and k_status.shape[2] == k_quantized_out.shape[2]
+    assert (
+        k_status.shape[1] == k_quantized_out.shape[1]
+        and k_status.shape[2] == k_quantized_out.shape[2]
+    )
     BLOCK_HEAD = triton.next_power_of_2(k_head_num)
     grid = (bs,)
     num_warps = 1
+
+    print(
+        "Input data index:",
+        dest_idx,
+        k_status.stride(0),
+        k_status.stride(1),
+        k_status.stride(2),
+    )
+    print(
+        "Input data shape:",
+        k_scale_zeros.shape,
+        k_scale_zeros.stride(0),
+        k_scale_zeros.stride(1),
+    )
+    print("Cache pointer shape:", v_status.shape)
+    print("Scale zeros pointer shape:", k_scale_zeros.shape, v_scale_zeros.stride(2))
 
     _fwd_kernel_quantize_cache_kv[grid](
         k_status,
@@ -1036,18 +1067,9 @@ def quantize_cache_kv(
         v_status.stride(0),
         v_status.stride(1),
         v_status.stride(2),
-        k_quantized_out.stride(0),
-        k_quantized_out.stride(1),
-        k_quantized_out.stride(2),
-        v_quantized_out.stride(0),
-        v_quantized_out.stride(1),
-        v_quantized_out.stride(2),
         k_scale_zeros.stride(0),
         k_scale_zeros.stride(1),
         k_scale_zeros.stride(2),
-        v_scale_zeros.stride(0),
-        v_scale_zeros.stride(1),
-        v_scale_zeros.stride(2),
         k_head_num,
         BLOCK_DMODEL=k_head_dim,
         BLOCK_HEAD=BLOCK_HEAD,

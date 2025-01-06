@@ -543,11 +543,11 @@ class ModelRunner:
             )
         elif self.kv_cache_dtype == "int8":
             cell_size = (
-                self.model_config.get_num_kv_heads(self.tp_size) 
-                * (self.model_config.head_dim + 1) # scale
-                * self.model_config.num_hidden_layers 
-                * 2 
-                * torch._utils._element_size(self.kv_cache_dtype) 
+                self.model_config.get_num_kv_heads(self.tp_size)
+                * (self.model_config.head_dim + 1)  # scale
+                * self.model_config.num_hidden_layers
+                * 2
+                * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
             cell_size = (

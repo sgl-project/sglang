@@ -122,7 +122,6 @@ class BaseTokenToKVPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-
         return select_index.to(self.device, non_blocking=True)
 
     def free(self, free_index: torch.Tensor):
@@ -184,14 +183,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def __init__(
         self,
         size: int,
-        dtype: torch.dtype,
+        kv_cache_dtype: torch.dtype,
         head_num: int,
         head_dim: int,
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
     ):
-        super().__init__(size, dtype, device)
+        super().__init__(size, kv_cache_dtype, device)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -280,32 +279,32 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.v_buffer[i][indices] = v_data[i]
 
     def get_key_buffer(self, layer_id: int):
-        if self.store_dtype != self.cache_type:
-            return self.k_buffer[layer_id].view(self.cache_type)
+        if self.store_dtype != self.kv_cache_dtype:
+            return self.k_buffer[layer_id].view(self.kv_cache_dtype)
         return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        if self.store_dtype != self.cache_type:
-            return self.v_buffer[layer_id].view(self.cache_type)
+        if self.store_dtype != self.kv_cache_dtype:
+            return self.v_buffer[layer_id].view(self.kv_cache_dtype)
         return self.v_buffer[layer_id]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def get_key_scales_zeros_buffer(self, layer_id: int):
-        if self.cache_type == torch.int8:
+        if self.kv_cache_dtype == torch.int8:
             return self.k_scales_zeros[layer_id]
         else:
             return None
 
     def get_value_scales_zeros_buffer(self, layer_id: int):
-        if self.cache_type == torch.int8:
+        if self.kv_cache_dtype == torch.int8:
             return self.v_scales_zeros[layer_id]
         else:
             return None
 
-    def get_kv_scales_zeros_buffer(self, layer_id: int):
-        if self.cache_type == torch.int8:
+    def get_kv_scales_buffer(self, layer_id: int):
+        if self.kv_cache_dtype == torch.int8:
             return self.get_key_scales_zeros_buffer(
                 layer_id
             ), self.get_value_scales_zeros_buffer(layer_id)
@@ -332,13 +331,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # For handling fp8 situations, When float8_e5m2 is enabled, cache_k.dtype is fp16, self.cache_type is float8_e5m2, and store_dtype is uint8.
         elif self.cache_type == torch.int8:
             quantize_cache_kv(
-                cache_k,
-                cache_v,
+                cache_k.contiguous(),
+                cache_v.contiguous(),
                 loc,
                 self.k_buffer[layer_id],
                 self.k_scales_zeros[layer_id],
                 self.v_buffer[layer_id],
-                self.v_scales_zeros[layer_id]
+                self.v_scales_zeros[layer_id],
             )
 
         if self.store_dtype != self.cache_type:
@@ -388,14 +387,14 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             ]
 
     def get_key_buffer(self, layer_id: int):
-        if self.store_dtype != self.cache_type:
-            return self.kv_buffer[layer_id].view(self.cache_type)
+        if self.store_dtype != self.kv_cache_dtype:
+            return self.kv_buffer[layer_id].view(self.kv_cache_dtype)
         return self.kv_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        if self.store_dtype != self.cache_type:
+        if self.store_dtype != self.kv_cache_dtype:
             return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(
-                self.cache_type
+                self.kv_cache_dtype
             )
         return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
 
@@ -410,9 +409,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        if cache_k.dtype != self.cache_type:
-            cache_k = cache_k.to(self.cache_type)
-        if self.store_dtype != self.cache_type:
+        if cache_k.dtype != self.kv_cache_dtype:
+            cache_k = cache_k.to(self.kv_cache_dtype)
+        if self.store_dtype != self.kv_cache_dtype:
             self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
         else:
             self.kv_buffer[layer_id][loc] = cache_k
