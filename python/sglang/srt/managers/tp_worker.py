@@ -47,11 +47,9 @@ class TpModelWorker:
         nccl_port: int,
         is_draft_worker: bool = False,
     ):
-        print(f'hi {self.__class__} 1')
         # Parse args
         self.tp_rank = tp_rank
 
-        print(f'hi {self.__class__} 2')
         # Init model and tokenizer
         self.model_config = ModelConfig(
             (
@@ -77,7 +75,6 @@ class TpModelWorker:
             server_args=server_args,
             is_draft_worker=is_draft_worker,
         )
-        print(f'hi {self.__class__} 3')
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -96,7 +93,6 @@ class TpModelWorker:
                 )
         self.device = self.model_runner.device
 
-        print(f'hi {self.__class__} 4')
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
@@ -124,7 +120,6 @@ class TpModelWorker:
             self.model_runner.tp_group.cpu_group,
         )[0]
         set_random_seed(self.random_seed)
-        print(f'hi {self.__class__} 5')
 
     def get_worker_info(self):
         return (

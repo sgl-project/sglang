@@ -59,14 +59,12 @@ class TpModelWorkerClient:
         dp_rank: Optional[int],
         nccl_port: int,
     ):
-        print(f'hi {self.__class__} 1')
         # Load the model
         self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
 
-        print(f'hi {self.__class__} 2')
         # Init future mappings
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3
@@ -74,7 +72,6 @@ class TpModelWorkerClient:
             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
         )
 
-        print(f'hi {self.__class__} 3')
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
@@ -85,8 +82,6 @@ class TpModelWorkerClient:
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
-
-        print(f'hi {self.__class__} 4')
     def get_worker_info(self):
         return self.worker.get_worker_info()
 
