@@ -8,6 +8,14 @@ from sglang.srt.server_args import ServerFragmentArgs
 
 
 def run():
+    """
+    Example command:
+
+    ```
+    torchrun --nproc_per_node=4 offline_batch_inference_torchrun.py
+    ```
+    """
+
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
