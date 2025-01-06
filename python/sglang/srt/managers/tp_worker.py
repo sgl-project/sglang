@@ -30,7 +30,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, set_random_seed
+from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +45,18 @@ class TpModelWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        is_draft_worker: bool = False,
     ):
         # Parse args
         self.tp_rank = tp_rank
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path,
+            (
+                server_args.model_path
+                if not is_draft_worker
+                else server_args.speculative_draft_model_path
+            ),
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.context_length,
@@ -68,6 +73,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            is_draft_worker=is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -150,12 +156,18 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
+        skip_sample: bool = False,
     ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:
             launch_done.set()
-        next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+
+        if skip_sample:
+            next_token_ids = None
+        else:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+
         return logits_output, next_token_ids
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
@@ -191,7 +203,7 @@ class TpModelWorker:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.update_weights_from_tensor(
-            recv_req.name, recv_req.tensor
+            MultiprocessingSerializer.deserialize(recv_req.serialized_named_tensors)
         )
         return success, message
 
