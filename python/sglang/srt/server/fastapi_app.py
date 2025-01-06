@@ -57,6 +57,10 @@ class _GlobalState:
 _global_state: Optional[_GlobalState] = None
 
 
+def setup_global_state(engine: Engine):
+    _global_state = _GlobalState(engine=engine)
+
+
 ##### Native API endpoints #####
 
 

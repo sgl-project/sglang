@@ -13,6 +13,7 @@ import uvicorn
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.server.engine import Engine
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     is_port_available,
@@ -199,7 +200,12 @@ def _launch_server(
     1. The HTTP server and TokenizerManager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-    launch_engine(server_args=server_args)
+
+    from sglang.srt.server.fastapi_app import app
+    from sglang.srt.server import fastapi_app
+
+    engine = Engine(server_args=server_args)
+    fastapi_app.setup_global_state(engine=engine)
 
     # Add api key authorization
     if server_args.api_key:
