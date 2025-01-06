@@ -1,14 +1,12 @@
 import asyncio
 import atexit
 import dataclasses
-import json
 import logging
 import multiprocessing as mp
 import os
 import signal
-from typing import Dict, List, Optional, Tuple, Union, AsyncIterator
+from typing import Dict, List, Tuple, Union
 
-import orjson
 import torch
 from fastapi import Request
 from sglang.srt.managers.data_parallel_controller import (
@@ -28,6 +26,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
 )
+from sglang.srt.server.engine_base import EngineBase
 from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import PortArgs
 from sglang.srt.server_args import ServerArgs
@@ -44,12 +43,11 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.version import __version__
-from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
 
-class Engine:
+class Engine(EngineBase):
     """
     SRT Engine without an HTTP server layer.
 
@@ -159,6 +157,12 @@ class Engine:
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.get_weights_by_name(obj, None))
+
+    async def _generate_request_impl(self, obj: GenerateReqInput, request: Request):
+        return self.tokenizer_manager.generate_request(obj, request)
+
+    def _create_abort_task_impl(self, obj: GenerateReqInput):
+        return self.tokenizer_manager.create_abort_task(obj)
 
 
 def _launch_subprocesses(
@@ -298,4 +302,3 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-

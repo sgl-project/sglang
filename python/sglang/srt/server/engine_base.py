@@ -1,34 +1,16 @@
 import asyncio
-import atexit
 import json
 import logging
-import multiprocessing as mp
+from abc import ABC
 from typing import Dict, List, Optional, Union, AsyncIterator
 
 import orjson
-import torch
 from fastapi import Request
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
 from sglang.srt.managers.io_struct import (
-    EmbeddingReqInput,
     GenerateReqInput,
-    GetWeightsByNameReqInput,
-    InitWeightsUpdateGroupReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
-from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import (
-    load_chat_template_for_openai_api,
 )
 from sglang.srt.server.utils import create_error_response
-from sglang.srt.server_args import ServerArgs
-from sglang.version import __version__
 from starlette.responses import StreamingResponse
-from abc import ABC
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +117,7 @@ class EngineBase(ABC):
         if obj.stream:
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
-                    async for out in self.tokenizer_manager.generate_request(obj, request):
+                    async for out in self._generate_request_impl(obj, request):
                         yield b"data: " + orjson.dumps(
                             out, option=orjson.OPT_NON_STR_KEYS
                         ) + b"\n\n"
@@ -149,17 +131,23 @@ class EngineBase(ABC):
             return StreamingResponse(
                 stream_results(),
                 media_type="text/event-stream",
-                background=self.tokenizer_manager.create_abort_task(obj),
+                background=self._create_abort_task_impl(obj),
             )
         else:
             try:
-                ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
+                ret = await self._generate_request_impl(obj, request).__anext__()
                 return ret
             except ValueError as e:
                 logger.error(f"Error: {e}")
                 # TODO: maybe we should not return such ORJSONResponse for engine API,
                 # but for backward compatibility we do so
                 return create_error_response(e)
+
+    async def _generate_request_impl(self, obj: GenerateReqInput, request: Request):
+        raise NotImplementedError
+
+    def _create_abort_task_impl(self, obj: GenerateReqInput):
+        raise NotImplementedError
 
 
 # TODO refactor
