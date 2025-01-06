@@ -80,6 +80,7 @@ class EAGLEWorker(TpModelWorker):
                 logits_output,
                 verified_id,
                 self.finish_extend_len,
+                accept_length_cpu,
                 model_worker_batch,
             ) = self.verify(batch)
             next_draft_input.load_server_args(self.server_args)
@@ -87,7 +88,12 @@ class EAGLEWorker(TpModelWorker):
             # if it is None, means all requsets are finished
             if batch.spec_info.verified_id is not None:
                 self.forward_draft_extend_after_decode(batch)
-            return logits_output, verified_id, model_worker_batch
+            return (
+                logits_output,
+                verified_id,
+                model_worker_batch,
+                sum(accept_length_cpu),
+            )
 
         else:
             # Forward with the target model and get hidden states.
@@ -105,7 +111,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.verified_id = next_token_ids
             batch.spec_info = spec_info
             self.forward_draft_extend(batch)
-            return logits_output, next_token_ids, model_worker_batch
+            return logits_output, next_token_ids, model_worker_batch, 0
 
     def verify(self, batch: ScheduleBatch):
         verify_input = batch.spec_info.prepare_for_verify(batch)

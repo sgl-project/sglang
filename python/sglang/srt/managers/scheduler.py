@@ -962,9 +962,13 @@ class Scheduler:
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    logits_output, next_token_ids, model_worker_batch = (
-                        self.draft_worker.forward_batch_speculative_generation(batch)
-                    )
+                    (
+                        logits_output,
+                        next_token_ids,
+                        model_worker_batch,
+                        num_accepted_tokens,
+                    ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                    self.num_generated_tokens += num_accepted_tokens
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)

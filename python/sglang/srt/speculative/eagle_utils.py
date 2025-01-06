@@ -597,4 +597,10 @@ class EagleVerifyInput(SpecInfo):
             draft_input.unfinished_index = unfinished_index
 
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
-        return draft_input, logits_output, verified_id, finished_extend_len
+        return (
+            draft_input,
+            logits_output,
+            verified_id,
+            finished_extend_len,
+            accept_length_cpu,
+        )
