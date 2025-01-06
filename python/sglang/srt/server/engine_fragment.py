@@ -1,8 +1,8 @@
 from typing import Union
 
 from fastapi import Request
-from sglang.srt.managers.io_struct import GenerateReqInput, EmbeddingReqInput
-from sglang.srt.managers.scheduler.core import SchedulerCore
+from sglang.srt.managers.io_struct import GenerateReqInput, EmbeddingReqInput, BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.scheduler.core import SchedulerCore, SchedulerCoreCallback
 from sglang.srt.server.engine_base import EngineBase
 from sglang.srt.server_args import ServerArgs
 
@@ -29,7 +29,10 @@ class EngineFragment(EngineBase):
             server_args=server_args, nccl_port=nccl_port,
             gpu_id=gpu_id, tp_rank=tp_rank, dp_rank=dp_rank,
         )
-        self._scheduler_core.callback = TODO
+        self._scheduler_core.callback = SchedulerCoreCallback(
+            on_output=self._handle_core_output,
+            on_event_loop_iteration=lambda: None,
+        )
 
     async def _generate_request_impl(self, obj: Union[GenerateReqInput, EmbeddingReqInput], request: Request):
         TODO  # TODO wrong, we need TokenizedGenerateReqInput, not GenerateReqInput, thus call tokenizer
@@ -39,3 +42,6 @@ class EngineFragment(EngineBase):
 
     def _create_abort_task_impl(self, obj: GenerateReqInput):
         return None  # not supported yet
+
+    def _handle_core_output(self, obj: Union[BatchTokenIDOut, BatchEmbeddingOut]):
+        TODO
