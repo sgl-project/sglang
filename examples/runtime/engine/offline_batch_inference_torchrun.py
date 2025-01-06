@@ -68,14 +68,11 @@ def run():
     )
     _log(f"{engine=}")
 
-    for i in range(5):
-        output = engine.generate(
-            prompt="Today is a sunny day and I like",
-            sampling_params=dict(max_new_tokens=16),
-        )
-        _log(f"Iteration {i}: {output=}")
-
-    engine.shutdown()
+    output = engine.generate(
+        prompt="Today is a sunny day and I like",
+        sampling_params=dict(max_new_tokens=16),
+    )
+    _log(f"{output=}")
 
 
 if __name__ == "__main__":
