@@ -21,13 +21,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from vllm.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-    set_custom_all_reduce,
-)
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -59,6 +52,12 @@ from sglang.srt.utils import (
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
+from vllm.distributed import (
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+    set_custom_all_reduce,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +76,7 @@ class ModelRunner:
         server_args: ServerArgs,
         is_draft_worker: bool = False,
     ):
+        print(f'hi {self.__class__} 1')
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -93,6 +93,7 @@ class ModelRunner:
             server_args.speculative_algorithm
         )
 
+        print(f'hi {self.__class__} 2')
         # Model-specific adjustment
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -115,6 +116,7 @@ class ModelRunner:
                 self.server_args.ds_heavy_channel_type
             )
 
+        print(f'hi {self.__class__} 3')
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
             if self.model_config.hf_config.architectures == [
@@ -132,6 +134,7 @@ class ModelRunner:
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
 
+        print(f'hi {self.__class__} 4')
         # Global vars
         if server_args.show_time_cost:
             enable_show_time_cost()
@@ -140,6 +143,7 @@ class ModelRunner:
 
             disable_cache()
 
+        print(f'hi {self.__class__} 5')
         global_server_args_dict.update(
             {
                 "attention_backend": server_args.attention_backend,
@@ -153,15 +157,18 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
+        print(f'hi {self.__class__} 6')
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        print(f'hi {self.__class__} 7')
         # Load the model
         self.sampler = Sampler()
         self.load_model()
 
+        print(f'hi {self.__class__} 8')
         # Apply torchao quantization
         apply_torchao_config_to_model(
             self.model, global_server_args_dict["torchao_config"]
@@ -191,7 +198,10 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
+        print(f'hi {self.__class__} 9')
+
     def init_torch_distributed(self):
+        print(f'hi {self.__class__} init_torch_distributed {self.device=} {self.gpu_id=}')
         logger.info("Init torch distributed begin.")
         # Init torch distributed
         torch.get_device_module(self.device).set_device(self.gpu_id)
@@ -204,15 +214,19 @@ class ModelRunner:
         elif self.device == "hpu":
             backend = "hccl"
 
+        print(f'hi {self.__class__} init_torch_distributed 2')
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
         if self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+        print(f'hi {self.__class__} init_torch_distributed 3')
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        print(f'hi {self.__class__} init_torch_distributed 4')
 
         if not self.is_draft_worker:
+            print(f'hi {self.__class__} init_torch_distributed 5')
             # Only initilzie the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
@@ -221,13 +235,17 @@ class ModelRunner:
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
             )
+            print(f'hi {self.__class__} init_torch_distributed 6')
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            print(f'hi {self.__class__} init_torch_distributed 7')
 
+        print(f'hi {self.__class__} init_torch_distributed 8')
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
 
+        print(f'hi {self.__class__} init_torch_distributed 9')
         # Check memory for tensor parallelism
         if self.tp_size > 1:
             local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -236,6 +254,7 @@ class ModelRunner:
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
 
+        print(f'hi {self.__class__} init_torch_distributed 10')
         return min_per_gpu_memory
 
     def load_model(self):
@@ -638,7 +657,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
