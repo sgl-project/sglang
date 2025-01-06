@@ -171,7 +171,7 @@ async def flush_cache():
     tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -448,7 +448,7 @@ def launch_engine(
         tp_rank_range = range(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
-        )
+            )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
@@ -665,7 +665,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
                 json=json_data,
                 headers=headers,
                 timeout=600,
-            )
+                )
             assert res.status_code == 200, f"{res}"
     except Exception:
         last_traceback = get_exception_traceback()
@@ -1022,7 +1022,7 @@ class Runtime:
         response = requests.post(
             self.url + "/generate",
             json=json_data,
-        )
+            )
         return json.dumps(response.json())
 
     def encode(
