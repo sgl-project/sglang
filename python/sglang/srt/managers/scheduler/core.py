@@ -85,7 +85,7 @@ class SchedulerCore:
     def __init__(
         self,
         server_args: ServerArgs,
-        nccl_port: int,  # TODO maybe hide this into an opaque struct etc from API
+        nccl_port: int,
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
