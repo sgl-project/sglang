@@ -3,7 +3,6 @@ import os
 import signal
 import threading
 import time
-import warnings
 from abc import ABC
 from collections import deque
 from concurrent import futures
@@ -16,47 +15,17 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
-    CloseSessionReqInput,
-    GetWeightsByNameReqInput,
-    InitWeightsUpdateGroupReqInput,
-    OpenSessionReqInput,
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
-    ImageInputs,
-    Req,
-    ScheduleBatch,
-    global_server_args_dict,
-)
-from sglang.srt.managers.schedule_policy import (
-    AddReqResult,
-    PrefillAdder,
-    SchedulePolicy,
-)
 from sglang.srt.managers.scheduler.core import SchedulerCore
 from sglang.srt.managers.scheduler.communication import SchedulerCommunication
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
-    crash_on_warnings,
     get_bool_env_var,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -103,7 +72,7 @@ def run_scheduler_process(
         communication = SchedulerCommunication(
             core=core,
             server_args=server_args, port_args=port_args,
-            tp_rank=TODO, tp_size=TODO, tp_cpu_group=TODO,
+            tp_rank=tp_rank, tp_cpu_group=TODO,
         )
         core.callback = communication
 
