@@ -51,12 +51,12 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
         ['Today is a sunny day and I like', 'I have a very good idea on'],
         ['Hello, I am', 'What is your name?', 'Mathematics is defined as'],
     ]:
-        output = engine.generate(
+        outputs = engine.generate(
             prompt=prompt,
             sampling_params=[dict(max_new_tokens=16)] * len(prompt),
         )
-        print(f"{tp_rank=} {prompt=} {output=} {output['text']=}")
-        ans.append(output['text'])
+        print(f"{tp_rank=} {prompt=} {outputs=}")
+        ans += [o['text'] for o in outputs]
 
     writer.send(ans)
     writer.close()
