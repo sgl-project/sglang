@@ -73,8 +73,7 @@ class SchedulerCommunicator:
         self._dispatcher = TypeBasedDispatcher([
             (TokenizedGenerateReqInput, self.core.handle_generate_request),
             (TokenizedEmbeddingReqInput, self.core.handle_embedding_request),
-            # TODO flush_cache return bool
-            (FlushCacheReq, lambda _: self.core.flush_cache()),
+            (FlushCacheReq, self.core.flush_cache_wrapped),
             (AbortReq, self.core.abort_request),
             (UpdateWeightFromDiskReqInput, self.core.update_weights_from_disk),
             (InitWeightsUpdateGroupReqInput, self.core.init_weights_update_group),

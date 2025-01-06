@@ -44,7 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput, UpdateWeightFromDiskReqOutput, InitWeightsUpdateGroupReqOutput,
     UpdateWeightsFromDistributedReqOutput, UpdateWeightsFromTensorReqOutput, GetWeightsByNameReqOutput, ProfileReq,
-    OpenSessionReqOutput, )
+    OpenSessionReqOutput, FlushCacheReq, )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
@@ -1354,6 +1354,9 @@ class SchedulerCore:
 
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+
+    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
+        self.flush_cache()
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
