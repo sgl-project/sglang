@@ -464,9 +464,7 @@ def launch_engine(
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
         try:
-            print(f'hi before recv ({i})')
             data = scheduler_pipe_readers[i].recv()
-            print(f'hi after recv ({i})')
         except EOFError as e:
             logger.exception(e)
             logger.error(
