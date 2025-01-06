@@ -44,5 +44,5 @@ class EngineFragment(EngineBase):
         return None  # not supported yet
 
     def _handle_core_output(self, obj: Union[BatchTokenIDOut, BatchEmbeddingOut]):
-        # TODO use/refactor my communicator? maybe not?
+        # TODO note this is batch, need to unbatch
         TODO
