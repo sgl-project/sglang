@@ -9,6 +9,9 @@ from sglang.srt.server_args import ServerFragmentArgs
 
 # TODO big refactor sglang system after poc
 def run():
+    print('environ', '\n\n', '\n'.join(f'{k}\t{v}' for k, v in sorted(os.environ.items())))
+    exit(1)
+
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -48,6 +51,32 @@ def run():
     # inference_engine.sync_model_weights(actor_weights=state_dict, load_format='dtensor')
     #
     # name = sys.argv[1]
+
+    print('HACK DEL ENV VAR!!!')
+    for k in [
+        'GROUP_RANK',
+        'GROUP_WORLD_SIZE',
+        'HF_HUB_ENABLE_HF_TRANSFER',
+        'HF_TOKEN',
+        'LOCAL_RANK',
+        'LOCAL_WORLD_SIZE',
+        'MASTER_ADDR',
+        'MASTER_PORT',
+        'NCCL_DEBUG',
+        'OMP_NUM_THREADS',
+        'RANK',
+        'ROLE_NAME',
+        'ROLE_RANK',
+        'ROLE_WORLD_SIZE',
+        'TORCHELASTIC_ERROR_FILE',
+        'TORCHELASTIC_MAX_RESTARTS',
+        'TORCHELASTIC_RESTART_COUNT',
+        'TORCHELASTIC_RUN_ID',
+        'TORCHELASTIC_USE_AGENT_STORE',
+        'TORCH_NCCL_ASYNC_ERROR_HANDLING',
+        'WORLD_SIZE',
+    ]:
+        del os.environ[k]
 
     # [Optional] build device mesh for inference engine
     # gen_device_mesh = init_device_mesh('cuda', mesh_shape=(dp_size, tp_size), mesh_dim_names=['dp', 'tp'])
