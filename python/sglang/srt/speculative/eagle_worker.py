@@ -67,12 +67,14 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_batch_speculative_generation(self, batch: ScheduleBatch):
         if batch.forward_mode.is_decode():
-            prev_spec_info = batch.spec_info
+            # Draft
             self._set_mem_pool(batch, self.model_runner)
             for i in range(self.server_args.speculative_num_steps):
                 self.forward_draft_decode(batch)
             batch.spec_info.clear_draft_cache(batch)
             self._set_mem_pool(batch, self.target_worker.model_runner)
+
+            # Verify
             (
                 next_draft_input,
                 logits_output,
@@ -84,9 +86,8 @@ class EAGLEWorker(TpModelWorker):
             batch.spec_info = next_draft_input
             # if it is None, means all requsets are finished
             if batch.spec_info.verified_id is not None:
-                self.forward_extend_after_decode(batch)
-            batch.spec_info = prev_spec_info
-            return logits_output, verified_id, model_worker_batch, next_draft_input
+                self.forward_draft_extend_after_decode(batch)
+            return logits_output, verified_id, model_worker_batch
 
         else:
             # Forward with the target model and get hidden states.
@@ -104,12 +105,12 @@ class EAGLEWorker(TpModelWorker):
             spec_info.verified_id = next_token_ids
             batch.spec_info = spec_info
             self.forward_draft_extend(batch)
-            return logits_output, next_token_ids, model_worker_batch, spec_info
+            return logits_output, next_token_ids, model_worker_batch
 
     def verify(self, batch: ScheduleBatch):
         verify_input = batch.spec_info.prepare_for_verify(batch)
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
         verify_input.prepare_for_verify(batch)
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify_input
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch = batch.get_model_worker_batch()
@@ -125,18 +126,20 @@ class EAGLEWorker(TpModelWorker):
         batch.token_to_kv_pool = runner.token_to_kv_pool
         batch.req_to_token_pool = runner.req_to_token_pool
 
-    def forward_extend_after_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         self._set_mem_pool(batch, self.model_runner)
         batch.forward_mode = ForwardMode.DRAFT_EXTEND
         if batch.spec_info.has_finished:
             index = batch.spec_info.unfinished_index
             seq_lens = batch.seq_lens
             batch.seq_lens = batch.seq_lens[index]
+
         batch.spec_info.prepare_extend_after_decode(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         logits_output = self.model_runner.forward(forward_batch)
+
         batch.spec_info.hidden_states = logits_output.hidden_states
         self.capture_for_decode(logits_output, forward_batch)
         batch.forward_mode = ForwardMode.DECODE

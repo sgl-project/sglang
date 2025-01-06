@@ -189,7 +189,6 @@ class EAGLEDraftInput(SpecInfo):
         self.parents_list: List[torch.Tensor] = []
         self.cache_list: List[torch.Tenor] = []
         self.iter = 0
-        self.root_token: int = None
 
         self.hidden_states: torch.Tensor = None
         self.verified_id: torch.Tensor = None
@@ -410,11 +409,6 @@ class EAGLEDraftInput(SpecInfo):
         )
         return bs, kv_indices, cum_kv_seq_len
 
-    def clear(self):
-        self.iter = 0
-        self.score_list.clear()
-        self.positions = None
-
     def clear_draft_cache(self, batch):
         draft_cache = torch.cat(self.cache_list, dim=0)
         batch.token_to_kv_pool.free(draft_cache)
@@ -451,7 +445,6 @@ class EAGLEDraftInput(SpecInfo):
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        # self.positions = torch.cat([self.positions, spec_info.positions], axis=0)
         self.sample_output = torch.cat([self.sample_output, spec_info.sample_output])
 
 
@@ -559,9 +552,6 @@ class EagleVerifyInput(SpecInfo):
         )
 
         accept_index = accept_index[accept_index != -1]
-        # extract_index = extract_index[extract_index != 0]
-
-        draft_input = EAGLEDraftInput()
 
         accept_length_cpu = accept_length.tolist()
         verified_id = predict[accept_index]
@@ -587,6 +577,7 @@ class EagleVerifyInput(SpecInfo):
         # retracted_reqs, new_token_ratio = batch.retract_decode()
 
         low = 0
+        draft_input = EAGLEDraftInput()
         for i, (req, verified_len) in enumerate(zip(batch.reqs, accept_length_cpu)):
             req.output_ids.extend(verified_id_cpu[low : low + verified_len + 1])
             req.check_finished()
