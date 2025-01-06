@@ -482,7 +482,18 @@ def launch_engine(
 
 
 def _start_scheduler_processes(port_args, server_args):
-    if server_args.dp_size == 1:
+    if server_args.fragment is not None:
+        assert server_args.nnodes == 1, 'Has not tested multi-node TP yet'
+        reader, writer = mp.Pipe(duplex=False)
+        gpu_id = server_args.base_gpu_id + tp_rank
+        proc = mp.Process(
+            target=run_scheduler_process,
+            args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+        )
+        proc.start()
+        scheduler_procs, scheduler_pipe_readers = [proc], [reader]
+
+    elif server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
         scheduler_pipe_readers = []
@@ -508,6 +519,7 @@ def _start_scheduler_processes(port_args, server_args):
             for proc in scheduler_procs:
                 proc.join()
     else:
+
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
         proc = mp.Process(
@@ -515,8 +527,8 @@ def _start_scheduler_processes(port_args, server_args):
             args=(server_args, port_args, writer),
         )
         proc.start()
-        scheduler_procs = [proc]
-        scheduler_pipe_readers = [reader]
+        scheduler_procs, scheduler_pipe_readers = [proc], [reader]
+
     return scheduler_pipe_readers, scheduler_procs
 
 
