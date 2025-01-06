@@ -904,6 +904,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 @dataclasses.dataclass
 class ServerFragmentArgs:
     tp_rank: int
+    nccl_port: int
 
 
 @dataclasses.dataclass
