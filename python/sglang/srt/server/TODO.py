@@ -93,13 +93,6 @@ from sglang.srt.utils import (
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
-logger = logging.getLogger(__name__)
-
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
-tokenizer_manager: TokenizerManager = None
-scheduler_info: Dict = None
-
 
 def launch_engine(
     server_args: ServerArgs,
@@ -107,9 +100,6 @@ def launch_engine(
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
-
-    global tokenizer_manager
-    global scheduler_info
 
     # Configure global environment
     configure_logger(server_args)
