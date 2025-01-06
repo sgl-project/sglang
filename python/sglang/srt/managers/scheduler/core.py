@@ -64,7 +64,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     crash_on_warnings,
@@ -85,7 +85,7 @@ class SchedulerCore:
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        nccl_port: int,
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -164,7 +164,7 @@ class SchedulerCore:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
-            nccl_port=port_args.nccl_port,
+            nccl_port=nccl_port,
         )
 
         # Launch worker for speculative decoding if need
@@ -175,7 +175,7 @@ class SchedulerCore:
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 server_args=server_args,
-                nccl_port=port_args.nccl_port,
+                nccl_port=nccl_port,
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )

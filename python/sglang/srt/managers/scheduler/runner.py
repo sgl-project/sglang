@@ -1,22 +1,17 @@
 import logging
 import os
 import signal
-import threading
 from typing import Optional
 
 import psutil
 import setproctitle
-import torch
-from sglang.srt.managers.scheduler.core import SchedulerCore
 from sglang.srt.managers.scheduler.communication import SchedulerCommunication
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.managers.scheduler.core import SchedulerCore
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     set_gpu_proc_affinity,
-    set_random_seed,
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
@@ -54,7 +49,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         core = SchedulerCore(
-            server_args=server_args, port_args=port_args,
+            server_args=server_args, nccl_port=port_args.nccl_port,
             gpu_id=gpu_id, tp_rank=tp_rank, dp_rank=dp_rank,
         )
         communication = SchedulerCommunication(
