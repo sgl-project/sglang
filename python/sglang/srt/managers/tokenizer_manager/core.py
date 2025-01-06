@@ -617,97 +617,7 @@ class TokenizerManager:
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
-                for i, rid in enumerate(recv_obj.rids):
-                    state = self.rid_to_state.get(rid, None)
-                    if state is None:
-                        continue
-
-                    meta_info = {
-                        "id": rid,
-                        "finish_reason": recv_obj.finished_reasons[i],
-                        "prompt_tokens": recv_obj.prompt_tokens[i],
-                    }
-
-                    if getattr(state.obj, "return_logprob", False):
-                        self.convert_logprob_style(
-                            meta_info,
-                            state.obj.top_logprobs_num,
-                            state.obj.return_text_in_logprobs,
-                            recv_obj,
-                            i,
-                        )
-
-                    if not isinstance(recv_obj, BatchEmbeddingOut):
-                        meta_info.update(
-                            {
-                                "completion_tokens": recv_obj.completion_tokens[i],
-                                "cached_tokens": recv_obj.cached_tokens[i],
-                            }
-                        )
-
-                    if isinstance(recv_obj, BatchStrOut):
-                        out_dict = {
-                            "text": recv_obj.output_strs[i],
-                            "meta_info": meta_info,
-                        }
-                        if self.server_args.return_token_ids:
-                            out_dict.update(
-                                {
-                                    "input_ids": recv_obj.origin_input_ids[i],
-                                    "output_ids": recv_obj.output_ids[i],
-                                }
-                            )
-                    elif isinstance(recv_obj, BatchTokenIDOut):
-                        out_dict = {
-                            "token_ids": recv_obj.output_ids[i],
-                            "meta_info": meta_info,
-                        }
-                    else:
-                        assert isinstance(recv_obj, BatchEmbeddingOut)
-                        out_dict = {
-                            "embedding": recv_obj.embeddings[i],
-                            "meta_info": meta_info,
-                        }
-                    state.out_list.append(out_dict)
-                    state.finished = recv_obj.finished_reasons[i] is not None
-                    state.event.set()
-
-                    if self.enable_metrics:
-                        completion_tokens = (
-                            recv_obj.completion_tokens[i]
-                            if recv_obj.completion_tokens
-                            else 0
-                        )
-
-                        if state.first_token_time is None:
-                            state.first_token_time = time.time()
-                            self.metrics_collector.observe_time_to_first_token(
-                                state.first_token_time - state.created_time
-                            )
-                        else:
-                            if completion_tokens >= 2:
-                                # Compute time_per_output_token for the streaming case
-                                self.metrics_collector.observe_time_per_output_token(
-                                    (time.time() - state.first_token_time)
-                                    / (completion_tokens - 1)
-                                )
-
-                        if state.finished:
-                            self.metrics_collector.inc_prompt_tokens(
-                                recv_obj.prompt_tokens[i]
-                            )
-                            self.metrics_collector.inc_generation_tokens(
-                                completion_tokens
-                            )
-                            self.metrics_collector.observe_e2e_request_latency(
-                                time.time() - state.created_time
-                            )
-                            # Compute time_per_output_token for the non-streaming case
-                            if not state.obj.stream and completion_tokens >= 1:
-                                self.metrics_collector.observe_time_per_output_token(
-                                    (time.time() - state.created_time)
-                                    / completion_tokens
-                                )
+                self._handle_batch_output(recv_obj)
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
                     recv_obj.session_id if recv_obj.success else None
@@ -739,6 +649,99 @@ class TokenizerManager:
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
+
+    def _handle_batch_output(self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]):
+        for i, rid in enumerate(recv_obj.rids):
+            state = self.rid_to_state.get(rid, None)
+            if state is None:
+                continue
+
+            meta_info = {
+                "id": rid,
+                "finish_reason": recv_obj.finished_reasons[i],
+                "prompt_tokens": recv_obj.prompt_tokens[i],
+            }
+
+            if getattr(state.obj, "return_logprob", False):
+                self.convert_logprob_style(
+                    meta_info,
+                    state.obj.top_logprobs_num,
+                    state.obj.return_text_in_logprobs,
+                    recv_obj,
+                    i,
+                )
+
+            if not isinstance(recv_obj, BatchEmbeddingOut):
+                meta_info.update(
+                    {
+                        "completion_tokens": recv_obj.completion_tokens[i],
+                        "cached_tokens": recv_obj.cached_tokens[i],
+                    }
+                )
+
+            if isinstance(recv_obj, BatchStrOut):
+                out_dict = {
+                    "text": recv_obj.output_strs[i],
+                    "meta_info": meta_info,
+                }
+                if self.server_args.return_token_ids:
+                    out_dict.update(
+                        {
+                            "input_ids": recv_obj.origin_input_ids[i],
+                            "output_ids": recv_obj.output_ids[i],
+                        }
+                    )
+            elif isinstance(recv_obj, BatchTokenIDOut):
+                out_dict = {
+                    "token_ids": recv_obj.output_ids[i],
+                    "meta_info": meta_info,
+                }
+            else:
+                assert isinstance(recv_obj, BatchEmbeddingOut)
+                out_dict = {
+                    "embedding": recv_obj.embeddings[i],
+                    "meta_info": meta_info,
+                }
+            state.out_list.append(out_dict)
+            state.finished = recv_obj.finished_reasons[i] is not None
+            state.event.set()
+
+            if self.enable_metrics:
+                completion_tokens = (
+                    recv_obj.completion_tokens[i]
+                    if recv_obj.completion_tokens
+                    else 0
+                )
+
+                if state.first_token_time is None:
+                    state.first_token_time = time.time()
+                    self.metrics_collector.observe_time_to_first_token(
+                        state.first_token_time - state.created_time
+                    )
+                else:
+                    if completion_tokens >= 2:
+                        # Compute time_per_output_token for the streaming case
+                        self.metrics_collector.observe_time_per_output_token(
+                            (time.time() - state.first_token_time)
+                            / (completion_tokens - 1)
+                        )
+
+                if state.finished:
+                    self.metrics_collector.inc_prompt_tokens(
+                        recv_obj.prompt_tokens[i]
+                    )
+                    self.metrics_collector.inc_generation_tokens(
+                        completion_tokens
+                    )
+                    self.metrics_collector.observe_e2e_request_latency(
+                        time.time() - state.created_time
+                    )
+                    # Compute time_per_output_token for the non-streaming case
+                    if not state.obj.stream and completion_tokens >= 1:
+                        self.metrics_collector.observe_time_per_output_token(
+                            (time.time() - state.created_time)
+                            / completion_tokens
+                        )
 
     def convert_logprob_style(
         self,
