@@ -18,7 +18,8 @@ class TestFragment(unittest.TestCase):
         for tp_rank in range(_TP_SIZE):
             reader, writer = mp.Pipe(duplex=False)
             p = Process(
-                target=_run_subprocess, args=(tp_rank, fragment_nccl_port, writer)
+                target=_run_subprocess,
+                args=(tp_rank, fragment_nccl_port, writer),
             )
             p.start()
             processes.append(p)
@@ -42,26 +43,28 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
         fragment_tp_rank=tp_rank,
         fragment_nccl_port=fragment_nccl_port,
         fragment_gpu_id=tp_rank,
+        log_level="debug",
     )
-    print(f"run_subprocess[{tp_rank=}] Initialized {engine=}")
+    print(f"run_subprocess[{tp_rank=}] Initialized {engine=}", flush=True)
 
     ans = []
 
     for prompt in [
-        ['Today is a sunny day and I like', 'I have a very good idea on'],
-        ['Hello, I am', 'What is your name?', 'Mathematics is defined as'],
+        ["Today is a sunny day and I like", "I have a very good idea on"],
+        ["Hello, I am", "What is your name?", "Mathematics is defined as"],
     ]:
+        print(f"Start generation", flush=True)
         outputs = engine.generate(
             prompt=prompt,
             sampling_params=[dict(max_new_tokens=16)] * len(prompt),
         )
-        print(f"{tp_rank=} {prompt=} {outputs=}")
-        ans += [o['text'] for o in outputs]
+        print(f"End generation {tp_rank=} {prompt=} {outputs=}", flush=True)
+        ans += [o["text"] for o in outputs]
 
     writer.send(ans)
     writer.close()
 
-    print(f"run_subprocess[{tp_rank=}] engine.shutdown")
+    print(f"run_subprocess[{tp_rank=}] engine.shutdown", flush=True)
     engine.shutdown()
 
 
