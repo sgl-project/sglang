@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from http import HTTPStatus
 from typing import AsyncIterator
 
@@ -31,6 +32,8 @@ from sglang.srt.openai_api.adapter import (
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.version import __version__
+
+logger = logging.getLogger(__name__)
 
 # Fast API
 app = FastAPI()
