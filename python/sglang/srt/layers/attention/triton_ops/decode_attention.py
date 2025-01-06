@@ -22,6 +22,7 @@ It supports page size = 1.
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 
@@ -132,8 +133,8 @@ def _fwd_kernel_stage1(
                 )
                 # load k scale
                 offs_scale_k = (
-                    kv_loc[:, None] * stride_sz_kbs * 2
-                    + cur_kv_head * stride_buf_kh * 2
+                    kv_loc[:, None] * stride_sz_kbs
+                    + cur_kv_head * stride_buf_kh
                 )
                 k_scales = tl.load(
                     K_Scale_Zeros_Buffer + offs_scale_k,
@@ -141,8 +142,8 @@ def _fwd_kernel_stage1(
                     other=1.0,
                 )
                 offs_zeros_k = (
-                    kv_loc[:, None] * stride_sz_kbs * 2
-                    + cur_kv_head * stride_buf_kh * 2
+                    kv_loc[:, None] * stride_sz_kbs
+                    + cur_kv_head * stride_buf_kh
                     + 1
                 )
                 k_zeros = tl.load(
@@ -179,8 +180,8 @@ def _fwd_kernel_stage1(
                 )
                 # load v scale
                 offs_scale_v = (
-                    kv_loc[:, None] * stride_sz_vbs * 2
-                    + cur_kv_head * stride_buf_vh * 2
+                    kv_loc[:, None] * stride_sz_vbs
+                    + cur_kv_head * stride_buf_vh
                 )
                 v_scales = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
@@ -188,8 +189,8 @@ def _fwd_kernel_stage1(
                     other=1.0,
                 )
                 offs_zeros_v = (
-                    kv_loc[:, None] * stride_sz_vbs * 2
-                    + cur_kv_head * stride_buf_vh * 2
+                    kv_loc[:, None] * stride_sz_vbs
+                    + cur_kv_head * stride_buf_vh
                     + 1
                 )
                 v_zeros = tl.load(
@@ -254,6 +255,7 @@ def _decode_att_m_fwd(
     Lv = v_buffer.shape[-1]
 
     # assert kv dtype
+    print(k_buffer.dtype)
     USE_INT8_KV = k_buffer[0].dtype == torch.int8
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
@@ -426,16 +428,16 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                 )
                 offs_scale_k = (
-                    kv_loc[None, :] * stride_sz_kbs * 2 + cur_kv_head * stride_sz_kh * 2
+                    kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 )
-                k_scale = tl.load(
+                k_scales = tl.load(
                     K_Scale_Zeros_Buffer + offs_scale_k,
                     mask=offs_n[None, :] < split_kv_end,
                     other=1.0,
                 )
                 offs_zeros_k = (
-                    kv_loc[None, :] * stride_sz_kbs * 2
-                    + cur_kv_head * stride_sz_kh * 2
+                    kv_loc[None, :] * stride_sz_kbs
+                    + cur_kv_head * stride_sz_kh
                     + 1
                 )
                 k_zeros = tl.load(
@@ -443,7 +445,7 @@ def _fwd_grouped_kernel_stage1(
                     mask=offs_n[None, :] < split_kv_end,
                     other=0,
                 )
-                k = (k_int8 - k_zeros).to(scales_dtype) * k_scale
+                k = (k_int8 - k_zeros).to(scales_dtype) * k_scales
 
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
@@ -465,17 +467,17 @@ def _fwd_grouped_kernel_stage1(
                         other=0.0,
                     )
                     offs_scale_kpe = (
-                        kv_loc[None, :] * stride_sz_kbs * 2
-                        + cur_kv_head * stride_sz_kh * 2
+                        kv_loc[None, :] * stride_sz_kbs
+                        + cur_kv_head * stride_sz_kh
                     )
-                    kpe_scale = tl.load(
+                    kpe_scales = tl.load(
                         K_Scale_Zeros_Buffer + offs_scale_kpe,
                         mask=offs_n[None, :] < split_kv_end,
                         other=1.0,
                     )
                     offs_zeros_kpe = (
-                        kv_loc[None, :] * stride_sz_kbs * 2
-                        + cur_kv_head * stride_sz_kh * 2
+                        kv_loc[None, :] * stride_sz_kbs
+                        + cur_kv_head * stride_sz_kh
                         + 1
                     )
                     kpe_zeros = tl.load(
@@ -483,7 +485,7 @@ def _fwd_grouped_kernel_stage1(
                         mask=offs_n[None, :] < split_kv_end,
                         other=0,
                     )
-                    kpe = (kpe_int8 - kpe_zeros).to(scales_dtype) * kpe_scale
+                    kpe = (kpe_int8 - kpe_zeros).to(scales_dtype) * kpe_scales
 
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
@@ -513,24 +515,25 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                 )
                 offs_scale_v = (
-                    kv_loc[None, :] * stride_sz_vbs * 2 + cur_kv_head * stride_sz_vh * 2
+                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )
-                v_scale = tl.load(
+                
+                v_scales = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
-                    mask=offs_n[None, :] < split_kv_end,
+                    mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
                 offs_zeros_v = (
-                    kv_loc[None, :] * stride_sz_vbs * 2
-                    + cur_kv_head * stride_sz_vh * 2
+                    kv_loc[:, None] * stride_sz_vbs
+                    + cur_kv_head * stride_sz_vh
                     + 1
                 )
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
-                    mask=offs_n[None, :] < split_kv_end,
+                    mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
-                v = (v_int8 - v_zeros).to(scales_dtype) * v_scale
+                v = (v_int8 - v_zeros).to(scales_dtype) * v_scales
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)

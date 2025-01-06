@@ -126,6 +126,10 @@ class ModelRunner:
                 self.server_args.ds_heavy_channel_type
             )
 
+        if self.server_args.kv_cache_dtype == "int8":
+            logger.info("int8 kv cache optimization is turned on. Use triton backend.")
+            self.server_args.attention_backend = "triton"
+
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
             logger.info(

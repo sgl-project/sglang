@@ -303,13 +303,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         else:
             return None
 
-    def get_kv_scales_buffer(self, layer_id: int):
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
         if self.kv_cache_dtype == torch.int8:
             return self.get_key_scales_zeros_buffer(
                 layer_id
             ), self.get_value_scales_zeros_buffer(layer_id)
         else:
-            return None
+            return None, None
 
     def set_kv_buffer(
         self,

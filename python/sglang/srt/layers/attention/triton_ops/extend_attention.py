@@ -154,15 +154,15 @@ def _fwd_kernel(
                 K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
             )
             offs_scales_k = (
-                offs_kv_loc[None, :] * stride_scale_kbs * 2
-                + cur_kv_head * stride_scale_kh * 2
+                offs_kv_loc[None, :] * stride_scale_kbs
+                + cur_kv_head * stride_scale_kh
             )
             k_scales = tl.load(
                 K_Scale_Zeros_Buffer + offs_scales_k, mask=mask_n[None, :], other=1.0
             )
             offs_zeros_k = (
-                offs_kv_loc[None, :] * stride_scale_kbs * 2
-                + cur_kv_head * stride_scale_kh * 2
+                offs_kv_loc[None, :] * stride_scale_kbs
+                + cur_kv_head * stride_scale_kh
                 + 1
             )
             k_zeros = tl.load(
@@ -190,15 +190,15 @@ def _fwd_kernel(
                     other=0.0,
                 )
                 offs_scales_kpe = (
-                    offs_kv_loc[None, :] * stride_scale_kbs * 2
-                    + cur_kv_head * stride_scale_kh * 2
+                    offs_kv_loc[None, :] * stride_scale_kbs
+                    + cur_kv_head * stride_scale_kh
                 )
                 kpe_scales = tl.load(
                     K_Scale_Zeros_Buffer + offs_scales_kpe, mask=mask_n[None, :], other=1.0
                 )
                 offs_zeros_kpe = (
-                    offs_kv_loc[None, :] * stride_scale_kbs * 2
-                    + cur_kv_head * stride_scale_kh * 2
+                    offs_kv_loc[None, :] * stride_scale_kbs
+                    + cur_kv_head * stride_scale_kh
                     + 1
                 )
                 kpe_zeros = tl.load(
@@ -232,19 +232,19 @@ def _fwd_kernel(
                 V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
             offs_scales_v = (
-                offs_kv_loc[:, None] * stride_scale_vbs * 2
-                + cur_kv_head * stride_scale_vh * 2
+                offs_kv_loc[:, None] * stride_scale_vbs
+                + cur_kv_head * stride_scale_vh
             )
             v_scales = tl.load(
                 V_Scale_Zeros_Buffer + offs_scales_v, mask=mask_n[:, None], other=1.0
             )
             offs_zeros_v = (
-                offs_kv_loc[None, :] * stride_scale_vbs * 2
-                + cur_kv_head * stride_scale_vh * 2
+                offs_kv_loc[None, :] * stride_scale_vbs
+                + cur_kv_head * stride_scale_vh
                 + 1
             )
             v_zeros = tl.load(
-                V_Scale_Zeros_Buffer + offs_zeros_v, mask=mask_n[None, :], other=0
+                V_Scale_Zeros_Buffer + offs_zeros_v, mask=mask_n[:, None], other=0
             )
             v = (v_int8 - v_zeros).to(scale_dtype) * v_scales
         p = p.to(v.dtype)
