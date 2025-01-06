@@ -27,7 +27,7 @@ from sglang.srt.openai_api.adapter import (
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
-    v1_retrieve_file_content,
+    v1_retrieve_file_content, create_error_response,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server.engine import Engine
@@ -232,14 +232,14 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    return TODO
+    return _global_state.engine._generate_impl(obj, request)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
-    return TODO
+    return _global_state.engine._encode_impl(obj, request)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
