@@ -29,4 +29,5 @@ class TypeBasedDispatcher:
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:
             if isinstance(obj, ty):
-                fn(obj)
+                return fn(obj)
+        raise ValueError(f"Invalid request: {obj}")

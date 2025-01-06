@@ -8,20 +8,14 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     FlushCacheReq,
     GetWeightsByNameReqInput,
-    GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
-    InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
-    OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     Req,
@@ -79,16 +73,17 @@ class SchedulerCommunicator:
         self._dispatcher = TypeBasedDispatcher([
             (TokenizedGenerateReqInput, self.core.handle_generate_request),
             (TokenizedEmbeddingReqInput, self.core.handle_embedding_request),
-            (FlushCacheReq, self.core.flush_cache),
+            # TODO flush_cache return bool
+            (FlushCacheReq, lambda _: self.core.flush_cache()),
             (AbortReq, self.core.abort_request),
-            # TODO things with ret type?
-            (TODO, self.core.TODO),
-            (TODO, self.core.TODO),
-            (TODO, self.core.TODO),
-            (TODO, self.core.TODO),
-            (TODO, self.core.TODO),
-            (TODO, self.core.TODO),
-            (TODO, self.core.TODO),
+            (UpdateWeightFromDiskReqInput, self.core.update_weights_from_disk),
+            (InitWeightsUpdateGroupReqInput, self.core.init_weights_update_group),
+            (UpdateWeightsFromDistributedReqInput, self.core.update_weights_from_distributed),
+            (UpdateWeightsFromTensorReqInput, self.core.update_weights_from_tensor),
+            (GetWeightsByNameReqInput, self.core.get_weights_by_name),
+            (ProfileReq, self.core.profile),
+            (OpenSessionReqInput, self.core.open_session),
+            (CloseSessionReqInput, self.core.close_session),
         ])
 
     def _recv_requests(self) -> List[Req]:
@@ -111,48 +106,6 @@ class SchedulerCommunicator:
 
     def _process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
-            if isinstance(recv_req, TokenizedGenerateReqInput):
-                self.core.handle_generate_request(recv_req)
-            elif isinstance(recv_req, TokenizedEmbeddingReqInput):
-                self.core.handle_embedding_request(recv_req)
-            elif isinstance(recv_req, FlushCacheReq):
-                self.core.flush_cache()
-            elif isinstance(recv_req, AbortReq):
-                self.core.abort_request(recv_req)
-            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
-                success, message = self.core.update_weights_from_disk(recv_req)
-                self._send_to_tokenizer.send_pyobj(
-                    UpdateWeightFromDiskReqOutput(success, message)
-                )
-            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
-                success, message = self.core.init_weights_update_group(recv_req)
-                self._send_to_tokenizer.send_pyobj(
-                    InitWeightsUpdateGroupReqOutput(success, message)
-                )
-            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
-                success, message = self.core.update_weights_from_distributed(recv_req)
-                self._send_to_tokenizer.send_pyobj(
-                    UpdateWeightsFromDistributedReqOutput(success, message)
-                )
-            elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
-                success, message = self.core.update_weights_from_tensor(recv_req)
-                self._send_to_tokenizer.send_pyobj(
-                    UpdateWeightsFromTensorReqOutput(success, message)
-                )
-            elif isinstance(recv_req, GetWeightsByNameReqInput):
-                parameter = self.core.get_weights_by_name(recv_req)
-                self._send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
-            elif isinstance(recv_req, ProfileReq):
-                if recv_req == ProfileReq.START_PROFILE:
-                    self.core.start_profile()
-                else:
-                    self.core.stop_profile()
-            elif isinstance(recv_req, OpenSessionReqInput):
-                session_id, success = self.core.open_session(recv_req)
-                self._send_to_tokenizer.send_pyobj(
-                    OpenSessionReqOutput(session_id=session_id, success=success)
-                )
-            elif isinstance(recv_req, CloseSessionReqInput):
-                self.core.close_session(recv_req)
-            else:
-                raise ValueError(f"Invalid request: {recv_req}")
+            output = self._dispatcher(recv_req)
+            if output is not None:
+                self._send_to_tokenizer.send_pyobj(output)

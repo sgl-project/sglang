@@ -42,8 +42,9 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
+    UpdateWeightsFromTensorReqInput, UpdateWeightFromDiskReqOutput, InitWeightsUpdateGroupReqOutput,
+    UpdateWeightsFromDistributedReqOutput, UpdateWeightsFromTensorReqOutput, GetWeightsByNameReqOutput, ProfileReq,
+    OpenSessionReqOutput, )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
@@ -1406,12 +1407,12 @@ class SchedulerCore:
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        return success, message
+        return UpdateWeightFromDiskReqOutput(success, message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return success, message
+        return InitWeightsUpdateGroupReqOutput(success, message)
 
     def update_weights_from_distributed(
         self, recv_req: UpdateWeightsFromDistributedReqInput
@@ -1423,7 +1424,7 @@ class SchedulerCore:
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        return success, message
+        return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
@@ -1434,11 +1435,17 @@ class SchedulerCore:
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        return success, message
+        return UpdateWeightsFromTensorReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return parameter
+        return GetWeightsByNameReqOutput(parameter)
+
+    def profile(self, recv_req: ProfileReq):
+        if recv_req == ProfileReq.START_PROFILE:
+            self.start_profile()
+        else:
+            self.stop_profile()
 
     def start_profile(self) -> None:
         if self.profiler is None:
@@ -1459,15 +1466,15 @@ class SchedulerCore:
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
-            return session_id, False
+            return OpenSessionReqOutput(session_id, False)
         elif session_id is None:
             logger.warning(f"session id is None, cannot open.")
-            return session_id, False
+            return OpenSessionReqOutput(session_id, False)
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len, session_id
             )
-            return session_id, True
+            return OpenSessionReqOutput(session_id, True)
 
     def close_session(self, recv_req: CloseSessionReqInput):
         # handle error
