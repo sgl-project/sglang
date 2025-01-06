@@ -3,6 +3,7 @@ import unittest
 from multiprocessing import Process
 
 from sglang import Engine
+from sglang.srt.server_args import get_random_available_port
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 _TP_SIZE = 2
@@ -35,7 +36,7 @@ def _run_subprocess(tp_rank: int, writer):
         mem_fraction_static=0.1,
         tp_size=_TP_SIZE,
         fragment_tp_rank=tp_rank,
-        fragment_nccl_port=23456,
+        fragment_nccl_port=get_random_available_port(),
     )
     print(f'run_subprocess[{tp_rank=}] Initialized {engine=}')
 
