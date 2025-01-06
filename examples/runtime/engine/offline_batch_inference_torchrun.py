@@ -62,6 +62,7 @@ def run():
         tp_size=tp_size,
         fragment_tp_rank=tp_rank,
         fragment_nccl_port=23456,
+        fragment_gpu_id=tp_rank,
     )
     _log(f"{engine=}")
 

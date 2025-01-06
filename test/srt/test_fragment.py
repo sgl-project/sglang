@@ -41,6 +41,7 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
         tp_size=_TP_SIZE,
         fragment_tp_rank=tp_rank,
         fragment_nccl_port=fragment_nccl_port,
+        fragment_gpu_id=tp_rank,
     )
     print(f"run_subprocess[{tp_rank=}] Initialized {engine=}")
 
