@@ -8,11 +8,13 @@
 #include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
 #include "cutlass_extensions/gemm/gemm_universal_base_compat.h"
 #include "cutlass_extensions/gemm/gemm_with_epilogue_visitor.h"
+#include "iostream"
 #include "utils.hpp"
 
 template <typename OutputType>
 void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                            const torch::Tensor& scales_a, const torch::Tensor& scales_b) {
+                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                            const c10::optional<torch::Tensor>& bias) {
   using ElementAccumulator = int32_t;
   using ElementCompute = float;
   using ElementInputA = int8_t;
@@ -73,13 +75,20 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
 
   int64_t lda = mat_a.stride(0);
   int64_t ldb = mat_b.stride(1);
-  int64_t ldc = out.stride(0);
+  int64_t ldd = out.stride(0);
+
+  ElementOutput* bias_ptr = nullptr;
+  int64_t ldc = 0;
+  if (bias) {
+    bias_ptr = static_cast<ElementOutput*>(bias->data_ptr());
+    ldc = bias->stride(0);
+  }
 
   typename EpilogueOutputOp::Params linearScalingParams;
-  typename EpilogueVisitor::Arguments visitor_args{linearScalingParams, 0, 0, 0};
+  typename EpilogueVisitor::Arguments visitor_args{linearScalingParams};
 
-  typename Gemm::Arguments args{{m, n, k},    {a_ptr, lda}, {b_ptr, ldb}, {b_s_ptr, 0},
-                                {a_s_ptr, 0}, {nullptr, 0}, {o_ptr, ldc}, visitor_args};
+  typename Gemm::Arguments args{{m, n, k},    {a_ptr, lda},    {b_ptr, ldb}, {b_s_ptr, 0},
+                                {a_s_ptr, 0}, {bias_ptr, ldc}, {o_ptr, ldd}, visitor_args};
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
   auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device());
@@ -123,14 +132,14 @@ void int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch:
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
-  if (bias) {
-    TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched")
-    TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous")
-  }
+  // if (bias) {
+  //   TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched")
+  //   TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous")
+  // }
 
   if (out.scalar_type() == torch::kBFloat16) {
-    cutlass_int8_scaled_mm<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b);
+    cutlass_int8_scaled_mm<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
   } else {
-    cutlass_int8_scaled_mm<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b);
+    cutlass_int8_scaled_mm<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
   }
 }

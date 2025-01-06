@@ -26,13 +26,16 @@ class TestInt8Gemm(unittest.TestCase):
         scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
         scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
         if with_bias:
-            bias = torch.zeros((N,), device="cuda", dtype=out_dtype)
+            bias = torch.randn((N,), device="cuda", dtype=out_dtype) * 10
         else:
             bias = None
 
         int8_scaled_mm(o, a, b, scale_a, scale_b, bias)
         o1 = torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
         o2 = vllm_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
+        # print(o)
+        # print(o1)
+        # print(o2)
         torch.testing.assert_close(o, o1)
         torch.testing.assert_close(o, o2)
         print(f"{M} {N} {K} {with_bias} {out_dtype}: OK")

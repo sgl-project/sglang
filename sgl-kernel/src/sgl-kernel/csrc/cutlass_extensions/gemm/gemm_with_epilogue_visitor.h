@@ -406,10 +406,16 @@ struct GemmWithEpilogueVisitor {
     // Construct the epilogue visitor
     //
 
-    EpilogueVisitor epilogue_visitor(
-        params.epilogue_visitor, shared_storage.epilogue.visitor, params.problem_size.mn(), thread_idx, warp_idx,
-        lane_idx, params.params_alpha_col, params.params_C, params.params_D, true, true, params.ptr_alpha_row,
-        params.ptr_alpha_col, params.ptr_C, params.ptr_D, threadblock_offset, blockIdx.y * params.problem_size.m());
+    bool with_bias = true;
+    if (params.ptr_C == nullptr) {
+      with_bias = false;
+    }
+
+    EpilogueVisitor epilogue_visitor(params.epilogue_visitor, shared_storage.epilogue.visitor, params.problem_size.mn(),
+                                     thread_idx, warp_idx, lane_idx, params.params_alpha_col, params.params_C,
+                                     params.params_D, with_bias, true, true, params.ptr_alpha_row, params.ptr_alpha_col,
+                                     params.ptr_C, params.ptr_D, threadblock_offset,
+                                     blockIdx.y * params.problem_size.m());
 
     if (params.mode == GemmUniversalMode::kGemm) {
       // Indicate which position in a serial reduction the output operator is currently updating

@@ -29,13 +29,15 @@ def benchmark(batch_size, provider):
     o = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
     scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
     scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
-    # bias = torch.zeros((N,), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((N,), device="cuda", dtype=torch.bfloat16)
 
-    bias = None
+    bias1 = bias.unsqueeze(0).expand(M, N).contiguous()
+
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sgl-kernel":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: int8_scaled_mm(o, a, b, scale_a, scale_b, bias), quantiles=quantiles
+            lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, bias1),
+            quantiles=quantiles,
         )
     if provider == "vllm":
         ms, min_ms, max_ms = triton.testing.do_bench(

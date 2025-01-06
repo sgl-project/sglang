@@ -8,6 +8,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/numeric_conversion.h"
+#include "stdio.h"
 
 namespace cutlass {
 namespace epilogue {
@@ -95,6 +96,7 @@ class EpilogueVisitorPerRowPerCol {
   MatrixCoord extent_real_;
   ElementwiseFunctor elementwise_;
 
+  bool const with_bias_;
   bool const per_token_quant_;
   bool const per_channel_quant_;
 
@@ -118,18 +120,22 @@ class EpilogueVisitorPerRowPerCol {
 
  public:
   CUTLASS_DEVICE
-  EpilogueVisitorPerRowPerCol(
-      Params const& params, SharedStorage& shared_storage, cutlass::MatrixCoord const& problem_size, int thread_idx,
-      int warp_idx, int lane_idx, typename ScaleTileIterator::Params params_alpha_col,
-      typename OutputTileIterator::Params params_C, typename OutputTileIterator::Params params_D, bool per_token_quant,
-      bool per_channel_quant, AlphaScaleElementType* ptr_alpha_row, AlphaScaleElementType* ptr_alpha_col,
-      typename OutputTileIterator::Element* ptr_C, typename OutputTileIterator::Element* ptr_D,
-      cutlass::MatrixCoord const& threadblock_offset = cutlass::MatrixCoord(0, 0), int column_offset = 0,
-      cutlass::MatrixCoord const& problem_size_real = cutlass::MatrixCoord(0, 0))
+  EpilogueVisitorPerRowPerCol(Params const& params, SharedStorage& shared_storage,
+                              cutlass::MatrixCoord const& problem_size, int thread_idx, int warp_idx, int lane_idx,
+                              typename ScaleTileIterator::Params params_alpha_col,
+                              typename OutputTileIterator::Params params_C,
+                              typename OutputTileIterator::Params params_D, bool with_bias, bool per_token_quant,
+                              bool per_channel_quant, AlphaScaleElementType* ptr_alpha_row,
+                              AlphaScaleElementType* ptr_alpha_col, typename OutputTileIterator::Element* ptr_C,
+                              typename OutputTileIterator::Element* ptr_D,
+                              cutlass::MatrixCoord const& threadblock_offset = cutlass::MatrixCoord(0, 0),
+                              int column_offset = 0,
+                              cutlass::MatrixCoord const& problem_size_real = cutlass::MatrixCoord(0, 0))
       : params_(params),
         shared_storage_(shared_storage),
         extent_(problem_size),
         elementwise_(params.elementwise),
+        with_bias_(with_bias),
         per_token_quant_(per_token_quant),
         per_channel_quant_(per_channel_quant),
         ptr_alpha_row_(ptr_alpha_row),
@@ -138,12 +144,6 @@ class EpilogueVisitorPerRowPerCol {
         iterator_C_(params_C, ptr_C, problem_size, thread_idx, threadblock_offset),
         iterator_D_(params_D, ptr_D, problem_size, thread_idx, threadblock_offset),
         extent_real_(problem_size_real) {
-    beta_ = (params.elementwise.beta_ptr ? *params.elementwise.beta_ptr : params.elementwise.beta);
-
-    if (beta_ == ElementAccumulator()) {
-      iterator_C_.clear_mask();
-    }
-
     if (!per_channel_quant_ && (ptr_alpha_col_ != nullptr)) {
       element_alpha_col_ = *ptr_alpha_col_;
     }
@@ -181,10 +181,8 @@ class EpilogueVisitorPerRowPerCol {
     fragment_D_.clear();
     fragment_C_.clear();
 
-    if (elementwise_.kScale != cutlass::epilogue::thread::ScaleType::OnlyAlphaScaling) {
-      iterator_C_.load(fragment_C_);
-      ++iterator_C_;
-    }
+    iterator_C_.load(fragment_C_);
+    ++iterator_C_;
   }
 
   /// Called at the start of a row
@@ -212,6 +210,10 @@ class EpilogueVisitorPerRowPerCol {
     } else {
       result = per_token_scale_accumulator_(result, element_alpha_col_, element_alpha_row_);
     }
+
+    NumericArrayConverter<ElementCompute, ElementOutput, kElementsPerAccess> bias_converter;
+    OutputVector& bias = reinterpret_cast<OutputVector*>(&fragment_C_)[frag_idx];
+    result = bias_accumulator_(result, bias_converter(bias));
 
     // Convert to the output
     NumericArrayConverter<ElementOutput, ElementCompute, kElementsPerAccess> output_converter;
@@ -256,6 +258,16 @@ class EpilogueVisitorPerRowPerCol {
       result[i] = accum[i] * (scale_col * scale_row);
     }
 
+    return result;
+  }
+
+  CUTLASS_DEVICE
+  ComputeFragment bias_accumulator_(ComputeFragment const& accum, ComputeFragment const& bias) {
+    ComputeFragment result;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < OutputVector::kElements; ++i) {
+      result[i] = accum[i] + bias[i];
+    }
     return result;
   }
 };
