@@ -24,9 +24,9 @@ class TestFragment(unittest.TestCase):
             processes.append(p)
             readers.append(reader)
 
-        for reader in readers:
-            output_text = reader.recv()
-            self.assertEqual(output_text, "5, 1+5=6, 1+6=7,")
+        outputs = [reader.recv() for reader in readers]
+        for output in outputs:
+            self.assertEqual(outputs[0], output)
 
         for p in processes:
             p.join()
@@ -45,13 +45,20 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
     )
     print(f"run_subprocess[{tp_rank=}] Initialized {engine=}")
 
-    output = engine.generate(
-        prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
-        sampling_params=dict(max_new_tokens=16, temperature=0.0),
-    )
-    print(f"{tp_rank=} {output=} {output['text']=}")
+    ans = []
 
-    writer.send(output["text"])
+    for prompt in [
+        ['Today is a sunny day and I like', 'I have a very good idea on'],
+        ['Hello, I am', 'What is your name?', 'Mathematics is defined as'],
+    ]:
+        output = engine.generate(
+            prompt=prompt,
+            sampling_params=dict(max_new_tokens=16, temperature=0.0),
+        )
+        print(f"{tp_rank=} {prompt=} {output=} {output['text']=}")
+        ans.append(output['text'])
+
+    writer.send(ans)
     writer.close()
 
     print(f"run_subprocess[{tp_rank=}] engine.shutdown")
