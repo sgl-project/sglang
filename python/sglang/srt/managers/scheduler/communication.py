@@ -68,7 +68,11 @@ class SchedulerCommunication:
             self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
-    def recv_requests(self) -> List[Req]:
+    def recv_and_process_requests(self):
+        recv_reqs = self._recv_requests()
+        self._process_input_requests(recv_reqs)
+
+    def _recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
@@ -86,7 +90,7 @@ class SchedulerCommunication:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
-    def process_input_requests(self, recv_reqs: List):
+    def _process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 self.core.handle_generate_request(recv_req)

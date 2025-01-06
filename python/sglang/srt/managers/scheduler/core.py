@@ -19,9 +19,10 @@ import signal
 import threading
 import time
 import warnings
+from abc import ABC
 from collections import deque
 from concurrent import futures
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -93,7 +94,7 @@ class SchedulerCore:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
-        send_to_detokenizer: Callable,  # TODO rename
+        callback: 'SchedulerCoreCallback',
     ):
         # Parse args
         self.server_args = server_args
@@ -114,7 +115,7 @@ class SchedulerCore:
             if not self.spec_algorithm.is_none()
             else 1
         )
-        self.send_to_detokenizer = send_to_detokenizer
+        self.callback = callback
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -369,8 +370,7 @@ class SchedulerCore:
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.callback.recv_and_process_requests()
 
             batch = self.get_next_batch_to_run()
 
@@ -395,8 +395,7 @@ class SchedulerCore:
         result_queue = deque()
 
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.callback.recv_and_process_requests()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1231,7 +1230,7 @@ class SchedulerCore:
 
             # Send to detokenizer
             if rids:
-                self.send_to_detokenizer.send_pyobj(
+                self.callback.send_to_detokenizer(
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
@@ -1267,7 +1266,7 @@ class SchedulerCore:
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
-            self.send_to_detokenizer.send_pyobj(
+            self.callback.send_to_detokenizer(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
@@ -1516,3 +1515,11 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+class SchedulerCoreCallback(ABC):
+    def send_to_detokenizer(self, obj):
+        raise NotImplementedError
+
+    def recv_and_process_requests(self):
+        raise NotImplementedError
