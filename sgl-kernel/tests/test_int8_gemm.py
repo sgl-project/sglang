@@ -22,23 +22,19 @@ class TestInt8Gemm(unittest.TestCase):
     def _test_accuracy_once(self, M, N, K, with_bias, out_dtype, device):
         a = to_int8(torch.randn((M, K), device=device) * 5)
         b = to_int8(torch.randn((N, K), device=device).t() * 5)
-        o = torch.empty((M, N), device=device, dtype=out_dtype)
         scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
         scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
         if with_bias:
-            bias = torch.randn((N,), device="cuda", dtype=out_dtype) * 10
+            bias = torch.ones((N,), device="cuda", dtype=out_dtype) * 10
         else:
             bias = None
 
-        int8_scaled_mm(o, a, b, scale_a, scale_b, bias)
+        o = int8_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
         o1 = torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
         o2 = vllm_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
-        # print(o)
-        # print(o1)
-        # print(o2)
         torch.testing.assert_close(o, o1)
         torch.testing.assert_close(o, o2)
-        print(f"{M} {N} {K} {with_bias} {out_dtype}: OK")
+        print(f"M={M}, N={N}, K={K}, with_bias={with_bias}, out_dtype={out_dtype}: OK")
 
     def test_accuracy(self):
         Ms = [1, 128, 512, 1024, 4096]

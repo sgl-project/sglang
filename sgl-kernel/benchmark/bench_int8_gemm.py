@@ -31,12 +31,10 @@ def benchmark(batch_size, provider):
     scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
     bias = torch.randn((N,), device="cuda", dtype=torch.bfloat16)
 
-    bias1 = bias.unsqueeze(0).expand(M, N).contiguous()
-
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sgl-kernel":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, bias1),
+            lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, bias),
             quantiles=quantiles,
         )
     if provider == "vllm":

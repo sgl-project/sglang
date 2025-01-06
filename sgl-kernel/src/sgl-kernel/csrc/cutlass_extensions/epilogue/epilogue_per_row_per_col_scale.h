@@ -8,7 +8,6 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/numeric_conversion.h"
-#include "stdio.h"
 
 namespace cutlass {
 namespace epilogue {
@@ -173,16 +172,16 @@ class EpilogueVisitorPerRowPerCol {
     if (per_channel_quant_) {
       iterator_alpha_col_.load(fragment_alpha_col_);
     }
+
+    if (with_bias_) {
+      iterator_C_.load(fragment_C_);
+    }
   }
 
   /// Called at the start of one step before starting accumulator exchange
   CUTLASS_DEVICE
   void begin_step(int step_idx) {
     fragment_D_.clear();
-    fragment_C_.clear();
-
-    iterator_C_.load(fragment_C_);
-    ++iterator_C_;
   }
 
   /// Called at the start of a row
@@ -211,9 +210,11 @@ class EpilogueVisitorPerRowPerCol {
       result = per_token_scale_accumulator_(result, element_alpha_col_, element_alpha_row_);
     }
 
-    NumericArrayConverter<ElementCompute, ElementOutput, kElementsPerAccess> bias_converter;
-    OutputVector& bias = reinterpret_cast<OutputVector*>(&fragment_C_)[frag_idx];
-    result = bias_accumulator_(result, bias_converter(bias));
+    if (with_bias_) {
+      NumericArrayConverter<ElementCompute, ElementOutput, kElementsPerAccess> bias_converter;
+      OutputVector bias = reinterpret_cast<OutputVector*>(&fragment_C_)[column_idx];
+      result = bias_accumulator_(result, bias_converter(bias));
+    }
 
     // Convert to the output
     NumericArrayConverter<ElementOutput, ElementCompute, kElementsPerAccess> output_converter;

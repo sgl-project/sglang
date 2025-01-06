@@ -81,7 +81,6 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   int64_t ldc = 0;
   if (bias) {
     bias_ptr = static_cast<ElementOutput*>(bias->data_ptr());
-    ldc = bias->stride(0);
   }
 
   typename EpilogueOutputOp::Params linearScalingParams;
@@ -90,9 +89,8 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   typename Gemm::Arguments args{{m, n, k},    {a_ptr, lda},    {b_ptr, ldb}, {b_s_ptr, 0},
                                 {a_s_ptr, 0}, {bias_ptr, ldc}, {o_ptr, ldd}, visitor_args};
 
-  size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
+  auto workspace = torch::empty(gemm_op.get_workspace_size(args),
+                                torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device()));
 
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
 
@@ -103,27 +101,22 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-void int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                    const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                    const c10::optional<torch::Tensor>& bias) {
-  TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
+torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
+                             const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
+                             const c10::optional<torch::Tensor>& bias) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
-  TORCH_CHECK(out.dim() == 2, "out must be a 2D tensor");
   TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
   TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
-  TORCH_CHECK(out.stride(1) == 1, "out must be a row major tensor");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
-  TORCH_CHECK(mat_a.size(0) == out.size(0) && mat_b.size(1) == out.size(1), "out has incorrect shape");
-  TORCH_CHECK(mat_a.stride(0) % 16 == 0, "mat_a.stride(0) must be a multiple of 16 for memory alignment")
-  TORCH_CHECK(mat_b.stride(1) % 16 == 0, "mat_b.stride(1) must be a multiple of 16 for memory alignment")
-  TORCH_CHECK(out.stride(0) % 8 == 0, "out.stride(0) should be a multiple of 8 for memory alignment")
+  TORCH_CHECK(mat_a.size(1) % 16 == 0, "mat_a.size(1) must be multiple of 16 for memory alignment")  // mat_a.stride(0)
+  TORCH_CHECK(mat_b.size(0) % 16 == 0, "mat_b.size(0) must be multiple of 16 for memory alignment")  // mat_b.stride(1)
+  TORCH_CHECK(mat_b.size(1) % 8 == 0, "mat_b.size(1) must be multiple of 8 for memory alignment")    // out.stride(0)
   TORCH_CHECK(mat_a.scalar_type() == torch::kInt8, "mat_a must be Int8");
   TORCH_CHECK(mat_b.scalar_type() == torch::kInt8, "mat_b must be Int8");
-  TORCH_CHECK(out.scalar_type() == torch::kHalf || out.scalar_type() == torch::kBFloat16,
-              "out must be Half or BFloat16");
+  TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
   TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
   TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
@@ -132,14 +125,18 @@ void int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch:
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
-  // if (bias) {
-  //   TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched")
-  //   TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous")
-  // }
+  if (bias) {
+    TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched")
+    TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous")
+  }
 
-  if (out.scalar_type() == torch::kBFloat16) {
+  torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
+
+  if (out_dtype == torch::kBFloat16) {
     cutlass_int8_scaled_mm<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
   } else {
     cutlass_int8_scaled_mm<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
   }
+
+  return out;
 }
