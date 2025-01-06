@@ -46,7 +46,7 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
         prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
         sampling_params=dict(max_new_tokens=16, temperature=0.0),
     )
-    print(f"{tp_rank=} {output=}")
+    print(f"{tp_rank=} {output=} {output['text']=}")
 
     writer.send(output['text'])
     writer.close()
