@@ -3,7 +3,6 @@ import os
 import sys
 
 from sglang import Engine
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerFragmentArgs
 
 
@@ -69,7 +68,7 @@ def run():
 
     output = engine.generate(
         prompt="Today is a sunny day and I like",
-        sampling_params=[SamplingParams(max_new_tokens=16)],
+        sampling_params=dict(max_new_tokens=16),
     )
     _log(f'{output=}')
 
