@@ -2,21 +2,15 @@ import logging
 import os
 import signal
 import threading
-import time
 import warnings
-from collections import deque
 from concurrent import futures
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import psutil
 import setproctitle
 import torch
 import zmq
-from sglang.global_config import global_config
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -42,36 +36,21 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
-    ImageInputs,
     Req,
     ScheduleBatch,
-    global_server_args_dict,
 )
-from sglang.srt.managers.schedule_policy import (
-    AddReqResult,
-    PrefillAdder,
-    SchedulePolicy,
-)
-from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     broadcast_pyobj,
-    configure_logger,
     crash_on_warnings,
-    get_bool_env_var,
     get_zmq_socket,
-    set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
+
 
 class SchedulerCommunication:
     def __init__(self):
@@ -100,3 +79,68 @@ class SchedulerCommunication:
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
+    def recv_requests(self) -> List[Req]:
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
+            recv_reqs = []
+
+            while True:
+                try:
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                recv_reqs.append(recv_req)
+        else:
+            recv_reqs = None
+
+        if self.tp_size != 1 and not self.server_args.enable_dp_attention:
+            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+        return recv_reqs
+
+    def process_input_requests(self, recv_reqs: List):
+        for recv_req in recv_reqs:
+            if isinstance(recv_req, TokenizedGenerateReqInput):
+                self.handle_generate_request(recv_req)
+            elif isinstance(recv_req, TokenizedEmbeddingReqInput):
+                self.handle_embedding_request(recv_req)
+            elif isinstance(recv_req, FlushCacheReq):
+                self.flush_cache()
+            elif isinstance(recv_req, AbortReq):
+                self.abort_request(recv_req)
+            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
+                success, message = self.update_weights_from_disk(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightFromDiskReqOutput(success, message)
+                )
+            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
+                success, message = self.init_weights_update_group(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    InitWeightsUpdateGroupReqOutput(success, message)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+                success, message = self.update_weights_from_distributed(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightsFromDistributedReqOutput(success, message)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
+                success, message = self.update_weights_from_tensor(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightsFromTensorReqOutput(success, message)
+                )
+            elif isinstance(recv_req, GetWeightsByNameReqInput):
+                parameter = self.get_weights_by_name(recv_req)
+                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+            elif isinstance(recv_req, ProfileReq):
+                if recv_req == ProfileReq.START_PROFILE:
+                    self.start_profile()
+                else:
+                    self.stop_profile()
+            elif isinstance(recv_req, OpenSessionReqInput):
+                session_id, success = self.open_session(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    OpenSessionReqOutput(session_id=session_id, success=success)
+                )
+            elif isinstance(recv_req, CloseSessionReqInput):
+                self.close_session(recv_req)
+            else:
+                raise ValueError(f"Invalid request: {recv_req}")
