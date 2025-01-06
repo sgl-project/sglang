@@ -6,9 +6,11 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, AsyncIterator
 
+import orjson
 import torch
+from fastapi import Request
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -41,6 +43,7 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.version import __version__
+from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +93,7 @@ class Engine:
 
         # get the current event loop
         loop = asyncio.get_event_loop()
-        ret = loop.run_until_complete(generate_request(obj, None))
+        ret = loop.run_until_complete(self._generate_impl(obj, None))
 
         if stream is True:
 
@@ -139,7 +142,7 @@ class Engine:
             stream=stream,
         )
 
-        ret = await generate_request(obj, None)
+        ret = await self._generate_impl(obj, None)
 
         if stream is True:
             generator = ret.body_iterator
@@ -162,6 +165,34 @@ class Engine:
             return generator_wrapper()
         else:
             return ret
+
+    async def _generate_impl(self, obj: GenerateReqInput, request: Request):
+        if obj.stream:
+            async def stream_results() -> AsyncIterator[bytes]:
+                try:
+                    async for out in self.tokenizer_manager.generate_request(obj, request):
+                        yield b"data: " + orjson.dumps(
+                            out, option=orjson.OPT_NON_STR_KEYS
+                        ) + b"\n\n"
+                except ValueError as e:
+                    out = {"error": {"message": str(e)}}
+                    yield b"data: " + orjson.dumps(
+                        out, option=orjson.OPT_NON_STR_KEYS
+                    ) + b"\n\n"
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(
+                stream_results(),
+                media_type="text/event-stream",
+                background=self.tokenizer_manager.create_abort_task(obj),
+            )
+        else:
+            try:
+                ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
+                return ret
+            except ValueError as e:
+                logger.error(f"Error: {e}")
+                return _create_error_response(e)
 
     def shutdown(self):
         kill_process_tree(os.getpid(), include_parent=False)
