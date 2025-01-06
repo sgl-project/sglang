@@ -12,16 +12,6 @@ class Receiver(ABC):
         raise NotImplementedError
 
 
-class ReceiverDispatcher:
-    def __init__(self, receiver: Receiver, target: Any, mapping: List[Tuple[Type, Callable]]):
-        self._receiver = receiver
-        self._target = target
-        self._mapping = mapping
-
-    def recv_and_dispatch(self):
-        TODO
-
-
 class _ZMQSender(Sender):
     def send(self, obj):
         TODO
@@ -30,3 +20,13 @@ class _ZMQSender(Sender):
 class _ZMQReceiver(Receiver):
     def recv(self):
         TODO
+
+
+class TypeBasedDispatcher:
+    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+        self._mapping = mapping
+
+    def __call__(self, obj: Any):
+        for ty, fn in self._mapping:
+            if isinstance(obj, ty):
+                fn(obj)
