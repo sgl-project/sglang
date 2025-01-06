@@ -1,20 +1,9 @@
-import logging
-import os
-import signal
-import threading
-import warnings
-from concurrent import futures
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import List
 
-import psutil
-import setproctitle
-import torch
 import zmq
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
     GetWeightsByNameReqInput,
@@ -34,26 +23,26 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
     Req,
-    ScheduleBatch,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.managers.scheduler.core import SchedulerCore
+from sglang.srt.server_args import PortArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
-    crash_on_warnings,
     get_zmq_socket,
-    set_random_seed,
-    suppress_other_loggers,
 )
-from sglang.utils import get_exception_traceback
 
 
 class SchedulerCommunication:
-    def __init__(self):
+    def __init__(
+        self,
+        core: SchedulerCore,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+    ):
+        self.core = core
+        self.server_args = server_args
+
         context = zmq.Context(2)
 
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
@@ -64,7 +53,7 @@ class SchedulerCommunication:
                 context, zmq.PUSH, port_args.tokenizer_ipc_name
             )
 
-            if server_args.skip_tokenizer_init:
+            if self.server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
                 self._send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name
