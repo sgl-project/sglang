@@ -440,7 +440,7 @@ def launch_engine(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    scheduler_pipe_readers, scheduler_procs = _start_scheduler_processes(port_args, server_args)
+    scheduler_pipe_readers, scheduler_procs = _start_scheduler_or_dp_controller_processes(port_args, server_args)
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -481,35 +481,24 @@ def launch_engine(
     scheduler_info = scheduler_infos[0]
 
 
-def _start_scheduler_processes(port_args, server_args):
+def _start_scheduler_or_dp_controller_processes(port_args, server_args):
+    tp_size_per_node = server_args.tp_size // server_args.nnodes
+
     if server_args.fragment is not None:
         assert server_args.nnodes == 1, 'Has not tested multi-node TP yet'
-        reader, writer = mp.Pipe(duplex=False)
-        gpu_id = server_args.base_gpu_id + tp_rank
-        proc = mp.Process(
-            target=run_scheduler_process,
-            args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-        )
-        proc.start()
+        proc, reader = _start_one_scheduler_process(port_args, server_args, tp_rank, tp_size_per_node)
         scheduler_procs, scheduler_pipe_readers = [proc], [reader]
 
     elif server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
         scheduler_pipe_readers = []
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
         tp_rank_range = range(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
         )
         for tp_rank in tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-            )
-            proc.start()
+            proc, reader = _start_one_scheduler_process(port_args, server_args, tp_rank, tp_size_per_node)
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
@@ -530,6 +519,17 @@ def _start_scheduler_processes(port_args, server_args):
         scheduler_procs, scheduler_pipe_readers = [proc], [reader]
 
     return scheduler_pipe_readers, scheduler_procs
+
+
+def _start_one_scheduler_process(port_args, server_args, tp_rank, tp_size_per_node):
+    reader, writer = mp.Pipe(duplex=False)
+    gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+    proc = mp.Process(
+        target=run_scheduler_process,
+        args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+    )
+    proc.start()
+    return proc, reader
 
 
 def launch_server(
