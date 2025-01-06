@@ -27,10 +27,11 @@ from sglang.srt.openai_api.adapter import (
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
-    v1_retrieve_file_content, create_error_response,
+    v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server.engine import Engine
+from sglang.srt.server.utils import create_error_response
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
