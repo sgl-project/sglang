@@ -1224,7 +1224,7 @@ class SchedulerCore:
 
             # Send to detokenizer
             if rids:
-                self.callback.send_to_detokenizer(
+                self.callback.handle_output(
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
@@ -1260,7 +1260,7 @@ class SchedulerCore:
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
-            self.callback.send_to_detokenizer(
+            self.callback.handle_output(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
@@ -1469,7 +1469,7 @@ class SchedulerCore:
 
 
 class SchedulerCoreCallback(ABC):
-    def send_to_detokenizer(self, obj):
+    def handle_output(self, obj):
         raise NotImplementedError
 
     def recv_and_process_requests(self):

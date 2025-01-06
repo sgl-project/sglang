@@ -140,5 +140,5 @@ class SchedulerCommunication(SchedulerCoreCallback):
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
-    def send_to_detokenizer(self, obj):
+    def handle_output(self, obj):
         self._send_to_detokenizer.send_pyobj(obj)
