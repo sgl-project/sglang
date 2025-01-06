@@ -27,7 +27,7 @@ from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar
 import fastapi
 import uvloop
 from fastapi import BackgroundTasks
-
+from sglang.communicator import TypeBasedDispatcher
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -63,7 +63,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     kill_process_tree,
@@ -184,6 +184,18 @@ class TokenizerManager:
                     # TODO: Add lora name/path in the future,
                 },
             )
+
+        self._dispatcher = TypeBasedDispatcher([
+            (BatchStrOut, self._handle_batch_output),
+            (BatchEmbeddingOut, self._handle_batch_output),
+            (BatchTokenIDOut, self._handle_batch_output),
+            (TODO, self.TODO),
+            (TODO, self.TODO),
+            (TODO, self.TODO),
+            (TODO, self.TODO),
+            (TODO, self.TODO),
+            (TODO, self.TODO),
+        ])
 
     async def generate_request(
         self,
