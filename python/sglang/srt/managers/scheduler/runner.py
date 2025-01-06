@@ -65,14 +65,10 @@ def run_scheduler_process(
     try:
         core = SchedulerCore(
             server_args=server_args, port_args=port_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
+            gpu_id=gpu_id, tp_rank=tp_rank, dp_rank=dp_rank,
         )
         communication = SchedulerCommunication(
-            core=core,
-            server_args=server_args, port_args=port_args,
-            tp_rank=tp_rank, tp_cpu_group=TODO,
+            core=core, server_args=server_args, port_args=port_args, tp_rank=tp_rank,
         )
         core.callback = communication
 

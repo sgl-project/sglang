@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 from typing import List
 
-import torch
 import zmq
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -41,12 +40,10 @@ class SchedulerCommunication(SchedulerCoreCallback):
         server_args: ServerArgs,
         port_args: PortArgs,
         tp_rank: int,
-        tp_cpu_group: torch.distributed.ProcessGroup,
     ):
         self.core = core
         self.server_args = server_args
         self.tp_rank = tp_rank
-        self.tp_cpu_group = tp_cpu_group
 
         context = zmq.Context(2)
 
@@ -92,7 +89,7 @@ class SchedulerCommunication(SchedulerCoreCallback):
             recv_reqs = None
 
         if self.server_args.tp_size != 1 and not self.server_args.enable_dp_attention:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.core.tp_cpu_group)
         return recv_reqs
 
     def _process_input_requests(self, recv_reqs: List):
