@@ -28,6 +28,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
 )
+from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import PortArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -192,14 +193,18 @@ class Engine:
                 return ret
             except ValueError as e:
                 logger.error(f"Error: {e}")
-                return _create_error_response(e)
+                # TODO: maybe we should not return such ORJSONResponse for engine API,
+                # but for backward compatibility we do so
+                return create_error_response(e)
 
     async def _encode_impl(self, obj: EmbeddingReqInput, request: Request):
         try:
             ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
-            return _create_error_response(e)
+            # TODO: maybe we should not return such ORJSONResponse for engine API,
+            # but for backward compatibility we do so
+            return create_error_response(e)
 
     def shutdown(self):
         kill_process_tree(os.getpid(), include_parent=False)
