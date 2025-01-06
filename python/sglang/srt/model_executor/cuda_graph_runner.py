@@ -344,7 +344,9 @@ class CudaGraphRunner:
             gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=spec_info.capture_hidden_mode,
+            capture_hidden_mode=(
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            ),
         )
 
         # Attention backend
