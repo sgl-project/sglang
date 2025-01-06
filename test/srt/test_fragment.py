@@ -17,7 +17,9 @@ class TestFragment(unittest.TestCase):
         readers = []
         for tp_rank in range(_TP_SIZE):
             reader, writer = mp.Pipe(duplex=False)
-            p = Process(target=_run_subprocess, args=(tp_rank, fragment_nccl_port, writer))
+            p = Process(
+                target=_run_subprocess, args=(tp_rank, fragment_nccl_port, writer)
+            )
             p.start()
             processes.append(p)
             readers.append(reader)
@@ -31,7 +33,7 @@ class TestFragment(unittest.TestCase):
 
 
 def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
-    print(f'run_subprocess[{tp_rank=}] Start')
+    print(f"run_subprocess[{tp_rank=}] Start")
 
     engine = Engine(
         model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -40,7 +42,7 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
         fragment_tp_rank=tp_rank,
         fragment_nccl_port=fragment_nccl_port,
     )
-    print(f'run_subprocess[{tp_rank=}] Initialized {engine=}')
+    print(f"run_subprocess[{tp_rank=}] Initialized {engine=}")
 
     output = engine.generate(
         prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
@@ -48,10 +50,10 @@ def _run_subprocess(tp_rank: int, fragment_nccl_port: int, writer):
     )
     print(f"{tp_rank=} {output=} {output['text']=}")
 
-    writer.send(output['text'])
+    writer.send(output["text"])
     writer.close()
 
-    print(f'run_subprocess[{tp_rank=}] engine.shutdown')
+    print(f"run_subprocess[{tp_rank=}] engine.shutdown")
     engine.shutdown()
 
 
