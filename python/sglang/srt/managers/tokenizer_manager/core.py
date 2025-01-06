@@ -27,7 +27,7 @@ from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar
 import fastapi
 import uvloop
 from fastapi import BackgroundTasks
-from sglang.communicator import TypeBasedDispatcher
+from sglang.communicator import TypeBasedDispatcher, create_receiver, create_sender
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -63,7 +63,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, PortArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     kill_process_tree,
@@ -97,6 +97,7 @@ class TokenizerManager:
     def __init__(
         self,
         server_args: ServerArgs,
+        port_args: PortArgs,
     ):
         # Parse args
         self.server_args = server_args
@@ -115,6 +116,10 @@ class TokenizerManager:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
+
+        # Init inter-process communication
+        self.recv_from_detokenizer = create_receiver(port_args.tokenizer_ipc_name)
+        self.send_to_scheduler = create_sender(port_args.scheduler_input_ipc_name)
 
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
