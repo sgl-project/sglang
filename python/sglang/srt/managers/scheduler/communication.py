@@ -57,27 +57,27 @@ class SchedulerCommunication:
         context = zmq.Context(2)
 
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
-            self.recv_from_tokenizer = get_zmq_socket(
+            self._recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
-            self.send_to_tokenizer = get_zmq_socket(
+            self._send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name
             )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+                self._send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name
                 )
             else:
                 # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+                self._send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name
                 )
         else:
-            self.recv_from_tokenizer = None
-            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self._recv_from_tokenizer = None
+            self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -86,7 +86,7 @@ class SchedulerCommunication:
 
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = self._recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
@@ -109,27 +109,27 @@ class SchedulerCommunication:
                 self.abort_request(recv_req)
             elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
                 success, message = self.update_weights_from_disk(recv_req)
-                self.send_to_tokenizer.send_pyobj(
+                self._send_to_tokenizer.send_pyobj(
                     UpdateWeightFromDiskReqOutput(success, message)
                 )
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 success, message = self.init_weights_update_group(recv_req)
-                self.send_to_tokenizer.send_pyobj(
+                self._send_to_tokenizer.send_pyobj(
                     InitWeightsUpdateGroupReqOutput(success, message)
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 success, message = self.update_weights_from_distributed(recv_req)
-                self.send_to_tokenizer.send_pyobj(
+                self._send_to_tokenizer.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success, message)
                 )
             elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
                 success, message = self.update_weights_from_tensor(recv_req)
-                self.send_to_tokenizer.send_pyobj(
+                self._send_to_tokenizer.send_pyobj(
                     UpdateWeightsFromTensorReqOutput(success, message)
                 )
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
-                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+                self._send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
                     self.start_profile()
@@ -137,10 +137,13 @@ class SchedulerCommunication:
                     self.stop_profile()
             elif isinstance(recv_req, OpenSessionReqInput):
                 session_id, success = self.open_session(recv_req)
-                self.send_to_tokenizer.send_pyobj(
+                self._send_to_tokenizer.send_pyobj(
                     OpenSessionReqOutput(session_id=session_id, success=success)
                 )
             elif isinstance(recv_req, CloseSessionReqInput):
                 self.close_session(recv_req)
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
+
+    def send_to_detokenizer(self, obj):
+        self._send_to_detokenizer.send_pyobj(obj)

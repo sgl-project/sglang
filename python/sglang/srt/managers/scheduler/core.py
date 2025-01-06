@@ -21,7 +21,7 @@ import time
 import warnings
 from collections import deque
 from concurrent import futures
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 
 import psutil
 import setproctitle
@@ -93,6 +93,7 @@ class SchedulerCore:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        send_to_detokenizer: Callable,  # TODO rename
     ):
         # Parse args
         self.server_args = server_args
@@ -113,6 +114,7 @@ class SchedulerCore:
             if not self.spec_algorithm.is_none()
             else 1
         )
+        self.send_to_detokenizer = send_to_detokenizer
 
         # Init tokenizer
         self.model_config = ModelConfig(
