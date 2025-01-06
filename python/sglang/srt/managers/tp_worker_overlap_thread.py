@@ -82,6 +82,7 @@ class TpModelWorkerClient:
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
+
     def get_worker_info(self):
         return self.worker.get_worker_info()
 
