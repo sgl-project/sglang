@@ -25,7 +25,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     Req,
 )
-from sglang.srt.managers.scheduler.core import SchedulerCore
+from sglang.srt.managers.scheduler.core import SchedulerCore, SchedulerCoreCallback
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -33,15 +33,19 @@ from sglang.srt.utils import (
 )
 
 
-class SchedulerCommunication:
+class SchedulerCommunication(SchedulerCoreCallback):
     def __init__(
         self,
         core: SchedulerCore,
         server_args: ServerArgs,
         port_args: PortArgs,
+        tp_rank: int,
+        tp_cpu_group: int,
     ):
         self.core = core
         self.server_args = server_args
+        self.tp_rank = tp_rank
+        self.tp_cpu_group = tp_cpu_group
 
         context = zmq.Context(2)
 
