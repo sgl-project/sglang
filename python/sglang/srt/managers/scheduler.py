@@ -22,6 +22,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import psutil
@@ -68,8 +69,6 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.scheduler.communicator import SchedulerCommunicator
-from sglang.srt.managers.scheduler.core import SchedulerCore
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
@@ -127,7 +126,32 @@ class Scheduler:
             if not self.spec_algorithm.is_none()
             else 1
         )
-        self.callback: Optional["SchedulerCoreCallback"] = None
+
+        # Init inter-process communication
+        context = zmq.Context(2)
+
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
+            self.recv_from_tokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.scheduler_input_ipc_name
+            )
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name
+            )
+
+            if self.server_args.skip_tokenizer_init:
+                # Directly send to the TokenizerManager
+                self._send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name
+                )
+            else:
+                # Send to the DetokenizerManager
+                self._send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name
+                )
+        else:
+            self.recv_from_tokenizer = None
+            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -246,31 +270,6 @@ class Scheduler:
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
-
-        context = zmq.Context(2)
-
-        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
-            self._recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name
-            )
-            self._send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name
-            )
-
-            if self.server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
-                self._send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_ipc_name
-                )
-            else:
-                # Send to the DetokenizerManager
-                self._send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name
-                )
-        else:
-            self._recv_from_tokenizer = None
-            self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -427,7 +426,8 @@ class Scheduler:
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            self._process_input_requests(self._recv_requests())
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
 
@@ -452,7 +452,8 @@ class Scheduler:
         result_queue = deque()
 
         while True:
-            self._process_input_requests(self._recv_requests())
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -485,14 +486,14 @@ class Scheduler:
 
             self.last_batch = batch
 
-    def _recv_requests(self) -> List[Req]:
+    def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
             while True:
                 try:
-                    recv_req = self._recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
@@ -503,11 +504,11 @@ class Scheduler:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.core.tp_cpu_group)
         return recv_reqs
 
-    def _process_input_requests(self, recv_reqs: List):
+    def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
             output = self._dispatcher(recv_req)
             if output is not None:
-                self._send_to_tokenizer.send_pyobj(output)
+                self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_or_embedding_request(
         self,
