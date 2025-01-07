@@ -21,6 +21,7 @@ from enum import Enum, auto
 
 import psutil
 import zmq
+
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
