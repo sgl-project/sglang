@@ -21,7 +21,6 @@ from enum import Enum, auto
 
 import psutil
 import zmq
-
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -239,10 +238,11 @@ def run_data_parallel_controller_process(
 ):
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
+    ready_sender = get_zmq_socket(zmq.Context(1), zmq.PUSH, ready_ipc_name)
 
     try:
         controller = DataParallelController(server_args, port_args)
-        ready_ipc_name.send_pyobj(
+        ready_sender.send_pyobj(
             {"status": "ready", "max_total_num_tokens": controller.max_total_num_tokens}
         )
         controller.event_loop()
