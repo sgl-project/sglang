@@ -52,7 +52,7 @@ The core features include:
 - [Contribution Guide](https://sgl-project.github.io/references/contribution_guide.html)
 
 ## Benchmark and Performance
-Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
+Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
 
 ## Roadmap
 [Development Roadmap (2024 Q4)](https://github.com/sgl-project/sglang/issues/1487)

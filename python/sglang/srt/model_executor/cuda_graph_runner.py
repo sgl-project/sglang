@@ -124,6 +124,13 @@ class CudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
 
         # Batch sizes to capture
+        self.capture_bs = self.model_runner.server_args.cuda_graph_bs
+        if self.capture_bs is None:
+            if model_runner.server_args.disable_cuda_graph_padding:
+                self.capture_bs = list(range(1, 33)) + [64, 128]
+            else:
+                self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+
         if model_runner.server_args.disable_cuda_graph_padding:
             self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
@@ -322,6 +329,8 @@ class CudaGraphRunner:
             global_num_tokens = None
             gathered_buffer = None
 
+        spec_info = self.get_spec_info(num_tokens, positions)
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -338,10 +347,13 @@ class CudaGraphRunner:
             top_logprobs_nums=[0] * bs,
             positions=positions,
             global_num_tokens=global_num_tokens,
-            mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
+            mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=self.get_spec_info(num_tokens, positions),
+            spec_info=spec_info,
+            capture_hidden_mode=(
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            ),
         )
 
         # Attention backend
@@ -446,10 +458,10 @@ class CudaGraphRunner:
 
             if self.model_runner.is_draft_worker:
                 spec_info = EAGLEDraftInput()
+                spec_info.load_server_args(self.model_runner.server_args)
                 spec_info.hidden_states = self.hidden_states[:num_tokens]
                 spec_info.positions = positions
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
-                spec_info.init(self.model_runner.server_args)
             else:
                 spec_info = EagleVerifyInput(
                     None,
