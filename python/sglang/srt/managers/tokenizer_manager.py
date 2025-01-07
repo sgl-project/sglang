@@ -26,9 +26,10 @@ from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar
 
 import fastapi
 import uvloop
+import zmq
 from fastapi import BackgroundTasks
 
-from sglang.communicator import TypeBasedDispatcher, create_receiver, create_sender
+from sglang.communicator import TypeBasedDispatcher
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -65,7 +66,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import dataclass_to_string_truncated, kill_process_tree
+from sglang.srt.utils import (
+    dataclass_to_string_truncated,
+    get_zmq_socket,
+    kill_process_tree,
+)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -101,6 +106,15 @@ class TokenizerManager:
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
 
+        # Init inter-process communication
+        context = zmq.asyncio.Context(2)
+        self.recv_from_detokenizer = get_zmq_socket(
+            context, zmq.PULL, port_args.tokenizer_ipc_name
+        )
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
+
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
@@ -114,10 +128,6 @@ class TokenizerManager:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
-
-        # Init inter-process communication
-        self.recv_from_detokenizer = create_receiver(port_args.tokenizer_ipc_name)
-        self.send_to_scheduler = create_sender(port_args.scheduler_input_ipc_name)
 
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
