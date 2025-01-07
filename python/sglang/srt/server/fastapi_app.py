@@ -77,6 +77,9 @@ async def health() -> Response:
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
 
+    if not _global_state.engine.initialized:
+        return Response(status_code=503)
+
     if _global_state.engine.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}

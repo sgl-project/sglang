@@ -56,6 +56,10 @@ class Engine:
         assert self.server_args.fragment
         self._wait_subprocess_launcher()
 
+    @property
+    def initialized(self):
+        return self._subprocess_launcher is None
+
     def _wait_subprocess_launcher(self):
         tokenizer_manager, scheduler_info = self._subprocess_launcher.wait()
         del self._subprocess_launcher
