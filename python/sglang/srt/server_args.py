@@ -860,6 +860,14 @@ class ServerArgs:
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
+        # Function Calling
+        parser.add_argument(
+            "--tool-call-parser",
+            type=str,
+            choices=["qwen25", "mistral", "llama3"],
+            default=None,
+            help="Delete the model checkpoint after loading the model.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
