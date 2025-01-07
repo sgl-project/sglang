@@ -21,14 +21,14 @@ from enum import Enum, auto
 
 import psutil
 import zmq
-from sglang.communicator import create_receiver, create_sender
+
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import bind_port, configure_logger
+from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,10 @@ class DataParallelController:
         )
 
         # Init inter-process communication
-        self.recv_from_tokenizer = create_receiver(port_args.scheduler_input_ipc_name)
+        self.context = zmq.Context(1 + server_args.dp_size)
+        self.recv_from_tokenizer = get_zmq_socket(
+            self.context, zmq.PULL, port_args.scheduler_input_ipc_name
+        )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -156,7 +159,9 @@ class DataParallelController:
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
-        send_to = create_sender(port_args.scheduler_input_ipc_name)
+        send_to = get_zmq_socket(
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
 
         # Wait for model to finish loading and get max token nums
         scheduler_info = []
@@ -182,7 +187,9 @@ class DataParallelController:
             args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
         )
         proc.start()
-        send_to = create_sender(port_args.scheduler_input_ipc_name)
+        send_to = get_zmq_socket(
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
 
         scheduler_info = reader.recv()
         self.max_total_num_tokens = scheduler_info["max_total_num_tokens"]
