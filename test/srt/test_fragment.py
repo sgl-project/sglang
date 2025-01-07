@@ -43,20 +43,27 @@ class TestFragment(unittest.TestCase):
 def _run_subprocess(tp_rank: int, fragment_args, writer):
     print(f"run_subprocess[{tp_rank=}] Start")
 
-    fragment = EngineFragment(
-        tp_rank=tp_rank,
-        gpu_id=tp_rank,
-        fragment_args=fragment_args,
-    )
-    print(f"run_subprocess[{tp_rank=}] {fragment=}", flush=True)
-
     # Engine can be put anywhere, e.g. tp_rank=0, or other places
     if tp_rank == 0:
-        engine = Engine(fragment_args=fragment_args)
+        engine = Engine(
+            tp_rank=tp_rank,
+            gpu_id=tp_rank,
+            fragment=True,
+        )
         print(f"run_subprocess[{tp_rank=}] {engine=}", flush=True)
+        fragment_args = engine.fragment_args
+    else:
+        fragment_args = None
 
+    TODO_broadcast_fragment_args
+
+    fragment = EngineFragment(fragment_args=fragment_args)
+    print(f"run_subprocess[{tp_rank=}] {fragment=}", flush=True)
+
+    if tp_rank == 0:
+        TODO_wait_finish_launch(engine)
+      
         ans = []
-
         for prompt in [
             ["Today is a sunny day and I like", "I have a very good idea on"],
             ["Hello, I am", "What is your name?", "Mathematics is defined as"],
