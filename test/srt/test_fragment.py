@@ -32,11 +32,11 @@ class TestFragment(unittest.TestCase):
         self.assertEqual(
             output,
             [
-                ' to spend it outdoors. I decided to take a walk in the nearby park.',
+                " to spend it outdoors. I decided to take a walk in the nearby park.",
                 " how to improve the performance of my website. I've been doing some research and",
-                ' a new user of the platform. I am looking for a new laptop to buy',
+                " a new user of the platform. I am looking for a new laptop to buy",
                 " I'm looking for someone to help me with a project.\nI'm a student",
-                ' the science of numbers and their properties. It is a vast and complex field that'
+                " the science of numbers and their properties. It is a vast and complex field that",
             ],
         )
 
@@ -84,7 +84,8 @@ def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
                 print(f"subprocess[{tp_rank=}] Start generation", flush=True)
                 outputs = engine.generate(
                     prompt=prompt,
-                    sampling_params=[dict(max_new_tokens=16, temperature=0.0)] * len(prompt),
+                    sampling_params=[dict(max_new_tokens=16, temperature=0.0)]
+                    * len(prompt),
                 )
                 print(
                     f"subprocess[{tp_rank=}] End generation {tp_rank=} {prompt=} {outputs=}",
