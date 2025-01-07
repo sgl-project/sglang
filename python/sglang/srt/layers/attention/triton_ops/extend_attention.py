@@ -80,7 +80,7 @@ def _fwd_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    USE_INT8_KV: tl.constexpr
+    USE_INT8_KV: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -147,15 +147,18 @@ def _fwd_kernel(
         )
         if not USE_INT8_KV:
             k = tl.load(
-                K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+                K_Buffer + offs_buf_k,
+                mask=(mask_n[None, :]) & (mask_d[:, None]),
+                other=0.0,
             )
         else:
             k_int8 = tl.load(
-                K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+                K_Buffer + offs_buf_k,
+                mask=(mask_n[None, :]) & (mask_d[:, None]),
+                other=0.0,
             )
             offs_scales_k = (
-                offs_kv_loc[None, :] * stride_scale_kbs
-                + cur_kv_head * stride_scale_kh
+                offs_kv_loc[None, :] * stride_scale_kbs + cur_kv_head * stride_scale_kh
             )
             k_scales = tl.load(
                 K_Scale_Zeros_Buffer + offs_scales_k, mask=mask_n[None, :], other=1.0
@@ -177,7 +180,7 @@ def _fwd_kernel(
                 + cur_kv_head * stride_buf_kh
                 + offs_dpe[:, None]
             )
-            if not USE_INT8_KV: 
+            if not USE_INT8_KV:
                 kpe = tl.load(
                     K_Buffer + offs_kpe,
                     mask=mask_n[None, :],
@@ -194,7 +197,9 @@ def _fwd_kernel(
                     + cur_kv_head * stride_scale_kh
                 )
                 kpe_scales = tl.load(
-                    K_Scale_Zeros_Buffer + offs_scales_kpe, mask=mask_n[None, :], other=1.0
+                    K_Scale_Zeros_Buffer + offs_scales_kpe,
+                    mask=mask_n[None, :],
+                    other=1.0,
                 )
                 offs_zeros_kpe = (
                     offs_kv_loc[None, :] * stride_scale_kbs
@@ -225,15 +230,18 @@ def _fwd_kernel(
         )
         if not USE_INT8_KV:
             v = tl.load(
-                V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+                V_Buffer + offs_buf_v,
+                mask=mask_n[:, None] & mask_dv[None, :],
+                other=0.0,
             )
         else:
             v_int8 = tl.load(
-                V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+                V_Buffer + offs_buf_v,
+                mask=mask_n[:, None] & mask_dv[None, :],
+                other=0.0,
             )
             offs_scales_v = (
-                offs_kv_loc[:, None] * stride_scale_vbs
-                + cur_kv_head * stride_scale_vh
+                offs_kv_loc[:, None] * stride_scale_vbs + cur_kv_head * stride_scale_vh
             )
             v_scales = tl.load(
                 V_Scale_Zeros_Buffer + offs_scales_v, mask=mask_n[:, None], other=1.0
@@ -347,10 +355,10 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
-    
+
     # assert kv dtype
     USE_INT8_KV = k_buffer[0].dtype == torch.int8
-    
+
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
@@ -422,6 +430,8 @@ def extend_attention_fwd(
         o_extend,
         k_buffer,
         v_buffer,
+        k_scale_zeros_buffer,
+        v_scale_zeros_buffer,
         req_to_tokens,
         b_req_idx,
         b_seq_len,
@@ -452,6 +462,7 @@ def extend_attention_fwd(
         BLOCK_DV=BLOCK_DV,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        USE_INT8_KV=USE_INT8_KV,
         Lq=Lq,
         Lv=Lv,
         num_warps=num_warps,

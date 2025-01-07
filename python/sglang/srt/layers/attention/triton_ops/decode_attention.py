@@ -133,8 +133,7 @@ def _fwd_kernel_stage1(
                 )
                 # load k scale
                 offs_scale_k = (
-                    kv_loc[:, None] * stride_sz_kbs
-                    + cur_kv_head * stride_buf_kh
+                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_buf_kh
                 )
                 k_scales = tl.load(
                     K_Scale_Zeros_Buffer + offs_scale_k,
@@ -142,9 +141,7 @@ def _fwd_kernel_stage1(
                     other=1.0,
                 )
                 offs_zeros_k = (
-                    kv_loc[:, None] * stride_sz_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + 1
+                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_buf_kh + 1
                 )
                 k_zeros = tl.load(
                     K_Scale_Zeros_Buffer + offs_zeros_k,
@@ -180,8 +177,7 @@ def _fwd_kernel_stage1(
                 )
                 # load v scale
                 offs_scale_v = (
-                    kv_loc[:, None] * stride_sz_vbs
-                    + cur_kv_head * stride_buf_vh
+                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_buf_vh
                 )
                 v_scales = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
@@ -189,9 +185,7 @@ def _fwd_kernel_stage1(
                     other=1.0,
                 )
                 offs_zeros_v = (
-                    kv_loc[:, None] * stride_sz_vbs
-                    + cur_kv_head * stride_buf_vh
-                    + 1
+                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_buf_vh + 1
                 )
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
@@ -436,9 +430,7 @@ def _fwd_grouped_kernel_stage1(
                     other=1.0,
                 )
                 offs_zeros_k = (
-                    kv_loc[None, :] * stride_sz_kbs
-                    + cur_kv_head * stride_sz_kh
-                    + 1
+                    kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh + 1
                 )
                 k_zeros = tl.load(
                     K_Scale_Zeros_Buffer + offs_zeros_k,
@@ -467,8 +459,7 @@ def _fwd_grouped_kernel_stage1(
                         other=0.0,
                     )
                     offs_scale_kpe = (
-                        kv_loc[None, :] * stride_sz_kbs
-                        + cur_kv_head * stride_sz_kh
+                        kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh
                     )
                     kpe_scales = tl.load(
                         K_Scale_Zeros_Buffer + offs_scale_kpe,
@@ -476,9 +467,7 @@ def _fwd_grouped_kernel_stage1(
                         other=1.0,
                     )
                     offs_zeros_kpe = (
-                        kv_loc[None, :] * stride_sz_kbs
-                        + cur_kv_head * stride_sz_kh
-                        + 1
+                        kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh + 1
                     )
                     kpe_zeros = tl.load(
                         K_Scale_Zeros_Buffer + offs_zeros_kpe,
@@ -517,16 +506,14 @@ def _fwd_grouped_kernel_stage1(
                 offs_scale_v = (
                     kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )
-                
+
                 v_scales = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
                 offs_zeros_v = (
-                    kv_loc[:, None] * stride_sz_vbs
-                    + cur_kv_head * stride_sz_vh
-                    + 1
+                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh + 1
                 )
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
@@ -1039,22 +1026,6 @@ def quantize_cache_kv(
     BLOCK_HEAD = triton.next_power_of_2(k_head_num)
     grid = (bs,)
     num_warps = 1
-
-    print(
-        "Input data index:",
-        dest_idx,
-        k_status.stride(0),
-        k_status.stride(1),
-        k_status.stride(2),
-    )
-    print(
-        "Input data shape:",
-        k_scale_zeros.shape,
-        k_scale_zeros.stride(0),
-        k_scale_zeros.stride(1),
-    )
-    print("Cache pointer shape:", v_status.shape)
-    print("Scale zeros pointer shape:", k_scale_zeros.shape, v_scale_zeros.stride(2))
 
     _fwd_kernel_quantize_cache_kv[grid](
         k_status,
