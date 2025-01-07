@@ -157,6 +157,7 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
+    tool_call_parser: str = None
 
     def __post_init__(self):
         # Set missing default values
@@ -865,7 +866,7 @@ class ServerArgs:
             "--tool-call-parser",
             type=str,
             choices=["qwen25", "mistral", "llama3"],
-            default=None,
+            default=ServerArgs.tool_call_parser,
             help="Delete the model checkpoint after loading the model.",
         )
 
