@@ -61,8 +61,9 @@ def _run_subprocess(tp_rank: int, fragment_args, writer):
     print(f"run_subprocess[{tp_rank=}] {fragment=}", flush=True)
 
     if tp_rank == 0:
-        TODO_wait_finish_launch(engine)
-      
+        engine.await_fragments()
+        print(f"run_subprocess[{tp_rank=}] end wait engine launch", flush=True)
+
         ans = []
         for prompt in [
             ["Today is a sunny day and I like", "I have a very good idea on"],
