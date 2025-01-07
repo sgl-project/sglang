@@ -310,6 +310,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     ret,
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
+                    tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
                 )
             else:
                 responses = v1_generate_response(
@@ -1014,7 +1015,9 @@ def v1_chat_generate_request(
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
-def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
+def v1_chat_generate_response(
+    request, ret, to_file=False, cache_report=False, tool_call_parser=None
+):
     choices = []
 
     for idx, ret_item in enumerate(ret):
@@ -1075,7 +1078,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:
-                parser = FunctionCallParser(tools)
+                parser = FunctionCallParser(tools, tool_call_parser)
                 full_normal_text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = [
                     ToolCall(
@@ -1279,7 +1282,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:
-                            parser_dict[index] = FunctionCallParser(tools=request.tools)
+                            parser_dict[index] = FunctionCallParser(
+                                tools=request.tools,
+                                tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                            )
                         parser = parser_dict[index]
 
                         # parse_increment => returns (normal_text, calls)
@@ -1424,7 +1430,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret = [ret]
 
     response = v1_chat_generate_response(
-        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
+        request,
+        ret,
+        cache_report=tokenizer_manager.server_args.enable_cache_report,
+        tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
     )
 
     return response

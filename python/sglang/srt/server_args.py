@@ -877,6 +877,14 @@ class ServerArgs:
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
+        # Function Calling
+        parser.add_argument(
+            "--tool-call-parser",
+            type=str,
+            choices=["qwen25", "mistral", "llama3"],
+            default=None,
+            help="Delete the model checkpoint after loading the model.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

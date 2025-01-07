@@ -869,17 +869,24 @@ class FunctionCallParser:
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    def __init__(self, tools: List[Tool]):
-        # Inject a set of Detectors here. To support Qwen25, InternLM2 in the future,
-        # simply instantiate the corresponding Detector and add it to the list:
-        self.multi_format_parser = MultiFormatParser(
-            [
-                Llama32Detector(),
-                # Qwen25Detector(),
-                # MistralDetector(),
-                # ...
-            ]
-        )
+    ToolCallParserEnum: Dict[str, BaseFormatDetector] = {
+        "llama3": Llama32Detector,
+        "qwen25": Qwen25Detector,
+        "mistral": MistralDetector,
+    }
+
+    def __init__(self, tools: List["Tool"], tool_call_parser: str):
+        detectors = []
+        if tool_call_parser:
+            detector_class = self.ToolCallParserEnum.get(tool_call_parser)
+            if detector_class:
+                detectors.append(detector_class())
+            else:
+                raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+        else:
+            detectors = [cls() for cls in self.ToolCallParserEnum.values()]
+
+        self.multi_format_parser = MultiFormatParser(detectors)
         self.tools = tools
 
     def parse_non_stream(self, full_text: str):
