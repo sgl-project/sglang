@@ -376,7 +376,7 @@ class Grok1ForCausalLM(nn.Module):
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
-        use_presharded_weights: bool | None = None,
+        use_presharded_weights: Optional[bool] = None,
     ):
         if use_presharded_weights is None:
             use_presharded_weights = self.use_presharded_weights
