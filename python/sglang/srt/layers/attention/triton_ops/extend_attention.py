@@ -163,11 +163,8 @@ def _fwd_kernel(
             k_scales = tl.load(
                 K_Scale_Zeros_Buffer + offs_scales_k, mask=mask_n[None, :], other=1.0
             )
-            offs_zeros_k = (
-                offs_kv_loc[None, :] * stride_scale_kbs
-                + cur_kv_head * stride_scale_kh
-                + 1
-            )
+            offs_zeros_k = offs_scales_k + 1
+
             k_zeros = tl.load(
                 K_Scale_Zeros_Buffer + offs_zeros_k, mask=mask_n[None, :], other=0
             )
@@ -201,11 +198,7 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=1.0,
                 )
-                offs_zeros_kpe = (
-                    offs_kv_loc[None, :] * stride_scale_kbs
-                    + cur_kv_head * stride_scale_kh
-                    + 1
-                )
+                offs_zeros_kpe = offs_scales_kpe + 1
                 kpe_zeros = tl.load(
                     K_Scale_Zeros_Buffer + offs_zeros_kpe, mask=mask_n[None, :], other=0
                 )
@@ -246,11 +239,7 @@ def _fwd_kernel(
             v_scales = tl.load(
                 V_Scale_Zeros_Buffer + offs_scales_v, mask=mask_n[:, None], other=1.0
             )
-            offs_zeros_v = (
-                offs_kv_loc[:, None] * stride_scale_vbs
-                + cur_kv_head * stride_scale_vh
-                + 1
-            )
+            offs_zeros_v = offs_scales_v + 1
             v_zeros = tl.load(
                 V_Scale_Zeros_Buffer + offs_zeros_v, mask=mask_n[:, None], other=0
             )

@@ -140,9 +140,8 @@ def _fwd_kernel_stage1(
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
-                offs_zeros_k = (
-                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_buf_kh + 1
-                )
+                offs_zeros_k = offs_scale_k + 1
+
                 k_zeros = tl.load(
                     K_Scale_Zeros_Buffer + offs_zeros_k,
                     mask=offs_n[:, None] < split_kv_end,
@@ -184,9 +183,7 @@ def _fwd_kernel_stage1(
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
-                offs_zeros_v = (
-                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_buf_vh + 1
-                )
+                offs_zeros_v = offs_scale_v
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
                     mask=offs_n[:, None] < split_kv_end,
@@ -358,7 +355,7 @@ def _fwd_grouped_kernel_stage1(
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
-    scales_dtype = K_Scale_Zeros_Buffer.dtype.element_ty
+    scale_dtype = K_Scale_Zeros_Buffer.dtype.element_ty
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -429,15 +426,13 @@ def _fwd_grouped_kernel_stage1(
                     mask=offs_n[None, :] < split_kv_end,
                     other=1.0,
                 )
-                offs_zeros_k = (
-                    kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh + 1
-                )
+                offs_zeros_k = offs_scale_k + 1
                 k_zeros = tl.load(
                     K_Scale_Zeros_Buffer + offs_zeros_k,
                     mask=offs_n[None, :] < split_kv_end,
                     other=0,
                 )
-                k = (k_int8 - k_zeros).to(scales_dtype) * k_scales
+                k = (k_int8 - k_zeros).to(scale_dtype) * k_scales
 
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
@@ -466,15 +461,13 @@ def _fwd_grouped_kernel_stage1(
                         mask=offs_n[None, :] < split_kv_end,
                         other=1.0,
                     )
-                    offs_zeros_kpe = (
-                        kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh + 1
-                    )
+                    offs_zeros_kpe = offs_scale_kpe + 1
                     kpe_zeros = tl.load(
                         K_Scale_Zeros_Buffer + offs_zeros_kpe,
                         mask=offs_n[None, :] < split_kv_end,
                         other=0,
                     )
-                    kpe = (kpe_int8 - kpe_zeros).to(scales_dtype) * kpe_scales
+                    kpe = (kpe_int8 - kpe_zeros).to(scale_dtype) * kpe_scales
 
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
@@ -512,15 +505,13 @@ def _fwd_grouped_kernel_stage1(
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
-                offs_zeros_v = (
-                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh + 1
-                )
+                offs_zeros_v = offs_scale_v + 1
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
-                v = (v_int8 - v_zeros).to(scales_dtype) * v_scales
+                v = (v_int8 - v_zeros).to(scale_dtype) * v_scales
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
