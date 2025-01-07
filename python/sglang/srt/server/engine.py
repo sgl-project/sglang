@@ -47,6 +47,11 @@ class Engine:
         if self.server_args.fragment:
             self._wait_subprocess_launcher()
 
+    @property
+    def fragment_args(self):
+        assert self.server_args.fragment
+        return self._subprocess_launcher.fragment_args
+
     def await_fragments(self):
         assert self.server_args.fragment
         self._wait_subprocess_launcher()

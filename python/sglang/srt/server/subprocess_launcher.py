@@ -41,7 +41,7 @@ class SubprocessLauncher:
 
         # Allocate ports for inter-process communications
         port_args = PortArgs.init_new(server_args)
-        fragment_args = EngineFragmentArgs.init_new(server_args, port_args)
+        self.fragment_args = EngineFragmentArgs.init_new(server_args, port_args)
         logger.info(f"{server_args=}")
 
         # If using model from www.modelscope.cn, first download the model.
