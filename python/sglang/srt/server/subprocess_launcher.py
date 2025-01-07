@@ -150,7 +150,9 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args):
 def _start_scheduler_process(
     port_args, server_args, tp_rank: int, tp_size_per_node: int
 ):
-    if TODO:
+    if server_args.fragment:
+        return None, TODO
+    else:
         ready_ipc_name = create_zmq_ipc_name()
         ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
         gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
@@ -160,8 +162,6 @@ def _start_scheduler_process(
         )
         proc.start()
         return proc, ready_receiver
-    else:
-        return None, TODO
 
 
 def _set_envs_and_config(server_args: ServerArgs):
