@@ -149,6 +149,7 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
     torchao_config: str = ""
+    modelopt_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -361,6 +362,7 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
+                "modelopt",
             ],
             help="The quantization method.",
         )
@@ -807,6 +809,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.torchao_config,
             help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
+        )
+        parser.add_argument(
+            "--modelopt-config",
+            type=str,
+            default=ServerArgs.modelopt_config,
+            help="Optimize the model with nvidia-modelopt. Experimental feature. Current choices are: fp8",
         )
         parser.add_argument(
             "--enable-nan-detection",

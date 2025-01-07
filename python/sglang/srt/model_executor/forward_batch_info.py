@@ -107,6 +107,21 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DUMMY_FIRST
 
 
+class CaptureHiddenMode(IntEnum):
+    NULL = auto()
+    FULL = auto()
+    LAST = auto()
+
+    def need_capture(self):
+        return self != CaptureHiddenMode.NULL
+
+    def is_full(self):
+        return self == CaptureHiddenMode.FULL
+
+    def is_last(self):
+        return self == CaptureHiddenMode.LAST
+
+
 @dataclass
 class ForwardBatch:
     """Store all inputs of a forward pass."""
@@ -174,6 +189,7 @@ class ForwardBatch:
     # Speculative decoding
     spec_info: SpecInfo = None
     spec_algorithm: SpeculativeAlgorithm = None
+    capture_hidden_mode: CaptureHiddenMode = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -265,6 +281,7 @@ class ForwardBatch:
             sampling_info=batch.sampling_info,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
+            capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
         )
 
@@ -400,18 +417,3 @@ def compute_position_torch(
 @maybe_torch_compile(dynamic=True)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
-
-
-class CaptureHiddenMode(IntEnum):
-    NULL = auto()
-    FULL = auto()
-    LAST = auto()
-
-    def need_capture(self):
-        return self != CaptureHiddenMode.NULL
-
-    def is_full(self):
-        return self == CaptureHiddenMode.FULL
-
-    def is_last(self):
-        return self == CaptureHiddenMode.LAST
