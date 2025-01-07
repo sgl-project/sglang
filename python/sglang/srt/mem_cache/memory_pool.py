@@ -31,33 +31,9 @@ import psutil
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import debug_timing, get_compiler_backend
 
 logger = logging.getLogger(__name__)
-
-
-def debug_timing(func):
-    # todo: replace with a more organized instrumentation
-    def wrapper(*args, **kwargs):
-        if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
-            tic.record()
-            result = func(*args, **kwargs)
-            toc.record()
-            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
-            elapsed = tic.elapsed_time(toc)
-            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
-            num_tokens = len(indices) if indices is not None else 0
-            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
-            logger.debug(
-                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
-            )
-            return result
-        else:
-            return func(*args, **kwargs)
-
-    return wrapper
 
 
 class ReqToTokenPool:
