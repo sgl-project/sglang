@@ -549,32 +549,30 @@ class EagleVerifyInput(SpecInfo):
             self.draft_token_num,
             triton.next_power_of_2(max_draft_len),
         )
-        
+
         draft_input = EAGLEDraftInput()
         new_accept_index = []
         unfinished_index = []
         finished_extend_len = {}  # {rid:accept_length + 1}
         accept_index_cpu = accept_index.tolist()
-        # iterate every accepted token and check if req is finished after append the token
-        # should be check BEFORE free kv cache slot
+        predict_cpu = predict.tolist()
+        # iterate every accepted token and check if req has finished after append the token
+        # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            found_finished = False
             new_accept_index_ = []
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
-                id = predict[idx].item()
-                if not found_finished:
-                    req.output_ids.append(id)
-                    req.check_finished()
+                id = predict_cpu[idx]
+                # if not found_finished:
+                req.output_ids.append(id)
+                finished_extend_len[req.rid] = j + 1
+                req.check_finished()
                 if req.finished():
                     draft_input.has_finished = True
-                    if not found_finished:
-                        finished_extend_len[req.rid] = j + 1
-                        found_finished = True
-                    else:
-                        # set all tokens after finished token to -1
-                        accept_index[i,j] = -1
+                    # set all tokens after finished token to -1 and break
+                    accept_index[i, j + 1 :] = -1
+                    break
                 else:
                     new_accept_index_.append(idx)
             if not req.finished():
