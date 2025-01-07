@@ -46,9 +46,10 @@ __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
                                             int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
-                                            int32_t block_size, size_t numel, int32_t* cumsum) {
+                                            int32_t block_size, size_t numel) {
   __shared__ int32_t shared_counts[32][8];
   __shared__ int32_t local_offsets[256];
+  __shared__ int32_t shared_cumsum[257];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
   const int experts_per_warp = 8;
@@ -73,25 +74,25 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    cumsum[0] = 0;
+    shared_cumsum[0] = 0;
     for (int i = 1; i <= num_experts; ++i) {
       int expert_count = 0;
       int warp_idx = (i - 1) / experts_per_warp;
       int expert_offset = (i - 1) % experts_per_warp;
       expert_count = shared_counts[warp_idx][expert_offset];
 
-      cumsum[i] = cumsum[i - 1] + CEILDIV(expert_count, block_size) * block_size;
+      shared_cumsum[i] = shared_cumsum[i - 1] + CEILDIV(expert_count, block_size) * block_size;
     }
-    *total_tokens_post_pad = cumsum[num_experts];
+    *total_tokens_post_pad = shared_cumsum[num_experts];
   }
 
   __syncthreads();
 
   if (threadIdx.x < num_experts) {
-    for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
+    for (int i = shared_cumsum[threadIdx.x]; i < shared_cumsum[threadIdx.x + 1]; i += block_size) {
       expert_ids[i / block_size] = threadIdx.x;
     }
-    local_offsets[threadIdx.x] = cumsum[threadIdx.x];
+    local_offsets[threadIdx.x] = shared_cumsum[threadIdx.x];
   }
 
   __syncthreads();
@@ -104,13 +105,14 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
 }
 
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
-                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
-                          torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer) {
+                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int threads_per_block = 1024;
+  assert(num_experts == 256 && "num_experts must be 256 now.");
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     auto kernel = moe_align_block_size_kernel<scalar_t>;
-    kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+    kernel<<<1, threads_per_block, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                    experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
-                                   num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
+                                   num_experts, block_size, topk_ids.numel());
   });
 }

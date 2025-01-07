@@ -9,8 +9,8 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 
 // moe_align_block_size
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
-                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
-                          torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer);
+                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad);
+
 
 // int8_scaled_mm
 torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
