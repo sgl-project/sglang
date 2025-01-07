@@ -340,8 +340,8 @@ class CudaGraphRunner:
             top_logprobs_nums=[0] * bs,
             positions=positions,
             global_num_tokens=global_num_tokens,
-            mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
+            mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(
