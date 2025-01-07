@@ -46,6 +46,9 @@ from sglang.srt.utils import (
 from sglang.version import __version__
 
 
+logger = logging.getLogger(__name__)
+
+
 class SubprocessLauncher:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
@@ -167,8 +170,6 @@ def _start_scheduler_process(
     )
     proc.start()
     return proc, ready_receiver
-
-
 
 
 def _set_envs_and_config(server_args: ServerArgs):
