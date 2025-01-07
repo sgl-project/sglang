@@ -175,7 +175,7 @@ class Engine:
         if obj.stream:
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
-                    async for out in self._generate_request_impl(obj, request):
+                    async for out in self.tokenizer_manager.generate_request(obj, request):
                         yield b"data: " + orjson.dumps(
                             out, option=orjson.OPT_NON_STR_KEYS
                         ) + b"\n\n"
@@ -189,11 +189,11 @@ class Engine:
             return StreamingResponse(
                 stream_results(),
                 media_type="text/event-stream",
-                background=self._create_abort_task_impl(obj),
+                background=self.self.tokenizer_manager.create_abort_task(obj),
             )
         else:
             try:
-                ret = await self._generate_request_impl(obj, request).__anext__()
+                ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
                 return ret
             except ValueError as e:
                 logger.error(f"Error: {e}")
@@ -213,18 +213,12 @@ class Engine:
 
     async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
         try:
-            ret = await self._generate_request_impl(obj, request).__anext__()
+            ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
             # TODO: maybe we should not return such ORJSONResponse for engine API,
             # but for backward compatibility we do so
             return create_error_response(e)
-
-    async def _generate_request_impl(self, obj: Union[GenerateReqInput, EmbeddingReqInput], request: Request):
-        raise NotImplementedError
-
-    def _create_abort_task_impl(self, obj: GenerateReqInput):
-        raise NotImplementedError
 
 
     def shutdown(self):
@@ -299,12 +293,6 @@ class Engine:
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.get_weights_by_name(obj, None))
-
-    async def _generate_request_impl(self, obj: GenerateReqInput, request: Request):
-        return self.tokenizer_manager.generate_request(obj, request)
-
-    def _create_abort_task_impl(self, obj: GenerateReqInput):
-        return self.tokenizer_manager.create_abort_task(obj)
 
 
 def _launch_subprocesses(
