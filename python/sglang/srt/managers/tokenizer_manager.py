@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar
 import fastapi
 import uvloop
 import zmq
+import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
@@ -107,7 +108,7 @@ class TokenizerManager:
         self.enable_metrics = server_args.enable_metrics
 
         # Init inter-process communication
-        context = zmq.Context(2)
+        context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name
         )
