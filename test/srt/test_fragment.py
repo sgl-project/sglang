@@ -35,7 +35,7 @@ class TestFragment(unittest.TestCase):
 
 
 def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
-    print(f"run_subprocess[{tp_rank=}] Start")
+    print(f"subprocess[{tp_rank=}] Start")
 
     # Engine can be put anywhere, e.g. tp_rank=0, or other places
     if tp_rank == 0:
@@ -46,7 +46,7 @@ def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
             random_seed=42,
             fragment=True,
         )
-        print(f"run_subprocess[{tp_rank=}] {engine=}", flush=True)
+        print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
 
         for _ in range(_TP_SIZE):
             queue.put(engine.fragment_args)
@@ -59,29 +59,29 @@ def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
         tp_rank=tp_rank,
         gpu_id=tp_rank,
     )
-    print(f"run_subprocess[{tp_rank=}] {fragment=}", flush=True)
+    print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
     if tp_rank == 0:
         engine.await_fragments()
-        print(f"run_subprocess[{tp_rank=}] end wait engine launch", flush=True)
+        print(f"subprocess[{tp_rank=}] end wait engine launch", flush=True)
 
         ans = []
         for prompt in [
             ["Today is a sunny day and I like", "I have a very good idea on"],
             ["Hello, I am", "What is your name?", "Mathematics is defined as"],
         ]:
-            print(f"Start generation", flush=True)
+            print(f"subprocess[{tp_rank=}] Start generation", flush=True)
             outputs = engine.generate(
                 prompt=prompt,
                 sampling_params=[dict(max_new_tokens=16)] * len(prompt),
             )
-            print(f"End generation {tp_rank=} {prompt=} {outputs=}", flush=True)
+            print(f"subprocess[{tp_rank=}] End generation {tp_rank=} {prompt=} {outputs=}", flush=True)
             ans += [o["text"] for o in outputs]
 
         output_writer.send(ans)
         output_writer.close()
 
-        print(f"run_subprocess[{tp_rank=}] engine.shutdown", flush=True)
+        print(f"subprocess[{tp_rank=}] engine.shutdown", flush=True)
         engine.shutdown()
 
 
