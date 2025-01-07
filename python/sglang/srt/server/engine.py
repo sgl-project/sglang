@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.server.subprocess_launcher import SubprocessLauncher
 from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -63,24 +64,25 @@ class Engine:
         atexit.register(self.shutdown)
 
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
-        tokenizer_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args
-        )
+
+        self._subprocess_launcher = SubprocessLauncher(server_args=server_args)
+
+        tokenizer_manager, scheduler_info = self._subprocess_launcher.wait()
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
     def generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        stream: bool = False,
+            self,
+            # The input prompt. It can be a single prompt or a batch of prompts.
+            prompt: Optional[Union[List[str], str]] = None,
+            sampling_params: Optional[Union[List[Dict], Dict]] = None,
+            # The token ids for text; one can either specify text or input_ids.
+            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+            return_logprob: Optional[Union[List[bool], bool]] = False,
+            logprob_start_len: Optional[Union[List[int], int]] = None,
+            top_logprobs_num: Optional[Union[List[int], int]] = None,
+            lora_path: Optional[List[Optional[str]]] = None,
+            stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -108,7 +110,7 @@ class Engine:
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -120,17 +122,17 @@ class Engine:
             return ret
 
     async def async_generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Dict] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        stream: bool = False,
+            self,
+            # The input prompt. It can be a single prompt or a batch of prompts.
+            prompt: Optional[Union[List[str], str]] = None,
+            sampling_params: Optional[Dict] = None,
+            # The token ids for text; one can either specify text or input_ids.
+            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+            return_logprob: Optional[Union[List[bool], bool]] = False,
+            logprob_start_len: Optional[Union[List[int], int]] = None,
+            top_logprobs_num: Optional[Union[List[int], int]] = None,
+            lora_path: Optional[List[Optional[str]]] = None,
+            stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -155,7 +157,7 @@ class Engine:
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -170,7 +172,7 @@ class Engine:
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
                     async for out in self.tokenizer_manager.generate_request(
-                        obj, request
+                            obj, request
                     ):
                         yield b"data: " + orjson.dumps(
                             out, option=orjson.OPT_NON_STR_KEYS
@@ -200,8 +202,8 @@ class Engine:
                 return create_error_response(e)
 
     def encode(
-        self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+            self,
+            prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
         obj = EmbeddingReqInput(text=prompt)
 
@@ -243,13 +245,13 @@ class Engine:
         }
 
     def init_weights_update_group(
-        self,
-        master_address: str,
-        master_port: int,
-        rank_offset: int,
-        world_size: int,
-        group_name: str,
-        backend: str = "nccl",
+            self,
+            master_address: str,
+            master_port: int,
+            rank_offset: int,
+            world_size: int,
+            group_name: str,
+            backend: str = "nccl",
     ):
         """Initialize parameter update group."""
         obj = InitWeightsUpdateGroupReqInput(
@@ -294,6 +296,7 @@ class Engine:
         return loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
+
 
 _STREAM_END_SYMBOL = b"data: [DONE]"
 _STREAM_CHUNK_START_SYMBOL = b"data:"
