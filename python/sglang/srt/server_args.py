@@ -81,6 +81,7 @@ class ServerArgs:
     watchdog_timeout: float = 300
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
+    fragment: bool = True
 
     # Logging
     log_level: str = "info"
@@ -517,6 +518,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.base_gpu_id,
             help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
+        )
+        parser.add_argument(
+            "--fragment",
+            type=bool,
+            default=ServerArgs.fragment,
+            help="Enable fragment mode.",
         )
 
         # Logging

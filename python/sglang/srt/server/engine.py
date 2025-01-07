@@ -41,14 +41,14 @@ class Engine:
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
 
-        server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
-        self._subprocess_launcher = SubprocessLauncher(server_args=server_args)
+        self.server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
+        self._subprocess_launcher = SubprocessLauncher(server_args=self.server_args)
 
-        if TODO:
+        if self.server_args.fragment:
             self._wait_subprocess_launcher()
 
     def await_fragments(self):
-        assert TODO
+        assert self.server_args.fragment
         self._wait_subprocess_launcher()
 
     def _wait_subprocess_launcher(self):
