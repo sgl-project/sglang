@@ -14,12 +14,14 @@ class TestFragment(unittest.TestCase):
     def test_fragment(self):
         multiprocessing.set_start_method("spawn")
 
+        queue = multiprocessing.Queue()
+
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         for tp_rank in range(_TP_SIZE):
             p = Process(
                 target=_run_subprocess,
-                args=(tp_rank, output_writer),
+                args=(tp_rank, queue, output_writer),
             )
             p.start()
             processes.append(p)
@@ -32,7 +34,7 @@ class TestFragment(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(tp_rank: int, output_writer):
+def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
     print(f"run_subprocess[{tp_rank=}] Start")
 
     # Engine can be put anywhere, e.g. tp_rank=0, or other places
@@ -45,11 +47,12 @@ def _run_subprocess(tp_rank: int, output_writer):
             fragment=True,
         )
         print(f"run_subprocess[{tp_rank=}] {engine=}", flush=True)
-        fragment_args = engine.fragment_args
-    else:
-        fragment_args = None
 
-    TODO_broadcast_fragment_args
+        for _ in range(_TP_SIZE):
+            queue.put(engine.fragment_args)
+
+    # can use e.g. torch.distributed to broadcast it; here for simplicity we do not init torch.distributed
+    fragment_args = queue.get()
 
     fragment = EngineFragment(
         fragment_args=fragment_args,
