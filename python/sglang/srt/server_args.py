@@ -938,6 +938,21 @@ class PortArgs:
             nccl_port=port,
         )
 
+@dataclasses.dataclass
+class EngineFragmentArgs:
+    server_args: ServerArgs
+    port_args: PortArgs
+    scheduler_ready_ipc_names: List[str]
+
+    @staticmethod
+    def init_new(server_args, port_args) -> "EngineFragmentArgs":
+        return EngineFragmentArgs(
+            server_args=server_args,
+            port_args=port_args,
+            scheduler_ready_ipc_names=[
+                create_zmq_ipc_name() for _ in range(server_args.tp_size)
+            ],
+        )
 
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):

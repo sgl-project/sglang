@@ -1,17 +1,10 @@
-import asyncio
-import atexit
-import dataclasses
-import json
 import logging
 import multiprocessing as mp
 import os
 import signal
+from typing import Optional
 
-import orjson
-import torch
 import zmq
-from fastapi import Request
-
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -19,9 +12,8 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, EngineFragmentArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
     create_zmq_ipc_name,
@@ -32,7 +24,6 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +41,7 @@ class SubprocessLauncher:
 
         # Allocate ports for inter-process communications
         port_args = PortArgs.init_new(server_args)
+        fragment_args = EngineFragmentArgs.init_new(server_args, port_args)
         logger.info(f"{server_args=}")
 
         # If using model from www.modelscope.cn, first download the model.
@@ -60,7 +52,7 @@ class SubprocessLauncher:
         )
 
         ready_receivers, scheduler_procs = _start_scheduler_or_dp_controller_processes(
-            port_args, server_args
+            port_args, server_args, fragment_args
         )
 
         # Launch detokenizer process
@@ -111,7 +103,7 @@ class SubprocessLauncher:
         return self._tokenizer_manager, scheduler_info
 
 
-def _start_scheduler_or_dp_controller_processes(port_args, server_args):
+def _start_scheduler_or_dp_controller_processes(port_args, server_args, fragment_args):
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
@@ -123,7 +115,7 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args):
         )
         for tp_rank in tp_rank_range:
             proc, ready_receiver = _start_scheduler_process(
-                port_args, server_args, tp_rank, tp_size_per_node
+                port_args, server_args, fragment_args, tp_rank, tp_size_per_node
             )
             scheduler_procs.append(proc)
             scheduler_ready_receivers.append(ready_receiver)
@@ -148,10 +140,14 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args):
 
 
 def _start_scheduler_process(
-    port_args, server_args, tp_rank: int, tp_size_per_node: int
+        port_args, server_args,
+        fragment_args: Optional[EngineFragmentArgs],
+        tp_rank: int, tp_size_per_node: int
 ):
     if server_args.fragment:
-        return None, TODO
+        ready_ipc_name = fragment_args.scheduler_ready_ipc_names[tp_rank]
+        ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
+        proc = None
     else:
         ready_ipc_name = create_zmq_ipc_name()
         ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
@@ -161,7 +157,7 @@ def _start_scheduler_process(
             args=(server_args, port_args, gpu_id, tp_rank, None, ready_ipc_name),
         )
         proc.start()
-        return proc, ready_receiver
+    return proc, ready_receiver
 
 
 def _set_envs_and_config(server_args: ServerArgs):
