@@ -87,10 +87,11 @@ def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
             engine.shutdown()
 
             for _ in range(_TP_SIZE):
-                queue.put('LEAVE')
+                queue.put('END')
 
         # Again, can use torch barrier
-        assert queue.get() == 'LEAVE'
+        assert queue.get() == 'END'
+        print(f"subprocess[{tp_rank=}] end", flush=True)
 
     except Exception as e:
         print(f"subprocess[{tp_rank=}] has error: {e}", flush=True)
