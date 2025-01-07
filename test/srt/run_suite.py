@@ -16,6 +16,7 @@ suites = {
         "test_eagle_infer.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
+        "test_fragment.py",
         "test_get_weights_by_name.py",
         "test_gguf.py",
         "test_input_embeddings.py",
@@ -65,7 +66,6 @@ for target_suite_name, target_tests in suites.items():
         if target_suite_name in tests:
             tests.remove(target_suite_name)
             tests.extend(target_tests)
-
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
