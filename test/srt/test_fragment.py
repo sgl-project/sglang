@@ -29,13 +29,16 @@ class TestFragment(unittest.TestCase):
 
         output = output_reader.recv()
         print(output)
-        self.assertEqual(output, [
-            ' to spend my time outside. The weather is perfect for an outdoor activity.\n\nPack',
-            ' developing a new propulsion system for high-speed vehicular transportation systems, in particular,',
-            ' planning a trip to Europe. My home country is the United States. The trip',
-            " I've heard about you. I've been waiting for this moment for a long",
-            ' the quantitative study of mathematical laws, a fact-based approach, clarity of thought,',
-        ])
+        self.assertEqual(
+            output,
+            [
+                " to spend my time outside. The weather is perfect for an outdoor activity.\n\nPack",
+                " developing a new propulsion system for high-speed vehicular transportation systems, in particular,",
+                " planning a trip to Europe. My home country is the United States. The trip",
+                " I've heard about you. I've been waiting for this moment for a long",
+                " the quantitative study of mathematical laws, a fact-based approach, clarity of thought,",
+            ],
+        )
 
         for p in processes:
             p.join()
@@ -83,7 +86,10 @@ def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
                     prompt=prompt,
                     sampling_params=[dict(max_new_tokens=16)] * len(prompt),
                 )
-                print(f"subprocess[{tp_rank=}] End generation {tp_rank=} {prompt=} {outputs=}", flush=True)
+                print(
+                    f"subprocess[{tp_rank=}] End generation {tp_rank=} {prompt=} {outputs=}",
+                    flush=True,
+                )
                 ans += [o["text"] for o in outputs]
 
             output_writer.send(ans)
@@ -93,10 +99,10 @@ def _run_subprocess(tp_rank: int, queue: multiprocessing.Queue, output_writer):
             engine.shutdown()
 
             for _ in range(_TP_SIZE):
-                queue.put('END')
+                queue.put("END")
 
         # Again, can use torch barrier
-        assert queue.get() == 'END'
+        assert queue.get() == "END"
         print(f"subprocess[{tp_rank=}] end", flush=True)
 
     except Exception as e:
