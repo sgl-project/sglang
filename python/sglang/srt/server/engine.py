@@ -66,13 +66,13 @@ class Engine:
     launching the HTTP server adds unnecessary complexity or overhead,
     """
 
-    def __init__(self, log_level: str = "error", *args, **kwargs):
+    def __init__(self, log_level: str = "error", *args, server_args=None, **kwargs):
         """See the arguments in server_args.py::ServerArgs"""
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
 
-        server_args = ServerArgs(*args, log_level=log_level, **kwargs)
+        server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
         tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info

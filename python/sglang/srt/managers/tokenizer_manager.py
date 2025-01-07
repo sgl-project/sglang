@@ -107,7 +107,7 @@ class TokenizerManager:
         self.enable_metrics = server_args.enable_metrics
 
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
+        context = zmq.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name
         )
