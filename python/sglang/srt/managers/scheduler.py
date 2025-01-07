@@ -23,7 +23,7 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import psutil
 import setproctitle
@@ -388,7 +388,7 @@ class Scheduler:
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, lambda _: self.flush_cache()),
+                (FlushCacheReq, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
@@ -1445,6 +1445,9 @@ class Scheduler:
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
+    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
+        self.flush_cache()
+
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if len(self.waiting_queue) == 0 and (
@@ -1551,7 +1554,7 @@ class Scheduler:
         )
         logger.info("Profiler is done")
 
-    def open_session(self, recv_req: OpenSessionReqInput) -> Tuple[Optional[str], bool]:
+    def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
         session_id = recv_req.session_id
         if session_id in self.sessions:
