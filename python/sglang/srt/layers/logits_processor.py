@@ -117,6 +117,11 @@ class LogitsProcessor(nn.Module):
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
+        if (
+            self.final_logit_softcapping is not None
+            and self.final_logit_softcapping < 0
+        ):
+            self.final_logit_softcapping = None
 
     def forward(
         self,
