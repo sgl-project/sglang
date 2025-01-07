@@ -39,7 +39,6 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
 )
-from sglang.srt.server.engine_base import EngineBase
 from sglang.srt.server_args import PortArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
