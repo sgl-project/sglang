@@ -57,12 +57,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Login to Hugging Face
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN_FROM_SANG }}
-        run: |
-          huggingface-cli login --token $HF_TOKEN
-
       - name: Install dependencies
         env:
           FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
