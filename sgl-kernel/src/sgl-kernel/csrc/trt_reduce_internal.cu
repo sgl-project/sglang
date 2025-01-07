@@ -302,8 +302,10 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
     buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
   }
 
+#if (defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ >= 12))
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
+#endif
 #endif
 
   block_barrier(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx,
@@ -350,9 +352,10 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
       *reinterpret_cast<int4*>(&local_output_buffer[offset_rank]) = *reinterpret_cast<int4*>(&buffers[ii][offset_rank]);
     }
   }
-
+#if (defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ >= 12))
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
+#endif
 #endif
 }
 
