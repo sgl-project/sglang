@@ -183,7 +183,7 @@ class Engine:
             return StreamingResponse(
                 stream_results(),
                 media_type="text/event-stream",
-                background=self.self.tokenizer_manager.create_abort_task(obj),
+                background=self.tokenizer_manager.create_abort_task(obj),
             )
         else:
             try:
