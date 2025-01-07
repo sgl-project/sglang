@@ -88,10 +88,11 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
 
   auto can_implement = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess)
+  TORCH_CHECK(can_implement == cutlass::Status::kSuccess,
+              "gemm cannot implement, error: ", cutlassGetStatusString(can_implement));
 
   auto status = gemm_op(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess)
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm executioin failed, error: ", cutlassGetStatusString(status));
 }
 
 template <typename ElementOutput, typename ArchTag, typename InstructionShape>
