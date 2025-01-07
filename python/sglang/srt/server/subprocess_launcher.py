@@ -6,30 +6,19 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import orjson
 import torch
 import zmq
 from fastapi import Request
-from starlette.responses import StreamingResponse
 
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
-from sglang.srt.managers.io_struct import (
-    EmbeddingReqInput,
-    GenerateReqInput,
-    GetWeightsByNameReqInput,
-    InitWeightsUpdateGroupReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
-from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -44,7 +33,6 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.version import __version__
-
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +78,9 @@ class SubprocessLauncher:
 
         self._ready_receivers = ready_receivers
         self._scheduler_procs = scheduler_procs
+        self._tokenizer_manager = tokenizer_manager
 
-    def gather_results(self):
+    def wait(self):
         # Wait for model to finish loading
         scheduler_infos = []
         for i in range(len(self._ready_receivers)):
@@ -115,8 +104,7 @@ class SubprocessLauncher:
         # Assume all schedulers have same scheduler_info
         scheduler_info = scheduler_infos[0]
 
-        return tokenizer_manager, scheduler_info
-
+        return self._tokenizer_manager, scheduler_info
 
 
 def _start_scheduler_or_dp_controller_processes(port_args, server_args):
@@ -128,7 +116,7 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args):
         tp_rank_range = range(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
-            )
+        )
         for tp_rank in tp_rank_range:
             proc, ready_receiver = _start_scheduler_process(
                 port_args, server_args, tp_rank, tp_size_per_node
@@ -209,5 +197,3 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-
-
