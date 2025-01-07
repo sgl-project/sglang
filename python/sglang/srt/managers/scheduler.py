@@ -140,18 +140,18 @@ class Scheduler:
 
             if self.server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
-                self._send_to_detokenizer = get_zmq_socket(
+                self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name
                 )
             else:
                 # Send to the DetokenizerManager
-                self._send_to_detokenizer = get_zmq_socket(
+                self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name
                 )
         else:
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -388,7 +388,7 @@ class Scheduler:
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
+                (FlushCacheReq, lambda _: self.flush_cache()),
                 (AbortReq, self.abort_request),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
@@ -500,8 +500,8 @@ class Scheduler:
         else:
             recv_reqs = None
 
-        if self.server_args.tp_size != 1 and not self.server_args.enable_dp_attention:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.core.tp_cpu_group)
+        if self.tp_size != 1 and not self.server_args.enable_dp_attention:
+            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1322,7 +1322,7 @@ class Scheduler:
 
             # Send to detokenizer
             if rids:
-                self._send_to_detokenizer.send_pyobj(
+                self.send_to_detokenizer.send_pyobj(
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
@@ -1358,7 +1358,7 @@ class Scheduler:
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
-            self._send_to_detokenizer.send_pyobj(
+            self.send_to_detokenizer.send_pyobj(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
@@ -1441,9 +1441,6 @@ class Scheduler:
 
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
-
-    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
-        self.flush_cache()
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
