@@ -79,7 +79,7 @@ class ServerArgs:
     watchdog_timeout: float = 300
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
-    fragment: bool = True
+    fragment: bool = False
 
     # Logging
     log_level: str = "info"
