@@ -101,8 +101,10 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            logger.info("MLA optimization is turned on. Use triton backend.")
-            self.server_args.attention_backend = "triton"
+            # TODO: add MLA optimization on CPU
+            if self.server_args.device != "cpu":
+                logger.info("MLA optimization is turned on. Use triton backend.")
+                self.server_args.attention_backend = "triton"
 
         if self.server_args.enable_double_sparsity:
             logger.info(
@@ -159,6 +161,7 @@ class ModelRunner:
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
+                "device": server_args.device,
             }
         )
 
@@ -225,7 +228,7 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
-        if not self.is_draft_worker:
+        if not self.is_draft_worker and self.device != "cpu":
             # Only initilzie the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
@@ -239,7 +242,7 @@ class ModelRunner:
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
-        self.tp_group = get_tp_group()
+        self.tp_group = get_tp_group(self.device)
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
@@ -257,7 +260,8 @@ class ModelRunner:
         )
 
         # This can reduce thread conflicts and speed up weight loading.
-        torch.set_num_threads(1)
+        if self.device != "cpu":
+            torch.set_num_threads(1)
         if self.device == "cuda":
             if torch.cuda.get_device_capability()[0] < 8:
                 logger.info(

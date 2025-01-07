@@ -52,6 +52,13 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 
+# Avoid circular import
+def get_global_server_args_dict():
+    from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+    return global_server_args_dict
+
+
 def adjust_marlin_shard(param, shard_size, shard_offset):
     marlin_tile_size = getattr(param, "marlin_tile_size", None)
     if marlin_tile_size is None:
@@ -302,9 +309,13 @@ class ColumnParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_tensor_model_parallel_rank(
+                get_global_server_args_dict()["device"]
+            )
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_tensor_model_parallel_world_size(
+                get_global_server_args_dict()["device"]
+            )
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
@@ -446,9 +457,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         self.output_sizes = output_sizes
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_tensor_model_parallel_rank(
+                get_global_server_args_dict()["device"]
+            )
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_tensor_model_parallel_world_size(
+                get_global_server_args_dict()["device"]
+            )
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         self.use_presharded_weights = use_presharded_weights
@@ -1090,9 +1105,13 @@ class RowParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_tensor_model_parallel_rank(
+                get_global_server_args_dict()["device"]
+            )
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_tensor_model_parallel_world_size(
+                get_global_server_args_dict()["device"]
+            )
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None

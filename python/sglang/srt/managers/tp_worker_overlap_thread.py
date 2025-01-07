@@ -192,7 +192,8 @@ class TpModelWorkerClient:
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.
-        self.scheduler_stream.synchronize()
+        if self.device != "cpu":
+            self.scheduler_stream.synchronize()
 
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
