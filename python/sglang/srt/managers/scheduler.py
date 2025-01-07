@@ -720,11 +720,12 @@ class Scheduler:
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        # todo, locked memory for hierarchical cache is not leaked
-        if available_size != self.max_total_num_tokens:
+        protected_size = self.tree_cache.protected_size()
+        # protected memory for hierarchical cache is not leaked
+        if available_size != self.max_total_num_tokens - protected_size:
             msg = (
                 "KV cache pool leak detected!"
-                f"{available_size=}, {self.max_total_num_tokens=}\n"
+                f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
             )
             warnings.warn(msg)
             if crash_on_warnings():
