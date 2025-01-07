@@ -54,72 +54,69 @@ class SubprocessLauncher:
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
 
-    def start_subprocesses(self):
-        TODO
+    def __init__(self, server_args: ServerArgs):
+        # Configure global environment
+        configure_logger(server_args)
+        server_args.check_server_args()
+        _set_envs_and_config(server_args)
+
+        # Allocate ports for inter-process communications
+        port_args = PortArgs.init_new(server_args)
+        logger.info(f"{server_args=}")
+
+        # If using model from www.modelscope.cn, first download the model.
+        server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
+            server_args.model_path, server_args.tokenizer_path
+        )
+
+        ready_receivers, scheduler_procs = _start_scheduler_or_dp_controller_processes(
+            port_args, server_args
+        )
+
+        # Launch detokenizer process
+        detoken_proc = mp.Process(
+            target=run_detokenizer_process,
+            args=(
+                server_args,
+                port_args,
+            ),
+        )
+        detoken_proc.start()
+
+        # Launch tokenizer process
+        tokenizer_manager = TokenizerManager(server_args, port_args)
+        if server_args.chat_template:
+            load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+
+        self._ready_receivers = ready_receivers
+        self._scheduler_procs = scheduler_procs
 
     def gather_results(self):
-        TODO
+        # Wait for model to finish loading
+        scheduler_infos = []
+        for i in range(len(self._ready_receivers)):
+            try:
+                data = self._ready_receivers[i].recv_pyobj()
+            except EOFError as e:
+                logger.exception(e)
+                logger.error(
+                    f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+                )
+                scheduler_procs[i].join()
+                logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+                raise
 
-def _launch_subprocesses(
-    server_args: ServerArgs,
-):
-    # Configure global environment
-    configure_logger(server_args)
-    server_args.check_server_args()
-    _set_envs_and_config(server_args)
+            if data["status"] != "ready":
+                raise RuntimeError(
+                    "Initialization failed. Please see the error messages above."
+                )
+            scheduler_infos.append(data)
 
-    # Allocate ports for inter-process communications
-    port_args = PortArgs.init_new(server_args)
-    logger.info(f"{server_args=}")
+        # Assume all schedulers have same scheduler_info
+        scheduler_info = scheduler_infos[0]
 
-    # If using model from www.modelscope.cn, first download the model.
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
+        return tokenizer_manager, scheduler_info
 
-    ready_receivers, scheduler_procs = _start_scheduler_or_dp_controller_processes(
-        port_args, server_args
-    )
-
-    # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-        ),
-    )
-    detoken_proc.start()
-
-    # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
-
-    # Wait for model to finish loading
-    scheduler_infos = []
-    for i in range(len(ready_receivers)):
-        try:
-            data = ready_receivers[i].recv_pyobj()
-        except EOFError as e:
-            logger.exception(e)
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
-
-    # Assume all schedulers have same scheduler_info
-    scheduler_info = scheduler_infos[0]
-
-    return tokenizer_manager, scheduler_info
 
 
 def _start_scheduler_or_dp_controller_processes(port_args, server_args):
