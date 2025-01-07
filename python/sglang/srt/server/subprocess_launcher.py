@@ -52,7 +52,7 @@ class SubprocessLauncher:
         )
 
         ready_receivers, scheduler_procs = _start_scheduler_or_dp_controller_processes(
-            port_args, server_args, fragment_args
+            port_args, server_args, self.fragment_args
         )
 
         # Launch detokenizer process
