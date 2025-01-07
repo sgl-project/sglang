@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar
 import fastapi
 import uvloop
 from fastapi import BackgroundTasks
+
 from sglang.communicator import TypeBasedDispatcher, create_receiver, create_sender
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -63,11 +64,8 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, PortArgs
-from sglang.srt.utils import (
-    dataclass_to_string_truncated,
-    kill_process_tree,
-)
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import dataclass_to_string_truncated, kill_process_tree
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -190,17 +188,34 @@ class TokenizerManager:
                 },
             )
 
-        self._dispatcher = TypeBasedDispatcher([
-            (BatchStrOut, self._handle_batch_output),
-            (BatchEmbeddingOut, self._handle_batch_output),
-            (BatchTokenIDOut, self._handle_batch_output),
-            (OpenSessionReqOutput, self._handle_open_session_req_output),
-            (UpdateWeightFromDiskReqOutput, self._handle_update_weights_from_disk_req_output),
-            (InitWeightsUpdateGroupReqOutput, self.init_weights_update_group_communicator.handle_recv),
-            (UpdateWeightsFromDistributedReqOutput, self.update_weights_from_distributed_communicator.handle_recv),
-            (UpdateWeightsFromTensorReqOutput, self.update_weights_from_tensor_communicator.handle_recv),
-            (GetWeightsByNameReqOutput, self.get_weights_by_name_communicator.handle_recv),
-        ])
+        self._dispatcher = TypeBasedDispatcher(
+            [
+                (BatchStrOut, self._handle_batch_output),
+                (BatchEmbeddingOut, self._handle_batch_output),
+                (BatchTokenIDOut, self._handle_batch_output),
+                (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (
+                    UpdateWeightFromDiskReqOutput,
+                    self._handle_update_weights_from_disk_req_output,
+                ),
+                (
+                    InitWeightsUpdateGroupReqOutput,
+                    self.init_weights_update_group_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromDistributedReqOutput,
+                    self.update_weights_from_distributed_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromTensorReqOutput,
+                    self.update_weights_from_tensor_communicator.handle_recv,
+                ),
+                (
+                    GetWeightsByNameReqOutput,
+                    self.get_weights_by_name_communicator.handle_recv,
+                ),
+            ]
+        )
 
     async def generate_request(
         self,
@@ -626,7 +641,9 @@ class TokenizerManager:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._dispatcher(recv_obj)
 
-    def _handle_batch_output(self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]):
+    def _handle_batch_output(
+        self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
+    ):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -684,9 +701,7 @@ class TokenizerManager:
 
             if self.enable_metrics:
                 completion_tokens = (
-                    recv_obj.completion_tokens[i]
-                    if recv_obj.completion_tokens
-                    else 0
+                    recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
                 )
 
                 if state.first_token_time is None:
@@ -703,20 +718,15 @@ class TokenizerManager:
                         )
 
                 if state.finished:
-                    self.metrics_collector.inc_prompt_tokens(
-                        recv_obj.prompt_tokens[i]
-                    )
-                    self.metrics_collector.inc_generation_tokens(
-                        completion_tokens
-                    )
+                    self.metrics_collector.inc_prompt_tokens(recv_obj.prompt_tokens[i])
+                    self.metrics_collector.inc_generation_tokens(completion_tokens)
                     self.metrics_collector.observe_e2e_request_latency(
                         time.time() - state.created_time
                     )
                     # Compute time_per_output_token for the non-streaming case
                     if not state.obj.stream and completion_tokens >= 1:
                         self.metrics_collector.observe_time_per_output_token(
-                            (time.time() - state.created_time)
-                            / completion_tokens
+                            (time.time() - state.created_time) / completion_tokens
                         )
 
     def _convert_logprob_style(
