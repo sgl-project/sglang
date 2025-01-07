@@ -44,7 +44,7 @@ class Engine:
         self.server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
         self._subprocess_launcher = SubprocessLauncher(server_args=self.server_args)
 
-        if self.server_args.fragment:
+        if not self.server_args.fragment:
             self._wait_subprocess_launcher()
 
     @property
