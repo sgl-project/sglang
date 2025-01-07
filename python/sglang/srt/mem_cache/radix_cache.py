@@ -257,7 +257,7 @@ class RadixCache(BasePrefixCache):
 
     def evictable_size(self):
         return self.evictable_size_
-    
+
     def protected_size(self):
         return self.protected_size_
 

@@ -241,7 +241,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         del self.k_buffer
         del self.v_buffer
 
+    # Todo: different memory layout
     def get_flat_data(self, indices):
+        # prepare a large chunk of contiguous data for efficient transfer
         flatten = torch.stack(
             [
                 torch.stack([self.k_buffer[i][indices] for i in range(self.layer_num)]),
@@ -252,6 +254,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     @debug_timing
     def transfer(self, indices, flat_data):
+        # transfer prepared data from host to device
         flat_data = flat_data.to(device=self.device, non_blocking=False)
         k_data, v_data = flat_data[0], flat_data[1]
         for i in range(self.layer_num):
@@ -430,49 +433,61 @@ class MLATokenToKVPoolHost:
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 2,
-        pin_memory: bool = True,  # not necessary pin memory with the double buffering
+        host_to_device_ratio: float = 2.0,
+        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        device: str = "cpu",
     ):
         assert (
             host_to_device_ratio >= 1
         ), "The host memory should be larger than the device memory with the current protocol"
         # todo, other ways of configuring the size
+
+        self.device_pool = device_pool
+        self.host_to_device_ratio = host_to_device_ratio
+        self.pin_memory = pin_memory
+        self.device = device
+
         self.size = int(device_pool.size * host_to_device_ratio)
         self.dtype = device_pool.store_dtype
         self.head_num = device_pool.head_num
         self.head_dim = device_pool.head_dim
         self.layer_num = device_pool.layer_num
-        self.device = "cpu"
-
-        # checking if there is enough host memory
         self.size_per_token = (
             self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
         )
+
+        # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
+        requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
-        if self.size * self.size_per_token > host_mem.available - 10 * 1e9:
+        ten_gb = 10 * (1024**3)
+        if requested_bytes > host_mem.available - ten_gb:
             raise ValueError(
-                f"Not enough host memory available, asking for {self.size * self.size_per_token / 1e9} GB but only have {host_mem.available / 1e9} GB available, please reduce the size of the hierarchical cache"
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{host_mem.available / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
             )
         else:
             logger.info(
-                f"Allocating {self.size * self.size_per_token / 1e9} GB host memory for hierarchical cache"
+                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
         self.kv_buffer = torch.empty(
             (2, self.layer_num, self.size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=pin_memory,
+            pin_memory=self.pin_memory,
         )
 
-        # indicates the state of the memory slots
+        # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int32)
         self.can_use_mem_size = self.size
-        # this lock is for transactional operations to the memory pool states
+
+        # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
 
     def get_flat_data(self, indices):
@@ -480,8 +495,10 @@ class MLATokenToKVPoolHost:
 
     @debug_timing
     def transfer(self, indices, flat_data):
-        flat_data = flat_data.to(device=self.device, non_blocking=False)
-        self.kv_buffer[:, :, indices] = flat_data
+        # backup prepared data from device to host
+        self.kv_buffer[:, :, indices] = flat_data.to(
+            device=self.device, non_blocking=False
+        )
 
     @synchronized
     def clear(self):
@@ -502,9 +519,11 @@ class MLATokenToKVPoolHost:
     def alloc(self, need_size: int) -> torch.Tensor:
         if need_size > self.can_use_mem_size:
             return None
+
         # todo: de-fragementation
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+
         self.mem_state[select_index] = MemoryStateInt.RESERVED
         self.can_use_mem_size -= need_size
 
@@ -528,43 +547,38 @@ class MLATokenToKVPoolHost:
 
     @synchronized
     def update_backup(self, indices: torch.Tensor):
-        assert self.is_synced(
-            indices
-        ), "The host memory slots should be synced after I/O operations"
+        assert self.is_synced(indices), (
+            f"The host memory slots should be in SYNCED state before turning into BACKUP. "
+            f"Current state: {self.get_state(indices)}"
+        )
         self.mem_state[indices] = MemoryStateInt.BACKUP
 
     @synchronized
     def update_synced(self, indices: torch.Tensor):
-        # assert (
-        #     self.get_state(indices) == MemoryStateInt.BACKUP
-        # ), "The host memory slots should be backup before read operations"
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
     @synchronized
     def protect_write(self, indices: torch.Tensor):
-        if not self.is_reserved(indices):
-            raise ValueError(
-                "The host memory slots should be reserved before write operations",
-                self.get_state(indices),
-            )
+        assert self.is_reserved(indices), (
+            f"The host memory slots should be RESERVED before write operations. "
+            f"Current state: {self.get_state(indices)}"
+        )
         self.mem_state[indices] = MemoryStateInt.PROTECTED
 
     @synchronized
     def protect_load(self, indices: torch.Tensor):
-        if not self.is_backup(indices):
-            raise ValueError(
-                "The host memory slots should be backup before read operations",
-                self.get_state(indices),
-            )
+        assert self.is_backup(indices), (
+            f"The host memory slots should be in BACKUP state before load operations. "
+            f"Current state: {self.get_state(indices)}"
+        )
         self.mem_state[indices] = MemoryStateInt.PROTECTED
 
     @synchronized
     def complete_io(self, indices: torch.Tensor):
-        if not self.is_protected(indices):
-            raise ValueError(
-                "The host memory slots should be protected during I/O operations",
-                self.get_state(indices),
-            )
+        assert self.is_protected(indices), (
+            f"The host memory slots should be PROTECTED during I/O operations. "
+            f"Current state: {self.get_state(indices)}"
+        )
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
     def available_size(self):
