@@ -3,7 +3,8 @@
 import json
 import sys
 
-from sglang.srt.server import launch_server, prepare_server_args
+from sglang.srt.server import launch_server
+from sglang.srt.server_args import prepare_server_args
 
 if __name__ == "__main__":
     server_args = prepare_server_args(sys.argv[1:])
