@@ -5,7 +5,6 @@ from multiprocessing import Process
 
 from sglang import Engine
 from sglang.srt.engine_fragment import EngineFragment
-from sglang.srt.server_args import EngineFragmentArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 _TP_SIZE = 2
@@ -15,24 +14,17 @@ class TestFragment(unittest.TestCase):
     def test_fragment(self):
         multiprocessing.set_start_method("spawn")
 
-        fragment_args = EngineFragmentArgs.init_new(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            mem_fraction_static=0.1,
-            tp_size=_TP_SIZE,
-            random_seed=42,
-        )
-
         processes = []
-        reader, writer = mp.Pipe(duplex=False)
+        output_reader, output_writer = mp.Pipe(duplex=False)
         for tp_rank in range(_TP_SIZE):
             p = Process(
                 target=_run_subprocess,
-                args=(tp_rank, fragment_args, writer),
+                args=(tp_rank, output_writer),
             )
             p.start()
             processes.append(p)
 
-        output = reader.recv()
+        output = output_reader.recv()
         print(output)
         # TODO add assertions
 
@@ -40,7 +32,7 @@ class TestFragment(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(tp_rank: int, writer):
+def _run_subprocess(tp_rank: int, output_writer):
     print(f"run_subprocess[{tp_rank=}] Start")
 
     # Engine can be put anywhere, e.g. tp_rank=0, or other places
@@ -83,8 +75,8 @@ def _run_subprocess(tp_rank: int, writer):
             print(f"End generation {tp_rank=} {prompt=} {outputs=}", flush=True)
             ans += [o["text"] for o in outputs]
 
-        writer.send(ans)
-        writer.close()
+        output_writer.send(ans)
+        output_writer.close()
 
         print(f"run_subprocess[{tp_rank=}] engine.shutdown", flush=True)
         engine.shutdown()
