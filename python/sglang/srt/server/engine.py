@@ -3,21 +3,12 @@ import atexit
 import dataclasses
 import json
 import logging
-import multiprocessing as mp
 import os
-import signal
 from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import orjson
 import torch
-import zmq
 from fastapi import Request
-from starlette.responses import StreamingResponse
-
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -26,25 +17,15 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.server.subprocess_launcher import SubprocessLauncher
 from sglang.srt.server.utils import create_error_response
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
-    assert_pkg_version,
-    configure_logger,
-    create_zmq_ipc_name,
-    get_zmq_socket,
     kill_process_tree,
-    maybe_set_triton_cache_manager,
-    prepare_model_and_tokenizer,
-    set_prometheus_multiproc_dir,
-    set_ulimit,
 )
 from sglang.version import __version__
+from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +45,11 @@ class Engine:
         atexit.register(self.shutdown)
 
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
-
         self._subprocess_launcher = SubprocessLauncher(server_args=server_args)
 
+    def _wait_subprocess_launcher(self):
         tokenizer_manager, scheduler_info = self._subprocess_launcher.wait()
+        del self._subprocess_launcher
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
