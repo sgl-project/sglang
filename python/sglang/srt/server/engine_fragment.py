@@ -7,10 +7,10 @@ from sglang.srt.server_args import EngineFragmentArgs
 
 class EngineFragment:
     def __init__(
-            self,
-            tp_rank: int,
-            gpu_id: int,
-            fragment_args: "EngineFragmentArgs",
+        self,
+        tp_rank: int,
+        gpu_id: int,
+        fragment_args: "EngineFragmentArgs",
     ):
         # Not a good idea to change *current* process's env; but it seems Engine currently does so,
         # so here EngineFragment does the same.

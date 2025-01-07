@@ -5,6 +5,7 @@ import signal
 from typing import Optional
 
 import zmq
+
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -12,7 +13,7 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
-from sglang.srt.server_args import PortArgs, ServerArgs, EngineFragmentArgs
+from sglang.srt.server_args import EngineFragmentArgs, PortArgs, ServerArgs
 from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
@@ -140,9 +141,11 @@ def _start_scheduler_or_dp_controller_processes(port_args, server_args, fragment
 
 
 def _start_scheduler_process(
-        port_args, server_args,
-        fragment_args: Optional[EngineFragmentArgs],
-        tp_rank: int, tp_size_per_node: int
+    port_args,
+    server_args,
+    fragment_args: Optional[EngineFragmentArgs],
+    tp_rank: int,
+    tp_size_per_node: int,
 ):
     if server_args.fragment:
         ready_ipc_name = fragment_args.scheduler_ready_ipc_names[tp_rank]
