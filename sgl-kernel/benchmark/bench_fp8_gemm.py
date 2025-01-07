@@ -5,7 +5,6 @@ import triton
 from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
 from vllm._custom_ops import scaled_fp8_quant as vllm_scaled_fp8_quant
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
-import time
 
 @triton.testing.perf_report(
         triton.testing.Benchmark(
