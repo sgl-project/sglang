@@ -58,6 +58,7 @@ _global_state: Optional[_GlobalState] = None
 
 
 def setup_global_state(engine: Engine):
+    global _global_state
     _global_state = _GlobalState(engine=engine)
 
 
@@ -233,14 +234,14 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    return _global_state.engine._generate_raw(obj, request)
+    return await _global_state.engine._generate_raw(obj, request)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
-    return _global_state.engine._encode_raw(obj, request)
+    return await _global_state.engine._encode_raw(obj, request)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
