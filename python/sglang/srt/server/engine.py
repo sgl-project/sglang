@@ -6,17 +6,13 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-from abc import ABC
 from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import orjson
 import torch
+import zmq
 from fastapi import Request
-from starlette.responses import StreamingResponse
-
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
+from sglang.srt.managers.data_parallel_controller import run_data_parallel_controller_process
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -39,9 +35,10 @@ from sglang.srt.utils import (
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
-    set_ulimit,
+    set_ulimit, create_zmq_ipc_name, get_zmq_socket,
 )
 from sglang.version import __version__
+from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -68,17 +65,17 @@ class Engine:
         self.scheduler_info = scheduler_info
 
     def generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        stream: bool = False,
+            self,
+            # The input prompt. It can be a single prompt or a batch of prompts.
+            prompt: Optional[Union[List[str], str]] = None,
+            sampling_params: Optional[Union[List[Dict], Dict]] = None,
+            # The token ids for text; one can either specify text or input_ids.
+            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+            return_logprob: Optional[Union[List[bool], bool]] = False,
+            logprob_start_len: Optional[Union[List[int], int]] = None,
+            top_logprobs_num: Optional[Union[List[int], int]] = None,
+            lora_path: Optional[List[Optional[str]]] = None,
+            stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -106,7 +103,7 @@ class Engine:
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -118,17 +115,17 @@ class Engine:
             return ret
 
     async def async_generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Dict] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        stream: bool = False,
+            self,
+            # The input prompt. It can be a single prompt or a batch of prompts.
+            prompt: Optional[Union[List[str], str]] = None,
+            sampling_params: Optional[Dict] = None,
+            # The token ids for text; one can either specify text or input_ids.
+            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+            return_logprob: Optional[Union[List[bool], bool]] = False,
+            logprob_start_len: Optional[Union[List[int], int]] = None,
+            top_logprobs_num: Optional[Union[List[int], int]] = None,
+            lora_path: Optional[List[Optional[str]]] = None,
+            stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -153,7 +150,7 @@ class Engine:
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -168,7 +165,7 @@ class Engine:
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
                     async for out in self.tokenizer_manager.generate_request(
-                        obj, request
+                            obj, request
                     ):
                         yield b"data: " + orjson.dumps(
                             out, option=orjson.OPT_NON_STR_KEYS
@@ -198,8 +195,8 @@ class Engine:
                 return create_error_response(e)
 
     def encode(
-        self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+            self,
+            prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
         obj = EmbeddingReqInput(text=prompt)
 
@@ -241,13 +238,13 @@ class Engine:
         }
 
     def init_weights_update_group(
-        self,
-        master_address: str,
-        master_port: int,
-        rank_offset: int,
-        world_size: int,
-        group_name: str,
-        backend: str = "nccl",
+            self,
+            master_address: str,
+            master_port: int,
+            rank_offset: int,
+            world_size: int,
+            group_name: str,
+            backend: str = "nccl",
     ):
         """Initialize parameter update group."""
         obj = InitWeightsUpdateGroupReqInput(
@@ -295,7 +292,7 @@ class Engine:
 
 
 def _launch_subprocesses(
-    server_args: ServerArgs,
+        server_args: ServerArgs,
 ):
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
@@ -315,40 +312,9 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    if server_args.dp_size == 1:
-        # Launch tensor parallel scheduler processes
-        scheduler_procs = []
-        scheduler_pipe_readers = []
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
-        tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
-        )
-        for tp_rank in tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-            )
-            proc.start()
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
-
-        if server_args.node_rank >= 1:
-            # For other nodes, they do not need to run tokenizer or detokenizer,
-            # so they can just wait here.
-            for proc in scheduler_procs:
-                proc.join()
-    else:
-        # Launch the data parallel controller
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers = [reader]
-        proc = mp.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
-        )
-        proc.start()
+    ready_receivers, scheduler_procs = _start_scheduler_or_dp_controller_processes(
+        port_args, server_args
+    )
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -367,9 +333,9 @@ def _launch_subprocesses(
 
     # Wait for model to finish loading
     scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
+    for i in range(len(ready_receivers)):
         try:
-            data = scheduler_pipe_readers[i].recv()
+            data = ready_receivers[i].recv_pyobj()
         except EOFError as e:
             logger.exception(e)
             logger.error(
@@ -389,6 +355,56 @@ def _launch_subprocesses(
     scheduler_info = scheduler_infos[0]
 
     return tokenizer_manager, scheduler_info
+
+
+def _start_scheduler_or_dp_controller_processes(port_args, server_args):
+    if server_args.dp_size == 1:
+        # Launch tensor parallel scheduler processes
+        scheduler_procs = []
+        scheduler_ready_receivers = []
+        tp_size_per_node = server_args.tp_size // server_args.nnodes
+        tp_rank_range = range(
+            tp_size_per_node * server_args.node_rank,
+            tp_size_per_node * (server_args.node_rank + 1),
+        )
+        for tp_rank in tp_rank_range:
+            proc, ready_receiver = _start_scheduler_process(
+                port_args, server_args, tp_rank, tp_size_per_node
+            )
+            scheduler_procs.append(proc)
+            scheduler_ready_receivers.append(ready_receiver)
+
+        if server_args.node_rank >= 1:
+            # For other nodes, they do not need to run tokenizer or detokenizer,
+            # so they can just wait here.
+            for proc in scheduler_procs:
+                proc.join()
+
+        return scheduler_ready_receivers, scheduler_procs
+    else:
+        # Launch the data parallel controller
+        ready_ipc_name = create_zmq_ipc_name()
+        ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, ready_ipc_name),
+        )
+        proc.start()
+        return [ready_receiver], [proc]
+
+
+def _start_scheduler_process(
+        port_args, server_args, tp_rank: int, tp_size_per_node: int
+):
+    ready_ipc_name = create_zmq_ipc_name()
+    ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
+    gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+    proc = mp.Process(
+        target=run_scheduler_process,
+        args=(server_args, port_args, gpu_id, tp_rank, None, ready_ipc_name),
+    )
+    proc.start()
+    return proc, ready_receiver
 
 
 def _set_envs_and_config(server_args: ServerArgs):

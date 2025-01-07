@@ -1337,6 +1337,10 @@ def parse_tool_response(text, tools, **kwargs):
     return text, call_info_list
 
 
+def create_zmq_ipc_name():
+    return tempfile.NamedTemporaryFile(delete=False).name
+
+
 class MultiprocessingSerializer:
     @staticmethod
     def serialize(obj):

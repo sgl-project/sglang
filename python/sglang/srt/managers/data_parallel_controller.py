@@ -28,7 +28,12 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import (
+    bind_port,
+    configure_logger,
+    create_zmq_ipc_name,
+    get_zmq_socket,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -142,22 +147,23 @@ class DataParallelController:
     ):
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
-        scheduler_pipe_readers = []
+        ready_receivers = []
         tp_size_per_node = server_args.tp_size // server_args.nnodes
         tp_rank_range = range(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
         )
         for tp_rank in tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
+            ready_ipc_name = create_zmq_ipc_name()
+            ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
             gpu_id = server_args.base_gpu_id + base_gpu_id + tp_rank % tp_size_per_node
             proc = mp.Process(
                 target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
+                args=(server_args, port_args, gpu_id, tp_rank, dp_rank, ready_ipc_name),
             )
             proc.start()
             scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
+            ready_receivers.append(ready_receiver)
 
         send_to = get_zmq_socket(
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
@@ -165,8 +171,8 @@ class DataParallelController:
 
         # Wait for model to finish loading and get max token nums
         scheduler_info = []
-        for i in range(len(scheduler_pipe_readers)):
-            scheduler_info.append(scheduler_pipe_readers[i].recv())
+        for i in range(len(ready_receivers)):
+            scheduler_info.append(ready_receivers[i].recv_pyobj())
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
 
@@ -179,19 +185,20 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: int,
     ):
-        reader, writer = mp.Pipe(duplex=False)
+        ready_ipc_name = create_zmq_ipc_name()
+        ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
         gpu_id = base_gpu_id
         tp_rank = dp_rank
         proc = mp.Process(
             target=run_scheduler_process,
-            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
+            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, ready_ipc_name),
         )
         proc.start()
         send_to = get_zmq_socket(
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
 
-        scheduler_info = reader.recv()
+        scheduler_info = ready_receiver.recv_pyobj()
         self.max_total_num_tokens = scheduler_info["max_total_num_tokens"]
 
         return send_to
@@ -228,14 +235,14 @@ class DataParallelController:
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    pipe_writer,
+    ready_ipc_name,
 ):
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 
     try:
         controller = DataParallelController(server_args, port_args)
-        pipe_writer.send(
+        ready_ipc_name.send_pyobj(
             {"status": "ready", "max_total_num_tokens": controller.max_total_num_tokens}
         )
         controller.event_loop()

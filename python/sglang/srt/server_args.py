@@ -25,6 +25,7 @@ import torch
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    create_zmq_ipc_name,
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -924,9 +925,9 @@ class PortArgs:
             port += 42
 
         return PortArgs(
-            tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
+            tokenizer_ipc_name=create_zmq_ipc_name(),
+            scheduler_input_ipc_name=create_zmq_ipc_name(),
+            detokenizer_ipc_name=create_zmq_ipc_name(),
             nccl_port=port,
         )
 
