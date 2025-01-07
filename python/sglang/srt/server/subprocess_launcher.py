@@ -47,16 +47,19 @@ from sglang.version import __version__
 
 
 class SubprocessLauncher:
-    def launch(self):
+    """
+    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    """
+
+    def start_subprocesses(self):
+        TODO
+
+    def gather_results(self):
         TODO
 
 def _launch_subprocesses(
     server_args: ServerArgs,
 ):
-    """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
-    """
-
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
@@ -164,5 +167,49 @@ def _start_scheduler_process(
     )
     proc.start()
     return proc, ready_receiver
+
+
+
+
+def _set_envs_and_config(server_args: ServerArgs):
+    # Set global environments
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+
+    # Set prometheus env vars
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+
+    # Set ulimit
+    set_ulimit()
+
+    # Fix triton bugs
+    if server_args.tp_size * server_args.dp_size > 1:
+        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
+        maybe_set_triton_cache_manager()
+
+    # Check flashinfer version
+    if server_args.attention_backend == "flashinfer":
+        assert_pkg_version(
+            "flashinfer",
+            "0.1.6",
+            "Please uninstall the old version and "
+            "reinstall the latest version by following the instructions "
+            "at https://docs.flashinfer.ai/installation.html.",
+        )
+
+    # Register the signal handler.
+    # The child processes will send SIGQUIT to this process when any error happens
+    # This process then clean up the whole process tree
+    def sigquit_handler(signum, frame):
+        kill_process_tree(os.getpid())
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
+
+    # Set mp start method
+    mp.set_start_method("spawn", force=True)
 
 
