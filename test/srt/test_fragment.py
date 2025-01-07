@@ -40,14 +40,16 @@ class TestFragment(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(tp_rank: int, fragment_args, writer):
+def _run_subprocess(tp_rank: int, writer):
     print(f"run_subprocess[{tp_rank=}] Start")
 
     # Engine can be put anywhere, e.g. tp_rank=0, or other places
     if tp_rank == 0:
         engine = Engine(
-            tp_rank=tp_rank,
-            gpu_id=tp_rank,
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            mem_fraction_static=0.1,
+            tp_size=_TP_SIZE,
+            random_seed=42,
             fragment=True,
         )
         print(f"run_subprocess[{tp_rank=}] {engine=}", flush=True)
@@ -57,7 +59,11 @@ def _run_subprocess(tp_rank: int, fragment_args, writer):
 
     TODO_broadcast_fragment_args
 
-    fragment = EngineFragment(fragment_args=fragment_args)
+    fragment = EngineFragment(
+        fragment_args=fragment_args,
+        tp_rank=tp_rank,
+        gpu_id=tp_rank,
+    )
     print(f"run_subprocess[{tp_rank=}] {fragment=}", flush=True)
 
     if tp_rank == 0:
