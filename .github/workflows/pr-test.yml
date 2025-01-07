@@ -57,6 +57,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Login to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_FROM_SANG }}
+        run: |
+          huggingface-cli login --token $HF_TOKEN
+
       - name: Install dependencies
         env:
           FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
@@ -66,11 +72,13 @@ jobs:
       - name: Run test
         timeout-minutes: 25
         run: |
-          cd test/srt
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
           range_end=${RANGE#*-}
+
+          cd test/srt
           python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
+
 
   unit-test-backend-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
