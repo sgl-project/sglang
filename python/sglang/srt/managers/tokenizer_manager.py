@@ -29,7 +29,6 @@ import uvloop
 import zmq
 from fastapi import BackgroundTasks
 
-from sglang.communicator import TypeBasedDispatcher
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -71,6 +70,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.utils import TypeBasedDispatcher
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
