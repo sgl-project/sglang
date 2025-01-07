@@ -29,7 +29,13 @@ class TestFragment(unittest.TestCase):
 
         output = output_reader.recv()
         print(output)
-        # TODO add assertions
+        self.assertEqual(output, [
+            ' to spend my time outside. The weather is perfect for an outdoor activity.\n\nPack',
+            ' developing a new propulsion system for high-speed vehicular transportation systems, in particular,',
+            ' planning a trip to Europe. My home country is the United States. The trip',
+            " I've heard about you. I've been waiting for this moment for a long",
+            ' the quantitative study of mathematical laws, a fact-based approach, clarity of thought,',
+        ])
 
         for p in processes:
             p.join()
