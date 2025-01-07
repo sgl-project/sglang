@@ -1,13 +1,16 @@
+import argparse
+import itertools
+import time
+
 import torch
-from sgl_kernel import moe_align_block_size
 import triton
 import triton.language as tl
-import time
-import itertools
-import argparse
+from sgl_kernel import moe_align_block_size
+
 
 def ceil_div(a, b):
     return (a + b - 1) // b
+
 
 @triton.jit
 def moe_align_block_size_stage1(
@@ -27,6 +30,7 @@ def moe_align_block_size_stage1(
             token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
             tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
 
+
 @triton.jit
 def moe_align_block_size_stage2(
     tokens_cnts_ptr,
@@ -38,6 +42,7 @@ def moe_align_block_size_stage2(
         token_cnt = tl.load(tokens_cnts_ptr + i * num_experts + pid)
         last_cnt = last_cnt + token_cnt
         tl.store(tokens_cnts_ptr + i * num_experts + pid, last_cnt)
+
 
 @triton.jit
 def moe_align_block_size_stage3(
@@ -54,6 +59,7 @@ def moe_align_block_size_stage3(
         last_cumsum = last_cumsum + tl.cdiv(token_cnt, block_size) * block_size
         tl.store(cumsum_ptr + i, last_cumsum)
     tl.store(total_tokens_post_pad_ptr, last_cumsum)
+
 
 @triton.jit
 def moe_align_block_size_stage4(
@@ -83,6 +89,7 @@ def moe_align_block_size_stage4(
         rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
         tl.store(sorted_token_ids_ptr + rank_post_pad, i)
         tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
+
 
 def moe_align_block_size_triton(
     topk_ids: torch.Tensor,
@@ -130,10 +137,13 @@ def moe_align_block_size_triton(
         tokens_per_thread,
     )
 
+
 def calculate_diff(batch_size, seq_len):
     num_experts = 256
     block_size = 128
-    topk_ids = torch.randint(0, num_experts, (batch_size, seq_len), dtype=torch.int32, device="cuda")
+    topk_ids = torch.randint(
+        0, num_experts, (batch_size, seq_len), dtype=torch.int32, device="cuda"
+    )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids_cuda = torch.empty(
@@ -144,7 +154,9 @@ def calculate_diff(batch_size, seq_len):
     expert_ids_cuda = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
-    num_tokens_post_pad_cuda = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad_cuda = torch.empty(
+        (1), dtype=torch.int32, device=topk_ids.device
+    )
     token_cnts_buffer = torch.empty(
         (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
     )
@@ -177,7 +189,9 @@ def calculate_diff(batch_size, seq_len):
         num_tokens_post_pad_triton,
     )
 
-    if torch.allclose(expert_ids_cuda, expert_ids_triton) and torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_triton):
+    if torch.allclose(expert_ids_cuda, expert_ids_triton) and torch.allclose(
+        num_tokens_post_pad_cuda, num_tokens_post_pad_triton
+    ):
         print("✅ CUDA and Triton implementations match")
     else:
         print("❌ CUDA and Triton implementations do not match")
@@ -186,9 +200,11 @@ def calculate_diff(batch_size, seq_len):
         print("CUDA num_tokens_post_pad:", num_tokens_post_pad_cuda)
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
 
+
 batch_size_range = [2**i for i in range(0, 8)]
 seq_length_range = [2**i for i in range(0, 16)]
 configs = list(itertools.product(batch_size_range, seq_length_range))
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -206,7 +222,9 @@ configs = list(itertools.product(batch_size_range, seq_length_range))
 def benchmark(batch_size, seq_len, provider):
     num_experts = 256
     block_size = 128
-    topk_ids = torch.randint(0, num_experts, (batch_size, seq_len), dtype=torch.int32, device="cuda")
+    topk_ids = torch.randint(
+        0, num_experts, (batch_size, seq_len), dtype=torch.int32, device="cuda"
+    )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids = torch.empty(
@@ -254,6 +272,7 @@ def benchmark(batch_size, seq_len, provider):
         )
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
