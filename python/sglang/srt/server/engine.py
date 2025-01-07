@@ -45,6 +45,8 @@ class Engine:
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
         self._subprocess_launcher = SubprocessLauncher(server_args=server_args)
 
+        self._wait_subprocess_launcher()
+
     def _wait_subprocess_launcher(self):
         tokenizer_manager, scheduler_info = self._subprocess_launcher.wait()
         del self._subprocess_launcher
