@@ -53,8 +53,10 @@ class SubprocessLauncher:
         logger.info(f"{server_args=}")
 
         # If using model from www.modelscope.cn, first download the model.
-        server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-            server_args.model_path, server_args.tokenizer_path
+        server_args.model_path, server_args.tokenizer_path = (
+            prepare_model_and_tokenizer(
+                server_args.model_path, server_args.tokenizer_path
+            )
         )
 
         ready_receivers, scheduler_procs = _start_scheduler_or_dp_controller_processes(
@@ -74,7 +76,9 @@ class SubprocessLauncher:
         # Launch tokenizer process
         tokenizer_manager = TokenizerManager(server_args, port_args)
         if server_args.chat_template:
-            load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+            load_chat_template_for_openai_api(
+                tokenizer_manager, server_args.chat_template
+            )
 
         self._ready_receivers = ready_receivers
         self._scheduler_procs = scheduler_procs

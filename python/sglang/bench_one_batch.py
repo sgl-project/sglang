@@ -61,7 +61,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server import _set_envs_and_config
+from sglang.srt.server.subprocess_launcher import _set_envs_and_config
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import configure_logger, kill_process_tree, suppress_other_loggers
