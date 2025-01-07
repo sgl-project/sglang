@@ -709,13 +709,14 @@ def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -724,19 +725,19 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)

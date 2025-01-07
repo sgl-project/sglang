@@ -66,11 +66,13 @@ jobs:
       - name: Run test
         timeout-minutes: 25
         run: |
-          cd test/srt
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
           range_end=${RANGE#*-}
+
+          cd test/srt
           python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
+
 
   unit-test-backend-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
