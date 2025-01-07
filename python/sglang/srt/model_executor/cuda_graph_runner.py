@@ -322,6 +322,8 @@ class CudaGraphRunner:
             global_num_tokens = None
             gathered_buffer = None
 
+        spec_info = self.get_spec_info(num_tokens, positions)
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -341,7 +343,10 @@ class CudaGraphRunner:
             mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=self.get_spec_info(num_tokens, positions),
+            spec_info=spec_info,
+            capture_hidden_mode=(
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            ),
         )
 
         # Attention backend
@@ -446,10 +451,10 @@ class CudaGraphRunner:
 
             if self.model_runner.is_draft_worker:
                 spec_info = EAGLEDraftInput()
+                spec_info.load_server_args(self.model_runner.server_args)
                 spec_info.hidden_states = self.hidden_states[:num_tokens]
                 spec_info.positions = positions
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
-                spec_info.init(self.model_runner.server_args)
             else:
                 spec_info = EagleVerifyInput(
                     None,

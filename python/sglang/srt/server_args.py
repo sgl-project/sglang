@@ -361,6 +361,7 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
+                "modelopt",
             ],
             help="The quantization method.",
         )
