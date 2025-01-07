@@ -1,8 +1,8 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.1.post3 -t v0.4.1.post3-rocm620 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.1.post4 -t v0.4.1.post4-rocm620 -f Dockerfile.rocm .
 
 # default base image
-ARG BASE_IMAGE="rocm/vllm-dev:20241022"
+ARG BASE_IMAGE="rocmshared/vllm-rocm:20241031-tuned"
 
 FROM $BASE_IMAGE AS base
 USER root
@@ -32,6 +32,12 @@ RUN git clone ${SGL_REPO} \
 
 RUN cp -r /sgl-workspace/sglang /sglang
 RUN python -m pip cache purge
+
+RUN pip install IPython \
+    && pip install orjson \
+    && pip install python-multipart \
+    && pip install torchao \
+    && pip install pybind11
 
 RUN pip uninstall -y triton
 RUN git clone ${TRITON_REPO} \

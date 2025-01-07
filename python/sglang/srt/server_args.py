@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -247,6 +248,17 @@ class ServerArgs:
                 "Overlap scheduler is disabled."
             )
 
+        # Speculative Decoding
+        if self.speculative_algorithm == "EAGLE":
+            self.prefill_only_one_req = True
+            self.disable_cuda_graph_padding = True
+            self.disable_radix_cache = True
+            self.disable_overlap_schedule = True
+            self.chunked_prefill_size = -1
+            logger.info(
+                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
+            )
+
         # GGUF
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -349,6 +361,7 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
+                "modelopt",
             ],
             help="The quantization method.",
         )

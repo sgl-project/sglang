@@ -1,6 +1,7 @@
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
 from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
+from sgl_kernel.ops._kernels import int8_scaled_mm as _int8_scaled_mm
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
 
 
@@ -35,4 +36,15 @@ def moe_align_block_size(
         num_tokens_post_pad,
         token_cnts_buffer,
         cumsum_buffer,
+    )
+
+
+def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+    return _int8_scaled_mm(
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        out_dtype,
+        bias,
     )
