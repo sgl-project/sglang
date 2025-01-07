@@ -102,8 +102,8 @@ class SubprocessLauncher:
                 logger.error(
                     f"Rank {i} scheduler is dead. Please check if there are relevant logs."
                 )
-                scheduler_procs[i].join()
-                logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+                self._scheduler_procs[i].join()
+                logger.error(f"Exit code: {self._scheduler_procs[i].exitcode}")
                 raise
 
             if data["status"] != "ready":
