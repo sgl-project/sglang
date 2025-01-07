@@ -1,33 +1,25 @@
 import asyncio
-import json
-import logging
-from abc import ABC
-from typing import Dict, List, Optional, Union, AsyncIterator
-
-import orjson
-from fastapi import Request
-from sglang.srt.managers.io_struct import (
-    GenerateReqInput, EmbeddingReqInput,
-)
-from sglang.srt.server.utils import create_error_response
-from starlette.responses import StreamingResponse
-
-import asyncio
 import atexit
 import dataclasses
+import json
 import logging
 import multiprocessing as mp
 import os
 import signal
-from typing import List, Tuple
+from abc import ABC
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
+import orjson
 import torch
 from fastapi import Request
+from starlette.responses import StreamingResponse
+
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -36,18 +28,14 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import (
-    load_chat_template_for_openai_api,
-)
-from sglang.srt.server_args import PortArgs
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.server.utils import create_error_response
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
-    kill_process_tree,
-)
-from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
+    kill_process_tree,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
@@ -73,22 +61,24 @@ class Engine:
         atexit.register(self.shutdown)
 
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
-        tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+        tokenizer_manager, scheduler_info = _launch_subprocesses(
+            server_args=server_args
+        )
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
     def generate(
-            self,
-            # The input prompt. It can be a single prompt or a batch of prompts.
-            prompt: Optional[Union[List[str], str]] = None,
-            sampling_params: Optional[Union[List[Dict], Dict]] = None,
-            # The token ids for text; one can either specify text or input_ids.
-            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-            return_logprob: Optional[Union[List[bool], bool]] = False,
-            logprob_start_len: Optional[Union[List[int], int]] = None,
-            top_logprobs_num: Optional[Union[List[int], int]] = None,
-            lora_path: Optional[List[Optional[str]]] = None,
-            stream: bool = False,
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -106,6 +96,7 @@ class Engine:
         ret = loop.run_until_complete(self._generate_raw(obj, None))
 
         if stream is True:
+
             def generator_wrapper():
                 offset = 0
                 loop = asyncio.get_event_loop()
@@ -115,7 +106,7 @@ class Engine:
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -127,17 +118,17 @@ class Engine:
             return ret
 
     async def async_generate(
-            self,
-            # The input prompt. It can be a single prompt or a batch of prompts.
-            prompt: Optional[Union[List[str], str]] = None,
-            sampling_params: Optional[Dict] = None,
-            # The token ids for text; one can either specify text or input_ids.
-            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-            return_logprob: Optional[Union[List[bool], bool]] = False,
-            logprob_start_len: Optional[Union[List[int], int]] = None,
-            top_logprobs_num: Optional[Union[List[int], int]] = None,
-            lora_path: Optional[List[Optional[str]]] = None,
-            stream: bool = False,
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Dict] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -162,7 +153,7 @@ class Engine:
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -173,9 +164,12 @@ class Engine:
 
     async def _generate_raw(self, obj: GenerateReqInput, request: Request):
         if obj.stream:
+
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
-                    async for out in self.tokenizer_manager.generate_request(obj, request):
+                    async for out in self.tokenizer_manager.generate_request(
+                        obj, request
+                    ):
                         yield b"data: " + orjson.dumps(
                             out, option=orjson.OPT_NON_STR_KEYS
                         ) + b"\n\n"
@@ -193,7 +187,9 @@ class Engine:
             )
         else:
             try:
-                ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
+                ret = await self.tokenizer_manager.generate_request(
+                    obj, request
+                ).__anext__()
                 return ret
             except ValueError as e:
                 logger.error(f"Error: {e}")
@@ -202,8 +198,8 @@ class Engine:
                 return create_error_response(e)
 
     def encode(
-            self,
-            prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
         obj = EmbeddingReqInput(text=prompt)
 
@@ -213,13 +209,14 @@ class Engine:
 
     async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
         try:
-            ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
+            ret = await self.tokenizer_manager.generate_request(
+                obj, request
+            ).__anext__()
             return ret
         except ValueError as e:
             # TODO: maybe we should not return such ORJSONResponse for engine API,
             # but for backward compatibility we do so
             return create_error_response(e)
-
 
     def shutdown(self):
         kill_process_tree(os.getpid(), include_parent=False)
@@ -292,7 +289,9 @@ class Engine:
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.get_weights_by_name(obj, None))
+        return loop.run_until_complete(
+            self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
 
 
 def _launch_subprocesses(
@@ -432,6 +431,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
 
 _STREAM_END_SYMBOL = b"data: [DONE]"
 _STREAM_CHUNK_START_SYMBOL = b"data:"

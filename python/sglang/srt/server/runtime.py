@@ -10,17 +10,21 @@ from typing import Dict, List, Optional, Union
 import aiohttp
 import requests
 import uvicorn
+from uvicorn.config import LOGGING_CONFIG
+
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.server.engine import Engine
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    add_api_key_middleware,
+    add_prometheus_middleware,
+    delete_directory,
     is_port_available,
-    kill_process_tree, add_api_key_middleware, add_prometheus_middleware, delete_directory,
+    kill_process_tree,
 )
 from sglang.utils import get_exception_traceback
-from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +205,8 @@ def launch_server(
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
 
-    from sglang.srt.server.fastapi_app import app
     from sglang.srt.server import fastapi_app
+    from sglang.srt.server.fastapi_app import app
 
     engine = Engine(server_args=server_args)
     fastapi_app.setup_global_state(engine=engine)
