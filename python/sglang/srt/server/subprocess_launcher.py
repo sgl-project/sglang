@@ -1,0 +1,168 @@
+import asyncio
+import atexit
+import dataclasses
+import json
+import logging
+import multiprocessing as mp
+import os
+import signal
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
+
+import orjson
+import torch
+import zmq
+from fastapi import Request
+from starlette.responses import StreamingResponse
+
+from sglang.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
+)
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
+from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.server.utils import create_error_response
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    assert_pkg_version,
+    configure_logger,
+    create_zmq_ipc_name,
+    get_zmq_socket,
+    kill_process_tree,
+    maybe_set_triton_cache_manager,
+    prepare_model_and_tokenizer,
+    set_prometheus_multiproc_dir,
+    set_ulimit,
+)
+from sglang.version import __version__
+
+
+class SubprocessLauncher:
+    def launch(self):
+        TODO
+
+def _launch_subprocesses(
+    server_args: ServerArgs,
+):
+    """
+    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    """
+
+    # Configure global environment
+    configure_logger(server_args)
+    server_args.check_server_args()
+    _set_envs_and_config(server_args)
+
+    # Allocate ports for inter-process communications
+    port_args = PortArgs.init_new(server_args)
+    logger.info(f"{server_args=}")
+
+    # If using model from www.modelscope.cn, first download the model.
+    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
+        server_args.model_path, server_args.tokenizer_path
+    )
+
+    ready_receivers, scheduler_procs = _start_scheduler_or_dp_controller_processes(
+        port_args, server_args
+    )
+
+    # Launch detokenizer process
+    detoken_proc = mp.Process(
+        target=run_detokenizer_process,
+        args=(
+            server_args,
+            port_args,
+        ),
+    )
+    detoken_proc.start()
+
+    # Launch tokenizer process
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+
+    # Wait for model to finish loading
+    scheduler_infos = []
+    for i in range(len(ready_receivers)):
+        try:
+            data = ready_receivers[i].recv_pyobj()
+        except EOFError as e:
+            logger.exception(e)
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+
+    # Assume all schedulers have same scheduler_info
+    scheduler_info = scheduler_infos[0]
+
+    return tokenizer_manager, scheduler_info
+
+
+def _start_scheduler_or_dp_controller_processes(port_args, server_args):
+    if server_args.dp_size == 1:
+        # Launch tensor parallel scheduler processes
+        scheduler_procs = []
+        scheduler_ready_receivers = []
+        tp_size_per_node = server_args.tp_size // server_args.nnodes
+        tp_rank_range = range(
+            tp_size_per_node * server_args.node_rank,
+            tp_size_per_node * (server_args.node_rank + 1),
+            )
+        for tp_rank in tp_rank_range:
+            proc, ready_receiver = _start_scheduler_process(
+                port_args, server_args, tp_rank, tp_size_per_node
+            )
+            scheduler_procs.append(proc)
+            scheduler_ready_receivers.append(ready_receiver)
+
+        if server_args.node_rank >= 1:
+            # For other nodes, they do not need to run tokenizer or detokenizer,
+            # so they can just wait here.
+            for proc in scheduler_procs:
+                proc.join()
+
+        return scheduler_ready_receivers, scheduler_procs
+    else:
+        # Launch the data parallel controller
+        ready_ipc_name = create_zmq_ipc_name()
+        ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, ready_ipc_name),
+        )
+        proc.start()
+        return [ready_receiver], [proc]
+
+
+def _start_scheduler_process(
+    port_args, server_args, tp_rank: int, tp_size_per_node: int
+):
+    ready_ipc_name = create_zmq_ipc_name()
+    ready_receiver = get_zmq_socket(zmq.Context(1), zmq.PULL, ready_ipc_name)
+    gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+    proc = mp.Process(
+        target=run_scheduler_process,
+        args=(server_args, port_args, gpu_id, tp_rank, None, ready_ipc_name),
+    )
+    proc.start()
+    return proc, ready_receiver
+
+
