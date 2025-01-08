@@ -359,6 +359,9 @@ class Entrypoint:
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
+    @property
+    def is_generation(self):
+        return self._generation_manager.is_generation
 
 class _SignalHandler:
     def __init__(self, entrypoint):
