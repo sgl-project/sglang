@@ -129,7 +129,7 @@ class GenerationManager:
         else:
             raise NotImplementedError
 
-    def postprocess_batch_output_item(
+    def postprocess_output(
         self,
         recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
         index: int,

@@ -550,7 +550,7 @@ class TokenizerManager:
             if state is None:
                 continue
 
-            out_dict = self.generation_manager.postprocess_batch_output_item(recv_obj, index, rid, state.obj)
+            out_dict = self.generation_manager.postprocess_output(recv_obj, index, rid, state.obj)
 
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[index] is not None
