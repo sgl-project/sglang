@@ -231,7 +231,7 @@ class TokenizerManager:
         created_time: Optional[float] = None,
     ):
         event = asyncio.Event()
-        state = ReqState([], False, event, obj, metric=_MetricReqState.init_new())
+        state = ReqState([], False, event, obj, metric=_MetricReqState(created_time=created_time))
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
@@ -609,12 +609,6 @@ class _Communicator(Generic[T]):
 class _MetricReqState:
     created_time: float
     first_token_time: Optional[float] = None
-
-    @classmethod
-    def init_new(cls):
-        return cls(
-            created_time=TODO,
-        )
 
 
 class _MetricManager:
