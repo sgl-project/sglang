@@ -192,34 +192,35 @@ class GenerationManager:
             state.event.set()
 
             if self.enable_metrics:
-                completion_tokens = (
-                    recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
+                self._handle_batch_output_metrics(recv_obj, i, state)
+
+    def _handle_batch_output_metrics(self, recv_obj, i, state):
+        completion_tokens = (
+            recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
+        )
+        if state.first_token_time is None:
+            state.first_token_time = time.time()
+            self.metrics_collector.observe_time_to_first_token(
+                state.first_token_time - state.created_time
+            )
+        else:
+            if completion_tokens >= 2:
+                # Compute time_per_output_token for the streaming case
+                self.metrics_collector.observe_time_per_output_token(
+                    (time.time() - state.first_token_time)
+                    / (completion_tokens - 1)
                 )
-
-                if state.first_token_time is None:
-                    state.first_token_time = time.time()
-                    self.metrics_collector.observe_time_to_first_token(
-                        state.first_token_time - state.created_time
-                    )
-                else:
-                    if completion_tokens >= 2:
-                        # Compute time_per_output_token for the streaming case
-                        self.metrics_collector.observe_time_per_output_token(
-                            (time.time() - state.first_token_time)
-                            / (completion_tokens - 1)
-                        )
-
-                if state.finished:
-                    self.metrics_collector.inc_prompt_tokens(recv_obj.prompt_tokens[i])
-                    self.metrics_collector.inc_generation_tokens(completion_tokens)
-                    self.metrics_collector.observe_e2e_request_latency(
-                        time.time() - state.created_time
-                    )
-                    # Compute time_per_output_token for the non-streaming case
-                    if not state.obj.stream and completion_tokens >= 1:
-                        self.metrics_collector.observe_time_per_output_token(
-                            (time.time() - state.created_time) / completion_tokens
-                        )
+        if state.finished:
+            self.metrics_collector.inc_prompt_tokens(recv_obj.prompt_tokens[i])
+            self.metrics_collector.inc_generation_tokens(completion_tokens)
+            self.metrics_collector.observe_e2e_request_latency(
+                time.time() - state.created_time
+            )
+            # Compute time_per_output_token for the non-streaming case
+            if not state.obj.stream and completion_tokens >= 1:
+                self.metrics_collector.observe_time_per_output_token(
+                    (time.time() - state.created_time) / completion_tokens
+                )
 
     def _convert_logprob_style(
         self,
