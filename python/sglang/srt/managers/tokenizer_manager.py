@@ -168,15 +168,6 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
 
-        # Metrics
-        if self.enable_metrics:
-            self.metrics_collector = TokenizerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    # TODO: Add lora name/path in the future,
-                },
-            )
-
         self._dispatcher = TypeBasedDispatcher(
             [
                 (BatchStrOut, self._handle_batch_output),
