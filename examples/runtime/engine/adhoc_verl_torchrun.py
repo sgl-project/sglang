@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 from typing import List
 
@@ -22,18 +21,17 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
 
-# COPIED FROM https://github.com/volcengine/verl/blob/gm/ci/tests/rollout/run_fsdp_vllm.py
 def main():
     assert torch.cuda.is_available(), 'CUDA must be present to run FSDP vLLM example'
     local_rank, rank, world_size = initialize_global_process_group()
 
+    # NOTE MODIFIED path-related logic
     # local_cache_path = '~/.cache/verl/rlhf'
     # local_cache_path = os.path.expanduser(local_cache_path)
     hdfs_path = 'Qwen/Qwen2-7B-Instruct'
-
+    local_model_path = hdfs_path
     # from verl.utils.fs import copy_local_path_from_hdfs
     # local_model_path = copy_local_path_from_hdfs(src=hdfs_path, cache_dir=local_cache_path)
-    local_model_path = hdfs_path
     tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True)
     actor_model_config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
     with torch.device("cuda"):
@@ -49,19 +47,16 @@ def main():
     ]
     tokenizer.pad_token = tokenizer.eos_token
     prompts = tokenizer(preencode_prompts, return_tensors='pt', padding=True,
-                        padding_side='left')  # NOTE MODIFIED ADD
+                        padding_side='left')  # NOTE MODIFIED add
     input_ids = prompts['input_ids']
     attention_mask = prompts['attention_mask']
-    print(f'hi stage1 {input_ids=} {attention_mask=}')
+    # from verl.utils.torch_functional import pad_sequence_to_length
     input_ids = pad_sequence_to_length(input_ids, max_prompt_length, tokenizer.pad_token_id, left_pad=True).cuda()
     attention_mask = pad_sequence_to_length(attention_mask, max_prompt_length, 0, left_pad=True).cuda()
-    print(f'hi stage2 {input_ids=} {attention_mask=}')
 
     from transformers import GenerationConfig
     generation_config = GenerationConfig(do_sample=False)
     actor_model.cuda()
-    if torch.distributed.get_rank() == 0:
-        print(f'hi call hf.generate({input_ids=}, {attention_mask=})')
     output = actor_model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -100,32 +95,37 @@ def main():
     #
     # state_dict = fsdp_model.state_dict()
 
+    # NOTE MODIFIED
+    # sampling_params = SamplingParams(temperature=0,
+    #                                  top_p=1,
+    #                                  n=1,
+    #                                  max_tokens=response_length,
+    #                                  logprobs=1,
+    #                                  ignore_eos=True,
+    #                                  detokenize=False)
     sampling_params = dict(temperature=0,
                            top_p=1,
                            n=1,
-                           # max_tokens=response_length,
                            max_new_tokens=response_length,
-                           # logprobs=1, # TODO
-                           ignore_eos=True,
-                           # detokenize=False,  # TODO
-                           )
+                           ignore_eos=True)
 
     print(actor_model_config)
+    # llm = LLM(model=None,
+    #           tokenizer=tokenizer,
+    #           model_hf_config=actor_model_config,
+    #           tensor_parallel_size=tensor_model_parallel_size,
+    #           enforce_eager=True,
+    #           dtype='bfloat16',
+    #           load_format='dummy_dtensor',
+    #           gpu_memory_utilization=0.1,
+    #           trust_remote_code=True)
     llm = EngineFragment(model_path=local_model_path,
-                         # tokenizer=tokenizer,
-                         # model_hf_config=actor_model_config,
-                         # tensor_parallel_size=tensor_model_parallel_size,
                          tp_size=tensor_model_parallel_size,
-                         # enforce_eager=True,
                          dtype='bfloat16',
-                         # load_format='dummy_dtensor',
-                         # gpu_memory_utilization=0.1,
                          mem_fraction_static=0.1,
-                         # trust_remote_code=True,
                          nccl_port=12345,
                          tp_rank=rank,
-                         gpu_id=rank,
-                         )
+                         gpu_id=rank)
 
     # llm.sync_model_weights(actor_weights=state_dict, load_format='dtensor')
 
@@ -135,19 +135,13 @@ def main():
     batch_size = input_ids.shape[0]
 
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    # from verl.workers.rollout.vllm_rollout.vllm_rollout import _pre_process_inputs
     for i in range(batch_size):
         idx_list.append(_pre_process_inputs(pad_token_id, input_ids[i]))
     print('start generation')
-    if torch.distributed.get_rank() == 0:
-        print(f'llm (real input ids){idx_list=} {pad_token_id=} {input_ids=}')
-    outputs = llm.generate(
-        # prompt_token_ids=idx_list,
-        input_ids=idx_list,
-        sampling_params=sampling_params,
-        # use_tqdm=False,
-    )
-    print(f'{outputs=}')
-    vllm_output = outputs
+    # outputs = llm.generate(prompt_token_ids=idx_list, sampling_params=sampling_params, use_tqdm=False)
+    outputs = llm.generate(input_ids=idx_list, sampling_params=sampling_params)
+
     # vllm_output = outputs[0].cuda()
     if torch.distributed.get_rank() == 0:
         print(f'hf response: {tokenizer.batch_decode(response)}')
@@ -190,9 +184,8 @@ def pad_sequence_to_length(tensors, max_seq_len, pad_token_id, left_pad=False):
 def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
     # remove the left padding in the prompt token_id
     # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
-    nonzero = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)
-    print(f'hi _pre_process_inputs {pad_token_id=} {prompt_token_ids=} {nonzero=}')
-    token_ids = prompt_token_ids[nonzero[0][0]:nonzero[-1][0] + 1].tolist()
+    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
+    token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
 
