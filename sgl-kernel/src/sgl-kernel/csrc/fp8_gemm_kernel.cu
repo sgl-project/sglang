@@ -3,7 +3,6 @@
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h
 
 #pragma once
-#include <chrono>
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -31,7 +30,6 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "utils.hpp"
-
 
 using namespace cute;
 
@@ -138,7 +136,6 @@ typename Gemm::Arguments prepare_sm89_fp8_args(torch::Tensor& out, const torch::
     ElementComputeEpilogue const* ptr_scales_a = reinterpret_cast<ElementComputeEpilogue const*>(scales_a.data_ptr());
     ElementComputeEpilogue const* ptr_scales_b = reinterpret_cast<ElementComputeEpilogue const*>(scales_b.data_ptr());
 
-
     typename Gemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, // Mode
         {m, n, k},                                                         // Problem size
         1,                                                                 // Split-k factor
@@ -239,7 +236,7 @@ void sm89_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     uint32_t const n = out.size(1);
     uint32_t const np2 = next_pow_2(n);
 
-  if (m == 1) {
+  if (m <= 1) {
     if (np2 <= 8192) {
         return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     } else if (np2 <= 16384) {
@@ -590,7 +587,6 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
   } else {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented fp8_scaled_mm for current compute capability: ", sm_version);
   }
-
 
   return out;
 }

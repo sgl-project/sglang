@@ -1,6 +1,5 @@
 #pragma once
 #include <torch/extension.h>
-#include <fstream>
 #include <sstream>
 
 struct cuda_error : public std::runtime_error {
