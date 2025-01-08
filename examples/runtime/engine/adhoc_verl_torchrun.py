@@ -140,11 +140,12 @@ def main():
         # use_tqdm=False,
     )
     print(f'{outputs=}')
-    vllm_output = outputs[0]
+    vllm_output = outputs
     # vllm_output = outputs[0].cuda()
     if torch.distributed.get_rank() == 0:
         print(f'hf response: {tokenizer.batch_decode(response)}')
-        print(f'vllm response: {tokenizer.batch_decode(vllm_output)}')
+        # print(f'vllm response: {tokenizer.batch_decode(vllm_output)}')
+        print(f'vllm response: {[o["text"] for o in outputs]}')
 
 
 # COPIED FROM verl
