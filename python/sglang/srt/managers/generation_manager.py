@@ -243,6 +243,10 @@ class GenerationManager:
         req = AbortReq(rid)
         self.on_request(req)
 
+    @property
+    def tokenizer(self):
+        return self._generation_converter.tokenizer
+
 
 @dataclasses.dataclass
 class _ReqState:

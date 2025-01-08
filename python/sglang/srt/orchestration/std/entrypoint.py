@@ -363,6 +363,10 @@ class Entrypoint:
     def is_generation(self):
         return self._generation_manager.is_generation
 
+    @property
+    def tokenizer(self):
+        return self._generation_manager.tokenizer
+
 class _SignalHandler:
     def __init__(self, entrypoint):
         self.entrypoint = entrypoint
