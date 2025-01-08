@@ -23,6 +23,8 @@ from sglang.srt.server_args import ServerArgs
 
 
 class GenerationConverter:
+    """Preprocessors and postprocessors for generation"""
+
     def __init__(
         self,
         server_args: ServerArgs,
