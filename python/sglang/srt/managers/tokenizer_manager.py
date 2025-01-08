@@ -29,15 +29,9 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.generation_manager import GenerationManager
-from sglang.srt.managers.image_processor import (
-    get_dummy_image_processor,
-    get_image_processor,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -54,7 +48,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
-    SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -65,7 +58,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
@@ -88,9 +80,7 @@ class ReqState:
     event: asyncio.Event
     obj: Any
 
-    # For metrics
-    created_time: float
-    first_token_time: Optional[float] = None
+    metric: '_MetricReqState'
 
     # For streaming output
     last_output_offset: int = 0
@@ -149,6 +139,10 @@ class TokenizerManager:
             None
         )
         self.asyncio_tasks = set()
+
+        # Metrics
+        if self.enable_metrics:
+            self._metric_manager = _MetricManager()
 
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
@@ -237,7 +231,7 @@ class TokenizerManager:
         created_time: Optional[float] = None,
     ):
         event = asyncio.Event()
-        state = ReqState([], False, event, obj, created_time=created_time)
+        state = ReqState([], False, event, obj, metric=_MetricReqState.init_new())
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
@@ -556,6 +550,9 @@ class TokenizerManager:
             if state is None:
                 continue
             self.generation_manager.handle_batch_output_item(recv_obj, i, state)
+            if self._metric_manager:
+                self._metric_manager.handle_batch_output_metrics(recv_obj, i, state.metric, finished=state.finished,
+                                                                 stream=state.obj.stream)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
@@ -606,3 +603,60 @@ class _Communicator(Generic[T]):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_future.set_result(None)
+
+
+@dataclasses.dataclass
+class _MetricReqState:
+    created_time: float
+    first_token_time: Optional[float] = None
+
+    @classmethod
+    def init_new(cls):
+        return cls(
+            created_time=TODO,
+        )
+
+
+class _MetricManager:
+    def __init__(self):
+        self._metrics_collector = TokenizerMetricsCollector(
+            labels={
+                "model_name": self.server_args.served_model_name,
+                # TODO: Add lora name/path in the future,
+            },
+        )
+
+    def handle_batch_output_metrics(
+        self,
+        recv_obj,
+        i: int,
+        state: _MetricReqState,
+        finished: bool,
+        stream: bool,
+    ):
+        completion_tokens = (
+            recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
+        )
+        if state.first_token_time is None:
+            state.first_token_time = time.time()
+            self._metrics_collector.observe_time_to_first_token(
+                state.first_token_time - state.created_time
+            )
+        else:
+            if completion_tokens >= 2:
+                # Compute time_per_output_token for the streaming case
+                self._metrics_collector.observe_time_per_output_token(
+                    (time.time() - state.first_token_time)
+                    / (completion_tokens - 1)
+                )
+        if finished:
+            self._metrics_collector.inc_prompt_tokens(recv_obj.prompt_tokens[i])
+            self._metrics_collector.inc_generation_tokens(completion_tokens)
+            self._metrics_collector.observe_e2e_request_latency(
+                time.time() - state.created_time
+            )
+            # Compute time_per_output_token for the non-streaming case
+            if not stream and completion_tokens >= 1:
+                self._metrics_collector.observe_time_per_output_token(
+                    (time.time() - state.created_time) / completion_tokens
+                )

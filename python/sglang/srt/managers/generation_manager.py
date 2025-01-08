@@ -1,5 +1,4 @@
 import os
-import time
 from typing import Dict, List, Union
 
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -19,7 +18,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
@@ -57,15 +55,6 @@ class GenerationManager:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
-
-        # Metrics
-        if self.enable_metrics:
-            self.metrics_collector = TokenizerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    # TODO: Add lora name/path in the future,
-                },
-            )
 
     async def tokenize_one_request(
         self,
@@ -199,34 +188,6 @@ class GenerationManager:
 
         if self.enable_metrics:
             self._handle_batch_output_metrics(recv_obj, i, state)
-
-    def _handle_batch_output_metrics(self, recv_obj, i):
-        completion_tokens = (
-            recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
-        )
-        if state.first_token_time is None:
-            state.first_token_time = time.time()
-            self.metrics_collector.observe_time_to_first_token(
-                state.first_token_time - state.created_time
-            )
-        else:
-            if completion_tokens >= 2:
-                # Compute time_per_output_token for the streaming case
-                self.metrics_collector.observe_time_per_output_token(
-                    (time.time() - state.first_token_time)
-                    / (completion_tokens - 1)
-                )
-        if state.finished:
-            self.metrics_collector.inc_prompt_tokens(recv_obj.prompt_tokens[i])
-            self.metrics_collector.inc_generation_tokens(completion_tokens)
-            self.metrics_collector.observe_e2e_request_latency(
-                time.time() - state.created_time
-            )
-            # Compute time_per_output_token for the non-streaming case
-            if not state.obj.stream and completion_tokens >= 1:
-                self.metrics_collector.observe_time_per_output_token(
-                    (time.time() - state.created_time) / completion_tokens
-                )
 
     def _convert_logprob_style(
         self,
