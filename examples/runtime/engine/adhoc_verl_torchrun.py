@@ -52,8 +52,10 @@ def main():
                         padding_side='left')  # NOTE MODIFIED ADD
     input_ids = prompts['input_ids']
     attention_mask = prompts['attention_mask']
+    print(f'hi stage1 {input_ids=} {attention_mask=}')
     input_ids = pad_sequence_to_length(input_ids, max_prompt_length, tokenizer.pad_token_id, left_pad=True).cuda()
     attention_mask = pad_sequence_to_length(attention_mask, max_prompt_length, 0, left_pad=True).cuda()
+    print(f'hi stage2 {input_ids=} {attention_mask=}')
 
     from transformers import GenerationConfig
     generation_config = GenerationConfig(do_sample=False)
