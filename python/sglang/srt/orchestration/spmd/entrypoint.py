@@ -20,5 +20,12 @@ class Entrypoint:
         )
 
     def generate(self, obj: GenerateReqInput):
-        self._scheduler.handle_generate_or_embedding_request()
+        tokenized_requests = TODO
+
+        for tokenized_request in tokenized_requests:
+            self._scheduler.handle_generate_request(tokenized_request)
+
+        while TODO:
+            self._scheduler.process_batch()
+
         return TODO
