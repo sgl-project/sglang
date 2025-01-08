@@ -380,6 +380,14 @@ class GenerationConverter:
         else:
             raise NotImplementedError
 
+    def tokenize_requests(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+        objs = [obj[i] for i in range(obj.batch_size)]
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(asyncio.gather(*(self.tokenize_request(obj) for obj in objs)))
+
     def postprocess_response(
         self,
         recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
