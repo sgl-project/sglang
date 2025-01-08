@@ -62,8 +62,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
-class TokenizerManager:
-    """TokenizerManager is a process that tokenizes the text."""
+class Entrypoint:
+    """Entrypoint of the whole orchestration"""
 
     def __init__(
         self,

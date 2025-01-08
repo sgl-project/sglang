@@ -6,7 +6,7 @@ import signal
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import Entrypoint
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.orchestration.std.detokenizer import run_detokenizer_process
 from sglang.srt.orchestration.std.scheduler import run_scheduler_process
@@ -90,7 +90,7 @@ def launch(
     detoken_proc.start()
 
     # Launch tokenizer process
-    entrypoint = TokenizerManager(server_args, port_args)
+    entrypoint = Entrypoint(server_args, port_args)
     if server_args.chat_template:
         load_chat_template_for_openai_api(entrypoint, server_args.chat_template)
 
