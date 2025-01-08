@@ -33,6 +33,11 @@ class DetokenizerManagerCommunicator:
             ]
         )
 
+    def recv_and_process_input_requests(self):
+        recv_obj = self._recv_from_scheduler.recv_pyobj()
+        output_obj = self._dispatcher(recv_obj)
+        self._send_to_tokenizer.send_pyobj(output_obj)
+
 
 def run_detokenizer_process(
     server_args: ServerArgs,
@@ -47,12 +52,8 @@ def run_detokenizer_process(
         communicator = DetokenizerManagerCommunicator(core=manager, port_args=port_args)
 
         while True:
-            recv_obj = self._recv_from_scheduler.recv_pyobj()
-            if isinstance(recv_obj, BatchEmbeddingOut):
-                self._send_to_tokenizer.send_pyobj(recv_obj)
-            else:
-                assert isinstance(recv_obj, BatchTokenIDOut)
-                self._send_to_tokenizer.send_pyobj(self.handle_batch_token_id_out(recv_obj))
+            communicator.recv_and_process_input_requests()
+
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
