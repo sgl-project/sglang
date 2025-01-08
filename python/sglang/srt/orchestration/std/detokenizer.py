@@ -43,7 +43,9 @@ def run_detokenizer_process(
     parent_process = psutil.Process().parent()
 
     try:
-        manager = DetokenizerManager(server_args, port_args)
+        manager = DetokenizerManager(server_args)
+        communicator = DetokenizerManagerCommunicator(core=manager, port_args=port_args)
+
         manager.event_loop()
     except Exception:
         traceback = get_exception_traceback()
