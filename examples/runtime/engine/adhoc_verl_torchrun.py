@@ -14,13 +14,12 @@
 
 import os
 from typing import List
-from sglang.srt.server.engine_fragment import EngineFragment
 
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
-from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
 import torch
+import torch.nn.functional as F
+from sglang.srt.server.engine_fragment import EngineFragment
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
 
 # COPIED FROM https://github.com/volcengine/verl/blob/gm/ci/tests/rollout/run_fsdp_vllm.py
@@ -103,19 +102,23 @@ def main():
                            max_new_tokens=response_length,
                            # logprobs=1, # TODO
                            ignore_eos=True,
-                           detokenize=False, # TODO
+                           detokenize=False,  # TODO
                            )
 
     print(actor_model_config)
     llm = EngineFragment(model=None,
-              tokenizer=tokenizer,
-              model_hf_config=actor_model_config,
-              tensor_parallel_size=tensor_model_parallel_size,
-              enforce_eager=True,
-              dtype='bfloat16',
-              load_format='dummy_dtensor',
-              gpu_memory_utilization=0.1,
-              trust_remote_code=True)
+                         tokenizer=tokenizer,
+                         model_hf_config=actor_model_config,
+                         tensor_parallel_size=tensor_model_parallel_size,
+                         enforce_eager=True,
+                         dtype='bfloat16',
+                         load_format='dummy_dtensor',
+                         gpu_memory_utilization=0.1,
+                         trust_remote_code=True,
+                         nccl_port=12345,
+                         tp_rank=rank,
+                         gpu_id=rank,
+                         )
 
     # llm.sync_model_weights(actor_weights=state_dict, load_format='dtensor')
 
@@ -134,6 +137,7 @@ def main():
         print(f'hf response: {tokenizer.batch_decode(response)}')
         print(f'vllm response: {tokenizer.batch_decode(vllm_output)}')
 
+
 # COPIED FROM verl
 def initialize_global_process_group(timeout_second=36000):
     import torch.distributed
@@ -146,6 +150,7 @@ def initialize_global_process_group(timeout_second=36000):
     if torch.distributed.is_initialized():
         torch.cuda.set_device(local_rank)
     return local_rank, rank, world_size
+
 
 # COPIED FROM verl
 def pad_sequence_to_length(tensors, max_seq_len, pad_token_id, left_pad=False):
@@ -160,6 +165,7 @@ def pad_sequence_to_length(tensors, max_seq_len, pad_token_id, left_pad=False):
     pad_tuple = (max_seq_len - tensors.shape[-1], 0) if left_pad else (0, max_seq_len - tensors.shape[-1])
     return F.pad(tensors, pad_tuple, 'constant', pad_token_id)
 
+
 # COPIED FROM verl
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
 def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
@@ -169,6 +175,6 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
+
 if __name__ == "__main__":
     main()
-
