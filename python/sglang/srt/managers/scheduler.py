@@ -1489,6 +1489,7 @@ class Scheduler:
     def shutdown(self):
         self.tp_worker.shutdown()
 
+
 @dataclass
 class SchedulerCallback:
     on_generation_output: Callable
