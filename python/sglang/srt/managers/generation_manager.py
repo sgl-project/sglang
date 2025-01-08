@@ -138,28 +138,7 @@ class GenerationManager:
         rid: str,
         req_obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
-        meta_info = {
-            "id": rid,
-            "finish_reason": recv_obj.finished_reasons[i],
-            "prompt_tokens": recv_obj.prompt_tokens[i],
-        }
-
-        if getattr(req_obj, "return_logprob", False):
-            self._convert_logprob_style(
-                meta_info,
-                req_obj.top_logprobs_num,
-                req_obj.return_text_in_logprobs,
-                recv_obj,
-                i,
-            )
-
-        if not isinstance(recv_obj, BatchEmbeddingOut):
-            meta_info.update(
-                {
-                    "completion_tokens": recv_obj.completion_tokens[i],
-                    "cached_tokens": recv_obj.cached_tokens[i],
-                }
-            )
+        meta_info = self._compute_meta_info(i, recv_obj, req_obj, rid)
 
         if isinstance(recv_obj, BatchStrOut):
             out_dict = {
@@ -186,6 +165,29 @@ class GenerationManager:
             }
 
         return out_dict
+
+    def _compute_meta_info(self, i, recv_obj, req_obj, rid):
+        meta_info = {
+            "id": rid,
+            "finish_reason": recv_obj.finished_reasons[i],
+            "prompt_tokens": recv_obj.prompt_tokens[i],
+        }
+        if getattr(req_obj, "return_logprob", False):
+            self._convert_logprob_style(
+                meta_info,
+                req_obj.top_logprobs_num,
+                req_obj.return_text_in_logprobs,
+                recv_obj,
+                i,
+            )
+        if not isinstance(recv_obj, BatchEmbeddingOut):
+            meta_info.update(
+                {
+                    "completion_tokens": recv_obj.completion_tokens[i],
+                    "cached_tokens": recv_obj.cached_tokens[i],
+                }
+            )
+        return meta_info
 
     def _convert_logprob_style(
         self,
