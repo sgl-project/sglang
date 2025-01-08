@@ -102,7 +102,7 @@ def main():
                            max_new_tokens=response_length,
                            # logprobs=1, # TODO
                            ignore_eos=True,
-                           detokenize=False,  # TODO
+                           # detokenize=False,  # TODO
                            )
 
     print(actor_model_config)
