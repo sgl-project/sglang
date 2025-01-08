@@ -12,4 +12,4 @@ class EngineFragment(EngineBase):
         self._entrypoint = Entrypoint()
 
     def _generate_impl(self, obj: GenerateReqInput):
-        TODO
+        return self._entrypoint.generate(obj)
