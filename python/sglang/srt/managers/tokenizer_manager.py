@@ -96,7 +96,6 @@ class TokenizerManager:
     ):
         # Parse args
         self.server_args = server_args
-        self.enable_metrics = server_args.enable_metrics
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -437,7 +436,9 @@ class _MetricReqState:
 
 
 class _GenerationManager:
-    def __init__(self):
+    def __init__(self, server_args: ServerArgs):
+        self.server_args = server_args
+
         self._generation_converter = GenerationConverter(
             server_args=server_args,
         )
@@ -445,7 +446,7 @@ class _GenerationManager:
         self.rid_to_state: Dict[str, ReqState] = {}
 
         # Metrics
-        if self.enable_metrics:
+        if server_args.enable_metrics:
             self._metric_manager = _MetricManager()
 
     async def generate_request(
