@@ -139,7 +139,6 @@ class TokenizerManager:
 
         self._generation_manager = _GenerationManager(
             server_args=server_args,
-            model_update_lock=self.model_update_lock,
             send_to_scheduler=self.send_to_scheduler,
         )
 
@@ -193,7 +192,8 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        self._generation_manager.generate_request(obj, request)
+        async with self.model_update_lock.reader_lock:
+            self._generation_manager.generate_request(obj, request)
 
     def abort_request(self, rid: str):
         self._generation_manager.abort_request(rid)
@@ -444,11 +444,9 @@ class _GenerationManager:
     def __init__(
         self,
         server_args: ServerArgs,
-        model_update_lock,
         send_to_scheduler,
     ):
         self.server_args = server_args
-        self.model_update_lock = model_update_lock
         self.send_to_scheduler = send_to_scheduler
 
         self._generation_converter = GenerationConverter(
@@ -479,18 +477,17 @@ class _GenerationManager:
         if self.server_args.log_requests:
             logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)}")
 
-        async with self.model_update_lock.reader_lock:
-            is_single = obj.is_single
-            if is_single:
-                tokenized_obj = await self._generation_converter.tokenize_request(obj)
-                self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, request):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(
-                    obj, request, created_time
-                ):
-                    yield response
+        is_single = obj.is_single
+        if is_single:
+            tokenized_obj = await self._generation_converter.tokenize_request(obj)
+            self._send_one_request(obj, tokenized_obj, created_time)
+            async for response in self._wait_one_response(obj, request):
+                yield response
+        else:
+            async for response in self._handle_batch_request(
+                obj, request, created_time
+            ):
+                yield response
 
     def _send_one_request(
         self,
