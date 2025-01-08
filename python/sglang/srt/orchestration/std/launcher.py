@@ -6,9 +6,9 @@ import signal
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
-from sglang.srt.orchestration.std.entrypoint import Entrypoint
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.orchestration.std.detokenizer import run_detokenizer_process
+from sglang.srt.orchestration.std.entrypoint import Entrypoint
 from sglang.srt.orchestration.std.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -22,6 +22,7 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 def launch(
     server_args: ServerArgs,
@@ -52,7 +53,7 @@ def launch(
         tp_rank_range = range(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
-            )
+        )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
@@ -120,7 +121,6 @@ def launch(
     return entrypoint, scheduler_info
 
 
-
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -161,5 +161,3 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-
-

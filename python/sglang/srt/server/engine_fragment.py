@@ -6,13 +6,13 @@ from sglang.srt.server_args import ServerArgs
 
 class EngineFragment(EngineBase):
     def __init__(
-            self,
-            nccl_port: int,
-            gpu_id: int,
-            tp_rank: int,
-            log_level: str = "error",
-            *args,
-            **kwargs,
+        self,
+        nccl_port: int,
+        gpu_id: int,
+        tp_rank: int,
+        log_level: str = "error",
+        *args,
+        **kwargs,
     ):
         server_args = ServerArgs(*args, log_level=log_level, **kwargs)
         self._entrypoint = Entrypoint(

@@ -131,9 +131,7 @@ def load_chat_template_for_openai_api(entrypoint, chat_template_arg):
         if chat_template_arg.endswith(".jinja"):
             with open(chat_template_arg, "r") as f:
                 chat_template = "".join(f.readlines()).strip("\n")
-            entrypoint.tokenizer.chat_template = chat_template.replace(
-                "\\n", "\n"
-            )
+            entrypoint.tokenizer.chat_template = chat_template.replace("\\n", "\n")
             chat_template_name = None
         else:
             assert chat_template_arg.endswith(
@@ -311,9 +309,7 @@ async def process_batch(entrypoint, batch_id: str, batch_request: BatchRequest):
                     cache_report=entrypoint.server_args.enable_cache_report,
                 )
             else:
-                responses = v1_generate_response(
-                    request, ret, entrypoint, to_file=True
-                )
+                responses = v1_generate_response(request, ret, entrypoint, to_file=True)
 
         except Exception as e:
             logger.error(f"error: {get_exception_traceback()}")
@@ -582,9 +578,7 @@ def v1_generate_response(request, ret, entrypoint, to_file=False):
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], int):
             # for the case of single token ids prompt
             prompts = [
-                entrypoint.tokenizer.decode(
-                    request.prompt, skip_special_tokens=True
-                )
+                entrypoint.tokenizer.decode(request.prompt, skip_special_tokens=True)
             ]
         else:
             # for the case of single str prompt

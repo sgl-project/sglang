@@ -26,6 +26,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
@@ -51,10 +52,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    get_zmq_socket,
-    kill_process_tree,
-)
+from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import TypeBasedDispatcher
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -366,6 +364,7 @@ class Entrypoint:
     @property
     def tokenizer(self):
         return self._generation_manager.tokenizer
+
 
 class _SignalHandler:
     def __init__(self, entrypoint):

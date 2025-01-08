@@ -85,9 +85,7 @@ async def health_generate(request: Request) -> Response:
         gri = EmbeddingReqInput(input_ids=[0], sampling_params=sampling_params)
 
     try:
-        async for _ in _global_state.engine.entrypoint.generate_request(
-            gri, request
-        ):
+        async for _ in _global_state.engine.entrypoint.generate_request(gri, request):
             break
         return Response(status_code=200)
     except Exception as e:
@@ -154,10 +152,8 @@ async def stop_profile_async():
 @time_func_latency
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk in-place without re-launching the server."""
-    success, message = (
-        await _global_state.engine.entrypoint.update_weights_from_disk(
-            obj, request
-        )
+    success, message = await _global_state.engine.entrypoint.update_weights_from_disk(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -177,10 +173,8 @@ async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    success, message = (
-        await _global_state.engine.entrypoint.init_weights_update_group(
-            obj, request
-        )
+    success, message = await _global_state.engine.entrypoint.init_weights_update_group(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -210,9 +204,7 @@ async def update_weights_from_distributed(
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.engine.entrypoint.get_weights_by_name(
-            obj, request
-        )
+        ret = await _global_state.engine.entrypoint.get_weights_by_name(obj, request)
         if ret is None:
             return create_error_response("Get parameter by name failed")
         else:
@@ -225,9 +217,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await _global_state.engine.entrypoint.open_session(
-            obj, request
-        )
+        session_id = await _global_state.engine.entrypoint.open_session(obj, request)
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
@@ -287,9 +277,7 @@ async def openai_v1_completions(raw_request: Request):
 @app.post("/v1/chat/completions")
 @time_func_latency
 async def openai_v1_chat_completions(raw_request: Request):
-    return await v1_chat_completions(
-        _global_state.engine.entrypoint, raw_request
-    )
+    return await v1_chat_completions(_global_state.engine.entrypoint, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)

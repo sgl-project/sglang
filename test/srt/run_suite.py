@@ -101,7 +101,7 @@ if __name__ == "__main__":
     else:
         files = suites[args.suite]
 
-    files = files[args.range_begin: args.range_end]
+    files = files[args.range_begin : args.range_end]
 
     print(f"{args=}")
     print("The running tests are ", files)

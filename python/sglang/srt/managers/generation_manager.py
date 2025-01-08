@@ -4,10 +4,10 @@ import dataclasses
 import logging
 import os
 import time
-from typing import Dict, List, Union, Any, Callable
-from typing import Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import fastapi
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -16,13 +16,9 @@ from sglang.srt.managers.image_processor import (
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
-)
-from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
-)
-from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     SessionParams,
@@ -32,9 +28,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    dataclass_to_string_truncated,
-)
+from sglang.srt.utils import dataclass_to_string_truncated
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +93,9 @@ class GenerationManager:
         created_time: Optional[float] = None,
     ):
         event = asyncio.Event()
-        state = _ReqState([], False, event, obj, metric=_MetricReqState(created_time=created_time))
+        state = _ReqState(
+            [], False, event, obj, metric=_MetricReqState(created_time=created_time)
+        )
         self.rid_to_state[obj.rid] = state
         self.on_request(tokenized_obj)
 
@@ -154,7 +150,9 @@ class GenerationManager:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
-                tokenized_obj = await self._generation_converter.tokenize_request(tmp_obj)
+                tokenized_obj = await self._generation_converter.tokenize_request(
+                    tmp_obj
+                )
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
@@ -226,15 +224,22 @@ class GenerationManager:
             if state is None:
                 continue
 
-            out_dict = self._generation_converter.postprocess_response(recv_obj, index, state.obj)
+            out_dict = self._generation_converter.postprocess_response(
+                recv_obj, index, state.obj
+            )
 
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[index] is not None
             state.event.set()
 
             if self._metric_manager:
-                self._metric_manager.handle_batch_output_metrics(recv_obj, index, state.metric, finished=state.finished,
-                                                                 stream=state.obj.stream)
+                self._metric_manager.handle_batch_output_metrics(
+                    recv_obj,
+                    index,
+                    state.metric,
+                    finished=state.finished,
+                    stream=state.obj.stream,
+                )
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
@@ -257,7 +262,7 @@ class _ReqState:
     event: asyncio.Event
     obj: Any
 
-    metric: '_MetricReqState'
+    metric: "_MetricReqState"
 
     # For streaming output
     last_output_offset: int = 0
@@ -336,7 +341,10 @@ class GenerationConverter:
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-        if obj.input_ids is not None and len(input_ids) >= self.model_config.context_len:
+        if (
+            obj.input_ids is not None
+            and len(input_ids) >= self.model_config.context_len
+        ):
             raise ValueError(
                 f"The input ({len(input_ids)} tokens) is longer than the "
                 f"model's context length ({self.model_config.context_len} tokens)."
@@ -379,7 +387,9 @@ class GenerationConverter:
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         objs = [obj[i] for i in range(obj.batch_size)]
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(asyncio.gather(*(self.tokenize_request(obj) for obj in objs)))
+        return loop.run_until_complete(
+            asyncio.gather(*(self.tokenize_request(obj) for obj in objs))
+        )
 
     def postprocess_response(
         self,
@@ -538,7 +548,7 @@ class _MetricManager:
         self,
         recv_obj,
         i: int,
-        state: '_MetricReqState',
+        state: "_MetricReqState",
         finished: bool,
         stream: bool,
     ):
@@ -554,8 +564,7 @@ class _MetricManager:
             if completion_tokens >= 2:
                 # Compute time_per_output_token for the streaming case
                 self._metrics_collector.observe_time_per_output_token(
-                    (time.time() - state.first_token_time)
-                    / (completion_tokens - 1)
+                    (time.time() - state.first_token_time) / (completion_tokens - 1)
                 )
         if finished:
             self._metrics_collector.inc_prompt_tokens(recv_obj.prompt_tokens[i])

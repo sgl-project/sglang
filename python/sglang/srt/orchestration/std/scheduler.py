@@ -7,6 +7,7 @@ from typing import List, Optional
 import psutil
 import setproctitle
 import zmq
+
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -21,23 +22,18 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import (
-    Req,
-)
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler, SchedulerCallback
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
-    get_zmq_socket,
-)
-from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
+    get_zmq_socket,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
-from sglang.utils import TypeBasedDispatcher
-from sglang.utils import get_exception_traceback
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 

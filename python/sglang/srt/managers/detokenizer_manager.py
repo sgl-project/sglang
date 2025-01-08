@@ -86,12 +86,12 @@ class DetokenizerManager:
 
             read_ids.append(
                 _trim_matched_stop(
-                    s.decode_ids[s.surr_offset:],
+                    s.decode_ids[s.surr_offset :],
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
                 )
             )
-            surr_ids.append(s.decode_ids[s.surr_offset: s.read_offset])
+            surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
         surr_texts = self.tokenizer.batch_decode(
@@ -109,7 +109,7 @@ class DetokenizerManager:
         output_strs = []
         for i in range(bs):
             s = self.decode_status[recv_obj.rids[i]]
-            new_text = read_texts[i][len(surr_texts[i]):]
+            new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):

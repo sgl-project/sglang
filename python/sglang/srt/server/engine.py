@@ -9,6 +9,8 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 import orjson
 import torch
 from fastapi import Request
+from starlette.responses import StreamingResponse
+
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -21,12 +23,8 @@ from sglang.srt.orchestration import std
 from sglang.srt.server.engine_base import EngineBase
 from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    MultiprocessingSerializer,
-    kill_process_tree,
-)
+from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.version import __version__
-from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +44,7 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
-        entrypoint, scheduler_info = std.launcher.launch(
-            server_args=server_args
-        )
+        entrypoint, scheduler_info = std.launcher.launch(server_args=server_args)
         self.entrypoint = entrypoint
         self.scheduler_info = scheduler_info
 
@@ -58,6 +54,7 @@ class Engine(EngineBase):
         ret = loop.run_until_complete(self._generate_raw(obj, None))
 
         if obj.stream is True:
+
             def generator_wrapper():
                 offset = 0
                 loop = asyncio.get_event_loop()
@@ -67,7 +64,7 @@ class Engine(EngineBase):
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -79,17 +76,17 @@ class Engine(EngineBase):
             return ret
 
     async def async_generate(
-            self,
-            # The input prompt. It can be a single prompt or a batch of prompts.
-            prompt: Optional[Union[List[str], str]] = None,
-            sampling_params: Optional[Dict] = None,
-            # The token ids for text; one can either specify text or input_ids.
-            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-            return_logprob: Optional[Union[List[bool], bool]] = False,
-            logprob_start_len: Optional[Union[List[int], int]] = None,
-            top_logprobs_num: Optional[Union[List[int], int]] = None,
-            lora_path: Optional[List[Optional[str]]] = None,
-            stream: bool = False,
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Dict] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -114,7 +111,7 @@ class Engine(EngineBase):
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -128,9 +125,7 @@ class Engine(EngineBase):
 
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
-                    async for out in self.entrypoint.generate_request(
-                            obj, request
-                    ):
+                    async for out in self.entrypoint.generate_request(obj, request):
                         yield b"data: " + orjson.dumps(
                             out, option=orjson.OPT_NON_STR_KEYS
                         ) + b"\n\n"
@@ -148,9 +143,7 @@ class Engine(EngineBase):
             )
         else:
             try:
-                ret = await self.entrypoint.generate_request(
-                    obj, request
-                ).__anext__()
+                ret = await self.entrypoint.generate_request(obj, request).__anext__()
                 return ret
             except ValueError as e:
                 logger.error(f"Error: {e}")
@@ -159,8 +152,8 @@ class Engine(EngineBase):
                 return create_error_response(e)
 
     def encode(
-            self,
-            prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
         obj = EmbeddingReqInput(text=prompt)
 
@@ -170,9 +163,7 @@ class Engine(EngineBase):
 
     async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
         try:
-            ret = await self.entrypoint.generate_request(
-                obj, request
-            ).__anext__()
+            ret = await self.entrypoint.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
             # TODO: maybe we should not return such ORJSONResponse for engine API,
@@ -202,13 +193,13 @@ class Engine(EngineBase):
         }
 
     def init_weights_update_group(
-            self,
-            master_address: str,
-            master_port: int,
-            rank_offset: int,
-            world_size: int,
-            group_name: str,
-            backend: str = "nccl",
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str = "nccl",
     ):
         """Initialize parameter update group."""
         obj = InitWeightsUpdateGroupReqInput(
@@ -250,9 +241,7 @@ class Engine(EngineBase):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.entrypoint.get_weights_by_name(obj, None)
-        )
+        return loop.run_until_complete(self.entrypoint.get_weights_by_name(obj, None))
 
 
 _STREAM_END_SYMBOL = b"data: [DONE]"
