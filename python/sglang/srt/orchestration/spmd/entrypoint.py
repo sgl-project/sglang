@@ -27,19 +27,20 @@ class Entrypoint:
 
     def generate(self, obj: GenerateReqInput):
         obj.normalize_batch_and_arguments()
+        tokenized_requests = self._generation_converter.tokenize_requests(obj)
+        rid_to_req_index = {r.rid: i for i, r in enumerate(tokenized_requests)}
 
         outputs: List[Dict[str, Any]] = [None] * obj.batch_size
 
         def _handle_scheduler_output(batch_token_id_out: BatchTokenIDOut):
             batch_str_out = self._detokenizer.handle_batch_token_id_out(batch_token_id_out)
             for output_index in range(len(batch_str_out)):
-                req_index = TODO
+                req_index = rid_to_req_index[batch_str_out.rids[output_index]]
                 outputs[req_index] = self._generation_converter.postprocess_response(
                     batch_str_out, index=output_index, req_obj=obj[req_index])
 
         self._scheduler.callback = SchedulerCallback(on_generation_output=_handle_scheduler_output)
 
-        tokenized_requests = self._generation_converter.tokenize_requests(obj)
         for tokenized_request in tokenized_requests:
             self._scheduler.handle_generate_request(tokenized_request)
 
