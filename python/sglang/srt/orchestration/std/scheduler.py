@@ -1,3 +1,4 @@
+import logging
 import os
 import signal
 from types import SimpleNamespace
@@ -162,6 +163,12 @@ def run_scheduler_process(
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
+        )
+        communicator = SchedulerCommunicator(
+            core=scheduler,
+            server_args=server_args,
+            port_args=port_args,
+            tp_rank=tp_rank,
         )
 
         pipe_writer.send(
