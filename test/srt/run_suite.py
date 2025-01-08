@@ -16,6 +16,7 @@ suites = {
         "test_eagle_infer.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
+        "test_fragment.py",
         "test_get_weights_by_name.py",
         "test_gguf.py",
         "test_input_embeddings.py",
@@ -66,7 +67,6 @@ for target_suite_name, target_tests in suites.items():
             tests.remove(target_suite_name)
             tests.extend(target_tests)
 
-
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
@@ -101,7 +101,7 @@ if __name__ == "__main__":
     else:
         files = suites[args.suite]
 
-    files = files[args.range_begin : args.range_end]
+    files = files[args.range_begin: args.range_end]
 
     print(f"{args=}")
     print("The running tests are ", files)
