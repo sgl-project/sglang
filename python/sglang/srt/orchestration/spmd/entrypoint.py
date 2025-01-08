@@ -20,4 +20,5 @@ class Entrypoint:
         )
 
     def generate(self, obj: GenerateReqInput):
+        self._scheduler.handle_generate_or_embedding_request()
         return TODO

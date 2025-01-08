@@ -429,16 +429,6 @@ class Scheduler:
 
         self.last_batch = batch
 
-    def handle_generate_or_embedding_request(
-            self,
-            recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
-    ):
-        if isinstance(recv_req, TokenizedGenerateReqInput):
-            return self.handle_generate_request(recv_req)
-        if isinstance(recv_req, TokenizedEmbeddingReqInput):
-            return self.handle_embedding_request(recv_req)
-        raise NotImplementedError
-
     def handle_generate_request(
             self,
             recv_req: TokenizedGenerateReqInput,
