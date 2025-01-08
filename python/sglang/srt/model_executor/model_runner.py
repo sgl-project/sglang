@@ -206,7 +206,7 @@ class ModelRunner:
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
-            # TODO(liangan1):Just use gloo to bypass the initilization fail
+            # TODO(liangan1): Just use gloo to bypass the initilization fail
             # Need to use xccl for xpu backend in the future
             backend = "gloo"
         elif self.device == "hpu":
@@ -661,7 +661,6 @@ class ModelRunner:
             )
 
     def init_double_sparsity_channel_config(self, selected_channel):
-
         selected_channel = "." + selected_channel + "_proj"
         self.sorted_channels = []
         # load channel config

@@ -66,7 +66,14 @@ class AttentionBackend(ABC):
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         else:
-            return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+            )
 
     def forward_decode(
         self,

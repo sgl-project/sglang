@@ -106,6 +106,9 @@ class ForwardMode(IntEnum):
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
 
+    def is_decode_or_idle(self):
+        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+
 
 class CaptureHiddenMode(IntEnum):
     NULL = auto()
