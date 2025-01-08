@@ -40,7 +40,6 @@ class TestFragment(unittest.TestCase):
             )
 
         for p in processes:
-            p.kill()
             p.join()
 
 
@@ -84,6 +83,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         raise
 
     print(f"subprocess[{tp_rank=}] end", flush=True)
+    exit(0)
 
 
 if __name__ == "__main__":
