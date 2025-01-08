@@ -1486,6 +1486,8 @@ class Scheduler:
         else:
             del self.sessions[session_id]
 
+    def shutdown(self):
+        self.tp_worker.shutdown()
 
 @dataclass
 class SchedulerCallback:

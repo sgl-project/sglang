@@ -233,5 +233,8 @@ class TpModelWorkerClient:
         return self.worker.get_weights_by_name(recv_req)
 
     def __delete__(self):
+        self.shutdown()
+
+    def shutdown(self):
         self.input_queue.put((None, None))
-        self.copy_queue.put((None, None, None))
+        # self.copy_queue.put((None, None, None)) # the queue seems not longer exist

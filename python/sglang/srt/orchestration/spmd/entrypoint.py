@@ -9,11 +9,11 @@ from sglang.srt.server_args import ServerArgs
 
 class Entrypoint:
     def __init__(
-        self,
-        server_args: ServerArgs,
-        nccl_port: int,
-        gpu_id: int,
-        tp_rank: int,
+            self,
+            server_args: ServerArgs,
+            nccl_port: int,
+            gpu_id: int,
+            tp_rank: int,
     ):
         self._scheduler = Scheduler(
             server_args=server_args,
@@ -55,7 +55,4 @@ class Entrypoint:
         return outputs
 
     def shutdown(self):
-        # TODO improve this later
-        # TpModelWorkerClient, without calling __delete__ on it, will have a forever loop in background thread,
-        # making the main process not able to exit
-        del self._scheduler.tp_worker
+        self._scheduler.shutdown()
