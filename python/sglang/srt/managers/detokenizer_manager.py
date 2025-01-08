@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.utils import find_printable_text
 
 logger = logging.getLogger(__name__)
@@ -94,92 +94,95 @@ class DetokenizerManager:
                 continue
             else:
                 assert isinstance(recv_obj, BatchTokenIDOut)
+           
+            self.handle_batch_token_id_out(recv_obj)
 
-            bs = len(recv_obj.rids)
+    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
+        bs = len(recv_obj.rids)
 
-            # Initialize decode status
-            read_ids, surr_ids = [], []
-            for i in range(bs):
-                rid = recv_obj.rids[i]
-                vid = recv_obj.vids[i]
-                if rid not in self.decode_status or self.decode_status[rid].vid != vid:
-                    s = DecodeStatus(
-                        vid=vid,
-                        decoded_text=recv_obj.decoded_texts[i],
-                        decode_ids=recv_obj.decode_ids[i],
-                        surr_offset=0,
-                        read_offset=recv_obj.read_offsets[i],
-                    )
-                    self.decode_status[rid] = s
+        # Initialize decode status
+        read_ids, surr_ids = [], []
+        for i in range(bs):
+            rid = recv_obj.rids[i]
+            vid = recv_obj.vids[i]
+            if rid not in self.decode_status or self.decode_status[rid].vid != vid:
+                s = DecodeStatus(
+                    vid=vid,
+                    decoded_text=recv_obj.decoded_texts[i],
+                    decode_ids=recv_obj.decode_ids[i],
+                    surr_offset=0,
+                    read_offset=recv_obj.read_offsets[i],
+                )
+                self.decode_status[rid] = s
+            else:
+                s = self.decode_status[rid]
+                s.decode_ids = recv_obj.decode_ids[i]
+
+            read_ids.append(
+                self.trim_matched_stop(
+                    s.decode_ids[s.surr_offset:],
+                    recv_obj.finished_reasons[i],
+                    recv_obj.no_stop_trim[i],
+                )
+            )
+            surr_ids.append(s.decode_ids[s.surr_offset: s.read_offset])
+
+        # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
+        surr_texts = self.tokenizer.batch_decode(
+            surr_ids,
+            skip_special_tokens=recv_obj.skip_special_tokens[0],
+            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+        )
+        read_texts = self.tokenizer.batch_decode(
+            read_ids,
+            skip_special_tokens=recv_obj.skip_special_tokens[0],
+            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+        )
+
+        # Incremental decoding
+        output_strs = []
+        for i in range(bs):
+            s = self.decode_status[recv_obj.rids[i]]
+            new_text = read_texts[i][len(surr_texts[i]):]
+            if recv_obj.finished_reasons[i] is None:
+                # Streaming chunk: update the decode status
+                if len(new_text) > 0 and not new_text.endswith("�"):
+                    s.decoded_text = s.decoded_text + new_text
+                    s.surr_offset = s.read_offset
+                    s.read_offset = len(s.decode_ids)
+                    new_text = ""
                 else:
-                    s = self.decode_status[rid]
-                    s.decode_ids = recv_obj.decode_ids[i]
+                    new_text = find_printable_text(new_text)
 
-                read_ids.append(
-                    self.trim_matched_stop(
-                        s.decode_ids[s.surr_offset:],
-                        recv_obj.finished_reasons[i],
-                        recv_obj.no_stop_trim[i],
-                    )
-                )
-                surr_ids.append(s.decode_ids[s.surr_offset: s.read_offset])
-
-            # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-            surr_texts = self.tokenizer.batch_decode(
-                surr_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
-            read_texts = self.tokenizer.batch_decode(
-                read_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
-
-            # Incremental decoding
-            output_strs = []
-            for i in range(bs):
-                s = self.decode_status[recv_obj.rids[i]]
-                new_text = read_texts[i][len(surr_texts[i]):]
-                if recv_obj.finished_reasons[i] is None:
-                    # Streaming chunk: update the decode status
-                    if len(new_text) > 0 and not new_text.endswith("�"):
-                        s.decoded_text = s.decoded_text + new_text
-                        s.surr_offset = s.read_offset
-                        s.read_offset = len(s.decode_ids)
-                        new_text = ""
-                    else:
-                        new_text = find_printable_text(new_text)
-
-                output_strs.append(
-                    self.trim_matched_stop(
-                        s.decoded_text + new_text,
-                        recv_obj.finished_reasons[i],
-                        recv_obj.no_stop_trim[i],
-                    )
-                )
-
-            self._send_to_tokenizer.send_pyobj(
-                BatchStrOut(
-                    rids=recv_obj.rids,
-                    finished_reasons=recv_obj.finished_reasons,
-                    output_strs=output_strs,
-                    prompt_tokens=recv_obj.prompt_tokens,
-                    origin_input_ids=recv_obj.origin_input_ids,
-                    output_ids=recv_obj.output_ids,
-                    completion_tokens=recv_obj.completion_tokens,
-                    cached_tokens=recv_obj.cached_tokens,
-                    input_token_logprobs_val=recv_obj.input_token_logprobs_val,
-                    input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
-                    output_token_logprobs_val=recv_obj.output_token_logprobs_val,
-                    output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
-                    input_top_logprobs_val=recv_obj.input_top_logprobs_val,
-                    input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
-                    output_top_logprobs_val=recv_obj.output_top_logprobs_val,
-                    output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
-                    normalized_prompt_logprob=recv_obj.normalized_prompt_logprob,
+            output_strs.append(
+                self.trim_matched_stop(
+                    s.decoded_text + new_text,
+                    recv_obj.finished_reasons[i],
+                    recv_obj.no_stop_trim[i],
                 )
             )
+
+        self._send_to_tokenizer.send_pyobj(
+            BatchStrOut(
+                rids=recv_obj.rids,
+                finished_reasons=recv_obj.finished_reasons,
+                output_strs=output_strs,
+                prompt_tokens=recv_obj.prompt_tokens,
+                origin_input_ids=recv_obj.origin_input_ids,
+                output_ids=recv_obj.output_ids,
+                completion_tokens=recv_obj.completion_tokens,
+                cached_tokens=recv_obj.cached_tokens,
+                input_token_logprobs_val=recv_obj.input_token_logprobs_val,
+                input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
+                output_token_logprobs_val=recv_obj.output_token_logprobs_val,
+                output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
+                input_top_logprobs_val=recv_obj.input_top_logprobs_val,
+                input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
+                output_top_logprobs_val=recv_obj.output_top_logprobs_val,
+                output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+                normalized_prompt_logprob=recv_obj.normalized_prompt_logprob,
+            )
+        )
 
 
 class LimitedCapacityDict(OrderedDict):
