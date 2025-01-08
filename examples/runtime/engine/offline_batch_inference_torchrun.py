@@ -2,7 +2,7 @@ import datetime
 import os
 import sys
 
-from sglang import Engine
+from sglang.srt.server.engine_fragment import EngineFragment
 
 
 def run():
@@ -55,17 +55,17 @@ def run():
     ]:
         del os.environ[k]
 
-    engine = Engine(
+    fragment = EngineFragment(
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
         tp_size=tp_size,
-        fragment_tp_rank=tp_rank,
-        fragment_nccl_port=23456,
-        fragment_gpu_id=tp_rank,
+        tp_rank=tp_rank,
+        nccl_port=23456,
+        gpu_id=tp_rank,
     )
-    _log(f"{engine=}")
+    _log(f"{fragment=}")
 
-    output = engine.generate(
+    output = fragment.generate(
         prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
         sampling_params=dict(max_new_tokens=16, temperature=0.0),
     )
