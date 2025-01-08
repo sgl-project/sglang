@@ -261,8 +261,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            cache_k = (cache_k * k_scale).to(self.dtype)
-            cache_v = (cache_v * v_scale).to(self.dtype)
+            cache_k = (cache_k / k_scale).to(self.dtype)
+            cache_v = (cache_v / v_scale).to(self.dtype)
         if self.store_dtype != self.dtype:
             self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
             self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)

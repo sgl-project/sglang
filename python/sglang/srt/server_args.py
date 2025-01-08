@@ -53,6 +53,7 @@ class ServerArgs:
     trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
+    quantization_param_path: nullable_str = None
     quantization: Optional[str] = None
     context_length: Optional[int] = None
     device: str = "cuda"

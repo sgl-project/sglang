@@ -278,17 +278,15 @@ class ModelRunner:
             device_config=DeviceConfig(self.device),
         )
 
-        if self.server_args.kv_cache_dtype == "fp8" and (
-            current_platform.is_rocm() or current_platform.is_cuda()
-        ):
-            if self.model_config.quantization_param_path is not None:
+        if self.server_args.kv_cache_dtype == "fp8_e4m3":
+            if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
                     self.model.load_kv_cache_scales(
-                        self.model_config.quantization_param_path
+                        self.server_args.quantization_param_path
                     )
                     logger.info(
                         "Loaded KV cache scaling factors from %s",
-                        self.model_config.quantization_param_path,
+                        self.server_args.quantization_param_path,
                     )
                 else:
                     raise RuntimeError(
