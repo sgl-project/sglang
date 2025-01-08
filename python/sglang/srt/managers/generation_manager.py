@@ -184,9 +184,8 @@ class GenerationManager:
                 "embedding": recv_obj.embeddings[i],
                 "meta_info": meta_info,
             }
-        state.out_list.append(out_dict)
-        state.finished = recv_obj.finished_reasons[i] is not None
-        state.event.set()
+
+        return out_dict
 
     def _convert_logprob_style(
         self,
