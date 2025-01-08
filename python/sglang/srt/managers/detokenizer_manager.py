@@ -59,29 +59,6 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict()
 
-    def _trim_matched_stop(
-        self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
-    ):
-        if no_stop_trim or not finished_reason:
-            return output
-
-        matched = finished_reason.get("matched", None)
-        if not matched:
-            return output
-
-        # TODO(lmzheng): handle the case where multiple stop strs are hit
-
-        # Trim stop str.
-        if isinstance(matched, str) and isinstance(output, str):
-            pos = output.find(matched)
-            return output[:pos] if pos != -1 else output
-
-        # Trim stop token.
-        if isinstance(matched, int) and isinstance(output, list):
-            assert len(output) > 0
-            return output[:-1]
-        return output
-
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
@@ -170,6 +147,29 @@ class DetokenizerManager:
             output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
             normalized_prompt_logprob=recv_obj.normalized_prompt_logprob,
         )
+
+    def _trim_matched_stop(
+        self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
+    ):
+        if no_stop_trim or not finished_reason:
+            return output
+
+        matched = finished_reason.get("matched", None)
+        if not matched:
+            return output
+
+        # TODO(lmzheng): handle the case where multiple stop strs are hit
+
+        # Trim stop str.
+        if isinstance(matched, str) and isinstance(output, str):
+            pos = output.find(matched)
+            return output[:pos] if pos != -1 else output
+
+        # Trim stop token.
+        if isinstance(matched, int) and isinstance(output, list):
+            assert len(output) > 0
+            return output[:-1]
+        return output
 
 
 class LimitedCapacityDict(OrderedDict):
