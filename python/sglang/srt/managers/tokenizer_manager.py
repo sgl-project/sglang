@@ -157,9 +157,9 @@ class TokenizerManager:
 
         self._dispatcher = TypeBasedDispatcher(
             [
-                (BatchStrOut, self._handle_batch_output),
-                (BatchEmbeddingOut, self._handle_batch_output),
-                (BatchTokenIDOut, self._handle_batch_output),
+                (BatchStrOut, self._generation_manager.handle_batch_output),
+                (BatchEmbeddingOut, self._generation_manager.handle_batch_output),
+                (BatchTokenIDOut, self._generation_manager.handle_batch_output),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -607,7 +607,7 @@ class _GenerationManager:
                     except StopAsyncIteration:
                         pass
 
-    def _handle_batch_output(
+    def handle_batch_output(
         self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
     ):
         for index, rid in enumerate(recv_obj.rids):
