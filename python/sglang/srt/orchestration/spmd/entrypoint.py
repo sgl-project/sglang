@@ -36,7 +36,6 @@ class Entrypoint:
             batch_str_out = self._detokenizer.handle_batch_token_id_out(batch_token_id_out)
             for output_index in range(len(batch_str_out.rids)):
                 req_index = rid_to_req_index[batch_str_out.rids[output_index]]
-                assert outputs[req_index] is None
                 outputs[req_index] = self._generation_converter.postprocess_response(
                     batch_str_out, index=output_index, req_obj=obj[req_index])
 
