@@ -86,7 +86,7 @@ def _fwd_kernel(
     cur_head = tl.program_id(1)
     cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
-    scale_dtype = K_Scale_Zeros_Buffer.dtype.element_ty
+    scale_dtype = Q_Extend.dtype.element_ty
 
     cur_seq_len = tl.load(B_Seq_Len + cur_seq)
     cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq)

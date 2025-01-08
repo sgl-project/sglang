@@ -83,7 +83,7 @@ def _fwd_kernel_stage1(
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
-    scale_dtype = K_Scale_Zeros_Buffer.dtype.element_ty
+    scale_dtype = Q.dtype.element_ty
 
     cur_kv_head = cur_head // kv_group_num
 
@@ -355,7 +355,7 @@ def _fwd_grouped_kernel_stage1(
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
-    scale_dtype = K_Scale_Zeros_Buffer.dtype.element_ty
+    scale_dtype = Q.dtype.element_ty
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -787,9 +787,9 @@ def decode_attention_fwd_grouped(
     q,
     k_buffer,
     v_buffer,
-    o,
     k_scale_zeros_buffer,
     v_scale_zeros_buffer,
+    o,
     req_to_token,
     b_req_idx,
     b_seq_len,
@@ -819,9 +819,9 @@ def decode_attention_fwd(
     q,
     k_buffer,
     v_buffer,
-    o,
     k_scale_zeros_buffer,
     v_scale_zeros_buffer,
+    o,
     req_to_token,
     b_req_idx,
     b_seq_len,
