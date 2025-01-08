@@ -47,7 +47,7 @@ class GenerationManager:
         self.server_args = server_args
         self.on_request = on_request
 
-        self._generation_converter = _GenerationConverter(
+        self._generation_converter = GenerationConverter(
             server_args=server_args,
         )
 
@@ -254,7 +254,7 @@ class _ReqState:
     last_output_offset: int = 0
 
 
-class _GenerationConverter:
+class GenerationConverter:
     """Preprocessors and postprocessors for generation"""
 
     def __init__(
