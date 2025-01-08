@@ -138,12 +138,12 @@ class DetokenizerManager:
             surr_texts = self.tokenizer.batch_decode(
                 surr_ids,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+                # spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
             read_texts = self.tokenizer.batch_decode(
                 read_ids,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+                # spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
 
             # Incremental decoding
