@@ -31,9 +31,8 @@ class Entrypoint:
         def _handle_scheduler_output(batch_token_id_out: BatchTokenIDOut):
             batch_str_out = self._detokenizer.handle_batch_token_id_out(batch_token_id_out)
             for index in range(len(batch_str_out)):
-                output = self._generation_converter.postprocess_response(
-                    batch_str_out, index=index, rid=TODO, req_obj=TODO)
-                outputs.append(output)
+                outputs.append(self._generation_converter.postprocess_response(
+                    batch_str_out, index=index, req_obj=TODO))
 
         self._scheduler.callback = SchedulerCallback(on_generation_output=_handle_scheduler_output)
 
