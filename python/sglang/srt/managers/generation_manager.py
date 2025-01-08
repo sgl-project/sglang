@@ -3,7 +3,7 @@ import copy
 import dataclasses
 import os
 import time
-from typing import Dict, List, Union, Any
+from typing import Dict, List, Union, Any, Callable
 from typing import Optional
 
 import fastapi
@@ -39,10 +39,10 @@ class GenerationManager:
     def __init__(
         self,
         server_args: ServerArgs,
-        send_to_scheduler,
+        on_request: Callable,
     ):
         self.server_args = server_args
-        self.send_to_scheduler = send_to_scheduler
+        self.on_request = on_request
 
         self._generation_converter = _GenerationConverter(
             server_args=server_args,
@@ -93,7 +93,7 @@ class GenerationManager:
         event = asyncio.Event()
         state = _ReqState([], False, event, obj, metric=_MetricReqState(created_time=created_time))
         self.rid_to_state[obj.rid] = state
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        self.on_request(tokenized_obj)
 
     async def _wait_one_response(
         self,
@@ -233,7 +233,7 @@ class GenerationManager:
             return
         del self.rid_to_state[rid]
         req = AbortReq(rid)
-        self.send_to_scheduler.send_pyobj(req)
+        self.on_request(req)
 
 
 @dataclasses.dataclass

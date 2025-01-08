@@ -28,6 +28,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
@@ -115,7 +116,7 @@ class TokenizerManager:
 
         self._generation_manager = GenerationManager(
             server_args=server_args,
-            send_to_scheduler=self.send_to_scheduler,
+            on_request=self.send_to_scheduler.send_pyobj,
         )
 
         # Others
