@@ -105,7 +105,7 @@ class GenerationManager:
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            tokenized_obj = TokenizedGenerateReqInput(
+            return TokenizedGenerateReqInput(
                 obj.rid,
                 input_text,
                 input_ids,
@@ -120,7 +120,7 @@ class GenerationManager:
                 session_params=session_params,
             )
         elif isinstance(obj, EmbeddingReqInput):
-            tokenized_obj = TokenizedEmbeddingReqInput(
+            return TokenizedEmbeddingReqInput(
                 obj.rid,
                 input_text,
                 input_ids,
@@ -128,8 +128,6 @@ class GenerationManager:
             )
         else:
             raise NotImplementedError
-
-        return tokenized_obj
 
     def handle_batch_output_item(
         self,
