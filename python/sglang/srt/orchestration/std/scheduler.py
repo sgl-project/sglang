@@ -23,7 +23,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     Req,
 )
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler import Scheduler, SchedulerCallback
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -70,13 +70,13 @@ class SchedulerCommunicator:
                 )
             else:
                 # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+                self._send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name
                 )
         else:
             self._recv_from_tokenizer = None
             self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         self._dispatcher = TypeBasedDispatcher(
             [
@@ -96,6 +96,10 @@ class SchedulerCommunicator:
                 (OpenSessionReqInput, self.core.open_session),
                 (CloseSessionReqInput, self.core.close_session),
             ]
+        )
+
+        core.callback = SchedulerCallback(
+            on_output=self._send_to_detokenizer.send_pyobj,
         )
 
     def _recv_requests(self) -> List[Req]:

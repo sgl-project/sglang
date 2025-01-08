@@ -21,7 +21,8 @@ import time
 import warnings
 from collections import deque
 from concurrent import futures
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Union, Callable
 
 import psutil
 import torch
@@ -115,6 +116,7 @@ class Scheduler:
             if not self.spec_algorithm.is_none()
             else 1
         )
+        self.callback: Optional[SchedulerCallback] = None
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -1244,7 +1246,7 @@ class Scheduler:
 
             # Send to detokenizer
             if rids:
-                self.send_to_detokenizer.send_pyobj(
+                self.callback.on_output(
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
@@ -1280,7 +1282,7 @@ class Scheduler:
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
-            self.send_to_detokenizer.send_pyobj(
+            self.callback.on_output(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
@@ -1495,3 +1497,8 @@ class Scheduler:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
             del self.sessions[session_id]
+
+
+@dataclass
+class SchedulerCallback:
+    on_output: Callable
