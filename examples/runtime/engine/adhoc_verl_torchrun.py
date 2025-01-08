@@ -186,7 +186,8 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     # remove the left padding in the prompt token_id
     # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
     nonzero = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)
-    token_ids = prompt_token_ids[nonzero[0][0]:nonzero[0][-1] + 1].tolist()
+    print(f'hi _pre_process_inputs {pad_token_id=} {prompt_token_ids=} {nonzero=}')
+    token_ids = prompt_token_ids[nonzero[0][0]:nonzero[-1][0] + 1].tolist()
     return token_ids
 
 
