@@ -179,9 +179,9 @@ class TokenizerManager:
 
         self._dispatcher = TypeBasedDispatcher(
             [
-                (BatchStrOut, self._handle_batch_output),
-                (BatchEmbeddingOut, self._handle_batch_output),
-                (BatchTokenIDOut, self._handle_batch_output),
+                (BatchStrOut, self.generation_manager.handle_batch_output),
+                (BatchEmbeddingOut, self.generation_manager.handle_batch_output),
+                (BatchTokenIDOut, self.generation_manager.handle_batch_output),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -556,15 +556,6 @@ class TokenizerManager:
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._dispatcher(recv_obj)
-
-    def _handle_batch_output(
-        self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
-    ):
-        for i, rid in enumerate(recv_obj.rids):
-            state = self.rid_to_state.get(rid, None)
-            if state is None:
-                continue
-            self.generation_manager.handle_batch_output_item(recv_obj, i, state)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
