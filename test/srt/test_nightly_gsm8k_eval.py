@@ -99,7 +99,9 @@ def write_results_to_json(model, metrics, mode="a"):
 
 def check_model_scores(results):
     failed_models = []
-    summary = ""
+    summary = " | model | score | threshold |\n"
+    summary += "| ----- | ----- | --------- |\n"
+
     for model, score in results:
         threshold = MODEL_SCORE_THRESHOLDS.get(model)
         if threshold is None:
@@ -112,8 +114,10 @@ def check_model_scores(results):
                 f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
             )
 
-        line = str({"model": model, "score": score, "threshold": threshold})
-        summary += line + "\n"
+        line = f"| {model} | {score} | {threshold} |"
+        summary += line
+
+    print(summary)
 
     if is_in_ci():
         write_github_step_summary(f"### TestNightlyGsm8KEval\n{summary}")
