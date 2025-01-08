@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Any, Dict
 
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.generation_manager import GenerationConverter
@@ -26,12 +26,14 @@ class Entrypoint:
         self._generation_converter = GenerationConverter(server_args, model_config=TODO)
 
     def generate(self, obj: GenerateReqInput):
-        outputs: List[TODO] = []
+        outputs: List[Dict[str, Any]] = []
 
         def _handle_scheduler_output(batch_token_id_out: BatchTokenIDOut):
             batch_str_out = self._detokenizer.handle_batch_token_id_out(batch_token_id_out)
-            self._generation_converter.postprocess_response(batch_str_out, index=TODO, rid=TODO, req_obj=TODO)
-            TODO
+            for index in range(len(batch_str_out)):
+                output = self._generation_converter.postprocess_response(
+                    batch_str_out, index=index, rid=TODO, req_obj=TODO)
+                outputs.append(output)
 
         self._scheduler.callback = SchedulerCallback(on_generation_output=_handle_scheduler_output)
 
