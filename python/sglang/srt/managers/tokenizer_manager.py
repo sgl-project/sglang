@@ -129,7 +129,6 @@ class TokenizerManager:
 
         # Store states
         self.to_create_loop = True
-        self.rid_to_state: Dict[str, ReqState] = {}
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
@@ -446,6 +445,8 @@ class _GenerationManager:
         self._generation_converter = GenerationConverter(
             server_args=server_args,
         )
+
+        self.rid_to_state: Dict[str, ReqState] = {}
 
     async def generate_request(
         self,
