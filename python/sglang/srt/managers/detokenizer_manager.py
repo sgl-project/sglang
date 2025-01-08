@@ -59,7 +59,7 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict()
 
-    def trim_matched_stop(
+    def _trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
         if no_stop_trim or not finished_reason:
@@ -108,7 +108,7 @@ class DetokenizerManager:
                 s.decode_ids = recv_obj.decode_ids[i]
 
             read_ids.append(
-                self.trim_matched_stop(
+                self._trim_matched_stop(
                     s.decode_ids[s.surr_offset:],
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
@@ -144,7 +144,7 @@ class DetokenizerManager:
                     new_text = find_printable_text(new_text)
 
             output_strs.append(
-                self.trim_matched_stop(
+                self._trim_matched_stop(
                     s.decoded_text + new_text,
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
