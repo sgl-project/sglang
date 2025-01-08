@@ -1,12 +1,13 @@
 # Use Models From ModelScope
 
-To use a model from [ModelScope](https://www.modelscope.cn), set the environment variable SGLANG_USE_MODELSCOPE.
+To use a model from [ModelScope](https://www.modelscope.cn), set the environment variable `SGLANG_USE_MODELSCOPE`.
 
 ```bash
 export SGLANG_USE_MODELSCOPE=true
 ```
 
 We take [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) as an example. Launch the Server:
+---
 
 ```bash
 python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
@@ -24,4 +25,4 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 30000
 ```
 
-If you want to deploy a model with a large parameter weight, e.g. meta-llama/`Meta-Llama-3.1-405B-Instruct`, it's a good idea to map `/root/.cache/modelscope` to your `/data` directory, e.g. `-v /data/.cache/modelscope:/root/.cache/modelscope`. Note that modelscope uses a different cache directory than huggingface. You may need to set it manually to avoid running out of disk space.
+Note that modelscope uses a different cache directory than huggingface. You may need to set it manually to avoid running out of disk space.
