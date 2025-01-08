@@ -8,7 +8,6 @@ from typing import Optional
 
 import fastapi
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.generation_manager import GenerationConverter
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
     get_image_processor,
@@ -45,7 +44,7 @@ class GenerationManager:
         self.server_args = server_args
         self.send_to_scheduler = send_to_scheduler
 
-        self._generation_converter = GenerationConverter(
+        self._generation_converter = _GenerationConverter(
             server_args=server_args,
         )
 
@@ -252,7 +251,7 @@ class _ReqState:
     last_output_offset: int = 0
 
 
-class GenerationConverter:
+class _GenerationConverter:
     """Preprocessors and postprocessors for generation"""
 
     def __init__(
