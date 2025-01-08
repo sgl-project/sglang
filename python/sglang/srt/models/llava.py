@@ -30,7 +30,6 @@ from transformers import (
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
-from sglang.srt.configs import Phi3VConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.mm_utils import (
@@ -40,7 +39,7 @@ from sglang.srt.mm_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.llama import LlamaForCausalLM, Phi3ForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
@@ -555,41 +554,4 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
             )
 
 
-class LlavaPhi3VForCausalLM(LlavaBaseForCausalLM):
-    def __init__(
-        self,
-        config: LlavaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
-
-        self.config = config
-        self.vision_tower = None
-
-        if getattr(self.config, "vision_config", None) is None:
-            self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
-        if getattr(self.config, "text_config", None) is None:
-            self.config.text_config = Phi3VConfig(self.config._name_or_path)
-
-        self.config.vision_config.hidden_size = config.mm_hidden_size
-        self.config.text_config.hidden_size = config.hidden_size
-
-        if getattr(self.config, "projector_hidden_act", None) is None:
-            self.config.projector_hidden_act = "gelu"
-        if getattr(self.config, "image_token_index", None) is None:
-            self.config.image_token_index = 32044
-
-        self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = Phi3ForCausalLM(config, quant_config=quant_config)
-        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
-            self.language_model.model.image_newline = nn.Parameter(
-                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
-            )
-
-
-EntryClass = [
-    LlavaLlamaForCausalLM,
-    LlavaQwenForCausalLM,
-    LlavaMistralForCausalLM,
-    LlavaPhi3VForCausalLM,
-]
+EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]

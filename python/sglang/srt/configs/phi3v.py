@@ -15,7 +15,9 @@
 
 """ Phi-3-V model configuration"""
 
+from dataclasses import dataclass
 
+from transformers import CLIPVisionConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
@@ -221,3 +223,42 @@ class Phi3VConfig(PretrainedConfig):
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
             )
+
+
+@dataclass
+class Phi3VCLIPVisionConfig:
+    attention_dropout: float = 0.0
+    dropout: float = 0.0
+    hidden_act: str = "quick_gelu"
+    hidden_size: int = 1024
+    image_size: int = 336
+    initializer_factor: float = 1.0
+    initializer_range: float = 0.02
+    intermediate_size: int = 4096
+    layer_norm_eps: float = 1e-5
+    num_attention_heads: int = 16
+    num_channels: int = 3
+    num_hidden_layers: int = 24
+    patch_size: int = 14
+    projection_dim: int = 768
+
+    def to_transformers_config(self) -> CLIPVisionConfig:
+        """
+        Converts this dataclass into a Hugging Face CLIPVisionConfig object.
+        """
+        return CLIPVisionConfig(
+            attention_dropout=self.attention_dropout,
+            dropout=self.dropout,
+            hidden_act=self.hidden_act,
+            hidden_size=self.hidden_size,
+            image_size=self.image_size,
+            initializer_factor=self.initializer_factor,
+            initializer_range=self.initializer_range,
+            intermediate_size=self.intermediate_size,
+            layer_norm_eps=self.layer_norm_eps,
+            num_attention_heads=self.num_attention_heads,
+            num_channels=self.num_channels,
+            num_hidden_layers=self.num_hidden_layers,
+            patch_size=self.patch_size,
+            projection_dim=self.projection_dim,
+        )
