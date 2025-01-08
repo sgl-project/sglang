@@ -66,7 +66,7 @@ def run():
     _log(f"{fragment=}")
 
     output = fragment.generate(
-        prompt="1+1=2, 1+2=3, 1+3=4, 1+4=",
+        prompt=["1+1=2, 1+2=3, 1+3=4, 1+4=", "9-1=8, 8-1=7, 7-1="],
         sampling_params=dict(max_new_tokens=16, temperature=0.0),
     )
     _log(f"{output=}")
