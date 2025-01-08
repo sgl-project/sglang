@@ -256,8 +256,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float,
-        v_scale: float,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
