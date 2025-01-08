@@ -24,3 +24,6 @@ class EngineFragment(EngineBase):
 
     def _generate_impl(self, obj: GenerateReqInput):
         return self._entrypoint.generate(obj)
+
+    def shutdown(self):
+        self._entrypoint.shutdown()

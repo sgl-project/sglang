@@ -53,3 +53,9 @@ class Entrypoint:
             pass
 
         return outputs
+
+    def shutdown(self):
+        # TODO improve this later
+        # TpModelWorkerClient, without calling __delete__ on it, will have a forever loop in background thread,
+        # making the main process not able to exit
+        del self._scheduler.tp_worker
