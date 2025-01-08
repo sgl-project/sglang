@@ -100,7 +100,7 @@ class SchedulerCommunicator:
         )
 
         core.callback = SchedulerCallback(
-            on_output=self._send_to_detokenizer.send_pyobj,
+            on_generation_output=self._send_to_detokenizer.send_pyobj,
         )
 
     def recv_and_process_input_requests(self):

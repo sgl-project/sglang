@@ -1244,7 +1244,7 @@ class Scheduler:
 
             # Send to detokenizer
             if rids:
-                self.callback.on_output(
+                self.callback.on_generation_output(
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
@@ -1280,7 +1280,7 @@ class Scheduler:
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
-            self.callback.on_output(
+            self.callback.on_generation_output(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
@@ -1499,4 +1499,4 @@ class Scheduler:
 
 @dataclass
 class SchedulerCallback:
-    on_output: Callable
+    on_generation_output: Callable
