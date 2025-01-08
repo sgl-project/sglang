@@ -8,7 +8,8 @@ import threading
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
-    BaseTokenToKVPool
+    BaseTokenToKVPool,
+    MHATokenToKVPool
 )
 
 from hip.models.hip_attention.gen3.uvm_gpu_cache import (
@@ -45,6 +46,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         self.max_mask_cache_token_size = max_mask_cache_token_size * head_num
         self.max_sa_cache_token_size = max_sa_cache_token_size * head_num
         
+        self.online_update_cache = os.getenv('DEBUG_ONLINE', '0') == '1'
         self.layer_buffer = [
             HiPOffloadCache(
                 max_token_size=max_token_size + 1,
@@ -54,6 +56,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 head_dim=head_dim,
                 dtype=dtype,
                 device=device,
+                online_cache_update=self.online_update_cache,
             )
             for _ in range(layer_num)
         ]
@@ -80,6 +83,19 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             f'Allocated total GPU bytes: {format_size_bytes(gpu_allocated_bytes)}, '
             f'{self.dtype} on {self.device}'
         )
+
+        self.require_validation = os.getenv('HIP_OFFLOAD_CACHE_VALIDATION', '0') == '1'
+        if self.require_validation:
+            self.validation_cache = MHATokenToKVPool(
+                max_token_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=layer_num,
+                device=self.device,
+            )
+        else:
+            self.validation_cache = None
 
     def get_key_buffer(self, layer_id: int):
         raise NotImplementedError()
@@ -115,10 +131,11 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 try:
                     stream = torch.cuda.Stream(device=self.device, priority=0)
                     stream.wait_event(start_event)
+                    stream.synchronize()
 
                     with torch.cuda.stream(stream):
                         k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
-                            table=table,
+                            table=table.to(torch.int64),
                             device=self.device,
                         )
                         assert k.device == self.device
@@ -134,7 +151,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             t.start()
         else:
             k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
-                table=table,
+                table=table.to(torch.int64),
                 device=self.device,
             )
             assert k.device == self.device
@@ -180,19 +197,35 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         assert k.shape[1] == prefix_seq_len + cache_k.shape[1]
         assert k.dtype in [torch.float8_e5m2, torch.float16, torch.bfloat16, torch.float32]
 
-        if self.dtype not in [torch.float8_e5m2]:
-            assert cache_k.dtype == self.dtype
-        else:
-            if cache_k.dtype != self.dtype:
-                cache_k = cache_k.to(self.dtype)
-                cache_v = cache_v.to(self.dtype)
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+        # if self.dtype not in [torch.float8_e5m2]:
+        #     assert cache_k.dtype == self.dtype
+        # else:
+        #     if cache_k.dtype != self.dtype:
+        #         cache_k = cache_k.to(self.dtype)
+        #         cache_v = cache_v.to(self.dtype)
         
-        if prefix_seq_len == 0:
-            return cache_k, cache_v
+        k[:, prefix_seq_len:, :, :] = cache_k
+        v[:, prefix_seq_len:, :, :] = cache_v
+
+        if self.require_validation:
+            k_valid, v_valid = self.validation_cache.get_kv_buffer(layer_id)
+
+            assert k.dtype == k_valid.dtype
+
+            k_valid_packed = k_valid[table].unsqueeze(0)
+            v_valid_packed = v_valid[table].unsqueeze(0)
+
+            k_err = ((k_valid_packed - k) ** 2).sum()
+            v_err = ((v_valid_packed - v) ** 2).sum()
+
+            assert k_err < 1e-5, k_err
+            assert v_err < 1e-5, v_err
+
+            return k, v, k_valid, v_valid
         else:
-            k[:, prefix_seq_len:, :, :].copy_(cache_k)
-            v[:, prefix_seq_len:, :, :].copy_(cache_v)
-            
             return k, v
 
     def set_kv_buffer(
@@ -204,6 +237,11 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         async_copy: bool = False,
         push_to_gpu_cache: bool = False,
     ):
+        if self.require_validation:
+            self.validation_cache.set_kv_buffer(
+                layer, table, cache_k, cache_v,
+            )
+
         if not self.enable_async:
             async_copy = False
         
@@ -223,9 +261,10 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 try:
                     stream = torch.cuda.Stream(device=self.device)
                     stream.wait_event(start_event)
+                    stream.synchronize()
 
                     with torch.cuda.stream(stream):
-                        table_gpu = table
+                        table_gpu = table.to(torch.int64)
                         table_cpu = table.to('cpu', non_blocking=False)
                         cache_k_cpu = cache_k.to('cpu', non_blocking=False)
                         cache_v_cpu = cache_v.to('cpu', non_blocking=False)

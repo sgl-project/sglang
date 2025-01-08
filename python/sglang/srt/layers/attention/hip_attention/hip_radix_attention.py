@@ -126,56 +126,103 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else:
                 if is_offload_cache:
                     assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
-                    k_chunk, v_chunk = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
-                        layer_id=layer.layer_id,
-                        batch_id=idx_batch,
-                        cache_k=k[start_len:start_len+seq_len].unsqueeze(0),
-                        cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
-                    )
-
-                    # print(k_chunk.shape)
-
-                    # BUG: test padding...
-                    # _k_chunk = torch.zeros((1, 196608, k_chunk.shape[2], k_chunk.shape[3]), dtype=k_chunk.dtype, device=k_chunk.device)
-                    # _v_chunk = torch.zeros((1, 196608, k_chunk.shape[2], k_chunk.shape[3]), dtype=k_chunk.dtype, device=k_chunk.device)
-                    # _k_chunk[:, :k_chunk.shape[1], :, :] = k_chunk
-                    # _v_chunk[:, :v_chunk.shape[1], :, :] = v_chunk
-                    # k_chunk = _k_chunk
-                    # v_chunk = _v_chunk
-
-                    # print(k_chunk.shape)
-
-                    k_cache = v_cache = None
-                    offload_cache = None
-                    # if layer.layer_id == 31:
+                    require_validation = forward_batch.token_to_kv_pool.require_validation
+                    if require_validation:
+                        k_chunk, v_chunk, k_pages, v_pages = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
+                            layer_id=layer.layer_id,
+                            batch_id=idx_batch,
+                            cache_k=k[start_len:start_len+seq_len].unsqueeze(0),
+                            cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
+                        )
+                    else:
+                        k_chunk, v_chunk = forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
+                            layer_id=layer.layer_id,
+                            batch_id=idx_batch,
+                            cache_k=k[start_len:start_len+seq_len].unsqueeze(0),
+                            cache_v=v[start_len:start_len+seq_len].unsqueeze(0),
+                        )
+                    offload_cache = k_cache = v_cache = None
                 else:
                     k_chunk = v_chunk = None
                 
-                # print(layer.layer_id, k[::1,0,0], v[::1,0,0])
+                if is_offload_cache:
+                    # BUG: this padding is neccesary to match non offload scenario. why?
+                    pad_size = self.max_context_len
+                    k_chunk_padded = torch.zeros((k_chunk.shape[0], pad_size, k_chunk.shape[2], k_chunk.shape[3]), dtype=k_chunk.dtype, device=k_chunk.device)
+                    k_chunk_padded[:, :k_chunk.shape[1]] = k_chunk
+                    v_chunk_padded = torch.zeros((v_chunk.shape[0], pad_size, v_chunk.shape[2], v_chunk.shape[3]), dtype=v_chunk.dtype, device=v_chunk.device)
+                    v_chunk_padded[:, :v_chunk.shape[1]] = v_chunk
+                    k_chunk = k_chunk_padded
+                    v_chunk = v_chunk_padded
 
-                o_req, _ = self.forward_paged_hip(
-                    query=q_reshaped[start_len:start_len+seq_len],
-                    sm_scale=layer.scaling,
-                    batch_size=1,
+                    o_req, _ = self.forward_paged_hip(
+                        query=q_reshaped[start_len:start_len+seq_len],
+                        sm_scale=layer.scaling,
+                        batch_size=1,
 
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    offload_cache=offload_cache,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        offload_cache=offload_cache,
 
-                    positions=forward_batch.positions[start_len:start_len+seq_len],
-                    seq_lens=forward_batch.seq_lens[idx_batch:idx_batch+1],
-                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
-                    req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
+                        positions=forward_batch.positions[start_len:start_len+seq_len],
+                        seq_lens=forward_batch.seq_lens[idx_batch:idx_batch+1],
+                        req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
 
-                    layer=layer,
-                    is_dense=layer.layer_id in self.hip_config.dense_layers,
+                        layer=layer,
+                        is_dense=layer.layer_id in self.hip_config.dense_layers,
 
-                    k=k_chunk,
-                    v=v_chunk,
-                )
-                # if layer.layer_id == 31:
-                # print(layer.layer_id, o_req[::1,0,0])
-                o[start_len:start_len+seq_len] = o_req
+                        k=k_chunk,
+                        v=v_chunk,
+                        online_update_cache=forward_batch.token_to_kv_pool.online_update_cache
+                    )
+
+                    if require_validation:
+                        o_req_valid, _ = self.forward_paged_hip(
+                            query=q_reshaped[start_len:start_len+seq_len],
+                            sm_scale=layer.scaling,
+                            batch_size=1,
+
+                            k_cache=k_pages,
+                            v_cache=v_pages,
+                            offload_cache=None,
+
+                            positions=forward_batch.positions[start_len:start_len+seq_len],
+                            seq_lens=forward_batch.seq_lens[idx_batch:idx_batch+1],
+                            req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                            req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
+
+                            layer=layer,
+                            is_dense=layer.layer_id in self.hip_config.dense_layers,
+                        )
+                        
+                        o_err = ((o_req - o_req_valid) ** 2).sum()
+                        assert o_err < 1e-5, o_err
+                    
+                    o[start_len:start_len+seq_len] = o_req
+                else:
+                    o_req, _ = self.forward_paged_hip(
+                        query=q_reshaped[start_len:start_len+seq_len],
+                        sm_scale=layer.scaling,
+                        batch_size=1,
+
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        offload_cache=offload_cache,
+
+                        positions=forward_batch.positions[start_len:start_len+seq_len],
+                        seq_lens=forward_batch.seq_lens[idx_batch:idx_batch+1],
+                        req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices[idx_batch:idx_batch+1],
+
+                        layer=layer,
+                        is_dense=layer.layer_id in self.hip_config.dense_layers,
+
+                        k=k_chunk,
+                        v=v_chunk,
+                    )
+                    
+                    o[start_len:start_len+seq_len] = o_req
             start_len += seq_len
         assert len(decoding_reqs) == 0
 
@@ -242,6 +289,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
             layer=layer,
             cached_metadata=metadata,
             is_dense=layer.layer_id in self.hip_config.dense_layers,
+
+            online_update_cache=forward_batch.token_to_kv_pool.online_update_cache,
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
@@ -278,6 +327,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
+
+        online_update_cache: bool = False,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
         is_dense = layer.layer_id in self.hip_config.dense_layers
         
@@ -344,6 +395,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             scan_extend_backend=('relative' if self.hip_config.apply_v_dot
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,
+            online_update_cache=online_update_cache,
         )
 
         # print(isinstance(k, torch.Tensor), isinstance(v, torch.Tensor), args.offload_cache, isinstance(args.k_cache, torch.Tensor))

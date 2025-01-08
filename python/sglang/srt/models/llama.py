@@ -44,7 +44,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
-from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 
 logger = logging.getLogger(__name__)
 
