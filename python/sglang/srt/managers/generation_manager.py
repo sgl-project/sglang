@@ -236,7 +236,7 @@ class GenerationManager:
             if state is None:
                 continue
 
-            out_dict = self._generation_converter.postprocess_response(recv_obj, index, rid, state.obj)
+            out_dict = self._generation_converter.postprocess_response(recv_obj, index, state.obj)
 
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[index] is not None
@@ -384,10 +384,9 @@ class GenerationConverter:
         self,
         recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
         index: int,
-        rid: str,
         req_obj: Union[GenerateReqInput, EmbeddingReqInput],
     ) -> Dict[str, Any]:
-        meta_info = self._compute_meta_info(index, recv_obj, req_obj, rid)
+        meta_info = self._compute_meta_info(index, recv_obj, req_obj)
 
         if isinstance(recv_obj, BatchStrOut):
             out_dict = {
@@ -418,9 +417,9 @@ class GenerationConverter:
         else:
             raise NotImplementedError
 
-    def _compute_meta_info(self, index, recv_obj, req_obj, rid):
+    def _compute_meta_info(self, index, recv_obj, req_obj):
         meta_info = {
-            "id": rid,
+            "id": recv_obj.rids[index],
             "finish_reason": recv_obj.finished_reasons[index],
             "prompt_tokens": recv_obj.prompt_tokens[index],
         }
