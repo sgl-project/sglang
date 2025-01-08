@@ -544,7 +544,12 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+        target=_wait_and_warmup,
+        args=(
+            server_args,
+            pipe_finish_writer,
+            tokenizer_manager.image_token_id,
+        ),
     )
     t.start()
 
@@ -614,7 +619,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer):
+def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
