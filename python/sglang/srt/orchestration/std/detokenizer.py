@@ -22,6 +22,17 @@ from sglang.utils import find_printable_text, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+class DetokenizerManagerCommunicator:
+    def __init__(self, port_args: PortArgs):
+        # Init inter-process communication
+        context = zmq.Context(2)
+        self.recv_from_scheduler = get_zmq_socket(
+            context, zmq.PULL, port_args.detokenizer_ipc_name
+        )
+        self.send_to_tokenizer = get_zmq_socket(
+            context, zmq.PUSH, port_args.tokenizer_ipc_name
+        )
+
 
 def run_detokenizer_process(
     server_args: ServerArgs,
