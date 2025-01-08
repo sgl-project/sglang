@@ -137,10 +137,6 @@ class TokenizerManager:
         )
         self.asyncio_tasks = set()
 
-        # Metrics
-        if self.enable_metrics:
-            self._metric_manager = _MetricManager()
-
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -448,6 +444,10 @@ class _GenerationManager:
 
         self.rid_to_state: Dict[str, ReqState] = {}
 
+        # Metrics
+        if self.enable_metrics:
+            self._metric_manager = _MetricManager()
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -615,7 +615,7 @@ class _GenerationManager:
             if state is None:
                 continue
 
-            out_dict = self.generation_converter.postprocess_response(recv_obj, index, rid, state.obj)
+            out_dict = self._generation_converter.postprocess_response(recv_obj, index, rid, state.obj)
 
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[index] is not None
