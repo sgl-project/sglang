@@ -85,7 +85,7 @@ class DetokenizerManager:
                 s.decode_ids = recv_obj.decode_ids[i]
 
             read_ids.append(
-                self._trim_matched_stop(
+                _trim_matched_stop(
                     s.decode_ids[s.surr_offset:],
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
@@ -121,7 +121,7 @@ class DetokenizerManager:
                     new_text = find_printable_text(new_text)
 
             output_strs.append(
-                self._trim_matched_stop(
+                _trim_matched_stop(
                     s.decoded_text + new_text,
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
@@ -148,28 +148,29 @@ class DetokenizerManager:
             normalized_prompt_logprob=recv_obj.normalized_prompt_logprob,
         )
 
-    def _trim_matched_stop(
-        self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
-    ):
-        if no_stop_trim or not finished_reason:
-            return output
 
-        matched = finished_reason.get("matched", None)
-        if not matched:
-            return output
-
-        # TODO(lmzheng): handle the case where multiple stop strs are hit
-
-        # Trim stop str.
-        if isinstance(matched, str) and isinstance(output, str):
-            pos = output.find(matched)
-            return output[:pos] if pos != -1 else output
-
-        # Trim stop token.
-        if isinstance(matched, int) and isinstance(output, list):
-            assert len(output) > 0
-            return output[:-1]
+def _trim_matched_stop(
+    output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
+):
+    if no_stop_trim or not finished_reason:
         return output
+
+    matched = finished_reason.get("matched", None)
+    if not matched:
+        return output
+
+    # TODO(lmzheng): handle the case where multiple stop strs are hit
+
+    # Trim stop str.
+    if isinstance(matched, str) and isinstance(output, str):
+        pos = output.find(matched)
+        return output[:pos] if pos != -1 else output
+
+    # Trim stop token.
+    if isinstance(matched, int) and isinstance(output, list):
+        assert len(output) > 0
+        return output[:-1]
+    return output
 
 
 class LimitedCapacityDict(OrderedDict):
