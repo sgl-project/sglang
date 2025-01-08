@@ -8,6 +8,7 @@ from typing import Dict, List, Union, Any, Callable
 from typing import Optional
 
 import fastapi
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
@@ -46,6 +47,21 @@ class GenerationManager:
     ):
         self.server_args = server_args
         self.on_request = on_request
+
+        self.model_config = ModelConfig(
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
+        )
+
+        self.is_generation = self.model_config.is_generation
+        self.context_len = self.model_config.context_len
+        self.image_token_id = self.model_config.image_token_id
 
         self._generation_converter = GenerationConverter(
             server_args=server_args,
@@ -260,6 +276,7 @@ class GenerationConverter:
     def __init__(
         self,
         server_args: ServerArgs,
+        model_config: ModelConfig,
     ):
         self.server_args = server_args
 
@@ -270,7 +287,7 @@ class GenerationConverter:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if self.model_config.is_multimodal:
+            if model_config.is_multimodal:
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -281,7 +298,7 @@ class GenerationConverter:
 
                 # We want to parallelize the image pre-processing so we create an executor for it
                 self.image_processor = get_image_processor(
-                    self.model_config.hf_config, server_args, self.processor
+                    model_config.hf_config, server_args, self.processor
                 )
             else:
                 self.tokenizer = get_tokenizer(
