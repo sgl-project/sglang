@@ -139,7 +139,9 @@ def main():
         sampling_params=sampling_params,
         # use_tqdm=False,
     )
-    vllm_output = outputs[0].cuda()
+    print(f'{outputs=}')
+    vllm_output = outputs[0]
+    # vllm_output = outputs[0].cuda()
     if torch.distributed.get_rank() == 0:
         print(f'hf response: {tokenizer.batch_decode(response)}')
         print(f'vllm response: {tokenizer.batch_decode(vllm_output)}')
