@@ -1,3 +1,7 @@
+from typing import List
+
+from sglang.srt.managers.detokenizer_manager import DetokenizerManager
+from sglang.srt.managers.generation_manager import GenerationConverter
 from sglang.srt.managers.io_struct import GenerateReqInput, BatchTokenIDOut
 from sglang.srt.managers.scheduler import Scheduler, SchedulerCallback
 from sglang.srt.server_args import ServerArgs
@@ -18,9 +22,15 @@ class Entrypoint:
             tp_rank=tp_rank,
             dp_rank=None,
         )
+        self._detokenizer = DetokenizerManager(server_args)
+        self._generation_converter = GenerationConverter(server_args, model_config=TODO)
 
     def generate(self, obj: GenerateReqInput):
-        def _handle_scheduler_output(out: BatchTokenIDOut):
+        outputs: List[TODO] = []
+
+        def _handle_scheduler_output(batch_token_id_out: BatchTokenIDOut):
+            batch_str_out = self._detokenizer.handle_batch_token_id_out(batch_token_id_out)
+            self._generation_converter.postprocess_response(batch_str_out, index=TODO, rid=TODO, req_obj=TODO)
             TODO
 
         self._scheduler.callback = SchedulerCallback(on_generation_output=_handle_scheduler_output)
@@ -32,4 +42,4 @@ class Entrypoint:
         while TODO:
             self._scheduler.process_batch()
 
-        return TODO
+        return outputs
