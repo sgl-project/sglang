@@ -316,7 +316,7 @@ class TokenizerManager:
         loop = asyncio.get_event_loop()
         self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
 
-        signal_handler = SignalHandler(self)
+        signal_handler = _SignalHandler(self)
         loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
         self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
 
@@ -360,7 +360,7 @@ class TokenizerManager:
                 self.model_update_result.set_result(self.model_update_tmp)
 
 
-class SignalHandler:
+class _SignalHandler:
     def __init__(self, tokenizer_manager):
         self.tokenizer_manager = tokenizer_manager
 
