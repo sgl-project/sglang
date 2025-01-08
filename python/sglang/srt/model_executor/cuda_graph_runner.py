@@ -223,7 +223,7 @@ class CudaGraphRunner:
             if self.enable_dp_attention:
                 self.gathered_buffer = torch.zeros(
                     (
-                        self.max_bs * self.dp_size,
+                        self.max_bs * self.tp_size,
                         self.model_runner.model_config.hidden_size,
                     ),
                     dtype=self.model_runner.dtype,
