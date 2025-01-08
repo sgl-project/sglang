@@ -17,6 +17,10 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                              const c10::optional<torch::Tensor>& bias);
 
+torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
+                             const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
+                             const c10::optional<torch::Tensor>& bias);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -26,4 +30,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_align_block_size", &moe_align_block_size, "MOE Align Block Size (CUDA)");
   // int8_scaled_mm
   m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
+  // fp8_scaled_mm
+  m.def("fp8_scaled_mm", &fp8_scaled_mm, "FP8 scaled matmul (CUDA)");
 }

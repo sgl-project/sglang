@@ -3,6 +3,7 @@ from sgl_kernel.ops import (
     custom_reduce,
     init_custom_reduce,
     int8_scaled_mm,
+    fp8_scaled_mm,
     moe_align_block_size,
 )
 
@@ -12,4 +13,5 @@ __all__ = [
     "custom_dispose",
     "custom_reduce",
     "int8_scaled_mm",
+    "fp8_scaled_mm",
 ]
