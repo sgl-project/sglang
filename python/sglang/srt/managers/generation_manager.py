@@ -188,9 +188,6 @@ class GenerationManager:
         state.finished = recv_obj.finished_reasons[i] is not None
         state.event.set()
 
-        if self.enable_metrics:
-            self._handle_batch_output_metrics(recv_obj, i, state)
-
     def _convert_logprob_style(
         self,
         meta_info: dict,
