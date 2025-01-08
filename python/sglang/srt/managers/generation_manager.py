@@ -56,7 +56,7 @@ class GenerationManager:
                     trust_remote_code=server_args.trust_remote_code,
                 )
 
-    async def tokenize_one_request(
+    async def tokenize_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
@@ -129,7 +129,7 @@ class GenerationManager:
         else:
             raise NotImplementedError
 
-    def handle_batch_output_item(
+    def postprocess_batch_output_item(
         self,
         recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
         index: int,
