@@ -1097,7 +1097,7 @@ class ScheduleBatch:
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
-        if self.spec_algorithm == "EAGLE" and self.spec_info is not None:
+        if self.spec_info is not None:
             self.spec_info.filter_batch(spec_keep_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):

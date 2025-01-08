@@ -141,7 +141,6 @@ class TestEAGLELaunchServer(unittest.TestCase):
                 "16",
                 "--served-model-name",
                 "base",
-                "--disable-radix-cache",
             ],
         )
 
