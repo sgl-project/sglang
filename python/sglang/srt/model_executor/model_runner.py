@@ -595,7 +595,7 @@ class ModelRunner:
                 4096,
             )
 
-        if not self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_eagle():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
             else:
@@ -717,6 +717,7 @@ class ModelRunner:
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
+        self.cuda_graph_runner_spec = None
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -728,6 +729,10 @@ class ModelRunner:
         tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
+        if self.spec_algorithm.is_lookahead():
+            # in case look_ahead failed to match any draft token, fallback to normal cuda graph decode
+            self.cuda_graph_runner_spec = CudaGraphRunner(self, is_spec=True)
+
         logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
@@ -772,12 +777,16 @@ class ModelRunner:
         )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        cuda_graph_runner = self.cuda_graph_runner
+        if forward_batch.spec_algorithm.is_lookahead():
+            cuda_graph_runner = self.cuda_graph_runner_spec
+
         if (
             forward_batch.forward_mode.is_cuda_graph()
-            and self.cuda_graph_runner
-            and self.cuda_graph_runner.can_run(forward_batch)
+            and cuda_graph_runner
+            and cuda_graph_runner.can_run(forward_batch)
         ):
-            return self.cuda_graph_runner.replay(forward_batch)
+            return cuda_graph_runner.replay(forward_batch)
 
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)

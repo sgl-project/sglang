@@ -17,6 +17,7 @@ suites = {
         "test_custom_allreduce.py",
         "test_double_sparsity.py",
         "test_eagle_infer.py",
+        "test_lookahead_infer.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
         "test_gguf.py",

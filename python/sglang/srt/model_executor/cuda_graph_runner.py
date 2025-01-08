@@ -106,7 +106,7 @@ def set_torch_compile_config():
         torch._dynamo.config.cache_size_limit = 1024
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
+def get_batch_sizes_to_capture(model_runner: ModelRunner, is_spec=False):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
     if capture_bs is None:
@@ -126,12 +126,17 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
                 )
             )
         )
-    capture_bs = [
-        bs
-        for bs in capture_bs
-        if bs <= model_runner.req_to_token_pool.size
-        and bs <= server_args.cuda_graph_max_bs
-    ]
+    if is_spec:
+        # For speculative inference, large batch sizes are not effective.
+        capture_bs = [1, 2, 3, 4]
+    else:
+        capture_bs = [
+            bs
+            for bs in capture_bs
+            if bs <= model_runner.req_to_token_pool.size
+            and bs <= server_args.cuda_graph_max_bs
+        ]
+
     if is_hip_:
         capture_bs += [i * 8 for i in range(21, 33)]
     compile_bs = (
@@ -158,7 +163,7 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: "ModelRunner", is_spec=False):
         # Parse args
         self.model_runner = model_runner
         self.graphs = {}
@@ -171,7 +176,7 @@ class CudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner, is_spec)
         self.capture_forward_mode = ForwardMode.DECODE
         self.num_tokens_per_bs = 1
         if model_runner.spec_algorithm.is_eagle():
@@ -182,6 +187,13 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+
+        if model_runner.spec_algorithm.is_lookahead() and self.is_spec:
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = (
+                self.model_runner.server_args.speculative_num_draft_tokens
+            )
+
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -212,6 +224,11 @@ class CudaGraphRunner:
                 self.hidden_states = torch.zeros(
                     (self.max_num_token, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
+                )
+            if self.is_spec:
+                self.draft_token_num = (
+                    torch.ones((len(self.capture_bs),), dtype=torch.int32)
+                    * self.num_tokens_per_bs
                 )
 
             if self.is_encoder_decoder:
@@ -281,7 +298,14 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        is_token_num_supported = True
+        if self.is_spec:
+            is_token_num_supported = (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+        return is_token_num_supported and is_bs_supported and is_encoder_lens_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -481,5 +505,23 @@ class CudaGraphRunner:
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
+        if self.model_runner.spec_algorithm.is_lookahead() and self.is_spec:
+            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+
+            bs = int(num_tokens / self.num_tokens_per_bs)
+            spec_info = LookaheadVerifyInput(
+                None,
+                None,
+                None,
+                None,
+                None,
+                self.draft_token_num[:bs],
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+            spec_info.custom_mask = torch.zeros(
+                (num_tokens * self.model_runner.model_config.context_len),
+                dtype=torch.bool,
+                device="cuda",
+            )
 
         return spec_info

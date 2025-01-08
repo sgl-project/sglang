@@ -1049,6 +1049,11 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
         if self.spec_algorithm.is_eagle():
             return
+        elif self.spec_algorithm.is_lookahead():
+            self.spec_info.prepare_for_verify(self)
+            # overwrite the forward_mode
+            self.forward_mode = ForwardMode.TARGET_VERIFY
+            return
 
         self.input_ids = self.output_ids
         self.output_ids = None
