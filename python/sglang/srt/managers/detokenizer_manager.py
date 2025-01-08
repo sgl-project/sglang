@@ -209,20 +209,3 @@ class LimitedCapacityDict(OrderedDict):
             self.popitem(last=False)
         # Set the new item
         super().__setitem__(key, value)
-
-
-def run_detokenizer_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-):
-    setproctitle.setproctitle("sglang::detokenizer")
-    configure_logger(server_args)
-    parent_process = psutil.Process().parent()
-
-    try:
-        manager = DetokenizerManager(server_args, port_args)
-        manager.event_loop()
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DetokenizerManager hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
