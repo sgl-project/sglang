@@ -107,9 +107,7 @@ class TokenizerManager:
             context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
 
-        self.generation_converter = GenerationConverter(
-            server_args=server_args,
-        )
+        self._generation_manager = _GenerationManager()
 
         # Read model args
         self.model_path = server_args.model_path
@@ -196,169 +194,13 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        created_time = time.time()
+        self._generation_manager.generate_request(obj, request)
 
-        self.auto_create_handle_loop()
-
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
-            raise ValueError(
-                "This model does not appear to be an embedding model by default. "
-                "Please add `--is-embedding` when launching the server or try another model."
-            )
-
-        obj.normalize_batch_and_arguments()
-
-        if self.server_args.log_requests:
-            logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)}")
-
-        async with self.model_update_lock.reader_lock:
-            is_single = obj.is_single
-            if is_single:
-                tokenized_obj = await self.generation_converter.tokenize_request(obj)
-                self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, request):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(
-                    obj, request, created_time
-                ):
-                    yield response
-
-    def _send_one_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
-        created_time: Optional[float] = None,
-    ):
-        event = asyncio.Event()
-        state = ReqState([], False, event, obj, metric=_MetricReqState(created_time=created_time))
-        self.rid_to_state[obj.rid] = state
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
-
-    async def _wait_one_response(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-    ):
-        """Wait for the response of one request."""
-        state = self.rid_to_state[obj.rid]
-
-        while True:
-            try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
-            except asyncio.TimeoutError:
-                if request is not None and await request.is_disconnected():
-                    self.abort_request(obj.rid)
-                    raise ValueError(f"Abort request {obj.rid}")
-                continue
-
-            out = state.out_list[-1]
-
-            state.out_list = []
-            if state.finished:
-                if self.server_args.log_requests:
-                    msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
-                    logger.info(msg)
-                del self.rid_to_state[obj.rid]
-                yield out
-                break
-
-            state.event.clear()
-
-            if obj.stream:
-                yield out
-            else:
-                if request is not None and await request.is_disconnected():
-                    self.abort_request(obj.rid)
-                    raise ValueError(f"Abort request {obj.rid}")
-
-    async def _handle_batch_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-        created_time: Optional[float] = None,
-    ):
-        batch_size = obj.batch_size
-
-        generators = []
-        rids = []
-        if getattr(obj, "parallel_sample_num", 1) == 1:
-            # Send all requests
-            for i in range(batch_size):
-                tmp_obj = obj[i]
-                tokenized_obj = await self.generation_converter.tokenize_request(tmp_obj)
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                generators.append(self._wait_one_response(tmp_obj, request))
-                rids.append(tmp_obj.rid)
-        else:
-            # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
-            if batch_size > 128:
-                logger.warning(
-                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
-                    "The performance might be better if you just duplicate the requests n times or use "
-                    "many threads to send them one by one with parallel sampling (n > 1)."
-                )
-
-            # Tokenize all requests
-            objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self.generation_converter.tokenize_request(obj) for obj in objs)
-            )
-
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                tokenized_obj = copy.copy(tokenized_objs[i])
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                await self._wait_one_response(tmp_obj, request).__anext__()
-
-            # Expand requests, assign new rids for them, and send them
-            for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
-                    tmp_obj = copy.copy(objs[i])
-                    tokenized_obj = copy.copy(tokenized_objs[i])
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, request))
-                    rids.append(tmp_obj.rid)
-
-        # Wait for all requests
-        is_stream = hasattr(obj, "stream") and obj.stream
-        if not is_stream:
-            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
-            yield outputs
-        else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-            while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
-
-                for task in done:
-                    gen = task_map.pop(task)
-                    try:
-                        result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
-                    except StopAsyncIteration:
-                        pass
+    def abort_request(self, rid: str):
+        self._generation_manager.abort_request(rid)
 
     def flush_cache(self):
         req = FlushCacheReq()
-        self.send_to_scheduler.send_pyobj(req)
-
-    def abort_request(self, rid: str):
-        if rid not in self.rid_to_state:
-            return
-        del self.rid_to_state[rid]
-        req = AbortReq(rid)
         self.send_to_scheduler.send_pyobj(req)
 
     def start_profile(self):
@@ -542,24 +384,6 @@ class TokenizerManager:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._dispatcher(recv_obj)
 
-    def _handle_batch_output(
-        self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
-    ):
-        for index, rid in enumerate(recv_obj.rids):
-            state = self.rid_to_state.get(rid, None)
-            if state is None:
-                continue
-
-            out_dict = self.generation_converter.postprocess_response(recv_obj, index, rid, state.obj)
-
-            state.out_list.append(out_dict)
-            state.finished = recv_obj.finished_reasons[index] is not None
-            state.event.set()
-
-            if self._metric_manager:
-                self._metric_manager.handle_batch_output_metrics(recv_obj, index, state.metric, finished=state.finished,
-                                                                 stream=state.obj.stream)
-
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
             recv_obj.session_id if recv_obj.success else None
@@ -615,6 +439,197 @@ class _Communicator(Generic[T]):
 class _MetricReqState:
     created_time: float
     first_token_time: Optional[float] = None
+
+
+class _GenerationManager:
+    def __init__(self):
+        self._generation_converter = GenerationConverter(
+            server_args=server_args,
+        )
+
+    async def generate_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ):
+        created_time = time.time()
+
+        self.auto_create_handle_loop()
+
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        obj.normalize_batch_and_arguments()
+
+        if self.server_args.log_requests:
+            logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)}")
+
+        async with self.model_update_lock.reader_lock:
+            is_single = obj.is_single
+            if is_single:
+                tokenized_obj = await self._generation_converter.tokenize_request(obj)
+                self._send_one_request(obj, tokenized_obj, created_time)
+                async for response in self._wait_one_response(obj, request):
+                    yield response
+            else:
+                async for response in self._handle_batch_request(
+                    obj, request, created_time
+                ):
+                    yield response
+
+    def _send_one_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        created_time: Optional[float] = None,
+    ):
+        event = asyncio.Event()
+        state = ReqState([], False, event, obj, metric=_MetricReqState(created_time=created_time))
+        self.rid_to_state[obj.rid] = state
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
+
+    async def _wait_one_response(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ):
+        """Wait for the response of one request."""
+        state = self.rid_to_state[obj.rid]
+
+        while True:
+            try:
+                await asyncio.wait_for(state.event.wait(), timeout=4)
+            except asyncio.TimeoutError:
+                if request is not None and await request.is_disconnected():
+                    self.abort_request(obj.rid)
+                    raise ValueError(f"Abort request {obj.rid}")
+                continue
+
+            out = state.out_list[-1]
+
+            state.out_list = []
+            if state.finished:
+                if self.server_args.log_requests:
+                    msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
+                    logger.info(msg)
+                del self.rid_to_state[obj.rid]
+                yield out
+                break
+
+            state.event.clear()
+
+            if obj.stream:
+                yield out
+            else:
+                if request is not None and await request.is_disconnected():
+                    self.abort_request(obj.rid)
+                    raise ValueError(f"Abort request {obj.rid}")
+
+    async def _handle_batch_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+        created_time: Optional[float] = None,
+    ):
+        batch_size = obj.batch_size
+
+        generators = []
+        rids = []
+        if getattr(obj, "parallel_sample_num", 1) == 1:
+            # Send all requests
+            for i in range(batch_size):
+                tmp_obj = obj[i]
+                tokenized_obj = await self._generation_converter.tokenize_request(tmp_obj)
+                self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                generators.append(self._wait_one_response(tmp_obj, request))
+                rids.append(tmp_obj.rid)
+        else:
+            # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+            if batch_size > 128:
+                logger.warning(
+                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
+                    "The performance might be better if you just duplicate the requests n times or use "
+                    "many threads to send them one by one with parallel sampling (n > 1)."
+                )
+
+            # Tokenize all requests
+            objs = [obj[i] for i in range(batch_size)]
+            tokenized_objs = await asyncio.gather(
+                *(self._generation_converter.tokenize_request(obj) for obj in objs)
+            )
+
+            # Cache the common prefix for parallel sampling
+            for i in range(batch_size):
+                tmp_obj = copy.copy(objs[i])
+                tokenized_obj = copy.copy(tokenized_objs[i])
+                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
+                tokenized_obj.sampling_params.max_new_tokens = 0
+                tokenized_obj.stream = False
+                self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                await self._wait_one_response(tmp_obj, request).__anext__()
+
+            # Expand requests, assign new rids for them, and send them
+            for i in range(batch_size):
+                for _ in range(obj.parallel_sample_num):
+                    tmp_obj = copy.copy(objs[i])
+                    tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, request))
+                    rids.append(tmp_obj.rid)
+
+        # Wait for all requests
+        is_stream = hasattr(obj, "stream") and obj.stream
+        if not is_stream:
+            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
+            yield outputs
+        else:
+            rid_to_index = {rid: i for i, rid in enumerate(rids)}
+            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+            while task_map:
+                done, _ = await asyncio.wait(
+                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for task in done:
+                    gen = task_map.pop(task)
+                    try:
+                        result = task.result()
+                        result["index"] = rid_to_index[result["meta_info"]["id"]]
+                        yield result
+                        new_task = asyncio.create_task(gen.__anext__())
+                        task_map[new_task] = gen
+                    except StopAsyncIteration:
+                        pass
+
+    def _handle_batch_output(
+        self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
+    ):
+        for index, rid in enumerate(recv_obj.rids):
+            state = self.rid_to_state.get(rid, None)
+            if state is None:
+                continue
+
+            out_dict = self.generation_converter.postprocess_response(recv_obj, index, rid, state.obj)
+
+            state.out_list.append(out_dict)
+            state.finished = recv_obj.finished_reasons[index] is not None
+            state.event.set()
+
+            if self._metric_manager:
+                self._metric_manager.handle_batch_output_metrics(recv_obj, index, state.metric, finished=state.finished,
+                                                                 stream=state.obj.stream)
+
+    def abort_request(self, rid: str):
+        if rid not in self.rid_to_state:
+            return
+        del self.rid_to_state[rid]
+        req = AbortReq(rid)
+        self.send_to_scheduler.send_pyobj(req)
 
 
 class _MetricManager:
