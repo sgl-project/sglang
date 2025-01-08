@@ -1,5 +1,3 @@
-
-import dataclasses
 import logging
 import signal
 from collections import OrderedDict
@@ -11,25 +9,21 @@ import zmq
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
-from sglang.srt.managers.io_struct import (
-    BatchEmbeddingOut,
-    BatchStrOut,
-    BatchTokenIDOut,
-)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, get_zmq_socket
-from sglang.utils import find_printable_text, get_exception_traceback
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
 
 class DetokenizerManagerCommunicator:
     def __init__(self, port_args: PortArgs):
         # Init inter-process communication
         context = zmq.Context(2)
-        self.recv_from_scheduler = get_zmq_socket(
+        self._recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name
         )
-        self.send_to_tokenizer = get_zmq_socket(
+        self._send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name
         )
 

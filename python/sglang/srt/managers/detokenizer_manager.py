@@ -15,13 +15,8 @@
 
 import dataclasses
 import logging
-import signal
 from collections import OrderedDict
 from typing import Dict, List, Union
-
-import psutil
-import setproctitle
-import zmq
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -30,8 +25,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, get_zmq_socket
-from sglang.utils import find_printable_text, get_exception_traceback
+from sglang.utils import find_printable_text
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +86,11 @@ class DetokenizerManager:
         """The event loop that handles requests"""
 
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = self._recv_from_scheduler.recv_pyobj()
 
             if isinstance(recv_obj, BatchEmbeddingOut):
                 # If it is embedding model, no detokenization is needed.
-                self.send_to_tokenizer.send_pyobj(recv_obj)
+                self._send_to_tokenizer.send_pyobj(recv_obj)
                 continue
             else:
                 assert isinstance(recv_obj, BatchTokenIDOut)
@@ -123,12 +117,12 @@ class DetokenizerManager:
 
                 read_ids.append(
                     self.trim_matched_stop(
-                        s.decode_ids[s.surr_offset :],
+                        s.decode_ids[s.surr_offset:],
                         recv_obj.finished_reasons[i],
                         recv_obj.no_stop_trim[i],
                     )
                 )
-                surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
+                surr_ids.append(s.decode_ids[s.surr_offset: s.read_offset])
 
             # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
             surr_texts = self.tokenizer.batch_decode(
@@ -146,7 +140,7 @@ class DetokenizerManager:
             output_strs = []
             for i in range(bs):
                 s = self.decode_status[recv_obj.rids[i]]
-                new_text = read_texts[i][len(surr_texts[i]) :]
+                new_text = read_texts[i][len(surr_texts[i]):]
                 if recv_obj.finished_reasons[i] is None:
                     # Streaming chunk: update the decode status
                     if len(new_text) > 0 and not new_text.endswith("�"):
@@ -165,7 +159,7 @@ class DetokenizerManager:
                     )
                 )
 
-            self.send_to_tokenizer.send_pyobj(
+            self._send_to_tokenizer.send_pyobj(
                 BatchStrOut(
                     rids=recv_obj.rids,
                     finished_reasons=recv_obj.finished_reasons,
