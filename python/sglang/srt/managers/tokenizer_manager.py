@@ -33,6 +33,7 @@ from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
     get_image_processor,
@@ -115,6 +116,8 @@ class TokenizerManager:
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
+
+        self.generation_manager = GenerationManager()
 
         # Read model args
         self.model_path = server_args.model_path
@@ -251,7 +254,7 @@ class TokenizerManager:
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
             if is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
+                tokenized_obj = await self.generation_manager.tokenize_one_request(obj)
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, request):
                     yield response
@@ -260,79 +263,6 @@ class TokenizerManager:
                     obj, request, created_time
                 ):
                     yield response
-
-    async def _tokenize_one_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-    ):
-        """Tokenize one request."""
-        # Tokenize
-        input_embeds = None
-        input_text = obj.text
-        if obj.input_embeds is not None:
-            if not self.server_args.disable_radix_cache:
-                raise ValueError(
-                    "input_embeds is provided while disable_radix_cache is False. "
-                    "Please add `--disable-radix-cache` when you launch the server "
-                    "if you want to use input_embeds as inputs."
-                )
-            input_embeds = obj.input_embeds
-            input_ids = obj.input_ids
-        elif obj.input_ids is None:
-            input_ids = self.tokenizer.encode(input_text)
-        else:
-            input_ids = obj.input_ids
-
-        if self.is_generation:
-            # TODO: also support getting embeddings for multimodal models
-            image_inputs: Dict = await self.image_processor.process_images_async(
-                obj.image_data, input_text or input_ids, obj
-            )
-            if image_inputs and "input_ids" in image_inputs:
-                input_ids = image_inputs["input_ids"]
-            return_logprob = obj.return_logprob
-            logprob_start_len = obj.logprob_start_len
-            top_logprobs_num = obj.top_logprobs_num
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
-
-        if obj.input_ids is not None and len(input_ids) >= self.context_len:
-            raise ValueError(
-                f"The input ({len(input_ids)} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
-            )
-
-        # Parse sampling parameters
-        sampling_params = SamplingParams(**obj.sampling_params)
-        sampling_params.normalize(self.tokenizer)
-        sampling_params.verify()
-
-        # Build return object
-        if isinstance(obj, GenerateReqInput):
-            tokenized_obj = TokenizedGenerateReqInput(
-                obj.rid,
-                input_text,
-                input_ids,
-                image_inputs,
-                sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                obj.stream,
-                lora_path=obj.lora_path,
-                input_embeds=input_embeds,
-                session_params=session_params,
-            )
-        elif isinstance(obj, EmbeddingReqInput):
-            tokenized_obj = TokenizedEmbeddingReqInput(
-                obj.rid,
-                input_text,
-                input_ids,
-                sampling_params,
-            )
-
-        return tokenized_obj
 
     def _send_one_request(
         self,
@@ -396,7 +326,7 @@ class TokenizerManager:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
-                tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                tokenized_obj = await self.generation_manager.tokenize_one_request(tmp_obj)
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
@@ -412,7 +342,7 @@ class TokenizerManager:
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
+                *(self.generation_manager.tokenize_one_request(obj) for obj in objs)
             )
 
             # Cache the common prefix for parallel sampling
