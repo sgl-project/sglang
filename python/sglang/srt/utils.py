@@ -1306,8 +1306,12 @@ def parse_tool_response(text, tools, **kwargs):
                 (action["name"], json.dumps(action["arguments"], ensure_ascii=False))
             )
             break
-    elif "<|python_tag|>" in text:  # llama3.1+ JSON-based
+    elif "<|python_tag|>" in text:  # llama3.1+ JSON-based Tooling Calling
         _, action = text.split("<|python_tag|>")
+        # split multiple actions and only select the first one
+        # e.g. {"name": "A", "parameters": {"arg": "x"}}; {"name": "B", "parameters": {"arg": "y"}}
+        if "}};" in action:
+            action = action.split("}};")[0] + "}}"
         action = json.loads(action)
         name, parameters = action["name"], json.dumps(
             action.get("parameters", action.get("arguments", {})), ensure_ascii=False
@@ -1320,7 +1324,7 @@ def parse_tool_response(text, tools, **kwargs):
             text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
         else:
             text = ""
-    elif "<function=" in text:  # llama3.1+ User-defined
+    elif "<function=" in text:  # llama3.1+ User-defined Tooling Calling
         action, _ = text.split("</function>")
         parameters = action[action.find("{") :]
         name = action.split("<function=")[1].split(">{")[0]

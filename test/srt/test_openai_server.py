@@ -719,7 +719,7 @@ class TestOpenAIServerEBNF(unittest.TestCase):
             content is None
         ), "When tools provided by the response, content should be None"
         assert (
-            isinstance(tool_calls, list) and len(tool_calls) > 0
+            isinstance(tool_calls, list) and len(tool_calls) == 0
         ), "Format not matched, tool_calls should be a list"
 
         function_name = tool_calls[0].function.name
