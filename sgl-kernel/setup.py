@@ -26,6 +26,7 @@ cutlass = root / "3rdparty" / "cutlass"
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
+    root / "src" / "sgl-kernel" / "csrc",
 ]
 nvcc_flags = [
     "-O3",
@@ -48,6 +49,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/trt_reduce_internal.cu",
             "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
+            "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
         include_dirs=include_dirs,
