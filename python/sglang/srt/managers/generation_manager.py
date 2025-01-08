@@ -59,9 +59,6 @@ class GenerationManager:
             quantization=server_args.quantization,
         )
 
-        self.is_generation = self.model_config.is_generation
-        self.image_token_id = self.model_config.image_token_id
-
         self._generation_converter = GenerationConverter(
             server_args=server_args,
             model_config=self.model_config,
