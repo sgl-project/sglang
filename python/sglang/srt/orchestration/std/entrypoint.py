@@ -359,12 +359,15 @@ class Entrypoint:
 
     @property
     def is_generation(self):
-        return self._generation_manager.is_generation
+        return self._generation_manager.model_config.is_generation
 
     @property
     def tokenizer(self):
         return self._generation_manager.tokenizer
 
+    @property
+    def image_token_id(self):
+        return self._generation_manager.model_config.image_token_id
 
 class _SignalHandler:
     def __init__(self, entrypoint):

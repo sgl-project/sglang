@@ -226,7 +226,7 @@ def launch_server(
         args=(
             server_args,
             pipe_finish_writer,
-            engine.tokenizer_manager.image_token_id,
+            engine.entrypoint.image_token_id,
         ),
     )
     t.start()

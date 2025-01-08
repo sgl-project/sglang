@@ -43,7 +43,6 @@ class GenerationManager:
         self.on_request = on_request
 
         self.model_config = _compute_model_config(server_args)
-        self.is_generation = self.model_config.is_generation
         self._generation_converter = GenerationConverter(server_args=server_args)
 
         self.rid_to_state: Dict[str, _ReqState] = {}
@@ -63,7 +62,7 @@ class GenerationManager:
     ):
         created_time = time.time()
 
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+        if isinstance(obj, EmbeddingReqInput) and self.model_config.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
                 "Please add `--is-embedding` when launching the server or try another model."
