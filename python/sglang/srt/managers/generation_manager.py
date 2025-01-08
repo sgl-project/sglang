@@ -132,6 +132,7 @@ class GenerationManager:
 
         return tokenized_obj
 
+    # TODO refactor this long function later
     def handle_batch_output(
         self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
     ):
