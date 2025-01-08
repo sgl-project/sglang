@@ -1,30 +1,30 @@
-import torch
-from torch import nn
-import torchvision
-import numpy as np
-from PIL import Image
-from typing import List, Any, Dict, Optional, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from transformers.image_transforms import (
-    convert_to_rgb,
-)
+import numpy as np
+import torch
+import torchvision
+from PIL import Image
+from torch import nn
+from transformers import CLIPVisionModel
+from transformers.image_transforms import convert_to_rgb
 from transformers.image_utils import (
     OPENAI_CLIP_MEAN,
     OPENAI_CLIP_STD,
-    make_list_of_images
+    make_list_of_images,
 )
-from transformers import CLIPVisionModel
 
-from sglang.srt.models.llama import Phi3ForCausalLM
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.configs import Phi3VConfig, Phi3VCLIPVisionConfig
+from sglang.srt.configs import Phi3VCLIPVisionConfig, Phi3VConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.llama import Phi3ForCausalLM
 
 
 # adapted from https://huggingface.co/microsoft/Phi-3-vision-128k-instruct/blob/c45209e90a4c4f7d16b2e9d48503c7f3e83623ed/image_processing_phi3_v.py
 class ImageProcessor(nn.Module):
-    def __init__(self, num_crops=1, image_mean=OPENAI_CLIP_MEAN, image_std=OPENAI_CLIP_STD):
+    def __init__(
+        self, num_crops=1, image_mean=OPENAI_CLIP_MEAN, image_std=OPENAI_CLIP_STD
+    ):
         super().__init__()
         self.num_crops = num_crops
         self.image_mean = image_mean
@@ -33,23 +33,25 @@ class ImageProcessor(nn.Module):
 
     def _create_image_processor(self):
         """Create the torchvision transform pipeline."""
-        return torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize(self.image_mean, self.image_std),
-        ])
+        return torchvision.transforms.Compose(
+            [
+                torchvision.transforms.ToTensor(),
+                torchvision.transforms.Normalize(self.image_mean, self.image_std),
+            ]
+        )
 
     def _pad_image_336(self, image):
         """Pad image to multiple of 336 pixels."""
         width, height = image.size
         tar = int(np.ceil(height / 336) * 336)
-        top_padding = int((tar - height)/2)
+        top_padding = int((tar - height) / 2)
         bottom_padding = tar - height - top_padding
         left_padding = 0
         right_padding = 0
         padded_image = torchvision.transforms.functional.pad(
-            image, 
+            image,
             [left_padding, top_padding, right_padding, bottom_padding],
-            fill=[255, 255, 255]
+            fill=[255, 255, 255],
         )
         return padded_image
 
@@ -95,19 +97,19 @@ class ImageProcessor(nn.Module):
             img = img.transpose(Image.TRANSPOSE)
             trans = True
             width, height = img.size
-            
-        ratio = (width / height)
+
+        ratio = width / height
         scale = 1
-        while scale * np.ceil(scale/ratio) <= hd_num:
+        while scale * np.ceil(scale / ratio) <= hd_num:
             scale += 1
         scale -= 1
-        
+
         new_w = int(scale * 336)
         new_h = int(new_w / ratio)
 
         img = torchvision.transforms.functional.resize(img, [new_h, new_w])
         img = self._pad_image_336(img)
-        
+
         if trans:
             img = img.transpose(Image.TRANSPOSE)
 
@@ -117,7 +119,9 @@ class ImageProcessor(nn.Module):
         """Pad tensor with zeros to reach max_crops."""
         B, _, H, W = images.shape
         if B < max_crops:
-            pad = torch.zeros(max_crops - B, 3, H, W, dtype=images.dtype, device=images.device)
+            pad = torch.zeros(
+                max_crops - B, 3, H, W, dtype=images.dtype, device=images.device
+            )
             images = torch.cat([images, pad], dim=0)
         return images
 
@@ -125,7 +129,7 @@ class ImageProcessor(nn.Module):
         """Convert and standardize input images to RGB format."""
         images = make_list_of_images(pixel_values)
         images = [convert_to_rgb(image) for image in images]
-        return [image.convert('RGB') for image in images]
+        return [image.convert("RGB") for image in images]
 
     def _convert_to_tensors(self, transformed_pil):
         """Convert PIL images to normalized tensors."""
@@ -135,9 +139,7 @@ class ImageProcessor(nn.Module):
         """Create global crops by interpolating to fixed size."""
         return [
             torch.nn.functional.interpolate(
-                im.unsqueeze(0).float(),
-                size=(336, 336),
-                mode='bicubic'
+                im.unsqueeze(0).float(), size=(336, 336), mode="bicubic"
             ).to(im.dtype)
             for im in hd_images
         ]
@@ -146,7 +148,7 @@ class ImageProcessor(nn.Module):
         """Calculate image shapes and token counts."""
         shapes = [[im.size(1), im.size(2)] for im in hd_images]
         num_img_tokens = [
-            int(((h//336)*(w//336)+1)*144 + 1 + (h//336+1)*12)
+            int(((h // 336) * (w // 336) + 1) * 144 + 1 + (h // 336 + 1) * 12)
             for h, w in shapes
         ]
         return shapes, num_img_tokens
@@ -154,10 +156,10 @@ class ImageProcessor(nn.Module):
     def _reshape_hd_images(self, hd_images, shapes):
         """Reshape HD images to the required format."""
         return [
-            im.reshape(1, 3, h//336, 336, w//336, 336)
-              .permute(0,2,4,1,3,5)
-              .reshape(-1, 3, 336, 336)
-              .contiguous()
+            im.reshape(1, 3, h // 336, 336, w // 336, 336)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(-1, 3, 336, 336)
+            .contiguous()
             for im, (h, w) in zip(hd_images, shapes)
         ]
 
@@ -174,16 +176,16 @@ class ImageProcessor(nn.Module):
         return {
             "pixel_values": image_transformed,
             "image_sizes": image_sizes,
-            "num_img_tokens": num_img_tokens
+            "num_img_tokens": num_img_tokens,
         }
 
     def forward(self, pixel_values: List[Any]) -> Dict[str, Any]:
         """
         Process raw images into a batched tensor suitable for a "Phi3V-like" pipeline.
-        
+
         Args:
             pixel_values (List[Any]): List of raw images (PIL.Image.Image, NumPy array, etc.)
-            
+
         Returns:
             Dict[str, Any]: Dictionary containing:
                 - "pixel_values": torch.FloatTensor of shape (batch_size, num_crops+1, 3, 336, 336)
@@ -192,41 +194,46 @@ class ImageProcessor(nn.Module):
         """
         # Step 1: Preprocess images
         images = self._preprocess_images(pixel_values)
-        
+
         # Step 2: Apply HD transform
-        transformed_pil = [self._apply_hd_transform(im, hd_num=self.num_crops) for im in images]
-        
+        transformed_pil = [
+            self._apply_hd_transform(im, hd_num=self.num_crops) for im in images
+        ]
+
         # Step 3: Convert to tensors
         hd_images = self._convert_to_tensors(transformed_pil)
-        
+
         # Step 4: Create global crops
         global_image = self._create_global_crops(hd_images)
-        
+
         # Step 5: Calculate shapes and tokens
         shapes, num_img_tokens = self._calculate_shapes_and_tokens(hd_images)
-        
+
         # Step 6: Reshape HD images
         hd_images_reshape = self._reshape_hd_images(hd_images, shapes)
-        
+
         # Step 7: Combine global and local images
-        combined_images = self._combine_global_and_local(global_image, hd_images_reshape)
-        
+        combined_images = self._combine_global_and_local(
+            global_image, hd_images_reshape
+        )
+
         # Step 8: Pad and stack
         image_transformed = [
-            self._pad_to_max_num_crops_tensor(im, self.num_crops+1)
+            self._pad_to_max_num_crops_tensor(im, self.num_crops + 1)
             for im in combined_images
         ]
         image_transformed = torch.stack(image_transformed, dim=0)
-        
+
         # Step 9: Create final output
         return self._finalize_output(image_transformed, shapes, num_img_tokens)
+
 
 # adapted from https://huggingface.co/microsoft/Phi-3-vision-128k-instruct/blob/main/image_embedding_phi3_v.py
 class Phi3VMultiModalProjector(nn.Module):
     def __init__(self, config: Phi3VConfig):
         super().__init__()
 
-        self.image_dim_out = config.img_processor['image_dim_out']
+        self.image_dim_out = config.img_processor["image_dim_out"]
         self.hidden_size = config.get("n_embd", config.get("hidden_size"))
         self.dim_projection = self.hidden_size
         self.depth = 2
@@ -243,8 +250,8 @@ class Phi3VMultiModalProjector(nn.Module):
 
         image_features_proj = self.hd_feature_transform(image_features, image_sizes)
         hidden_states = hidden_states.index_put(
-                image_positions, image_features_proj, accumulate=False
-            ) # position changed to image_position from original code
+            image_positions, image_features_proj, accumulate=False
+        )  # position changed to image_position from original code
 
         return hidden_states
 
@@ -255,8 +262,12 @@ class Phi3VMultiModalProjector(nn.Module):
 
         global_image_features = image_features[:, 0]  # (num_images, 24*24, 1024)
         # global feature can be viewed as a special HD case with num_crops 1x1
-        global_image_features_hd = self.reshape_hd_patches_2x2merge(global_image_features, 1, 1)
-        global_image_features_hd_newline = self.add_image_newline(global_image_features_hd)
+        global_image_features_hd = self.reshape_hd_patches_2x2merge(
+            global_image_features, 1, 1
+        )
+        global_image_features_hd_newline = self.add_image_newline(
+            global_image_features_hd
+        )
 
         all_image_embeddings = []
         # need a for loop to process each image because of different image sizes
@@ -273,12 +284,16 @@ class Phi3VMultiModalProjector(nn.Module):
             sub_image_features_hd = self.reshape_hd_patches_2x2merge(
                 sub_image_features, h_crop, w_crop
             )
-            sub_image_features_hd_newline = self.add_image_newline(sub_image_features_hd)
+            sub_image_features_hd_newline = self.add_image_newline(
+                sub_image_features_hd
+            )
 
             # [sub features, separator, global features]
             all_image_embeddings.extend(
                 [
-                    sub_image_features_hd_newline.squeeze(0),  # (h_crop*12*(w_crop*12+1), 4096)
+                    sub_image_features_hd_newline.squeeze(
+                        0
+                    ),  # (h_crop*12*(w_crop*12+1), 4096)
                     self.glb_GN.squeeze(0),
                     global_image_features_hd_newline[i],
                 ]
@@ -293,7 +308,9 @@ class Phi3VMultiModalProjector(nn.Module):
         target_device = self.layer1.bias.device
         target_dtype = self.layer1.bias.dtype
 
-        all_image_embeddings = torch.cat(all_image_embeddings, dim=0).to(target_device, target_dtype)
+        all_image_embeddings = torch.cat(all_image_embeddings, dim=0).to(
+            target_device, target_dtype
+        )
 
         image_features_proj = self.layer1(all_image_embeddings)
         image_features_proj = self.gelu(image_features_proj)
@@ -308,7 +325,9 @@ class Phi3VMultiModalProjector(nn.Module):
         """
         num_images, h, w, hid_dim = image_features_hd.shape
         # add the newline token to the HD image feature patches
-        newline_embeddings = self.sub_GN.expand(num_images, h, -1, -1)  # (n_img, h, 1, hid_dim)
+        newline_embeddings = self.sub_GN.expand(
+            num_images, h, -1, -1
+        )  # (n_img, h, 1, hid_dim)
         image_features_hd_newline = torch.cat(
             [image_features_hd, newline_embeddings], dim=2
         ).reshape(num_images, -1, hid_dim)
@@ -339,6 +358,7 @@ class Phi3VMultiModalProjector(nn.Module):
 
         return image_features_hd
 
+
 class Phi3VForCausalLM(nn.Module):
     def __init__(
         self,
@@ -351,7 +371,9 @@ class Phi3VForCausalLM(nn.Module):
         self.language_model = Phi3ForCausalLM(config, quant_config=quant_config)
         self._process_images = ImageProcessor()
 
-        self.layer_idx = -2 # fixed to default value of clip embedding feature extraction
+        self.layer_idx = (
+            -2
+        )  # fixed to default value of clip embedding feature extraction
 
     # adapted from https://huggingface.co/microsoft/Phi-3-vision-128k-instruct/blob/main/image_embedding_phi3_v.py
     def encode_images(
@@ -362,11 +384,11 @@ class Phi3VForCausalLM(nn.Module):
         Encode images using the vision tower, returning patch embeddings.
 
         Args:
-            pixel_values (torch.FloatTensor): A float tensor of shape 
+            pixel_values (torch.FloatTensor): A float tensor of shape
                 (num_images, num_crops, 3, 336, 336).
-        
+
         Returns:
-            torch.FloatTensor: A tensor of shape 
+            torch.FloatTensor: A tensor of shape
                 (num_images, num_crops, seq_len-1, self.image_dim_out)
                 containing patch embeddings for each crop.
         """
@@ -378,16 +400,18 @@ class Phi3VForCausalLM(nn.Module):
 
         # 2. Forward pass through vision model
         vision_outputs = self.vision_tower(pixel_values_flat, output_hidden_states=True)
-        
+
         # 3. Get the desired hidden state and remove [CLS] token
-        img_feature = vision_outputs.hidden_states[self.layer_idx]  # shape: (N*C, seq_len, hidden_size)
-        patch_feature = img_feature[:, 1:]                     # remove the CLS token -> (N*C, seq_len-1, hidden_size)
+        img_feature = vision_outputs.hidden_states[
+            self.layer_idx
+        ]  # shape: (N*C, seq_len, hidden_size)
+        patch_feature = img_feature[
+            :, 1:
+        ]  # remove the CLS token -> (N*C, seq_len-1, hidden_size)
 
         # 4. Reshape to (num_images, num_crops, seq_len-1, image_dim_out)
-        image_dim_out = self.config['img_processor'].get('image_dim_out', 1024)
-        image_features = patch_feature.reshape(
-            num_images, num_crops, -1, image_dim_out
-        )
+        image_dim_out = self.config["img_processor"].get("image_dim_out", 1024)
+        image_features = patch_feature.reshape(num_images, num_crops, -1, image_dim_out)
 
         return image_features
 
@@ -421,10 +445,12 @@ class Phi3VForCausalLM(nn.Module):
 
                 pixel_values = torch.tensor(image.pixel_values, device="cuda")
                 processed_image = self._process_images(pixel_values)
-                num_image_tokens = processed_image['num_image_tokens'] # or self.config['img_processor']['num_image_tokens'] ?
+                num_image_tokens = processed_image[
+                    "num_image_tokens"
+                ]  # or self.config['img_processor']['num_image_tokens'] ?
 
                 # Embed image
-                image_embeds = self.encode_images(processed_image['pixel_values'])
+                image_embeds = self.encode_images(processed_image["pixel_values"])
 
                 image_offsets = image.image_offsets
 
@@ -447,26 +473,22 @@ class Phi3VForCausalLM(nn.Module):
             )
 
         elif forward_batch.forward_mode.is_decode():
-            return self.language_model(
-                input_ids, positions, forward_batch
-            )
+            return self.language_model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
 
-        vision_path = self.config['img_processor']['model_name']
+        vision_path = self.config["img_processor"]["model_name"]
         clip_config = Phi3VCLIPVisionConfig().to_transformers_config()
         self.vision_tower = CLIPVisionModel.from_pretrained(
-                    vision_path, 
-                    config=clip_config,
-                    torch_dtype=torch.float16
-                ).cuda()
+            vision_path, config=clip_config, torch_dtype=torch.float16
+        ).cuda()
 
         self.vision_tower.eval()
 
         # load mm_projector
         projector_weights = {
-            "model.vision_embed_tokens.img_projection.0": "multi_modal_projector.linear_1", # Weights for the first linear layer of the image projection.
-            "model.vision_embed_tokens.img_projection.2": "multi_modal_projector.linear_2", # Weights for the second linear layer of the image projection.
+            "model.vision_embed_tokens.img_projection.0": "multi_modal_projector.linear_1",  # Weights for the first linear layer of the image projection.
+            "model.vision_embed_tokens.img_projection.2": "multi_modal_projector.linear_2",  # Weights for the second linear layer of the image projection.
             "model.vision_embed_tokens.glb_GN": "multi_modal_projector.glb_GN",
             "model.vision_embed_tokens.sub_GN": "multi_modal_projector.sub_GN",
             "model.vision_embed_tokens.img_processor.vision_model": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
@@ -474,7 +496,12 @@ class Phi3VForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "img_projection" in name or "vision_model" in name or "glb_GN" in name or "sub_GN" in name:
+            if (
+                "img_projection" in name
+                or "vision_model" in name
+                or "glb_GN" in name
+                or "sub_GN" in name
+            ):
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
@@ -483,5 +510,6 @@ class Phi3VForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
             else:
                 self.language_model.load_weights([(name, loaded_weight)])
+
 
 EntryClass = [Phi3VForCausalLM]
