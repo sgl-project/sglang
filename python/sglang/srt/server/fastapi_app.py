@@ -79,7 +79,7 @@ async def health_generate(request: Request) -> Response:
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.7}
 
-    if _global_state.engine.tokenizer_manager.is_generation:
+    if _global_state.engine.entrypoint.is_generation:
         gri = GenerateReqInput(input_ids=[0], sampling_params=sampling_params)
     else:
         gri = EmbeddingReqInput(input_ids=[0], sampling_params=sampling_params)
