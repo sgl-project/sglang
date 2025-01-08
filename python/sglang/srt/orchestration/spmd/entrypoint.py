@@ -37,6 +37,7 @@ class Entrypoint:
 
         obj.normalize_batch_and_arguments()
         for i in range(obj.batch_size):
+            TODO_await
             tokenized_request = self._generation_converter.tokenize_request(obj[i])
             self._scheduler.handle_generate_request(tokenized_request)
 
