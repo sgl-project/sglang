@@ -90,9 +90,9 @@ def launch(
     detoken_proc.start()
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    entrypoint = TokenizerManager(server_args, port_args)
     if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+        load_chat_template_for_openai_api(entrypoint, server_args.chat_template)
 
     # Wait for model to finish loading
     scheduler_infos = []
@@ -117,7 +117,7 @@ def launch(
     # Assume all schedulers have same scheduler_info
     scheduler_info = scheduler_infos[0]
 
-    return tokenizer_manager, scheduler_info
+    return entrypoint, scheduler_info
 
 
 

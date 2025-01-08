@@ -361,14 +361,14 @@ class TokenizerManager:
 
 
 class _SignalHandler:
-    def __init__(self, tokenizer_manager):
-        self.tokenizer_manager = tokenizer_manager
+    def __init__(self, entrypoint):
+        self.entrypoint = entrypoint
 
     def signal_handler(self, signum=None, frame=None):
         logger.warning(
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
-        self.tokenizer_manager.gracefully_exit = True
+        self.entrypoint.gracefully_exit = True
 
 
 T = TypeVar("T")

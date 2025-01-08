@@ -116,7 +116,7 @@ def create_streaming_error_response(
     return json_str
 
 
-def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
+def load_chat_template_for_openai_api(entrypoint, chat_template_arg):
     global chat_template_name
 
     logger.info(
@@ -131,7 +131,7 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
         if chat_template_arg.endswith(".jinja"):
             with open(chat_template_arg, "r") as f:
                 chat_template = "".join(f.readlines()).strip("\n")
-            tokenizer_manager.tokenizer.chat_template = chat_template.replace(
+            entrypoint.tokenizer.chat_template = chat_template.replace(
                 "\\n", "\n"
             )
             chat_template_name = None
@@ -217,7 +217,7 @@ async def v1_delete_file(file_id: str):
     return FileDeleteResponse(id=file_id, deleted=True)
 
 
-async def v1_batches(tokenizer_manager, raw_request: Request):
+async def v1_batches(entrypoint, raw_request: Request):
     try:
         body = await raw_request.json()
 
@@ -238,7 +238,7 @@ async def v1_batches(tokenizer_manager, raw_request: Request):
         batch_storage[batch_id] = batch_response
 
         # Start processing the batch asynchronously
-        asyncio.create_task(process_batch(tokenizer_manager, batch_id, batch_request))
+        asyncio.create_task(process_batch(entrypoint, batch_id, batch_request))
 
         # Return the initial batch_response
         return batch_response
@@ -249,7 +249,7 @@ async def v1_batches(tokenizer_manager, raw_request: Request):
         return {"error": str(e)}
 
 
-async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRequest):
+async def process_batch(entrypoint, batch_id: str, batch_request: BatchRequest):
     try:
         # Update the batch status to "in_progress"
         batch_storage[batch_id].status = "in_progress"
@@ -292,7 +292,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
 
         if end_point == "/v1/chat/completions":
             adapted_request, request = v1_chat_generate_request(
-                all_requests, tokenizer_manager, request_ids=request_ids
+                all_requests, entrypoint, request_ids=request_ids
             )
         elif end_point == "/v1/completions":
             adapted_request, request = v1_generate_request(
@@ -300,7 +300,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             )
 
         try:
-            ret = await tokenizer_manager.generate_request(adapted_request).__anext__()
+            ret = await entrypoint.generate_request(adapted_request).__anext__()
             if not isinstance(ret, list):
                 ret = [ret]
             if end_point == "/v1/chat/completions":
@@ -308,11 +308,11 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     request,
                     ret,
                     to_file=True,
-                    cache_report=tokenizer_manager.server_args.enable_cache_report,
+                    cache_report=entrypoint.server_args.enable_cache_report,
                 )
             else:
                 responses = v1_generate_response(
-                    request, ret, tokenizer_manager, to_file=True
+                    request, ret, entrypoint, to_file=True
                 )
 
         except Exception as e:
@@ -384,7 +384,7 @@ async def v1_retrieve_batch(batch_id: str):
     return batch_response
 
 
-async def v1_cancel_batch(tokenizer_manager, batch_id: str):
+async def v1_cancel_batch(entrypoint, batch_id: str):
     # Retrieve the batch job from the in-memory storage
     batch_response = batch_storage.get(batch_id)
     if batch_response is None:
@@ -395,7 +395,7 @@ async def v1_cancel_batch(tokenizer_manager, batch_id: str):
         # Start cancelling the batch asynchronously
         asyncio.create_task(
             cancel_batch(
-                tokenizer_manager=tokenizer_manager,
+                entrypoint=entrypoint,
                 batch_id=batch_id,
                 input_file_id=batch_response.input_file_id,
             )
@@ -412,7 +412,7 @@ async def v1_cancel_batch(tokenizer_manager, batch_id: str):
         )
 
 
-async def cancel_batch(tokenizer_manager, batch_id: str, input_file_id: str):
+async def cancel_batch(entrypoint, batch_id: str, input_file_id: str):
     try:
         # Update the batch status to "cancelling"
         batch_storage[batch_id].status = "cancelling"
@@ -436,7 +436,7 @@ async def cancel_batch(tokenizer_manager, batch_id: str, input_file_id: str):
 
         # Cancel requests by request_ids
         for rid in request_ids:
-            tokenizer_manager.abort_request(rid=rid)
+            entrypoint.abort_request(rid=rid)
 
         retrieve_batch = batch_storage[batch_id]
         retrieve_batch.status = "cancelled"
@@ -564,7 +564,7 @@ def v1_generate_request(
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
-def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
+def v1_generate_response(request, ret, entrypoint, to_file=False):
     choices = []
     echo = False
 
@@ -576,13 +576,13 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], list):
             # for the case of multiple token ids prompts
             prompts = [
-                tokenizer_manager.tokenizer.decode(prompt, skip_special_tokens=True)
+                entrypoint.tokenizer.decode(prompt, skip_special_tokens=True)
                 for prompt in request.prompt
             ]
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], int):
             # for the case of single token ids prompt
             prompts = [
-                tokenizer_manager.tokenizer.decode(
+                entrypoint.tokenizer.decode(
                     request.prompt, skip_special_tokens=True
                 )
             ]
@@ -694,7 +694,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
     return response
 
 
-async def v1_completions(tokenizer_manager, raw_request: Request):
+async def v1_completions(entrypoint, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [CompletionRequest(**request_json)]
     adapted_request, request = v1_generate_request(all_requests)
@@ -707,7 +707,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             prompt_tokens = {}
             completion_tokens = {}
             try:
-                async for content in tokenizer_manager.generate_request(
+                async for content in entrypoint.generate_request(
                     adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
@@ -730,14 +730,14 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                                     prompts = request.prompt[index // request.n]
                                 elif isinstance(request.prompt[0], int):
                                     # for the case of single token ids prompt
-                                    prompts = tokenizer_manager.tokenizer.decode(
+                                    prompts = entrypoint.tokenizer.decode(
                                         request.prompt, skip_special_tokens=True
                                     )
                                 elif isinstance(request.prompt[0], list) and isinstance(
                                     request.prompt[0][0], int
                                 ):
                                     # for the case of multiple token ids prompts
-                                    prompts = tokenizer_manager.tokenizer.decode(
+                                    prompts = entrypoint.tokenizer.decode(
                                         request.prompt[index // request.n],
                                         skip_special_tokens=True,
                                     )
@@ -832,12 +832,12 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
         return StreamingResponse(
             generate_stream_resp(),
             media_type="text/event-stream",
-            background=tokenizer_manager.create_abort_task(adapted_request),
+            background=entrypoint.create_abort_task(adapted_request),
         )
 
     # Non-streaming response.
     try:
-        ret = await tokenizer_manager.generate_request(
+        ret = await entrypoint.generate_request(
             adapted_request, raw_request
         ).__anext__()
     except ValueError as e:
@@ -846,13 +846,13 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_generate_response(request, ret, tokenizer_manager)
+    response = v1_generate_response(request, ret, entrypoint)
     return response
 
 
 def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
-    tokenizer_manager,
+    entrypoint,
     request_ids: List[str] = None,
 ):
     input_ids = []
@@ -908,14 +908,14 @@ def v1_chat_generate_request(
                     openai_compatible_messages = openai_compatible_messages[:-1]
                 else:
                     assistant_prefix = None
-                prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                prompt_ids = entrypoint.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                     tools=tools,
                 )
                 if assistant_prefix:
-                    prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
+                    prompt_ids += entrypoint.tokenizer.encode(assistant_prefix)
                 stop = request.stop
                 image_data = None
                 modalities = []
@@ -930,7 +930,7 @@ def v1_chat_generate_request(
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
-                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
+                prompt_ids = entrypoint.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1166,10 +1166,10 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         return response
 
 
-async def v1_chat_completions(tokenizer_manager, raw_request: Request):
+async def v1_chat_completions(entrypoint, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    adapted_request, request = v1_chat_generate_request(all_requests, entrypoint)
 
     if adapted_request.stream:
 
@@ -1180,7 +1180,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             prompt_tokens = {}
             completion_tokens = {}
             try:
-                async for content in tokenizer_manager.generate_request(
+                async for content in entrypoint.generate_request(
                     adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
@@ -1319,12 +1319,12 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         return StreamingResponse(
             generate_stream_resp(),
             media_type="text/event-stream",
-            background=tokenizer_manager.create_abort_task(adapted_request),
+            background=entrypoint.create_abort_task(adapted_request),
         )
 
     # Non-streaming response.
     try:
-        ret = await tokenizer_manager.generate_request(
+        ret = await entrypoint.generate_request(
             adapted_request, raw_request
         ).__anext__()
     except ValueError as e:
@@ -1333,13 +1333,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret = [ret]
 
     response = v1_chat_generate_response(
-        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
+        request, ret, cache_report=entrypoint.server_args.enable_cache_report
     )
 
     return response
 
 
-def v1_embedding_request(all_requests, tokenizer_manager):
+def v1_embedding_request(all_requests, entrypoint):
     prompts = []
     sampling_params_list = []
     first_prompt_type = type(all_requests[0].input)
@@ -1394,13 +1394,13 @@ def v1_embedding_response(ret, model_path, to_file=False):
     )
 
 
-async def v1_embeddings(tokenizer_manager, raw_request: Request):
+async def v1_embeddings(entrypoint, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [EmbeddingRequest(**request_json)]
-    adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
+    adapted_request, request = v1_embedding_request(all_requests, entrypoint)
 
     try:
-        ret = await tokenizer_manager.generate_request(
+        ret = await entrypoint.generate_request(
             adapted_request, raw_request
         ).__anext__()
     except ValueError as e:
@@ -1409,7 +1409,7 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_embedding_response(ret, tokenizer_manager.model_path)
+    response = v1_embedding_response(ret, entrypoint.model_path)
 
     return response
 

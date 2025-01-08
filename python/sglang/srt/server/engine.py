@@ -45,10 +45,10 @@ class Engine:
         atexit.register(self.shutdown)
 
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
-        tokenizer_manager, scheduler_info = std.launcher.launch(
+        entrypoint, scheduler_info = std.launcher.launch(
             server_args=server_args
         )
-        self.tokenizer_manager = tokenizer_manager
+        self.entrypoint = entrypoint
         self.scheduler_info = scheduler_info
 
     def generate(
@@ -151,7 +151,7 @@ class Engine:
 
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
-                    async for out in self.tokenizer_manager.generate_request(
+                    async for out in self.entrypoint.generate_request(
                             obj, request
                     ):
                         yield b"data: " + orjson.dumps(
@@ -167,11 +167,11 @@ class Engine:
             return StreamingResponse(
                 stream_results(),
                 media_type="text/event-stream",
-                background=self.tokenizer_manager.create_abort_task(obj),
+                background=self.entrypoint.create_abort_task(obj),
             )
         else:
             try:
-                ret = await self.tokenizer_manager.generate_request(
+                ret = await self.entrypoint.generate_request(
                     obj, request
                 ).__anext__()
                 return ret
@@ -193,7 +193,7 @@ class Engine:
 
     async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
         try:
-            ret = await self.tokenizer_manager.generate_request(
+            ret = await self.entrypoint.generate_request(
                 obj, request
             ).__anext__()
             return ret
@@ -206,20 +206,20 @@ class Engine:
         kill_process_tree(os.getpid(), include_parent=False)
 
     def get_tokenizer(self):
-        if self.tokenizer_manager is None:
+        if self.entrypoint is None:
             raise ReferenceError("Tokenizer Manager is not initialized.")
         else:
-            return self.tokenizer_manager.tokenizer
+            return self.entrypoint.tokenizer
 
     def start_profile(self):
-        self.tokenizer_manager.start_profile()
+        self.entrypoint.start_profile()
 
     def stop_profile(self):
-        self.tokenizer_manager.stop_profile()
+        self.entrypoint.stop_profile()
 
     def get_server_info(self):
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),  # server args
+            **dataclasses.asdict(self.entrypoint.server_args),  # server args
             **self.scheduler_info,
             "version": __version__,
         }
@@ -244,7 +244,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.init_weights_update_group(obj, None)
+            self.entrypoint.init_weights_update_group(obj, None)
         )
 
     def update_weights_from_distributed(self, name, dtype, shape):
@@ -256,7 +256,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_distributed(obj, None)
+            self.entrypoint.update_weights_from_distributed(obj, None)
         )
 
     def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
@@ -266,7 +266,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_tensor(obj, None)
+            self.entrypoint.update_weights_from_tensor(obj, None)
         )
 
     def get_weights_by_name(self, name, truncate_size=100):
@@ -274,7 +274,7 @@ class Engine:
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.get_weights_by_name(obj, None)
+            self.entrypoint.get_weights_by_name(obj, None)
         )
 
 
