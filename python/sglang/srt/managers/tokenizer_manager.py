@@ -106,8 +106,6 @@ class TokenizerManager:
             context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
 
-        self._generation_manager = _GenerationManager()
-
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
@@ -138,6 +136,12 @@ class TokenizerManager:
 
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
+
+        self._generation_manager = _GenerationManager(
+            server_args=server_args,
+            model_update_lock=self.model_update_lock,
+            send_to_scheduler=self.send_to_scheduler,
+        )
 
         # Others
         self.gracefully_exit = False
@@ -437,8 +441,15 @@ class _MetricReqState:
 
 
 class _GenerationManager:
-    def __init__(self, server_args: ServerArgs):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        model_update_lock,
+        send_to_scheduler,
+    ):
         self.server_args = server_args
+        self.model_update_lock = model_update_lock
+        self.send_to_scheduler = send_to_scheduler
 
         self._generation_converter = GenerationConverter(
             server_args=server_args,
