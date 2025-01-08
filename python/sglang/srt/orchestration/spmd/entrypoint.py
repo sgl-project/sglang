@@ -41,7 +41,9 @@ class Entrypoint:
             tokenized_request = self._generation_converter.tokenize_request(obj[i])
             self._scheduler.handle_generate_request(tokenized_request)
 
-        while TODO:
-            self._scheduler.process_batch()
+        while True:
+            has_batch = self._scheduler.process_batch()
+            if not has_batch:
+                break
 
         return outputs
