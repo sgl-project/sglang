@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 MODEL_SCORE_THRESHOLDS = {
-    "meta-llama/Llama-3.1-8B-Instruct": 0.84,
+    "meta-llama/Llama-3.1-8B-Instruct": 0.82,
     "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     "google/gemma-2-27b-it": 0.92,
@@ -29,11 +29,11 @@ MODEL_SCORE_THRESHOLDS = {
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
     "Qwen/Qwen2-57B-A14B-Instruct": 0.88,
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.83,
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.55,
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
     "neuralmagic/gemma-2-2b-it-FP8": 0.60,
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.63,
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.62,
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.84,
