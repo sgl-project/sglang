@@ -1011,11 +1011,22 @@ def fused_experts_impl(
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
-            torch.sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                dim=1,
-                out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
+            if topk_ids.shape[1] == 1:
+                out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(
+                    intermediate_cache3[:, 0]
+                )
+            elif topk_ids.shape[1] == 2:
+                torch.add(
+                    intermediate_cache3[:, 0],
+                    intermediate_cache3[:, 1],
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                ).squeeze(dim=1)
+            elif topk_ids.shape[1] > 2:
+                torch.sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    dim=1,
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
 
     return out_hidden_states
 

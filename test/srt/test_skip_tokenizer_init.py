@@ -55,8 +55,10 @@ class TestSkipTokenizerInit(unittest.TestCase):
         print(json.dumps(ret))
 
         def assert_one_item(item):
-            assert len(item["token_ids"]) == item["meta_info"]["completion_tokens"]
-            assert len(item["token_ids"]) == max_new_tokens
+            self.assertEqual(
+                len(item["token_ids"]), item["meta_info"]["completion_tokens"]
+            )
+            self.assertEqual(len(item["token_ids"]), max_new_tokens)
             assert item["meta_info"]["prompt_tokens"] == len(input_ids)
 
             if return_logprob:

@@ -204,6 +204,7 @@ class FusedMoE(torch.nn.Module):
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        use_presharded_weights: bool = False,
     ):
         super().__init__()
 
@@ -243,6 +244,7 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+        self.use_presharded_weights = use_presharded_weights
 
     def _load_per_tensor_weight_scale(
         self,
@@ -395,10 +397,7 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
         expert_id: int,
-        use_presharded_weights: bool = False,
     ) -> None:
-        self.use_presharded_weights = use_presharded_weights
-
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
