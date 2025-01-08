@@ -369,6 +369,7 @@ class Entrypoint:
     def image_token_id(self):
         return self._generation_manager.model_config.image_token_id
 
+
 class _SignalHandler:
     def __init__(self, entrypoint):
         self.entrypoint = entrypoint

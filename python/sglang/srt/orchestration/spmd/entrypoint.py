@@ -9,11 +9,11 @@ from sglang.srt.server_args import ServerArgs
 
 class Entrypoint:
     def __init__(
-            self,
-            server_args: ServerArgs,
-            nccl_port: int,
-            gpu_id: int,
-            tp_rank: int,
+        self,
+        server_args: ServerArgs,
+        nccl_port: int,
+        gpu_id: int,
+        tp_rank: int,
     ):
         self._scheduler = Scheduler(
             server_args=server_args,
