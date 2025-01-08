@@ -250,6 +250,7 @@ class Scheduler:
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
+        self.overlap_result_queue = deque()
 
         # Session info
         self.sessions: Dict[str, Session] = {}
@@ -394,8 +395,6 @@ class Scheduler:
     @torch.no_grad()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        result_queue = deque()
-
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -405,7 +404,7 @@ class Scheduler:
 
             if batch:
                 result = self.run_batch(batch)
-                result_queue.append((batch.copy(), result))
+                self.overlap_result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap scheduler.
@@ -419,7 +418,7 @@ class Scheduler:
 
             if self.last_batch:
                 # Process the results of the last batch
-                tmp_batch, tmp_result = result_queue.popleft()
+                tmp_batch, tmp_result = self.overlap_result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
