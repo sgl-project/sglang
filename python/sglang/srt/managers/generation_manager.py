@@ -60,18 +60,20 @@ class GenerationManager:
         )
 
         self.is_generation = self.model_config.is_generation
-        self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
 
         self._generation_converter = GenerationConverter(
             server_args=server_args,
+            model_config=self.model_config,
         )
 
         self.rid_to_state: Dict[str, _ReqState] = {}
 
         # Metrics
         if server_args.enable_metrics:
-            self._metric_manager = _MetricManager()
+            self._metric_manager = _MetricManager(
+                server_args=server_args,
+            )
 
     async def generate(
         self,
@@ -80,7 +82,7 @@ class GenerationManager:
     ):
         created_time = time.time()
 
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+        if isinstance(obj, EmbeddingReqInput) and self.model_config.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
                 "Please add `--is-embedding` when launching the server or try another model."
@@ -279,6 +281,7 @@ class GenerationConverter:
         model_config: ModelConfig,
     ):
         self.server_args = server_args
+        self.model_config = model_config
 
         # Create image processor placeholder
         self.image_processor = get_dummy_image_processor()
@@ -329,7 +332,7 @@ class GenerationConverter:
         else:
             input_ids = obj.input_ids
 
-        if self.is_generation:
+        if self.model_config.is_generation:
             # TODO: also support getting embeddings for multimodal models
             image_inputs: Dict = await self.image_processor.process_images_async(
                 obj.image_data, input_text or input_ids, obj
@@ -343,10 +346,10 @@ class GenerationConverter:
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-        if obj.input_ids is not None and len(input_ids) >= self.context_len:
+        if obj.input_ids is not None and len(input_ids) >= self.model_config.context_len:
             raise ValueError(
                 f"The input ({len(input_ids)} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
+                f"model's context length ({self.model_config.context_len} tokens)."
             )
 
         # Parse sampling parameters
@@ -513,7 +516,7 @@ class GenerationConverter:
 
 
 class _MetricManager:
-    def __init__(self):
+    def __init__(self, server_args: ServerArgs):
         self._metrics_collector = TokenizerMetricsCollector(
             labels={
                 "model_name": self.server_args.served_model_name,
