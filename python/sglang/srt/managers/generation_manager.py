@@ -59,6 +59,8 @@ class GenerationManager:
             self._metric_manager = _MetricManager(
                 server_args=server_args,
             )
+        else:
+            self._metric_manager = None
 
     async def generate(
         self,
