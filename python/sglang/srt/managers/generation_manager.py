@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import dataclasses
+import logging
 import os
 import time
 from typing import Dict, List, Union, Any, Callable
@@ -33,6 +34,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class GenerationManager:
