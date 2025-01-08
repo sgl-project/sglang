@@ -114,7 +114,7 @@ def check_model_scores(results):
                 f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
             )
 
-        line = f"| {model} | {score} | {threshold} |"
+        line = f"| {model} | {score} | {threshold} |\n"
         summary += line
 
     print(summary)
