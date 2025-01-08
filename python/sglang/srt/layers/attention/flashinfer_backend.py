@@ -375,6 +375,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 causal=True,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
             )
 
             if self.forward_metadata.extend_no_prefix:
@@ -386,6 +388,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=layer.logit_cap,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
