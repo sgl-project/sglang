@@ -57,19 +57,11 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+    runtime = sgl.Runtime(model_path="/root/autodl-tmp/model/Qwen2.5-7B-Instruct", kv_cache_dtype="int8", attention_backend="triton")
     sgl.set_default_backend(runtime)
 
     # Run a single request
     print("\n========== single ==========\n")
     single()
-
-    # Stream output
-    print("\n========== stream ==========\n")
-    stream()
-
-    # Run a batch of requests
-    print("\n========== batch ==========\n")
-    batch()
 
     runtime.shutdown()

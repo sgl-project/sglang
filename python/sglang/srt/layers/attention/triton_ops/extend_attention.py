@@ -346,7 +346,7 @@ def extend_attention_fwd(
     """
 
     # assert kv dtype
-    USE_INT8_KV = k_buffer[0].dtype == torch.int8
+    USE_INT8_KV = k_buffer[0].dtype == torch.uint8
 
     Lq, Lk, Lv = (
         q_extend.shape[-1],

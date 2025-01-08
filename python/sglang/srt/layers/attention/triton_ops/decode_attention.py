@@ -247,7 +247,7 @@ def _decode_att_m_fwd(
 
     # assert kv dtype
     print(k_buffer.dtype)
-    USE_INT8_KV = k_buffer[0].dtype == torch.int8
+    USE_INT8_KV = k_buffer[0].dtype == torch.uint8
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -568,7 +568,7 @@ def _decode_grouped_att_m_fwd(
     Lv = v_buffer.shape[-1]
 
     # assert kv dtype
-    USE_INT8_KV = k_buffer[0].dtype == torch.int8
+    USE_INT8_KV = k_buffer[0].dtype == torch.uint8
 
     # [TODO] work around shmem limit on MI3xx
     if is_hip_ and Lk >= 576:

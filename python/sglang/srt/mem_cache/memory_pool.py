@@ -207,6 +207,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
 
     def _create_buffers(self):
+<<<<<<< HEAD
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -242,6 +243,43 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 )
                 for _ in range(self.layer_num)
             ]
+=======
+        # [size, head_num, head_dim] for each layer
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        print(self.store_dtype)
+        self.k_buffer = [
+            torch.empty(
+                (self.size + 1, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.v_buffer = [
+            torch.empty(
+                (self.size + 1, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.k_scales_zeros = [
+            torch.empty(
+                (self.size + 1, self.head_num, 2),
+                dtype=torch.float16,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.v_scales_zeros = [
+            torch.empty(
+                (self.size + 1, self.head_num, 2),
+                dtype=torch.float16,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+>>>>>>> 9fc855c6 (fix output bug)
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -279,12 +317,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.v_buffer[i][indices] = v_data[i]
 
     def get_key_buffer(self, layer_id: int):
-        if self.store_dtype != self.kv_cache_dtype:
+        if self.kv_cache_dtype == torch.float8_e5m2 and self.store_dtype != self.kv_cache_dtype:
             return self.k_buffer[layer_id].view(self.kv_cache_dtype)
         return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        if self.store_dtype != self.kv_cache_dtype:
+        if self.kv_cache_dtype == torch.float8_e5m2 and self.store_dtype != self.kv_cache_dtype:
             return self.v_buffer[layer_id].view(self.kv_cache_dtype)
         return self.v_buffer[layer_id]
 
