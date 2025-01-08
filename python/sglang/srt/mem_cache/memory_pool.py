@@ -105,7 +105,7 @@ class BaseTokenToKVPool:
     ):
         self.size = size
         self.dtype = dtype
-        if dtype == torch.float8_e5m2:
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             # NOTE: Store as torch.uint8 because Tensor index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -232,11 +232,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        k_scale: float,
+        v_scale: float,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+            cache_k = (cache_k * k_scale).to(self.dtype)
+            cache_v = (cache_v * v_scale).to(self.dtype)
         if self.store_dtype != self.dtype:
             self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
             self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)

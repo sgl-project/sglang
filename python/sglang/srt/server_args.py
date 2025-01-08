@@ -37,6 +37,12 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -345,8 +351,17 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--quantization-param-path",
+            type=nullable_str,
+            default=None,
+            help="Path to the JSON file containing the KV cache "
+            "scaling factors. This should generally be supplied, when "
+            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+            "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--quantization",
