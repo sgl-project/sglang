@@ -18,6 +18,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.orchestration import std
+from sglang.srt.server.engine_base import EngineBase
 from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -30,7 +31,7 @@ from starlette.responses import StreamingResponse
 logger = logging.getLogger(__name__)
 
 
-class Engine:
+class Engine(EngineBase):
     """
     SRT Engine without an HTTP server layer.
 
@@ -51,36 +52,12 @@ class Engine:
         self.entrypoint = entrypoint
         self.scheduler_info = scheduler_info
 
-    def generate(
-            self,
-            # The input prompt. It can be a single prompt or a batch of prompts.
-            prompt: Optional[Union[List[str], str]] = None,
-            sampling_params: Optional[Union[List[Dict], Dict]] = None,
-            # The token ids for text; one can either specify text or input_ids.
-            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-            return_logprob: Optional[Union[List[bool], bool]] = False,
-            logprob_start_len: Optional[Union[List[int], int]] = None,
-            top_logprobs_num: Optional[Union[List[int], int]] = None,
-            lora_path: Optional[List[Optional[str]]] = None,
-            stream: bool = False,
-    ):
-        obj = GenerateReqInput(
-            text=prompt,
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            lora_path=lora_path,
-            stream=stream,
-        )
-
+    def _generate_impl(self, obj: GenerateReqInput):
         # get the current event loop
         loop = asyncio.get_event_loop()
         ret = loop.run_until_complete(self._generate_raw(obj, None))
 
-        if stream is True:
-
+        if obj.stream is True:
             def generator_wrapper():
                 offset = 0
                 loop = asyncio.get_event_loop()
