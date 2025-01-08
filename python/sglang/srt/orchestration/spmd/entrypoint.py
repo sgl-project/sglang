@@ -35,8 +35,9 @@ class Entrypoint:
 
         self._scheduler.callback = SchedulerCallback(on_generation_output=_handle_scheduler_output)
 
-        tokenized_requests = TODO
-        for tokenized_request in tokenized_requests:
+        obj.normalize_batch_and_arguments()
+        for i in range(obj.batch_size):
+            tokenized_request = self._generation_converter.tokenize_request(obj[i])
             self._scheduler.handle_generate_request(tokenized_request)
 
         while TODO:
