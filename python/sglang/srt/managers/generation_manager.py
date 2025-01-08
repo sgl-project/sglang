@@ -135,6 +135,8 @@ class GenerationManager:
         self,
         recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
         i: int,
+        rid: str,
+        req_obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         meta_info = {
             "id": rid,
@@ -142,11 +144,11 @@ class GenerationManager:
             "prompt_tokens": recv_obj.prompt_tokens[i],
         }
 
-        if getattr(state.obj, "return_logprob", False):
+        if getattr(req_obj, "return_logprob", False):
             self._convert_logprob_style(
                 meta_info,
-                state.obj.top_logprobs_num,
-                state.obj.return_text_in_logprobs,
+                req_obj.top_logprobs_num,
+                req_obj.return_text_in_logprobs,
                 recv_obj,
                 i,
             )
