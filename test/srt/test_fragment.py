@@ -83,8 +83,6 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         raise
 
     print(f"subprocess[{tp_rank=}] end", flush=True)
-    # TODO Wait for more real tests, if it does not exit there, then we should fix it
-    exit(0)
 
 
 if __name__ == "__main__":
