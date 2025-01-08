@@ -77,14 +77,12 @@ async def health() -> Response:
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
 
+    sampling_params = {"max_new_tokens": 1, "temperature": 0.7}
+
     if _global_state.engine.tokenizer_manager.is_generation:
-        gri = GenerateReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = GenerateReqInput(input_ids=[0], sampling_params=sampling_params)
     else:
-        gri = EmbeddingReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = EmbeddingReqInput(input_ids=[0], sampling_params=sampling_params)
 
     try:
         async for _ in _global_state.engine.tokenizer_manager.generate_request(
