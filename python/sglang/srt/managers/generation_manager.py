@@ -200,7 +200,7 @@ class GenerationManager:
         if self.enable_metrics:
             self._handle_batch_output_metrics(recv_obj, i, state)
 
-    def _handle_batch_output_metrics(self, recv_obj, i, state):
+    def _handle_batch_output_metrics(self, recv_obj, i):
         completion_tokens = (
             recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
         )
