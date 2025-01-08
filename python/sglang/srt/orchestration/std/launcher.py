@@ -1,36 +1,17 @@
-import asyncio
-import atexit
-import dataclasses
-import json
 import logging
 import multiprocessing as mp
 import os
 import signal
-from abc import ABC
-from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
-
-import orjson
-import torch
-from fastapi import Request
-from starlette.responses import StreamingResponse
 
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
-from sglang.srt.managers.io_struct import (
-    EmbeddingReqInput,
-    GenerateReqInput,
-    GetWeightsByNameReqInput,
-    InitWeightsUpdateGroupReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
-from sglang.srt.server.utils import create_error_response
+from sglang.srt.orchestration.std.detokenizer import run_detokenizer_process
+from sglang.srt.orchestration.std.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
     kill_process_tree,
@@ -39,7 +20,8 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.version import __version__
+
+logger = logging.getLogger(__name__)
 
 def launch(
     server_args: ServerArgs,
