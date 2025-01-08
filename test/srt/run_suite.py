@@ -49,8 +49,7 @@ suites = {
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
-        "test_nightly_human_eval.py",
-        # Disable temporarly
+        # Disable temporarily
         # "test_nightly_math_eval.py",
     ],
     "sampling/penaltylib": glob.glob(
