@@ -34,13 +34,47 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.utils import TypeBasedDispatcher
 
 
 class GenerationManager:
+    def __init__(
+        self,
+        server_args: ServerArgs,
+    ):
+        self.server_args = server_args
+
+        # Create image processor placeholder
+        self.image_processor = get_dummy_image_processor()
+
+        # Create tokenizer
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        else:
+            if self.model_config.is_multimodal:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                self.tokenizer = self.processor.tokenizer
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+                # We want to parallelize the image pre-processing so we create an executor for it
+                self.image_processor = get_image_processor(
+                    self.model_config.hf_config, server_args, self.processor
+                )
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+
     async def tokenize_one_request(
-            self,
-            obj: Union[GenerateReqInput, EmbeddingReqInput],
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
         # Tokenize
