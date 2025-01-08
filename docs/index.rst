@@ -60,5 +60,5 @@ The core features include:
    references/troubleshooting.md
    references/faq.md
    references/learn_more.md
-   references/example_run_llama_3.1_405b.md
-   references/use_models_from_modelscope.md
+   references/llama_405B.md
+   references/modelscope.md
