@@ -48,7 +48,8 @@ def main():
         "The future of AI is",
     ]
     tokenizer.pad_token = tokenizer.eos_token
-    prompts = tokenizer(preencode_prompts, return_tensors='pt', padding=True)
+    prompts = tokenizer(preencode_prompts, return_tensors='pt', padding=True,
+                        padding_side='left')  # NOTE MODIFIED ADD
     input_ids = prompts['input_ids']
     attention_mask = prompts['attention_mask']
     input_ids = pad_sequence_to_length(input_ids, max_prompt_length, tokenizer.pad_token_id, left_pad=True).cuda()
@@ -57,6 +58,8 @@ def main():
     from transformers import GenerationConfig
     generation_config = GenerationConfig(do_sample=False)
     actor_model.cuda()
+    if torch.distributed.get_rank() == 0:
+        print(f'hi call hf.generate({input_ids=}, {attention_mask=})')
     output = actor_model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
