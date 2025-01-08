@@ -103,6 +103,9 @@ class SchedulerCommunicator:
             on_output=self._send_to_detokenizer.send_pyobj,
         )
 
+    def recv_and_process_input_requests(self):
+        self._process_input_requests(self._recv_requests())
+
     def _recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
@@ -176,9 +179,9 @@ def run_scheduler_process(
         )
 
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            communicator.recv_and_process_input_requests()
             scheduler.process_batch()
+
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
