@@ -14,6 +14,7 @@
 
 import os
 from typing import List
+from sglang.srt.server.engine_fragment import EngineFragment
 
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
@@ -75,36 +76,38 @@ def main():
     print(f'hf response: {tokenizer.batch_decode(response)}')
 
     tensor_model_parallel_size = 4
-    from torch.distributed.device_mesh import init_device_mesh
-    device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
+    # from torch.distributed.device_mesh import init_device_mesh
+    # device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
+    #
+    # mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
+    # fsdp_model = FSDP(actor_model,
+    #                   use_orig_params=True,
+    #                   auto_wrap_policy=None,
+    #                   device_id=torch.cuda.current_device(),
+    #                   sharding_strategy=ShardingStrategy.FULL_SHARD,
+    #                   mixed_precision=mixed_precision,
+    #                   cpu_offload=CPUOffload(offload_params=False),
+    #                   sync_module_states=False,
+    #                   device_mesh=device_mesh)
+    #
+    # FSDP.set_state_dict_type(fsdp_model,
+    #                          state_dict_type=StateDictType.SHARDED_STATE_DICT,
+    #                          state_dict_config=ShardedStateDictConfig())
+    #
+    # state_dict = fsdp_model.state_dict()
 
-    mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
-    fsdp_model = FSDP(actor_model,
-                      use_orig_params=True,
-                      auto_wrap_policy=None,
-                      device_id=torch.cuda.current_device(),
-                      sharding_strategy=ShardingStrategy.FULL_SHARD,
-                      mixed_precision=mixed_precision,
-                      cpu_offload=CPUOffload(offload_params=False),
-                      sync_module_states=False,
-                      device_mesh=device_mesh)
-
-    FSDP.set_state_dict_type(fsdp_model,
-                             state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                             state_dict_config=ShardedStateDictConfig())
-
-    state_dict = fsdp_model.state_dict()
-
-    sampling_params = SamplingParams(temperature=0,
-                                     top_p=1,
-                                     n=1,
-                                     max_tokens=response_length,
-                                     logprobs=1,
-                                     ignore_eos=True,
-                                     detokenize=False)
+    sampling_params = dict(temperature=0,
+                           top_p=1,
+                           n=1,
+                           # max_tokens=response_length,
+                           max_new_tokens=response_length,
+                           # logprobs=1, # TODO
+                           ignore_eos=True,
+                           detokenize=False, # TODO
+                           )
 
     print(actor_model_config)
-    llm = LLM(model=None,
+    llm = EngineFragment(model=None,
               tokenizer=tokenizer,
               model_hf_config=actor_model_config,
               tensor_parallel_size=tensor_model_parallel_size,
@@ -114,7 +117,7 @@ def main():
               gpu_memory_utilization=0.1,
               trust_remote_code=True)
 
-    llm.sync_model_weights(actor_weights=state_dict, load_format='dtensor')
+    # llm.sync_model_weights(actor_weights=state_dict, load_format='dtensor')
 
     input_ids = input_ids.cuda()
     attention_mask = attention_mask.cuda()
@@ -122,7 +125,6 @@ def main():
     batch_size = input_ids.shape[0]
 
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    from verl.workers.rollout.vllm_rollout.vllm_rollout import _pre_process_inputs
     for i in range(batch_size):
         idx_list.append(_pre_process_inputs(pad_token_id, input_ids[i]))
     print('start generation')
