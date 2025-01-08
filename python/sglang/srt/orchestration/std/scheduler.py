@@ -162,7 +162,7 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(
             server_args=server_args,
-            port_args=port_args,
+            nccl_port=port_args.nccl_port,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,

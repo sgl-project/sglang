@@ -92,7 +92,7 @@ class Scheduler:
     def __init__(
             self,
             server_args: ServerArgs,
-            port_args: PortArgs,
+            nccl_port: int,
             gpu_id: int,
             tp_rank: int,
             dp_rank: Optional[int],
@@ -171,7 +171,7 @@ class Scheduler:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
-            nccl_port=port_args.nccl_port,
+            nccl_port=nccl_port,
         )
 
         # Launch worker for speculative decoding if need
@@ -182,7 +182,7 @@ class Scheduler:
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 server_args=server_args,
-                nccl_port=port_args.nccl_port,
+                nccl_port=nccl_port,
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
