@@ -170,7 +170,8 @@ class TokenizerManager:
     ):
         self.auto_create_handle_loop()
         async with self.model_update_lock.reader_lock:
-            self._generation_manager.generate_request(obj, request)
+            async for value in self._generation_manager.generate(obj, request):
+                yield value
 
     def abort_request(self, rid: str):
         self._generation_manager.abort_request(rid)

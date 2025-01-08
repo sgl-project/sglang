@@ -57,7 +57,7 @@ class GenerationManager:
         if server_args.enable_metrics:
             self._metric_manager = _MetricManager()
 
-    async def generate_request(
+    async def generate(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
