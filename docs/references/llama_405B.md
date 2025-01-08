@@ -1,9 +1,8 @@
-# Example: Run Llama 3.1 405B
+# Run Llama 3.1 405B
 
 ## Run 405B (fp8) on a Single Node
 
 ```bash
-
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
 ```
 
