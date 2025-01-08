@@ -1,0 +1,2 @@
+class SchedulerCommunicator:
+    TODO
