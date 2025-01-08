@@ -1,82 +1,44 @@
+import os
+import signal
 from types import SimpleNamespace
+from typing import List, Optional
 
+import psutil
+import setproctitle
 import zmq
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    CloseSessionReqInput,
+    FlushCacheReq,
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    OpenSessionReqInput,
+    ProfileReq,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
+from sglang.srt.managers.schedule_batch import (
+    Req,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
     get_zmq_socket,
 )
-from sglang.utils import TypeBasedDispatcher
-
-import os
-import signal
-import threading
-import time
-import warnings
-from collections import deque
-from concurrent import futures
-from typing import Callable, Dict, List, Optional, Union
-
-import psutil
-import setproctitle
-import torch
-from sglang.global_config import global_config
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
-    CloseSessionReqInput,
-    FlushCacheReq,
-    GetWeightsByNameReqInput,
-    GetWeightsByNameReqOutput,
-    InitWeightsUpdateGroupReqInput,
-    InitWeightsUpdateGroupReqOutput,
-    OpenSessionReqInput,
-    OpenSessionReqOutput,
-    ProfileReq,
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
-)
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
-    ImageInputs,
-    Req,
-    ScheduleBatch,
-    global_server_args_dict,
-)
-from sglang.srt.managers.schedule_policy import (
-    AddReqResult,
-    PrefillAdder,
-    SchedulePolicy,
-)
-from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
-    crash_on_warnings,
     get_bool_env_var,
     set_gpu_proc_affinity,
-    set_random_seed,
     suppress_other_loggers,
 )
+from sglang.utils import TypeBasedDispatcher
 from sglang.utils import get_exception_traceback
+
+logger = logging.getLogger(__name__)
 
 
 class SchedulerCommunicator:
