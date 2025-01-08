@@ -13,13 +13,14 @@ _TP_SIZE = 2
 class TestFragment(unittest.TestCase):
     def test_fragment(self):
         multiprocessing.set_start_method("spawn")
+        nccl_port = 12345
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         for tp_rank in range(_TP_SIZE):
             p = Process(
                 target=_run_subprocess,
-                args=(tp_rank, queue, output_writer),
+                args=(tp_rank, nccl_port, output_writer),
             )
             p.start()
             processes.append(p)
@@ -42,7 +43,7 @@ class TestFragment(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(tp_rank: int, output_writer):
+def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
     try:
         print(f"subprocess[{tp_rank=}] Start")
 
@@ -54,7 +55,7 @@ def _run_subprocess(tp_rank: int, output_writer):
             # fragment args
             tp_rank=tp_rank,
             gpu_id=tp_rank,
-            nccl_port=TODO,
+            nccl_port=nccl_port,
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
