@@ -100,7 +100,7 @@ class SchedulerCommunicator:
         )
 
         core.callback = SchedulerCallback(
-            on_generation_output=self._send_to_detokenizer.send_pyobj,
+            on_generation_output=self._on_generation_output,
         )
 
     def recv_and_process_input_requests(self):
@@ -129,6 +129,9 @@ class SchedulerCommunicator:
             output = self._dispatcher(recv_req)
             if output is not None:
                 self._send_to_tokenizer.send_pyobj(output)
+
+    def _on_generation_output(self, obj):
+        self._send_to_detokenizer.send_pyobj(obj)
 
 
 def run_scheduler_process(
