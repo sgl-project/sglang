@@ -62,7 +62,7 @@ class SchedulerCommunicator:
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+                self._send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name
                 )
             else:
