@@ -5,7 +5,7 @@ import time
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size
+from sgl_kernel import moe_align_block_size_v2 as moe_align_block_size
 
 
 def ceil_div(a, b):
