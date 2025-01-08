@@ -704,6 +704,195 @@ class ModelRunner:
         )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        # # print forward_mode, input_ids, token_list.shape, positions, verified_id, hidden_states.shape for forward_batch if its not none
+        if forward_batch is not None:
+            print(f"=====forward_batch=====")
+            print(f"- is_draft_model?: {self.is_draft_worker}")
+            print(f"- forward_mode: {forward_batch.forward_mode}")
+            print(f"- input_ids: {forward_batch.input_ids}")
+            if (
+                hasattr(forward_batch, "token_list")
+                and forward_batch.token_list is not None
+            ):
+                print(f"- token_list shape: {forward_batch.token_list.shape}")
+            print(f"positions: {forward_batch.positions}")
+            if (
+                hasattr(forward_batch, "verified_id")
+                and forward_batch.verified_id is not None
+            ):
+                print(f"- verified_id: {forward_batch.verified_id}")
+            if (
+                hasattr(forward_batch, "hidden_states")
+                and forward_batch.hidden_states is not None
+            ):
+                print(f"- hidden_states shape: {forward_batch.hidden_states.shape}")
+            if (
+                hasattr(forward_batch, "req_pool_indices")
+                and forward_batch.req_pool_indices is not None
+            ):
+                print(f"- req_pool_indices: {forward_batch.req_pool_indices}")
+            if (
+                hasattr(forward_batch, "seq_lens")
+                and forward_batch.seq_lens is not None
+            ):
+                print(f"- seq_lens: {forward_batch.seq_lens}")
+            if (
+                hasattr(forward_batch, "out_cache_loc")
+                and forward_batch.out_cache_loc is not None
+            ):
+                print(f"- out_cache_loc: {forward_batch.out_cache_loc}")
+            if (
+                hasattr(forward_batch, "seq_lens_sum")
+                and forward_batch.seq_lens_sum is not None
+            ):
+                print(f"- seq_lens_sum: {forward_batch.seq_lens_sum}")
+            if (
+                hasattr(forward_batch, "extend_num_tokens")
+                and forward_batch.extend_num_tokens is not None
+            ):
+                print(f"- extend_num_tokens: {forward_batch.extend_num_tokens}")
+            if (
+                hasattr(forward_batch, "extend_seq_lens")
+                and forward_batch.extend_seq_lens is not None
+            ):
+                print(f"- extend_seq_lens: {forward_batch.extend_seq_lens}")
+            if (
+                hasattr(forward_batch, "extend_prefix_lens")
+                and forward_batch.extend_prefix_lens is not None
+            ):
+                print(f"- extend_prefix_lens: {forward_batch.extend_prefix_lens}")
+            if (
+                hasattr(forward_batch, "extend_start_loc")
+                and forward_batch.extend_start_loc is not None
+            ):
+                print(f"- extend_start_loc: {forward_batch.extend_start_loc}")
+            if (
+                hasattr(forward_batch, "extend_prefix_lens_cpu")
+                and forward_batch.extend_prefix_lens_cpu is not None
+            ):
+                print(
+                    f"- extend_prefix_lens_cpu: {forward_batch.extend_prefix_lens_cpu}"
+                )
+            if (
+                hasattr(forward_batch, "extend_seq_lens_cpu")
+                and forward_batch.extend_seq_lens_cpu is not None
+            ):
+                print(f"- extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}")
+            if (
+                hasattr(forward_batch, "extend_logprob_start_lens_cpu")
+                and forward_batch.extend_logprob_start_lens_cpu is not None
+            ):
+                print(
+                    f"- extend_logprob_start_lens_cpu: {forward_batch.extend_logprob_start_lens_cpu}"
+                )
+            if (
+                hasattr(forward_batch, "image_inputs")
+                and forward_batch.image_inputs is not None
+            ):
+                print(f"- image_inputs: {forward_batch.image_inputs}")
+            if (
+                hasattr(forward_batch, "encoder_cached")
+                and forward_batch.encoder_cached is not None
+            ):
+                print(f"- encoder_cached: {forward_batch.encoder_cached}")
+            if (
+                hasattr(forward_batch, "encoder_lens")
+                and forward_batch.encoder_lens is not None
+            ):
+                print(f"- encoder_lens: {forward_batch.encoder_lens}")
+            if (
+                hasattr(forward_batch, "encoder_lens_cpu")
+                and forward_batch.encoder_lens_cpu is not None
+            ):
+                print(f"- encoder_lens_cpu: {forward_batch.encoder_lens_cpu}")
+            if (
+                hasattr(forward_batch, "encoder_out_cache_loc")
+                and forward_batch.encoder_out_cache_loc is not None
+            ):
+                print(f"- encoder_out_cache_loc: {forward_batch.encoder_out_cache_loc}")
+            if (
+                hasattr(forward_batch, "lora_paths")
+                and forward_batch.lora_paths is not None
+            ):
+                print(f"- lora_paths: {forward_batch.lora_paths}")
+            if (
+                hasattr(forward_batch, "input_embeds")
+                and forward_batch.input_embeds is not None
+            ):
+                print(f"- input_embeds: {forward_batch.input_embeds}")
+            if (
+                hasattr(forward_batch, "sampling_info")
+                and forward_batch.sampling_info is not None
+            ):
+                print(f"- sampling_info: {forward_batch.sampling_info}")
+            if (
+                hasattr(forward_batch, "req_to_token_pool")
+                and forward_batch.req_to_token_pool is not None
+            ):
+                print(
+                    f"- req_to_token_pool: {forward_batch.req_to_token_pool.write_records.__len__()}"
+                )
+            if (
+                hasattr(forward_batch, "token_to_kv_pool")
+                and forward_batch.token_to_kv_pool is not None
+            ):
+                print(f"- token_to_kv_pool: {forward_batch.token_to_kv_pool.size}")
+            if (
+                hasattr(forward_batch, "attn_backend")
+                and forward_batch.attn_backend is not None
+            ):
+                print(f"- attn_backend: {forward_batch.attn_backend}")
+            if (
+                hasattr(forward_batch, "global_num_tokens")
+                and forward_batch.global_num_tokens is not None
+            ):
+                print(f"- global_num_tokens: {forward_batch.global_num_tokens}")
+            if (
+                hasattr(forward_batch, "gathered_buffer")
+                and forward_batch.gathered_buffer is not None
+            ):
+                print(f"- gathered_buffer: {forward_batch.gathered_buffer}")
+            if (
+                hasattr(forward_batch, "can_run_dp_cuda_graph")
+                and forward_batch.can_run_dp_cuda_graph is not None
+            ):
+                print(f"- can_run_dp_cuda_graph: {forward_batch.can_run_dp_cuda_graph}")
+            if (
+                hasattr(forward_batch, "spec_info")
+                and forward_batch.spec_info is not None
+            ):
+                print(f"- spec_info: {forward_batch.spec_info}")
+            if (
+                hasattr(forward_batch, "spec_algorithm")
+                and forward_batch.spec_algorithm is not None
+            ):
+                print(f"- spec_algorithm: {forward_batch.spec_algorithm}")
+            if (
+                hasattr(forward_batch, "mrope_positions")
+                and forward_batch.mrope_positions is not None
+            ):
+                print(f"- mrope_positions: {forward_batch.mrope_positions}")
+
+            if forward_batch.spec_info is not None:
+                print(f"=====spec_info=====")
+                if hasattr(forward_batch.spec_info, "iter"):
+                    print(f"- iter: {forward_batch.spec_info.iter}")
+                if hasattr(forward_batch.spec_info, "verified_id"):
+                    print(f"- verified_id: {forward_batch.spec_info.verified_id}")
+                if (
+                    hasattr(forward_batch.spec_info, "hidden_states")
+                    and forward_batch.spec_info.hidden_states is not None
+                ):
+                    print(
+                        f"- hidden_states shape: {forward_batch.spec_info.hidden_states.shape}"
+                    )
+                if (
+                    hasattr(forward_batch.spec_info, "draft_token")
+                    and forward_batch.spec_info.draft_token is not None
+                ):
+                    print(f"- draft_token: {forward_batch.spec_info.draft_token}")
+                print(f"- positions: {forward_batch.spec_info.positions}")
+
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
@@ -712,9 +901,11 @@ class ModelRunner:
             return self.cuda_graph_runner.replay(forward_batch)
 
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(forward_batch)
+            res = self.forward_decode(forward_batch)
+            return res
         elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(forward_batch)
+            res = self.forward_extend(forward_batch)
+            return res
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)
         else:

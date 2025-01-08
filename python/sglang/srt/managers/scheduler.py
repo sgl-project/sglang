@@ -220,6 +220,13 @@ class Scheduler:
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+        elif self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_worker import NGramWorker
+
+            self.draft_worker = NGramWorker(
+                target_worker=self.tp_worker,
+                server_args=server_args,
+            )
         else:
             self.draft_worker = None
 

@@ -541,13 +541,25 @@ class EagleVerifyInput(SpecInfo):
             [self.draft_token, torch.full([1], -1, dtype=torch.long, device="cuda")],
             dim=-1,
         )
+        print("=====Verify=====")
+        print("predict", predict)
+        print("draft_token", draft_token)
+
         target_predict = predict[self.retrive_index]
         candidates = draft_token[self.retrive_index]
+        print("retrive_index", self.retrive_index)
+        print("target_predict", target_predict)
+        print("candidates", candidates)
+
         # logits = logits_output.next_token_logits[self.retrive_index]
         # target_predict = torch.argmax(logits[:, :-1], dim=-1)
         accept_mask = candidates[:, 1:] == target_predict[:, :-1]
         accept_mask = (torch.cumprod(accept_mask, dim=1)).sum(dim=1)
+        # accept_length_cpu = accept_mask.tolist()
         bs = self.retrive_cum_len.numel() - 1
+        print("accept_mask", accept_mask)
+        print("retrive_cum_len", self.retrive_cum_len)
+        print("bs", bs)
 
         max_draft_len = self.retrive_index.shape[-1]
         accept_index = torch.full(
@@ -555,6 +567,10 @@ class EagleVerifyInput(SpecInfo):
         )
         accept_length = torch.empty((bs,), dtype=torch.int, device="cuda")
         extract_index = torch.full((bs * 2,), 0, dtype=torch.int, device="cuda")
+        print("accept_index", accept_index)
+        print("accept_length", accept_length)
+        print("extract_index", extract_index)
+
         eagle_verify_retrive[(bs,)](
             self.retrive_index.contiguous(),
             accept_mask.contiguous(),
@@ -568,6 +584,7 @@ class EagleVerifyInput(SpecInfo):
         )
 
         accept_index = accept_index[accept_index != -1]
+        print("accept_index", accept_index)
         # extract_index = extract_index[extract_index != 0]
 
         draft_input = EAGLEDraftInput()
@@ -578,6 +595,7 @@ class EagleVerifyInput(SpecInfo):
 
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
+
         mem_need_free_idx = batch.out_cache_loc[evict_mask]
         batch.token_to_kv_pool.free(mem_need_free_idx)
         assign_req_to_token_pool[(bs,)](
@@ -613,6 +631,10 @@ class EagleVerifyInput(SpecInfo):
             draft_input.hidden_states = batch.spec_info.hidden_states[new_accept_index]
             draft_input.accept_length = accept_length[unfinished_index]
             draft_input.unfinished_index = unfinished_index
+        print("draft_input", draft_input)
+        print("logits_output", logits_output)
+        print("verified_id", verified_id)
+        print("finished_extend_len", finished_extend_len)
 
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         return draft_input, logits_output, verified_id, finished_extend_len

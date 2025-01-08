@@ -163,6 +163,12 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
 
+        if model_runner.spec_algorithm.is_ngram():
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = (
+                self.model_runner.server_args.speculative_num_draft_tokens
+            )
+
         self.compile_bs = (
             [
                 bs
@@ -343,7 +349,6 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=self.get_spec_info(num_tokens, positions),
         )
-
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
@@ -467,4 +472,12 @@ class CudaGraphRunner:
                 )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        if self.model_runner.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_worker import NGramSpecInfo
+
+            spec_info = NGramSpecInfo(
+                verified_tokens=None,
+                candidate_tokens=None,
+                positions=None,
+            )
         return spec_info

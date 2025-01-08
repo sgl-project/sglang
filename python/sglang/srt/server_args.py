@@ -124,6 +124,7 @@ class ServerArgs:
     speculative_num_steps: int = 5
     speculative_num_draft_tokens: int = 64
     speculative_eagle_topk: int = 8
+    speculative_ngram_window_size: int = 5
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -249,14 +250,17 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        if self.speculative_algorithm == "EAGLE":
+        if (
+            self.speculative_algorithm == "EAGLE"
+            or self.speculative_algorithm == "NGRAM"
+        ):
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
             self.disable_overlap_schedule = True
             self.chunked_prefill_size = -1
             logger.info(
-                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
+                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle/ngram speculative decoding."
             )
 
         # GGUF
@@ -664,7 +668,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE"],
+            choices=["EAGLE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

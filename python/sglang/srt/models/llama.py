@@ -171,6 +171,11 @@ class LlamaAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
+        if forward_batch.input_ids[..., 0] == 372:
+            print("1. q sum", q.sum())
+            print("1. k sum", k.sum())
+            print("1. v sum", v.sum())
+            print("1.attn_output sum", attn_output.sum())
         return output
 
 

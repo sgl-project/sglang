@@ -3,29 +3,27 @@ import unittest
 import sglang as sgl
 
 
-class TestEAGLEEngine(unittest.TestCase):
+class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
 
-    def test_eagle_accuracy(self):
+    def test_ngram_accuracy(self):
         prompt = "Today is a sunny day and I like"
         target_model_path = "daryl149/llama-2-7b-chat-hf"
-        speculative_draft_model_path = "lmzheng/sglang-EAGLE-llama2-chat-7B"
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(
-            model_path=target_model_path,
-            speculative_draft_model_path=speculative_draft_model_path,
-            speculative_algorithm="EAGLE",
-            speculative_num_steps=3,
-            speculative_eagle_topk=4,
-            speculative_num_draft_tokens=16,
-            watchdog_timeout=10000000,
-        )
-        out1 = engine.generate(prompt, sampling_params)["text"]
+        engine = sgl.Engine(model_path=target_model_path, disable_cuda_graph=True)
+        out2 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
-        engine = sgl.Engine(model_path=target_model_path)
-        out2 = engine.generate(prompt, sampling_params)["text"]
+        engine = sgl.Engine(
+            model_path=target_model_path,
+            speculative_algorithm="NGRAM",
+            speculative_ngram_window_size=3,
+            speculative_num_draft_tokens=16,
+            watchdog_timeout=10000000,
+            disable_cuda_graph=True,
+        )
+        out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
         print("==== Answer 1 ====")

@@ -74,7 +74,9 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
-        if forward_batch.spec_info:
+        if forward_batch.spec_info and hasattr(
+            forward_batch.spec_info, "capture_hidden_mode"
+        ):
             capture_hidden_mode = forward_batch.spec_info.capture_hidden_mode
         else:
             capture_hidden_mode = CaptureHiddenMode.NULL
