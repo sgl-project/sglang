@@ -20,6 +20,7 @@ import threading
 from enum import Enum, auto
 
 import psutil
+import setproctitle
 import zmq
 
 from sglang.srt.managers.io_struct import (
@@ -230,6 +231,7 @@ def run_data_parallel_controller_process(
     port_args: PortArgs,
     pipe_writer,
 ):
+    setproctitle.setproctitle("sglang::data_parallel_controller")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

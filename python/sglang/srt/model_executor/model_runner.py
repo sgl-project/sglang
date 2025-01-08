@@ -89,6 +89,7 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        self.should_log = tp_rank == 0
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -117,15 +118,21 @@ class ModelRunner:
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
+            logger.info(
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
+                f"because this is a multimodal model."
+            )
+
             if self.model_config.hf_config.architectures == [
                 "MllamaForConditionalGeneration"
             ]:
                 logger.info("Automatically turn off --chunked-prefill-size for mllama.")
                 server_args.chunked_prefill_size = -1
-            # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
+
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
             ]:
+                # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info(
                     "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
                 )
@@ -198,7 +205,7 @@ class ModelRunner:
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
-            # TODO(liangan1):Just use gloo to bypass the initilization fail
+            # TODO(liangan1): Just use gloo to bypass the initilization fail
             # Need to use xccl for xpu backend in the future
             backend = "gloo"
         elif self.device == "hpu":
@@ -627,7 +634,6 @@ class ModelRunner:
             )
 
     def init_double_sparsity_channel_config(self, selected_channel):
-
         selected_channel = "." + selected_channel + "_proj"
         self.sorted_channels = []
         # load channel config

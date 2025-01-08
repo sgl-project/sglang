@@ -222,7 +222,12 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+        target=_wait_and_warmup,
+        args=(
+            server_args,
+            pipe_finish_writer,
+            engine.tokenizer_manager.image_token_id,
+        ),
     )
     t.start()
 
