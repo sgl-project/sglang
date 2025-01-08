@@ -106,10 +106,11 @@ def main():
                            )
 
     print(actor_model_config)
-    llm = EngineFragment(model=None,
-                         tokenizer=tokenizer,
-                         model_hf_config=actor_model_config,
-                         tensor_parallel_size=tensor_model_parallel_size,
+    llm = EngineFragment(model_path=local_model_path,
+                         # tokenizer=tokenizer,
+                         # model_hf_config=actor_model_config,
+                         # tensor_parallel_size=tensor_model_parallel_size,
+                         tp_size=tensor_model_parallel_size,
                          enforce_eager=True,
                          dtype='bfloat16',
                          load_format='dummy_dtensor',
