@@ -1,4 +1,9 @@
+import multiprocessing
+import random
+import time
 import unittest
+
+import requests
 
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
@@ -7,10 +12,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
-import multiprocessing
-import random
-import time
-import requests
 
 
 class TestEAGLEEngine(unittest.TestCase):
