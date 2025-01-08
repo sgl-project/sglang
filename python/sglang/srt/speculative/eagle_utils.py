@@ -14,7 +14,7 @@ from sglang.srt.speculative.build_eagle_tree import build_tree_kernel
 from sglang.srt.speculative.spec_info import SpecInfo
 
 if TYPE_CHECKING:
-    from python.sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
 
