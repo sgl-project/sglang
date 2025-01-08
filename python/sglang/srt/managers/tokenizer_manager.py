@@ -188,6 +188,7 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        self.auto_create_handle_loop()
         self._generation_manager.generate_request(obj, request)
 
     def abort_request(self, rid: str):
@@ -455,8 +456,6 @@ class _GenerationManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
-
-        self.auto_create_handle_loop()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
