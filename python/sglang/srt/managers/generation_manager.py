@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Any
 
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -59,7 +59,7 @@ class GenerationManager:
     async def tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-    ):
+    ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Tokenize one request."""
         # Tokenize
         input_embeds = None
@@ -132,46 +132,46 @@ class GenerationManager:
     def handle_batch_output_item(
         self,
         recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
-        i: int,
+        index: int,
         rid: str,
         req_obj: Union[GenerateReqInput, EmbeddingReqInput],
-    ):
-        meta_info = self._compute_meta_info(i, recv_obj, req_obj, rid)
+    ) -> Dict[str, Any]:
+        meta_info = self._compute_meta_info(index, recv_obj, req_obj, rid)
 
         if isinstance(recv_obj, BatchStrOut):
             out_dict = {
-                "text": recv_obj.output_strs[i],
+                "text": recv_obj.output_strs[index],
                 "meta_info": meta_info,
             }
             if self.server_args.return_token_ids:
                 out_dict.update(
                     {
-                        "input_ids": recv_obj.origin_input_ids[i],
-                        "output_ids": recv_obj.output_ids[i],
+                        "input_ids": recv_obj.origin_input_ids[index],
+                        "output_ids": recv_obj.output_ids[index],
                     }
                 )
             return out_dict
 
         elif isinstance(recv_obj, BatchTokenIDOut):
             return {
-                "token_ids": recv_obj.output_ids[i],
+                "token_ids": recv_obj.output_ids[index],
                 "meta_info": meta_info,
             }
 
         elif isinstance(recv_obj, BatchEmbeddingOut):
             return {
-                "embedding": recv_obj.embeddings[i],
+                "embedding": recv_obj.embeddings[index],
                 "meta_info": meta_info,
             }
 
         else:
             raise NotImplementedError
 
-    def _compute_meta_info(self, i, recv_obj, req_obj, rid):
+    def _compute_meta_info(self, index, recv_obj, req_obj, rid):
         meta_info = {
             "id": rid,
-            "finish_reason": recv_obj.finished_reasons[i],
-            "prompt_tokens": recv_obj.prompt_tokens[i],
+            "finish_reason": recv_obj.finished_reasons[index],
+            "prompt_tokens": recv_obj.prompt_tokens[index],
         }
         if getattr(req_obj, "return_logprob", False):
             self._convert_logprob_style(
@@ -179,13 +179,13 @@ class GenerationManager:
                 req_obj.top_logprobs_num,
                 req_obj.return_text_in_logprobs,
                 recv_obj,
-                i,
+                index,
             )
         if not isinstance(recv_obj, BatchEmbeddingOut):
             meta_info.update(
                 {
-                    "completion_tokens": recv_obj.completion_tokens[i],
-                    "cached_tokens": recv_obj.cached_tokens[i],
+                    "completion_tokens": recv_obj.completion_tokens[index],
+                    "cached_tokens": recv_obj.cached_tokens[index],
                 }
             )
         return meta_info

@@ -545,19 +545,19 @@ class TokenizerManager:
     def _handle_batch_output(
         self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
     ):
-        for i, rid in enumerate(recv_obj.rids):
+        for index, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 continue
 
-            out_dict = self.generation_manager.handle_batch_output_item(recv_obj, i, rid, state.obj)
+            out_dict = self.generation_manager.handle_batch_output_item(recv_obj, index, rid, state.obj)
 
             state.out_list.append(out_dict)
-            state.finished = recv_obj.finished_reasons[i] is not None
+            state.finished = recv_obj.finished_reasons[index] is not None
             state.event.set()
 
             if self._metric_manager:
-                self._metric_manager.handle_batch_output_metrics(recv_obj, i, state.metric, finished=state.finished,
+                self._metric_manager.handle_batch_output_metrics(recv_obj, index, state.metric, finished=state.finished,
                                                                  stream=state.obj.stream)
 
     def _handle_open_session_req_output(self, recv_obj):
