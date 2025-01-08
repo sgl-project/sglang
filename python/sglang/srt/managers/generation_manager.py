@@ -48,21 +48,8 @@ class GenerationManager:
         self.server_args = server_args
         self.on_request = on_request
 
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
-
-        self._generation_converter = GenerationConverter(
-            server_args=server_args,
-            model_config=self.model_config,
-        )
+        self.model_config = _compute_model_config(server_args)
+        self._generation_converter = GenerationConverter(server_args=server_args)
 
         self.rid_to_state: Dict[str, _ReqState] = {}
 
@@ -275,10 +262,9 @@ class GenerationConverter:
     def __init__(
         self,
         server_args: ServerArgs,
-        model_config: ModelConfig,
     ):
         self.server_args = server_args
-        self.model_config = model_config
+        self.model_config = _compute_model_config(server_args)
 
         # Create image processor placeholder
         self.image_processor = get_dummy_image_processor()
@@ -287,7 +273,7 @@ class GenerationConverter:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if model_config.is_multimodal:
+            if self.model_config.is_multimodal:
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -298,7 +284,7 @@ class GenerationConverter:
 
                 # We want to parallelize the image pre-processing so we create an executor for it
                 self.image_processor = get_image_processor(
-                    model_config.hf_config, server_args, self.processor
+                    self.model_config.hf_config, server_args, self.processor
                 )
             else:
                 self.tokenizer = get_tokenizer(
@@ -517,6 +503,19 @@ class GenerationConverter:
             else:
                 ret.append(None)
         return ret
+
+
+def _compute_model_config(server_args: ServerArgs):
+    return ModelConfig(
+        server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        context_length=server_args.context_length,
+        model_override_args=server_args.json_model_override_args,
+        is_embedding=server_args.is_embedding,
+        dtype=server_args.dtype,
+        quantization=server_args.quantization,
+    )
 
 
 class _MetricManager:

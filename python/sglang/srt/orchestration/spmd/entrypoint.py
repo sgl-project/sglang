@@ -22,8 +22,8 @@ class Entrypoint:
             tp_rank=tp_rank,
             dp_rank=None,
         )
+        self._generation_converter = GenerationConverter(server_args)
         self._detokenizer = DetokenizerManager(server_args)
-        self._generation_converter = GenerationConverter(server_args, model_config=TODO)
 
     def generate(self, obj: GenerateReqInput):
         obj.normalize_batch_and_arguments()
