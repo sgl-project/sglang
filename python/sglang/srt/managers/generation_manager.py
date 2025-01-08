@@ -22,7 +22,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 
-class GenerationManager:
+class GenerationConverter:
     def __init__(
         self,
         server_args: ServerArgs,

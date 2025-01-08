@@ -31,7 +31,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.generation_manager import GenerationManager
+from sglang.srt.managers.generation_manager import GenerationConverter
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -107,7 +107,7 @@ class TokenizerManager:
             context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
 
-        self.generation_manager = GenerationManager(
+        self.generation_converter = GenerationConverter(
             server_args=server_args,
         )
 
@@ -214,7 +214,7 @@ class TokenizerManager:
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
             if is_single:
-                tokenized_obj = await self.generation_manager.tokenize_request(obj)
+                tokenized_obj = await self.generation_converter.tokenize_request(obj)
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, request):
                     yield response
@@ -286,7 +286,7 @@ class TokenizerManager:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
-                tokenized_obj = await self.generation_manager.tokenize_request(tmp_obj)
+                tokenized_obj = await self.generation_converter.tokenize_request(tmp_obj)
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
@@ -302,7 +302,7 @@ class TokenizerManager:
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
-                *(self.generation_manager.tokenize_request(obj) for obj in objs)
+                *(self.generation_converter.tokenize_request(obj) for obj in objs)
             )
 
             # Cache the common prefix for parallel sampling
@@ -550,7 +550,7 @@ class TokenizerManager:
             if state is None:
                 continue
 
-            out_dict = self.generation_manager.postprocess_response(recv_obj, index, rid, state.obj)
+            out_dict = self.generation_converter.postprocess_response(recv_obj, index, rid, state.obj)
 
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[index] is not None
