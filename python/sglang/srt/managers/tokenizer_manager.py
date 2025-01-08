@@ -117,7 +117,9 @@ class TokenizerManager:
             context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
 
-        self.generation_manager = GenerationManager()
+        self.generation_manager = GenerationManager(
+            server_args=server_args,
+        )
 
         # Read model args
         self.model_path = server_args.model_path

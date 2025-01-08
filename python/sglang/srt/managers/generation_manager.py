@@ -1,13 +1,5 @@
-import copy
 import os
-import signal
-import time
-import uuid
-from typing import Any, Dict, Generic, List, TypeVar, Union
-
-import fastapi
-import zmq
-from fastapi import BackgroundTasks
+from typing import Dict, Union
 
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -15,27 +7,14 @@ from sglang.srt.managers.image_processor import (
     get_image_processor,
 )
 from sglang.srt.managers.io_struct import (
-    BatchStrOut,
-    BatchTokenIDOut,
-    CloseSessionReqInput,
     EmbeddingReqInput,
-    FlushCacheReq,
     GenerateReqInput,
-    GetWeightsByNameReqInput,
-    InitWeightsUpdateGroupReqOutput,
-    OpenSessionReqInput,
-    OpenSessionReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.utils import TypeBasedDispatcher
 
 
 class GenerationManager:
@@ -142,5 +121,7 @@ class GenerationManager:
                 input_ids,
                 sampling_params,
             )
+        else:
+            raise NotImplementedError
 
         return tokenized_obj
