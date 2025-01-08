@@ -152,20 +152,22 @@ class GenerationManager:
                         "output_ids": recv_obj.output_ids[i],
                     }
                 )
+            return out_dict
+
         elif isinstance(recv_obj, BatchTokenIDOut):
-            out_dict = {
+            return {
                 "token_ids": recv_obj.output_ids[i],
                 "meta_info": meta_info,
             }
+
         elif isinstance(recv_obj, BatchEmbeddingOut):
-            out_dict = {
+            return {
                 "embedding": recv_obj.embeddings[i],
                 "meta_info": meta_info,
             }
+
         else:
             raise NotImplementedError
-
-        return out_dict
 
     def _compute_meta_info(self, i, recv_obj, req_obj, rid):
         meta_info = {
