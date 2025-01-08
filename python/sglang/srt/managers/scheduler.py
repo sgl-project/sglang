@@ -22,7 +22,8 @@ import warnings
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union, Callable
+from types import SimpleNamespace
+from typing import Callable, Dict, List, Optional, Union, Tuple
 
 import psutil
 import torch
