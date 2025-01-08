@@ -516,7 +516,7 @@ class _MetricManager:
     def __init__(self, server_args: ServerArgs):
         self._metrics_collector = TokenizerMetricsCollector(
             labels={
-                "model_name": self.server_args.served_model_name,
+                "model_name": server_args.served_model_name,
                 # TODO: Add lora name/path in the future,
             },
         )
