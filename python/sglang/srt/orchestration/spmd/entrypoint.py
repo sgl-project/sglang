@@ -1,5 +1,5 @@
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.io_struct import GenerateReqInput, BatchTokenIDOut
+from sglang.srt.managers.scheduler import Scheduler, SchedulerCallback
 from sglang.srt.server_args import ServerArgs
 
 
@@ -20,8 +20,12 @@ class Entrypoint:
         )
 
     def generate(self, obj: GenerateReqInput):
-        tokenized_requests = TODO
+        def _handle_scheduler_output(out: BatchTokenIDOut):
+            TODO
 
+        self._scheduler.callback = SchedulerCallback(on_generation_output=_handle_scheduler_output)
+
+        tokenized_requests = TODO
         for tokenized_request in tokenized_requests:
             self._scheduler.handle_generate_request(tokenized_request)
 
