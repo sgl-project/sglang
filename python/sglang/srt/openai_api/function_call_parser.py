@@ -833,7 +833,9 @@ class MultiFormatParser:
         final_normal_text = text
         for detector in self.detectors:
             tool_call_list = detector.detect_and_parse(text, tools)
-            final_calls.extend(tool_call_list)
+            if len(tool_call_list) > 0:  # parsed successfully
+                final_calls = tool_call_list
+                break
 
         # leftover_text is the normal text not consumed by any Detector
         return final_normal_text, final_calls
