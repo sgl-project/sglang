@@ -563,7 +563,7 @@ def sample_sharegpt_requests(
         raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not os.path.isfile(dataset_path):
+    if not os.path.isfile(dataset_path) and dataset_path == "":
         dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
@@ -1064,8 +1064,11 @@ async def benchmark(
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+            "mean_ttft_ms": metrics.mean_ttft_ms,
             "median_ttft_ms": metrics.median_ttft_ms,
+            "mean_itl_ms": metrics.mean_itl_ms,
             "median_itl_ms": metrics.median_itl_ms,
+            "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,

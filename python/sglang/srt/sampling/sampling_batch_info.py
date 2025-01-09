@@ -276,6 +276,7 @@ class SamplingBatchInfo:
         self.custom_logit_processor = SamplingBatchInfo.merge_custom_logit_processor(
             self.custom_logit_processor, other.custom_logit_processor
         )
+        self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
 
     def apply_logits_bias(self, logits: torch.Tensor):
         # Apply logit_bias

@@ -124,6 +124,13 @@ class CudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
 
         # Batch sizes to capture
+        self.capture_bs = self.model_runner.server_args.cuda_graph_bs
+        if self.capture_bs is None:
+            if model_runner.server_args.disable_cuda_graph_padding:
+                self.capture_bs = list(range(1, 33)) + [64, 128]
+            else:
+                self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+
         if model_runner.server_args.disable_cuda_graph_padding:
             self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
@@ -340,8 +347,8 @@ class CudaGraphRunner:
             top_logprobs_nums=[0] * bs,
             positions=positions,
             global_num_tokens=global_num_tokens,
-            mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
+            mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(

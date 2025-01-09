@@ -1517,8 +1517,9 @@ class Scheduler:
         return success, message
 
     def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
+        self,
+        recv_req: UpdateWeightsFromDistributedReqInput,
+    ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
