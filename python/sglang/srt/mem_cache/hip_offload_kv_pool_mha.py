@@ -49,6 +49,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         self.online_update_cache = os.getenv('DEBUG_ONLINE', '0') == '1'
         self.layer_buffer = [
             HiPOffloadCache(
+                layer_id=layer_id,
                 max_token_size=max_token_size + 1,
                 max_mask_cache_token_size=self.max_mask_cache_token_size,
                 max_sa_cache_token_size=self.max_sa_cache_token_size,
@@ -58,7 +59,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 device=device,
                 online_cache_update=self.online_update_cache,
             )
-            for _ in range(layer_num)
+            for layer_id in range(layer_num)
         ]
         
         # (layer_id, batch_id) -> (K, V, seq_len)

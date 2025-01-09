@@ -290,7 +290,11 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=metadata,
             is_dense=layer.layer_id in self.hip_config.dense_layers,
 
-            online_update_cache=forward_batch.token_to_kv_pool.online_update_cache,
+            online_update_cache=(
+                forward_batch.token_to_kv_pool.online_update_cache 
+                if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                None
+            ),
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(

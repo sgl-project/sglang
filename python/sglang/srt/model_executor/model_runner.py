@@ -260,7 +260,7 @@ class ModelRunner:
             orig_context_length = get_context_length(self.model_config.hf_config)
             update_context_length(self.model_config.hf_config, self.server_args.context_length)
             self.model_config.hf_config.orig_context_len = orig_context_length
-            logger.info(f"Update model config for HIP context extension "
+            logger.info(f"Update model config for HiP context extension "
                         f"{orig_context_length} -> {self.server_args.context_length}.")
 
         # Load the model
