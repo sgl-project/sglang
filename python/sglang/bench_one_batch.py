@@ -77,6 +77,8 @@ class BenchArgs:
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
+    profile: bool = False
+    profile_filename: str = "profile.trace.json.gz"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -95,6 +97,16 @@ class BenchArgs:
         )
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
+        parser.add_argument(
+            "--profile-filename",
+            type=str, default=BenchArgs.profile_filename
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -286,7 +298,16 @@ def synchronize(device):
 
 
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device
+    run_name,
+    model_runner,
+    rank_print,
+    reqs,
+    batch_size,
+    input_len,
+    output_len,
+    device,
+    profile,
+    profile_filename,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -307,6 +328,17 @@ def latency_test_run_once(
     }
 
     tot_latency = 0
+
+    profiler = None
+    if profile:
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_stack=True,
+        )
+        profiler.start()
 
     # Prefill
     synchronize(device)
@@ -337,6 +369,11 @@ def latency_test_run_once(
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+    if profile:
+        profiler.stop()
+        parent_dir = os.path.dirname(profile_filename)
+        os.makedirs(parent_dir, exist_ok=True)
+        profiler.export_chrome_trace(profile_filename)
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -386,6 +423,8 @@ def latency_test(
         bench_args.input_len[0],
         8,  # shorter decoding to speed up the warmup
         server_args.device,
+        profile=False,
+        profile_filename="",  # not used
     )
 
     rank_print("Benchmark ...")
@@ -405,6 +444,8 @@ def latency_test(
             il,
             ol,
             server_args.device,
+            bench_args.profile,
+            bench_args.profile_filename,
         )
         if ret is not None:
             result_list.append(ret)
