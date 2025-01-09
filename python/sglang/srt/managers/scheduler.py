@@ -559,6 +559,7 @@ class Scheduler:
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                return_hidden_state=recv_req.return_hidden_state,
             )
             req.tokenizer = self.tokenizer
 
@@ -1089,7 +1090,7 @@ class Scheduler:
                     # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(batch.reqs, batch.return_hidden_state, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         logits_output, next_token_ids, bid = result
@@ -1102,6 +1103,9 @@ class Scheduler:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+        
+        if batch.return_hidden_state:
+            hidden_states = logits_output.hidden_states
 
         self.token_to_kv_pool.free_group_begin()
 
@@ -1134,6 +1138,8 @@ class Scheduler:
                     req.output_top_logprobs_idx.append(
                         logits_output.next_token_top_logprobs_idx[i]
                     )
+            if req.return_hidden_state:
+                req.hidden_states.append(hidden_states[i])
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
@@ -1144,7 +1150,7 @@ class Scheduler:
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(batch.reqs, batch.return_hidden_state, batch.return_logprob)
 
         self.token_to_kv_pool.free_group_end()
 
@@ -1241,7 +1247,7 @@ class Scheduler:
         return num_input_logprobs
 
     def stream_output(
-        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+        self, reqs: List[Req], return_hidden_state: bool, return_logprob: bool, skip_req: Optional[Req] = None
     ):
         """Stream the output to detokenizer."""
         rids = []
@@ -1280,6 +1286,11 @@ class Scheduler:
                 ) = output_top_logprobs_val = output_top_logprobs_idx = (
                     normalized_prompt_logprob
                 ) = None
+                
+            if return_hidden_state:
+                hidden_states = []
+            else:
+                hidden_states = None
 
             for req in reqs:
                 if req is skip_req:
@@ -1333,6 +1344,12 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
                         normalized_prompt_logprob.append(req.normalized_prompt_logprob)
+                        
+                    if return_hidden_state:
+                        hidden_states.append(req.hidden_states)
+            
+            if return_hidden_state:    
+                print(f"The object we're sending to detokenizer contains hidden states of shape {len(hidden_states)}")
 
             # Send to detokenizer
             if rids:
@@ -1361,6 +1378,7 @@ class Scheduler:
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
                         normalized_prompt_logprob,
+                        hidden_states,
                     )
                 )
         else:  # embedding or reward model

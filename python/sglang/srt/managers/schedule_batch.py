@@ -216,6 +216,7 @@ class Req:
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
+        return_hidden_state: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -285,6 +286,12 @@ class Req:
         self.input_token_logprobs_idx = None
         self.input_top_logprobs_val = None
         self.input_top_logprobs_idx = None
+        
+        # Hidden states (arguments)
+        self.return_hidden_state = return_hidden_state
+        
+        # Hidden states (return value)
+        self.hidden_states = None
 
         if return_logprob:
             self.output_token_logprobs_val = []
@@ -295,6 +302,9 @@ class Req:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
                 self.output_top_logprobs_val
             ) = self.output_top_logprobs_idx = None
+            
+        if return_hidden_state:
+            self.hidden_states = []
 
         # Logprobs (internal values)
         # The tokens is prefilled but need to be considered as decode tokens
@@ -577,6 +587,9 @@ class ScheduleBatch:
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
+    
+    # For non-spec-dec hidden state capture
+    return_hidden_state: bool = False
 
     @classmethod
     def init_new(
@@ -597,6 +610,7 @@ class ScheduleBatch:
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=any(req.return_logprob for req in reqs),
+            return_hidden_state=any(req.return_hidden_state for req in reqs),
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
@@ -1136,6 +1150,12 @@ class ScheduleBatch:
 
         global bid
         bid += 1
+        
+        capture_hidden_mode = CaptureHiddenMode.NULL
+        if self.return_hidden_state:
+            capture_hidden_mode = CaptureHiddenMode.LAST
+        if self.spec_info:
+            capture_hidden_mode = getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)     
 
         return ModelWorkerBatch(
             bid=bid,
@@ -1163,11 +1183,7 @@ class ScheduleBatch:
             input_embeds=self.input_embeds,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
-            capture_hidden_mode=(
-                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
-                if self.spec_info
-                else CaptureHiddenMode.NULL
-            ),
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def copy(self):
@@ -1180,6 +1196,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            return_hidden_state=self.return_hidden_state,
         )
 
     def __str__(self):

@@ -188,12 +188,12 @@ class RuntimeEndpoint(BaseBackend):
                 **sampling_params.to_srt_kwargs(),
             },
         }
-
         for item in [
             "return_logprob",
             "logprob_start_len",
             "top_logprobs_num",
             "return_text_in_logprobs",
+            "return_hidden_state",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:

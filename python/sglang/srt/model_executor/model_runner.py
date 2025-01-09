@@ -685,16 +685,18 @@ class ModelRunner:
         self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
             if forward_batch.input_embeds is None:
-                return self.model.forward(
+                x = self.model.forward(
                     forward_batch.input_ids, forward_batch.positions, forward_batch
                 )
+                return x
             else:
-                return self.model.forward(
+                x = self.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     input_embeds=forward_batch.input_embeds.bfloat16(),
                 )
+                return x
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(

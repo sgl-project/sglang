@@ -213,6 +213,7 @@ class TokenizerManager:
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
+
         obj.normalize_batch_and_arguments()
 
         if self.server_args.log_requests:
@@ -278,6 +279,9 @@ class TokenizerManager:
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
 
+        is_instance_of_generate_req_input = isinstance(obj, GenerateReqInput)
+        is_instance_of_embedding_req_input = isinstance(obj, EmbeddingReqInput)
+
         # Build return object
         if isinstance(obj, GenerateReqInput):
             tokenized_obj = TokenizedGenerateReqInput(
@@ -293,6 +297,7 @@ class TokenizerManager:
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,
+                return_hidden_state=obj.return_hidden_state,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -629,6 +634,8 @@ class TokenizerManager:
                 InitWeightsUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
+            print(f"We recieved a request within the tokenizer event loop")
+
             if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
                 for i, rid in enumerate(recv_obj.rids):
                     state = self.rid_to_state.get(rid, None)
@@ -640,6 +647,9 @@ class TokenizerManager:
                         "finish_reason": recv_obj.finished_reasons[i],
                         "prompt_tokens": recv_obj.prompt_tokens[i],
                     }
+
+                    if getattr(state.obj, "return_hidden_state", False) and hasattr(recv_obj, 'hidden_states') and recv_obj.hidden_states:
+                        meta_info["hidden_states"] = recv_obj.hidden_states[i] if i < len(recv_obj.hidden_states) else None
 
                     if getattr(state.obj, "return_logprob", False):
                         self.convert_logprob_style(

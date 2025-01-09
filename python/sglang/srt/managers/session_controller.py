@@ -131,6 +131,7 @@ class Session:
             sampling_params=req.sampling_params,
             lora_path=req.lora_path,
             session_id=self.session_id,
+            return_hidden_state=req.return_hidden_state,
         )
         if last_req is not None:
             new_req.image_inputs = last_req.image_inputs

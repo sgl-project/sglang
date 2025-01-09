@@ -65,6 +65,8 @@ class GenerateReqInput:
     modalities: Optional[List[str]] = None
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Non-spec-dec hidden state capture
+    return_hidden_state: Optional[Union[List[bool], bool]] = None
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
@@ -133,6 +135,8 @@ class GenerateReqInput:
                 self.rid = uuid.uuid4().hex
             if self.return_logprob is None:
                 self.return_logprob = False
+            if self.return_hidden_state is None:
+                self.return_hidden_state = False
             if self.logprob_start_len is None:
                 self.logprob_start_len = -1
             if self.top_logprobs_num is None:
@@ -167,6 +171,13 @@ class GenerateReqInput:
                 self.return_logprob = [self.return_logprob] * num
             else:
                 assert self.parallel_sample_num == 1
+                
+            if self.return_hidden_state is None:
+                self.return_hidden_state = [False] * num
+            elif not isinstance(self.return_hidden_state, list):
+                self.return_hidden_state = [self.return_hidden_state] * num
+            else:
+                assert self.parallel_sample_num == 1
 
             if self.logprob_start_len is None:
                 self.logprob_start_len = [-1] * num
@@ -186,7 +197,7 @@ class GenerateReqInput:
         self.rid = uuid.uuid4().hex
         return self.rid
 
-    def __getitem__(self, i):
+    def __getitem__(self, i):)
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -194,6 +205,7 @@ class GenerateReqInput:
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
+            return_hidden_states=self.return_hidden_state[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
@@ -231,6 +243,9 @@ class TokenizedGenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
+    
+    # For non-spec-dec hidden state capture
+    return_hidden_state: bool = False
 
 
 @dataclass
@@ -345,6 +360,8 @@ class BatchTokenIDOut:
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
     normalized_prompt_logprob: List[float]
+    # Hidden states
+    hidden_states: List[List[float]]
 
 
 @dataclass
@@ -378,6 +395,9 @@ class BatchStrOut:
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
     normalized_prompt_logprob: List[float]
+    
+    # Non-spec-dec hidden state capture
+    hidden_states: List[List[float]]
 
 
 @dataclass

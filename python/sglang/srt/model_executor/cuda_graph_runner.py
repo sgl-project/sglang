@@ -346,9 +346,8 @@ class CudaGraphRunner:
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=(
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            ),
+            # Always capture the last hidden state
+            capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
         # Attention backend
@@ -438,7 +437,7 @@ class CudaGraphRunner:
         logits_output = LogitsProcessorOutput(
             next_token_logits=next_token_logits[:raw_num_token],
             hidden_states=(
-                hidden_states[:raw_num_token] if hidden_states is not None else None
+                hidden_states[:raw_num_token] if forward_batch.capture_hidden_mode is not None else None
             ),
         )
         return logits_output
