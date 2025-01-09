@@ -7,7 +7,6 @@ export SGLANG_USE_MODELSCOPE=true
 ```
 
 We take [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) as an example.
----
 
 Launch the Server:
 ```bash
