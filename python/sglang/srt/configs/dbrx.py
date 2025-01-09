@@ -1,8 +1,6 @@
-# yapf: disable
-# ruff: noqa: E501
-# coding=utf-8
-# Copied from
+# Adapted from
 # https://huggingface.co/databricks/dbrx-base/blob/main/configuration_dbrx.py
+# https://github.com/vllm-project/vllm/blob/main/vllm/transformers_utils/configs/dbrx.py
 """Dbrx configuration."""
 
 from typing import Any, Optional

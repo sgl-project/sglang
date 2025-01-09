@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/THUDM/ChatGLM2-6B
+# https://github.com/vllm-project/vllm/blob/main/vllm/transformers_utils/configs/chatglm.py
 
 # ChatGLM2 and ChatGLM3 share the same config.
 # ChatGLM4 is officially supported by Huggingface
