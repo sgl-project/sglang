@@ -26,6 +26,7 @@ import threading
 import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, Optional
+import json
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -197,6 +198,29 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"Error: {e}")
             return _create_error_response(e)
+        
+
+@app.api_route("/generate_from_file", methods=["POST"])
+async def generate_from_file_request(file: UploadFile, request: Request):
+    """Handle a generate request, this is purely to work with input_embeds."""
+    content = await file.read()
+    input_embeds = json.loads(content.decode("utf-8"))
+
+    obj = GenerateReqInput(
+        input_embeds=input_embeds,
+        sampling_params= {
+            "repetition_penalty": 1.2,
+            "temperature": 0.2,
+            "max_new_tokens": 512,
+        }
+    )
+    
+    try:
+        ret = await _global_state.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error(f"Error: {e}")
+        return _create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
