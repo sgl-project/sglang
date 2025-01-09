@@ -104,8 +104,7 @@ class BenchArgs:
             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
-            "--profile-filename",
-            type=str, default=BenchArgs.profile_filename
+            "--profile-filename", type=str, default=BenchArgs.profile_filename
         )
 
     @classmethod
