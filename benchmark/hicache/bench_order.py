@@ -68,6 +68,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Benchmark prompt generation and SGLang execution."
     )
+    parser.add_argument("--port", type=int, default=30000, help="SGLang port")
     parser.add_argument(
         "--order",
         type=str,
@@ -93,7 +94,7 @@ def main():
     args = parser.parse_args()
 
     # Initialize SGLang runtime
-    set_default_backend(RuntimeEndpoint("http://localhost:30000"))
+    set_default_backend(RuntimeEndpoint(f"http://localhost:{args.port}"))
     result_jsonl = []
 
     # Log current parameters
@@ -115,7 +116,8 @@ def main():
         max_tokens=args.output_length,
     )
 
-    url = "http://localhost:30000/flush_cache"
+    url = f"http://localhost:{args.port}/flush_cache"
+
     requests.post(url)
     # sgl.flush_cache()
     time.sleep(1)  # Wait for the cache to be flushed
