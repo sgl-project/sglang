@@ -25,7 +25,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.transformers_utils.configs.dbrx import DbrxConfig
+from sglang.srt.configs import DbrxConfig
 
 from sglang.srt.layers.linear import (
     QKVParallelLinear,

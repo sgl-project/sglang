@@ -23,7 +23,7 @@ from torch import nn
 from torch.nn import LayerNorm
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.transformers_utils.configs import ChatGLMConfig
+from sglang.srt.configs import ChatGLMConfig
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
