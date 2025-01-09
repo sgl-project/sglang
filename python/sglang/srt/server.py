@@ -39,7 +39,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import FastAPI, File, Form, Request, UploadFile, Query
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from uvicorn.config import LOGGING_CONFIG
@@ -315,7 +315,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
 @app.api_route("/generate_from_file", methods=["POST"])
 @time_func_latency
-async def generate_from_file_request(file: UploadFile, request: Request, stream: bool = Query(False, description="Toggle streaming response")):
+async def generate_from_file_request(
+    file: UploadFile,
+    request: Request,
+    stream: bool = Query(False, description="Toggle streaming response"),
+):
     """Handle a generate request, this is purely to work with input_embeds."""
     content = await file.read()
     input_embeds = json.loads(content.decode("utf-8"))
@@ -330,13 +334,18 @@ async def generate_from_file_request(file: UploadFile, request: Request, stream:
     )
 
     if stream:
+
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 async for out in tokenizer_manager.generate_request(obj, request):
-                    yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
+                    yield b"data: " + orjson.dumps(
+                        out, option=orjson.OPT_NON_STR_KEYS
+                    ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
+                yield b"data: " + orjson.dumps(
+                    out, option=orjson.OPT_NON_STR_KEYS
+                ) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
