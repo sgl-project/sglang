@@ -27,7 +27,9 @@ import signal
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Dict, List, Optional, Union
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
+
+import torch
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -78,6 +80,7 @@ from sglang.srt.openai_api.adapter import (
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     assert_pkg_version,
@@ -124,14 +127,12 @@ async def health() -> Response:
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
 
+    sampling_params = {"max_new_tokens": 1, "temperature": 0.7}
+
     if tokenizer_manager.is_generation:
-        gri = GenerateReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = GenerateReqInput(input_ids=[0], sampling_params=sampling_params)
     else:
-        gri = EmbeddingReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = EmbeddingReqInput(input_ids=[0], sampling_params=sampling_params)
 
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
@@ -543,7 +544,12 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+        target=_wait_and_warmup,
+        args=(
+            server_args,
+            pipe_finish_writer,
+            tokenizer_manager.image_token_id,
+        ),
     )
     t.start()
 
@@ -613,7 +619,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer):
+def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -872,9 +878,11 @@ class Engine:
             tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
-    def update_weights_from_tensor(self, name, tensor):
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
         """Update weights from distributed source."""
-        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
+        )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             tokenizer_manager.update_weights_from_tensor(obj, None)
@@ -910,10 +918,9 @@ class Runtime:
         atexit.register(self.shutdown)
 
         # Pre-allocate ports
-        for port in range(10000, 40000):
+        for port in range(self.server_args.port, 40000):
             if is_port_available(port):
                 break
-            port += 1
         self.server_args.port = port
 
         self.url = self.server_args.url()

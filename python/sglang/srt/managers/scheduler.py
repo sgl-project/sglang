@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
@@ -116,6 +117,14 @@ class Scheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        self.decode_mem_cache_buf_multiplier = (
+            self.server_args.speculative_num_draft_tokens
+            if not self.spec_algorithm.is_none()
+            else 1
+        )
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -198,6 +207,21 @@ class Scheduler:
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
+
+        # Launch worker for speculative decoding if need
+        if self.spec_algorithm.is_eagle():
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
+            self.draft_worker = EAGLEWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        else:
+            self.draft_worker = None
 
         # Get token and memory info from the model worker
         (
@@ -855,6 +879,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
+            self.spec_algorithm,
         )
         new_batch.prepare_for_extend()
 
@@ -888,11 +913,15 @@ class Scheduler:
             return None
 
         # Check if decode out of memory
-        if not batch.check_decode_mem() or (test_retract and batch.batch_size() > 10):
+        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
+            test_retract and batch.batch_size() > 10
+        ):
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
             self.new_token_ratio = new_token_ratio
+            if self.draft_worker:
+                self.draft_worker.finish_request(retracted_reqs)
 
             logger.info(
                 "Decode out of memory happened. "
@@ -926,11 +955,20 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
+                if self.spec_algorithm.is_none():
+                    model_worker_batch = batch.get_model_worker_batch()
+                    logits_output, next_token_ids = (
+                        self.tp_worker.forward_batch_generation(model_worker_batch)
+                    )
+                else:
+                    (
+                        logits_output,
+                        next_token_ids,
+                        model_worker_batch,
+                        num_accepted_tokens,
+                    ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                    self.num_generated_tokens += num_accepted_tokens
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -974,12 +1012,10 @@ class Scheduler:
                 logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             else:
                 # Move next_token_ids and logprobs to cpu
+                next_token_ids = next_token_ids.tolist()
                 if batch.return_logprob:
                     logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs[
-                            torch.arange(len(next_token_ids), device=self.device),
-                            next_token_ids,
-                        ].tolist()
+                        logits_output.next_token_logprobs.tolist()
                     )
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.tolist()
@@ -987,7 +1023,6 @@ class Scheduler:
                     logits_output.normalized_prompt_logprobs = (
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
-                next_token_ids = next_token_ids.tolist()
 
             # Check finish conditions
             logprob_pt = 0
@@ -1064,13 +1099,9 @@ class Scheduler:
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
         else:
-            # Move next_token_ids and logprobs to cpu
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs[
-                    torch.arange(len(next_token_ids), device=self.device),
-                    next_token_ids,
-                ].tolist()
             next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob:
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool.free_group_begin()
 
@@ -1084,7 +1115,10 @@ class Scheduler:
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
-            req.output_ids.append(next_token_id)
+            if batch.spec_algorithm.is_none():
+                # speculative worker will solve the output_ids in speculative decoding
+                req.output_ids.append(next_token_id)
+
             req.check_finished()
 
             if req.finished():
@@ -1095,10 +1129,10 @@ class Scheduler:
                 req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs_val.append(
-                        logits_output.output_top_logprobs_val[i]
+                        logits_output.next_token_top_logprobs_val[i]
                     )
                     req.output_top_logprobs_idx.append(
-                        logits_output.output_top_logprobs_idx[i]
+                        logits_output.next_token_top_logprobs_idx[i]
                     )
 
             if req.grammar is not None:
@@ -1200,8 +1234,9 @@ class Scheduler:
                 req.output_top_logprobs_idx.extend(
                     output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
                 )
-            req.output_top_logprobs_val.append(output.output_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.output_top_logprobs_idx[i])
+
+            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
+            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
         return num_input_logprobs
 
@@ -1258,6 +1293,9 @@ class Scheduler:
                     # If not stream, we still want to output some tokens to get the benefit of incremental decoding.
                     or (not req.stream and len(req.output_ids) % 50 == 0)
                 ):
+                    if self.draft_worker and req.finished():
+                        self.draft_worker.finish_request(req)
+
                     rids.append(req.rid)
                     finished_reasons.append(
                         req.finished_reason.to_json() if req.finished_reason else None
@@ -1329,11 +1367,11 @@ class Scheduler:
             embeddings = []
             prompt_tokens = []
             for req in reqs:
-                assert req.finished()
-                rids.append(req.rid)
-                finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
+                if req.finished():
+                    rids.append(req.rid)
+                    finished_reasons.append(req.finished_reason.to_json())
+                    embeddings.append(req.embedding)
+                    prompt_tokens.append(len(req.origin_input_ids))
             self.send_to_detokenizer.send_pyobj(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
@@ -1389,6 +1427,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
+            self.spec_algorithm,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -1477,8 +1516,9 @@ class Scheduler:
         return success, message
 
     def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
+        self,
+        recv_req: UpdateWeightsFromDistributedReqInput,
+    ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:

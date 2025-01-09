@@ -144,10 +144,9 @@ class TpModelWorkerClient:
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = logits_output.next_token_logprobs[
-                    torch.arange(len(next_token_ids), device=self.device),
-                    next_token_ids,
-                ].to("cpu", non_blocking=True)
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)

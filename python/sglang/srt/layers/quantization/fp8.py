@@ -25,9 +25,9 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
 
 from sglang.srt.layers.linear import LinearMethodBase, UnquantizedLinearMethod
+from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -280,9 +280,9 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=None,
                 )
-                layer.weight = torch.nn.Parameter(weight, require_grad=False)
+                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
                 layer.weight_scale_inv = torch.nn.Parameter(
-                    weight_scale, require_grad=False
+                    weight_scale, requires_grad=False
                 )
                 layer.input_scale = None
             return

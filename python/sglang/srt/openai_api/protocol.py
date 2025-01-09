@@ -171,15 +171,15 @@ class CompletionRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     min_tokens: int = 0
-    regex: Optional[str] = None
     json_schema: Optional[str] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    ebnf: Optional[str] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -315,13 +315,13 @@ class ChatCompletionRequest(BaseModel):
     min_p: float = 0.0
     min_tokens: int = 0
     regex: Optional[str] = None
+    ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    ebnf: Optional[str] = None
 
 
 class FunctionResponse(BaseModel):

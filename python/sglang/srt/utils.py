@@ -15,6 +15,7 @@
 
 import base64
 import dataclasses
+import io
 import ipaddress
 import itertools
 import json
@@ -34,6 +35,7 @@ import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
@@ -59,7 +61,6 @@ from triton.runtime.cache import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 show_time_cost = False
 time_infos = {}
@@ -708,13 +709,14 @@ def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -723,19 +725,19 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -1206,7 +1208,6 @@ def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> 
     # https://github.com/pytorch/pytorch/blob/
     # c1cd946818442aca8c7f812b16d187ce1586c3bc/
     # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.cuda
     import torch.version
 
     if not torch.cuda._is_compiled():
@@ -1335,3 +1336,40 @@ def parse_tool_response(text, tools, **kwargs):
         for call_info in call_info_list
     ]
     return text, call_info_list
+
+
+class MultiprocessingSerializer:
+    @staticmethod
+    def serialize(obj):
+        buf = io.BytesIO()
+        ForkingPickler(buf).dump(obj)
+        buf.seek(0)
+        return buf.read()
+
+    @staticmethod
+    def deserialize(data):
+        return ForkingPickler.loads(data)
+
+
+def debug_timing(func):
+    # todo: replace with a more organized instrumentation
+    def wrapper(*args, **kwargs):
+        if logger.isEnabledFor(logging.DEBUG):
+            tic = torch.cuda.Event(enable_timing=True)
+            toc = torch.cuda.Event(enable_timing=True)
+            tic.record()
+            result = func(*args, **kwargs)
+            toc.record()
+            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
+            elapsed = tic.elapsed_time(toc)
+            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
+            num_tokens = len(indices) if indices is not None else 0
+            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
+            logger.debug(
+                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
+            )
+            return result
+        else:
+            return func(*args, **kwargs)
+
+    return wrapper
