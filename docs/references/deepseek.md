@@ -15,20 +15,20 @@ SGLang provides several optimizations specifically designed for the DeepSeek mod
 Overall, with these optimizations, we have achieved up to a 7x acceleration in output throughput compared to the previous version.
 ![Data Parallelism Attention for DeepSeek Series Models](https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg)
 
-**Usage**: MLA optimization is enabled by defalut, to disable, use `--disable-mla`
+**Usage**: MLA optimization is enabled by defalut, to disable, use `--disable-mla`.
 
-**Reference**: Check [Blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [Slides](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/lmsys_1st_meetup_deepseek_mla.pdf) for more details
+**Reference**: Check [Blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [Slides](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/lmsys_1st_meetup_deepseek_mla.pdf) for more details.
 
 ## Data Parallelism Attention
 
 **Description**: This optimization involves data parallelism (DP) for the MLA attention mechanism of DeepSeek Series Models, which allows for a significant reduction in the KV cache size, enabling larger batch sizes. Each DP worker independently handles different types of batches (prefill, decode, idle), which are then synchronized before and after processing through the Mixture-of-Experts (MoE) layer.
-![Data Parallelism Attention for DeepSeek Series Models](https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg)
+![Data Parallelism Attention for DeepSeek Series Models](https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg).
 
 **Usage**: This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). Data Parallelism Attention optimization can be enabeld by `--enable-dp-attention` for DeepSeek Series Models.
 
-**Reference**: [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models)
+**Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 
 ## Multi Node Tensor Parallelism
 **Description**: For users with limited memory on a single node, SGLang supports serving DeepSeek Series Models, including DeepSeek V3, across multiple nodes using tensor parallelism. This approach partitions the model parameters across multiple GPUs or nodes to handle models that are too large for one node's memory.
 
-**Usage**: Check [here](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) for usage examples
+**Usage**: Check [here](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) for usage examples.
