@@ -136,6 +136,7 @@ typename Gemm::Arguments prepare_sm89_fp8_args(torch::Tensor& out, const torch::
     ElementComputeEpilogue const* ptr_scales_a = reinterpret_cast<ElementComputeEpilogue const*>(scales_a.data_ptr());
     ElementComputeEpilogue const* ptr_scales_b = reinterpret_cast<ElementComputeEpilogue const*>(scales_b.data_ptr());
 
+
     typename Gemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, // Mode
         {m, n, k},                                                         // Problem size
         1,                                                                 // Split-k factor
