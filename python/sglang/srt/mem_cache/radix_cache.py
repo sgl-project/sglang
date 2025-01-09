@@ -393,14 +393,14 @@ class HiRadixCache(RadixCache):
             return
         node.hit_count += 1
         if node.host_value is None and node.hit_count > self.write_through_threshold:
-            host_indices = self.cache_controller.write_through(
+            host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 priority=-self.get_height(node),
                 node_id=node.id,
             )
             if host_indices is None:
                 self.evict_host(len(node.value))
-                host_indices = self.cache_controller.write_through(
+                host_indices = self.cache_controller.write(
                     device_indices=node.value,
                     priority=-self.get_height(node),
                     node_id=node.id,
@@ -481,10 +481,10 @@ class HiRadixCache(RadixCache):
                 time.sleep(0.1)
 
     def _evict_write_back(self, node: TreeNode):
-        host_indices = self.cache_controller.write_back(node.value)
+        host_indices = self.cache_controller.write(node.value)
         if host_indices is None:
             self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write_back(node.value)
+            host_indices = self.cache_controller.write(node.value)
         if host_indices is None:
             raise RuntimeError("No sufficient host memory available")
         else:
@@ -549,12 +549,12 @@ class HiRadixCache(RadixCache):
             return None
 
         self.inc_lock_ref(last_node)
-        device_indices = self.cache_controller.load_back(
+        device_indices = self.cache_controller.load(
             host_indices=host_indices, node_id=last_hit_node.id
         )
         if device_indices is None:
             self.evict(len(host_indices))
-            device_indices = self.cache_controller.load_back(
+            device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
             )
         self.dec_lock_ref(last_node)
@@ -700,14 +700,14 @@ class HiRadixCache(RadixCache):
 
             # todo: deduplication
             if self.cache_controller.write_policy == "write_through":
-                new_node.host_value = self.cache_controller.write_through(
+                new_node.host_value = self.cache_controller.write(
                     device_indices=value,
                     priority=-self.get_height(new_node),
                     node_id=new_node.id,
                 )
                 if new_node.host_value is None:
                     self.evict_host(len(value))
-                    new_node.host_value = self.cache_controller.write_through(
+                    new_node.host_value = self.cache_controller.write(
                         device_indices=value,
                         priority=-self.get_height(new_node),
                         node_id=new_node.id,
