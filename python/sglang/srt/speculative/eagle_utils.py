@@ -455,11 +455,6 @@ class EAGLEDraftInput(SpecInfo):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.sample_output = torch.cat([self.sample_output, spec_info.sample_output])
 
-    def filter_batch(self, keep_indices):
-        self.hidden_states = self.hidden_states[keep_indices]
-        self.verified_id = self.verified_id[keep_indices]
-        self.sample_output = self.sample_output[keep_indices]
-
 
 class EagleVerifyInput(SpecInfo):
     def __init__(

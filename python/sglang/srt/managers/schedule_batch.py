@@ -1047,23 +1047,11 @@ class ScheduleBatch:
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
-            keep_indices = []
-            spec_index, abort_count = 0, 0
-            spec_keep_indices = []
-            for i in range(len(self.reqs)):
-                finished_reason = self.reqs[i].finished_reason
-                if (
-                    not self.reqs[i].finished()
-                    and self.reqs[i] is not being_chunked_req
-                ):
-                    keep_indices.append(i)
-                if finished_reason is not None and isinstance(
-                    finished_reason, FINISH_ABORT
-                ):
-                    abort_count += 1
-                if not self.reqs[i].finished():
-                    spec_keep_indices.append(spec_index + abort_count)
-                    spec_index += 1
+            keep_indices = [
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
+            ]
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
@@ -1097,8 +1085,6 @@ class ScheduleBatch:
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
-        if self.spec_info is not None:
-            self.spec_info.filter_batch(spec_keep_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
