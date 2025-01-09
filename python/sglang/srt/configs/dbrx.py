@@ -10,7 +10,7 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {} # type: ignore
+DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}  # type: ignore
 
 
 class DbrxAttentionConfig(PretrainedConfig):
@@ -73,7 +73,9 @@ class DbrxAttentionConfig(PretrainedConfig):
                 "You are using a model of type %s to instantiate a model of "
                 "type %s. This is not supported for all configurations of "
                 "models and can yield errors.",
-                config_dict["model_type"], cls.model_type)
+                config_dict["model_type"],
+                cls.model_type,
+            )
 
         return cls.from_dict(config_dict, **kwargs)
 
@@ -152,7 +154,10 @@ class DbrxFFNConfig(PretrainedConfig):
             logger.warning(
                 "You are using a model of type %s to instantiate a model of "
                 "type %s. This is not supported for all "
-                "configurations of models and can yield errors.", config_dict["model_type"], cls.model_type)
+                "configurations of models and can yield errors.",
+                config_dict["model_type"],
+                cls.model_type,
+            )
 
         return cls.from_dict(config_dict, **kwargs)
 
@@ -266,9 +271,7 @@ class DbrxConfig(PretrainedConfig):
 
         tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
         if tie_word_embeddings:
-            raise ValueError(
-                "tie_word_embeddings is not supported for Dbrx models."
-            )
+            raise ValueError("tie_word_embeddings is not supported for Dbrx models.")
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
