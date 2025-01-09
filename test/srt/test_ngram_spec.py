@@ -11,10 +11,6 @@ class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=target_model_path, disable_cuda_graph=True)
-        out2 = engine.generate(prompt, sampling_params)["text"]
-        engine.shutdown()
-
         engine = sgl.Engine(
             model_path=target_model_path,
             speculative_algorithm="NGRAM",
@@ -22,12 +18,22 @@ class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
             speculative_num_draft_tokens=16,
             watchdog_timeout=10000000,
             disable_cuda_graph=True,
+            attention_backend="torch_native",
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
         print("==== Answer 1 ====")
         print(out1)
+
+        engine = sgl.Engine(
+            model_path=target_model_path,
+            disable_cuda_graph=True,
+            disable_overlap_schedule=True,
+            attention_backend="torch_native",
+        )
+        out2 = engine.generate(prompt, sampling_params)["text"]
+        engine.shutdown()
 
         print("==== Answer 2 ====")
         print(out2)

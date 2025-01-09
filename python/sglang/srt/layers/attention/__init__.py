@@ -53,7 +53,7 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
-    def forward_extend(
+    def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
