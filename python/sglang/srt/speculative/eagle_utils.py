@@ -244,15 +244,11 @@ class EAGLEDraftInput(SpecInfo):
                 scores.flatten(start_dim=1), self.topk, dim=-1
             )  # (b, topk)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            self.scores = topk_cs_p
 
             selected_input_index = topk_cs_index.flatten() // self.topk + torch.arange(
                 0, batch.batch_size() * self.topk, step=self.topk, device="cuda"
             ).repeat_interleave(self.topk)
 
-            selected_input_index = (
-                topk_cs_index.flatten() // self.topk
-            )  # shape: (b * topk)
             batch.spec_info.hidden_states = batch.spec_info.hidden_states[
                 selected_input_index, :
             ]
