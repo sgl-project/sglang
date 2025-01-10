@@ -8,7 +8,6 @@ from multiprocessing import Process
 import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, CPUOffload
 from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
@@ -58,7 +57,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         os.environ['MASTER_PORT'] = '23456'
         torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
 
-        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        model_path = 'Qwen/Qwen2-0.5B-Instruct'  # To test FSDP
         changed_model_path = model_path.replace('-Instruct', '')
         assert changed_model_path != model_path
 
@@ -87,7 +86,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
 
         # test update weights
         fsdp_state_dict = _get_fsdp_state_dict(model_path=model_path)
-        print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
+        print(f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})", flush=True)
         fragment.update_weights_from_tensor([(k, v) for k, v in fsdp_state_dict.items()])
 
         # NOTE: We deliberately call fragment.generate *twice* to confirm this function can be called multiple times
