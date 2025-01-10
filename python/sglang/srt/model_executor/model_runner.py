@@ -23,10 +23,10 @@ import torch
 import torch.distributed as dist
 from vllm.distributed import (
     get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
     set_custom_all_reduce,
 )
+import vllm.distributed
+import sglang.srt.distributed
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
