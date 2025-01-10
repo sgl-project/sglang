@@ -70,7 +70,6 @@ class ModelRunner:
         self,
         model_config: ModelConfig,
         mem_fraction_static: float,
-        gpu_id: int,
         tp_rank: int,
         tp_size: int,
         nccl_port: int,
@@ -81,7 +80,6 @@ class ModelRunner:
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
-        self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.dist_port = nccl_port
@@ -201,7 +199,6 @@ class ModelRunner:
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
         # Init torch distributed
-        torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
@@ -212,7 +209,7 @@ class ModelRunner:
             backend = "hccl"
 
         if not self.server_args.enable_p2p_check:
-            monkey_patch_vllm_p2p_access_check(self.gpu_id)
+            monkey_patch_vllm_p2p_access_check()
         if self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
@@ -225,19 +222,19 @@ class ModelRunner:
                 backend=backend,
                 world_size=self.tp_size,
                 rank=self.tp_rank,
-                local_rank=self.gpu_id,
+                local_rank=self.tp_rank % 8,  # Assumes 8 GPUs / node.
                 distributed_init_method=dist_init_method,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
 
         min_per_gpu_memory = get_available_gpu_memory(
-            self.device, self.gpu_id, distributed=self.tp_size > 1
+            self.device, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
+            local_gpu_memory = get_available_gpu_memory(self.device)
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
@@ -247,7 +244,7 @@ class ModelRunner:
 
     def load_model(self):
         logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"Load weight begin. avail mem={get_available_gpu_memory(self.device):.2f} GB"
         )
 
         # This can reduce thread conflicts and speed up weight loading.
@@ -289,7 +286,7 @@ class ModelRunner:
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device):.2f} GB"
         )
 
     def update_weights_from_disk(
@@ -305,7 +302,7 @@ class ModelRunner:
 
         logger.info(
             f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device):.2f} GB"
         )
 
         target_device = torch.device(self.device)
@@ -478,7 +475,7 @@ class ModelRunner:
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
-            self.device, self.gpu_id, distributed=self.tp_size > 1
+            self.device, distributed=self.tp_size > 1
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -597,7 +594,7 @@ class ModelRunner:
             )
         logger.info(
             f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device):.2f} GB"
         )
 
     def init_cublas(self):

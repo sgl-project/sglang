@@ -102,7 +102,6 @@ class Scheduler:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
     ):
@@ -202,7 +201,6 @@ class Scheduler:
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
-            gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
@@ -213,7 +211,6 @@ class Scheduler:
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
-                gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 server_args=server_args,
                 nccl_port=port_args.nccl_port,
@@ -1590,6 +1587,7 @@ def run_scheduler_process(
     pipe_writer,
 ):
     setproctitle.setproctitle("sglang::scheduler")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
@@ -1610,7 +1608,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args, tp_rank, dp_rank)
         pipe_writer.send(
             {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
         )

@@ -41,7 +41,6 @@ class TpModelWorker:
     def __init__(
         self,
         server_args: ServerArgs,
-        gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
@@ -68,7 +67,6 @@ class TpModelWorker:
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,

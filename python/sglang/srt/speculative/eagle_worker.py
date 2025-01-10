@@ -16,11 +16,9 @@ from sglang.srt.speculative.eagle_utils import EAGLEDraftInput
 
 
 class EAGLEWorker(TpModelWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
-        gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
@@ -31,7 +29,6 @@ class EAGLEWorker(TpModelWorker):
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
         super().__init__(
-            gpu_id=gpu_id,
             tp_rank=tp_rank,
             server_args=server_args,
             nccl_port=nccl_port,

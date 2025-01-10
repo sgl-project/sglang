@@ -171,56 +171,27 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
+def get_available_gpu_memory(device, distributed=False, empty_cache=True):
     """
-    Get available memory for cuda:gpu_id device.
+    Get available memory for current cuda (or xpu, or hpu) device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = torch.cuda.device_count()
-        assert gpu_id < num_gpus
-
-        if torch.cuda.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
-                "which may cause useless memory allocation for torch CUDA context.",
-            )
-
         if empty_cache:
             torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
-
+        free_gpu_memory, _ = torch.cuda.mem_get_info()
     elif device == "xpu":
-        num_gpus = torch.xpu.device_count()
-        assert gpu_id < num_gpus
-
-        if torch.xpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
-                "which may cause useless memory allocation for torch XPU context.",
-            )
-
         if empty_cache:
             torch.xpu.empty_cache()
         used_memory = torch.xpu.memory_allocated()
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+        total_gpu_memory = torch.xpu.get_device_properties().total_memory
         free_gpu_memory = total_gpu_memory - used_memory
-
     elif device == "hpu":
-        num_gpus = torch.hpu.device_count()
-        assert gpu_id < num_gpus
-
-        if torch.hpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
-                "which may cause useless memory allocation for torch HPU context.",
-            )
-
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
-            torch.device(device, gpu_id)
+            torch.device(device)
         )
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
@@ -297,7 +268,6 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
 
 class LayerFn(Protocol):
-
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
 
 
@@ -505,7 +475,7 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
-def monkey_patch_vllm_p2p_access_check(gpu_id: int):
+def monkey_patch_vllm_p2p_access_check():
     """
     Monkey patch the slow p2p access check in vllm.
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
@@ -603,7 +573,6 @@ def maybe_set_triton_cache_manager() -> None:
 class CustomCacheManager(FileCacheManager):
     # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
     def __init__(self, key, override=False, dump=False):
-
         self.key = key
         self.lock_path = None
         if dump:
@@ -1291,8 +1260,12 @@ def parse_tool_response(text, tools, **kwargs):
         action = action.split("<|action_end|>".strip())[0]
         action = action[action.find("{") :]
         action = json.loads(action)
-        name, parameters = action["name"], json.dumps(
-            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        name, parameters = (
+            action["name"],
+            json.dumps(
+                action.get("parameters", action.get("arguments", {})),
+                ensure_ascii=False,
+            ),
         )
         call_info_list = [(name, parameters)]
     elif "<function=" in text:  # llama3.1
@@ -1320,8 +1293,12 @@ def parse_tool_response(text, tools, **kwargs):
     elif "<|python_tag|>" in text:  # llama3.2
         _, action = text.split("<|python_tag|>")
         action = json.loads(action)
-        name, parameters = action["name"], json.dumps(
-            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        name, parameters = (
+            action["name"],
+            json.dumps(
+                action.get("parameters", action.get("arguments", {})),
+                ensure_ascii=False,
+            ),
         )
         call_info_list = [(name, parameters)]
     else:
