@@ -10,22 +10,23 @@ import vllm.distributed.parallel_state as _ps
 logger = logging.getLogger(__name__)
 
 
-def monkey_patch_vllm_distributed_parallel_state():
-    _ps.GroupCoordinator.__init__ = _group_coordinator_init
-
-
 def init_distributed_environment_via_existing(
         local_rank: int,
         backend: str,
 ):
+    _monkey_patch()
+
     assert _ps._WORLD is None
     ranks = list(range(torch.distributed.get_world_size()))
     _ps._WORLD = _init_world_group(ranks, local_rank, backend)
 
 
-def initialize_model_parallel_via_existing() -> None:
+def initialize_model_parallel_via_existing(
+        tp_existing: 'GroupCoordinatorSourceExisting',
+) -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
     _ps._TP = _init_model_parallel_group(
+        existing=tp_existing,
         group_ranks=None,
         local_rank=_ps.get_world_group().local_rank,
         backend=None,
@@ -33,6 +34,10 @@ def initialize_model_parallel_via_existing() -> None:
         group_name="tp",
     )
     # Not handle PP yet
+
+
+def _monkey_patch():
+    _ps.GroupCoordinator.__init__ = _group_coordinator_init
 
 
 # Only thing added: `**kwargs`
