@@ -21,11 +21,18 @@ def init_distributed_environment_via_existing(
     _ps._WORLD = _init_world_group(ranks, local_rank, backend)
 
 
-# TODO improve API
+# TODO improve API and naming
 @dataclasses.dataclass
 class ParallelProcessGroups:
-    tp: 'GroupCoordinatorProcessGroups'
-    pp: 'GroupCoordinatorProcessGroups'
+    tp: 'DimProcessGroups'
+    pp: 'DimProcessGroups'
+
+
+@dataclasses.dataclass
+class DimProcessGroups:
+    ranks: List[int]
+    device_group: Any
+    cpu_group: Any
 
 
 def initialize_model_parallel_via_existing(existing_groups: ParallelProcessGroups) -> None:
@@ -100,13 +107,6 @@ def _init_model_parallel_group(
     )
 
 
-@dataclasses.dataclass
-class GroupCoordinatorProcessGroups:
-    ranks: List[int]
-    device_group: Any
-    cpu_group: Any
-
-
 def _group_coordinator_init(
         self,
         group_ranks: List[List[int]],
@@ -120,7 +120,7 @@ def _group_coordinator_init(
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         # NOTE MODIFIED add
-        existing: Optional[GroupCoordinatorProcessGroups] = None,
+        existing: Optional[DimProcessGroups] = None,
 ):
     group_name = group_name or "anonymous"
     self.unique_name = _ps._get_unique_name(group_name)

@@ -1,5 +1,3 @@
-from typing import List
-
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.orchestration.spmd.entrypoint import Entrypoint
@@ -13,10 +11,7 @@ class EngineFragment(EngineBase):
         nccl_port: int,
         gpu_id: int,
         tp_rank: int,
-        # TODO determine API
-        existing_tp_group_ranks: List[int],
-        existing_tp_device_group,
-        existing_tp_cpu_group,
+        parallel_process_groups: ParallelProcessGroups,
         log_level: str = "error",
         *args,
         **kwargs,
@@ -27,11 +22,7 @@ class EngineFragment(EngineBase):
             nccl_port=nccl_port,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
-            parallel_process_groups=ParallelProcessGroups(
-                ranks=existing_tp_group_ranks,
-                device_group=existing_tp_device_group,
-                cpu_group=existing_tp_cpu_group,
-            ),
+            parallel_process_groups=parallel_process_groups,
         )
 
     def _generate_impl(self, obj: GenerateReqInput):
