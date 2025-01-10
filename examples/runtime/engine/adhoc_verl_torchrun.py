@@ -84,6 +84,9 @@ def main():
     device_mesh_cpu = init_device_mesh("cpu", **kwargs)
     print(f"{device_mesh_device=} {device_mesh_cpu=}")
 
+    # TODO
+    train_device_mesh = device_mesh_device['tp']
+
     mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
     fsdp_model = FSDP(actor_model,
                       use_orig_params=True,
@@ -93,7 +96,7 @@ def main():
                       mixed_precision=mixed_precision,
                       cpu_offload=CPUOffload(offload_params=False),
                       sync_module_states=False,
-                      device_mesh=device_mesh_device)
+                      device_mesh=train_device_mesh)
 
     FSDP.set_state_dict_type(fsdp_model,
                              state_dict_type=StateDictType.SHARDED_STATE_DICT,
