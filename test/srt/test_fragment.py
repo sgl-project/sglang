@@ -87,6 +87,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
 
         # test update weights
         fsdp_state_dict = _get_fsdp_state_dict(model_path=model_path)
+        print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
         fragment.update_weights_from_tensor([(k, v) for k, v in fsdp_state_dict.items()])
 
         # NOTE: We deliberately call fragment.generate *twice* to confirm this function can be called multiple times
