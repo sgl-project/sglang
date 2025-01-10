@@ -57,7 +57,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         os.environ['MASTER_PORT'] = '23456'
         torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
 
-        model_path = 'Qwen/Qwen2-0.5B-Instruct'  # To test FSDP
+        model_path = 'Qwen/Qwen2-7B-Instruct'  # To test FSDP
         changed_model_path = model_path.replace('-Instruct', '')
         assert changed_model_path != model_path
 
