@@ -33,7 +33,10 @@
 using namespace cute;
 
 template <typename ElementType, typename OutElementType, typename AccumElementType, typename CtaShape,
-    typename WarpShape, int Stages, bool WithBias>
+    typename WarpShape, int Stages, bool WithBias,
+    typename FP8MathOperator = cutlass::arch::OpMultiplyAdd,
+    template <typename, typename> typename EpilogueVisitor = cutlass::epilogue::threadblock::Sm80EVT,
+    typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
 struct DeviceGemmFp8RowwiseSm89
 {
     static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
@@ -97,8 +100,8 @@ struct DeviceGemmFp8RowwiseSm89
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<ElementA, LayoutA,
         cutlass::ComplexTransform::kNone, AlignmentA, ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignmentB,
         ElementC, LayoutC, AlignmentC, ElementAccumulator, ElementComputeEpilogue, OperatorClass, ArchTag, CtaShape,
-        WarpShape, InstructionShape, EpilogueOp, cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, Stages,
-        cutlass::arch::OpMultiplyAdd, EVTEpilogueStages>::GemmKernel;
+        WarpShape, InstructionShape, EpilogueOp, ThreadblockSwizzle,
+        Stages, FP8MathOperator, EVTEpilogueStages>::GemmKernel;
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
@@ -509,16 +512,16 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     uint32_t const mp2 =
         std::max(static_cast<uint32_t>(64), next_pow_2(m));  // next power of 2
 
-    if (mp2 <= 64) {
-        // m in [1, 64]
-        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>>(out, a, b, scales_a, scales_b, bias);
-    } else if (mp2 <= 128) {
-        // m in (64, 128]
-        return sm90_dispatch_bias<OutType, Shape<_64, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
-    } else {
-        // m in (128, inf)
-        return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
-    }
+    // if (mp2 <= 64) {
+    //     // m in [1, 64]
+    //     return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>>(out, a, b, scales_a, scales_b, bias);
+    // } else if (mp2 <= 128) {
+    //     // m in (64, 128]
+    //     return sm90_dispatch_bias<OutType, Shape<_64, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+    // } else {
+    //     // m in (128, inf)
+    //     return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+    // }
 }
 
 torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
@@ -573,4 +576,134 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
   }
 
   return out;
+}
+
+
+#define DISPATCH_FP8_GEMM_CONFIG(TB_M, TB_N, TB_K, WP_M, WP_N, WP_K, STAGES) \
+    sm89_dispatch_bias<ElementOutput, cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>, \
+        cutlass::gemm::GemmShape<WP_M, WP_N, WP_K>, STAGES>(out, mat_a, mat_b, scales_a, scales_b, bias)
+// 定义一个宏来生成一组配置的所有stages
+#define DISPATCH_FP8_GEMM_GROUP(GROUP_ID, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, BASE_CASE) \
+    case BASE_CASE:     DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 2); break; \
+    case BASE_CASE + 1: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 3); break; \
+    case BASE_CASE + 2: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 4); break; \
+    case BASE_CASE + 3: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 5); break; \
+    case BASE_CASE + 4: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 6); break; \
+    case BASE_CASE + 5: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 7); break;
+
+template <typename ElementOutput>
+void sm89_dispatch_shape_profile(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                            const c10::optional<torch::Tensor>& bias,
+                            int config_id) {
+    switch(config_id) {
+        case 1:
+            DISPATCH_FP8_GEMM_CONFIG(32, 64, 128, 16, 64, 64, 5);
+        case 2:
+            DISPATCH_FP8_GEMM_CONFIG(16, 64, 128, 16, 64, 64, 5);
+        case 3:
+            DISPATCH_FP8_GEMM_CONFIG(64, 64, 128, 32, 64, 64, 5);
+        case 4:
+            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 5);
+        case 5:
+            DISPATCH_FP8_GEMM_CONFIG(128, 128, 64, 64, 32, 64, 2);
+        case 6:
+            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 6);
+        // // Group 1: CtaShape32x128x64_WarpShape32x32x64
+        // DISPATCH_FP8_GEMM_GROUP(1, 32, 128, 64, 32, 32, 64, 1)
+
+        // // Group 2: CtaShape64x128x64_WarpShape32x64x64
+        // DISPATCH_FP8_GEMM_GROUP(2, 64, 128, 64, 32, 64, 64, 7)
+
+        // // Group 3: CtaShape64x64x128_WarpShape32x64x64
+        // DISPATCH_FP8_GEMM_GROUP(3, 64, 64, 128, 32, 64, 64, 13)
+
+        // // Group 4: CtaShape64x128x64_WarpShape64x32x64
+        // DISPATCH_FP8_GEMM_GROUP(4, 64, 128, 64, 64, 32, 64, 19)
+
+        // // Group 5: CtaShape128x64x64_WarpShape64x32x64
+        // DISPATCH_FP8_GEMM_GROUP(5, 128, 64, 64, 64, 32, 64, 25)
+
+        // // Group 6: CtaShape128x128x64_WarpShape64x32x64
+        // DISPATCH_FP8_GEMM_GROUP(6, 128, 128, 64, 64, 32, 64, 31)
+
+        // // Group 7: CtaShape128x128x64_WarpShape64x64x64
+        // DISPATCH_FP8_GEMM_GROUP(7, 128, 128, 64, 64, 64, 64, 37)
+
+        // // Group 8: CtaShape128x128x64_WarpShape128x32x64
+        // DISPATCH_FP8_GEMM_GROUP(8, 128, 128, 64, 128, 32, 64, 43)
+
+        // // Group 9: CtaShape128x256x64_WarpShape64x64x64
+        // DISPATCH_FP8_GEMM_GROUP(9, 128, 256, 64, 64, 64, 64, 49)
+
+        // // Group 10: CtaShape256x128x64_WarpShape64x64x64
+        // DISPATCH_FP8_GEMM_GROUP(10, 256, 128, 64, 64, 64, 64, 55)
+
+        // // Group 11: CtaShape128x64x128_WarpShape64x32x128
+        // DISPATCH_FP8_GEMM_GROUP(11, 128, 64, 128, 64, 32, 128, 61)
+
+        // // Group 12: CtaShape16x256x128_WarpShape16x64x128
+        // DISPATCH_FP8_GEMM_GROUP(12, 16, 256, 128, 16, 64, 128, 67)
+
+        // // Group 13: CtaShape16x64x128_WarpShape16x64x64
+        // DISPATCH_FP8_GEMM_GROUP(13, 16, 64, 128, 16, 64, 64, 73)
+
+        // // Group 14: CtaShape16x128x64_WarpShape16x64x64
+        // DISPATCH_FP8_GEMM_GROUP(14, 16, 128, 64, 16, 64, 64, 79)
+
+        // // Group 15: CtaShape32x64x128_WarpShape16x64x64
+        // DISPATCH_FP8_GEMM_GROUP(15, 32, 64, 128, 16, 64, 64, 85)
+    }
+}
+torch::Tensor fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_b, 
+    const torch::Tensor& scales_a, const torch::Tensor& scales_b, 
+    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias,
+    int config_id) {
+    
+    // 基本检查
+    TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
+    TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
+    TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
+    TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
+    TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
+    TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
+    TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
+
+    TORCH_CHECK((mat_a.size(1) * mat_a.element_size()) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
+    TORCH_CHECK((mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
+    TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn, "mat_a must be Float8_e4m3fn");
+    TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
+    TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
+
+    // 检查scales
+    TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
+    TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
+    TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
+    TORCH_CHECK(scales_b.is_contiguous(), "scales_b must be contiguous");
+    TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
+    TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
+
+    // 检查bias
+    if (bias) {
+        TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched");
+        TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
+        TORCH_CHECK(bias->dtype() == out_dtype, "bias dtype must match output dtype");
+    }
+
+    torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
+    TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
+
+    auto sm_version = getSMVersion();
+    
+    if (sm_version == 89) {
+        if (out_dtype == torch::kBFloat16) {
+            sm89_dispatch_shape_profile<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        } else {
+            sm89_dispatch_shape_profile<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        }
+    } else {
+        TORCH_CHECK_NOT_IMPLEMENTED(false, "FP8 operations require SM89 GPU architecture");
+    }
+
+    return out;
 }

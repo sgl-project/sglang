@@ -2,6 +2,9 @@ from pathlib import Path
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import os
+import sys
+import multiprocessing
 
 root = Path(__file__).parent.resolve()
 
@@ -23,19 +26,32 @@ def update_wheel_platform_tag():
 
 
 cutlass = root / "3rdparty" / "cutlass"
+nlohmann = root / "3rdparty" / "nlohmann"
+
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
     root / "src" / "sgl-kernel" / "csrc",
+    nlohmann.resolve(),
 ]
+
+# nvcc_flags = [
+#     "-O3",
+#     "-Xcompiler",
+#     "-fPIC",
+#     "-gencode=arch=compute_75,code=sm_75",
+#     "-gencode=arch=compute_80,code=sm_80",
+#     "-gencode=arch=compute_89,code=sm_89",
+#     "-gencode=arch=compute_90,code=sm_90",
+#     "-U__CUDA_NO_HALF_OPERATORS__",
+#     "-U__CUDA_NO_HALF2_OPERATORS__",
+# ]
 nvcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-gencode=arch=compute_75,code=sm_75",
-    "-gencode=arch=compute_80,code=sm_80",
+    # 只保留需要的架构
     "-gencode=arch=compute_89,code=sm_89",
-    "-gencode=arch=compute_90,code=sm_90",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
@@ -49,7 +65,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/trt_reduce_internal.cu",
             "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
-            "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
+            # "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
             "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
@@ -63,6 +79,20 @@ ext_modules = [
     ),
 ]
 
+def set_parallel_jobs():
+    if sys.platform == 'win32':
+        num_cores = int(os.environ.get('NUMBER_OF_PROCESSORS', 4))
+    else:
+        num_cores = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count()
+    
+    # 限制并行度为核心数的1/4或更少
+    num_jobs = max(1, num_cores // 2)
+    os.environ['MAX_JOBS'] = str(num_jobs)
+    
+    # 设置CUDA编译的并行任务数
+    os.environ['CUDA_NVCC_THREADS'] = str(num_jobs)
+    return num_jobs
+set_parallel_jobs()
 setup(
     name="sgl-kernel",
     version=get_version(),
