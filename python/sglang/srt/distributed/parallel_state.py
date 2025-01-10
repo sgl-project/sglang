@@ -22,11 +22,11 @@ def init_distributed_environment_via_existing(
 
 
 def initialize_model_parallel_via_existing(
-        tp_source: 'GroupCoordinatorSourceExisting',
+        tp_existing_groups: 'GroupCoordinatorExistingGroups',
 ) -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
     _ps._TP = _init_model_parallel_group(
-        existing=tp_source,
+        existing=tp_existing_groups,
         group_ranks=None,
         local_rank=_ps.get_world_group().local_rank,
         backend=None,
@@ -86,7 +86,7 @@ def _init_model_parallel_group(
 
 
 @dataclasses.dataclass
-class GroupCoordinatorSourceExisting:
+class GroupCoordinatorExistingGroups:
     ranks: List[int]
     device_group: Any
     cpu_group: Any
@@ -105,7 +105,7 @@ def _group_coordinator_init(
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         # NOTE MODIFIED add
-        existing: Optional[GroupCoordinatorSourceExisting] = None,
+        existing: Optional[GroupCoordinatorExistingGroups] = None,
 ):
     group_name = group_name or "anonymous"
     self.unique_name = _ps._get_unique_name(group_name)
