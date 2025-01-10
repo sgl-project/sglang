@@ -2,7 +2,7 @@
 # Currently uses monkey patching, but there are other ways like copy-paste-modify
 import dataclasses
 import logging
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import vllm.distributed.parallel_state as _ps
@@ -37,23 +37,20 @@ class ParallelProcessGroups:
     ):
         return ParallelProcessGroups(
             tp=DimProcessGroups(
-                ranks=device_mesh_device[dim_tp].mesh.tolist(),
-                device_group=device_mesh_device.get_group(dim_tp),
-                cpu_group=device_mesh_cpu.get_group(dim_tp),
+                device_mesh_cpu=device_mesh_cpu[dim_tp],
+                device_mesh_device=device_mesh_device[dim_tp],
             ),
             pp=DimProcessGroups(
-                ranks=device_mesh_device[dim_pp].mesh.tolist(),
-                device_group=device_mesh_device.get_group(dim_pp),
-                cpu_group=device_mesh_cpu.get_group(dim_pp),
+                device_mesh_cpu=device_mesh_cpu[dim_pp],
+                device_mesh_device=device_mesh_device[dim_pp],
             ),
         )
 
 
 @dataclasses.dataclass
 class DimProcessGroups:
-    ranks: List[int]
-    device_group: Any
-    cpu_group: Any
+    device_mesh_device: DeviceMesh
+    device_mesh_cpu: DeviceMesh
 
 
 def initialize_model_parallel_via_existing(
@@ -157,11 +154,13 @@ def _group_coordinator_init(
     # NOTE MODIFIED add this branch
     if existing is not None:
         assert torch_distributed_backend is None and group_ranks is None
-        self.ranks = existing.ranks
-        self.world_size = len(existing.ranks)
-        self.rank_in_group = existing.ranks.index(self.rank)
-        self.device_group = existing.device_group
-        self.cpu_group = existing.cpu_group
+        ranks = existing.device_mesh_device.mesh.tolist()
+        self.ranks = ranks
+        self.world_size = len(ranks)
+        self.rank_in_group = ranks.index(self.rank)
+        self.device_group = existing.device_mesh_device.get_group()
+        self.cpu_group = existing.device_mesh_cpu.get_group()
+        self.device_mesh_device = existing.device_mesh_device
     else:
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
@@ -176,6 +175,7 @@ def _group_coordinator_init(
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
                 self.cpu_group = cpu_group
+        self.device_mesh_device = None
 
     assert self.cpu_group is not None
     assert self.device_group is not None
