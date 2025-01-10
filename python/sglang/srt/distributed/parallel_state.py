@@ -23,6 +23,7 @@ def init_distributed_environment_via_existing(
 
 def initialize_model_parallel_via_existing(
         tp_existing_groups: 'GroupCoordinatorExistingGroups',
+        pp_existing_groups: 'GroupCoordinatorExistingGroups',
 ) -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
     _ps._TP = _init_model_parallel_group(
@@ -33,7 +34,17 @@ def initialize_model_parallel_via_existing(
         use_message_queue_broadcaster=True,
         group_name="tp",
     )
-    # Not handle PP yet
+
+    assert _ps._PP is None, "pipeline model parallel group is already initialized"
+    # pipeline parallel does not need custom allreduce
+    _ps._PP = _ps.init_model_parallel_group(
+        existing=pp_existing_groups,
+        group_ranks=None,
+        local_rank=_ps.get_world_group().local_rank,
+        backend=None,
+        use_custom_allreduce=False,
+        group_name="pp",
+    )
 
 
 def _monkey_patch():
