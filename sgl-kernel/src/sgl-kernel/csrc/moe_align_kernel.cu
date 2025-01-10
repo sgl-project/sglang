@@ -244,6 +244,28 @@ __global__ void moe_align_block_size_stage4_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void moe_align_block_size_stage5_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ token_cnts,
+    const int32_t* __restrict__ cumsum,
+    const int32_t num_experts,
+    const size_t numel) {
+    
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = blockDim.x * gridDim.x;
+    const size_t off_t = blockIdx.x * num_experts;
+    
+    for (size_t i = tid; i < numel; i += stride) {
+        int32_t expert_id = topk_ids[i];
+        int32_t token_cnt = token_cnts[off_t + expert_id];
+        int32_t rank_post_pad = token_cnt + cumsum[expert_id];
+        sorted_token_ids[rank_post_pad] = i;
+        token_cnts[off_t + expert_id] = token_cnt + 1;
+    }
+}
+
 void moe_align_block_size_stage1(
     torch::Tensor topk_ids,
     torch::Tensor token_cnts_buffer,
@@ -336,5 +358,30 @@ void moe_align_block_size_stage4(
             block_size,
             numel,
             total_blocks);
+    });
+}
+
+void moe_align_block_size_stage5(
+    torch::Tensor topk_ids,
+    torch::Tensor sorted_token_ids,
+    torch::Tensor token_cnts_buffer,
+    torch::Tensor cumsum_buffer,
+    int64_t num_experts) {
+    
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const size_t numel = topk_ids.numel();
+    
+    const int threads_per_block = 256;
+    const int num_blocks = (numel + threads_per_block - 1) / threads_per_block;
+    
+    DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_stage5", [&] {
+        auto kernel = moe_align_block_size_stage5_kernel<scalar_t>;
+        kernel<<<num_blocks, threads_per_block, 0, stream>>>(
+            topk_ids.data_ptr<scalar_t>(),
+            sorted_token_ids.data_ptr<int32_t>(),
+            token_cnts_buffer.data_ptr<int32_t>(),
+            cumsum_buffer.data_ptr<int32_t>(),
+            num_experts,
+            numel);
     });
 }

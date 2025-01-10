@@ -36,6 +36,11 @@ void moe_align_block_size_stage4(torch::Tensor topk_ids,
                                 int64_t block_size,
                                 int64_t total_blocks);
 
+void moe_align_block_size_stage5(torch::Tensor topk_ids,
+                                torch::Tensor sorted_token_ids,
+                                torch::Tensor token_cnts_buffer,
+                                torch::Tensor cumsum_buffer,
+                                int64_t num_experts);
 
 // int8_scaled_mm
 torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
@@ -58,6 +63,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "MOE Align Block Size Stage 3: Compute total padded tokens (CUDA)");
   m.def("moe_align_block_size_stage4", &moe_align_block_size_stage4,
         "MOE Align Block Size Stage 4: Assign tokens to experts (CUDA)");
+  m.def("moe_align_block_size_stage5", &moe_align_block_size_stage5,
+        "MOE Align Block Size Stage 5: Assign tokens to experts (CUDA)");
   // int8_scaled_mm
   m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
 }
