@@ -1358,6 +1358,9 @@ def parse_tool_response(text, tools, **kwargs):
 def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
     if isinstance(w, DTensor):
         device_mesh = get_tp_group().device_mesh_device
+        print(
+            f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {device_mesh=}')
+
         ans = w.redistribute(device_mesh, [Shard(dim)]).to_local()
 
         rank_via_mesh = device_mesh.get_local_rank()
@@ -1365,7 +1368,7 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
         size_via_mesh = device_mesh.size()
         size_via_arg = w.shape[dim] // length
         print(
-            f'weight_loader_narrow {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {rank_via_mesh=} {size_via_mesh=}')
+            f'weight_loader_narrow {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {device_mesh=} {rank_via_mesh=} {size_via_mesh=}')
         assert rank_via_mesh == rank_via_arg
         assert size_via_mesh == size_via_arg
         assert ans.shape[dim] == length
