@@ -50,7 +50,7 @@ from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from starlette.routing import Mount
 from torch import nn
-from torch.distributed.tensor import DTensor, Shard, Replicate
+from torch.distributed.tensor import DTensor, Shard
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function

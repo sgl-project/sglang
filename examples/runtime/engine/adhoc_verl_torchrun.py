@@ -78,8 +78,11 @@ def main():
 
     print(f'hf response: {tokenizer.batch_decode(response)}')
 
-    tensor_model_parallel_size = 4
-    device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
+    tp_size, dp_size = 4, 1
+    kwargs = dict(mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=["tp", "dp", "pp"])
+    device_mesh_device = init_device_mesh("cuda", **kwargs)
+    device_mesh_cpu = init_device_mesh("cpu", **kwargs)
+    print(f"{device_mesh_device=} {device_mesh_cpu=}")
 
     mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
     fsdp_model = FSDP(actor_model,
@@ -90,7 +93,7 @@ def main():
                       mixed_precision=mixed_precision,
                       cpu_offload=CPUOffload(offload_params=False),
                       sync_module_states=False,
-                      device_mesh=device_mesh)
+                      device_mesh=device_mesh_device)
 
     FSDP.set_state_dict_type(fsdp_model,
                              state_dict_type=StateDictType.SHARDED_STATE_DICT,
@@ -119,12 +122,6 @@ def main():
                            max_new_tokens=response_length,
                            ignore_eos=True)
 
-    tp_size, dp_size = 4, 1
-    kwargs = dict(mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=["tp", "dp", "pp"])
-    inference_device_mesh_device = init_device_mesh("cuda", **kwargs)
-    inference_device_mesh_cpu = init_device_mesh("cpu", **kwargs)
-    print(f"{inference_device_mesh_device=} {inference_device_mesh_cpu=}")
-
     print(actor_model_config)
     # llm = LLM(model=None,
     #           tokenizer=tokenizer,
@@ -140,15 +137,15 @@ def main():
     print(f'{changed_model_path=}')
     llm = EngineFragment(
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
-        tp_size=tensor_model_parallel_size,
+        tp_size=tp_size,
         dtype='bfloat16',
         mem_fraction_static=0.1,
         nccl_port=12345,
         tp_rank=rank,
         gpu_id=rank,
         parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
-            device_mesh_device=inference_device_mesh_device,
-            device_mesh_cpu=inference_device_mesh_cpu,
+            device_mesh_device=device_mesh_device,
+            device_mesh_cpu=device_mesh_cpu,
             dim_tp="tp",
             dim_pp="pp",
         ),
