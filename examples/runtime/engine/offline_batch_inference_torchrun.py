@@ -2,9 +2,10 @@ import datetime
 import os
 import sys
 
+from torch.distributed.device_mesh import init_device_mesh
+
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
-from torch.distributed.device_mesh import init_device_mesh
 
 
 def run():
@@ -31,13 +32,15 @@ def run():
     dp_size = 2
     assert world_size == tp_size * dp_size
 
-    device_mesh_kwargs = dict(mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=['tp', 'dp', 'pp'])
-    device_mesh_device = init_device_mesh('cuda', **device_mesh_kwargs)
-    device_mesh_cpu = init_device_mesh('cpu', **device_mesh_kwargs)
+    device_mesh_kwargs = dict(
+        mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=["tp", "dp", "pp"]
+    )
+    device_mesh_device = init_device_mesh("cuda", **device_mesh_kwargs)
+    device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
     _log(f"{device_mesh_device=} {device_mesh_cpu=}")
 
-    tp_rank = device_mesh_device.get_local_rank('tp')
-    dp_rank = device_mesh_device.get_local_rank('dp')
+    tp_rank = device_mesh_device.get_local_rank("tp")
+    dp_rank = device_mesh_device.get_local_rank("dp")
     _log(f"{tp_rank=} {tp_size=} ; {dp_rank=} {dp_size=}")
 
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
@@ -76,8 +79,8 @@ def run():
         parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
             device_mesh_device=device_mesh_device,
             device_mesh_cpu=device_mesh_cpu,
-            dim_tp='tp',
-            dim_pp='pp',
+            dim_tp="tp",
+            dim_pp="pp",
         ),
     )
     _log(f"{fragment=}")
