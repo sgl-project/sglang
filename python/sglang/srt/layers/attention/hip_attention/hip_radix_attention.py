@@ -384,8 +384,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
             sliding_window_size=layer_config.sliding_window_size,
             sink_token_size=layer_config.sink_token_size,
 
-            using_extend=True,
-            need_apply_rope=True,
+            using_extend=self.hip_config.using_extend,
+            need_apply_rope=self.hip_config.using_extend,
             rope_cos=layer.rope_cos,
             rope_sin=layer.rope_sin,
 
@@ -396,8 +396,13 @@ class HiPRadixAttentionBackend(AttentionBackend):
             model_context_length=layer.orig_context_len,
             extend_context_length=self.max_context_len,
             block_sparse_block_size_q=self.hip_config.block_sparse_block_size_q,
-            scan_extend_backend=('relative' if self.hip_config.apply_v_dot
-                                 else ('streaming' if is_dense else 'relative')),
+            scan_extend_backend=(
+                (
+                    'relative' if self.hip_config.apply_v_dot
+                    else ('streaming' if is_dense else 'relative')
+                ) if layer_config.scan_extend_backend is None else 
+                layer_config.scan_extend_backend
+            ),
             sa_extend_backend=layer_config.sa_extend_backend,
             online_update_cache=online_update_cache,
         )

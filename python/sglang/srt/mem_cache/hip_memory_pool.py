@@ -27,6 +27,7 @@ class HiPMetadataCachePool:
         device: str,
         hip_config: HiPAttentionConfig,
     ):
+        self.hip_config = hip_config
         self.layer_num = layer_num
         self.cache = [{} for _ in range(layer_num)]
         self.head_num = query_head_num

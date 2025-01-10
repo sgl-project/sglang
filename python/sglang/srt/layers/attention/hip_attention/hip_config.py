@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field, InitVar
+from typing import Optional
 
 from hip.models.hip_attention.gen3.attention_metadata import ScanStage
 
@@ -34,6 +35,7 @@ class HiPAttentionPerLayerConfig:
     sliding_window_size: int = 1024
     sink_token_size: int = 256
     sa_extend_backend: str = 'streaming'
+    scan_extend_backend: Optional[str] = None
     stages: list[ScanStage] = field(default_factory=lambda: _DEFAULT_STAGES)
 
     parsed_json: InitVar[dict | None] = None
@@ -53,6 +55,9 @@ class HiPAttentionPerLayerConfig:
             if 'sa_extend_backend' in parsed_json:
                 self.sa_extend_backend = parsed_json['sa_extend_backend']
                 parsed_json.pop('sa_extend_backend')
+            if 'scan_extend_backend' in parsed_json:
+                self.scan_extend_backend = parsed_json['scan_extend_backend']
+                parsed_json.pop('scan_extend_backend')
             if 'stages' in parsed_json:
                 self.stages = [
                     ScanStage(**stage)
@@ -74,6 +79,7 @@ class HiPAttentionConfig:
     block_sparse_block_size_q: int = 64
     metadata_cache_max_batch_size: int = 256
     mask_refresh_interval: int = 4
+    using_extend: bool = True
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
         HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 1024, 'sink_token_size': 256}),
         HiPAttentionPerLayerConfig(),
@@ -111,6 +117,9 @@ class HiPAttentionConfig:
             if 'mask_refresh_interval' in parsed_json:
                 self.mask_refresh_interval = parsed_json['mask_refresh_interval']
                 parsed_json.pop('mask_refresh_interval')
+            if 'using_extend' in parsed_json:
+                self.using_extend = parsed_json['using_extend']
+                parsed_json.pop('using_extend')
             if 'layers' in parsed_json:
                 self.layers = [
                     HiPAttentionPerLayerConfig(parsed_json=layer)
