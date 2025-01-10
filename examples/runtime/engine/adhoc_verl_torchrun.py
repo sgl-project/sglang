@@ -22,7 +22,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, CPUOffload
 from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-from verl.utils.distributed import initialize_global_process_group
 
 
 def main():
