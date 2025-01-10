@@ -191,7 +191,7 @@ class DataParallelController:
             args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
         )
         proc.start()
-        os.environ["CUDA_VISIBLE_DEVICES"]
+        del os.environ["CUDA_VISIBLE_DEVICES"]
         send_to = get_zmq_socket(
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
