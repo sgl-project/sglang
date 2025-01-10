@@ -11,7 +11,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs, weight_loader_narrow
+from sglang.srt.utils import set_weight_attrs, weight_loader_tp_narrow
 from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm.distributed import (
     divide,
@@ -449,7 +449,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == self.org_vocab_size
 
         # Copy the data.
-        loaded_weight = weight_loader_narrow(loaded_weight, output_dim, start_idx, shard_size)
+        loaded_weight = weight_loader_tp_narrow(loaded_weight, output_dim, start_idx, shard_size)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0]:].data.fill_(0)
 

@@ -1355,7 +1355,7 @@ def parse_tool_response(text, tools, **kwargs):
 
 
 # TODO maybe move
-def weight_loader_narrow(w: torch.Tensor, dim: int, start: int, length: int):
+def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
     print(f'weight_loader_narrow {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=}')
     if isinstance(w, DTensor):
         return TODO
