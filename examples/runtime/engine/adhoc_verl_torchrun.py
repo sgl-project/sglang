@@ -19,7 +19,10 @@ import torch.nn.functional as F
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, CPUOffload
+from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from verl.utils.distributed import initialize_global_process_group
 
 
 def main():
@@ -76,24 +79,30 @@ def main():
     print(f'hf response: {tokenizer.batch_decode(response)}')
 
     tensor_model_parallel_size = 4
-    # device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
-    #
-    # mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
-    # fsdp_model = FSDP(actor_model,
-    #                   use_orig_params=True,
-    #                   auto_wrap_policy=None,
-    #                   device_id=torch.cuda.current_device(),
-    #                   sharding_strategy=ShardingStrategy.FULL_SHARD,
-    #                   mixed_precision=mixed_precision,
-    #                   cpu_offload=CPUOffload(offload_params=False),
-    #                   sync_module_states=False,
-    #                   device_mesh=device_mesh)
-    #
-    # FSDP.set_state_dict_type(fsdp_model,
-    #                          state_dict_type=StateDictType.SHARDED_STATE_DICT,
-    #                          state_dict_config=ShardedStateDictConfig())
-    #
-    # state_dict = fsdp_model.state_dict()
+    device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
+
+    mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
+    fsdp_model = FSDP(actor_model,
+                      use_orig_params=True,
+                      auto_wrap_policy=None,
+                      device_id=torch.cuda.current_device(),
+                      sharding_strategy=ShardingStrategy.FULL_SHARD,
+                      mixed_precision=mixed_precision,
+                      cpu_offload=CPUOffload(offload_params=False),
+                      sync_module_states=False,
+                      device_mesh=device_mesh)
+
+    FSDP.set_state_dict_type(fsdp_model,
+                             state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                             state_dict_config=ShardedStateDictConfig())
+
+    state_dict = fsdp_model.state_dict()
+
+    if rank == 0:
+        lines = ['------------------------ state_dict ------------------------']
+        for k, v in state_dict.items():
+            lines.append(f'{k}\t: {v.shape=} {v.type=} {v.dtype=} {type(v)=}')
+        print('\n'.join(lines))
 
     # NOTE MODIFIED
     # sampling_params = SamplingParams(temperature=0,
@@ -169,7 +178,7 @@ def main():
 def initialize_global_process_group(timeout_second=36000):
     import torch.distributed
     from datetime import timedelta
-   
+
     # NOTE MODIFIED should provide backend=None to have nccl+gloo
     # torch.distributed.init_process_group('nccl', timeout=timedelta(seconds=timeout_second))
     torch.distributed.init_process_group(timeout=timedelta(seconds=timeout_second))
