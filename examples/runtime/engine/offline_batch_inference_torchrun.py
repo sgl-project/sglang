@@ -28,12 +28,13 @@ def run():
     )
 
     tp_size = world_size
-    tp_rank = rank
-    _log(f"{tp_rank=} {tp_size=}")
 
-    device_mesh_device = init_device_mesh('cuda', mesh_shape=(world_size, 1), mesh_dim_names=['tp', 'pp'])
-    device_mesh_cpu = init_device_mesh('cpu', mesh_shape=(world_size, 1), mesh_dim_names=['tp', 'pp'])
+    device_mesh_device = init_device_mesh('cuda', mesh_shape=(tp_size, 1), mesh_dim_names=['tp', 'pp'])
+    device_mesh_cpu = init_device_mesh('cpu', mesh_shape=(tp_size, 1), mesh_dim_names=['tp', 'pp'])
     _log(f"{device_mesh_device=} {device_mesh_cpu=}")
+
+    tp_rank = device_mesh_device.get_local_rank('tp')
+    _log(f"{tp_rank=} {tp_size=}")
 
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
     # model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9 # test large models
@@ -67,7 +68,7 @@ def run():
         tp_size=tp_size,
         tp_rank=tp_rank,
         nccl_port=23456,
-        gpu_id=tp_rank,
+        gpu_id=local_rank,
         # TODO maybe make shortcut methods to create it
         parallel_process_groups=ParallelProcessGroups(
             tp=DimProcessGroups(
