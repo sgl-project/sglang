@@ -152,7 +152,7 @@ def main():
 
     # most naive way
     state_dict_full = {k: v.full_tensor() for k, v in state_dict.items()}
-    llm.update_weights_from_tensor(state_dict_full)
+    llm.update_weights_from_tensor([(k, v) for k, v in state_dict_full.items()])
 
     input_ids = input_ids.cuda()
     attention_mask = attention_mask.cuda()
