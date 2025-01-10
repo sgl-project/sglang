@@ -150,7 +150,9 @@ def main():
         ),
     )
 
-    # llm.sync_model_weights(actor_weights=state_dict, load_format='dtensor')
+    # most naive way
+    state_dict_full = {k: v.full_tensor() for k, v in state_dict.items()}
+    llm.update_weights_from_tensor(state_dict_full)
 
     input_ids = input_ids.cuda()
     attention_mask = attention_mask.cuda()
