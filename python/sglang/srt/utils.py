@@ -1363,6 +1363,8 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
 
         ans = w
         # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
+        # Now we can either do this hacky full_tensor+from_local+redistribute (to test logical correctness and
+        # easier to flip in the future), or do full_tensor+narrow
         ans = DTensor.from_local(ans.full_tensor(), device_mesh=tp_device_mesh,
                                  placements=[Replicate() for _ in range(tp_device_mesh.ndim)])
         ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
