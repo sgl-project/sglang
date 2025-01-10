@@ -25,6 +25,8 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
+from torch.distributed.tensor import DTensor, Shard, Replicate
+from vllm.distributed import get_tp_group
 
 logger = logging.getLogger(__name__)
 
@@ -505,6 +507,32 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.
         raise
+
+
+def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
+    if isinstance(w, DTensor):
+        tp_device_mesh = get_tp_group().device_mesh_device
+        print(
+            f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=}')
+
+        ans = w
+        # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
+        ans = DTensor.from_local(ans.full_tensor(), device_mesh=tp_device_mesh,
+                                 placements=[Replicate() for _ in range(tp_device_mesh.ndim)])
+        ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
+
+        rank_via_mesh = tp_device_mesh.get_local_rank()
+        rank_via_arg = start // length
+        size_via_mesh = tp_device_mesh.size()
+        size_via_arg = w.shape[dim] // length
+        print(f'weight_loader_narrow END {rank_via_mesh=} {size_via_mesh=} {ans.shape=}')
+        assert rank_via_mesh == rank_via_arg
+        assert size_via_mesh == size_via_arg
+        assert ans.shape[dim] == length
+
+        return ans
+    else:
+        return w.narrow(dim, start, length)
 
 
 def row_parallel_weight_loader(
