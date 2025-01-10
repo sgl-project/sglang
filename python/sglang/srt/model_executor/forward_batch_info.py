@@ -289,7 +289,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
-            decode_start_idx=self.decode_start_idx,
+            decode_start_idx=batch.decode_start_idx,
         )
 
         if ret.global_num_tokens is not None:

@@ -185,9 +185,6 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens_extend = forward_batch.extend_prefix_lens[:extend_bs]
 
             extend_prefix_lens_origin = len(forward_batch.extend_prefix_lens)
-            print(
-                f"origin prefix lens = {extend_prefix_lens_origin}, extend_bs={extend_bs}"
-            )
             assert extend_prefix_lens_origin == extend_bs
             encoder_lens_extend = (
                 forward_batch.encoder_lens[:extend_bs]
@@ -784,7 +781,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                kv_indptr_decode,
+                kv_indptr,
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
