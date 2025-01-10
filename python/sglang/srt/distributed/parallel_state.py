@@ -1,12 +1,17 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/parallel_state.py
 # Currently uses monkey patching, but there are other ways like copy-paste-modify
 
+import logging
 from typing import Optional, List, Union
 
 import torch
 import vllm.distributed.parallel_state as _ps
 
 logger = logging.getLogger(__name__)
+
+
+def monkey_patch_vllm_distributed_parallel_state():
+    _ps.GroupCoordinator.__init__ = _group_coordinator_init
 
 
 def init_distributed_environment_via_existing(
