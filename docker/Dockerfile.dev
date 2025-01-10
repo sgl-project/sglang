@@ -63,6 +63,9 @@ RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
     && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
 
+RUN wget https://github.com/InternLM/turbomind/releases/download/v0.0.1/turbomind-0.0.1+cu118-cp312-cp312-manylinux2014_x86_64.whl \
+  && python3 -m pip install https://github.com/InternLM/turbomind/releases/download/v0.0.1/turbomind-0.0.1+cu118-cp312-cp312-manylinux2014_x86_64.whl
+
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
 #!/bin/bash
