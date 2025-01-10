@@ -62,6 +62,9 @@ def run():
         tp_rank=tp_rank,
         nccl_port=23456,
         gpu_id=tp_rank,
+        existing_tp_group_ranks=TODO,
+        existing_tp_device_group=TODO,
+        existing_tp_cpu_group=TODO,
     )
     _log(f"{fragment=}")
 
