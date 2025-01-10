@@ -1,3 +1,5 @@
+from typing import Optional
+
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.orchestration.spmd.entrypoint import Entrypoint
@@ -11,7 +13,7 @@ class EngineFragment(EngineBase):
         nccl_port: int,
         gpu_id: int,
         tp_rank: int,
-        parallel_process_groups: ParallelProcessGroups,
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
         log_level: str = "error",
         *args,
         **kwargs,
