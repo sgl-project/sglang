@@ -11,7 +11,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs, weight_loader_tp_narrow
+from sglang.srt.model_loader.weight_utils import weight_loader_tp_narrow
+from sglang.srt.utils import set_weight_attrs
 from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm.distributed import (
     divide,

@@ -59,7 +59,7 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
-from vllm.distributed import (GroupCoordinator, get_tp_group)
+from vllm.distributed import (GroupCoordinator)
 
 logger = logging.getLogger(__name__)
 
