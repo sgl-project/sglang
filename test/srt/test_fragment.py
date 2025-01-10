@@ -8,6 +8,7 @@ from multiprocessing import Process
 import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, CPUOffload
 from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
@@ -57,7 +58,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         os.environ['MASTER_PORT'] = '23456'
         torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
 
-        model_path = 'Qwen/Qwen2-7B-Instruct'  # To test FSDP
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         changed_model_path = model_path.replace('-Instruct', '')
         assert changed_model_path != model_path
 
@@ -145,7 +146,9 @@ def _get_fsdp_state_dict(model_path: str):
                              state_dict_type=StateDictType.SHARDED_STATE_DICT,
                              state_dict_config=ShardedStateDictConfig())
 
-    return fsdp_model.state_dict()
+    state_dict = fsdp_model.state_dict()
+    # small models have weight tieing, thus we skip it
+    return {k: v for k, v in state_dict.items() if k not in ['lm_head.weight']}
 
 
 if __name__ == "__main__":
