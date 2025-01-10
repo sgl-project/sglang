@@ -58,6 +58,7 @@ class MixedMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
+    decode_start_idx: int
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -167,18 +168,21 @@ class FlashInferAttnBackend(AttentionBackend):
             # Part 0: prepare
             extend_bs = forward_batch.decode_start_idx
             print(
-                f"init_forward_metadata: batch_size={forward_batch.batch_size}, running_bs={running_bs}, extend_bs={extend_bs}"
+                f"init_forward_metadata: batch_size={forward_batch.batch_size}, extend_bs={extend_bs}"
             )
 
-            req_pool_indices_extend = forward_batch.req_pool_indices[:extend_bs]
-            req_pool_indices_decode = (forward_batch.req_pool_indices[extend_bs:],)
+            req_pool_indices_extend, req_pool_indices_decode = (
+                forward_batch.req_pool_indices[:extend_bs],
+                forward_batch.req_pool_indices[extend_bs:],
+            )
             seq_lens_extend, seq_lens_decode = (
                 forward_batch.seq_lens[:extend_bs],
                 forward_batch.seq_lens[extend_bs:],
             )
-
-            seq_lens_sum_extend = forward_batch.seq_lens[:extend_bs].sum().item()
-            seq_lens_sum_decode = forward_batch.seq_lens[extend_bs:].sum().item()
+            seq_lens_sum_extend, seq_lens_sum_decode = (
+                forward_batch.seq_lens[:extend_bs].sum().item(),
+                forward_batch.seq_lens[extend_bs:].sum().item(),
+            )
             prefix_lens_extend = forward_batch.extend_prefix_lens[:extend_bs]
 
             extend_prefix_lens_origin = len(forward_batch.extend_prefix_lens)
@@ -198,7 +202,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     else None
                 ),
             )
-            self.indices_updater_decode.decode_indices = extend_bs
 
             # Part1: Prefill
             if forward_batch.decode_start_idx >= 4096 and self.num_wrappers == 1:
@@ -230,12 +233,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens_decode,
                 spec_info=forward_batch.spec_info,
             )
+            # since the `decode_start_idx` only used in the mixed mode
+            # Manually update it so we do not need change the update method
+            self.indices_updater_decode.decode_start_idx = extend_bs
 
             self.forward_metadata = MixedMetadata(
                 self.prefill_wrappers_paged,
                 self.decode_wrappers,
                 use_ragged,
                 extend_no_prefix,
+                extend_bs,
             )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
@@ -639,6 +646,9 @@ class FlashInferIndicesUpdaterDecode:
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
 
+        # mixed chunk prefill
+        self.decode_start_idx = 0
+
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -769,7 +779,6 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indptr_decode = kv_indptr[
                     1 + self.decode_indices : 2 + self.decode_indices + bs
                 ]
-                self.decode_indices = 0
             else:
                 kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
                 kv_indptr_decode = kv_indptr[: bs + 1]
@@ -982,9 +991,11 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(req_pool_indices)
         if spec_info is None:
-            # Normal extend
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
+            shift_pos = self.decode_start_idx
+            kv_indptr[1 + shift_pos : bs + 1 + shift_pos] = torch.cumsum(
+                paged_kernel_lens, dim=0
+            )
+            kv_indptr = kv_indptr[shift_pos : bs + 1 + shift_pos]
             kv_indices = torch.empty(
                 paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
             )
