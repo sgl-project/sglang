@@ -76,13 +76,12 @@ def run():
         # TODO maybe make shortcut methods to create it
         parallel_process_groups=ParallelProcessGroups(
             tp=DimProcessGroups(
-                # TODO use device_mesh etc to get ranks
-                ranks=list(range(world_size)),
+                ranks=device_mesh_device['tp'].mesh,
                 device_group=device_mesh_device.get_group('tp'),
                 cpu_group=device_mesh_cpu.get_group('tp'),
             ),
             pp=DimProcessGroups(
-                ranks=[rank],
+                ranks=device_mesh_device['pp'].mesh,
                 device_group=device_mesh_device.get_group('pp'),
                 cpu_group=device_mesh_cpu.get_group('pp'),
             ),
