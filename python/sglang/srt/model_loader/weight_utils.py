@@ -9,7 +9,7 @@ import logging
 import os
 import tempfile
 from collections import defaultdict
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union, Callable
 
 import filelock
 import gguf
