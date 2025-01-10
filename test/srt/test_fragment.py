@@ -4,8 +4,13 @@ import traceback
 import unittest
 from multiprocessing import Process
 
+import torch
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, CPUOffload
+from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
+from transformers import AutoModelForCausalLM
 
 _TP_SIZE = 2
 
@@ -47,8 +52,12 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
     try:
         print(f"subprocess[{tp_rank=}] Start")
 
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        changed_model_path = model_path.replace('-Instruct', '')
+        assert changed_model_path != model_path
+
         fragment = EngineFragment(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            model_path=changed_model_path,
             mem_fraction_static=0.1,
             tp_size=_TP_SIZE,
             random_seed=42,
@@ -58,6 +67,10 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             nccl_port=nccl_port,
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
+
+        # test update weights
+        fsdp_state_dict = _get_fsdp_state_dict(model_path=model_path)
+        fragment.update_weights_from_tensor([(k, v) for k, v in fsdp_state_dict.items()])
 
         # NOTE: We deliberately call fragment.generate *twice* to confirm this function can be called multiple times
         # In real batch generation, surely we should only call fragment.generate once
@@ -70,7 +83,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             outputs = fragment.generate(
                 prompt=prompt,
                 sampling_params=[dict(max_new_tokens=16, temperature=0.0)]
-                * len(prompt),
+                                * len(prompt),
             )
             print(
                 f"subprocess[{tp_rank=}] End generation {prompt=} {outputs=}",
@@ -88,6 +101,33 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
 
     fragment.shutdown()
     print(f"subprocess[{tp_rank=}] end", flush=True)
+
+
+# Adapted from https://github.com/volcengine/verl/blob/main/tests/rollout/run_fsdp_vllm.py
+def _get_fsdp_state_dict(model_path: str):
+    with torch.device("cuda"):
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+        model.to(torch.bfloat16)
+    model.cuda()
+
+    device_mesh = init_device_mesh('cuda', mesh_shape=(_TP_SIZE,), mesh_dim_names=['fsdp'])
+
+    mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
+    fsdp_model = FSDP(model,
+                      use_orig_params=True,
+                      auto_wrap_policy=None,
+                      device_id=torch.cuda.current_device(),
+                      sharding_strategy=ShardingStrategy.FULL_SHARD,
+                      mixed_precision=mixed_precision,
+                      cpu_offload=CPUOffload(offload_params=False),
+                      sync_module_states=False,
+                      device_mesh=device_mesh)
+
+    FSDP.set_state_dict_type(fsdp_model,
+                             state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                             state_dict_config=ShardedStateDictConfig())
+
+    return fsdp_model.state_dict()
 
 
 if __name__ == "__main__":
