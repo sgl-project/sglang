@@ -30,6 +30,7 @@ import torch
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import GroupCoordinatorExistingGroups
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -94,6 +95,7 @@ class Scheduler:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        tp_existing_groups: Optional[GroupCoordinatorExistingGroups] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -170,6 +172,7 @@ class Scheduler:
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             nccl_port=nccl_port,
+            tp_existing_groups=tp_existing_groups,
         )
 
         # Launch worker for speculative decoding if need

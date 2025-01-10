@@ -18,6 +18,7 @@ import threading
 from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import GroupCoordinatorExistingGroups
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
@@ -45,6 +46,7 @@ class TpModelWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        tp_existing_groups: Optional[GroupCoordinatorExistingGroups] = None,
         is_draft_worker: bool = False,
     ):
         # Parse args
@@ -73,6 +75,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            tp_existing_groups=tp_existing_groups,
             is_draft_worker=is_draft_worker,
         )
         if server_args.skip_tokenizer_init:

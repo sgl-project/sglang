@@ -75,7 +75,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
-        tp_existing_groups: Optional[GroupCoordinatorExistingGroups],
+        tp_existing_groups: Optional[GroupCoordinatorExistingGroups] = None,
         is_draft_worker: bool = False,
     ):
         # Parse args
