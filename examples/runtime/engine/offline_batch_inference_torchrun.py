@@ -68,6 +68,7 @@ def run():
         tp_rank=tp_rank,
         nccl_port=23456,
         gpu_id=tp_rank,
+        # TODO maybe make shortcut methods to create it
         parallel_process_groups=ParallelProcessGroups(
             tp=DimProcessGroups(
                 # TODO use device_mesh etc to get ranks
