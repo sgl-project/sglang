@@ -347,7 +347,7 @@ class StreamExecutor:
         size: int = 1,
         position_ids_offset: Optional[List[int]] = None,
     ):
-        if size > 1:
+        if size > 1 and str(self.text_):
             self.submit(SglCommitLazy())
 
         self.sync()
