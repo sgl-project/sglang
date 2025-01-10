@@ -714,9 +714,9 @@ def broadcast_pyobj_in_group(
 ):
     broadcast_pyobj(
         data=data,
-        rank=TODO,
+        rank=dist_group_coordinator.ranks[index_in_group],
         dist_group=dist_group_coordinator.cpu_group,
-        src=TODO,
+        src=dist_group_coordinator.ranks[src_index_in_group],
     )
 
 
