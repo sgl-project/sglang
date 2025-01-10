@@ -32,6 +32,7 @@ def run():
 
     device_mesh_device = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['tp'])
     device_mesh_cpu = init_device_mesh('cpu', mesh_shape=(world_size,), mesh_dim_names=['tp'])
+    _log(f"{device_mesh_device=} {device_mesh_cpu=}")
 
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
     # model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9 # test large models
