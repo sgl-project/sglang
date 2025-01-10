@@ -59,7 +59,7 @@ class TestFragment(unittest.TestCase):
 
 def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
     try:
-        print(f"subprocess[{tp_rank=}] Start")
+        print(f"subprocess[{tp_rank=}] Start {os.environ['CUDA_VISIBLE_DEVICES']=}")
 
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "23456"
