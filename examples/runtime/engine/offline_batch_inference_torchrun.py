@@ -2,6 +2,7 @@ import datetime
 import os
 import sys
 
+from sglang.srt.distributed import ParallelProcessGroups, DimProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
 from torch.distributed.device_mesh import init_device_mesh
 
@@ -67,10 +68,19 @@ def run():
         tp_rank=tp_rank,
         nccl_port=23456,
         gpu_id=tp_rank,
-        # TODO use device_mesh etc to get ranks
-        existing_tp_group_ranks=list(range(world_size)),
-        existing_tp_device_group=device_mesh_device.get_group('tp'),
-        existing_tp_cpu_group=device_mesh_cpu.get_group('tp'),
+        parallel_process_groups=ParallelProcessGroups(
+            tp=DimProcessGroups(
+                # TODO use device_mesh etc to get ranks
+                ranks=list(range(world_size)),
+                device_group=device_mesh_device.get_group('tp'),
+                cpu_group=device_mesh_cpu.get_group('tp'),
+            ),
+            pp=DimProcessGroups(
+                ranks=TODO,
+                device_group=TODO,
+                cpu_group=TODO,
+            ),
+        ),
     )
     _log(f"{fragment=}")
 
