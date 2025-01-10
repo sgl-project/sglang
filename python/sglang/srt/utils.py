@@ -50,7 +50,7 @@ from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from starlette.routing import Mount
 from torch import nn
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Shard, Replicate
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -1364,7 +1364,7 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
         ans = w
         if w.device_mesh != tp_device_mesh:
             # TODO otherwise torch has "not yet implemented" error - we should remove this after torch implements it
-            ans = ans.redistribute(tp_device_mesh, ans.placements)
+            ans = ans.redistribute(tp_device_mesh, [Replicate()])
         ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
 
         rank_via_mesh = tp_device_mesh.get_local_rank()
