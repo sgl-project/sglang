@@ -16,8 +16,9 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
 
@@ -75,7 +76,6 @@ def main():
     print(f'hf response: {tokenizer.batch_decode(response)}')
 
     tensor_model_parallel_size = 4
-    # from torch.distributed.device_mesh import init_device_mesh
     # device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
     #
     # mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
@@ -109,6 +109,12 @@ def main():
                            max_new_tokens=response_length,
                            ignore_eos=True)
 
+    tp_size, dp_size = 4, 1
+    kwargs = dict(mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=["tp", "dp", "pp"])
+    inference_device_mesh_device = init_device_mesh("cuda", **kwargs)
+    inference_device_mesh_cpu = init_device_mesh("cpu", **kwargs)
+    print(f"{inference_device_mesh_device=} {inference_device_mesh_cpu=}")
+
     print(actor_model_config)
     # llm = LLM(model=None,
     #           tokenizer=tokenizer,
@@ -119,13 +125,21 @@ def main():
     #           load_format='dummy_dtensor',
     #           gpu_memory_utilization=0.1,
     #           trust_remote_code=True)
-    llm = EngineFragment(model_path=local_model_path,
-                         tp_size=tensor_model_parallel_size,
-                         dtype='bfloat16',
-                         mem_fraction_static=0.1,
-                         nccl_port=12345,
-                         tp_rank=rank,
-                         gpu_id=rank)
+    llm = EngineFragment(
+        model_path=local_model_path,
+        tp_size=tensor_model_parallel_size,
+        dtype='bfloat16',
+        mem_fraction_static=0.1,
+        nccl_port=12345,
+        tp_rank=rank,
+        gpu_id=rank,
+        parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
+            device_mesh_device=inference_device_mesh_device,
+            device_mesh_cpu=inference_device_mesh_cpu,
+            dim_tp="tp",
+            dim_pp="pp",
+        ),
+    )
 
     # llm.sync_model_weights(actor_weights=state_dict, load_format='dtensor')
 
