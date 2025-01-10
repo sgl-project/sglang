@@ -97,11 +97,7 @@ class AWQTurbomindConfig(QuantizationConfig):
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
         can_convert = cls.is_awq_turbomind_compatible(hf_quant_cfg)
-        is_valid_user_quant = (
-            user_quant is None
-            or user_quant == "turbomind"
-            or user_quant == "awq_turbomind"
-        )
+        is_valid_user_quant = user_quant is None or user_quant == "awq_turbomind"
 
         if can_convert and is_valid_user_quant:
             msg = (
