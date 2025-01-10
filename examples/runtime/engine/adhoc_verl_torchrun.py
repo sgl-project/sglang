@@ -86,6 +86,7 @@ def main():
 
     # TODO
     train_device_mesh = device_mesh_device['tp']
+    print(f"{train_device_mesh=}")
 
     mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
     fsdp_model = FSDP(actor_model,
