@@ -222,7 +222,7 @@ class ModelRunner:
                 backend=backend,
                 world_size=self.tp_size,
                 rank=self.tp_rank,
-                local_rank=self.tp_rank % 8,  # Assumes 8 GPUs / node.
+                local_rank=0,  # CUDA_VISIBLE_DEVICES is set to a single GPU.
                 distributed_init_method=dist_init_method,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
