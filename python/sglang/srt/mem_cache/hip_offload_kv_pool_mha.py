@@ -59,6 +59,18 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 device=device,
                 online_cache_update=self.online_update_cache,
             )
+            if layer_id not in [0, 1, 2] else
+            HiPOffloadCache(
+                layer_id=layer_id,
+                max_token_size=max_token_size + 1,
+                max_mask_cache_token_size=self.max_mask_cache_token_size * 2,
+                max_sa_cache_token_size=self.max_sa_cache_token_size * 2,
+                head_num=head_num,
+                head_dim=head_dim,
+                dtype=dtype,
+                device=device,
+                online_cache_update=self.online_update_cache,
+            )
             for layer_id in range(layer_num)
         ]
         
@@ -130,9 +142,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         if self.enable_async:
             def thread_main():
                 try:
+                    start_event.synchronize()
                     stream = torch.cuda.Stream(device=self.device, priority=0)
-                    stream.wait_event(start_event)
-                    stream.synchronize()
 
                     with torch.cuda.stream(stream):
                         k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
@@ -157,8 +168,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             )
             assert k.device == self.device
             assert v.device == self.device
-            self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
             torch.cuda.synchronize()
+            self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
         return
     
     def get_fetched_prefix_kv_buffer(
@@ -260,9 +271,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
 
             def thread_main():
                 try:
+                    start_event.synchronize()
                     stream = torch.cuda.Stream(device=self.device)
-                    stream.wait_event(start_event)
-                    stream.synchronize()
 
                     with torch.cuda.stream(stream):
                         table_gpu = table.to(torch.int64)
