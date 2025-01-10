@@ -23,15 +23,15 @@ def init_distributed_environment_via_existing(
     _ps._WORLD = _init_world_group(ranks, local_rank, backend)
 
 
-def initialize_model_parallel_via_existing(
-        backend: Optional[str] = None,
-) -> None:
+def initialize_model_parallel_via_existing() -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
-    _ps._TP = _init_model_parallel_group(group_ranks,
-                                         _ps.get_world_group().local_rank,
-                                         backend,
-                                         use_message_queue_broadcaster=True,
-                                         group_name="tp")
+    _ps._TP = _init_model_parallel_group(
+        group_ranks=None,
+        local_rank=_ps.get_world_group().local_rank,
+        backend=None,
+        use_message_queue_broadcaster=True,
+        group_name="tp",
+    )
     # Not handle PP yet
 
 
@@ -113,6 +113,7 @@ def _group_coordinator_init(
 
     # NOTE MODIFIED add this branch
     if existing is not None:
+        assert torch_distributed_backend is None and group_ranks is None
         self.ranks = existing.ranks
         self.world_size = len(existing.ranks)
         self.rank_in_group = existing.ranks.index(self.rank)
