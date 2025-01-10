@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 from typing import List
 
 import torch
@@ -154,8 +155,11 @@ def main():
     )
 
     # most naive way
+    t = time.time()
     state_dict_full = {k: v.full_tensor() for k, v in state_dict.items()}
+    print(f'gather full tensor: {time.time() - t:.2f}')
     llm.update_weights_from_tensor([(k, v) for k, v in state_dict_full.items()])
+    print(f'gather + update weights: {time.time() - t:.2f}')
 
     input_ids = input_ids.cuda()
     attention_mask = attention_mask.cuda()
