@@ -1371,8 +1371,7 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
         rank_via_arg = start // length
         size_via_mesh = tp_device_mesh.size()
         size_via_arg = w.shape[dim] // length
-        print(
-            f'weight_loader_narrow END {rank_via_mesh=} {size_via_mesh=}')
+        print(f'weight_loader_narrow END {rank_via_mesh=} {size_via_mesh=} {ans.shape=}')
         assert rank_via_mesh == rank_via_arg
         assert size_via_mesh == size_via_arg
         assert ans.shape[dim] == length
