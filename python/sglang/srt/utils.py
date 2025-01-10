@@ -1364,7 +1364,7 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
         ans = w
         if w.device_mesh != tp_device_mesh:
             # TODO otherwise torch has "not yet implemented" error - we should remove this after torch implements it
-            ans = ans.redistribute(tp_device_mesh)
+            ans = ans.redistribute(tp_device_mesh, ans.placements)
         ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
 
         rank_via_mesh = tp_device_mesh.get_local_rank()
