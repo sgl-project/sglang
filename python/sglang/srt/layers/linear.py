@@ -19,8 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
-from sglang.srt.model_loader.weight_utils import weight_loader_tp_narrow
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import set_weight_attrs, weight_loader_tp_narrow
 from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm.distributed import (
     divide,
