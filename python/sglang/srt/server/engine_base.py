@@ -1,4 +1,5 @@
-from typing import Dict, List, Optional, Union
+import torch
+from typing import Dict, List, Optional, Union, Tuple
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -29,6 +30,10 @@ class EngineBase:
             stream=stream,
         )
         return self._generate_impl(obj)
+
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        """Update weights from distributed source."""
+        raise NotImplementedError
 
     def _generate_impl(self, obj: GenerateReqInput):
         raise NotImplementedError

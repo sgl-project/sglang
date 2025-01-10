@@ -9,8 +9,6 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 import orjson
 import torch
 from fastapi import Request
-from starlette.responses import StreamingResponse
-
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -25,6 +23,7 @@ from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.version import __version__
+from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +63,7 @@ class Engine(EngineBase):
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -111,7 +110,7 @@ class Engine(EngineBase):
                     if chunk.startswith(_STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL) :])
+                        data = json.loads(chunk[len(_STREAM_CHUNK_START_SYMBOL):])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -228,7 +227,6 @@ class Engine(EngineBase):
         )
 
     def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        """Update weights from distributed source."""
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
         )
