@@ -21,13 +21,17 @@ def init_distributed_environment_via_existing(
     _ps._WORLD = _init_world_group(ranks, local_rank, backend)
 
 
-def initialize_model_parallel_via_existing(
-        tp_existing_groups: 'GroupCoordinatorExistingGroups',
-        pp_existing_groups: 'GroupCoordinatorExistingGroups',
-) -> None:
+# TODO improve API
+@dataclasses.dataclass
+class ExistingGroups:
+    tp_existing_groups: 'GroupCoordinatorExistingGroups'
+    pp_existing_groups: 'GroupCoordinatorExistingGroups'
+
+
+def initialize_model_parallel_via_existing(existing_groups: ExistingGroups) -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
     _ps._TP = _init_model_parallel_group(
-        existing=tp_existing_groups,
+        existing=existing_groups.tp_existing_groups,
         group_ranks=None,
         local_rank=_ps.get_world_group().local_rank,
         backend=None,
@@ -38,7 +42,7 @@ def initialize_model_parallel_via_existing(
     assert _ps._PP is None, "pipeline model parallel group is already initialized"
     # pipeline parallel does not need custom allreduce
     _ps._PP = _ps.init_model_parallel_group(
-        existing=pp_existing_groups,
+        existing=existing_groups.pp_existing_groups,
         group_ranks=None,
         local_rank=_ps.get_world_group().local_rank,
         backend=None,
