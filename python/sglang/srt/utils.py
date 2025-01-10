@@ -704,6 +704,13 @@ def set_weight_attrs(
         assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
         setattr(weight, key, value)
 
+def broadcast_pyobj_in_group(
+    data: List[Any],
+    index_in_group: int,
+    dist_group: torch.distributed.ProcessGroup,
+    src_index_in_group: int = 0,
+):
+    TODO
 
 def broadcast_pyobj(
     data: List[Any],

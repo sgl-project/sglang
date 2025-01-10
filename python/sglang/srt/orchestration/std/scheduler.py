@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler, SchedulerCallback
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    broadcast_pyobj,
+    broadcast_pyobj_in_group,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
@@ -117,7 +117,7 @@ class SchedulerCommunicator:
             recv_reqs = None
 
         if self.core.tp_size != 1 and not self.server_args.enable_dp_attention:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.core.tp_cpu_group)
+            recv_reqs = broadcast_pyobj_in_group(recv_reqs, self.tp_rank, self.core.tp_cpu_group)
         return recv_reqs
 
     def _process_input_requests(self, recv_reqs: List):

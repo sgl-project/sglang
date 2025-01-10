@@ -31,7 +31,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj_in_group, set_random_seed
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class TpModelWorker:
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
+        self.random_seed = broadcast_pyobj_in_group(
             [server_args.random_seed],
             self.tp_rank,
             self.model_runner.tp_group.cpu_group,
