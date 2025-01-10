@@ -100,7 +100,8 @@ def main():
     if rank == 0:
         lines = ['------------------------ state_dict ------------------------']
         for k, v in state_dict.items():
-            lines.append(f'{k}\t: {v.shape=} {v.type=} {v.dtype=} {type(v)=}')
+            v_local = v.to_local()
+            lines.append(f'{k}\t: {v.shape=} {v_local.shape=} {v.dtype=} {v_local.dtype=} {type(v)=} {type(v_local)=}')
         print('\n'.join(lines))
 
     # NOTE MODIFIED
