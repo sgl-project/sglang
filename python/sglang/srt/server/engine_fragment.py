@@ -1,6 +1,7 @@
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.orchestration.spmd.entrypoint import Entrypoint

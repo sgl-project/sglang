@@ -1,5 +1,6 @@
+from typing import Dict, List, Optional, Tuple, Union
+
 import torch
-from typing import Dict, List, Optional, Union, Tuple
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 
