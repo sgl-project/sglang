@@ -241,6 +241,8 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(tp_rank)
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -362,6 +364,8 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(tp_rank)
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
