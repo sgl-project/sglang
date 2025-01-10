@@ -26,7 +26,7 @@ import vllm.distributed
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.distributed import GroupCoordinatorExistingGroups, ExistingGroups
+from sglang.srt.distributed import GroupCoordinatorProcessGroups, ParallelProcessGroups
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -75,7 +75,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
-        existing_groups: Optional[ExistingGroups] = None,
+        existing_groups: Optional[ParallelProcessGroups] = None,
         is_draft_worker: bool = False,
     ):
         # Parse args

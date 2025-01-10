@@ -1,6 +1,6 @@
 from typing import List
 
-from sglang.srt.distributed import GroupCoordinatorExistingGroups
+from sglang.srt.distributed import GroupCoordinatorProcessGroups
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.orchestration.spmd.entrypoint import Entrypoint
 from sglang.srt.server.engine_base import EngineBase
@@ -27,7 +27,7 @@ class EngineFragment(EngineBase):
             nccl_port=nccl_port,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
-            tp_existing_groups=GroupCoordinatorExistingGroups(
+            tp_existing_groups=GroupCoordinatorProcessGroups(
                 ranks=existing_tp_group_ranks,
                 device_group=existing_tp_device_group,
                 cpu_group=existing_tp_cpu_group,

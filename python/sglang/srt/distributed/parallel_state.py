@@ -23,15 +23,15 @@ def init_distributed_environment_via_existing(
 
 # TODO improve API
 @dataclasses.dataclass
-class ExistingGroups:
-    tp_existing_groups: 'GroupCoordinatorExistingGroups'
-    pp_existing_groups: 'GroupCoordinatorExistingGroups'
+class ParallelProcessGroups:
+    tp: 'GroupCoordinatorProcessGroups'
+    pp: 'GroupCoordinatorProcessGroups'
 
 
-def initialize_model_parallel_via_existing(existing_groups: ExistingGroups) -> None:
+def initialize_model_parallel_via_existing(existing_groups: ParallelProcessGroups) -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
     _ps._TP = _init_model_parallel_group(
-        existing=existing_groups.tp_existing_groups,
+        existing=existing_groups.tp,
         group_ranks=None,
         local_rank=_ps.get_world_group().local_rank,
         backend=None,
@@ -42,7 +42,7 @@ def initialize_model_parallel_via_existing(existing_groups: ExistingGroups) -> N
     assert _ps._PP is None, "pipeline model parallel group is already initialized"
     # pipeline parallel does not need custom allreduce
     _ps._PP = _ps.init_model_parallel_group(
-        existing=existing_groups.pp_existing_groups,
+        existing=existing_groups.pp,
         group_ranks=None,
         local_rank=_ps.get_world_group().local_rank,
         backend=None,
@@ -101,7 +101,7 @@ def _init_model_parallel_group(
 
 
 @dataclasses.dataclass
-class GroupCoordinatorExistingGroups:
+class GroupCoordinatorProcessGroups:
     ranks: List[int]
     device_group: Any
     cpu_group: Any
@@ -120,7 +120,7 @@ def _group_coordinator_init(
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         # NOTE MODIFIED add
-        existing: Optional[GroupCoordinatorExistingGroups] = None,
+        existing: Optional[GroupCoordinatorProcessGroups] = None,
 ):
     group_name = group_name or "anonymous"
     self.unique_name = _ps._get_unique_name(group_name)

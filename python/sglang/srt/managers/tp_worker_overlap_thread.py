@@ -22,7 +22,7 @@ from typing import Optional
 
 import psutil
 import torch
-from sglang.srt.distributed import GroupCoordinatorExistingGroups
+from sglang.srt.distributed import GroupCoordinatorProcessGroups
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -58,7 +58,7 @@ class TpModelWorkerClient:
             tp_rank: int,
             dp_rank: Optional[int],
             nccl_port: int,
-            tp_existing_groups: Optional[GroupCoordinatorExistingGroups] = None,
+            tp_existing_groups: Optional[GroupCoordinatorProcessGroups] = None,
     ):
         # Load the model
         self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port, tp_existing_groups)
