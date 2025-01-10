@@ -617,7 +617,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # bitsandbytes loads the weights of the specific portion
             # no need to narrow here
             if not use_bitsandbytes_4bit and not self.use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                loaded_weight = weight_loader_tp_narrow(loaded_weight, output_dim, start_idx, shard_size)
         # Special case for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
