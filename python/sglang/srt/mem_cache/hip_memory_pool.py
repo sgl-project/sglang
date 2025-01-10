@@ -98,6 +98,7 @@ class HiPMetadataCachePool:
             ks_start_end=self.get_buffer(layer_id, 'ks_start_end', batch_size),
             mask_cache_statistics=None,
             sa_cache_statistics=None,
+            stage_caches=None,
         )
 
     def set_hip_metadata_cache(
