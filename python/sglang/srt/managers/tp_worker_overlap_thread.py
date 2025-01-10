@@ -22,7 +22,7 @@ from typing import Optional
 
 import psutil
 import torch
-from sglang.srt.distributed import GroupCoordinatorProcessGroups
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -58,10 +58,10 @@ class TpModelWorkerClient:
             tp_rank: int,
             dp_rank: Optional[int],
             nccl_port: int,
-            tp_existing_groups: Optional[GroupCoordinatorProcessGroups] = None,
+            parallel_process_groups: Optional[ParallelProcessGroups] = None,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port, tp_existing_groups)
+        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port, parallel_process_groups)
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
