@@ -360,6 +360,7 @@ class ServerArgs:
                 "marlin",
                 "gptq_marlin",
                 "awq_marlin",
+                "awq_turbomind",
                 "bitsandbytes",
                 "gguf",
                 "modelopt",

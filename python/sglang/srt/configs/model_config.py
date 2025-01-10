@@ -230,7 +230,7 @@ class ModelConfig:
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
 
-        if quant_cfg is not None:
+        if quant_cfg is not None and self.quantization != "awq_turbomind":
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
