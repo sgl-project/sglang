@@ -118,7 +118,7 @@ class SchedulerCommunicator:
 
         if self.core.tp_size != 1 and not self.server_args.enable_dp_attention:
             recv_reqs = broadcast_pyobj_in_group(
-                recv_reqs, self.tp_rank, self.core.tp_worker.model_runner.tp_group
+                recv_reqs, self.tp_rank, self.core.tp_worker.get_tp_group()
             )
         return recv_reqs
 

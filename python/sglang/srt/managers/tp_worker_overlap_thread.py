@@ -93,6 +93,9 @@ class TpModelWorkerClient:
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
 
+    def get_tp_group(self):
+        return self.worker.get_tp_group()
+
     def get_tp_cpu_group(self):
         return self.worker.get_tp_cpu_group()
 
