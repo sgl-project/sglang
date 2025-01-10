@@ -92,6 +92,8 @@ def _group_coordinator_init(
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        # NOTE MODIFIED add
+        use_existing: bool = False,
 ):
     group_name = group_name or "anonymous"
     self.unique_name = _ps._get_unique_name(group_name)
@@ -103,7 +105,9 @@ def _group_coordinator_init(
     self.cpu_group = None
 
     # NOTE MODIFIED
-    if TODO:
+    if use_existing:
+        TODO
+    else:
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend)
@@ -116,8 +120,6 @@ def _group_coordinator_init(
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
                 self.cpu_group = cpu_group
-    else:
-        TODO
 
     assert self.cpu_group is not None
     assert self.device_group is not None
