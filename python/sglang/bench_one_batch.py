@@ -368,6 +368,7 @@ def latency_test_run_once(
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+
     if profile:
         profiler.stop()
         parent_dir = os.path.dirname(profile_filename)
