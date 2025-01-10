@@ -724,7 +724,7 @@ class ModelRunner:
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)
         else:
-            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     def sample(
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
