@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +31,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -42,10 +44,14 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
+
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -209,6 +215,7 @@ class Req:
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
+        eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -236,6 +243,7 @@ class Req:
         self.finished_reason = None
         self.to_abort = False
         self.stream = stream
+        self.eos_token_ids = eos_token_ids
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -395,18 +403,23 @@ class Req:
 
         last_token_id = self.output_ids[-1]
 
-        matched_eos = False
+        if not self.sampling_params.ignore_eos:
+            matched_eos = False
 
-        # Check stop token ids
-        if self.sampling_params.stop_token_ids:
-            matched_eos = last_token_id in self.sampling_params.stop_token_ids
-        if self.tokenizer is not None:
-            matched_eos |= last_token_id == self.tokenizer.eos_token_id
-            if self.tokenizer.additional_stop_token_ids:
-                matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
-        if matched_eos and not self.sampling_params.ignore_eos:
-            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-            return
+            # Check stop token ids
+            if self.sampling_params.stop_token_ids:
+                matched_eos = last_token_id in self.sampling_params.stop_token_ids
+            if self.eos_token_ids:
+                matched_eos |= last_token_id in self.eos_token_ids
+            if self.tokenizer is not None:
+                matched_eos |= last_token_id == self.tokenizer.eos_token_id
+                if self.tokenizer.additional_stop_token_ids:
+                    matched_eos |= (
+                        last_token_id in self.tokenizer.additional_stop_token_ids
+                    )
+            if matched_eos:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+                return
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
@@ -479,8 +492,22 @@ class Req:
 
         return True
 
+    def reset_for_retract(self):
+        self.prefix_indices = []
+        self.last_node = None
+        self.extend_input_len = 0
+        self.is_retracted = True
+
+        # For incremental logprobs
+        # TODO: Fix the `logprob_start_len`
+        self.last_update_decode_tokens = 0
+        self.logprob_start_len = 10**9
+
     def __repr__(self):
-        return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
+        return (
+            f"rid(n={self.rid}, "
+            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}"
+        )
 
 
 bid = 0
@@ -544,8 +571,12 @@ class ScheduleBatch:
     # Has grammar
     has_grammar: bool = False
 
-    # device
+    # Device
     device: str = "cuda"
+
+    # Speculative decoding
+    spec_algorithm: SpeculativeAlgorithm = None
+    spec_info: Optional[SpecInfo] = None
 
     @classmethod
     def init_new(
@@ -556,6 +587,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm,
     ):
         return cls(
             reqs=reqs,
@@ -568,6 +600,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
+            spec_algorithm=spec_algorithm,
         )
 
     def batch_size(self):
@@ -822,8 +855,8 @@ class ScheduleBatch:
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-    def check_decode_mem(self):
-        bs = len(self.reqs)
+    def check_decode_mem(self, buf_multiplier=1):
+        bs = len(self.reqs) * buf_multiplier
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
@@ -894,15 +927,7 @@ class ScheduleBatch:
                 )
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
-
-            req.prefix_indices = []
-            req.last_node = None
-            req.extend_input_len = 0
-            req.is_retracted = True
-
-            # For incremental logprobs
-            req.last_update_decode_tokens = 0
-            req.logprob_start_len = 10**9
+            req.reset_for_retract()
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -985,6 +1010,8 @@ class ScheduleBatch:
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        if self.spec_algorithm.is_eagle():
+            return
 
         self.input_ids = self.output_ids
         self.output_ids = None
@@ -1090,6 +1117,9 @@ class ScheduleBatch:
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
 
+        if self.spec_info:
+            self.spec_info.merge_batch(other.spec_info)
+
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode() or self.forward_mode.is_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
@@ -1131,6 +1161,13 @@ class ScheduleBatch:
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            capture_hidden_mode=(
+                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
+                if self.spec_info
+                else CaptureHiddenMode.NULL
+            ),
         )
 
     def copy(self):
@@ -1142,6 +1179,7 @@ class ScheduleBatch:
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def __str__(self):
@@ -1200,6 +1238,11 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
+
+    # Speculative decoding
+    spec_algorithm: SpeculativeAlgorithm = None
+    spec_info: Optional[SpecInfo] = None
+    capture_hidden_mode: CaptureHiddenMode = None
 
 
 @triton.jit

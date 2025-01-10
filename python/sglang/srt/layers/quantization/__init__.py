@@ -1,8 +1,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 
-from typing import Callable, Dict, Optional, Type
+from typing import Dict, Type
 
-import torch
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
@@ -23,6 +22,7 @@ from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -32,6 +32,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
+    "modelopt": ModelOptFp8Config,
     "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
     "gptq_marlin": GPTQMarlinConfig,
@@ -60,8 +61,8 @@ def fp8_get_quant_method(self, layer, prefix):
         is_layer_skipped,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.linear import UnquantizedLinearMethod
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
     if isinstance(layer, LinearBase):
@@ -80,7 +81,7 @@ def gptq_get_quant_method(self, layer, prefix):
         GPTQMarlinMoEMethod,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return GPTQMarlinLinearMethod(self)
@@ -96,7 +97,7 @@ def awq_get_quant_method(self, layer, prefix):
         AWQMoEMethod,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return AWQMarlinLinearMethod(self)

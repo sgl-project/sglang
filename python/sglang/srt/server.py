@@ -27,7 +27,9 @@ import signal
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Dict, List, Optional, Union
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
+
+import torch
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -57,6 +59,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -77,6 +80,7 @@ from sglang.srt.openai_api.adapter import (
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     assert_pkg_version,
@@ -109,6 +113,7 @@ app.add_middleware(
 tokenizer_manager: TokenizerManager = None
 scheduler_info: Dict = None
 
+
 ##### Native API endpoints #####
 
 
@@ -122,14 +127,12 @@ async def health() -> Response:
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
 
+    sampling_params = {"max_new_tokens": 1, "temperature": 0.7}
+
     if tokenizer_manager.is_generation:
-        gri = GenerateReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = GenerateReqInput(input_ids=[0], sampling_params=sampling_params)
     else:
-        gri = EmbeddingReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = EmbeddingReqInput(input_ids=[0], sampling_params=sampling_params)
 
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
@@ -245,16 +248,11 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     try:
         ret = await tokenizer_manager.get_weights_by_name(obj, request)
         if ret is None:
-            return ORJSONResponse(
-                {"error": {"message": "Get parameter by name failed"}},
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
+            return _create_error_response("Get parameter by name failed")
         else:
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
@@ -262,11 +260,13 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await tokenizer_manager.open_session(obj, request)
+        if session_id is None:
+            raise Exception(
+                "Failed to open the session. Check if a session with the same id is still open."
+            )
         return session_id
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
@@ -276,9 +276,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         await tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -311,9 +309,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
-            return ORJSONResponse(
-                {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-            )
+            logger.error(f"Error: {e}")
+            return _create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -324,9 +321,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
@@ -337,9 +332,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return ORJSONResponse(
-            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-        )
+        return _create_error_response(e)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -413,6 +406,12 @@ async def retrieve_file(file_id: str):
 async def retrieve_file_content(file_id: str):
     # https://platform.openai.com/docs/api-reference/files/retrieve-contents
     return await v1_retrieve_file_content(file_id)
+
+
+def _create_error_response(e):
+    return ORJSONResponse(
+        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
 
 
 def launch_engine(
@@ -492,7 +491,16 @@ def launch_engine(
     # Wait for model to finish loading
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
-        data = scheduler_pipe_readers[i].recv()
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError as e:
+            logger.exception(e)
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
 
         if data["status"] != "ready":
             raise RuntimeError(
@@ -500,7 +508,7 @@ def launch_engine(
             )
         scheduler_infos.append(data)
 
-    # Assume all schedulers have same max_total_num_tokens
+    # Assume all schedulers have same scheduler_info
     scheduler_info = scheduler_infos[0]
 
 
@@ -536,7 +544,12 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+        target=_wait_and_warmup,
+        args=(
+            server_args,
+            pipe_finish_writer,
+            tokenizer_manager.image_token_id,
+        ),
     )
     t.start()
 
@@ -606,7 +619,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer):
+def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -848,12 +861,10 @@ class Engine:
             group_name=group_name,
             backend=backend,
         )
-
-        async def _init_group():
-            return await tokenizer_manager.init_weights_update_group(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_init_group())
+        return loop.run_until_complete(
+            tokenizer_manager.init_weights_update_group(obj, None)
+        )
 
     def update_weights_from_distributed(self, name, dtype, shape):
         """Update weights from distributed source."""
@@ -862,22 +873,26 @@ class Engine:
             dtype=dtype,
             shape=shape,
         )
-
-        async def _update_weights():
-            return await tokenizer_manager.update_weights_from_distributed(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_update_weights())
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        """Update weights from distributed source."""
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            tokenizer_manager.update_weights_from_tensor(obj, None)
+        )
 
     def get_weights_by_name(self, name, truncate_size=100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
-
-        async def _get_weights():
-            return await tokenizer_manager.get_weights_by_name(obj, None)
-
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get_weights())
+        return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
 
 
 class Runtime:
@@ -887,7 +902,7 @@ class Runtime:
     using the commond line interface.
 
     It is mainly used for the frontend language.
-    You should use the Engine class if you want to do normal offline processing.
+    You should use the Engine class above if you want to do normal offline processing.
     """
 
     def __init__(
@@ -903,10 +918,9 @@ class Runtime:
         atexit.register(self.shutdown)
 
         # Pre-allocate ports
-        for port in range(10000, 40000):
+        for port in range(self.server_args.port, 40000):
             if is_port_available(port):
                 break
-            port += 1
         self.server_args.port = port
 
         self.url = self.server_args.url()

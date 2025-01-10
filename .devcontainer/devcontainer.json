@@ -1,0 +1,20 @@
+{
+    "name": "sglang",
+    "build": {
+        "dockerfile": "../docker/Dockerfile.dev"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Python development
+                "ms-python.python",
+                "charliermarsh.ruff",
+                // Rust development
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    },
+    "workspaceFolder": "/sgl-workspace/sglang",
+    "forwardPorts": []
+}

@@ -36,7 +36,7 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
@@ -532,6 +532,8 @@ def run_bench_serving(
     request_rate,
     other_server_args,
     dataset_name="random",
+    dataset_path="",
+    tokenizer=None,
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
@@ -553,9 +555,9 @@ def run_bench_serving(
         host=None,
         port=None,
         dataset_name=dataset_name,
-        dataset_path="",
+        dataset_path=dataset_path,
         model=None,
-        tokenizer=None,
+        tokenizer=tokenizer,
         num_prompts=num_prompts,
         sharegpt_output_len=None,
         random_input_len=random_input_len,
@@ -657,16 +659,16 @@ STDERR_FILENAME = "stderr.txt"
 STDOUT_FILENAME = "stdout.txt"
 
 
-def read_output(output_lines):
+def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
-    while not os.path.exists(STDERR_FILENAME):
+    while not os.path.exists(filename):
         time.sleep(1)
 
     pt = 0
     while pt >= 0:
-        if pt > 0 and not os.path.exists(STDERR_FILENAME):
+        if pt > 0 and not os.path.exists(filename):
             break
-        lines = open(STDERR_FILENAME).readlines()
+        lines = open(filename).readlines()
         for line in lines[pt:]:
             print(line, end="", flush=True)
             output_lines.append(line)
@@ -745,6 +747,33 @@ def run_and_check_memory_leak(
     assert not has_leak
     if assert_has_abort:
         assert has_abort
+
+
+def run_command_and_capture_output(command, env: Optional[dict] = None):
+    stdout = open(STDOUT_FILENAME, "w")
+    stderr = open(STDERR_FILENAME, "w")
+    process = subprocess.Popen(
+        command, stdout=stdout, stderr=stderr, env=env, text=True
+    )
+
+    # Launch a thread to stream the output
+    output_lines = []
+    t = threading.Thread(target=read_output, args=(output_lines, STDOUT_FILENAME))
+    t.start()
+
+    # Join the process
+    process.wait()
+
+    stdout.close()
+    stderr.close()
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
+    kill_process_tree(process.pid)
+    t.join()
+
+    return output_lines
 
 
 def run_mmlu_test(
