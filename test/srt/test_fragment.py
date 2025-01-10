@@ -6,13 +6,20 @@ import unittest
 from multiprocessing import Process
 
 import torch
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import CPUOffload
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp.api import (
+    ShardedStateDictConfig,
+    ShardingStrategy,
+    StateDictType,
+)
+from transformers import AutoModelForCausalLM
+
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, CPUOffload
-from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
-from transformers import AutoModelForCausalLM
 
 _TP_SIZE = 2
 
@@ -54,18 +61,20 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
     try:
         print(f"subprocess[{tp_rank=}] Start")
 
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '23456'
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "23456"
         torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
 
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        changed_model_path = model_path.replace('-Instruct', '')
+        changed_model_path = model_path.replace("-Instruct", "")
         assert changed_model_path != model_path
 
         mesh_kwargs = dict(mesh_shape=(_TP_SIZE, 1), mesh_dim_names=["tp", "pp"])
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
         inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
-        print(f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}")
+        print(
+            f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
+        )
 
         fragment = EngineFragment(
             model_path=changed_model_path,
@@ -87,8 +96,13 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
 
         # test update weights
         fsdp_state_dict = _get_fsdp_state_dict(model_path=model_path)
-        print(f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})", flush=True)
-        fragment.update_weights_from_tensor([(k, v) for k, v in fsdp_state_dict.items()])
+        print(
+            f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
+            flush=True,
+        )
+        fragment.update_weights_from_tensor(
+            [(k, v) for k, v in fsdp_state_dict.items()]
+        )
 
         # NOTE: We deliberately call fragment.generate *twice* to confirm this function can be called multiple times
         # In real batch generation, surely we should only call fragment.generate once
@@ -101,7 +115,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             outputs = fragment.generate(
                 prompt=prompt,
                 sampling_params=[dict(max_new_tokens=16, temperature=0.0)]
-                                * len(prompt),
+                * len(prompt),
             )
             print(
                 f"subprocess[{tp_rank=}] End generation {prompt=} {outputs=}",
@@ -128,27 +142,37 @@ def _get_fsdp_state_dict(model_path: str):
         model.to(torch.bfloat16)
     model.cuda()
 
-    device_mesh = init_device_mesh('cuda', mesh_shape=(_TP_SIZE,), mesh_dim_names=['fsdp'])
+    device_mesh = init_device_mesh(
+        "cuda", mesh_shape=(_TP_SIZE,), mesh_dim_names=["fsdp"]
+    )
 
-    mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
-    fsdp_model = FSDP(model,
-                      use_orig_params=True,
-                      auto_wrap_policy=None,
-                      device_id=torch.cuda.current_device(),
-                      sharding_strategy=ShardingStrategy.FULL_SHARD,
-                      mixed_precision=mixed_precision,
-                      cpu_offload=CPUOffload(offload_params=False),
-                      sync_module_states=False,
-                      device_mesh=device_mesh)
-    print(f'{fsdp_model=}')
+    mixed_precision = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        buffer_dtype=torch.float32,
+    )
+    fsdp_model = FSDP(
+        model,
+        use_orig_params=True,
+        auto_wrap_policy=None,
+        device_id=torch.cuda.current_device(),
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=mixed_precision,
+        cpu_offload=CPUOffload(offload_params=False),
+        sync_module_states=False,
+        device_mesh=device_mesh,
+    )
+    print(f"{fsdp_model=}")
 
-    FSDP.set_state_dict_type(fsdp_model,
-                             state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                             state_dict_config=ShardedStateDictConfig())
+    FSDP.set_state_dict_type(
+        fsdp_model,
+        state_dict_type=StateDictType.SHARDED_STATE_DICT,
+        state_dict_config=ShardedStateDictConfig(),
+    )
 
     state_dict = fsdp_model.state_dict()
     # small models have weight tieing, thus we skip it
-    return {k: v for k, v in state_dict.items() if k not in ['lm_head.weight']}
+    return {k: v for k, v in state_dict.items() if k not in ["lm_head.weight"]}
 
 
 if __name__ == "__main__":

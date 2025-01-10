@@ -15,9 +15,10 @@
 
 import logging
 import threading
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -31,10 +32,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    broadcast_pyobj_in_group,
-    set_random_seed,
-)
+from sglang.srt.utils import broadcast_pyobj_in_group, set_random_seed
 
 logger = logging.getLogger(__name__)
 

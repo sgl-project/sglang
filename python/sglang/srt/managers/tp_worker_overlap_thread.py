@@ -18,7 +18,7 @@ import logging
 import signal
 import threading
 from queue import Queue
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 import psutil
 import torch
