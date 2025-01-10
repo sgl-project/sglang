@@ -26,7 +26,7 @@ import vllm.distributed
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.distributed import ParallelProcessGroups, ParallelProcessGroups
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -75,7 +75,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
-        existing_groups: Optional[ParallelProcessGroups] = None,
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
         is_draft_worker: bool = False,
     ):
         # Parse args
@@ -88,7 +88,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        self.existing_groups = existing_groups
+        self.parallel_process_groups = parallel_process_groups
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.should_log = tp_rank == 0
@@ -226,7 +226,7 @@ class ModelRunner:
 
             # TODO refactor the logic around here into separate functions etc
             distributed_local_rank = self.gpu_id
-            if self.existing_groups is None:
+            if self.parallel_process_groups is None:
                 vllm.distributed.init_distributed_environment(
                     backend=backend,
                     world_size=self.tp_size,
@@ -241,7 +241,7 @@ class ModelRunner:
                     local_rank=distributed_local_rank,
                 )
                 sglang.srt.distributed.initialize_model_parallel_via_existing(
-                    existing_groups=self.existing_groups,
+                    existing_groups=self.parallel_process_groups,
                 )
 
         min_per_gpu_memory = get_available_gpu_memory(
