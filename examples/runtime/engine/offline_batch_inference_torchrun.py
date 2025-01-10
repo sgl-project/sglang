@@ -12,7 +12,7 @@ def run():
     """
     Example command:
     ```
-    torchrun --nproc_per_node=4 offline_batch_inference_torchrun.py
+    torchrun --nproc_per_node=8 offline_batch_inference_torchrun.py
     ```
     """
 
