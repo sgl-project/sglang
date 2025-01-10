@@ -139,7 +139,7 @@ def main():
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
         tp_size=tp_size,
         dtype='bfloat16',
-        mem_fraction_static=0.2,
+        mem_fraction_static=0.1,
         nccl_port=12345,
         tp_rank=rank,
         gpu_id=rank,
