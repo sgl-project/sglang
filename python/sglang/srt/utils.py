@@ -728,7 +728,7 @@ def broadcast_pyobj(
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
-    if rank == 0:
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
             dist.broadcast(tensor_size, src=src, group=dist_group)
