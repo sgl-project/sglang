@@ -441,6 +441,8 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        logits_soft_cap = layer.logit_cap
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -453,7 +455,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
-                logits_soft_cap=layer.logit_cap,
+                logits_soft_cap=logits_soft_cap,
             )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -462,7 +464,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
                 causal=True,
                 sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
+                logits_soft_cap=logits_soft_cap,
             )
 
             if self.forward_metadata.extend_no_prefix:
