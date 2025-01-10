@@ -931,7 +931,7 @@ class PortArgs:
             if port < 60000:
                 port += 42
             else:
-                port -= random.randint(1, 100)
+                port -= 43
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
