@@ -134,8 +134,11 @@ def main():
     #           load_format='dummy_dtensor',
     #           gpu_memory_utilization=0.1,
     #           trust_remote_code=True)
+    changed_model_path = local_model_path.replace('-Instruct', '')
+    assert changed_model_path != local_model_path
+    print(f'{changed_model_path=}')
     llm = EngineFragment(
-        model_path=local_model_path,
+        model_path=changed_model_path,  # use model of same type but different weight to test update_weights
         tp_size=tensor_model_parallel_size,
         dtype='bfloat16',
         mem_fraction_static=0.1,
