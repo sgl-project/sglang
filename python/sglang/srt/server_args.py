@@ -929,7 +929,7 @@ class PortArgs:
             if is_port_available(port):
                 break
             if port < 60000:
-                port += random.randint(1, 100)
+                port += 42
             else:
                 port -= random.randint(1, 100)
 
