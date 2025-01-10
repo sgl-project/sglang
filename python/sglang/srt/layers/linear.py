@@ -6,19 +6,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter, UninitializedParameter
-from vllm.distributed import (
-    divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
-)
-
-# workaround
-from vllm.model_executor.layers.linear import LinearBase
-
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     PackedColumnParameter,
@@ -33,6 +20,17 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs, weight_loader_tp_narrow
+from torch.nn.parameter import Parameter, UninitializedParameter
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
+# workaround
+from vllm.model_executor.layers.linear import LinearBase
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +221,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         return F.linear(x, layer.weight, bias)
 
 
@@ -706,8 +703,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             block_n, _ = weight_block_size[0], weight_block_size[1]
             shard_offset = (
-                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
-            ) // self.tp_size
+                               (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
+                           ) // self.tp_size
             shard_size = (
                 (self.output_sizes[loaded_shard_id] + block_n - 1)
                 // block_n
@@ -1227,7 +1224,7 @@ class RowParallelLinear(LinearBase):
         ):
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = weight_loader_tp_narrow(input_dim, start_idx, shard_size)
+            loaded_weight = weight_loader_tp_narrow(loaded_weight, input_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
