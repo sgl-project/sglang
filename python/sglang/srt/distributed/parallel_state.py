@@ -1,8 +1,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/parallel_state.py
 # Currently uses monkey patching, but there are other ways like copy-paste-modify
-
+import dataclasses
 import logging
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Any
 
 import torch
 import vllm.distributed.parallel_state as _ps
@@ -80,6 +80,13 @@ def _init_model_parallel_group(
     )
 
 
+@dataclasses
+class GroupCoordinatorSourceExisting:
+    ranks: List[int]
+    device_group: Any
+    cpu_group: Any
+
+
 def _group_coordinator_init(
         self,
         group_ranks: List[List[int]],
@@ -93,7 +100,7 @@ def _group_coordinator_init(
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         # NOTE MODIFIED add
-        use_existing: bool = False,
+        existing: Optional[GroupCoordinatorSourceExisting] = None,
 ):
     group_name = group_name or "anonymous"
     self.unique_name = _ps._get_unique_name(group_name)
@@ -104,9 +111,13 @@ def _group_coordinator_init(
     self.device_group = None
     self.cpu_group = None
 
-    # NOTE MODIFIED
-    if use_existing:
-        TODO
+    # NOTE MODIFIED add this branch
+    if existing is not None:
+        self.ranks = existing.ranks
+        self.world_size = len(existing.ranks)
+        self.rank_in_group = existing.ranks.index(self.rank)
+        self.device_group = existing.device_group
+        self.cpu_group = existing.cpu_group
     else:
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
