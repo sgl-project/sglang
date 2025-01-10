@@ -5,6 +5,7 @@ import unittest
 from multiprocessing import Process
 
 import torch
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from torch.distributed.device_mesh import init_device_mesh
@@ -56,6 +57,11 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         changed_model_path = model_path.replace('-Instruct', '')
         assert changed_model_path != model_path
 
+        mesh_kwargs = dict(mesh_shape=(_TP_SIZE, 1), mesh_dim_names=["tp", "pp"])
+        inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
+        inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
+        print(f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}")
+
         fragment = EngineFragment(
             model_path=changed_model_path,
             mem_fraction_static=0.1,
@@ -65,6 +71,12 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             tp_rank=tp_rank,
             gpu_id=tp_rank,
             nccl_port=nccl_port,
+            parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
+                device_mesh_device=inference_device_mesh_device,
+                device_mesh_cpu=inference_device_mesh_cpu,
+                dim_tp="tp",
+                dim_pp="pp",
+            ),
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
