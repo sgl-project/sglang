@@ -112,7 +112,7 @@ def main():
     tp_size, dp_size = 4, 1
     kwargs = dict(mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=["tp", "dp", "pp"])
     inference_device_mesh_device = init_device_mesh("cuda", **kwargs)
-    inference_device_mesh_cpu = init_device_mesh("cpu", **kwargs)
+    inference_device_mesh_cpu = init_device_mesh("cpu", **kwargs, backend='gloo')
     print(f"{inference_device_mesh_device=} {inference_device_mesh_cpu=}")
 
     print(actor_model_config)
