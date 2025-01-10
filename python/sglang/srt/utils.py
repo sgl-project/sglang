@@ -1357,18 +1357,21 @@ def parse_tool_response(text, tools, **kwargs):
 # TODO maybe move
 def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
     if isinstance(w, DTensor):
-        device_mesh = get_tp_group().device_mesh_device
+        tp_device_mesh = get_tp_group().device_mesh_device
         print(
-            f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {device_mesh=}')
+            f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {tp_device_mesh=}')
 
-        ans = w.redistribute(device_mesh, [Shard(dim)]).to_local()
+        if w.device_mesh != tp_device_mesh:
+            # TODO otherwise torch has "not yet implemented" error - we should remove this after torch implements it
+            ans = w.redistribute(tp_device_mesh)
+        ans = w.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
 
-        rank_via_mesh = device_mesh.get_local_rank()
+        rank_via_mesh = tp_device_mesh.get_local_rank()
         rank_via_arg = start // length
-        size_via_mesh = device_mesh.size()
+        size_via_mesh = tp_device_mesh.size()
         size_via_arg = w.shape[dim] // length
         print(
-            f'weight_loader_narrow {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {device_mesh=} {rank_via_mesh=} {size_via_mesh=}')
+            f'weight_loader_narrow {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {tp_device_mesh=} {rank_via_mesh=} {size_via_mesh=}')
         assert rank_via_mesh == rank_via_arg
         assert size_via_mesh == size_via_arg
         assert ans.shape[dim] == length
