@@ -152,6 +152,7 @@ class DataParallelController:
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + base_gpu_id + tp_rank % tp_size_per_node
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
@@ -159,6 +160,7 @@ class DataParallelController:
             proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
+        del os.environ["CUDA_VISIBLE_DEVICES"]
 
         send_to = get_zmq_socket(
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
@@ -183,11 +185,13 @@ class DataParallelController:
         reader, writer = mp.Pipe(duplex=False)
         gpu_id = base_gpu_id
         tp_rank = dp_rank
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         proc = mp.Process(
             target=run_scheduler_process,
             args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
         )
         proc.start()
+        os.environ["CUDA_VISIBLE_DEVICES"]
         send_to = get_zmq_socket(
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )

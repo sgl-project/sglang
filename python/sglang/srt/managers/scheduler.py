@@ -538,7 +538,6 @@ class Scheduler:
             or recv_req.session_params.id is None
             or recv_req.session_params.id not in self.sessions
         ):
-
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -1587,8 +1586,6 @@ def run_scheduler_process(
     pipe_writer,
 ):
     setproctitle.setproctitle("sglang::scheduler")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])

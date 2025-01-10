@@ -450,6 +450,7 @@ def launch_engine(
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
@@ -457,6 +458,7 @@ def launch_engine(
             proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
+        del os.environ["CUDA_VISIBLE_DEVICES"]
 
         if server_args.node_rank >= 1:
             # For other nodes, they do not need to run tokenizer or detokenizer,

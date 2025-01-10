@@ -241,8 +241,6 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(tp_rank)
-
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -364,8 +362,6 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(tp_rank)
-
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -440,6 +436,7 @@ def main(server_args, bench_args):
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(tp_rank)
             proc = multiprocessing.Process(
                 target=work_func,
                 args=(
