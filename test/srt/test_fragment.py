@@ -1,5 +1,6 @@
 import multiprocessing
 import multiprocessing as mp
+import os
 import traceback
 import unittest
 from multiprocessing import Process
@@ -52,6 +53,9 @@ class TestFragment(unittest.TestCase):
 def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
     try:
         print(f"subprocess[{tp_rank=}] Start")
+
+        os.environ['RANK'] = str(tp_rank)
+        os.environ['WORLD_SIZE'] = str(_TP_SIZE)
 
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         changed_model_path = model_path.replace('-Instruct', '')
