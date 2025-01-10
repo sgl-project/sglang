@@ -134,6 +134,7 @@ def _get_fsdp_state_dict(model_path: str):
                       cpu_offload=CPUOffload(offload_params=False),
                       sync_module_states=False,
                       device_mesh=device_mesh)
+    print(f'{fsdp_model=}')
 
     FSDP.set_state_dict_type(fsdp_model,
                              state_dict_type=StateDictType.SHARDED_STATE_DICT,
