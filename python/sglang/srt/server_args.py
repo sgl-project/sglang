@@ -929,9 +929,9 @@ class PortArgs:
             if is_port_available(port):
                 break
             if port < 60000:
-                port += random.randint(1,100)
+                port += random.randint(1, 100)
             else:
-                port -= random.randint(1,100)
+                port -= random.randint(1, 100)
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
