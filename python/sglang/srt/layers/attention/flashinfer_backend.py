@@ -771,17 +771,12 @@ class FlashInferIndicesUpdaterDecode:
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
-            if self.decode_indices > 0:
-                kv_indptr[1 + self.decode_indices] = 0
-                kv_indptr[2 + self.decode_indices : 2 + self.decode_indices + bs] = (
-                    torch.cumsum(paged_kernel_lens, dim=0)
-                )
-                kv_indptr_decode = kv_indptr[
-                    1 + self.decode_indices : 2 + self.decode_indices + bs
-                ]
-            else:
-                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-                kv_indptr_decode = kv_indptr[: bs + 1]
+            shift_pos = self.decode_start_idx
+            kv_indptr[1 + shift_pos : bs + 1 + shift_pos] = torch.cumsum(
+                paged_kernel_lens, dim=0
+            )
+            kv_indptr = kv_indptr[shift_pos : bs + 1 + shift_pos]
+
             kv_indices = torch.empty(
                 paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
             )
@@ -800,12 +795,10 @@ class FlashInferIndicesUpdaterDecode:
                 paged_kernel_lens,
                 self.req_to_token,
             )
-            # TODO(lihu): fix this ?
-            kv_indptr_decode = kv_indptr[: bs + 1]
 
         wrapper.end_forward()
         wrapper.begin_forward(
-            kv_indptr_decode,
+            kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
@@ -991,11 +984,9 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(req_pool_indices)
         if spec_info is None:
-            shift_pos = self.decode_start_idx
-            kv_indptr[1 + shift_pos : bs + 1 + shift_pos] = torch.cumsum(
-                paged_kernel_lens, dim=0
-            )
-            kv_indptr = kv_indptr[shift_pos : bs + 1 + shift_pos]
+            # Normal extend
+            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
                 paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
             )
