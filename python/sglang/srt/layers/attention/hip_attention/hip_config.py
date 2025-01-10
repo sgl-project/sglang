@@ -70,12 +70,7 @@ class HiPAttentionPerLayerConfig:
 
 @dataclass
 class HiPAttentionConfig:
-    apply_v_dot: bool = False
     dense_layers: list[int] = field(default_factory=lambda: [0, 1, 2])
-    prefill_always_dense: bool = False
-    decode_always_dense: bool = False
-    force_dense: bool = False
-    prefill_dense_threshold: int = 8192
     block_sparse_block_size_q: int = 64
     metadata_cache_max_batch_size: int = 256
     mask_refresh_interval: int = 4
@@ -84,6 +79,13 @@ class HiPAttentionConfig:
         HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 1024, 'sink_token_size': 256}),
         HiPAttentionPerLayerConfig(),
     ])
+    
+    # deprecated
+    apply_v_dot: bool = False
+    prefill_always_dense: bool = False
+    decode_always_dense: bool = False
+    force_dense: bool = False
+    prefill_dense_threshold: int = 8192
 
     parsed_json: InitVar[dict | None] = None
 

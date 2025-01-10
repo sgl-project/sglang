@@ -19,6 +19,7 @@ from hip.models.hip_attention.gen3.uvm_gpu_cache import (
     format_size_bytes,
 )
 import logging
+from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         head_dim: int,
         layer_num: int,
         device: torch.device,
+        hip_config: HiPAttentionConfig,
     ):
         assert isinstance(device, torch.device)
         assert device.index is not None
@@ -59,7 +61,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 device=device,
                 online_cache_update=self.online_update_cache,
             )
-            if layer_id not in [0, 1, 2] else
+            if layer_id not in hip_config.dense_layers else
             HiPOffloadCache(
                 layer_id=layer_id,
                 max_token_size=max_token_size + 1,

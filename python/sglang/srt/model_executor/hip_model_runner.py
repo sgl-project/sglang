@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class HiPModelRunner(ModelRunner):
+    hip_attention_config: HiPAttentionConfig
 
     def __init__(
         self,
@@ -29,7 +30,6 @@ class HiPModelRunner(ModelRunner):
         nccl_port: int,
         server_args: ServerArgs,
     ):
-        self.hip_attention_config: HiPAttentionConfig
         if server_args.enable_hip_attention:
             logger.info("HIP attention is turned on.")
             server_args.attention_backend = "hip_attention"

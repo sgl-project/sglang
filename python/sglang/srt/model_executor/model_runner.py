@@ -576,6 +576,7 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=torch.device(self.gpu_id),
+                hip_config=self.hip_attention_config,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
