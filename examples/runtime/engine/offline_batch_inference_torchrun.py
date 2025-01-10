@@ -66,7 +66,7 @@ def run():
         tp_rank=tp_rank,
         nccl_port=23456,
         gpu_id=tp_rank,
-        # TODO use device_mesh etc
+        # TODO use device_mesh etc to get ranks
         existing_tp_group_ranks=list(range(world_size)),
         existing_tp_device_group=device_mesh_device.get_group('tp'),
         existing_tp_cpu_group=device_mesh_cpu.get_group('tp'),
