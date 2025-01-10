@@ -31,8 +31,8 @@ def run():
     tp_rank = rank
     _log(f"{tp_rank=} {tp_size=}")
 
-    device_mesh_device = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['tp'])
-    device_mesh_cpu = init_device_mesh('cpu', mesh_shape=(world_size,), mesh_dim_names=['tp'])
+    device_mesh_device = init_device_mesh('cuda', mesh_shape=(world_size, 1), mesh_dim_names=['tp', 'pp'])
+    device_mesh_cpu = init_device_mesh('cpu', mesh_shape=(world_size, 1), mesh_dim_names=['tp', 'pp'])
     _log(f"{device_mesh_device=} {device_mesh_cpu=}")
 
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
@@ -76,9 +76,9 @@ def run():
                 cpu_group=device_mesh_cpu.get_group('tp'),
             ),
             pp=DimProcessGroups(
-                ranks=TODO,
-                device_group=TODO,
-                cpu_group=TODO,
+                ranks=[rank],
+                device_group=device_mesh_device.get_group('pp'),
+                cpu_group=device_mesh_cpu.get_group('pp'),
             ),
         ),
     )
