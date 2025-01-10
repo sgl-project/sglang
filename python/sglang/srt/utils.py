@@ -60,7 +60,7 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
-from vllm.distributed import GroupCoordinator
+from vllm.distributed import (GroupCoordinator, get_tp_group)
 
 logger = logging.getLogger(__name__)
 
@@ -1358,7 +1358,8 @@ def parse_tool_response(text, tools, **kwargs):
 def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
     print(f'weight_loader_narrow {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=}')
     if isinstance(w, DTensor):
-        return w.redistribute(TODO, [Shard(dim)]).to_local()
+        device_mesh = get_tp_group().device_mesh_device
+        return w.redistribute(device_mesh, [Shard(dim)]).to_local()
     else:
         return w.narrow(dim, start, length)
 
