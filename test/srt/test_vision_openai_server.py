@@ -456,6 +456,7 @@ class TestPhi3VServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
+                "--trust-remote-code",
                 "--chat-template",
                 "phi-3-vision",
             ],
