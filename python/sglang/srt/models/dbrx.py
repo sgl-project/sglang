@@ -25,15 +25,15 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
-from sglang.srt.layers.fused_moe_triton import fused_moe
+from sglang.srt.configs import DbrxConfig
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import fused_moe
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (

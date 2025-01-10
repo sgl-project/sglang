@@ -32,7 +32,7 @@ is_hip_ = is_hip()
 logger = logging.getLogger(__name__)
 
 # TODO: Remove this when triton>=3.2.0. This issue will not affect performance and accuracy.
-logger.warn(
+logger.warning(
     "The following error message 'operation scheduled before its operands' can be ignored."
 )
 
@@ -406,6 +406,10 @@ def _decode_grouped_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
+    # [TODO] work around shmem limit on MI3xx
+    if is_hip_ and Lk >= 576:
+        BLOCK = 16
+
     if Lk == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
@@ -474,6 +478,7 @@ def _decode_grouped_att_m_fwd(
 def _fwd_kernel_stage2(
     Mid_O,
     O,
+    B_Seqlen,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -486,6 +491,8 @@ def _fwd_kernel_stage2(
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
 
@@ -497,19 +504,24 @@ def _fwd_kernel_stage2(
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
-        tv = tl.load(
-            Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
-        )
-        tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
-        n_e_max = tl.maximum(tlogic, e_max)
+        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
-        old_scale = tl.exp(e_max - n_e_max)
-        acc *= old_scale
-        exp_logic = tl.exp(tlogic - n_e_max)
-        acc += exp_logic * tv
+        if split_kv_end > split_kv_start:
+            tv = tl.load(
+                Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
+            )
+            tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
+            n_e_max = tl.maximum(tlogic, e_max)
 
-        e_sum = e_sum * old_scale + exp_logic
-        e_max = n_e_max
+            old_scale = tl.exp(e_max - n_e_max)
+            acc *= old_scale
+            exp_logic = tl.exp(tlogic - n_e_max)
+            acc += exp_logic * tv
+
+            e_sum = e_sum * old_scale + exp_logic
+            e_max = n_e_max
 
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
@@ -523,6 +535,7 @@ def _decode_softmax_reducev_fwd(
     q,
     o,
     v_buffer,
+    b_seq_len,
     num_kv_splits,
 ):
     batch, head_num = q.shape[0], q.shape[1]
@@ -541,6 +554,7 @@ def _decode_softmax_reducev_fwd(
     _fwd_kernel_stage2[grid](
         logits,
         o,
+        b_seq_len,
         logits.stride(0),
         logits.stride(1),
         logits.stride(2),
@@ -580,7 +594,7 @@ def decode_attention_fwd_normal(
         sm_scale,
         logit_cap,
     )
-    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, num_kv_splits)
+    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
 
 def decode_attention_fwd_grouped(
@@ -608,7 +622,7 @@ def decode_attention_fwd_grouped(
         sm_scale,
         logit_cap,
     )
-    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, num_kv_splits)
+    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
 
 def decode_attention_fwd(

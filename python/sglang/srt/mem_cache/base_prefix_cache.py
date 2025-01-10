@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Callable
+from typing import Callable, List, Tuple
 
 
 class BasePrefixCache(ABC):
@@ -10,7 +10,7 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def match_prefix(self, **kwargs):
+    def match_prefix(self, **kwargs) -> Tuple[List[int], int]:
         pass
 
     @abstractmethod

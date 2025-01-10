@@ -63,6 +63,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import configure_logger, kill_process_tree, suppress_other_loggers
 
 
@@ -214,6 +215,7 @@ def extend(reqs, model_runner):
         tree_cache=None,
         model_config=model_runner.model_config,
         enable_overlap=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
@@ -385,6 +387,7 @@ def latency_test(
         8,  # shorter decoding to speed up the warmup
         server_args.device,
     )
+
     rank_print("Benchmark ...")
 
     # Run the sweep
