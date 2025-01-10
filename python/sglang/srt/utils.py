@@ -1362,9 +1362,9 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
             f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=}')
 
         ans = w
-        if w.device_mesh != tp_device_mesh:
-            # TODO otherwise torch has "not yet implemented" error - we should remove this after torch implements it
-            ans = ans.redistribute(tp_device_mesh, [Replicate()])
+        # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
+        ans = DTensor.from_local(ans.full_tensor(), device_mesh=tp_device_mesh,
+                                 placements=[Replicate() for _ in range(tp_device_mesh.ndim)])
         ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
 
         rank_via_mesh = tp_device_mesh.get_local_rank()
