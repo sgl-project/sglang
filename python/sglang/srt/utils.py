@@ -50,7 +50,7 @@ from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from starlette.routing import Mount
 from torch import nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -1358,7 +1358,7 @@ def parse_tool_response(text, tools, **kwargs):
 def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
     print(f'weight_loader_narrow {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=}')
     if isinstance(w, DTensor):
-        return TODO
+        return w.redistribute(TODO, [Shard(dim)]).to_local()
     else:
         return w.narrow(dim, start, length)
 

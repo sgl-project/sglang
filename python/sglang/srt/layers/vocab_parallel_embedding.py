@@ -27,14 +27,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
     def create_weights(
-            self,
-            layer: torch.nn.Module,
-            input_size_per_partition: int,
-            output_partition_sizes: List[int],
-            input_size: int,
-            output_size: int,
-            params_dtype: torch.dtype,
-            **extra_weight_attrs,
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
         weight = Parameter(
@@ -50,10 +50,10 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def apply(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            bias: Optional[torch.Tensor] = None,
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
 
@@ -67,7 +67,7 @@ def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) ->
 
 
 def vocab_range_from_per_partition_vocab_size(
-        per_partition_vocab_size: int, rank: int, offset: int = 0
+    per_partition_vocab_size: int, rank: int, offset: int = 0
 ) -> Sequence[int]:
     index_f = rank * per_partition_vocab_size
     index_l = index_f + per_partition_vocab_size
@@ -75,7 +75,7 @@ def vocab_range_from_per_partition_vocab_size(
 
 
 def vocab_range_from_global_vocab_size(
-        global_vocab_size: int, rank: int, world_size: int, offset: int = 0
+    global_vocab_size: int, rank: int, world_size: int, offset: int = 0
 ) -> Sequence[int]:
     per_partition_vocab_size = divide(global_vocab_size, world_size)
     return vocab_range_from_per_partition_vocab_size(
@@ -144,26 +144,26 @@ class VocabParallelEmbeddingShardIndices:
 
 @torch.jit.script
 def get_masked_input_and_mask(
-        input_: torch.Tensor,
-        org_vocab_start_index: int,
-        org_vocab_end_index: int,
-        num_org_vocab_padding: int,
-        added_vocab_start_index: int,
-        added_vocab_end_index: int,
+    input_: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # torch.jit.script will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
     added_vocab_mask = (input_ >= added_vocab_start_index) & (
-            input_ < added_vocab_end_index
+        input_ < added_vocab_end_index
     )
     added_offset = (
-            added_vocab_start_index
-            - (org_vocab_end_index - org_vocab_start_index)
-            - num_org_vocab_padding
+        added_vocab_start_index
+        - (org_vocab_end_index - org_vocab_start_index)
+        - num_org_vocab_padding
     )
     valid_offset = (org_vocab_start_index * org_vocab_mask) + (
-            added_offset * added_vocab_mask
+        added_offset * added_vocab_mask
     )
     vocab_mask = org_vocab_mask | added_vocab_mask
     input_ = vocab_mask * (input_ - valid_offset)
@@ -210,15 +210,15 @@ class VocabParallelEmbedding(torch.nn.Module):
     """  # noqa: E501
 
     def __init__(
-            self,
-            num_embeddings: int,
-            embedding_dim: int,
-            params_dtype: Optional[torch.dtype] = None,
-            org_num_embeddings: Optional[int] = None,
-            padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
-            enable_tp: bool = True,
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        params_dtype: Optional[torch.dtype] = None,
+        org_num_embeddings: Optional[int] = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        enable_tp: bool = True,
     ):
         super().__init__()
         self.quant_config = quant_config
@@ -282,15 +282,15 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.num_embeddings_padded, self.tp_size
         )
         assert (
-                self.shard_indices.num_elements_padded == self.num_embeddings_per_partition
+            self.shard_indices.num_elements_padded == self.num_embeddings_per_partition
         )
         self.num_org_embeddings_per_partition = (
-                self.shard_indices.org_vocab_end_index
-                - self.shard_indices.org_vocab_start_index
+            self.shard_indices.org_vocab_end_index
+            - self.shard_indices.org_vocab_start_index
         )
         self.num_added_embeddings_per_partition = (
-                self.shard_indices.added_vocab_end_index
-                - self.shard_indices.added_vocab_start_index
+            self.shard_indices.added_vocab_end_index
+            - self.shard_indices.added_vocab_start_index
         )
 
         self.linear_method.create_weights(
@@ -305,13 +305,13 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     @classmethod
     def _get_indices(
-            cls,
-            vocab_size_padded: int,
-            org_vocab_size_padded: int,
-            vocab_size: int,
-            org_vocab_size: int,
-            tp_rank: int,
-            tp_size: int,
+        cls,
+        vocab_size_padded: int,
+        org_vocab_size_padded: int,
+        vocab_size: int,
+        org_vocab_size: int,
+        tp_rank: int,
+        tp_size: int,
     ) -> VocabParallelEmbeddingShardIndices:
         """Get start and end indices for vocab parallel embedding, following the
         layout outlined in the class docstring, based on the given tp_rank and
@@ -397,10 +397,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
             )
             assert (
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements_padded
-                    == range_end
+                range_start
+                + shard_indices.num_org_elements_padded
+                + shard_indices.num_added_elements_padded
+                == range_end
             )
         ret = base_embeddings + added_embeddings + padding
         assert len(ret) == self.num_embeddings_padded
@@ -441,7 +441,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 else param.pack_factor
             )
             assert loaded_weight.shape[output_dim] == (
-                    self.org_vocab_size // param.packed_factor
+                self.org_vocab_size // param.packed_factor
             )
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
@@ -504,15 +504,15 @@ class ParallelLMHead(VocabParallelEmbedding):
     """
 
     def __init__(
-            self,
-            num_embeddings: int,
-            embedding_dim: int,
-            bias: bool = False,
-            params_dtype: Optional[torch.dtype] = None,
-            org_num_embeddings: Optional[int] = None,
-            padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        bias: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        org_num_embeddings: Optional[int] = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__(
             num_embeddings,
