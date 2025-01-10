@@ -3,6 +3,7 @@ import os
 import sys
 
 from sglang.srt.server.engine_fragment import EngineFragment
+from torch.distributed.device_mesh import init_device_mesh
 
 
 def run():
@@ -28,6 +29,9 @@ def run():
     tp_size = world_size
     tp_rank = rank
     _log(f"{tp_rank=} {tp_size=}")
+
+    device_mesh_device = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['tp'])
+    device_mesh_cpu = init_device_mesh('cpu', mesh_shape=(world_size,), mesh_dim_names=['tp'])
 
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
     # model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9 # test large models
@@ -62,9 +66,10 @@ def run():
         tp_rank=tp_rank,
         nccl_port=23456,
         gpu_id=tp_rank,
-        existing_tp_group_ranks=TODO,
-        existing_tp_device_group=TODO,
-        existing_tp_cpu_group=TODO,
+        # TODO use device_mesh etc
+        existing_tp_group_ranks=list(range(world_size)),
+        existing_tp_device_group=device_mesh_device.get_group('tp'),
+        existing_tp_cpu_group=device_mesh_cpu.get_group('tp'),
     )
     _log(f"{fragment=}")
 
