@@ -85,7 +85,7 @@ def _init_model_parallel_group(
     )
 
 
-@dataclasses
+@dataclasses.dataclass
 class GroupCoordinatorSourceExisting:
     ranks: List[int]
     device_group: Any
