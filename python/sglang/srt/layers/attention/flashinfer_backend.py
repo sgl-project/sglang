@@ -58,7 +58,6 @@ class MixedMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
-    decode_start_idx: int
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -242,7 +241,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.decode_wrappers,
                 use_ragged,
                 extend_no_prefix,
-                extend_bs,
             )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
