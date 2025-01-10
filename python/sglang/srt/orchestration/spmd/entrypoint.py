@@ -1,5 +1,6 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.generation_manager import GenerationConverter
@@ -56,6 +57,9 @@ class Entrypoint:
             pass
 
         return outputs
+
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        TODO
 
     def shutdown(self):
         self._scheduler.shutdown()
