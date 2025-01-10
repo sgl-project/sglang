@@ -1250,26 +1250,3 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     torch.distributed.all_reduce(is_in_the_same_node, group=pg)
 
     return [x == 1 for x in is_in_the_same_node.tolist()]
-
-
-vllm_get_pp_group = None
-vllm_get_tp_group = None
-vllm_get_world_group = None
-
-
-def monkey_patch_vllm_parallel_state(reverse: bool = False):
-    import vllm.distributed.parallel_state as vllm_parrlel_state
-
-    global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
-    if vllm_get_pp_group is None:
-        vllm_get_pp_group = vllm_parrlel_state.get_pp_group
-        vllm_get_tp_group = vllm_parrlel_state.get_tp_group
-        vllm_get_world_group = vllm_parrlel_state.get_world_group
-    if reverse:
-        setattr(vllm_parrlel_state, "get_pp_group", vllm_get_pp_group)
-        setattr(vllm_parrlel_state, "get_tp_group", vllm_get_tp_group)
-        setattr(vllm_parrlel_state, "get_world_group", vllm_get_world_group)
-    else:
-        setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
-        setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
-        setattr(vllm_parrlel_state, "get_world_group", get_world_group)
