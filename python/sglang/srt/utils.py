@@ -712,7 +712,7 @@ def broadcast_pyobj_in_group(
     dist_group_coordinator: GroupCoordinator,
     src_index_in_group: int = 0,
 ):
-    broadcast_pyobj(
+    return broadcast_pyobj(
         data=data,
         rank=dist_group_coordinator.ranks[index_in_group],
         dist_group=dist_group_coordinator.cpu_group,
