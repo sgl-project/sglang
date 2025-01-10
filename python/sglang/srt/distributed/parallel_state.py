@@ -2,7 +2,7 @@
 # Currently uses monkey patching, but there are other ways like copy-paste-modify
 import dataclasses
 import logging
-from typing import Optional, List, Union, Any
+from typing import Any, List, Optional, Union
 
 import torch
 import vllm.distributed.parallel_state as _ps
@@ -25,8 +25,8 @@ def init_distributed_environment_via_existing(
 # TODO improve API and naming
 @dataclasses.dataclass
 class ParallelProcessGroups:
-    tp: 'DimProcessGroups'
-    pp: 'DimProcessGroups'
+    tp: "DimProcessGroups"
+    pp: "DimProcessGroups"
 
     @staticmethod
     def from_devices_meshes(
@@ -56,7 +56,9 @@ class DimProcessGroups:
     cpu_group: Any
 
 
-def initialize_model_parallel_via_existing(existing_groups: ParallelProcessGroups) -> None:
+def initialize_model_parallel_via_existing(
+    existing_groups: ParallelProcessGroups,
+) -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
     _ps._TP = _init_model_parallel_group(
         existing=existing_groups.tp,
@@ -84,9 +86,9 @@ def _monkey_patch():
 
 
 # Only thing added: `**kwargs`
-def _init_world_group(ranks: List[int], local_rank: int,
-                      backend: str,
-                      **kwargs) -> _ps.GroupCoordinator:
+def _init_world_group(
+    ranks: List[int], local_rank: int, backend: str, **kwargs
+) -> _ps.GroupCoordinator:
     return _ps.GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
@@ -163,7 +165,8 @@ def _group_coordinator_init(
     else:
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend)
+                ranks, backend=torch_distributed_backend
+            )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
@@ -189,10 +192,8 @@ def _group_coordinator_init(
     self.use_xpu_communicator = use_xpu_communicator
 
     # lazy import to avoid documentation build error
-    from vllm.distributed.device_communicators.custom_all_reduce import (
-        CustomAllreduce)
-    from vllm.distributed.device_communicators.pynccl import (
-        PyNcclCommunicator)
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     self.pynccl_comm: Optional[PyNcclCommunicator] = None
     if use_pynccl and self.world_size > 1:
@@ -209,27 +210,28 @@ def _group_coordinator_init(
             device=self.device,
         )
 
-    from vllm.distributed.device_communicators.tpu_communicator import (
-        TpuCommunicator)
+    from vllm.distributed.device_communicators.tpu_communicator import TpuCommunicator
+
     self.tpu_communicator: Optional[TpuCommunicator] = None
     if use_tpu_communicator and self.world_size > 1:
         self.tpu_communicator = TpuCommunicator(group=self.cpu_group)
 
-    from vllm.distributed.device_communicators.hpu_communicator import (
-        HpuCommunicator)
+    from vllm.distributed.device_communicators.hpu_communicator import HpuCommunicator
+
     self.hpu_communicator: Optional[HpuCommunicator]
     if use_hpu_communicator and self.world_size > 1:
         self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
-    from vllm.distributed.device_communicators.xpu_communicator import (
-        XpuCommunicator)
+    from vllm.distributed.device_communicators.xpu_communicator import XpuCommunicator
+
     self.xpu_communicator: Optional[XpuCommunicator]
     if use_xpu_communicator and self.world_size > 1:
         self.xpu_communicator = XpuCommunicator(group=self.device_group)
 
-    from vllm.distributed.device_communicators.shm_broadcast import (
-        MessageQueue)
+    from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+
     self.mq_broadcaster: Optional[MessageQueue] = None
     if use_message_queue_broadcaster and self.world_size > 1:
         self.mq_broadcaster = MessageQueue.create_from_process_group(
-            self.cpu_group, 1 << 22, 6)
+            self.cpu_group, 1 << 22, 6
+        )
