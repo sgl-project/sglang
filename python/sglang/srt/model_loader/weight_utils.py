@@ -9,7 +9,7 @@ import logging
 import os
 import tempfile
 from collections import defaultdict
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import filelock
 import gguf
@@ -18,13 +18,13 @@ import numpy as np
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from safetensors.torch import load_file, safe_open, save_file
-from tqdm.auto import tqdm
-from vllm.distributed import get_tensor_model_parallel_rank
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
+from torch.distributed.tensor import DTensor
+from tqdm.auto import tqdm
+from vllm.distributed import get_tensor_model_parallel_rank
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +122,6 @@ def convert_bin_to_safetensor_file(
 def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig:
-
     quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file
@@ -489,6 +488,9 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
+        if isinstance(loaded_weight, DTensor):
+            loaded_weight = loaded_weight.full_tensor()
+
         if param.numel() == 1 and loaded_weight.numel() == 1:
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,
