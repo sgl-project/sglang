@@ -20,19 +20,64 @@ def init_distributed_environment_via_existing(
 ):
     assert _ps._WORLD is None
     ranks = list(range(torch.distributed.get_world_size()))
-    _ps._WORLD = init_world_group(ranks, local_rank, backend)
+    _ps._WORLD = _init_world_group(ranks, local_rank, backend)
 
 
 def initialize_model_parallel_via_existing(
         backend: Optional[str] = None,
 ) -> None:
     assert _ps._TP is None, "tensor model parallel group is already initialized"
-    _ps._TP = init_model_parallel_group(group_ranks,
-                                        get_world_group().local_rank,
-                                        backend,
-                                        use_message_queue_broadcaster=True,
-                                        group_name="tp")
+    _ps._TP = _init_model_parallel_group(group_ranks,
+                                         _ps.get_world_group().local_rank,
+                                         backend,
+                                         use_message_queue_broadcaster=True,
+                                         group_name="tp")
     # Not handle PP yet
+
+
+# Only thing added: `**kwargs`
+def _init_world_group(ranks: List[int], local_rank: int,
+                      backend: str,
+                      **kwargs) -> _ps.GroupCoordinator:
+    return _ps.GroupCoordinator(
+        group_ranks=[ranks],
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        use_tpu_communicator=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        group_name="world",
+        **kwargs,
+    )
+
+
+# Only thing added: `**kwargs`
+def _init_model_parallel_group(
+        group_ranks: List[List[int]],
+        local_rank: int,
+        backend: str,
+        use_custom_allreduce: Optional[bool] = None,
+        use_message_queue_broadcaster: bool = False,
+        group_name: Optional[str] = None,
+        **kwargs,
+) -> _ps.GroupCoordinator:
+    if use_custom_allreduce is None:
+        use_custom_allreduce = _ps._ENABLE_CUSTOM_ALL_REDUCE
+    return _ps.GroupCoordinator(
+        group_ranks=group_ranks,
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_pynccl=True,
+        use_custom_allreduce=use_custom_allreduce,
+        use_tpu_communicator=True,
+        use_hpu_communicator=True,
+        use_xpu_communicator=True,
+        use_message_queue_broadcaster=use_message_queue_broadcaster,
+        group_name=group_name,
+        **kwargs,
+    )
 
 
 def _group_coordinator_init(
