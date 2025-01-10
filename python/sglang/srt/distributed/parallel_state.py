@@ -6,13 +6,14 @@ from typing import Optional, List, Union, Any
 
 import torch
 import vllm.distributed.parallel_state as _ps
+from torch.distributed._tensor import DeviceMesh
 
 logger = logging.getLogger(__name__)
 
 
 def init_distributed_environment_via_existing(
-        local_rank: int,
-        backend: str,
+    local_rank: int,
+    backend: str,
 ):
     _monkey_patch()
 
@@ -26,6 +27,26 @@ def init_distributed_environment_via_existing(
 class ParallelProcessGroups:
     tp: 'DimProcessGroups'
     pp: 'DimProcessGroups'
+
+    @staticmethod
+    def from_devices_meshes(
+        device_mesh_device: DeviceMesh,
+        device_mesh_cpu: DeviceMesh,
+        dim_tp: str,
+        dim_pp: str,
+    ):
+        return ParallelProcessGroups(
+            tp=DimProcessGroups(
+                ranks=device_mesh_device[dim_tp].mesh.tolist(),
+                device_group=device_mesh_device.get_group(dim_tp),
+                cpu_group=device_mesh_cpu.get_group(dim_tp),
+            ),
+            pp=DimProcessGroups(
+                ranks=device_mesh_device[dim_pp].mesh.tolist(),
+                device_group=device_mesh_device.get_group(dim_pp),
+                cpu_group=device_mesh_cpu.get_group(dim_pp),
+            ),
+        )
 
 
 @dataclasses.dataclass
@@ -82,13 +103,13 @@ def _init_world_group(ranks: List[int], local_rank: int,
 
 # Only thing added: `**kwargs`
 def _init_model_parallel_group(
-        group_ranks: List[List[int]],
-        local_rank: int,
-        backend: str,
-        use_custom_allreduce: Optional[bool] = None,
-        use_message_queue_broadcaster: bool = False,
-        group_name: Optional[str] = None,
-        **kwargs,
+    group_ranks: List[List[int]],
+    local_rank: int,
+    backend: str,
+    use_custom_allreduce: Optional[bool] = None,
+    use_message_queue_broadcaster: bool = False,
+    group_name: Optional[str] = None,
+    **kwargs,
 ) -> _ps.GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ps._ENABLE_CUSTOM_ALL_REDUCE
@@ -108,19 +129,19 @@ def _init_model_parallel_group(
 
 
 def _group_coordinator_init(
-        self,
-        group_ranks: List[List[int]],
-        local_rank: int,
-        torch_distributed_backend: Union[str, _ps.Backend],
-        use_pynccl: bool,
-        use_custom_allreduce: bool,
-        use_tpu_communicator: bool,
-        use_hpu_communicator: bool,
-        use_xpu_communicator: bool,
-        use_message_queue_broadcaster: bool = False,
-        group_name: Optional[str] = None,
-        # NOTE MODIFIED add
-        existing: Optional[DimProcessGroups] = None,
+    self,
+    group_ranks: List[List[int]],
+    local_rank: int,
+    torch_distributed_backend: Union[str, _ps.Backend],
+    use_pynccl: bool,
+    use_custom_allreduce: bool,
+    use_tpu_communicator: bool,
+    use_hpu_communicator: bool,
+    use_xpu_communicator: bool,
+    use_message_queue_broadcaster: bool = False,
+    group_name: Optional[str] = None,
+    # NOTE MODIFIED add
+    existing: Optional[DimProcessGroups] = None,
 ):
     group_name = group_name or "anonymous"
     self.unique_name = _ps._get_unique_name(group_name)
