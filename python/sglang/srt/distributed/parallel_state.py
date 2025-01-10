@@ -48,7 +48,7 @@ def initialize_model_parallel_via_existing(existing_groups: ParallelProcessGroup
 
     assert _ps._PP is None, "pipeline model parallel group is already initialized"
     # pipeline parallel does not need custom allreduce
-    _ps._PP = _ps.init_model_parallel_group(
+    _ps._PP = _init_model_parallel_group(
         existing=existing_groups.pp,
         group_ranks=None,
         local_rank=_ps.get_world_group().local_rank,
