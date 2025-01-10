@@ -120,7 +120,7 @@ class TpModelWorker:
         self.random_seed = broadcast_pyobj_in_group(
             [server_args.random_seed],
             self.tp_rank,
-            self.model_runner.tp_group.cpu_group,
+            self.model_runner.tp_group,
         )[0]
         set_random_seed(self.random_seed)
 
