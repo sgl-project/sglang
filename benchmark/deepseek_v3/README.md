@@ -4,6 +4,8 @@ The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVI
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
+For optimizations made on the DeepSeek series models regarding SGLang, please refer to https://sgl-project.github.io/references/deepseek.html
+
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
 
@@ -29,7 +31,7 @@ For high QPS scenarios, add the `--enable-dp-attention` argument to boost throug
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]>=0.4.1.post3" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
+pip install "sglang[all]>=0.4.1.post5" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
