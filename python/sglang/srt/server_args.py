@@ -939,7 +939,10 @@ class PortArgs:
         while True:
             if is_port_available(port):
                 break
-            port += 42
+            if port < 60000:
+                port += 42
+            else:
+                port -= 43
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
