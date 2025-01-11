@@ -1165,12 +1165,12 @@ class ScheduleBatch:
             input_embeds=self.input_embeds,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
-            decode_start_idx=self.decode_start_idx,
             capture_hidden_mode=(
                 getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
                 if self.spec_info
                 else CaptureHiddenMode.NULL
             ),
+            decode_start_idx=self.decode_start_idx,
         )
 
     def copy(self):
@@ -1224,9 +1224,6 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
 
-    # For mixed chunked prefill
-    decode_start_idx: int = 0
-
     # For multimodal
     image_inputs: Optional[List[ImageInputs]]
 
@@ -1249,6 +1246,9 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # For mixed chunked prefill
+    decode_start_idx: int = 0
 
 
 @triton.jit
