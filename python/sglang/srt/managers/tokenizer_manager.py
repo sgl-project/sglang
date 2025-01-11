@@ -688,7 +688,7 @@ class TokenizerManager:
                     if self.enable_metrics:
                         completion_tokens = (
                             recv_obj.completion_tokens[i]
-                            if recv_obj.completion_tokens
+                            if getattr(recv_obj, "completion_tokens", None)
                             else 0
                         )
 
@@ -716,7 +716,11 @@ class TokenizerManager:
                                 time.time() - state.created_time
                             )
                             # Compute time_per_output_token for the non-streaming case
-                            if not state.obj.stream and completion_tokens >= 1:
+                            if (
+                                hasattr(state.obj, "stream")
+                                and not state.obj.stream
+                                and completion_tokens >= 1
+                            ):
                                 self.metrics_collector.observe_time_per_output_token(
                                     (time.time() - state.created_time)
                                     / completion_tokens
