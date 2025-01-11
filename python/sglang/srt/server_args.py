@@ -32,15 +32,10 @@ from sglang.srt.utils import (
     is_hip,
     is_ipv6,
     is_port_available,
+    nullable_str,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def nullable_str(val: str):
-    if not val or val == "None":
-        return None
-    return val
 
 
 @dataclasses.dataclass
