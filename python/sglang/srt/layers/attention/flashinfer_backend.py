@@ -292,7 +292,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens_sum,
                 prefix_lens=None,
-                extend_no_prefix=self.forward_metadata.extend_no_prefix,
+                extend_no_prefix=False,
                 model_layer=model_layer,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
