@@ -237,7 +237,7 @@ class GenerationManager:
                     index,
                     state.metric,
                     finished=state.finished,
-                    stream=state.obj.stream,
+                    stream=state.obj.stream if hasattr(state.obj, "stream") else None,
                 )
 
     def abort_request(self, rid: str):
@@ -549,10 +549,12 @@ class _MetricManager:
         i: int,
         state: "_MetricReqState",
         finished: bool,
-        stream: bool,
+        stream: Optional[bool],
     ):
         completion_tokens = (
-            recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
+            recv_obj.completion_tokens[i]
+            if getattr(recv_obj, "completion_tokens", None)
+            else 0
         )
         if state.first_token_time is None:
             state.first_token_time = time.time()
@@ -572,7 +574,7 @@ class _MetricManager:
                 time.time() - state.created_time
             )
             # Compute time_per_output_token for the non-streaming case
-            if not stream and completion_tokens >= 1:
+            if stream is not None and not stream and completion_tokens >= 1:
                 self._metrics_collector.observe_time_per_output_token(
                     (time.time() - state.created_time) / completion_tokens
                 )
