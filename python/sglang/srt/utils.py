@@ -337,6 +337,8 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
+        except OverflowError:
+            return False
 
 
 def decode_video_base64(video_base64):
