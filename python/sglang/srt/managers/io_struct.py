@@ -323,7 +323,7 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init`
+    # Only used when `--skip-tokenizer-init` is on
     output_ids: Optional[List[int]]
     # Detokenization configs
     skip_special_tokens: List[bool]

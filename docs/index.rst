@@ -51,12 +51,12 @@ The core features include:
    :maxdepth: 1
    :caption: References
 
-   references/deepseek.md
    references/supported_models.md
    references/sampling_params.md
    references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
    references/custom_chat_template.md
+   references/deepseek.md
    references/llama_405B.md
    references/modelscope.md
    references/contribution_guide.md
