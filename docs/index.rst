@@ -51,6 +51,7 @@ The core features include:
    :maxdepth: 1
    :caption: References
 
+   references/deepseek.md
    references/supported_models.md
    references/sampling_params.md
    references/hyperparameter_tuning.md
@@ -62,4 +63,3 @@ The core features include:
    references/troubleshooting.md
    references/faq.md
    references/learn_more.md
-   references/deepseek.md
