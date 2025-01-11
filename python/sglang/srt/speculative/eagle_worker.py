@@ -169,6 +169,8 @@ class EAGLEWorker(TpModelWorker):
         if not isinstance(reqs, List):
             reqs = [reqs]
         for req in reqs:
+            if req.rid not in self.finish_extend_len:
+                continue
             req_len = (
                 len(req.origin_input_ids)
                 + len(req.output_ids)
