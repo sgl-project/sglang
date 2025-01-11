@@ -2,7 +2,7 @@ import json
 import unittest
 
 import requests
-from transformers import AutoTokenizer  # Using transformers' AutoTokenizer
+from transformers import AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -20,7 +20,6 @@ _tokenizer = None
 def setUpModule():
     """
     Launch the server once before all tests and initialize the tokenizer.
-    This avoids repeated server startups and tokenizer initializations for each test.
     """
     global _server_process, _base_url, _tokenizer
     _server_process = popen_launch_server(
@@ -57,10 +56,6 @@ class TestSkipTokenizerInit(unittest.TestCase):
         top_logprobs_num=0,
         n=1,
     ):
-        """
-        Unified request logic using the tokenizer to dynamically encode the prompt_text.
-        """
-        # Encode the prompt_text into input_ids using the tokenizer
         input_ids = _tokenizer(prompt_text, return_tensors="pt")["input_ids"][
             0
         ].tolist()
@@ -73,8 +68,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
                     "n": n,
-                    # Adjust the stop_token_ids as needed; 128009 is used as an example
-                    "stop_token_ids": [128009],
+                    "stop_token_ids": [_tokenizer.eos_token_id],
                 },
                 "stream": False,
                 "return_logprob": return_logprob,
@@ -86,11 +80,11 @@ class TestSkipTokenizerInit(unittest.TestCase):
         print(json.dumps(ret, indent=2))
 
         def assert_one_item(item):
-            """
-            Common assertion logic for each response item.
-            """
             if item["meta_info"]["finish_reason"]["type"] == "stop":
-                self.assertEqual(item["meta_info"]["finish_reason"]["matched"], 128009)
+                self.assertEqual(
+                    item["meta_info"]["finish_reason"]["matched"],
+                    _tokenizer.eos_token_id,
+                )
             elif item["meta_info"]["finish_reason"]["type"] == "length":
                 self.assertEqual(
                     len(item["token_ids"]), item["meta_info"]["completion_tokens"]
