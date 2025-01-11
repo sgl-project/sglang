@@ -249,13 +249,13 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.num_cascade_levels,
                         self.workspace_buffer,
                         "NHD",
-                        use_cuda_graph=True,
-                        qo_indptr_buf_arr=[self.qo_indptr[i][: num_tokens + 1]],
-                        paged_kv_indptr_buf_arr=[self.kv_indptr[i][: num_tokens + 1]],
-                        paged_kv_indices_buf_arr=[self.cuda_graph_kv_indices[i]],
-                        paged_kv_last_page_len_buf_arr=[
-                            self.kv_last_page_len[:num_tokens]
-                        ],
+                        # use_cuda_graph=True,
+                        # qo_indptr_buf_arr=[self.qo_indptr[i][: num_tokens + 1]],
+                        # paged_kv_indptr_buf_arr=[self.kv_indptr[i][: num_tokens + 1]],
+                        # paged_kv_indices_buf_arr=[self.cuda_graph_kv_indices[i]],
+                        # paged_kv_last_page_len_buf_arr=[
+                        #     self.kv_last_page_len[:num_tokens]
+                        # ],
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -291,8 +291,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 req_pool_indices,
                 seq_lens,
                 seq_lens_sum,
-                model_layer,
                 prefix_lens=None,
+                extend_no_prefix=self.forward_metadata.extend_no_prefix,
+                model_layer=model_layer,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens,
