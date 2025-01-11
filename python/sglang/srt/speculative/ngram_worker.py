@@ -85,15 +85,19 @@ class NGramWorker:
             batch.spec_info.positions = torch.cat(
                 [batch.spec_info.positions, positions]
             )
-            (logits_output, verified_id, self.finish_extend_len, model_worker_batch) = (
-                self.verify(batch)
-            )
+            (
+                logits_output,
+                verified_id,
+                verified_pos,
+                self.finish_extend_len,
+                model_worker_batch,
+            ) = self.verify(batch)
             next_spec_info = NGramSpecInfo(
                 verified_tokens=torch.cat(
                     [batch.spec_info.verified_tokens, verified_id]
                 ),
                 candidate_tokens=verified_id[-1:],
-                positions=batch.seq_lens,  # TODO: verify this
+                positions=verified_pos,  # TODO: verify this
             )
             return logits_output, verified_id, model_worker_batch, next_spec_info
         else:
@@ -136,6 +140,7 @@ class NGramWorker:
         accept_length_cpu = [accept_mask.item() + 1]
         accept_index = torch.arange(accept_length_cpu[0], device="cuda")
         verified_id = predict[accept_index]
+        verified_pos = batch.spec_info.positions[accept_index] + 1
         verified_id_cpu = verified_id.tolist()
 
         # TODO: Verify whether this is correct mem free idx
@@ -177,7 +182,13 @@ class NGramWorker:
 
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         batch.forward_mode = ForwardMode.DECODE
-        return logits_output, verified_id, finished_extend_len, model_worker_batch
+        return (
+            logits_output,
+            verified_id,
+            verified_pos,
+            finished_extend_len,
+            model_worker_batch,
+        )
 
 
 class NGramSpecInfo(SpecInfo):
@@ -221,6 +232,9 @@ class NGramSpecInfo(SpecInfo):
 
     def prepare_for_verify(self, batch: ScheduleBatch):
         batch.input_ids = self.candidate_tokens
+        batch.seq_lens = torch.tensor(
+            [batch.input_ids.numel()], device="cuda", dtype=torch.int32
+        )
         batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
         bs = batch.seq_lens.numel()
         assign_req_to_token_pool[(bs,)](

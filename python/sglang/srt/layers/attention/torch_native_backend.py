@@ -91,7 +91,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            print(per_req_tokens)
+            if (per_req_tokens == 0).any():
+                from remote_pdb import set_trace
 
+                set_trace(host="127.0.0.1", port=7728)
             per_req_out_redudant = (
                 scaled_dot_product_attention(
                     per_req_query_redudant.unsqueeze(0),
@@ -104,15 +108,6 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            print(per_req_out_redudant.shape)
-            print(prefill_seq_len_q)
-            print(start_q)
-            print(end_q)
-
-            if per_req_out_redudant.shape == torch.Size([11, 32, 128]):
-                from remote_pdb import set_trace
-
-                set_trace(host="127.0.0.1", port=7728)
             output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
