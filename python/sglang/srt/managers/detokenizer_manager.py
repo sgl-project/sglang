@@ -73,7 +73,9 @@ class DetokenizerManager:
                 trust_remote_code=server_args.trust_remote_code,
             )
 
-        self.decode_status = LimitedCapacityDict()
+        self.decode_status = LimitedCapacityDict(
+            capacity=server_args.detokenizer_max_states
+        )
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -155,7 +157,14 @@ class DetokenizerManager:
             # Incremental decoding
             output_strs = []
             for i in range(bs):
-                s = self.decode_status[recv_obj.rids[i]]
+                try:
+                    s = self.decode_status[recv_obj.rids[i]]
+                except KeyError:
+                    raise RuntimeError(
+                        f"Decode status not found for request {recv_obj.rids[i]}. "
+                        "It may be due to the request being evicted from the decode status due to memory pressure. "
+                        "Please increase the --detokenizer-max-states option."
+                    )
                 new_text = read_texts[i][len(surr_texts[i]) :]
                 if recv_obj.finished_reasons[i] is None:
                     # Streaming chunk: update the decode status
@@ -199,7 +208,7 @@ class DetokenizerManager:
 
 
 class LimitedCapacityDict(OrderedDict):
-    def __init__(self, capacity=1 << 15, *args, **kwargs):
+    def __init__(self, capacity: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.capacity = capacity
 
