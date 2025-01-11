@@ -106,6 +106,7 @@ jobs:
         run: |
           cd test/srt
           python3 test_update_weights_from_distributed.py
+          python3 test_fragment.py
 
       - name: Evaluate MoE EP accuracy (TP=2)
         timeout-minutes: 10
