@@ -1,7 +1,3 @@
-"""
-python3 -m unittest test_skip_tokenizer_init.TestSkipTokenizerInit.test_parallel_sample
-"""
-
 import json
 import unittest
 
@@ -32,8 +28,9 @@ class TestSkipTokenizerInit(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def run_decode(self, return_logprob=False, top_logprobs_num=0, n=1):
-        max_new_tokens = 32
+    def run_decode(
+        self, max_new_tokens=32, return_logprob=False, top_logprobs_num=0, n=1
+    ):
         input_ids = [128000, 791, 6864, 315, 9822, 374]  # The capital of France is
         response = requests.post(
             self.base_url + "/generate",
@@ -43,7 +40,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
                     "n": n,
-                    "stop_token_ids": [119690],
+                    "stop_token_ids": [128009],
                 },
                 "stream": False,
                 "return_logprob": return_logprob,
@@ -55,17 +52,23 @@ class TestSkipTokenizerInit(unittest.TestCase):
         print(json.dumps(ret))
 
         def assert_one_item(item):
-            self.assertEqual(
-                len(item["token_ids"]), item["meta_info"]["completion_tokens"]
-            )
-            self.assertEqual(len(item["token_ids"]), max_new_tokens)
-            assert item["meta_info"]["prompt_tokens"] == len(input_ids)
+            if item["meta_info"]["finish_reason"]["type"] == "stop":
+                self.assertEqual(item["meta_info"]["finish_reason"]["matched"], 128009)
+            else:
+                self.assertEqual(
+                    len(item["token_ids"]), item["meta_info"]["completion_tokens"]
+                )
+                self.assertEqual(len(item["token_ids"]), max_new_tokens)
+                assert item["meta_info"]["prompt_tokens"] == len(input_ids)
 
-            if return_logprob:
-                assert len(item["meta_info"]["input_token_logprobs"]) == len(
-                    input_ids
-                ), f'{len(item["meta_info"]["input_token_logprobs"])} vs. f{len(input_ids)}'
-                assert len(item["meta_info"]["output_token_logprobs"]) == max_new_tokens
+                if return_logprob:
+                    assert len(item["meta_info"]["input_token_logprobs"]) == len(
+                        input_ids
+                    ), f'{len(item["meta_info"]["input_token_logprobs"])} vs. f{len(input_ids)}'
+                    assert (
+                        len(item["meta_info"]["output_token_logprobs"])
+                        == max_new_tokens
+                    )
 
         if n == 1:
             assert_one_item(ret)
@@ -88,6 +91,9 @@ class TestSkipTokenizerInit(unittest.TestCase):
                 return_logprob=True,
                 top_logprobs_num=top_logprobs_num,
             )
+
+    def test_eos_behavior(self):
+        self.run_decode(max_new_tokens=256)
 
 
 if __name__ == "__main__":
