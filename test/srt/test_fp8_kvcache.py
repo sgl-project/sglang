@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDoubleSparsity(unittest.TestCase):
+class TestFp8Kvcache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
