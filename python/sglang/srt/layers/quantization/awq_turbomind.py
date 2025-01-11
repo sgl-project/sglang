@@ -100,10 +100,7 @@ class AWQTurbomindConfig(QuantizationConfig):
         is_valid_user_quant = user_quant is None or user_quant == "awq_turbomind"
 
         if can_convert and is_valid_user_quant:
-            msg = (
-                "The model is convertible to {} during runtime."
-                " Using {} kernel.".format(cls.get_name(), cls.get_name())
-            )
+            msg = f"The model is convertible to {cls.get_name()} during runtime. Using {cls.get_name()} kernel."
             logger.info(msg)
             return cls.get_name()
 
@@ -130,14 +127,14 @@ class AWQTurbomindConfig(QuantizationConfig):
 
     @classmethod
     def is_awq_turbomind_compatible(cls, quant_config: Dict[str, Any]):
+        if not is_cuda():
+            return False
+
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits")
         group_size = quant_config.get("group_size")
         zero_point = quant_config.get("zero_point")
-
-        if not is_cuda():
-            return False
 
         if quant_method != "awq":
             return False
@@ -172,7 +169,7 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del output_size
+
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
@@ -231,12 +228,12 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
-        qweight_tb = unpack_awq_gemm(layer.qweight.data)
-        qzeros_tb = unpack_awq_gemm(layer.qzeros.data)
-        scales_tb = layer.scales.data
+        qweight_turbomind = unpack_awq_gemm(layer.qweight.data)
+        qzeros_turbomind = unpack_awq_gemm(layer.qzeros.data)
+        scales_turbomind = layer.scales.data
 
-        qweight_tb = pack_u4_row(qweight_tb)
-        qzeros_tb = qzeros_tb.to(torch.half)
+        qweight_turbomind = pack_u4_row(qweight_turbomind)
+        qzeros_turbomind = qzeros_turbomind.to(torch.half)
 
         device_id = layer.qweight.device.index
         properties = torch.cuda.get_device_properties(device_id)
@@ -248,9 +245,9 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
             return bool(re.search(pattern, name))
 
         simt = is_16xx_series(properties.name)
-        qweight_tb = qweight_tb.contiguous()
-        scales_tb = scales_tb.contiguous()
-        qzeros_tb = qzeros_tb.contiguous()
+        qweight_turbomind = qweight_turbomind.contiguous()
+        scales_turbomind = scales_turbomind.contiguous()
+        qzeros_turbomind = qzeros_turbomind.contiguous()
 
         self.linear = _turbomind_ext.Linear(
             layer.input_size,
@@ -258,10 +255,12 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
             self.quant_config.weight_bits,
             self.quant_config.group_size,
         )
-        self.linear.post_init(qweight_tb, scales_tb, qzeros_tb, simt)
-        replace_parameter(layer, "qweight", qweight_tb)
-        replace_parameter(layer, "scales", scales_tb)
-        replace_parameter(layer, "qzeros", qzeros_tb)
+        self.linear.post_init(
+            qweight_turbomind, scales_turbomind, qzeros_turbomind, simt
+        )
+        replace_parameter(layer, "qweight", qweight_turbomind)
+        replace_parameter(layer, "scales", scales_turbomind)
+        replace_parameter(layer, "qzeros", qzeros_turbomind)
 
     def apply(
         self,
@@ -270,9 +269,6 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        input_dtype = x.dtype
-        if input_dtype != torch.float16:
-            x = x.half()
         x = x.view(-1, x.shape[-1])
         out_shape = x.shape[:-1] + (layer.output_size,)
         out = torch.empty(

@@ -13,7 +13,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["requests", "tqdm", "numpy", "IPython", "setproctitle", "turbomind"]
+dependencies = ["requests", "tqdm", "numpy", "IPython", "setproctitle"]
 
 [project.optional-dependencies]
 runtime_common = [

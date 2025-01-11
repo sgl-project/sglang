@@ -14,6 +14,7 @@
 
 import json
 import logging
+import sys
 from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
 
@@ -230,7 +231,7 @@ class ModelConfig:
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
 
-        if quant_cfg is not None and self.quantization != "awq_turbomind":
+        if quant_cfg is not None and not quantization_in_turbomind(self.quantization):
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
@@ -272,6 +273,16 @@ class ModelConfig:
                     "non-quantized models.",
                     self.quantization,
                 )
+
+        if quantization_in_turbomind(self.quantization):
+            try:
+                import subprocess
+
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "turbomind"], check=True
+                )
+            except subprocess.CalledProcessError:
+                raise ValueError(f"Install Turbomind failed.")
 
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
@@ -401,3 +412,10 @@ def is_multimodal_model(model_architectures: List[str]):
 
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
+
+
+def quantization_in_turbomind(quantization: str) -> bool:
+    if quantization in ["awq_turbomind"]:
+        return True
+    else:
+        return False
