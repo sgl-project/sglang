@@ -5,6 +5,10 @@ import traceback
 import unittest
 from multiprocessing import Process
 
+import torch
+from torch.distributed.device_mesh import init_device_mesh
+
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -48,6 +52,17 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
     try:
         print(f"subprocess[{tp_rank=}] Start {os.environ['CUDA_VISIBLE_DEVICES']=}")
 
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "23456"
+        torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
+
+        mesh_kwargs = dict(mesh_shape=(_TP_SIZE, 1), mesh_dim_names=["tp", "pp"])
+        inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
+        inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
+        print(
+            f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
+        )
+
         fragment = EngineFragment(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             mem_fraction_static=0.1,
@@ -57,6 +72,12 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             tp_rank=tp_rank,
             gpu_id=tp_rank,
             nccl_port=nccl_port,
+            parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
+                device_mesh_device=inference_device_mesh_device,
+                device_mesh_cpu=inference_device_mesh_cpu,
+                dim_tp="tp",
+                dim_pp="pp",
+            ),
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
