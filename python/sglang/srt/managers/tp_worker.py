@@ -208,8 +208,14 @@ class TpModelWorker:
         )
         return success, message
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]], load_format: Optional[str] = None):
-        success, message = self.model_runner.update_weights_from_tensor(named_tensors, load_format)
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
+        success, message = self.model_runner.update_weights_from_tensor(
+            named_tensors, load_format
+        )
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):

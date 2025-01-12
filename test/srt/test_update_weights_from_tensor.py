@@ -1,8 +1,9 @@
 import time
 import unittest
 
-import sglang as sgl
 import torch
+
+import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
@@ -31,10 +32,14 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
         write_param_name = f"model.layers.6.self_attn.qkv_proj.weight"
         read_param_name = f"model.layers.6.self_attn.k_proj.weight"
 
-        _check_param(engine, read_param_name, [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178])
+        _check_param(
+            engine, read_param_name, [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178]
+        )
 
         new_tensor = torch.full((3072, 2048), 1.5)
-        engine.update_weights_from_tensor([(write_param_name, new_tensor)], load_format='direct')
+        engine.update_weights_from_tensor(
+            [(write_param_name, new_tensor)], load_format="direct"
+        )
 
         _check_param(engine, read_param_name, [1.5] * 5)
 
