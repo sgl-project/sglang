@@ -21,25 +21,27 @@ if TYPE_CHECKING:
 
 
 class HiPCudaGraphRunner(CudaGraphRunner):
+    model_runner: "HiPModelRunner"
 
     def __init__(self, model_runner: "HiPModelRunner"):
         super().__init__(model_runner)
 
     def can_run(self, forward_batch: ForwardBatch):
         use_cached_mask = forward_batch.hip_use_cached_mask
+        num_stage_cached = forward_batch.hip_metadata_cached_stage
 
         if self.enable_dp_attention:
             min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
                 forward_batch.global_num_tokens
             )
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                (min_num_tokens == max_num_tokens and (max_num_tokens, use_cached_mask) in self.graphs)
+                (min_num_tokens == max_num_tokens and (max_num_tokens, use_cached_mask, num_stage_cached) in self.graphs)
                 if self.disable_padding
                 else max_num_tokens <= self.max_bs
             )
         else:
             is_bs_supported = (
-                (forward_batch.batch_size, use_cached_mask) in self.graphs
+                (forward_batch.batch_size, use_cached_mask, num_stage_cached) in self.graphs
                 if self.disable_padding
                 else forward_batch.batch_size <= self.max_bs
             )
@@ -56,6 +58,13 @@ class HiPCudaGraphRunner(CudaGraphRunner):
 
     def capture(self):
         with graph_capture() as graph_capture_context:
+            num_stages = len(self.model_runner.hip_attention_config.layers[0].stages)
+            for layer_config in self.model_runner.hip_attention_config.layers:
+                assert num_stages == len(layer_config.stages)
+            cache_configs = [(True, None)]
+            for i_stage in range(num_stages):
+                cache_configs.append((False, i_stage))
+            
             self.stream = graph_capture_context.stream
             capture_bs = (
                 tqdm.tqdm(self.capture_bs)
@@ -69,15 +78,25 @@ class HiPCudaGraphRunner(CudaGraphRunner):
                     bs,
                     self.model_runner.tp_group,
                 ) as forward:
-                    for use_cached_mask in [False, True]:
+                    for use_cached_mask, num_cached_stages in cache_configs:
                         (
                             graph,
                             output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward, use_cached_mask)
-                        self.graphs[(bs, use_cached_mask)] = graph
-                        self.output_buffers[(bs, use_cached_mask)] = output_buffers
+                        ) = self.capture_one_batch_size(
+                            bs, forward, 
+                            use_cached_mask, num_cached_stages
+                        )
+                        graph_handle = (bs, use_cached_mask, num_cached_stages)
+                        self.graphs[graph_handle] = graph
+                        self.output_buffers[graph_handle] = output_buffers
 
-    def capture_one_batch_size(self, bs: int, forward: Callable, hip_use_cached_mask: bool = False):
+    def capture_one_batch_size(
+        self, 
+        bs: int, 
+        forward: Callable, 
+        hip_use_cached_mask: bool = False,
+        hip_num_cached_stages: int = 0,
+    ):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
@@ -122,6 +141,7 @@ class HiPCudaGraphRunner(CudaGraphRunner):
                 attn_backend=self.model_runner.attn_backend,
                 hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
                 hip_use_cached_mask=hip_use_cached_mask,
+                hip_metadata_cached_stage=hip_num_cached_stages,
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=seq_lens_sum,
                 encoder_lens=encoder_lens,
@@ -192,7 +212,7 @@ class HiPCudaGraphRunner(CudaGraphRunner):
         )
 
         # Replay
-        key = (bs, forward_batch.hip_use_cached_mask)
+        key = (bs, forward_batch.hip_use_cached_mask, forward_batch.hip_metadata_cached_stage)
         self.graphs[key].replay()
         next_token_logits = self.output_buffers[key][:raw_bs]
 

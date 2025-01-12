@@ -144,6 +144,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         if self.enable_async:
             def thread_main():
                 try:
+                    # BUG(heejun): i think this line is quite suspicious hmm
                     start_event.synchronize()
                     stream = torch.cuda.Stream(device=self.device, priority=0)
 

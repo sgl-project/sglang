@@ -1203,7 +1203,7 @@ class ModelWorkerBatch:
 
     # Use cached mask for HiP Attention
     hip_use_cached_mask: Optional[bool] = None
-
+    hip_metadata_cached_stages: Optional[int] = None
 
 @triton.jit
 def write_req_to_token_pool_triton(

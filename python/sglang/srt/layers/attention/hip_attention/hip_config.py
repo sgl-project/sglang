@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, InitVar
-from typing import Optional
+from typing import List, Optional, Union
 
 from hip.models.hip_attention.gen3.attention_metadata import ScanStage
 
@@ -72,8 +72,8 @@ class HiPAttentionPerLayerConfig:
 class HiPAttentionConfig:
     dense_layers: list[int] = field(default_factory=lambda: [0, 1, 2])
     block_sparse_block_size_q: int = 64
-    metadata_cache_max_batch_size: int = 256
-    mask_refresh_interval: int = 4
+    metadata_cache_max_batch_size: int = 32
+    mask_refresh_interval: Union[int, List[int]] = field(default_factory=lambda: [9, 6, 3])
     using_extend: bool = True
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
         HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 1024, 'sink_token_size': 256}),
@@ -117,6 +117,7 @@ class HiPAttentionConfig:
                 self.metadata_cache_max_batch_size = parsed_json['metadata_cache_max_batch_size']
                 parsed_json.pop('metadata_cache_max_batch_size')
             if 'mask_refresh_interval' in parsed_json:
+                assert isinstance(parsed_json['mask_refresh_interval'], (int, list))
                 self.mask_refresh_interval = parsed_json['mask_refresh_interval']
                 parsed_json.pop('mask_refresh_interval')
             if 'using_extend' in parsed_json:

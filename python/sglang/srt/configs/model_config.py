@@ -69,6 +69,7 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
+                # FIXME: ignore this env flag only when HiP + context extension activated
                 logger.warning(
                     f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                     f"This may lead to incorrect model outputs or CUDA errors."
