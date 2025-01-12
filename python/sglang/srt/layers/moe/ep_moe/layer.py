@@ -29,18 +29,11 @@ from sglang.srt.utils import is_hip, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
-# 用于执行分组矩阵乘法的Runner类
+
 class GroupedGemmRunner(torch.nn.Module):
-    # flashinfer的gemm包装器,用于加速计算
     flashinfer_gemm_warpper = None
 
     def __init__(self, device, use_flashinfer: bool = False):
-        """
-        初始化GroupedGemmRunner
-        Args:
-            device: 运行设备
-            use_flashinfer: 是否使用flashinfer加速
-        """
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
@@ -49,14 +42,8 @@ class GroupedGemmRunner(torch.nn.Module):
 
     @classmethod
     def _init_flashinfer_wrapper(cls, device):
-        """
-        初始化flashinfer的gemm包装器
-        Args:
-            device: 运行设备
-        """
         from flashinfer import SegmentGEMMWrapper
 
-        # 创建工作空间缓冲区
         workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.int8, device=device
         )
@@ -65,18 +52,17 @@ class GroupedGemmRunner(torch.nn.Module):
     # c = a * b
     def forward(
         self,
-        a: torch.Tensor,  # 输入矩阵a
-        b: torch.Tensor,  # 输入矩阵b
-        c: torch.Tensor,  # 输出矩阵c
-        batch_size: int,  # batch大小
-        weight_column_major: bool,  # 权重是否为列主序
-        seg_indptr: Optional[torch.Tensor] = None,  # 分段指针
-        weight_indices: Optional[torch.Tensor] = None,  # 权重索引
-        use_fp8_w8a8: bool = False,  # 是否使用fp8量化
-        scale_a: torch.Tensor = None,  # a的缩放因子
-        scale_b: torch.Tensor = None,  # b的缩放因子
+        a: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
+        batch_size: int,
+        weight_column_major: bool,
+        seg_indptr: Optional[torch.Tensor] = None,
+        weight_indices: Optional[torch.Tensor] = None,
+        use_fp8_w8a8: bool = False,
+        scale_a: torch.Tensor = None,
+        scale_b: torch.Tensor = None,
     ):
-        """执行分组矩阵乘法"""
         if self.use_flashinfer:
             # TODO: flashinfer
             assert False
@@ -90,7 +76,6 @@ class GroupedGemmRunner(torch.nn.Module):
                 weight_indices=weight_indices,
             )
         else:
-            # 使用triton实现的分组矩阵乘法
             assert weight_column_major == True
             c = grouped_gemm_triton(
                 a,
@@ -109,22 +94,9 @@ class GroupedGemmRunner(torch.nn.Module):
 
 class EPMoE(torch.nn.Module):
     """
-    MoE专家并行实现
-    
-    Args:
-        num_experts: 专家总数
-        top_k: 每个token选择的专家数量
-        hidden_size: 隐藏层大小
-        intermediate_size: 中间层大小
-        params_dtype: 参数数据类型,默认为None使用系统默认类型
-        renormalize: 是否重新归一化,默认True
-        use_grouped_topk: 是否使用分组topk,默认False
-        num_expert_group: 专家组数量,仅在use_grouped_topk=True时使用
-        topk_group: 每组选择的专家数量,仅在use_grouped_topk=True时使用
-        quant_config: 量化配置,默认None
-        tp_size: 张量并行大小,默认None
-        prefix: 前缀,默认空字符串
-        correction_bias: 修正偏置,默认None
+    MoE Expert Parallel Impl
+
+
     """
 
     def __init__(
@@ -145,24 +117,20 @@ class EPMoE(torch.nn.Module):
     ):
         super().__init__()
 
-        # 如果未指定参数类型,使用系统默认类型
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
-        # 设置张量并行相关参数
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        # 设置专家相关参数
         self.num_experts = num_experts
-        assert self.num_experts % self.tp_size == 0  # 确保专家数可以被tp_size整除
-        self.num_experts_per_partition = self.num_experts // self.tp_size  # 每个分区的专家数
-        self.start_expert_id = self.tp_rank * self.num_experts_per_partition  # 当前分区起始专家ID
-        self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1  # 当前分区结束专家ID
+        assert self.num_experts % self.tp_size == 0
+        self.num_experts_per_partition = self.num_experts // self.tp_size
+        self.start_expert_id = self.tp_rank * self.num_experts_per_partition
+        self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
 
-        # 设置其他参数
         self.top_k = top_k
         self.intermediate_size = intermediate_size
         self.renormalize = renormalize
@@ -173,7 +141,6 @@ class EPMoE(torch.nn.Module):
         self.topk_group = topk_group
         self.correction_bias = correction_bias
 
-        # 设置量化方法
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
             self.use_fp8_w8a8 = False
@@ -186,7 +153,6 @@ class EPMoE(torch.nn.Module):
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
 
-        # 创建权重
         self.quant_method.create_weights(
             layer=self,
             num_experts_per_partition=self.num_experts_per_partition,
@@ -196,26 +162,16 @@ class EPMoE(torch.nn.Module):
             weight_loader=self.weight_loader,
         )
 
-        # 初始化分组矩阵乘法运行器
         self.grouped_gemm_runner = None
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        """前向传播函数
-        Args:
-            hidden_states: 输入的隐藏状态张量
-            router_logits: 路由器输出的logits张量
-        Returns:
-            output: 经过MoE层处理后的输出张量
-        """
         assert self.quant_method is not None
 
-        # 初始化分组矩阵乘法运行器
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
 
-        # 选择专家,获取topk权重和ID
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -227,19 +183,15 @@ class EPMoE(torch.nn.Module):
             correction_bias=self.correction_bias,
         )
 
-        # 预处理topk ID,获取重排序信息
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
 
-        # 初始化门控输入张量
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
             device=hidden_states.device,
             dtype=self.fp8_dtype if self.use_fp8_w8a8 else hidden_states.dtype,
         )
-        
-        # 动态量化时计算输入缩放因子
         if self.activation_scheme == "dynamic":
             max_value = (
                 torch.max(hidden_states)
@@ -248,7 +200,7 @@ class EPMoE(torch.nn.Module):
             )
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
-        # 预重排序,重新排列输入数据
+        # PreReorder
         pre_reorder_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
             gateup_input,
@@ -262,7 +214,6 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
 
-        # 获取当前rank的分段指针和权重索引
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
@@ -270,8 +221,7 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=torch.int64,
         )
-        
-        # 第一次分组矩阵乘法
+        # GroupGemm-0
         gateup_output = torch.empty(
             gateup_input.shape[0],
             self.w13_weight.shape[1],
@@ -291,7 +241,7 @@ class EPMoE(torch.nn.Module):
             scale_b=self.w13_weight_scale,
         )
 
-        # 激活函数处理
+        # Act
         down_input = torch.empty(
             gateup_output.shape[0],
             gateup_output.shape[1] // 2,
@@ -315,7 +265,7 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
 
-        # 第二次分组矩阵乘法
+        # GroupGemm-1
         down_output = torch.empty(
             down_input.shape[0],
             self.w2_weight.shape[1],
@@ -335,7 +285,7 @@ class EPMoE(torch.nn.Module):
             scale_b=self.w2_weight_scale,
         )
 
-        # 后重排序,生成最终输出
+        # PostReorder
         output = torch.empty_like(hidden_states)
         post_reorder_triton_kernel[(hidden_states.size(0),)](
             down_output,
@@ -359,21 +309,7 @@ class EPMoE(torch.nn.Module):
         ckpt_up_proj_name: str,
         num_experts: int,
     ) -> List[Tuple[str, str, int, str]]:
-        """生成专家参数映射关系
-        
-        Args:
-            ckpt_gate_proj_name: 检查点中gate投影层的名称
-            ckpt_down_proj_name: 检查点中down投影层的名称 
-            ckpt_up_proj_name: 检查点中up投影层的名称
-            num_experts: 专家总数
-            
-        Returns:
-            List[Tuple[str, str, int, str]]: 返回参数映射列表,每个元素为元组:
-                - param_name: 参数名称前缀(w13或w2)
-                - weight_name: 权重完整名称
-                - expert_id: 专家ID
-                - shard_id: 分片ID(w1/w2/w3)
-        """
+
         return [
             # (param_name, weight_name, expert_id, shard_id)
             (
@@ -402,18 +338,6 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        """加载权重参数
-        
-        Args:
-            param: 目标参数
-            loaded_weight: 加载的权重张量
-            weight_name: 权重名称
-            shard_id: 分片ID(w1/w2/w3)
-            expert_id: 专家ID
-            
-        Raises:
-            ValueError: 当shard_id不合法时抛出异常
-        """
         if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
             return
         expert_id = expert_id - self.start_expert_id
@@ -423,7 +347,7 @@ class EPMoE(torch.nn.Module):
                 f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
             )
 
-        # 处理FP8缩放因子的特殊情况
+        # Special case for fp8 scales.
         if "scale" in weight_name:
             self._load_fp8_scale(
                 param.data, loaded_weight, weight_name, shard_id, expert_id
@@ -448,21 +372,9 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        """加载FP8量化的缩放因子
-        
-        Args:
-            param: 目标参数
-            loaded_weight: 加载的权重张量
-            weight_name: 权重名称
-            shard_id: 分片ID(w1/w2/w3)
-            expert_id: 专家ID
-            
-        Raises:
-            ValueError: 当输入缩放因子不相等时抛出异常
-        """
         param_data = param.data
 
-        # 输入缩放因子可以直接加载,且必须相等
+        # Input scales can be loaded directly and should be equal.
         if "input_scale" in weight_name:
             if (
                 param_data[expert_id] != 1
@@ -474,14 +386,15 @@ class EPMoE(torch.nn.Module):
                     f"vs. {loaded_weight}"
                 )
             param_data[expert_id] = loaded_weight
-        # 权重缩放因子
+        # Weight scales
         elif "weight_scale" in weight_name:
-            # 合并列的情况(gate_up_proj)
+            # If we are in merged column case (gate_up_proj)
             if shard_id in ("w1", "w3"):
-                # 需要保留w1和w3的权重缩放因子,因为加载权重后需要重新量化
+                # We have to keep the weight scales of w1 and w3 because
+                # we need to re-quantize w1/w3 weights after weight loading.
                 idx = 0 if shard_id == "w1" else 1
                 param_data[expert_id][idx] = loaded_weight
-            # 行并行的情况(down_proj)
+            # If we are in the row parallel case (down_proj)
             else:
                 param_data[expert_id] = loaded_weight
 
