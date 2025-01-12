@@ -18,7 +18,7 @@ For KV cache offloading preview users, install `gmlwns2000/hip-ainl` first.
 # Maximum batch size to capture. Larger size requires more temporary buffers.
 export SRT_MAX_BATCH=1;
 # You can disable chunked prefill by change this into -1.
-export CHUNK_PREFILL=8192;
+export CHUNK_PREFILL=16384;
 # Any RoPE based attention models are supported in theoritically.
 # However currently we are supports `llama.py` models. (Llama Family)
 export MODEL="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4";
