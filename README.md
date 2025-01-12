@@ -12,7 +12,7 @@
 
 --------------------------------------------------------------------------------
 
-For KV cache offloading preview users,
+For KV cache offloading preview users, install `gmlwns2000/hip-ainl` first.
 
 ```bash
 # Maximum batch size to capture. Larger size requires more temporary buffers.
