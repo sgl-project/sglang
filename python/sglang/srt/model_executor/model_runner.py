@@ -19,12 +19,10 @@ import logging
 import time
 from typing import List, Optional, Tuple
 
+import sglang.srt.distributed
 import torch
 import torch.distributed as dist
 import vllm.distributed
-from vllm.distributed import get_tp_group, set_custom_all_reduce
-
-import sglang.srt.distributed
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -57,6 +55,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
+from vllm.distributed import get_tp_group, set_custom_all_reduce
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +159,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -458,8 +457,14 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]], load_format: Optional[str] = None):
-        self.model.load_weights(named_tensors)
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]],
+                                   load_format: Optional[str] = None):
+        if load_format == 'megatron':
+            TODO
+        elif load_format is None:
+            self.model.load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f'Unknown load_format={load_format}')
         return True, "Success"
 
     def get_weights_by_name(
@@ -658,7 +663,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
