@@ -55,7 +55,6 @@ class ServerArgs:
     is_embedding: bool = False
     revision: Optional[str] = None
     skip_tokenizer_init: bool = False
-    return_token_ids: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -297,6 +296,11 @@ class ServerArgs:
             "always use the slow tokenizer.",
         )
         parser.add_argument(
+            "--skip-tokenizer-init",
+            action="store_true",
+            help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
@@ -404,18 +408,6 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
-        parser.add_argument(
-            "--skip-tokenizer-init",
-            action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request",
-        )
-        parser.add_argument(
-            "--return-token-ids",
-            action="store_true",
-            default=ServerArgs.return_token_ids,
-            help="Whether to return token IDs in the output, this may introduce additional overhead.",
-        )
-
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
