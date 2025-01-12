@@ -3,6 +3,7 @@
 We research the capabilites of two configurations of H200 NVIDIA GPUs:
 - Single-node 8xH200 (BF16/FP8)
 - Multi-node 2x8xH200 (BF16/FP8)
+  - using Infiniband (400Gbps) with `nccl=2.21.5`
 
 For the benchmarking, we choose as baseline parameters:
 
