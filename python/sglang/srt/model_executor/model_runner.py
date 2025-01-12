@@ -459,8 +459,9 @@ class ModelRunner:
 
     def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]],
                                    load_format: Optional[str] = None):
-        if load_format == 'megatron':
-            TODO
+        # TODO should we name it "direct" or "megatron"?
+        if load_format == 'direct':
+            _model_load_weights_direct(self.model, named_tensors)
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
@@ -778,3 +779,7 @@ class ModelRunner:
         if rope_scaling is None:
             return False
         return rope_scaling.get("type", None) == "mrope"
+
+
+def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+    TODO
