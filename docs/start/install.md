@@ -13,7 +13,7 @@ Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/
 ## Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.4.1.post4 https://github.com/sgl-project/sglang.git
+git clone -b v0.4.1.post5 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -26,7 +26,7 @@ Note: To AMD ROCm system with Instinct/MI GPUs, do following instead:
 
 ```
 # Use the last release branch
-git clone -b v0.4.1.post4 https://github.com/sgl-project/sglang.git
+git clone -b v0.4.1.post5 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -51,7 +51,7 @@ docker run --gpus all \
 Note: To AMD ROCm system with Instinct/MI GPUs, it is recommended to use `docker/Dockerfile.rocm` to build images, example and usage as below:
 
 ```bash
-docker build --build-arg SGL_BRANCH=v0.4.1.post4 -t v0.4.1.post4-rocm620 -f Dockerfile.rocm .
+docker build --build-arg SGL_BRANCH=v0.4.1.post5 -t v0.4.1.post5-rocm620 -f Dockerfile.rocm .
 
 alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/dri --ipc=host \
     --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -60,11 +60,11 @@ alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/d
 drun -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<secret>" \
-    v0.4.1.post4-rocm620 \
+    v0.4.1.post5-rocm620 \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 
 # Till flashinfer backend available, --attention-backend triton --sampling-backend pytorch are set by default
-drun v0.4.1.post4-rocm620 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
+drun v0.4.1.post5-rocm620 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
 ## Method 4: Using docker compose
