@@ -91,6 +91,7 @@ class HiPAttentionConfig:
 
     def __post_init__(self, parsed_json: dict | None):
         super().__init__()
+        
         if parsed_json is not None:
             if 'apply_v_dot' in parsed_json:
                 self.apply_v_dot = parsed_json['apply_v_dot']
@@ -131,3 +132,10 @@ class HiPAttentionConfig:
                 parsed_json.pop('layers')
             if parsed_json:
                 raise ValueError(f'Unknown keys in json: {parsed_json.keys()}')
+        
+        num_stages = len(self.layers[0].stages)
+        for layer_config in self.layers:
+            assert num_stages == len(layer_config.stages)
+        
+        if isinstance(self.mask_refresh_interval, int):
+            self.mask_refresh_interval = [self.mask_refresh_interval, ] * num_stages

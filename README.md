@@ -12,6 +12,47 @@
 
 --------------------------------------------------------------------------------
 
+For KV cache offloading preview users,
+
+```bash
+# Maximum batch size to capture. Larger size requires more temporary buffers.
+export SRT_MAX_BATCH=1;
+# You can disable chunked prefill by change this into -1.
+export CHUNK_PREFILL=8192;
+# Any RoPE based attention models are supported in theoritically.
+# However currently we are supports `llama.py` models. (Llama Family)
+export MODEL="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4";
+# You can set upper limit of maximum extended context window. 
+# Training-free and unlimited.
+export EXTENDED_CONTEXT_LEN=196608;
+# You can change this flag into 1, if you want test online cache update. (exprimental)
+export DEBUG_ONLINE=0;
+
+python -m sglang.launch_server \
+    --model-path $MODEL \
+    # Supports auto and fp8_e5m2. Online cache updates are not supports fp8.
+    --kv-cache-dtype auto \
+    # You can increase this to use multi GPU.
+    --tp-size 1 \
+    --port 30000 \
+    --chunked-prefill-size $CHUNK_PREFILL \
+    --max-prefill-tokens $CHUNK_PREFILL \
+    --context-length $EXTENDED_CONTEXT_LEN \
+    --max-total-tokens $EXTENDED_CONTEXT_LEN \
+    --enable-hip-attention \
+    # You can turn of this flag to disable offloading. 
+    # Offloading may have difference in decoding result.
+    --enable-hip-offload \
+    # For on-gpu offloading cache in masking kernel, 
+    # allocate size of cache in num of tokens. This is shared by whole batch.
+    --hip-max-mask-cache-token-size 32000 \
+    # For on-gpu offloading cache in block sparse attention kernel, 
+    # allocate size of cache in num of tokens. This is shared by whole batch.
+    --hip-max-sa-cache-token-size 10000;
+```
+
+--------------------------------------------------------------------------------
+
 | [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/)
 | [**Documentation**](https://sgl-project.github.io/)
 | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2tmmp6flg-89dOlJW2TjnBrTRk1I_~GA)
