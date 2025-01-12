@@ -36,38 +36,43 @@
 ## Other runtime options
 
 * `tp_size`: The number of GPUs the model weights get sharded over. Mainly for memory efficency rather than for high throughput, see [this blogpost](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works).
-
-* `stream_interval`: TODO
-
+* `stream_interval`: Interval (in tokens) for streaming responses. Smaller = smoother streaming, larger = better throughput.
 * `random_seed`: Can be used to enforce more deterministic behavior. 
-
 * `watchdog_timeout`: Adjusts the watchdog thread’s timeout before killing the server if batch generation takes too long.
-
 * `download_dir`: Use to override the default Hugging Face cache directory for model weights.
-
 * `base_gpu_id`: Use to adjust first GPU used to distribute the model across available GPUs.
 
 
 ## Logging
 
-TODO
+* `log_level`: Global log verbosity.
+* `log_level_http`: Separate verbosity level for the HTTP server logs (if unset, defaults to `log_level`).
+* `log_requests`: Logs the inputs and outputs of all requests for debugging.
+* `show_time_cost`: Prints or logs detailed timing info for internal operations (helpful for performance tuning).
+* `enable_metrics`: Exports Prometheus-like metrics for request usage and performance.
+* `decode_log_interval`: How often (in tokens) to log decode progress.
 
 ## API related
 
-TODO
+* `api_key`: Sets an API key for the server or the OpenAI-compatible API. Clients must provide this key for authorized requests.
+* `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
+* `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
 ## Data parallelism 
 
 * `dp_size`: The number of data-parallel copies of the model. For maximum throughput, maximize `dp_size` and only split weights via tensor parallelism as needed for memory. Ensure `dp_size * tp_size = N` where `N` is the total number of GPUs.
-
-* `load_balance_method`: TODO
+* `load_balance_method`: Load balancing strategy for data parallel requests.
 
 ## Expert parallelism
 
 * `ep_size`: For MoE models we can distribute the experts onto this number of GPUs. Remember to shard the rest of the model weights with `tp_size=ep_size`, for detailed benchmarking [see the PR that implemented this technique](https://github.com/sgl-project/sglang/pull/2203).
 
 ## Multi-node distributed serving
-TODO
+
+* `dist_init_addr`: The TCP address used for initializing PyTorch’s distributed backend (e.g. `192.168.0.2:25000`).
+* `nnodes`: Total number of nodes in the cluster.
+* `node_rank`: Rank (ID) of this node among the `nnodes` in the distributed setup.
+
 
 ## Model override args in JSON
 
@@ -85,10 +90,23 @@ TODO
 * `grammar_backend`: You may want to change the default `outlines` grammar backend to `xgrammar` backend for [10 x speedup](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#fast-structured-outputs-with-xgrammar) in case you want to perform constrained decoding.
 
 ## Speculative decoding
-TODO
+
+* `speculative_draft_model_path`: In case we want to perform speculative decoding we can use this parameter for selection of the draft model.
+* `speculative_algorithm`: The algorithm for speculative decoding. Currently only [Eagle](https://arxiv.org/html/2406.16858v1) is supported. Note that the radix cache, chunked prefill, and overlap scheduler are disabled when using eagle speculative decoding.
+* `speculative_num_steps`: How many draft passes we run before verifying.
+* `speculative_num_draft_tokens`: The number of tokens proposed in a draft.
+* `speculative_eagle_topk`: The number of top candidates we keep for verification at each step.
+
 
 ## Double Sparsity
-TODO
+
+* `enable_double_sparsity`: Enables [double sparsity](https://arxiv.org/html/2408.07092v2) option.
+* `ds_channel_config_path`: After identifiying important channels offline we may place this information into a JSON and use only these during inference.
+* `ds_heavy_channel_num`: How many channel indices we keep for each layer. 
+* `ds_heavy_token_num`: How many tokens we choose for attention. Starting from the one with highest attention score for current query token.
+* `ds_heavy_channel_type`: The type of heavy channels.
+* `ds_sparse_decode_threshold`: Skip applying the sparse decode path if `max_seq_len` < this threshold.
 
 ## Optimization/debug options
+
 TODO
