@@ -6,7 +6,7 @@
 #include "vectorization.cuh"
 
 template <typename scalar_t>
-__global__ void sampling_scaling_penalties_kernel_vec4(
+__global__ void sampling_scaling_penalties_kernel(
     const scalar_t* logits,
     const scalar_t* scaling_penalties,
     scalar_t* output,
@@ -43,23 +43,6 @@ __global__ void sampling_scaling_penalties_kernel_vec4(
     }
 }
 
-template <typename scalar_t>
-__global__ void sampling_scaling_penalties_kernel(
-    const scalar_t* logits,
-    const scalar_t* scaling_penalties,
-    scalar_t* output,
-    const int32_t numel) {
-    
-    const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int32_t stride = blockDim.x * gridDim.x;
-    
-    for (int32_t i = tid; i < numel; i += stride) {
-        scalar_t logit = logits[i];
-        scalar_t penalty = scaling_penalties[i];
-        output[i] = logit > 0 ? logit / penalty : logit * penalty;
-    }
-}
-
 torch::Tensor sampling_scaling_penalties(const torch::Tensor& logits, const torch::Tensor& scaling_penalties) {
     auto output = torch::empty_like(logits);
     const auto numel = logits.numel();
@@ -69,21 +52,12 @@ torch::Tensor sampling_scaling_penalties(const torch::Tensor& logits, const torc
     
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
         logits.scalar_type(), "sampling_scaling_penalties_kernel", ([&] {
-        if (logits.is_contiguous() && scaling_penalties.is_contiguous() && numel % 4 == 0) {
-            const int blocks = (numel + threads * 4 - 1) / (threads * 4);
-            sampling_scaling_penalties_kernel_vec4<scalar_t><<<blocks, threads, 0, stream>>>(
-                logits.data_ptr<scalar_t>(),
-                scaling_penalties.data_ptr<scalar_t>(),
-                output.data_ptr<scalar_t>(),
-                numel);
-        } else {
-            const int blocks = (numel + threads - 1) / threads;
-            sampling_scaling_penalties_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-                logits.data_ptr<scalar_t>(),
-                scaling_penalties.data_ptr<scalar_t>(),
-                output.data_ptr<scalar_t>(),
-                numel);
-        }
+        const int blocks = (numel + threads * 4 - 1) / (threads * 4);
+        sampling_scaling_penalties_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            logits.data_ptr<scalar_t>(),
+            scaling_penalties.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            numel);
     }));
 
     return output;
