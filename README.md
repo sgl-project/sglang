@@ -15,6 +15,8 @@
 For KV cache offloading preview users, install `gmlwns2000/hip-ainl` first.
 
 ```bash
+# Following setting is tested on 1x RTX 4090 24GB
+
 # Maximum batch size to capture. Larger size requires more temporary buffers.
 export SRT_MAX_BATCH=1;
 # You can disable chunked prefill by change this into -1.
