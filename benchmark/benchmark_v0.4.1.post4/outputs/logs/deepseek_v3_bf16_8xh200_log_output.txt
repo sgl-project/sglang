@@ -1,0 +1,145 @@
+nohup: ignoring input
+Namespace(backend='sglang', base_url=None, host='0.0.0.0', port=40000, dataset_name='random', dataset_path='', model='deepseek-ai/DeepSeek-V3', tokenizer=None, num_prompts=300, sharegpt_output_len=None, random_input_len=1024, random_output_len=1024, random_range_ratio=1.0, request_rate=1.0, max_concurrency=None, seed=1, multi=False, request_rate_range='2,34,2', output_file='deepseek_v3_8xh200_BF16_online_output.jsonl', disable_tqdm=False, disable_stream=False, disable_ignore_eos=False, return_logprob=False, extra_request_body=None, gen_num_groups=64, gen_prompts_per_group=16, gen_system_prompt_len=2048, gen_question_len=128, gen_output_len=256, profile=False, lora_name=None)
+
+#Input tokens: 307200
+#Output tokens: 307200
+Starting initial single prompt test run...
+Initial test run completed. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang    
+Traffic request rate:                    1.0       
+Max reqeuest concurrency:                not set   
+Successful requests:                     300       
+Benchmark duration (s):                  478.05    
+Total input tokens:                      307200    
+Total generated tokens:                  307200    
+Total generated tokens (retokenized):    306099    
+Request throughput (req/s):              0.63      
+Input token throughput (tok/s):          642.60    
+Output token throughput (tok/s):         642.60    
+Total token throughput (tok/s):          1285.21   
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   215967.43 
+Median E2E Latency (ms):                 213466.29 
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1385.94   
+Median TTFT (ms):                        578.54    
+P99 TTFT (ms):                           9433.96   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          209.76    
+Median TPOT (ms):                        207.72    
+P99 TPOT (ms):                           263.40    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           209.76    
+Median ITL (ms):                         157.87    
+P99 ITL (ms):                            898.72    
+==================================================
+Namespace(backend='sglang', base_url=None, host='0.0.0.0', port=40000, dataset_name='random', dataset_path='', model='deepseek-ai/DeepSeek-V3', tokenizer=None, num_prompts=600, sharegpt_output_len=None, random_input_len=1024, random_output_len=1024, random_range_ratio=1.0, request_rate=2.0, max_concurrency=None, seed=1, multi=False, request_rate_range='2,34,2', output_file='deepseek_v3_8xh200_BF16_online_output.jsonl', disable_tqdm=False, disable_stream=False, disable_ignore_eos=False, return_logprob=False, extra_request_body=None, gen_num_groups=64, gen_prompts_per_group=16, gen_system_prompt_len=2048, gen_question_len=128, gen_output_len=256, profile=False, lora_name=None)
+
+#Input tokens: 614400
+#Output tokens: 614400
+Starting initial single prompt test run...
+Initial test run completed. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang    
+Traffic request rate:                    2.0       
+Max reqeuest concurrency:                not set   
+Successful requests:                     600       
+Benchmark duration (s):                  465.57    
+Total input tokens:                      614400    
+Total generated tokens:                  614400    
+Total generated tokens (retokenized):    612168    
+Request throughput (req/s):              1.29      
+Input token throughput (tok/s):          1319.68   
+Output token throughput (tok/s):         1319.68   
+Total token throughput (tok/s):          2639.36   
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   233050.15 
+Median E2E Latency (ms):                 233187.80 
+---------------Time to First Token----------------
+Mean TTFT (ms):                          653.21    
+Median TTFT (ms):                        593.40    
+P99 TTFT (ms):                           1171.34   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          227.17    
+Median TPOT (ms):                        227.37    
+P99 TPOT (ms):                           291.99    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           227.17    
+Median ITL (ms):                         160.69    
+P99 ITL (ms):                            925.49    
+==================================================
+Namespace(backend='sglang', base_url=None, host='0.0.0.0', port=40000, dataset_name='random', dataset_path='', model='deepseek-ai/DeepSeek-V3', tokenizer=None, num_prompts=1200, sharegpt_output_len=None, random_input_len=1024, random_output_len=1024, random_range_ratio=1.0, request_rate=4.0, max_concurrency=None, seed=1, multi=False, request_rate_range='2,34,2', output_file='deepseek_v3_8xh200_BF16_online_output.jsonl', disable_tqdm=False, disable_stream=False, disable_ignore_eos=False, return_logprob=False, extra_request_body=None, gen_num_groups=64, gen_prompts_per_group=16, gen_system_prompt_len=2048, gen_question_len=128, gen_output_len=256, profile=False, lora_name=None)
+
+#Input tokens: 1228800
+#Output tokens: 1228800
+Starting initial single prompt test run...
+Initial test run completed. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang    
+Traffic request rate:                    4.0       
+Max reqeuest concurrency:                not set   
+Successful requests:                     1200      
+Benchmark duration (s):                  516.75    
+Total input tokens:                      1228800   
+Total generated tokens:                  1228800   
+Total generated tokens (retokenized):    1224574   
+Request throughput (req/s):              2.32      
+Input token throughput (tok/s):          2377.95   
+Output token throughput (tok/s):         2377.95   
+Total token throughput (tok/s):          4755.90   
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   322017.38 
+Median E2E Latency (ms):                 325442.20 
+---------------Time to First Token----------------
+Mean TTFT (ms):                          782.61    
+Median TTFT (ms):                        756.71    
+P99 TTFT (ms):                           1651.82   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          314.01    
+Median TPOT (ms):                        317.36    
+P99 TPOT (ms):                           403.03    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           314.02    
+Median ITL (ms):                         239.53    
+P99 ITL (ms):                            1122.77   
+==================================================
+Namespace(backend='sglang', base_url=None, host='0.0.0.0', port=40000, dataset_name='random', dataset_path='', model='deepseek-ai/DeepSeek-V3', tokenizer=None, num_prompts=2400, sharegpt_output_len=None, random_input_len=1024, random_output_len=1024, random_range_ratio=1.0, request_rate=8.0, max_concurrency=None, seed=1, multi=False, request_rate_range='2,34,2', output_file='deepseek_v3_8xh200_BF16_online_output.jsonl', disable_tqdm=False, disable_stream=False, disable_ignore_eos=False, return_logprob=False, extra_request_body=None, gen_num_groups=64, gen_prompts_per_group=16, gen_system_prompt_len=2048, gen_question_len=128, gen_output_len=256, profile=False, lora_name=None)
+
+#Input tokens: 2457600
+#Output tokens: 2457600
+Starting initial single prompt test run...
+Initial test run completed. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang    
+Traffic request rate:                    8.0       
+Max reqeuest concurrency:                not set   
+Successful requests:                     2400      
+Benchmark duration (s):                  1103.55   
+Total input tokens:                      2457600   
+Total generated tokens:                  2457600   
+Total generated tokens (retokenized):    2449208   
+Request throughput (req/s):              2.17      
+Input token throughput (tok/s):          2226.99   
+Output token throughput (tok/s):         2226.99   
+Total token throughput (tok/s):          4453.98   
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   665434.00 
+Median E2E Latency (ms):                 697458.92 
+---------------Time to First Token----------------
+Mean TTFT (ms):                          98361.38  
+Median TTFT (ms):                        1194.39   
+P99 TTFT (ms):                           483150.07 
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          554.32    
+Median TPOT (ms):                        526.85    
+P99 TPOT (ms):                           844.25    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           554.33    
+Median ITL (ms):                         257.79    
+P99 ITL (ms):                            4449.63   
+==================================================
