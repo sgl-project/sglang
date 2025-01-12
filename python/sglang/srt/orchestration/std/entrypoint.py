@@ -27,6 +27,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
@@ -344,7 +345,7 @@ class Entrypoint:
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
                 self._dispatcher(recv_obj)
         except Exception as e:
-            logger.warning(f'Error in handle_loop: {e}')
+            logger.warning(f"Error in handle_loop: {e}")
             traceback.print_exc()
             raise
 
