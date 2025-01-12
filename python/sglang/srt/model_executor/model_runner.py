@@ -458,7 +458,7 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]], load_format: Optional[str] = None):
         self.model.load_weights(named_tensors)
         return True, "Success"
 

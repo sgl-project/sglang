@@ -232,8 +232,8 @@ class TpModelWorkerClient:
         success, message = self.worker.update_weights_from_distributed(recv_req)
         return success, message
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        success, message = self.worker.update_weights_from_tensor(named_tensors)
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]], load_format: Optional[str] = None):
+        success, message = self.worker.update_weights_from_tensor(named_tensors, load_format)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
