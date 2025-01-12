@@ -518,7 +518,7 @@ class Scheduler:
             return self.handle_generate_request(recv_req)
         if isinstance(recv_req, TokenizedEmbeddingReqInput):
             return self.handle_embedding_request(recv_req)
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def handle_generate_request(
         self,
