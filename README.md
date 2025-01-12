@@ -40,7 +40,7 @@ python -m sglang.launch_server \
     --context-length $EXTENDED_CONTEXT_LEN \
     --max-total-tokens $EXTENDED_CONTEXT_LEN \
     --enable-hip-attention \
-    # You can turn of this flag to disable offloading. 
+    # You can turn off this flag to disable offloading. 
     # Offloading may have difference in decoding result.
     --enable-hip-offload \
     # For on-gpu offloading cache in masking kernel, 
