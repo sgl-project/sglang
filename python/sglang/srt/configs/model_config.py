@@ -393,6 +393,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaVidForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
+        or "DeepseekVL2ForCausalLM" in model_architectures
     ):
         return True
     else:

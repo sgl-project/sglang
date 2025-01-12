@@ -342,6 +342,10 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             "image_grid_thws": image_grid_thws,
         }
 
+class DeepseekVL2ImageProcessor(BaseImageProcessor):
+    #todo finish imageprocessor
+    def __init__(self, hf_config, server_args, _image_processor):
+        super.__init__(hf_config, server_args, _image_processor)
 
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor

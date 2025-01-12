@@ -3,7 +3,7 @@ from typing import Tuple
 
 from transformers import PretrainedConfig
 
-class DeepseekVLV2VisionEncoderConfig(PretrainedConfig):
+class DeepseekVL2VisionEncoderConfig(PretrainedConfig):
     model_type:str="vision"
     
     model_name: str = "siglip_large_patch16_384"
@@ -53,7 +53,7 @@ class DeepseekVLV2VisionEncoderConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
         
-class DeepseekVLV2MlpProjectorConfig(PretrainedConfig):
+class DeepseekVL2MlpProjectorConfig(PretrainedConfig):
     model_type = "mlp_projector"
     projector_type: str = "downsample_mlp_gelu"
     input_dim: int = 1152
@@ -181,10 +181,10 @@ class DeepseekV2Config(PretrainedConfig):
             **kwargs,
         )
         
-class DeepseekVLV2Config(PretrainedConfig):
+class DeepseekVL2Config(PretrainedConfig):
     model_type = "deepseek_vl_v2"
-    vision_config: DeepseekVLV2VisionEncoderConfig
-    projector_config: DeepseekVLV2MlpProjectorConfig
+    vision_config: DeepseekVL2VisionEncoderConfig
+    projector_config: DeepseekVL2MlpProjectorConfig
     language_config: DeepseekV2Config
 
     tile_tag: str = "2D"
@@ -201,10 +201,10 @@ class DeepseekVLV2Config(PretrainedConfig):
         super().__init__(**kwargs)
 
         vision_config = kwargs.get("vision_config", {})
-        self.vision_config = DeepseekVLV2VisionEncoderConfig(**vision_config)
+        self.vision_config = DeepseekVL2VisionEncoderConfig(**vision_config)
 
         projector_config = kwargs.get("projector_config", {})
-        self.projector_config = DeepseekVLV2MlpProjectorConfig(**projector_config)
+        self.projector_config = DeepseekVL2MlpProjectorConfig(**projector_config)
 
         language_config = kwargs.get("language_config", {})
         
