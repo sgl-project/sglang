@@ -120,6 +120,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
 
     def get_kv_buffer(self, layer_id: int) -> HiPOffloadCache:
         # Use this function for decode, pass this to `k`
+        if self.require_validation:
+            return self.layer_buffer[layer_id], *self.validation_cache.get_kv_buffer(layer_id)
         return self.layer_buffer[layer_id]
     
     def prefetch_prefix_kv_buffer(
@@ -132,7 +134,10 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         # you must call before get fetched prefix
         assert table.ndim == 1
         
-        hip_offload_cache = self.get_kv_buffer(layer_id)
+        if self.require_validation:
+            hip_offload_cache, _, _ = self.get_kv_buffer(layer_id)
+        else:
+            hip_offload_cache = self.get_kv_buffer(layer_id)
         
         handle_id = (layer_id, batch_id)
         assert handle_id not in self.prefetch_threads, handle_id

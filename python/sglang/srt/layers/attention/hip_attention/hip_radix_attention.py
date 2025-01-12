@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
 
 from hip.models.hip_attention.gen3.attention_extend import dual_stage_quadratic_hip_attention
-from hip.models.hip_attention.gen3.attention_metadata import HiPAttentionArgs
+from hip.models.hip_attention.gen3.attention_metadata import HiPAttentionArgs, HiPAttentionOutputMetadata
 from hip.models.hip_attention.gen3.uvm_gpu_cache import HiPOffloadCache
 
 
@@ -197,7 +197,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         )
                         
                         o_err = ((o_req - o_req_valid) ** 2).sum()
-                        assert o_err < 1e-5, o_err
+                        assert o_err < 1e-6, o_err
                     
                     o[start_len:start_len+seq_len] = o_req
                 else:
@@ -247,25 +247,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
         is_offload_cache = isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
 
-        if is_offload_cache:
-            assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, 
-                        async_copy=False, push_to_gpu_cache=True,
-                    )
-            k_cache = v_cache = None
-            offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        else:
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            offload_cache = None
-
         metadata = None
         if forward_batch.hip_use_cached_mask or (forward_batch.hip_metadata_cached_stage is not None):
             metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
@@ -273,31 +254,231 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 forward_batch.batch_size,
                 forward_batch.hip_metadata_cached_stage,
             )
+        
+        require_validation = False
+        if is_offload_cache:
+            assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
+            require_validation = forward_batch.token_to_kv_pool.require_validation
+            
+            if k is not None:
+                assert v is not None
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, 
+                        async_copy=False, push_to_gpu_cache=True,
+                    )
+            
+            if not require_validation:
+                k_cache = v_cache = None
+                offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            else:
+                offload_cache, k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        else:
+            if k is not None:
+                assert v is not None
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            offload_cache = None
+        
+        if not require_validation:
+            o, metadata = self.forward_paged_hip(
+                query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                sm_scale=layer.scaling,
+                batch_size=forward_batch.batch_size,
 
-        o, metadata = self.forward_paged_hip(
-            query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            sm_scale=layer.scaling,
-            batch_size=forward_batch.batch_size,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                offload_cache=offload_cache,
 
-            k_cache=k_cache,
-            v_cache=v_cache,
-            offload_cache=offload_cache,
+                positions=forward_batch.positions,
+                seq_lens=forward_batch.seq_lens,
+                req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
 
-            positions=forward_batch.positions,
-            seq_lens=forward_batch.seq_lens,
-            req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
-            req_pool_indices=forward_batch.req_pool_indices,
+                layer=layer,
+                cached_metadata=metadata,
+                is_dense=layer.layer_id in self.hip_config.dense_layers,
 
-            layer=layer,
-            cached_metadata=metadata,
-            is_dense=layer.layer_id in self.hip_config.dense_layers,
+                online_update_cache=(
+                    forward_batch.token_to_kv_pool.online_update_cache 
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    None
+                ),
+            )
+        else:
+            def sse(a: torch.Tensor, b: torch.Tensor):
+                assert a.dtype == b.dtype
+                return ((a - b) ** 2).sum().item()
+            
+            err_k = sse(offload_cache.k_uvm.bank_gpu, k_cache)
+            err_v = sse(offload_cache.v_uvm.bank_gpu, v_cache)
+            
+            o, metadata_new = self.forward_paged_hip(
+                query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                sm_scale=layer.scaling,
+                batch_size=forward_batch.batch_size,
 
-            online_update_cache=(
-                forward_batch.token_to_kv_pool.online_update_cache 
-                if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
-                None
-            ),
-        )
+                k_cache=None,
+                v_cache=None,
+                offload_cache=offload_cache,
+                
+                # NOTE: to test uvm only
+                # k_cache=offload_cache.k_uvm.bank_gpu,
+                # v_cache=offload_cache.v_uvm.bank_gpu,
+                # offload_cache=None,
+                
+                # NOTE: to test on gpu only
+                # k_cache=k_cache,
+                # v_cache=v_cache,
+                # offload_cache=None,
+
+                positions=forward_batch.positions,
+                seq_lens=forward_batch.seq_lens,
+                req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+
+                layer=layer,
+                cached_metadata=metadata,
+                is_dense=layer.layer_id in self.hip_config.dense_layers,
+
+                online_update_cache=(
+                    forward_batch.token_to_kv_pool.online_update_cache 
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    None
+                ),
+            )
+            
+            o_valid, metadata_valid = self.forward_paged_hip(
+                query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                sm_scale=layer.scaling,
+                batch_size=forward_batch.batch_size,
+
+                k_cache=k_cache,
+                v_cache=v_cache,
+                offload_cache=None,
+
+                positions=forward_batch.positions,
+                seq_lens=forward_batch.seq_lens,
+                req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+
+                layer=layer,
+                cached_metadata=metadata,
+                is_dense=layer.layer_id in self.hip_config.dense_layers,
+
+                online_update_cache=(
+                    forward_batch.token_to_kv_pool.online_update_cache 
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    None
+                ),
+            )
+            
+            err_thresh = 1e-7
+            
+            o_sse = sse(o, o_valid)
+            err_retry = -1
+            err_uvm = None
+            if o_sse >= err_thresh:
+                indices_err = sse(metadata_new.indices, metadata_valid.indices)
+                ks_err = sse(metadata_new.ks, metadata_valid.ks)
+                ks_count_err = sse(metadata_new.ks_count, metadata_valid.ks_count)
+                ks_start_end_err = sse(metadata_new.ks_start_end, metadata_valid.ks_start_end)
+                if (metadata_valid.stage_caches is not None) and (len(metadata_valid.stage_caches) > 0):
+                    stage1_left_err = sse(metadata_new.stage_caches[1].indices_left, metadata_valid.stage_caches[1].indices_left)
+                    stage1_right_err = sse(metadata_new.stage_caches[1].indices_right, metadata_valid.stage_caches[1].indices_right)
+                    stage1_score_err = sse(metadata_new.stage_caches[1].out_scores, metadata_valid.stage_caches[1].out_scores)
+                    stage2_left_err = sse(metadata_new.stage_caches[2].indices_left, metadata_valid.stage_caches[2].indices_left)
+                    stage2_right_err = sse(metadata_new.stage_caches[2].indices_right, metadata_valid.stage_caches[2].indices_right)
+                    stage2_score_err = sse(metadata_new.stage_caches[2].out_scores, metadata_valid.stage_caches[2].out_scores)
+                else:
+                    stage1_left_err = stage1_right_err = stage1_score_err = stage2_left_err = stage2_right_err = stage2_score_err = None
+                online_update = (
+                    forward_batch.token_to_kv_pool.online_update_cache 
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    None
+                )
+                
+                o_uvm, metadata_uvm = self.forward_paged_hip(
+                    query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    sm_scale=layer.scaling,
+                    batch_size=forward_batch.batch_size,
+
+                    k_cache=offload_cache.k_uvm.bank_gpu,
+                    v_cache=offload_cache.v_uvm.bank_gpu,
+                    offload_cache=None,
+
+                    positions=forward_batch.positions,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+
+                    layer=layer,
+                    cached_metadata=metadata,
+                    is_dense=layer.layer_id in self.hip_config.dense_layers,
+
+                    online_update_cache=(
+                        forward_batch.token_to_kv_pool.online_update_cache 
+                        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                        None
+                    ),
+                )
+                
+                offload_cache.sa_kv_cache.flush()
+                offload_cache.mask_k_cache.flush()
+                
+                o_retry, metadata_retry = self.forward_paged_hip(
+                    query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    sm_scale=layer.scaling,
+                    batch_size=forward_batch.batch_size,
+
+                    k_cache=None,
+                    v_cache=None,
+                    offload_cache=offload_cache,
+
+                    positions=forward_batch.positions,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+
+                    layer=layer,
+                    cached_metadata=metadata,
+                    is_dense=layer.layer_id in self.hip_config.dense_layers,
+
+                    online_update_cache=(
+                        forward_batch.token_to_kv_pool.online_update_cache 
+                        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                        None
+                    ),
+                )
+                err_uvm = sse(o, o_uvm)
+                err_retry = sse(o_valid, o_retry)
+                
+                print(o)
+                print(o_valid)
+                print(metadata_new.indices)
+                print(metadata_valid.indices)
+            
+                assert o_sse < err_thresh, f"""
+sse={o_sse}
+err_k (uvm_k <=> valid_k) = {err_k}
+err_v (uvm_v <=> valid_v) ={err_v}
+err_retry (o_valid <=> o_retry) = {err_retry}
+err_uvm (o_first <=> o_uvm_retry) = {err_uvm}
+indices_err={indices_err}
+ks_err={ks_err}
+ks_count_err={ks_count_err}
+ks_start_end_err={ks_start_end_err}
+stage1_left_err={stage1_left_err}
+stage1_right_err={stage1_right_err}
+stage1_score_err={stage1_score_err}
+stage2_left_err={stage2_left_err}
+stage2_right_err={stage2_right_err}
+stage2_score_err={stage2_score_err}
+online_update={online_update}
+"""
+            
+            metadata = metadata_new
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
             layer_id=layer.layer_id, 
@@ -408,9 +589,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             sa_extend_backend=layer_config.sa_extend_backend,
             online_update_cache=online_update_cache,
         )
-
-        # print(isinstance(k, torch.Tensor), isinstance(v, torch.Tensor), args.offload_cache, isinstance(args.k_cache, torch.Tensor))
-
+        
         context, metadata = dual_stage_quadratic_hip_attention(
             (query * sm_scale).to(query.dtype),
             k, v,
