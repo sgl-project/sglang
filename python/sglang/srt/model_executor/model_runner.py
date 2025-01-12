@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -782,4 +783,6 @@ class ModelRunner:
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
-    TODO
+    params_dict = dict(model.named_parameters())
+    for name, tensor in named_tensors:
+        default_weight_loader(params_dict[name], tensor)
