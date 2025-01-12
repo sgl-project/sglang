@@ -1429,7 +1429,7 @@ class Scheduler:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        self.update_weights_from_tensor_raw(
+        return self.update_weights_from_tensor_raw(
             MultiprocessingSerializer.deserialize(recv_req.serialized_named_tensors)
         )
 
