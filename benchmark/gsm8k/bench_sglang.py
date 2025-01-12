@@ -1,6 +1,7 @@
 import argparse
 import ast
 import json
+import os
 import re
 import time
 
@@ -46,9 +47,11 @@ def main(args):
     set_default_backend(select_sglang_backend(args))
 
     # Read data
+    data_path = args.data_path
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
-    lines = list(read_jsonl(filename))
+    if not os.path.isfile(data_path):
+        data_path = download_and_cache_file(url)
+    lines = list(read_jsonl(data_path))
 
     # Construct prompts
     num_questions = args.num_questions

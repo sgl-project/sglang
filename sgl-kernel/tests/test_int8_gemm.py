@@ -37,8 +37,8 @@ class TestInt8Gemm(unittest.TestCase):
         print(f"M={M}, N={N}, K={K}, with_bias={with_bias}, out_dtype={out_dtype}: OK")
 
     def test_accuracy(self):
-        Ms = [1, 128, 512, 1024, 4096]
-        Ns = [16, 128, 512, 1024, 4096]
+        Ms = [1, 128, 512, 1024, 4096, 8192]
+        Ns = [16, 128, 512, 1024, 4096, 8192, 16384]
         Ks = [512, 1024, 4096, 8192, 16384]
         bias_opts = [True, False]
         out_dtypes = [torch.float16, torch.bfloat16]

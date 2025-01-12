@@ -14,7 +14,7 @@ from sglang.srt.speculative.build_eagle_tree import build_tree_kernel
 from sglang.srt.speculative.spec_info import SpecInfo
 
 if TYPE_CHECKING:
-    from python.sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
 
@@ -245,9 +245,10 @@ class EAGLEDraftInput(SpecInfo):
             )  # (b, topk)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
 
-            selected_input_index = (
-                topk_cs_index.flatten() // self.topk
-            )  # shape: (b * topk)
+            selected_input_index = topk_cs_index.flatten() // self.topk + torch.arange(
+                0, batch.batch_size() * self.topk, step=self.topk, device="cuda"
+            ).repeat_interleave(self.topk)
+
             batch.spec_info.hidden_states = batch.spec_info.hidden_states[
                 selected_input_index, :
             ]
@@ -336,6 +337,7 @@ class EAGLEDraftInput(SpecInfo):
             triton.next_power_of_2(self.spec_steps + 1),
         )
 
+        batch.seq_lens_sum = sum(batch.seq_lens)
         batch.input_ids = self.verified_id
         self.verified_id = new_verified_id
 
@@ -439,7 +441,14 @@ class EAGLEDraftInput(SpecInfo):
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def merge_batch(self, spec_info: EAGLEDraftInput):
-
+        if self.hidden_states is None:
+            self.hidden_states = spec_info.hidden_states
+            self.verified_id = spec_info.verified_id
+            self.sample_output = spec_info.sample_output
+            self.prev_mode = spec_info.prev_mode
+            return
+        if spec_info.hidden_states is None:
+            return
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
@@ -550,8 +559,37 @@ class EagleVerifyInput(SpecInfo):
             triton.next_power_of_2(max_draft_len),
         )
 
-        accept_index = accept_index[accept_index != -1]
+        draft_input = EAGLEDraftInput()
+        new_accept_index = []
+        unfinished_index = []
+        finished_extend_len = {}  # {rid:accept_length + 1}
+        accept_index_cpu = accept_index.tolist()
+        predict_cpu = predict.tolist()
+        # iterate every accepted token and check if req has finished after append the token
+        # should be checked BEFORE free kv cache slots
+        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            new_accept_index_ = []
+            for j, idx in enumerate(accept_index_row):
+                if idx == -1:
+                    break
+                id = predict_cpu[idx]
+                # if not found_finished:
+                req.output_ids.append(id)
+                finished_extend_len[req.rid] = j + 1
+                req.check_finished()
+                if req.finished():
+                    draft_input.has_finished = True
+                    # set all tokens after finished token to -1 and break
+                    accept_index[i, j + 1 :] = -1
+                    break
+                else:
+                    new_accept_index_.append(idx)
+            if not req.finished():
+                new_accept_index.extend(new_accept_index_)
+                unfinished_index.append(i)
+        accept_length = (accept_index != -1).sum(dim=1) - 1
 
+        accept_index = accept_index[accept_index != -1]
         accept_length_cpu = accept_length.tolist()
         verified_id = predict[accept_index]
         verified_id_cpu = verified_id.tolist()
@@ -570,26 +608,9 @@ class EagleVerifyInput(SpecInfo):
             triton.next_power_of_2(bs),
         )
         batch.seq_lens.add_(accept_length + 1)
-        new_accept_index = []
-        unfinished_index = []
-        finished_extend_len = {}  # {rid:accept_length + 1}
-        # retracted_reqs, new_token_ratio = batch.retract_decode()
-
-        low = 0
-        draft_input = EAGLEDraftInput()
-        for i, (req, verified_len) in enumerate(zip(batch.reqs, accept_length_cpu)):
-            req.output_ids.extend(verified_id_cpu[low : low + verified_len + 1])
-            req.check_finished()
-            if req.finished():
-                draft_input.has_finished = True
-            else:
-                new_accept_index.append(accept_index[low : low + verified_len + 1])
-                unfinished_index.append(i)
-            low += verified_len + 1
-            finished_extend_len[req.rid] = verified_len + 1
 
         if len(new_accept_index) > 0:
-            new_accept_index = torch.cat(new_accept_index, dim=0)
+            new_accept_index = torch.tensor(new_accept_index, device="cuda")
             draft_input.verified_id = predict[new_accept_index]
             draft_input.hidden_states = batch.spec_info.hidden_states[new_accept_index]
             draft_input.accept_length = accept_length[unfinished_index]

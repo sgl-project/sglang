@@ -142,6 +142,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                         data=torch.full(
                             (len(output_partition_sizes),),
                             torch.finfo(torch.float32).min,
+                            dtype=torch.float32,
                         ),
                         weight_loader=weight_loader,
                     ),
