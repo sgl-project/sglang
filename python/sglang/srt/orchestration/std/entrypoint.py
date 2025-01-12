@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import traceback
 import uuid
 from typing import Awaitable, Generic, List, Optional, Tuple, TypeVar, Union
 
@@ -26,7 +27,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
@@ -339,9 +339,14 @@ class Entrypoint:
     async def handle_loop(self):
         """The event loop that handles requests"""
 
-        while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._dispatcher(recv_obj)
+        try:
+            while True:
+                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                self._dispatcher(recv_obj)
+        except Exception as e:
+            logger.warning(f'Error in handle_loop: {e}')
+            traceback.print_exc()
+            raise
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
