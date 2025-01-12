@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import time
 
 import numpy as np
@@ -31,9 +32,11 @@ def main(args):
     set_default_backend(select_sglang_backend(args))
 
     # Read data
+    data_path = args.data_path
     url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
-    filename = download_and_cache_file(url)
-    lines = list(read_jsonl(filename))
+    if not os.path.isfile(data_path):
+        data_path = download_and_cache_file(url)
+    lines = list(read_jsonl(data_path))
 
     # Construct prompts
     num_questions = args.num_questions

@@ -129,16 +129,11 @@ class CudaGraphRunner:
         if self.capture_bs is None:
             if model_runner.server_args.disable_cuda_graph_padding:
                 self.capture_bs = list(range(1, 33)) + [64, 128]
+            elif self.is_spec:
+                # For speculative inference, large batch sizes are not effective.
+                self.capture_bs = [1, 2, 3, 4]
             else:
                 self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
-
-        if model_runner.server_args.disable_cuda_graph_padding:
-            self.capture_bs = list(range(1, 33)) + [64, 128]
-        elif self.is_spec:
-            # For speculative inference, large batch sizes are not effective.
-            self.capture_bs = [1, 2, 3, 4]
-        else:
-            self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
 
         if max(self.capture_bs) > model_runner.req_to_token_pool.size:
             # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests

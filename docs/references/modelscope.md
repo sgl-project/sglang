@@ -6,9 +6,9 @@ To use a model from [ModelScope](https://www.modelscope.cn), set the environment
 export SGLANG_USE_MODELSCOPE=true
 ```
 
-We take [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) as an example. Launch the Server:
----
+We take [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) as an example.
 
+Launch the Server:
 ```bash
 python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
 ```
