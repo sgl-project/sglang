@@ -129,7 +129,7 @@ class ModelConfig:
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
-        # Veirfy quantization
+        # Verify quantization
         self._verify_quantization()
 
         # Cache attributes
