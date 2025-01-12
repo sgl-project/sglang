@@ -59,7 +59,11 @@ class Entrypoint:
 
         return outputs
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]], load_format: Optional[str] = None):
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
         self._scheduler.update_weights_from_tensor_raw(named_tensors, load_format)
 
     def shutdown(self):

@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
@@ -31,8 +32,11 @@ class EngineBase:
         )
         return self._generate_impl(obj)
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]],
-                                   load_format: Optional[str] = None):
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
         """
         Update weights from distributed source.
 

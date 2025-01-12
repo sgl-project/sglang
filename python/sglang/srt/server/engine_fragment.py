@@ -32,7 +32,11 @@ class EngineFragment(EngineBase):
     def _generate_impl(self, obj: GenerateReqInput):
         return self._entrypoint.generate(obj)
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]], load_format: Optional[str] = None):
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
         self._entrypoint.update_weights_from_tensor(named_tensors, load_format)
 
     def shutdown(self):
