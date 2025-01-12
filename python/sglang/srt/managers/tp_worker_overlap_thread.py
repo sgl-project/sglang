@@ -18,11 +18,12 @@ import logging
 import signal
 import threading
 from queue import Queue
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import psutil
 import torch
 
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -58,9 +59,12 @@ class TpModelWorkerClient:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
+        self.worker = TpModelWorker(
+            server_args, gpu_id, tp_rank, dp_rank, nccl_port, parallel_process_groups
+        )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
@@ -88,6 +92,9 @@ class TpModelWorkerClient:
 
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
+
+    def get_tp_group(self):
+        return self.worker.get_tp_group()
 
     def get_tp_cpu_group(self):
         return self.worker.get_tp_cpu_group()
@@ -225,13 +232,16 @@ class TpModelWorkerClient:
         success, message = self.worker.update_weights_from_distributed(recv_req)
         return success, message
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.worker.update_weights_from_tensor(recv_req)
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        success, message = self.worker.update_weights_from_tensor(named_tensors)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         return self.worker.get_weights_by_name(recv_req)
 
     def __delete__(self):
+        self.shutdown()
+
+    def shutdown(self):
         self.input_queue.put((None, None))
-        self.copy_queue.put((None, None, None))
+        # self.copy_queue.put((None, None, None)) # the queue seems not longer exist
