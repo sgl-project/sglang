@@ -50,7 +50,6 @@ from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from starlette.routing import Mount
 from torch import nn
-from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -61,6 +60,11 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 from vllm.distributed import GroupCoordinator, get_tp_group
+
+try:
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+except ImportError:
+    from torch.distributed._tensor import DTensor, Replicate, Shard
 
 logger = logging.getLogger(__name__)
 
