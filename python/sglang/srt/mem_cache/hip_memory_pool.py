@@ -26,9 +26,9 @@ class CachedBuffer:
     
     def get(self, batch_size: int, head_size: int) -> torch.Tensor:
         if self.batch_format == 'BH':
-            return self.buffer[:batch_size * head_size].to(self.dtype)
+            return self.buffer[:batch_size * head_size].to(self.dtype, copy=True)
         elif self.batch_format == 'B,1,H':
-            return self.buffer[:batch_size, :, :head_size].to(self.dtype)
+            return self.buffer[:batch_size, :, :head_size].to(self.dtype, copy=True)
         else:
             raise Exception()
     
