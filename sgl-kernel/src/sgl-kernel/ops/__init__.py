@@ -3,7 +3,9 @@ from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
 from sgl_kernel.ops._kernels import int8_scaled_mm as _int8_scaled_mm
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
-from sgl_kernel.ops._kernels import sampling_scaling_penalties as _sampling_scaling_penalties
+from sgl_kernel.ops._kernels import (
+    sampling_scaling_penalties as _sampling_scaling_penalties,
+)
 
 
 def init_custom_reduce(rank_id, num_devices, buffers, barrier_in, barrier_out):
