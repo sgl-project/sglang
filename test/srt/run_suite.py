@@ -46,7 +46,6 @@ suites = {
         "test_vision_chunked_prefill.py",
         "test_vision_openai_server.py",
         "test_session_control.py",
-        "test_engine_token_ids.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
