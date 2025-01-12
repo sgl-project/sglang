@@ -216,12 +216,6 @@ def _group_coordinator_init(
     if use_tpu_communicator and self.world_size > 1:
         self.tpu_communicator = TpuCommunicator(group=self.cpu_group)
 
-    from vllm.distributed.device_communicators.hpu_communicator import HpuCommunicator
-
-    self.hpu_communicator: Optional[HpuCommunicator]
-    if use_hpu_communicator and self.world_size > 1:
-        self.hpu_communicator = HpuCommunicator(group=self.device_group)
-
     from vllm.distributed.device_communicators.xpu_communicator import XpuCommunicator
 
     self.xpu_communicator: Optional[XpuCommunicator]
