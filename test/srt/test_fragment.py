@@ -40,7 +40,7 @@ class TestFragment(unittest.TestCase):
             processes.append(p)
 
         outputs = [output_reader.recv() for _ in range(_TP_SIZE)]
-        print(outputs)
+        # print(outputs)
         for output in outputs:
             self.assertEqual(
                 output,
