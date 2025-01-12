@@ -18,7 +18,7 @@ class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
             speculative_num_draft_tokens=16,
             watchdog_timeout=10000000,
             disable_cuda_graph=True,
-            attention_backend="torch_native",
+            # attention_backend="torch_native",
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()

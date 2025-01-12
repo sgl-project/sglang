@@ -71,6 +71,12 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             extend_seq_len_q = extend_seq_lens[seq_idx]
             prefill_seq_len_q = extend_prefix_lens[seq_idx]
+            print(
+                "xiaotong prefill_seq_len_q"
+                + str(prefill_seq_len_q)
+                + "extend_seq_len_q"
+                + str(extend_seq_len_q)
+            )
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q

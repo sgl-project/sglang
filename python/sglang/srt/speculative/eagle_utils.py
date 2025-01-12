@@ -347,6 +347,7 @@ class EAGLEDraftInput(SpecInfo):
             triton.next_power_of_2(self.spec_steps + 1),
         )
 
+        batch.seq_lens_sum = sum(batch.seq_lens)
         batch.input_ids = self.verified_id
         self.verified_id = new_verified_id
 
@@ -361,7 +362,6 @@ class EAGLEDraftInput(SpecInfo):
         top_scores = torch.topk(score_list, self.num_verify_token - 1, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
-
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
         scores = torch.gather(origin_token_list, index=top_scores_index, dim=1)
         draft_tokens = torch.cat((self.verified_id.unsqueeze(1), draft_tokens), dim=1)
