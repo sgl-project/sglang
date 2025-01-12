@@ -6,7 +6,7 @@ Welcome to **SGLang**! We appreciate your interest in contributing. This guide p
 
 ### Fork and Clone the Repository
 
-**Note**: New contributors do **not** have the write permission to push to SGLang. Please fork the repository under your GitHub account, then clone your fork locally.
+**Note**: New contributors do **not** have the write permission to push to the official SGLang repo. Please fork the repository under your GitHub account, then clone your fork locally.
 
 ```bash
 git clone https://github.com/<your_user_name>/sglang.git
@@ -35,7 +35,6 @@ SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unitt
 ## Writing Documentation & Running Docs CI
 
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase. For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
-
 
 ## Tips for Newcomers
 

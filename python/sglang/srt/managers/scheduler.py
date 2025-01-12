@@ -962,10 +962,13 @@ class Scheduler:
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    logits_output, next_token_ids, model_worker_batch, spec_info = (
-                        self.draft_worker.forward_batch_speculative_generation(batch)
-                    )
-                    batch.spec_info = spec_info
+                    (
+                        logits_output,
+                        next_token_ids,
+                        model_worker_batch,
+                        num_accepted_tokens,
+                    ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                    self.num_generated_tokens += num_accepted_tokens
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -1250,7 +1253,6 @@ class Scheduler:
             decode_ids_list = []
             read_offsets = []
             output_ids = []
-            origin_input_ids = []
 
             skip_special_tokens = []
             spaces_between_special_tokens = []
@@ -1302,14 +1304,8 @@ class Scheduler:
                     decode_ids, read_offset = req.init_incremental_detokenize()
                     decode_ids_list.append(decode_ids)
                     read_offsets.append(read_offset)
-                    if self.skip_tokenizer_init or self.server_args.return_token_ids:
+                    if self.skip_tokenizer_init:
                         output_ids.append(req.output_ids)
-                    else:
-                        output_ids = None
-                    if self.server_args.return_token_ids:
-                        origin_input_ids.append(req.origin_input_ids)
-                    else:
-                        origin_input_ids = None
                     skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                     spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
@@ -1341,7 +1337,6 @@ class Scheduler:
                         decoded_texts,
                         decode_ids_list,
                         read_offsets,
-                        origin_input_ids,
                         output_ids,
                         skip_special_tokens,
                         spaces_between_special_tokens,
@@ -1364,11 +1359,11 @@ class Scheduler:
             embeddings = []
             prompt_tokens = []
             for req in reqs:
-                assert req.finished()
-                rids.append(req.rid)
-                finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
+                if req.finished():
+                    rids.append(req.rid)
+                    finished_reasons.append(req.finished_reason.to_json())
+                    embeddings.append(req.embedding)
+                    prompt_tokens.append(len(req.origin_input_ids))
             self.send_to_detokenizer.send_pyobj(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
@@ -1513,8 +1508,9 @@ class Scheduler:
         return success, message
 
     def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
+        self,
+        recv_req: UpdateWeightsFromDistributedReqInput,
+    ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:

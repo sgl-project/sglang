@@ -55,7 +55,6 @@ class ServerArgs:
     is_embedding: bool = False
     revision: Optional[str] = None
     skip_tokenizer_init: bool = False
-    return_token_ids: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -148,6 +147,7 @@ class ServerArgs:
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
+    cuda_graph_bs: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -296,6 +296,11 @@ class ServerArgs:
             "always use the slow tokenizer.",
         )
         parser.add_argument(
+            "--skip-tokenizer-init",
+            action="store_true",
+            help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
@@ -361,6 +366,7 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
+                "modelopt",
             ],
             help="The quantization method.",
         )
@@ -402,18 +408,6 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
-        parser.add_argument(
-            "--skip-tokenizer-init",
-            action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request",
-        )
-        parser.add_argument(
-            "--return-token-ids",
-            action="store_true",
-            default=ServerArgs.return_token_ids,
-            help="Whether to return token IDs in the output, this may introduce additional overhead.",
-        )
-
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -803,6 +797,12 @@ class ServerArgs:
             help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(
+            "--cuda-graph-bs",
+            type=int,
+            nargs="+",
+            help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
             "--torchao-config",
             type=str,
             default=ServerArgs.torchao_config,
@@ -920,7 +920,10 @@ class PortArgs:
         while True:
             if is_port_available(port):
                 break
-            port += 42
+            if port < 60000:
+                port += 42
+            else:
+                port -= 43
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,

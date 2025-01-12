@@ -127,14 +127,12 @@ async def health() -> Response:
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
 
+    sampling_params = {"max_new_tokens": 1, "temperature": 0.7}
+
     if tokenizer_manager.is_generation:
-        gri = GenerateReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = GenerateReqInput(input_ids=[0], sampling_params=sampling_params)
     else:
-        gri = EmbeddingReqInput(
-            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-        )
+        gri = EmbeddingReqInput(input_ids=[0], sampling_params=sampling_params)
 
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
@@ -546,7 +544,12 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+        target=_wait_and_warmup,
+        args=(
+            server_args,
+            pipe_finish_writer,
+            tokenizer_manager.image_token_id,
+        ),
     )
     t.start()
 
@@ -581,8 +584,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
-    if "GLOO_SOCKET_IFNAME" not in os.environ:
-        os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -618,7 +619,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer):
+def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
     headers = {}
     url = server_args.url()
     if server_args.api_key:

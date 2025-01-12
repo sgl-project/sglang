@@ -228,6 +228,7 @@ class BenchmarkWorker:
                 hidden_size,
                 topk,
                 dtype_str,
+                False,
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]

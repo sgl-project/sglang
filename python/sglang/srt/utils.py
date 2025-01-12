@@ -335,6 +335,8 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
+        except OverflowError:
+            return False
 
 
 def decode_video_base64(video_base64):
@@ -709,13 +711,14 @@ def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -724,19 +727,19 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -1348,3 +1351,27 @@ class MultiprocessingSerializer:
     @staticmethod
     def deserialize(data):
         return ForkingPickler.loads(data)
+
+
+def debug_timing(func):
+    # todo: replace with a more organized instrumentation
+    def wrapper(*args, **kwargs):
+        if logger.isEnabledFor(logging.DEBUG):
+            tic = torch.cuda.Event(enable_timing=True)
+            toc = torch.cuda.Event(enable_timing=True)
+            tic.record()
+            result = func(*args, **kwargs)
+            toc.record()
+            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
+            elapsed = tic.elapsed_time(toc)
+            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
+            num_tokens = len(indices) if indices is not None else 0
+            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
+            logger.debug(
+                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
+            )
+            return result
+        else:
+            return func(*args, **kwargs)
+
+    return wrapper

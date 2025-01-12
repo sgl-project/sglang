@@ -10,7 +10,10 @@ import triton.language as tl
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from sglang.srt.layers.fused_moe_triton.fused_moe import fused_moe, get_config_file_name
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    fused_moe,
+    get_config_file_name,
+)
 
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
