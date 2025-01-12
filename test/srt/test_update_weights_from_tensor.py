@@ -28,14 +28,15 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
     def test_update_weights_from_tensor_load_format_direct(self):
         engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
-        param_name = f"model.layers.6.self_attn.qkv_proj.weight"
+        write_param_name = f"model.layers.6.self_attn.qkv_proj.weight"
+        read_param_name = f"model.layers.6.self_attn.k_proj.weight"
 
-        _check_param(engine, param_name, [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
+        _check_param(engine, read_param_name, [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
 
         new_tensor = torch.full((16384, 2048), 1.5)
-        engine.update_weights_from_tensor([(param_name, new_tensor)], load_format='direct')
+        engine.update_weights_from_tensor([(write_param_name, new_tensor)], load_format='direct')
 
-        _check_param(engine, param_name, [1.5] * 5)
+        _check_param(engine, read_param_name, [1.5] * 5)
 
         engine.shutdown()
 
