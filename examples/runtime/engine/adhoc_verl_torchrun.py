@@ -17,6 +17,8 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.distributed import ParallelProcessGroups
+from sglang.srt.server.engine_fragment import EngineFragment
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -27,9 +29,6 @@ from torch.distributed.fsdp.api import (
     StateDictType,
 )
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-from sglang.srt.distributed import ParallelProcessGroups
-from sglang.srt.server.engine_fragment import EngineFragment
 
 
 def main():
@@ -170,6 +169,7 @@ def main():
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
         tp_size=tensor_model_parallel_size,
         dtype="bfloat16",
+        memory_saver=True,
         mem_fraction_static=0.1,
         nccl_port=12345,
         tp_rank=rank,
@@ -184,6 +184,8 @@ def main():
 
     print("release_gpu_occupation")
     llm.release_gpu_occupation()
+    print("Sleep to have time checking memory consumption")
+    time.sleep(5)
     print("resume_gpu_occupation")
     llm.resume_gpu_occupation()
 
