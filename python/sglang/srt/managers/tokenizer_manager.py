@@ -663,13 +663,6 @@ class TokenizerManager:
                             "text": recv_obj.output_strs[i],
                             "meta_info": meta_info,
                         }
-                        if self.server_args.return_token_ids:
-                            out_dict.update(
-                                {
-                                    "input_ids": recv_obj.origin_input_ids[i],
-                                    "output_ids": recv_obj.output_ids[i],
-                                }
-                            )
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
@@ -688,7 +681,7 @@ class TokenizerManager:
                     if self.enable_metrics:
                         completion_tokens = (
                             recv_obj.completion_tokens[i]
-                            if recv_obj.completion_tokens
+                            if getattr(recv_obj, "completion_tokens", None)
                             else 0
                         )
 
@@ -716,7 +709,11 @@ class TokenizerManager:
                                 time.time() - state.created_time
                             )
                             # Compute time_per_output_token for the non-streaming case
-                            if not state.obj.stream and completion_tokens >= 1:
+                            if (
+                                hasattr(state.obj, "stream")
+                                and not state.obj.stream
+                                and completion_tokens >= 1
+                            ):
                                 self.metrics_collector.observe_time_per_output_token(
                                     (time.time() - state.created_time)
                                     / completion_tokens
