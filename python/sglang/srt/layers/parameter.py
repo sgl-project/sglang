@@ -253,6 +253,8 @@ class PerTensorScaleParameter(BasevLLMParameter):
         self._load_into_shard_id(*args, **kwargs)
 
     def load_column_parallel_weight(self, *args, **kwargs):
+        kwargs.pop("tp_rank", None)
+        kwargs.pop("use_presharded_weights", None)
         super().load_row_parallel_weight(*args, **kwargs)
 
     def _load_into_shard_id(
