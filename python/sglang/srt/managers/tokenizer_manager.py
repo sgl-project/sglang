@@ -249,14 +249,16 @@ class TokenizerManager:
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
-        elif obj.input_ids is None:
+        elif obj.input_ids is not None:
+            input_ids = obj.input_ids
+        else:
             if self.tokenizer is None:
                 raise ValueError(
-                    "Only accept request with input_ids when skip_tokenizer_init=True"
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept text prompts. Please provide input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
                 )
             input_ids = self.tokenizer.encode(input_text)
-        else:
-            input_ids = obj.input_ids
 
         if self.is_generation:
             # TODO: also support getting embeddings for multimodal models
