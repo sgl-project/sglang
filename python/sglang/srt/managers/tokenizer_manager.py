@@ -250,6 +250,10 @@ class TokenizerManager:
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
         elif obj.input_ids is None:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "Only accept request with input_ids when skip_tokenizer_init=True"
+                )
             input_ids = self.tokenizer.encode(input_text)
         else:
             input_ids = obj.input_ids
