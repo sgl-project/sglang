@@ -17,8 +17,6 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
-from sglang.srt.distributed import ParallelProcessGroups
-from sglang.srt.server.engine_fragment import EngineFragment
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -29,6 +27,9 @@ from torch.distributed.fsdp.api import (
     StateDictType,
 )
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from sglang.srt.distributed import ParallelProcessGroups
+from sglang.srt.server.engine_fragment import EngineFragment
 
 
 def main():
