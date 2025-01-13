@@ -1339,6 +1339,24 @@ def parse_tool_response(text, tools, **kwargs):
     ]
     return text, call_info_list
 
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    b_ = x.shape[0];
+    n_ = x.shape[1];
+    k_ = x.shape[2];
+
+    x_ = x
+    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
+    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
+    else:
+       return x_
+
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
 
 class MultiprocessingSerializer:
     @staticmethod
