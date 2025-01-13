@@ -284,9 +284,10 @@ class ForwardBatch:
         ret.attn_backend = model_runner.attn_backend
 
         # Init HiP attention information
-        ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
-        ret.hip_use_cached_mask = batch.hip_use_cached_mask
-        ret.hip_metadata_cached_stage = batch.hip_metadata_cached_stages
+        if hasattr(model_runner, 'hip_metadata_cache_pool'):
+            ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
+            ret.hip_use_cached_mask = batch.hip_use_cached_mask
+            ret.hip_metadata_cached_stage = batch.hip_metadata_cached_stages
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
