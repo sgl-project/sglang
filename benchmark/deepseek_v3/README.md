@@ -4,7 +4,7 @@ The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVI
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
-For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://sgl-project.github.io/references/deepseek.html).
+For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.ai/references/deepseek.html).
 
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
@@ -39,7 +39,7 @@ python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-r
 
 For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 
-### Example with OpenAI API
+### Example: Sending requests with OpenAI API
 
 ```python3
 import openai
@@ -58,7 +58,8 @@ response = client.chat.completions.create(
 )
 print(response)
 ```
-### Example serving with 2 H20*8
+
+### Example: Serving with two H20*8 nodes
 For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`.
 
 ```bash
@@ -71,7 +72,7 @@ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --di
 
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
 
-### Example serving with Docker two H200*8 nodes
+### Example: Serving with two H200*8 nodes and docker
 There are two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 192.168.114.10:20000`.
 A single H200 with 8 devices can run DeepSeek V3, the dual H200 setup is just to demonstrate multi-node usage.
 
