@@ -66,5 +66,11 @@ class Entrypoint:
     ):
         self._scheduler.update_weights_from_tensor_raw(named_tensors, load_format)
 
+    def release_gpu_occupation(self):
+        self._scheduler.release_gpu_occupation()
+
+    def resume_gpu_occupation(self):
+        self._scheduler.resume_gpu_occupation()
+
     def shutdown(self):
         self._scheduler.shutdown()

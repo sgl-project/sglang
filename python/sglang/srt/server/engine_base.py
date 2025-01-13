@@ -1,7 +1,6 @@
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
@@ -44,6 +43,14 @@ class EngineBase:
             named_tensors: The name and value of the tensors used to update weights
             load_format: `None` for default HF format, and `direct` for 1-to-1 matching the raw SGLang format
         """
+        raise NotImplementedError
+
+    def release_gpu_occupation(self):
+        """Release GPU occupation temporarily"""
+        raise NotImplementedError
+
+    def resume_gpu_occupation(self):
+        """Resume GPU occupation"""
         raise NotImplementedError
 
     def _generate_impl(self, obj: GenerateReqInput):

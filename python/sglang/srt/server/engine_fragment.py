@@ -1,7 +1,6 @@
 from typing import List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.orchestration.spmd.entrypoint import Entrypoint
@@ -38,6 +37,12 @@ class EngineFragment(EngineBase):
         load_format: Optional[str] = None,
     ):
         self._entrypoint.update_weights_from_tensor(named_tensors, load_format)
+
+    def release_gpu_occupation(self):
+        self._entrypoint.release_gpu_occupation()
+
+    def resume_gpu_occupation(self):
+        self._entrypoint.resume_gpu_occupation()
 
     def shutdown(self):
         self._entrypoint.shutdown()

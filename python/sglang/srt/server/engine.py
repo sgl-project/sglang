@@ -250,13 +250,11 @@ class Engine(EngineBase):
         return loop.run_until_complete(self.entrypoint.get_weights_by_name(obj, None))
 
     def release_gpu_occupation(self):
-        """Release GPU occupation temporarily"""
         obj = ReleaseGPUOccupationReqInput()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.entrypoint.release_gpu_occupation(obj, None))
 
     def resume_gpu_occupation(self):
-        """Resume GPU occupation"""
         obj = ResumeGPUOccupationReqInput()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.entrypoint.resume_gpu_occupation(obj, None))
