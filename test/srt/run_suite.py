@@ -22,6 +22,8 @@ suites = {
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
         "test_metrics.py",
+        "test_mla.py",
+        "test_mla_fp8.py",
         "test_no_chunked_prefill.py",
         "test_no_overlap_scheduler.py",
         "test_openai_server.py",
