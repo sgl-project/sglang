@@ -1,6 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
-import os
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -19,7 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import is_hip, permute_weight, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -27,6 +26,8 @@ else:
     fused_experts = None  # type: ignore
 
 import logging
+
+is_hip_ = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if is_hip() and bool(int(os.getenv("CK_MOE", "0"))):
+        if is_hip_ and get_bool_env_var("CK_MOE"):
             layer.w13_weight = torch.nn.Parameter(
                 permute_weight(layer.w13_weight.data),
                 requires_grad=False,
@@ -163,7 +164,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             correction_bias=correction_bias,
         )
 
-        if is_hip() and bool(int(os.getenv("CK_MOE", "0"))):
+        if is_hip_ and get_bool_env_var("CK_MOE"):
             import ater
             from ater.fused_moe import fused_experts_ck
 
