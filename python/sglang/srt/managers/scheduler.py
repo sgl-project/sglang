@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import faulthandler
 import logging
 import os
 import signal
@@ -399,6 +400,8 @@ class Scheduler:
                     self.watchdog_last_time = time.time()
             time.sleep(self.watchdog_timeout / 2)
 
+        # Wait sometimes so that the parent process can print the error.
+        time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
     @torch.no_grad()
@@ -1582,6 +1585,7 @@ def run_scheduler_process(
     pipe_writer,
 ):
     setproctitle.setproctitle("sglang::scheduler")
+    faulthandler.enable()
 
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
