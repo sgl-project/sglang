@@ -17,6 +17,11 @@ def get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> List[torch.Tensor]:
 
 
 def unpack_awq_gemm(x: torch.Tensor) -> torch.Tensor:
+    """
+    The int4 weights are compressed into int32:
+    bit:       31-28  27-24  23-20  19-16  15-12  11-8   7-4    3-0
+    weight:    int4_1 int4_2 int4_3 int4_4 int4_5 int4_6 int4_7 int4_8
+    """
     xs = get_u4_slices(x, torch.uint8)
     order = [0, 4, 1, 5, 2, 6, 3, 7]
     ys = [xs[i] for i in order]

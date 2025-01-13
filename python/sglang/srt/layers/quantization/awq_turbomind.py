@@ -10,11 +10,10 @@ from torch.nn import Parameter
 turbomind_dir = os.path.split(turbomind.__file__)[0]
 sys.path.append(os.path.join(turbomind_dir, "lib"))
 import _turbomind_ext
-from vllm.model_executor.layers.linear import LinearBase, set_weight_attrs
-from vllm.model_executor.layers.quantization.utils import replace_parameter
-from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from vllm.model_executor.layers.linear import LinearBase
 
 from sglang.srt.layers.linear import LinearMethodBase, UnquantizedLinearMethod
+from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -27,7 +26,7 @@ from sglang.srt.layers.quantization.turbomind_utils import (
     verify_turbomind_supported,
 )
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -259,9 +258,10 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
         self.linear.post_init(
             qweight_turbomind, scales_turbomind, qzeros_turbomind, simt
         )
-        replace_parameter(layer, "qweight", qweight_turbomind)
-        replace_parameter(layer, "scales", scales_turbomind)
-        replace_parameter(layer, "qzeros", qzeros_turbomind)
+
+        layer.qweight = Parameter(qweight_turbomind, requires_grad=False)
+        layer.scales = Parameter(scales_turbomind, requires_grad=False)
+        layer.qzeros = Parameter(qzeros_turbomind, requires_grad=False)
 
     def apply(
         self,
