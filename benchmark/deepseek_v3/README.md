@@ -29,7 +29,7 @@ For high QPS scenarios, add the `--enable-dp-attention` argument to boost throug
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]>=0.4.1.post3" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
+pip install "sglang[all]>=0.4.1.post4" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -37,7 +37,7 @@ python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-r
 
 For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 
-### Example with OpenAI API
+### Example: Sending requests with OpenAI API
 
 ```python3
 import openai
@@ -56,7 +56,8 @@ response = client.chat.completions.create(
 )
 print(response)
 ```
-### Example serving with 2 H20*8
+
+### Example: Serving with two H20*8 nodes
 For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`.
 
 ```bash
@@ -69,7 +70,7 @@ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --di
 
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
 
-### Example serving with Docker two H200*8 nodes
+### Example: Serving with two H200*8 nodes and docker
 There are two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 192.168.114.10:20000`.
 A single H200 with 8 devices can run DeepSeek V3, the dual H200 setup is just to demonstrate multi-node usage.
 
