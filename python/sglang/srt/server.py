@@ -465,7 +465,7 @@ def launch_engine(
     )
 
     memory_saver_adapter = TorchMemorySaverAdapter.create(
-        enable=server_args.memory_saver
+        enable=server_args.enable_memory_saver
     )
 
     if server_args.dp_size == 1:

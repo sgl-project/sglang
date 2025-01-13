@@ -21,7 +21,6 @@ import tempfile
 from typing import List, Optional
 
 import torch
-
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
@@ -156,7 +155,7 @@ class ServerArgs:
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
-    memory_saver: bool = False
+    enable_memory_saver: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -294,8 +293,8 @@ class ServerArgs:
             default=ServerArgs.tokenizer_mode,
             choices=["auto", "slow"],
             help="Tokenizer mode. 'auto' will use the fast "
-            "tokenizer if available, and 'slow' will "
-            "always use the slow tokenizer.",
+                 "tokenizer if available, and 'slow' will "
+                 "always use the slow tokenizer.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -316,18 +315,18 @@ class ServerArgs:
                 "bitsandbytes",
             ],
             help="The format of the model weights to load. "
-            '"auto" will try to load the weights in the safetensors format '
-            "and fall back to the pytorch bin format if safetensors format "
-            "is not available. "
-            '"pt" will load the weights in the pytorch bin format. '
-            '"safetensors" will load the weights in the safetensors format. '
-            '"npcache" will load the weights in pytorch format and store '
-            "a numpy cache to speed up the loading. "
-            '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. '
-            '"bitsandbytes" will load the weights using bitsandbytes '
-            "quantization.",
+                 '"auto" will try to load the weights in the safetensors format '
+                 "and fall back to the pytorch bin format if safetensors format "
+                 "is not available. "
+                 '"pt" will load the weights in the pytorch bin format. '
+                 '"safetensors" will load the weights in the safetensors format. '
+                 '"npcache" will load the weights in pytorch format and store '
+                 "a numpy cache to speed up the loading. "
+                 '"dummy" will initialize the weights with random values, '
+                 "which is mainly for profiling."
+                 '"gguf" will load the weights in the gguf format. '
+                 '"bitsandbytes" will load the weights using bitsandbytes '
+                 "quantization.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -340,13 +339,13 @@ class ServerArgs:
             default=ServerArgs.dtype,
             choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
             help="Data type for model weights and activations.\n\n"
-            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-            "BF16 precision for BF16 models.\n"
-            '* "half" for FP16. Recommended for AWQ quantization.\n'
-            '* "float16" is the same as "half".\n'
-            '* "bfloat16" for a balance between precision and range.\n'
-            '* "float" is shorthand for FP32 precision.\n'
-            '* "float32" for FP32 precision.',
+                 '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+                 "BF16 precision for BF16 models.\n"
+                 '* "half" for FP16. Recommended for AWQ quantization.\n'
+                 '* "float16" is the same as "half".\n'
+                 '* "bfloat16" for a balance between precision and range.\n'
+                 '* "float" is shorthand for FP32 precision.\n'
+                 '* "float32" for FP32 precision.',
         )
         parser.add_argument(
             "--kv-cache-dtype",
@@ -360,9 +359,9 @@ class ServerArgs:
             type=nullable_str,
             default=None,
             help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
+                 "scaling factors. This should generally be supplied, when "
+                 "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+                 "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--quantization",
@@ -416,8 +415,8 @@ class ServerArgs:
             type=str,
             default=None,
             help="The specific model version to use. It can be a branch "
-            "name, a tag name, or a commit id. If unspecified, will use "
-            "the default version.",
+                 "name, a tag name, or a commit id. If unspecified, will use "
+                 "the default version.",
         )
         # Memory and scheduling
         parser.add_argument(
@@ -437,7 +436,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
-            "This option is typically used for development and debugging purposes.",
+                 "This option is typically used for development and debugging purposes.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
@@ -833,7 +832,7 @@ class ServerArgs:
             "--triton-attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels.",
+                 "This only affects Triton attention kernels.",
         )
         parser.add_argument(
             "--triton-attention-num-kv-splits",
@@ -846,8 +845,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_continuous_decode_steps,
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
-            "This can potentially increase throughput but may also increase time-to-first-token latency. "
-            "The default value is 1, meaning only run one decoding step at a time.",
+                 "This can potentially increase throughput but may also increase time-to-first-token latency. "
+                 "The default value is 1, meaning only run one decoding step at a time.",
         )
         parser.add_argument(
             "--delete-ckpt-after-loading",
