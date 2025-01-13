@@ -5,7 +5,8 @@ import torch
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer, _TokenIDs
 from sglang.srt.utils import is_cuda_available
 
-if is_cuda_available():
+is_cuda = is_cuda_available()
+if is_cuda:
     from sgl_kernel import sampling_scaling_penalties
 
 
@@ -60,7 +61,7 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
         self.cumulated_repetition_penalties[mask] = self.repetition_penalties[mask]
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        if is_cuda_available():
+        if is_cuda:
             return sampling_scaling_penalties(
                 logits, self.cumulated_repetition_penalties
             )

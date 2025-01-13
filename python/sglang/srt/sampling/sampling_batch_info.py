@@ -9,7 +9,8 @@ import torch
 
 from sglang.srt.utils import is_cuda_available
 
-if is_cuda_available():
+is_cuda = is_cuda_available()
+if is_cuda:
     from sgl_kernel import sampling_scaling_penalties
 
 import sglang.srt.sampling.penaltylib as penaltylib
@@ -250,7 +251,7 @@ class SamplingBatchInfo:
 
         # repetition
         if self.scaling_penalties is not None:
-            if is_cuda_available():
+            if is_cuda:
                 logits[:] = sampling_scaling_penalties(logits, self.scaling_penalties)
             else:
                 logits[:] = torch.where(
