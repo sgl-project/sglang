@@ -51,7 +51,7 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     #     bias,
     # )
 
-def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None, is_profile=False):
     return _fp8_scaled_mm(
         mat_a,
         mat_b,
@@ -59,15 +59,15 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         scales_b,
         out_dtype,
         bias,
+        is_profile,
     )
 
-def fp8_scaled_mm_profile(mat_a, mat_b, scales_a, scales_b, out_dtype, bias, config_id):
-    return _fp8_scaled_mm_profile(
+def fp8_scaled_mm_profile(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+    _fp8_scaled_mm_profile(
         mat_a,
         mat_b,
         scales_a,
         scales_b,
         out_dtype,
         bias,
-        config_id,
     )

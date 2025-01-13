@@ -3,6 +3,7 @@
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h
 
 #pragma once
+#include <chrono>
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -30,12 +31,14 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "utils.hpp"
+
+
 using namespace cute;
 
 template <typename ElementType, typename OutElementType, typename AccumElementType, typename CtaShape,
     typename WarpShape, int Stages, bool WithBias,
     typename FP8MathOperator = cutlass::arch::OpMultiplyAdd,
-    template <typename, typename> typename EpilogueVisitor = cutlass::epilogue::threadblock::Sm80EVT,
+    template <typename...> typename EpilogueVisitor = cutlass::epilogue::threadblock::Sm80EVT,
     typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
 struct DeviceGemmFp8RowwiseSm89
 {
@@ -524,9 +527,104 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     // }
 }
 
+#define DISPATCH_FP8_GEMM_CONFIG(TB_M, TB_N, TB_K, WP_M, WP_N, WP_K, STAGES) \
+    sm89_dispatch_bias<ElementOutput, cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>, \
+        cutlass::gemm::GemmShape<WP_M, WP_N, WP_K>, STAGES>(out, mat_a, mat_b, scales_a, scales_b, bias)
+// generate all stages for a group of configs
+#define DISPATCH_FP8_GEMM_GROUP(GROUP_ID, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, BASE_CASE) \
+    case BASE_CASE:     DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 2); break; \
+    case BASE_CASE + 1: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 3); break; \
+    case BASE_CASE + 2: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 4); break; \
+    case BASE_CASE + 3: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 5); break; \
+    case BASE_CASE + 4: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 6); break; \
+    case BASE_CASE + 5: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 7); break;
+
+template <typename ElementOutput>
+void sm89_dispatch_shape_explicit(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                            const c10::optional<torch::Tensor>& bias,
+                            int config_id) {
+#ifdef SGL_DEBUG_BUILD
+    switch(config_id) {
+        case 1:
+            DISPATCH_FP8_GEMM_CONFIG(32, 64, 128, 16, 64, 64, 5);
+            break;
+        case 2:
+            DISPATCH_FP8_GEMM_CONFIG(16, 64, 128, 16, 64, 64, 5);
+            break;
+        case 3:
+            DISPATCH_FP8_GEMM_CONFIG(64, 64, 128, 32, 64, 64, 5);
+            break;
+        case 4:
+            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 5);
+            break;
+        case 5:
+            DISPATCH_FP8_GEMM_CONFIG(128, 128, 64, 64, 32, 64, 2);
+            break;
+        case 6:
+            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 6);
+            break;
+        default:
+            throw std::runtime_error("Invalid config_id in debug mode: " + std::to_string(config_id));
+    }
+#else
+    switch(config_id) {
+        // Group 1: CtaShape32x128x64_WarpShape32x32x64
+        DISPATCH_FP8_GEMM_GROUP(1, 32, 128, 64, 32, 32, 64, 1);
+
+        // Group 2: CtaShape64x128x64_WarpShape32x64x64
+        DISPATCH_FP8_GEMM_GROUP(2, 64, 128, 64, 32, 64, 64, 7);
+
+        // Group 3: CtaShape64x64x128_WarpShape32x64x64
+        DISPATCH_FP8_GEMM_GROUP(3, 64, 64, 128, 32, 64, 64, 13);
+
+        // Group 4: CtaShape64x128x64_WarpShape64x32x64
+        DISPATCH_FP8_GEMM_GROUP(4, 64, 128, 64, 64, 32, 64, 19);
+
+        // Group 5: CtaShape128x64x64_WarpShape64x32x64
+        DISPATCH_FP8_GEMM_GROUP(5, 128, 64, 64, 64, 32, 64, 25);
+
+        // Group 6: CtaShape128x128x64_WarpShape64x32x64
+        DISPATCH_FP8_GEMM_GROUP(6, 128, 128, 64, 64, 32, 64, 31);
+
+        // Group 7: CtaShape128x128x64_WarpShape64x64x64
+        DISPATCH_FP8_GEMM_GROUP(7, 128, 128, 64, 64, 64, 64, 37);
+
+        // Group 8: CtaShape128x128x64_WarpShape128x32x64
+        DISPATCH_FP8_GEMM_GROUP(8, 128, 128, 64, 128, 32, 64, 43);
+
+        // Group 9: CtaShape128x256x64_WarpShape64x64x64
+        DISPATCH_FP8_GEMM_GROUP(9, 128, 256, 64, 64, 64, 64, 49);
+
+        // Group 10: CtaShape256x128x64_WarpShape64x64x64
+        DISPATCH_FP8_GEMM_GROUP(10, 256, 128, 64, 64, 64, 64, 55);
+
+        // Group 11: CtaShape128x64x128_WarpShape64x32x128
+        DISPATCH_FP8_GEMM_GROUP(11, 128, 64, 128, 64, 32, 128, 61);
+
+        // Group 12: CtaShape16x256x128_WarpShape16x64x128
+        DISPATCH_FP8_GEMM_GROUP(12, 16, 256, 128, 16, 64, 128, 67);
+
+        // Group 13: CtaShape16x64x128_WarpShape16x64x64
+        DISPATCH_FP8_GEMM_GROUP(13, 16, 64, 128, 16, 64, 64, 73);
+
+        // Group 14: CtaShape16x128x64_WarpShape16x64x64
+        DISPATCH_FP8_GEMM_GROUP(14, 16, 128, 64, 16, 64, 64, 79);
+
+        // Group 15: CtaShape32x64x128_WarpShape16x64x64
+        DISPATCH_FP8_GEMM_GROUP(15, 32, 64, 128, 16, 64, 64, 85);
+        
+        default:
+            throw std::runtime_error("Invalid config_id: " + std::to_string(config_id));
+    }
+#endif
+}
+
 torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
-                             const c10::optional<torch::Tensor>& bias) {
+                             const c10::optional<torch::Tensor>& bias, bool is_profile=false) {
+
+
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
@@ -558,7 +656,6 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
   auto sm_version = getSMVersion();
-
   if (sm_version >= 90) {
         if (out_dtype == torch::kBFloat16) {
             sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
@@ -566,6 +663,30 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
             sm90_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
         }
   } else if (sm_version == 89) {
+        if (is_profile) {
+            std::string config_path = get_config_path(mat_a.size(1), mat_b.size(1), out_dtype);
+            try {
+                json config = read_json_config(config_path);
+                int current_m = mat_a.size(0);
+                int nearest_m = find_nearest_m(config, current_m);
+                if (nearest_m != -1) {
+                    std::string key = "M=" + std::to_string(nearest_m);
+                    int config_id = config[key].get<int>();
+                    if (out_dtype == torch::kBFloat16) {
+                        sm89_dispatch_shape_explicit<cutlass::bfloat16_t>(
+                            out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+
+                    } else {
+                        sm89_dispatch_shape_explicit<cutlass::half_t>(
+                            out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+                    }
+                    return out;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to read config, using default dispatch: " << e.what() << std::endl;
+            }
+        }
+        
         if (out_dtype == torch::kBFloat16) {
             sm89_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
         } else {
@@ -575,92 +696,76 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
     TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability: ", sm_version);
   }
 
+
   return out;
 }
 
 
-#define DISPATCH_FP8_GEMM_CONFIG(TB_M, TB_N, TB_K, WP_M, WP_N, WP_K, STAGES) \
-    sm89_dispatch_bias<ElementOutput, cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>, \
-        cutlass::gemm::GemmShape<WP_M, WP_N, WP_K>, STAGES>(out, mat_a, mat_b, scales_a, scales_b, bias)
-// 定义一个宏来生成一组配置的所有stages
-#define DISPATCH_FP8_GEMM_GROUP(GROUP_ID, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, BASE_CASE) \
-    case BASE_CASE:     DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 2); break; \
-    case BASE_CASE + 1: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 3); break; \
-    case BASE_CASE + 2: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 4); break; \
-    case BASE_CASE + 3: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 5); break; \
-    case BASE_CASE + 4: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 6); break; \
-    case BASE_CASE + 5: DISPATCH_FP8_GEMM_CONFIG(CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, 7); break;
-
-template <typename ElementOutput>
-void sm89_dispatch_shape_profile(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                            const c10::optional<torch::Tensor>& bias,
-                            int config_id) {
-    switch(config_id) {
-        case 1:
-            DISPATCH_FP8_GEMM_CONFIG(32, 64, 128, 16, 64, 64, 5);
-        case 2:
-            DISPATCH_FP8_GEMM_CONFIG(16, 64, 128, 16, 64, 64, 5);
-        case 3:
-            DISPATCH_FP8_GEMM_CONFIG(64, 64, 128, 32, 64, 64, 5);
-        case 4:
-            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 5);
-        case 5:
-            DISPATCH_FP8_GEMM_CONFIG(128, 128, 64, 64, 32, 64, 2);
-        case 6:
-            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 6);
-        // // Group 1: CtaShape32x128x64_WarpShape32x32x64
-        // DISPATCH_FP8_GEMM_GROUP(1, 32, 128, 64, 32, 32, 64, 1)
-
-        // // Group 2: CtaShape64x128x64_WarpShape32x64x64
-        // DISPATCH_FP8_GEMM_GROUP(2, 64, 128, 64, 32, 64, 64, 7)
-
-        // // Group 3: CtaShape64x64x128_WarpShape32x64x64
-        // DISPATCH_FP8_GEMM_GROUP(3, 64, 64, 128, 32, 64, 64, 13)
-
-        // // Group 4: CtaShape64x128x64_WarpShape64x32x64
-        // DISPATCH_FP8_GEMM_GROUP(4, 64, 128, 64, 64, 32, 64, 19)
-
-        // // Group 5: CtaShape128x64x64_WarpShape64x32x64
-        // DISPATCH_FP8_GEMM_GROUP(5, 128, 64, 64, 64, 32, 64, 25)
-
-        // // Group 6: CtaShape128x128x64_WarpShape64x32x64
-        // DISPATCH_FP8_GEMM_GROUP(6, 128, 128, 64, 64, 32, 64, 31)
-
-        // // Group 7: CtaShape128x128x64_WarpShape64x64x64
-        // DISPATCH_FP8_GEMM_GROUP(7, 128, 128, 64, 64, 64, 64, 37)
-
-        // // Group 8: CtaShape128x128x64_WarpShape128x32x64
-        // DISPATCH_FP8_GEMM_GROUP(8, 128, 128, 64, 128, 32, 64, 43)
-
-        // // Group 9: CtaShape128x256x64_WarpShape64x64x64
-        // DISPATCH_FP8_GEMM_GROUP(9, 128, 256, 64, 64, 64, 64, 49)
-
-        // // Group 10: CtaShape256x128x64_WarpShape64x64x64
-        // DISPATCH_FP8_GEMM_GROUP(10, 256, 128, 64, 64, 64, 64, 55)
-
-        // // Group 11: CtaShape128x64x128_WarpShape64x32x128
-        // DISPATCH_FP8_GEMM_GROUP(11, 128, 64, 128, 64, 32, 128, 61)
-
-        // // Group 12: CtaShape16x256x128_WarpShape16x64x128
-        // DISPATCH_FP8_GEMM_GROUP(12, 16, 256, 128, 16, 64, 128, 67)
-
-        // // Group 13: CtaShape16x64x128_WarpShape16x64x64
-        // DISPATCH_FP8_GEMM_GROUP(13, 16, 64, 128, 16, 64, 64, 73)
-
-        // // Group 14: CtaShape16x128x64_WarpShape16x64x64
-        // DISPATCH_FP8_GEMM_GROUP(14, 16, 128, 64, 16, 64, 64, 79)
-
-        // // Group 15: CtaShape32x64x128_WarpShape16x64x64
-        // DISPATCH_FP8_GEMM_GROUP(15, 32, 64, 128, 16, 64, 64, 85)
+template <typename OutType>
+float test_config(int config_id, torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a, const torch::Tensor& scales_b, const c10::optional<torch::Tensor>& bias) {
+    const int NUM_WARMUP = 25;
+    const int NUM_TEST = 100;
+    // warmup
+    for (int i = 0; i < NUM_WARMUP; i++) {
+        sm89_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
     }
-}
-torch::Tensor fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_b, 
-    const torch::Tensor& scales_a, const torch::Tensor& scales_b, 
-    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias,
-    int config_id) {
     
-    // 基本检查
+    float total_time = 0.0f;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    for (int i = 0; i < NUM_TEST; i++) {
+        cudaEventRecord(start);
+        sm89_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        
+        float elapsed_time;
+        cudaEventElapsedTime(&elapsed_time, start, stop);
+        total_time += elapsed_time;
+    }
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    
+    return total_time / NUM_TEST;
+}
+
+template <typename OutType>
+int sm89_dispatch_shape_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a, const torch::Tensor& scales_b, 
+    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias) {
+    torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
+    float min_time = std::numeric_limits<float>::max();
+    int best_config = -1;
+#ifdef SGL_DEBUG_BUILD
+    for (int i = 1; i <= MAX_CONFIG_ID; i++) {
+#else
+    for (int i = 1; i <= MAX_CONFIG_ID; i++) {
+#endif
+        try {
+            float elapsed_time = test_config<OutType>(i, out, mat_a, mat_b, scales_a, scales_b, bias);
+            #ifdef SGL_DEBUG_BUILD
+            std::cout << "batch_size: " << mat_a.size(0) << ", config_id: " << i << ", time: " << elapsed_time << "ms" << std::endl;
+            #endif
+            if (elapsed_time < min_time) {
+                min_time = elapsed_time;
+                best_config = i;
+            }
+        } catch (const std::exception& e) {
+            continue;
+        }
+    }
+    return best_config;
+}
+
+
+void fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_b, 
+    const torch::Tensor& scales_a, const torch::Tensor& scales_b, 
+    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias) {
+    
     TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
     TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
     TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
@@ -675,7 +780,6 @@ torch::Tensor fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Ten
     TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
     TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
-    // 检查scales
     TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
     TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
     TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
@@ -683,7 +787,6 @@ torch::Tensor fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Ten
     TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
     TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
-    // 检查bias
     if (bias) {
         TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched");
         TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
@@ -692,18 +795,53 @@ torch::Tensor fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Ten
 
     torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
     TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
-
-    auto sm_version = getSMVersion();
     
-    if (sm_version == 89) {
-        if (out_dtype == torch::kBFloat16) {
-            sm89_dispatch_shape_profile<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
-        } else {
-            sm89_dispatch_shape_profile<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+    std::string config_path = get_config_path(mat_a.size(1), mat_b.size(1), out_dtype);
+    int best_config = -1;
+    bool need_profile = true;
+    
+    try {
+        json config = read_json_config(config_path);
+        // construct key
+        std::string key = "M=" + std::to_string(mat_a.size(0));
+        
+        // check if key exists
+        if (config.contains(key)) {
+            best_config = config[key].get<int>();
+            need_profile = false;
         }
-    } else {
-        TORCH_CHECK_NOT_IMPLEMENTED(false, "FP8 operations require SM89 GPU architecture");
+    } catch (const std::exception& e) {
+        // if read failed, create new json object
+        need_profile = true;
     }
-
-    return out;
+    
+    // if need profile, run profile and update config
+    if (need_profile) {
+        if (out_dtype == torch::kBFloat16) {
+            best_config = sm89_dispatch_shape_profile<cutlass::bfloat16_t>(mat_a, mat_b, scales_a, scales_b, out_dtype, bias);
+        } else {
+            best_config = sm89_dispatch_shape_profile<cutlass::half_t>(mat_a, mat_b, scales_a, scales_b, out_dtype, bias);
+        }
+        if (best_config != -1) {
+            try {
+                // read existing config or create new config
+                json config;
+                try {
+                    config = read_json_config(config_path);
+                } catch (...) {
+                    // if file not exists, use empty json object
+                }
+                
+                // update config
+                std::string key = "M=" + std::to_string(mat_a.size(0));
+                config[key] = best_config;
+                
+                // save config
+                std::ofstream o(config_path);
+                o << std::setw(4) << config << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to save config: " << e.what() << std::endl;
+            }
+        }
+    }
 }

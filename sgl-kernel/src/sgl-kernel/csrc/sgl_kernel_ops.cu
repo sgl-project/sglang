@@ -19,12 +19,11 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
 
 torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
-                             const c10::optional<torch::Tensor>& bias);
+                             const c10::optional<torch::Tensor>& bias, bool is_profile=false);
 
-torch::Tensor fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_b, 
+void fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_b, 
     const torch::Tensor& scales_a, const torch::Tensor& scales_b, 
-    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias,
-    int config_id);
+    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce

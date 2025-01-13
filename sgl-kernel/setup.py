@@ -8,6 +8,9 @@ import multiprocessing
 
 root = Path(__file__).parent.resolve()
 
+# 添加调试模式控制
+debug_build = os.environ.get('DEBUG_BUILD', '0').lower() in ('1', 'true', 'yes', 'on')
+print(f"Debug build: {'enabled' if debug_build else 'disabled'}")
 
 def get_version():
     with open(root / "pyproject.toml") as f:
@@ -50,12 +53,20 @@ nvcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    # 只保留需要的架构
     "-gencode=arch=compute_89,code=sm_89",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
+
+# 如果是调试模式，添加调试标志
+if debug_build:
+    nvcc_flags.extend([
+        "-DSGL_DEBUG_BUILD",
+    ])
 cxx_flags = ["-O3"]
+if debug_build:
+    cxx_flags.extend(["-DSGL_DEBUG_BUILD"])
+
 libraries = ["c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
 ext_modules = [
