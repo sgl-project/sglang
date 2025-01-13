@@ -16,7 +16,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 
-# workaround
+# Workaround: many QuantizationConfig still depends on this, so we have to use vLLM's LinearBase now.
 from vllm.model_executor.layers.linear import LinearBase
 
 from sglang.srt.layers.parameter import (
