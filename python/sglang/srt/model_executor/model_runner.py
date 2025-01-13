@@ -50,6 +50,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
@@ -60,7 +61,6 @@ from sglang.srt.utils import (
     monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
-from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
