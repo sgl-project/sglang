@@ -794,7 +794,7 @@ class ServerArgs:
             help="Delete the model checkpoint after loading the model.",
         )
         parser.add_argument(
-            "--memory-saver",
+            "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_gpu_occupation and resume_gpu_occupation",
         )
