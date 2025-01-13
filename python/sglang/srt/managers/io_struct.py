@@ -421,6 +421,7 @@ class UpdateWeightsFromDistributedReqOutput:
 @dataclass
 class UpdateWeightsFromTensorReqInput:
     serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    load_format: Optional[str]
 
 
 @dataclass
@@ -460,6 +461,26 @@ class GetWeightsByNameReqInput:
 @dataclass
 class GetWeightsByNameReqOutput:
     parameter: list
+
+
+@dataclass
+class ReleaseGPUOccupationReqInput:
+    pass
+
+
+@dataclass
+class ReleaseGPUOccupationReqOutput:
+    pass
+
+
+@dataclass
+class ResumeGPUOccupationReqInput:
+    pass
+
+
+@dataclass
+class ResumeGPUOccupationReqOutput:
+    pass
 
 
 @dataclass

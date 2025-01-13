@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.utils import make_layers
 
 
@@ -304,7 +305,7 @@ class Olmo2Model(nn.Module):
         return hidden_states
 
 
-class Olmo2ForCausalLM(nn.Module):
+class Olmo2ForCausalLM(BaseCausalLM):
     """
     Extremely barebones HF model wrapper.
     """

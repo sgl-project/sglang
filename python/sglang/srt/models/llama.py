@@ -46,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
 
@@ -328,8 +329,7 @@ class LlamaModel(nn.Module):
                 )
 
 
-class LlamaForCausalLM(nn.Module):
-
+class LlamaForCausalLM(BaseCausalLM):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",

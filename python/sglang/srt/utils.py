@@ -59,6 +59,12 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
+from vllm.distributed import GroupCoordinator, get_tp_group
+
+try:
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+except ImportError:
+    from torch.distributed._tensor import DTensor, Replicate, Shard
 
 logger = logging.getLogger(__name__)
 
@@ -707,6 +713,20 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+def broadcast_pyobj_in_group(
+    data: List[Any],
+    index_in_group: int,
+    dist_group_coordinator: GroupCoordinator,
+    src_index_in_group: int = 0,
+):
+    return broadcast_pyobj(
+        data=data,
+        rank=dist_group_coordinator.ranks[index_in_group],
+        dist_group=dist_group_coordinator.cpu_group,
+        src=dist_group_coordinator.ranks[src_index_in_group],
+    )
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
@@ -715,7 +735,7 @@ def broadcast_pyobj(
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
-    if rank == 0:
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
             dist.broadcast(tensor_size, src=src, group=dist_group)
@@ -1338,6 +1358,38 @@ def parse_tool_response(text, tools, **kwargs):
         for call_info in call_info_list
     ]
     return text, call_info_list
+
+
+# TODO maybe move
+def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
+    if isinstance(w, DTensor):
+        tp_device_mesh = get_tp_group().device_mesh_device
+        # print(
+        #     f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=}')
+
+        ans = w
+        # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
+        # Now we can either do this hacky full_tensor+from_local+redistribute (to test logical correctness and
+        # easier to flip in the future), or do full_tensor+narrow
+        ans = DTensor.from_local(
+            ans.full_tensor(),
+            device_mesh=tp_device_mesh,
+            placements=[Replicate() for _ in range(tp_device_mesh.ndim)],
+        )
+        ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
+
+        rank_via_mesh = tp_device_mesh.get_local_rank()
+        rank_via_arg = start // length
+        size_via_mesh = tp_device_mesh.size()
+        size_via_arg = w.shape[dim] // length
+        # print(f'weight_loader_narrow END {rank_via_mesh=} {size_via_mesh=} {ans.shape=}')
+        assert rank_via_mesh == rank_via_arg
+        assert size_via_mesh == size_via_arg
+        assert ans.shape[dim] == length
+
+        return ans
+    else:
+        return w.narrow(dim, start, length)
 
 
 class MultiprocessingSerializer:

@@ -46,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 
 
 class DeepseekMLP(nn.Module):
@@ -362,7 +363,7 @@ class DeepseekModel(nn.Module):
         return hidden_states
 
 
-class DeepseekForCausalLM(nn.Module):
+class DeepseekForCausalLM(BaseCausalLM):
 
     def __init__(
         self,

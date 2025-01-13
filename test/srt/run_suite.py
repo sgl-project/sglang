@@ -27,6 +27,7 @@ suites = {
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
+        "test_release_gpu_occupation.py",
         "test_retract_decode.py",
         "test_server_args.py",
         "test_session_control.py",
@@ -64,7 +65,6 @@ for target_suite_name, target_tests in suites.items():
         if target_suite_name in tests:
             tests.remove(target_suite_name)
             tests.extend(target_tests)
-
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
