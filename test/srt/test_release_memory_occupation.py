@@ -73,8 +73,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
         print("update_weights_from_tensor")
         # As if: PPO has updated hf model's weights, and now we sync it to SGLang
-        for name, tensor in hf_model_new.named_parameters():
-            engine.update_weights_from_tensor(name, tensor)
+        engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
         print("generate (#2)")
         outputs = engine.generate(prompt, sampling_params)["text"]
