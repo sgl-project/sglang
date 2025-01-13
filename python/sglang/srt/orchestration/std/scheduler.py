@@ -7,7 +7,6 @@ from typing import List, Optional
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -91,8 +90,8 @@ class SchedulerCommunicator:
                 ),
                 (UpdateWeightsFromTensorReqInput, self.core.update_weights_from_tensor),
                 (GetWeightsByNameReqInput, self.core.get_weights_by_name),
-                (ReleaseGPUOccupationReqInput, self.core.release_gpu_occupation),
-                (ResumeGPUOccupationReqInput, self.core.resume_gpu_occupation),
+                (ReleaseGPUOccupationReqInput, lambda _: self.core.release_gpu_occupation()),
+                (ResumeGPUOccupationReqInput, lambda _: self.core.resume_gpu_occupation()),
                 (ProfileReq, self.core.profile),
                 (OpenSessionReqInput, self.core.open_session),
                 (CloseSessionReqInput, self.core.close_session),
