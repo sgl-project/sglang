@@ -612,7 +612,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
         logger.error(
-            "Received sigquit from a child proces. It usually means the child hanged."
+            "Received sigquit from a child proces. It usually means the child failed."
         )
         kill_process_tree(os.getpid())
 
