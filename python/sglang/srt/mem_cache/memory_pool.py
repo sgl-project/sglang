@@ -47,8 +47,12 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         use_records: bool,
-        memory_saver_adapter: TorchMemorySaverAdapter,
+        enable_memory_saver: bool,
     ):
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
@@ -196,13 +200,17 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         head_dim: int,
         layer_num: int,
         device: str,
-        memory_saver_adapter: TorchMemorySaverAdapter,
+        enable_memory_saver: bool,
     ):
         super().__init__(size, dtype, device)
+
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        self.memory_saver_adapter = memory_saver_adapter
         self._create_buffers()
 
     def _create_buffers(self):
@@ -301,11 +309,15 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         qk_rope_head_dim: int,
         layer_num: int,
         device: str,
-        memory_saver_adapter: TorchMemorySaverAdapter,
+        enable_memory_saver: bool,
     ):
         super().__init__(size, dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
 
         with memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -357,9 +369,13 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         layer_num: int,
         device: str,
         heavy_channel_num: int,
-        memory_saver_adapter: TorchMemorySaverAdapter,
+        enable_memory_saver: bool,
     ):
         super().__init__(size, dtype, device)
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
 
         with memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
@@ -456,7 +472,7 @@ class MLATokenToKVPoolHost:
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
+        ten_gb = 10 * (1024 ** 3)
         if requested_bytes > host_mem.available - ten_gb:
             raise ValueError(
                 f"Not enough host memory available. Requesting "

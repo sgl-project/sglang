@@ -596,7 +596,7 @@ class ModelRunner:
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
             use_records=False,
-            memory_saver_adapter=self.memory_saver_adapter,
+            enable_memory_saver=self.server_args.memory_saver,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -609,7 +609,7 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
-                memory_saver_adapter=self.memory_saver_adapter,
+                enable_memory_saver=self.server_args.memory_saver,
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
@@ -620,7 +620,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
-                memory_saver_adapter=self.memory_saver_adapter,
+                enable_memory_saver=self.server_args.memory_saver,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -630,7 +630,7 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
-                memory_saver_adapter=self.memory_saver_adapter,
+                enable_memory_saver=self.server_args.memory_saver,
             )
         logger.info(
             f"Memory pool end. "
