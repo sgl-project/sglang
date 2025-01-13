@@ -250,11 +250,12 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
         qzeros_turbomind = qzeros_turbomind.contiguous()
 
         self.linear = _turbomind_ext.Linear(
-            layer.input_size,
-            layer.output_size,
+            layer.input_size_per_partition,
+            layer.output_size_per_partition,
             self.quant_config.weight_bits,
             self.quant_config.group_size,
         )
+
         self.linear.post_init(
             qweight_turbomind, scales_turbomind, qzeros_turbomind, simt
         )
@@ -270,9 +271,9 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         x = x.view(-1, x.shape[-1])
-        out_shape = x.shape[:-1] + (layer.output_size,)
+        out_shape = x.shape[:-1] + (layer.output_size_per_partition,)
         out = torch.empty(
-            (x.shape[0], layer.output_size),
+            (x.shape[0], layer.output_size_per_partition),
             dtype=torch.float16,
             device=x.device,
         )
