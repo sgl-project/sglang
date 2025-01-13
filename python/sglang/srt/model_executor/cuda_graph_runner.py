@@ -131,11 +131,6 @@ class CudaGraphRunner:
             else:
                 self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
 
-        if model_runner.server_args.disable_cuda_graph_padding:
-            self.capture_bs = list(range(1, 33)) + [64, 128]
-        else:
-            self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
-
         if max(self.capture_bs) > model_runner.req_to_token_pool.size:
             # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
             # is very samll. We add more values here to make sure we capture the maximum bs.

@@ -335,6 +335,8 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
+        except OverflowError:
+            return False
 
 
 def decode_video_base64(video_base64):
@@ -1378,3 +1380,9 @@ def debug_timing(func):
             return func(*args, **kwargs)
 
     return wrapper
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val

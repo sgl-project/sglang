@@ -514,6 +514,8 @@ class BenchmarkMetrics:
     p99_itl_ms: float
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
+    std_e2e_latency_ms: float
+    p99_e2e_latency_ms: float
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -873,6 +875,8 @@ def calculate_metrics(
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
+        std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
+        p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
     )
 
     return metrics, output_lens
@@ -1064,10 +1068,20 @@ async def benchmark(
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+            "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
+            "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
             "mean_ttft_ms": metrics.mean_ttft_ms,
             "median_ttft_ms": metrics.median_ttft_ms,
+            "std_ttft_ms": metrics.std_ttft_ms,
+            "p99_ttft_ms": metrics.p99_ttft_ms,
+            "mean_tpot_ms": metrics.mean_tpot_ms,
+            "median_tpot_ms": metrics.median_tpot_ms,
+            "std_tpot_ms": metrics.std_tpot_ms,
+            "p99_tpot_ms": metrics.p99_tpot_ms,
             "mean_itl_ms": metrics.mean_itl_ms,
             "median_itl_ms": metrics.median_itl_ms,
+            "std_itl_ms": metrics.std_itl_ms,
+            "p99_itl_ms": metrics.p99_itl_ms,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
             "sharegpt_output_len": args.sharegpt_output_len,
