@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 
 
 class MixtralMLP(nn.Module):
@@ -319,7 +320,7 @@ class MixtralModel(nn.Module):
         return hidden_states
 
 
-class QuantMixtralForCausalLM(nn.Module):
+class QuantMixtralForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: MixtralConfig,

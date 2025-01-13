@@ -24,6 +24,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.utils import make_layers
 
 
@@ -328,7 +329,7 @@ class Phi3SmallModel(nn.Module):
         return hidden_states
 
 
-class Phi3SmallForCausalLM(nn.Module):
+class Phi3SmallForCausalLM(BaseCausalLM):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(

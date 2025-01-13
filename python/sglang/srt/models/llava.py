@@ -39,12 +39,13 @@ from sglang.srt.mm_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
-class LlavaBaseForCausalLM(nn.Module):
+class LlavaBaseForCausalLM(BaseCausalLM):
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
 

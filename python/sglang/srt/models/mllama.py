@@ -34,6 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 
 
@@ -719,7 +720,7 @@ class MllamaTextModel(nn.Module):
         return hidden_states
 
 
-class MllamaForCausalLM(nn.Module):
+class MllamaForCausalLM(BaseCausalLM):
     config_class = config_mllama.MllamaTextConfig
     base_model_prefix = "language_model"
     _no_split_modules = [
