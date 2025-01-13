@@ -829,13 +829,22 @@ class TokenizerManager:
         self.dump_request_list.append(
             (state.obj, out_dict, state.created_time, time.time())
         )
-        if len(self.dump_request_list) > 1000:
-            os.makedirs(self.dump_requsts_folder, exist_ok=True)
-            current_time = datetime.now()
-            filename = current_time.strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
-            with open(os.path.join(self.dump_requsts_folder, filename), "wb") as f:
-                pickle.dump(self.dump_request_list, f)
+
+        if len(self.dump_request_list) > int(
+            os.environ.get("SGLANG_DUMP_REQUESTS_THRESHOLD", "1000")
+        ):
+            to_dump = self.dump_request_list
             self.dump_request_list = []
+
+            def background_task():
+                os.makedirs(self.dump_requsts_folder, exist_ok=True)
+                current_time = datetime.now()
+                filename = current_time.strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
+                with open(os.path.join(self.dump_requsts_folder, filename), "wb") as f:
+                    pickle.dump(to_dump, f)
+
+            # Schedule the task to run in the background without awaiting it
+            asyncio.create_task(asyncio.to_thread(background_task))
 
 
 class SignalHandler:
