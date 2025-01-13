@@ -7,6 +7,7 @@ from typing import List, Optional
 import psutil
 import setproctitle
 import zmq
+
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -15,11 +16,13 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
     ProfileReq,
+    ReleaseGPUOccupationReqInput,
+    ResumeGPUOccupationReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler, SchedulerCallback

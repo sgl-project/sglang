@@ -16,8 +16,10 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    ReleaseGPUOccupationReqInput,
+    ResumeGPUOccupationReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.orchestration import std
 from sglang.srt.server.engine_base import EngineBase
@@ -258,6 +260,7 @@ class Engine(EngineBase):
         obj = ResumeGPUOccupationReqInput()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.entrypoint.resume_gpu_occupation(obj, None))
+
 
 _STREAM_END_SYMBOL = b"data: [DONE]"
 _STREAM_CHUNK_START_SYMBOL = b"data:"

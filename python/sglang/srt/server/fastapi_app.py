@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response
+
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     EmbeddingReqInput,
@@ -13,8 +14,10 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
+    ReleaseGPUOccupationReqInput,
+    ResumeGPUOccupationReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.metrics.func_timer import time_func_latency
 from sglang.srt.openai_api.adapter import (
@@ -120,7 +123,7 @@ async def flush_cache():
     _global_state.engine.entrypoint.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-                "(When there are running or waiting requests, the operation will not be performed.)\n",
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
