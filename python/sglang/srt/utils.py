@@ -1375,3 +1375,9 @@ def debug_timing(func):
             return func(*args, **kwargs)
 
     return wrapper
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
