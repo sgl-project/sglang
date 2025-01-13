@@ -382,7 +382,7 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        param.load_column_parallel_weight(loaded_weight, self.tp_rank)
+        param.load_column_parallel_weight(loaded_weight, tp_rank=self.tp_rank)
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
