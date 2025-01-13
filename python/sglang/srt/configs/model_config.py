@@ -274,16 +274,6 @@ class ModelConfig:
                     self.quantization,
                 )
 
-        if quantization_in_turbomind(self.quantization):
-            try:
-                import subprocess
-
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "turbomind"], check=True
-                )
-            except subprocess.CalledProcessError:
-                raise ValueError(f"Install Turbomind failed.")
-
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids:
