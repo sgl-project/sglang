@@ -50,6 +50,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
+    ReleaseGPUOccupationReqOutput, ResumeGPUOccupationReqOutput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
@@ -148,6 +149,14 @@ class Entrypoint:
                 (
                     GetWeightsByNameReqOutput,
                     self.get_weights_by_name_communicator.handle_recv,
+                ),
+                (
+                    ReleaseGPUOccupationReqOutput,
+                    self.release_gpu_occupation_communicator.handle_recv,
+                ),
+                (
+                    ResumeGPUOccupationReqOutput,
+                    self.resume_gpu_occupation_communicator.handle_recv,
                 ),
             ]
         )
