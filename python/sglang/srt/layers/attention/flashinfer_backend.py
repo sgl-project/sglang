@@ -440,7 +440,9 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
             o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -449,6 +451,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
             )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -474,7 +478,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -603,13 +609,17 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
 
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
