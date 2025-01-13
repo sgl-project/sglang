@@ -18,10 +18,12 @@ import copy
 import dataclasses
 import logging
 import os
+import pickle
 import signal
 import sys
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
@@ -105,6 +107,7 @@ class TokenizerManager:
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
+        self.dump_requsts_folder = server_args.dump_requests_folder
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -163,6 +166,7 @@ class TokenizerManager:
         # Store states
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.dump_request_list: List[Tuple] = []
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
@@ -680,6 +684,9 @@ class TokenizerManager:
 
                     if self.enable_metrics:
                         self.collect_metrics(state, recv_obj, i)
+                    if self.dump_requsts_folder and state.finished:
+                        self.dump_requests(state, out_dict)
+
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
                     recv_obj.session_id if recv_obj.success else None
@@ -817,6 +824,18 @@ class TokenizerManager:
                 self.metrics_collector.observe_time_per_output_token(
                     (time.time() - state.created_time) / completion_tokens
                 )
+
+    def dump_requests(self, state: ReqState, out_dict: dict):
+        self.dump_request_list.append(
+            (state.obj, out_dict, state.created_time, time.time())
+        )
+        if len(self.dump_request_list) > 1000:
+            os.makedirs(self.dump_requsts_folder, exist_ok=True)
+            current_time = datetime.now()
+            filename = current_time.strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
+            with open(os.path.join(self.dump_requsts_folder, filename), "wb") as f:
+                pickle.dump(self.dump_request_list, f)
+            self.dump_request_list = []
 
 
 class SignalHandler:

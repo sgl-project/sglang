@@ -23,7 +23,6 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -89,6 +88,7 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
+    dump_requests: str = ""
 
     # API related
     api_key: Optional[str] = None
@@ -554,7 +554,13 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch",
+            help="The log interval of decode batch.",
+        )
+        parser.add_argument(
+            "--dump-requests-folder",
+            type=str,
+            default=ServerArgs.decode_log_interval,
+            help="Dump raw requests to a folder for replay.",
         )
 
         # API related
