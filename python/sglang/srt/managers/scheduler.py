@@ -1554,16 +1554,16 @@ class Scheduler:
         return parameter
 
     def release_memory_occupation(self):
-        self.stashed_model_static_state = (
-            self.tp_worker.worker.model_runner.model.export_static_state()
+        self.stashed_model_static_state = _export_static_state(
+            self.tp_worker.worker.model_runner.model
         )
         self.memory_saver_adapter.pause()
         self.flush_cache()
 
     def resume_memory_occupation(self):
         self.memory_saver_adapter.resume()
-        self.tp_worker.worker.model_runner.model.import_static_state(
-            self.stashed_model_static_state
+        _import_static_state(
+            self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
         )
         del self.stashed_model_static_state
 
@@ -1603,6 +1603,20 @@ class Scheduler:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
             del self.sessions[session_id]
+
+
+def _export_static_state(model):
+    return dict(
+        buffers=[
+            (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
+        ]
+    )
+
+
+def _import_static_state(model, static_params):
+    self_named_buffers = dict(model.named_buffers())
+    for name, tensor in static_params["buffers"]:
+        self_named_buffers[name][...] = tensor
 
 
 def run_scheduler_process(
