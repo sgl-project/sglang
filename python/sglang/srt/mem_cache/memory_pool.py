@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
 Memory pool.
