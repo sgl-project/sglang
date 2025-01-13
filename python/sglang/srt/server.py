@@ -618,13 +618,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
 
-    def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        time.sleep(5)  # Sleep enough so that it can print error messages accordingly.
-        raise RuntimeError(f"Child process died! {pid=} {exitcode=}")
-
-    signal.signal(signal.SIGCHLD, sigchld_handler)
-
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
