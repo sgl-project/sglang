@@ -643,6 +643,9 @@ def _set_envs_and_config(server_args: ServerArgs):
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
+        logger.error(
+            "Received sigquit from a child proces. It usually means the child failed."
+        )
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
