@@ -4,7 +4,7 @@ SGLang router is a standalone module implemented in Rust to achieve data paralle
 
 ## User docs
 
-Please check https://sgl-project.github.io/router/router.html
+Please check https://docs.sglang.ai/router/router.html
 
 ## Developer docs
 
