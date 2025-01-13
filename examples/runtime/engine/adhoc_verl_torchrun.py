@@ -170,8 +170,9 @@ def main():
         tp_size=tensor_model_parallel_size,
         dtype="bfloat16",
         memory_saver=True,
-        mem_fraction_static=0.1,
+        mem_fraction_static=0.6,
         nccl_port=12345,
+        # TODO `tp_rank` (and maybe `nccl_port`?) can be removed later, will do it when #2827's depending PRs are merged
         tp_rank=rank,
         gpu_id=rank,
         parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
@@ -182,9 +183,11 @@ def main():
         ),
     )
 
+    print("Sleep to have time checking memory consumption")
+    time.sleep(5)
     print("release_gpu_occupation")
     llm.release_gpu_occupation()
-    print("Sleep to have time checking memory consumption")
+    print("Sleep again to have time checking memory consumption")
     time.sleep(5)
     print("resume_gpu_occupation")
     llm.resume_gpu_occupation()
