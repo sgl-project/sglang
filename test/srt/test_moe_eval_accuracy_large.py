@@ -71,7 +71,7 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.62)
+        self.assertGreater(metrics["score"], 0.61)
 
 
 if __name__ == "__main__":

@@ -4,11 +4,11 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "rust/**"
+      - "sgl-router/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "rust/**"
+      - "sgl-router/**"
   workflow_dispatch:
 
 concurrency:
@@ -30,14 +30,14 @@ jobs:
       - name: Run fmt
         run: |
           source "$HOME/.cargo/env"
-          cd rust/
+          cd sgl-router/
           cargo fmt -- --check
 
       - name: Run test
         timeout-minutes: 20
         run: |
           source "$HOME/.cargo/env"
-          cd rust/
+          cd sgl-router/
           cargo test
 
   e2e-rust:
@@ -54,13 +54,14 @@ jobs:
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
-          cd rust
+          cd sgl-router
           pip install setuptools-rust wheel build
           python3 -m build
           pip install --force-reinstall dist/*.whl
       - name: Run e2e test
         run: |
-          cd rust/py_test
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-router/py_test
           python3 run_suite.py
 
   finish:

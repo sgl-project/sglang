@@ -55,6 +55,7 @@ class RuntimeEndpoint(BaseBackend):
             self.base_url + "/flush_cache",
             api_key=self.api_key,
             verify=self.verify,
+            method="POST",
         )
         self._assert_success(res)
 

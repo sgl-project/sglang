@@ -201,17 +201,16 @@ def throughput_test_once(
         for r in reqs
     ]
 
-    st = time.perf_counter()
     if profile:
         backend.start_profile()
 
+    st = time.perf_counter()
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+    latency = time.perf_counter() - st
 
     if profile:
         backend.stop_profile()
         monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
-
-    latency = time.perf_counter() - st
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
@@ -285,7 +284,7 @@ def throughput_test(
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
 
-    tokenizer_id = server_args.model_path
+    tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environmnets
@@ -304,8 +303,8 @@ def throughput_test(
     warmup_requests = sample_random_requests(
         input_len=256,
         output_len=16,
-        num_prompts=16,
-        range_ratio=0.8,
+        num_prompts=min(bench_args.num_prompts, 16),
+        range_ratio=1.0,
         tokenizer=tokenizer,
         dataset_path=bench_args.dataset_path,
     )
@@ -321,6 +320,7 @@ def throughput_test(
             extra_request_body=extra_request_body,
             profile=False,
         )
+        time.sleep(0.5)
 
     logging.info("\nBenchmark...")
     result = throughput_test_once(
@@ -331,6 +331,7 @@ def throughput_test(
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
     )
+    backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:

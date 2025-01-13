@@ -1,13 +1,18 @@
-.PHONY: check-deps install-deps format update
+.PHONY: check-deps install-deps format update help
 
-check-deps:
+# Show help for each target
+help:
+	@echo "Available targets:"
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+check-deps: ## Check and install required Python formatting dependencies
 	@command -v isort >/dev/null 2>&1 || (echo "Installing isort..." && pip install isort)
 	@command -v black >/dev/null 2>&1 || (echo "Installing black..." && pip install black)
 
-install-deps:
+install-deps: ## Install Python formatting tools (isort and black)
 	pip install isort black
 
-format: check-deps
+format: check-deps ## Format modified Python files using isort and black
 	@echo "Formatting modified Python files..."
 	git diff --name-only --diff-filter=M | grep '\.py$$' | xargs -I {} sh -c 'isort {} && black {}'
 
@@ -17,7 +22,7 @@ FILES_TO_UPDATE = docker/Dockerfile.rocm \
                  docs/developer/setup_github_runner.md \
                  docs/start/install.md
 
-update:
+update: ## Update version numbers across project files. Usage: make update <new_version>
 	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \
 		echo "Version required. Usage: make update <new_version>"; \
 		exit 1; \

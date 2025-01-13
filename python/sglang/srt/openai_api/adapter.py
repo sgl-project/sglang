@@ -65,10 +65,13 @@ from sglang.srt.openai_api.protocol import (
     FileDeleteResponse,
     FileRequest,
     FileResponse,
+    FunctionResponse,
     LogProbs,
+    ToolCall,
     TopLogprob,
     UsageInfo,
 )
+from sglang.srt.utils import TOOLS_TAG_LIST, parse_tool_response
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -510,11 +513,14 @@ def v1_generate_request(
                 "stop": request.stop,
                 "stop_token_ids": request.stop_token_ids,
                 "top_p": request.top_p,
+                "top_k": request.top_k,
+                "min_p": request.min_p,
                 "presence_penalty": request.presence_penalty,
                 "frequency_penalty": request.frequency_penalty,
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
                 "json_schema": request.json_schema,
+                "ebnf": request.ebnf,
                 "n": request.n,
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
@@ -856,6 +862,7 @@ def v1_chat_generate_request(
     logprob_start_lens = []
     top_logprobs_nums = []
     modalities_list = []
+    lora_paths = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -867,6 +874,21 @@ def v1_chat_generate_request(
         #    None skips any image processing in GenerateReqInput.
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
+            tools = None
+            if request.tools and request.tool_choice != "none":
+                request.skip_special_tokens = False
+                if request.stream:
+                    logger.warning("Streaming is not supported with tools.")
+                    request.stream = False
+                if not isinstance(request.tool_choice, str):
+                    tools = [
+                        item.function.model_dump()
+                        for item in request.tools
+                        if item.function.name == request.tool_choice.function.name
+                    ]
+                else:
+                    tools = [item.function.model_dump() for item in request.tools]
+
             if chat_template_name is None:
                 openai_compatible_messages = []
                 for message in request.messages:
@@ -890,6 +912,7 @@ def v1_chat_generate_request(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
+                    tools=tools,
                 )
                 if assistant_prefix:
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
@@ -918,6 +941,7 @@ def v1_chat_generate_request(
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
+        lora_paths.append(request.lora_path)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -926,10 +950,13 @@ def v1_chat_generate_request(
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
             "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
+            "ebnf": request.ebnf,
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
@@ -954,6 +981,7 @@ def v1_chat_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
+        lora_paths = lora_paths[0]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -971,6 +999,7 @@ def v1_chat_generate_request(
         return_text_in_logprobs=True,
         rid=request_ids,
         modalities=modalities_list,
+        lora_path=lora_paths,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -1023,11 +1052,46 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
+        tool_calls = None
+        text = ret_item["text"]
+
+        if isinstance(request, list):
+            tool_choice = request[idx].tool_choice
+            tools = request[idx].tools
+        else:
+            tool_choice = request.tool_choice
+            tools = request.tools
+
+        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
+            try:
+                text, call_info_list = parse_tool_response(text, tools)  # noqa
+                tool_calls = [
+                    ToolCall(
+                        id=str(call_info[0]),
+                        function=FunctionResponse(
+                            name=call_info[1], arguments=call_info[2]
+                        ),
+                    )
+                    for call_info in call_info_list
+                ]
+            except Exception as e:
+                logger.error(f"Exception: {e}")
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "Failed to parse fc related info to json format!",
+                )
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
                 "index": 0,
-                "message": {"role": "assistant", "content": ret_item["text"]},
+                "message": {
+                    "role": "assistant",
+                    "content": ret_item["text"] if tool_calls is None else None,
+                    "tool_calls": tool_calls,
+                },
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
@@ -1039,7 +1103,11 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
-                message=ChatMessage(role="assistant", content=ret_item["text"]),
+                message=ChatMessage(
+                    role="assistant",
+                    content=ret_item["text"] if tool_calls is None else None,
+                    tool_calls=tool_calls,
+                ),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
                 matched_stop=(
