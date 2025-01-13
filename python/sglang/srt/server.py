@@ -259,20 +259,20 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
         return _create_error_response(e)
 
 
-@app.api_route("/release_gpu_occupation", methods=["GET", "POST"])
-async def release_gpu_occupation(obj: ReleaseMemoryOccupationReqInput, request: Request):
+@app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput, request: Request):
     """Release GPU occupation temporarily"""
     try:
-        await tokenizer_manager.release_gpu_occupation(obj, request)
+        await tokenizer_manager.release_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
 
-@app.api_route("/resume_gpu_occupation", methods=["GET", "POST"])
-async def resume_gpu_occupation(obj: ResumeMemoryOccupationReqInput, request: Request):
+@app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
+async def resume_memory_occupation(obj: ResumeMemoryOccupationReqInput, request: Request):
     """Resume GPU occupation"""
     try:
-        await tokenizer_manager.resume_gpu_occupation(obj, request)
+        await tokenizer_manager.resume_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -922,17 +922,17 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
 
-    def release_gpu_occupation(self):
+    def release_memory_occupation(self):
         """Release GPU occupation temporarily"""
         obj = ReleaseMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(tokenizer_manager.release_gpu_occupation(obj, None))
+        loop.run_until_complete(tokenizer_manager.release_memory_occupation(obj, None))
 
-    def resume_gpu_occupation(self):
+    def resume_memory_occupation(self):
         """Resume GPU occupation"""
         obj = ResumeMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(tokenizer_manager.resume_gpu_occupation(obj, None))
+        loop.run_until_complete(tokenizer_manager.resume_memory_occupation(obj, None))
 
 
 class Runtime:

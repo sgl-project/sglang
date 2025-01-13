@@ -41,11 +41,11 @@ class TestReleaseGPUOccupation(unittest.TestCase):
             "Should not be able to allocate big tensors before releasing",
         )
 
-        print("release_gpu_occupation start")
+        print("release_memory_occupation start")
         t = time.time()
-        engine.release_gpu_occupation()
+        engine.release_memory_occupation()
         if _DEBUG_EXTRA:
-            print("release_gpu_occupation", time.time() - t)
+            print("release_memory_occupation", time.time() - t)
 
         if _DEBUG_EXTRA:
             time.sleep(5)
@@ -59,11 +59,11 @@ class TestReleaseGPUOccupation(unittest.TestCase):
         if _DEBUG_EXTRA:
             time.sleep(5)
 
-        print("resume_gpu_occupation start")
+        print("resume_memory_occupation start")
         t = time.time()
-        engine.resume_gpu_occupation()
+        engine.resume_memory_occupation()
         if _DEBUG_EXTRA:
-            print("resume_gpu_occupation", time.time() - t)
+            print("resume_memory_occupation", time.time() - t)
 
         self.assertEqual(
             _try_allocate_big_tensor(),
