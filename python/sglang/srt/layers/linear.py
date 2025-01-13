@@ -1174,11 +1174,18 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        param.load_row_parallel_weight(
-            loaded_weight,
-            tp_rank=self.tp_rank,
-            use_presharded_weights=self.use_presharded_weights,
-        )
+        if isinstance(param, BasevLLMParameter):
+            # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
+            # It supports additional parameters like tp_rank and use_presharded_weights.
+            param.load_row_parallel_weight(
+                loaded_weight,
+                tp_rank=self.tp_rank,
+                use_presharded_weights=self.use_presharded_weights,
+            )
+        else:
+            # `params` is defined in `vllm/model_executor/parameter.py`,
+            # It does not support additional parameters.
+            param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_):
         if self.input_is_parallel:
