@@ -26,6 +26,11 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
+
 logger = logging.getLogger(__name__)
 
 # use system-level temp directory for file locks, so that multiple users
@@ -122,7 +127,6 @@ def convert_bin_to_safetensor_file(
 def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig:
-
     quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file
@@ -489,6 +493,9 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
+        if isinstance(loaded_weight, DTensor):
+            loaded_weight = loaded_weight.full_tensor()
+
         if param.numel() == 1 and loaded_weight.numel() == 1:
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,

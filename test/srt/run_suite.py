@@ -65,7 +65,6 @@ for target_suite_name, target_tests in suites.items():
             tests.remove(target_suite_name)
             tests.extend(target_tests)
 
-
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
