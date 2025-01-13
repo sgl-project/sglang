@@ -6,7 +6,6 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response
-
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     EmbeddingReqInput,
@@ -15,7 +14,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqInput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
 )
 from sglang.srt.metrics.func_timer import time_func_latency
 from sglang.srt.openai_api.adapter import (
@@ -121,7 +120,7 @@ async def flush_cache():
     _global_state.engine.entrypoint.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -209,6 +208,24 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
             return create_error_response("Get parameter by name failed")
         else:
             return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return create_error_response(e)
+
+
+@app.api_route("/release_gpu_occupation", methods=["GET", "POST"])
+async def release_gpu_occupation(obj: ReleaseGPUOccupationReqInput, request: Request):
+    """Release GPU occupation temporarily"""
+    try:
+        await _global_state.engine.entrypoint.release_gpu_occupation(obj, request)
+    except Exception as e:
+        return create_error_response(e)
+
+
+@app.api_route("/resume_gpu_occupation", methods=["GET", "POST"])
+async def resume_gpu_occupation(obj: ResumeGPUOccupationReqInput, request: Request):
+    """Resume GPU occupation"""
+    try:
+        await _global_state.engine.entrypoint.resume_gpu_occupation(obj, request)
     except Exception as e:
         return create_error_response(e)
 
