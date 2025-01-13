@@ -88,7 +88,7 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
-    dump_requests: str = ""
+    dump_requests_folder: str = ""
 
     # API related
     api_key: Optional[str] = None
