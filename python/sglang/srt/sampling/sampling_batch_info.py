@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
-if torch.cuda.is_available() and torch.version.cuda:
+from sglang.srt.utils import is_cuda_available
+
+if is_cuda_available():
     from sgl_kernel import sampling_scaling_penalties
 
 import sglang.srt.sampling.penaltylib as penaltylib
@@ -248,7 +250,7 @@ class SamplingBatchInfo:
 
         # repetition
         if self.scaling_penalties is not None:
-            if torch.cuda.is_available() and torch.version.cuda:
+            if is_cuda_available():
                 logits[:] = sampling_scaling_penalties(logits, self.scaling_penalties)
             else:
                 logits[:] = torch.where(
