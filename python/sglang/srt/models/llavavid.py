@@ -28,7 +28,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
-class LlavaVidForCausalLM(BaseCausalLM):
+class LlavaVidForCausalLM:
     def __init__(
         self,
         config: LlavaConfig,

@@ -361,7 +361,7 @@ class DbrxModel(nn.Module):
         return hidden_states
 
 
-class DbrxForCausalLM(BaseCausalLM):
+class DbrxForCausalLM:
     def __init__(
         self,
         config: DbrxConfig,

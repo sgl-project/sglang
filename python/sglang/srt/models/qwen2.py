@@ -266,7 +266,7 @@ class Qwen2Model(nn.Module):
         return hidden_states
 
 
-class Qwen2ForCausalLM(BaseCausalLM):
+class Qwen2ForCausalLM:
 
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [

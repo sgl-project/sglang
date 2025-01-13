@@ -328,7 +328,7 @@ class Phi3SmallModel(nn.Module):
         return hidden_states
 
 
-class Phi3SmallForCausalLM(BaseCausalLM):
+class Phi3SmallForCausalLM:
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(

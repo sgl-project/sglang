@@ -823,7 +823,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
-class DeepseekV2ForCausalLM(BaseCausalLM):
+class DeepseekV2ForCausalLM:
 
     def __init__(
         self,

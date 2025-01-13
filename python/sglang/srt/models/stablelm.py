@@ -237,7 +237,7 @@ class StableLMEpochModel(nn.Module):
         return hidden_states
 
 
-class StableLmForCausalLM(BaseCausalLM):
+class StableLmForCausalLM:
     def __init__(
         self,
         config: PretrainedConfig,
