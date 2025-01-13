@@ -1,11 +1,10 @@
 import time
 import unittest
 
-import torch
-from transformers import AutoModelForCausalLM
-
 import sglang as sgl
+import torch
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from transformers import AutoModelForCausalLM
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = True
@@ -73,8 +72,7 @@ class TestReleaseGPUOccupation(unittest.TestCase):
 
         print("update_weights_from_tensor")
         # As if: PPO has updated hf model's weights, and now we sync it to SGLang
-        for name, tensor in hf_model_new.named_parameters():
-            engine.update_weights_from_tensor(name, tensor)
+        engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
         print("generate (#2)")
         outputs = engine.generate(prompt, sampling_params)["text"]
