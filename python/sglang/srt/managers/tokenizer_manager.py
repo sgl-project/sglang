@@ -873,7 +873,7 @@ class TokenizerManager:
             (state.obj, out_dict, state.created_time, time.time())
         )
 
-        if len(self.dump_request_list) > self.dump_requests_threshold:
+        if len(self.dump_request_list) >= self.dump_requests_threshold:
             to_dump = self.dump_request_list
             self.dump_request_list = []
 
