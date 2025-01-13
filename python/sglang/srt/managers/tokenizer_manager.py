@@ -20,6 +20,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
@@ -593,8 +594,17 @@ class TokenizerManager:
         loop = asyncio.get_event_loop()
         self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
 
-        signal_handler = SignalHandler(self)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        # We cannot add signal handler when the tokenizer manager is not in
+        # the main thread due to the CPython limitation.
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = SignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        else:
+            logger.warning(
+                "Signal handler is not added because the tokenizer manager is "
+                "not in the main thread. This disables graceful shutdown of the "
+                "tokenizer manager when SIGTERM is received."
+            )
         self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
 
     async def sigterm_watchdog(self):
