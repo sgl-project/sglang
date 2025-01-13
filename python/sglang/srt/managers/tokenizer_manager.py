@@ -29,7 +29,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -53,10 +52,10 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
-    ReleaseGPUOccupationReqInput,
-    ReleaseGPUOccupationReqOutput,
-    ResumeGPUOccupationReqInput,
-    ResumeGPUOccupationReqOutput,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -102,9 +101,9 @@ class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
-        self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
+            self,
+            server_args: ServerArgs,
+            port_args: PortArgs,
     ):
         # Parse args
         self.server_args = server_args
@@ -209,9 +208,9 @@ class TokenizerManager:
             )
 
     async def generate_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: Union[GenerateReqInput, EmbeddingReqInput],
+            request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
 
@@ -237,13 +236,13 @@ class TokenizerManager:
                     yield response
             else:
                 async for response in self._handle_batch_request(
-                    obj, request, created_time
+                        obj, request, created_time
                 ):
                     yield response
 
     async def _tokenize_one_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+            self,
+            obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
         # Tokenize
@@ -315,10 +314,10 @@ class TokenizerManager:
         return tokenized_obj
 
     def _send_one_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
-        created_time: Optional[float] = None,
+            self,
+            obj: Union[GenerateReqInput, EmbeddingReqInput],
+            tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+            created_time: Optional[float] = None,
     ):
         event = asyncio.Event()
         state = ReqState([], False, event, obj, created_time=created_time)
@@ -326,9 +325,9 @@ class TokenizerManager:
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
     async def _wait_one_response(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: Union[GenerateReqInput, EmbeddingReqInput],
+            request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
@@ -363,10 +362,10 @@ class TokenizerManager:
                     raise ValueError(f"Abort request {obj.rid}")
 
     async def _handle_batch_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-        created_time: Optional[float] = None,
+            self,
+            obj: Union[GenerateReqInput, EmbeddingReqInput],
+            request: Optional[fastapi.Request] = None,
+            created_time: Optional[float] = None,
     ):
         batch_size = obj.batch_size
 
@@ -460,9 +459,9 @@ class TokenizerManager:
         self.send_to_scheduler.send_pyobj(req)
 
     async def update_weights_from_disk(
-        self,
-        obj: UpdateWeightFromDiskReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: UpdateWeightFromDiskReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
@@ -478,7 +477,7 @@ class TokenizerManager:
                 return await self._wait_for_model_update_from_disk(obj)
 
     async def _wait_for_model_update_from_disk(
-        self, obj: UpdateWeightFromDiskReqInput
+            self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
@@ -504,25 +503,25 @@ class TokenizerManager:
             return all_success, all_message
 
     async def init_weights_update_group(
-        self,
-        obj: InitWeightsUpdateGroupReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: InitWeightsUpdateGroupReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
+                self.server_args.dp_size == 1
         ), "dp_size must be 1 for init parameter update group"
         result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(
-        self,
-        obj: UpdateWeightsFromDistributedReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: UpdateWeightsFromDistributedReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
+                self.server_args.dp_size == 1
         ), "dp_size must be for update weights from distributed"
 
         # This means that weight sync
@@ -532,13 +531,13 @@ class TokenizerManager:
             return result.success, result.message
 
     async def update_weights_from_tensor(
-        self,
-        obj: UpdateWeightsFromTensorReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: UpdateWeightsFromTensorReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
+                self.server_args.dp_size == 1
         ), "dp_size must be for update weights from distributed"
 
         # This means that weight sync
@@ -548,7 +547,7 @@ class TokenizerManager:
             return result.success, result.message
 
     async def get_weights_by_name(
-        self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
+            self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
@@ -559,23 +558,23 @@ class TokenizerManager:
             return all_parameters
 
     async def release_gpu_occupation(
-        self,
-        obj: ReleaseGPUOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: ReleaseMemoryOccupationReqInput,
+            request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.release_gpu_occupation_communicator(obj)
 
     async def resume_gpu_occupation(
-        self,
-        obj: ResumeGPUOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: ResumeMemoryOccupationReqInput,
+            request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.resume_gpu_occupation_communicator(obj)
 
     async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+            self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         self.auto_create_handle_loop()
 
@@ -592,7 +591,7 @@ class TokenizerManager:
         return session_id
 
     async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+            self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         assert not self.to_create_loop, "close session should not be the first request"
         await self.send_to_scheduler.send_pyobj(obj)
@@ -653,8 +652,8 @@ class TokenizerManager:
                 UpdateWeightsFromDistributedReqOutput,
                 GetWeightsByNameReqOutput,
                 InitWeightsUpdateGroupReqOutput,
-                ReleaseGPUOccupationReqOutput,
-                ResumeGPUOccupationReqOutput,
+                ReleaseMemoryOccupationReqOutput,
+                ResumeMemoryOccupationReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
@@ -738,9 +737,9 @@ class TokenizerManager:
                             )
                             # Compute time_per_output_token for the non-streaming case
                             if (
-                                hasattr(state.obj, "stream")
-                                and not state.obj.stream
-                                and completion_tokens >= 1
+                                    hasattr(state.obj, "stream")
+                                    and not state.obj.stream
+                                    and completion_tokens >= 1
                             ):
                                 self.metrics_collector.observe_time_per_output_token(
                                     (time.time() - state.created_time)
@@ -760,35 +759,35 @@ class TokenizerManager:
                         self.model_update_result.set_result(self.model_update_tmp)
             elif isinstance(recv_obj, InitWeightsUpdateGroupReqOutput):
                 assert (
-                    self.server_args.dp_size == 1
+                        self.server_args.dp_size == 1
                 ), "dp_size must be 1 for init parameter update group"
                 self.init_weights_update_group_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, UpdateWeightsFromDistributedReqOutput):
                 assert (
-                    self.server_args.dp_size == 1
+                        self.server_args.dp_size == 1
                 ), "dp_size must be 1 for update weights from distributed"
                 self.update_weights_from_distributed_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, UpdateWeightsFromTensorReqOutput):
                 assert (
-                    self.server_args.dp_size == 1
+                        self.server_args.dp_size == 1
                 ), "dp_size must be 1 for update weights from distributed"
                 self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
-            elif isinstance(recv_obj, ReleaseGPUOccupationReqOutput):
+            elif isinstance(recv_obj, ReleaseMemoryOccupationReqOutput):
                 self.release_gpu_occupation_communicator.handle_recv(recv_obj)
-            elif isinstance(recv_obj, ResumeGPUOccupationReqOutput):
+            elif isinstance(recv_obj, ResumeMemoryOccupationReqOutput):
                 self.resume_gpu_occupation_communicator.handle_recv(recv_obj)
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
 
     def convert_logprob_style(
-        self,
-        meta_info: dict,
-        top_logprobs_num: int,
-        return_text_in_logprobs: bool,
-        recv_obj: BatchStrOut,
-        recv_obj_index: int,
+            self,
+            meta_info: dict,
+            top_logprobs_num: int,
+            return_text_in_logprobs: bool,
+            recv_obj: BatchStrOut,
+            recv_obj_index: int,
     ):
         meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
             recv_obj.input_token_logprobs_val[recv_obj_index],
@@ -817,10 +816,10 @@ class TokenizerManager:
             )
 
     def detokenize_logprob_tokens(
-        self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
-        decode_to_text: bool,
+            self,
+            token_logprobs_val: List[float],
+            token_logprobs_idx: List[int],
+            decode_to_text: bool,
     ):
         if not decode_to_text:
             return [
@@ -833,10 +832,10 @@ class TokenizerManager:
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
-        self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
-        decode_to_text: bool,
+            self,
+            token_logprobs_val: List[float],
+            token_logprobs_idx: List[int],
+            decode_to_text: bool,
     ):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.

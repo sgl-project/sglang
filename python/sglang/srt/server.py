@@ -59,8 +59,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
-    ReleaseGPUOccupationReqInput,
-    ResumeGPUOccupationReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -260,7 +260,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 
 
 @app.api_route("/release_gpu_occupation", methods=["GET", "POST"])
-async def release_gpu_occupation(obj: ReleaseGPUOccupationReqInput, request: Request):
+async def release_gpu_occupation(obj: ReleaseMemoryOccupationReqInput, request: Request):
     """Release GPU occupation temporarily"""
     try:
         await tokenizer_manager.release_gpu_occupation(obj, request)
@@ -269,7 +269,7 @@ async def release_gpu_occupation(obj: ReleaseGPUOccupationReqInput, request: Req
 
 
 @app.api_route("/resume_gpu_occupation", methods=["GET", "POST"])
-async def resume_gpu_occupation(obj: ResumeGPUOccupationReqInput, request: Request):
+async def resume_gpu_occupation(obj: ResumeMemoryOccupationReqInput, request: Request):
     """Resume GPU occupation"""
     try:
         await tokenizer_manager.resume_gpu_occupation(obj, request)
@@ -924,13 +924,13 @@ class Engine:
 
     def release_gpu_occupation(self):
         """Release GPU occupation temporarily"""
-        obj = ReleaseGPUOccupationReqInput()
+        obj = ReleaseMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(tokenizer_manager.release_gpu_occupation(obj, None))
 
     def resume_gpu_occupation(self):
         """Resume GPU occupation"""
-        obj = ResumeGPUOccupationReqInput()
+        obj = ResumeMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(tokenizer_manager.resume_gpu_occupation(obj, None))
 
