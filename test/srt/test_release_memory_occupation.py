@@ -21,7 +21,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
         engine = sgl.Engine(
             model_path=model_name,
             random_seed=42,
-            memory_saver=True,
+            enable_memory_saver=True,
             # disable_cuda_graph=True,  # for debugging only
         )
         hf_model_new = AutoModelForCausalLM.from_pretrained(
