@@ -472,7 +472,7 @@ class MLATokenToKVPoolHost:
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024 ** 3)
+        ten_gb = 10 * (1024**3)
         if requested_bytes > host_mem.available - ten_gb:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
