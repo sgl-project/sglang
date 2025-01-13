@@ -1,7 +1,8 @@
 from typing import List
 
 import torch
-from sgl_kernel import sampling_scaling_penalties
+if torch.cuda.is_available() and torch.version.cuda:
+    from sgl_kernel import sampling_scaling_penalties
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer, _TokenIDs
 

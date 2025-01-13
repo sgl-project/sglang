@@ -6,7 +6,8 @@ import threading
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
-from sgl_kernel import sampling_scaling_penalties
+if torch.cuda.is_available() and torch.version.cuda:
+    from sgl_kernel import sampling_scaling_penalties
 
 import sglang.srt.sampling.penaltylib as penaltylib
 
