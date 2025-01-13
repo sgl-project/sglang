@@ -724,7 +724,7 @@ class TokenizerManager:
 
                     if self.enable_metrics:
                         self.collect_metrics(state, recv_obj, i)
-                    if self.dump_requsts_folder and state.finished:
+                    if self.dump_requests_folder and state.finished:
                         self.dump_requests(state, out_dict)
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
@@ -873,17 +873,15 @@ class TokenizerManager:
             (state.obj, out_dict, state.created_time, time.time())
         )
 
-        if len(self.dump_request_list) > int(
-            os.environ.get("SGLANG_DUMP_REQUESTS_THRESHOLD", "1000")
-        ):
+        if len(self.dump_request_list) > self.dump_requests_threshold:
             to_dump = self.dump_request_list
             self.dump_request_list = []
 
             def background_task():
-                os.makedirs(self.dump_requsts_folder, exist_ok=True)
+                os.makedirs(self.dump_requests_folder, exist_ok=True)
                 current_time = datetime.now()
                 filename = current_time.strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
-                with open(os.path.join(self.dump_requsts_folder, filename), "wb") as f:
+                with open(os.path.join(self.dump_requests_folder, filename), "wb") as f:
                     pickle.dump(to_dump, f)
 
             # Schedule the task to run in the background without awaiting it
