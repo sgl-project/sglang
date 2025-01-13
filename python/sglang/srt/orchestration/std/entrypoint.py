@@ -27,7 +27,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
@@ -50,7 +49,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, ReleaseGPUOccupationReqInput, ResumeGPUOccupationReqInput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
@@ -65,9 +64,9 @@ class Entrypoint:
     """Entrypoint of the whole orchestration"""
 
     def __init__(
-        self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
+            self,
+            server_args: ServerArgs,
+            port_args: PortArgs,
     ):
         # Parse args
         self.server_args = server_args
@@ -117,6 +116,12 @@ class Entrypoint:
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.release_gpu_occupation_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.resume_gpu_occupation_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._dispatcher = TypeBasedDispatcher(
             [
@@ -148,9 +153,9 @@ class Entrypoint:
         )
 
     async def generate_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: Union[GenerateReqInput, EmbeddingReqInput],
+            request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         async with self.model_update_lock.reader_lock:
@@ -173,9 +178,9 @@ class Entrypoint:
         self.send_to_scheduler.send_pyobj(req)
 
     async def update_weights_from_disk(
-        self,
-        obj: UpdateWeightFromDiskReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: UpdateWeightFromDiskReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
@@ -190,7 +195,7 @@ class Entrypoint:
             return await self._wait_for_model_update_from_disk(obj)
 
     async def _wait_for_model_update_from_disk(
-        self, obj: UpdateWeightFromDiskReqInput
+            self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
@@ -216,25 +221,25 @@ class Entrypoint:
             return all_success, all_message
 
     async def init_weights_update_group(
-        self,
-        obj: InitWeightsUpdateGroupReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: InitWeightsUpdateGroupReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
+                self.server_args.dp_size == 1
         ), "dp_size must be 1 for init parameter update group"
         result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(
-        self,
-        obj: UpdateWeightsFromDistributedReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: UpdateWeightsFromDistributedReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
+                self.server_args.dp_size == 1
         ), "dp_size must be for update weights from distributed"
 
         # This means that weight sync
@@ -244,13 +249,13 @@ class Entrypoint:
             return result.success, result.message
 
     async def update_weights_from_tensor(
-        self,
-        obj: UpdateWeightsFromTensorReqInput,
-        request: Optional[fastapi.Request] = None,
+            self,
+            obj: UpdateWeightsFromTensorReqInput,
+            request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
+                self.server_args.dp_size == 1
         ), "dp_size must be for update weights from distributed"
 
         # This means that weight sync
@@ -260,7 +265,7 @@ class Entrypoint:
             return result.success, result.message
 
     async def get_weights_by_name(
-        self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
+            self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
     ):
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
@@ -270,8 +275,24 @@ class Entrypoint:
         else:
             return all_parameters
 
+    async def release_gpu_occupation(
+            self,
+            obj: ReleaseGPUOccupationReqInput,
+            request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        await self.release_gpu_occupation_communicator(obj)
+
+    async def resume_gpu_occupation(
+            self,
+            obj: ResumeGPUOccupationReqInput,
+            request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        await self.resume_gpu_occupation_communicator(obj)
+
     async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+            self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         self.auto_create_handle_loop()
 
@@ -288,7 +309,7 @@ class Entrypoint:
         return session_id
 
     async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+            self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         assert not self.to_create_loop, "close session should not be the first request"
         await self.send_to_scheduler.send_pyobj(obj)
