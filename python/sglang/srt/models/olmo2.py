@@ -45,7 +45,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.utils import make_layers
 
 

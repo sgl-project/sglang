@@ -25,7 +25,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.models.llama import LlamaForCausalLM
 
 

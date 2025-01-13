@@ -40,7 +40,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.base import BaseCausalLM
 from sglang.srt.utils import make_layers
 
 Qwen2Config = None
