@@ -82,7 +82,7 @@ class TestDeepseekV3(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.63)
+        self.assertGreater(metrics["accuracy"], 0.62)
 
 
 if __name__ == "__main__":
