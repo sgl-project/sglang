@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     set_random_seed,
 )
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +328,10 @@ class Scheduler:
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
+
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.memory_saver
+        )
 
         # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
