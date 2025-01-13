@@ -1,4 +1,5 @@
 import itertools
+
 import torch
 import triton
 from sgl_kernel import sampling_scaling_penalties
@@ -6,9 +7,7 @@ from sgl_kernel import sampling_scaling_penalties
 
 def sampling_scaling_penalties_naive(logits, scaling_penalties):
     return torch.where(
-        logits > 0,
-        logits / scaling_penalties,
-        logits * scaling_penalties
+        logits > 0, logits / scaling_penalties, logits * scaling_penalties
     )
 
 
@@ -31,12 +30,18 @@ def test_memory(func, _iter):
 def calculate_diff(batch_size, vocab_size):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    
-    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
-    scaling_penalties = torch.rand(batch_size, vocab_size, device=device, dtype=dtype) + 0.5
 
-    output_naive = sampling_scaling_penalties_naive(logits.clone(), scaling_penalties.clone())
-    output_kernel = sampling_scaling_penalties_kernel(logits.clone(), scaling_penalties.clone())
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
+    scaling_penalties = (
+        torch.rand(batch_size, vocab_size, device=device, dtype=dtype) + 0.5
+    )
+
+    output_naive = sampling_scaling_penalties_naive(
+        logits.clone(), scaling_penalties.clone()
+    )
+    output_kernel = sampling_scaling_penalties_kernel(
+        logits.clone(), scaling_penalties.clone()
+    )
 
     print(f"Naive output={output_naive}")
     print(f"Kernel output={output_kernel}")
@@ -50,6 +55,7 @@ def calculate_diff(batch_size, vocab_size):
 batch_size_range = [2**i for i in range(0, 12)]
 vocab_size_range = [2**i for i in range(10, 17)]
 configs = list(itertools.product(batch_size_range, vocab_size_range))
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -67,12 +73,14 @@ configs = list(itertools.product(batch_size_range, vocab_size_range))
 def benchmark(batch_size, vocab_size, provider):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    
+
     logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
-    scaling_penalties = torch.rand(batch_size, vocab_size, device=device, dtype=dtype) + 0.5
+    scaling_penalties = (
+        torch.rand(batch_size, vocab_size, device=device, dtype=dtype) + 0.5
+    )
 
     quantiles = [0.5, 0.2, 0.8]
-    
+
     if provider == "naive":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: sampling_scaling_penalties_naive(
@@ -109,13 +117,17 @@ def benchmark(batch_size, vocab_size, provider):
 def benchmark_memory(batch_size, vocab_size, provider):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    
-    print(f"Running memory benchmark with batch_size={batch_size}, vocab_size={vocab_size}, provider={provider}")
-    
+
+    print(
+        f"Running memory benchmark with batch_size={batch_size}, vocab_size={vocab_size}, provider={provider}"
+    )
+
     def run_kernel():
         logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
-        scaling_penalties = torch.rand(batch_size, vocab_size, device=device, dtype=dtype) + 0.5
-        
+        scaling_penalties = (
+            torch.rand(batch_size, vocab_size, device=device, dtype=dtype) + 0.5
+        )
+
         if provider == "naive":
             return sampling_scaling_penalties_naive(logits, scaling_penalties)
         else:
@@ -142,6 +154,6 @@ if __name__ == "__main__":
 
     # Run performance benchmark
     benchmark.run(print_data=True, save_path=args.save_path)
-    
+
     # Run memory benchmark
     benchmark_memory.run(print_data=True, save_path=args.save_path)

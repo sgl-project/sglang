@@ -6,9 +6,9 @@ import threading
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
+from sgl_kernel import sampling_scaling_penalties
 
 import sglang.srt.sampling.penaltylib as penaltylib
-from sgl_kernel import sampling_scaling_penalties
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +247,6 @@ class SamplingBatchInfo:
         # repetition
         if self.scaling_penalties is not None:
             logits[:] = sampling_scaling_penalties(logits, self.scaling_penalties)
-
 
         # Apply regex vocab_mask
         if self.vocab_mask is not None:

@@ -224,7 +224,7 @@ def benchmark(batch_size, seq_len, provider):
     block_size = 128
     topk = 8
     topk_ids = torch.randint(
-        0, num_experts, (batch_size*seq_len, topk), dtype=torch.int32, device="cuda"
+        0, num_experts, (batch_size * seq_len, topk), dtype=torch.int32, device="cuda"
     )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
