@@ -1,6 +1,3 @@
-import os
-import shutil
-import zipfile
 from pathlib import Path
 
 from setuptools import setup
@@ -16,39 +13,6 @@ def get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
-def rename_wheel():
-    if not os.environ.get("CUDA_VERSION"):
-        return
-    cuda_version = os.environ["CUDA_VERSION"].replace(".", "")
-    base_version = get_version()
-
-    wheel_dir = Path("dist")
-    old_wheel = next(wheel_dir.glob("*.whl"))
-    tmp_dir = wheel_dir / "tmp"
-    tmp_dir.mkdir(exist_ok=True)
-
-    with zipfile.ZipFile(old_wheel, "r") as zip_ref:
-        zip_ref.extractall(tmp_dir)
-
-    old_info = tmp_dir / f"sgl_kernel-{base_version}.dist-info"
-    new_info = tmp_dir / f"sgl_kernel-{base_version}.post0+cu{cuda_version}.dist-info"
-    old_info.rename(new_info)
-
-    platform = "manylinux2014_x86_64"
-    new_wheel = wheel_dir / old_wheel.name.replace("linux_x86_64", platform)
-    new_wheel = wheel_dir / new_wheel.name.replace(
-        base_version, f"{base_version}.post0+cu{cuda_version}"
-    )
-
-    with zipfile.ZipFile(new_wheel, "w", zipfile.ZIP_DEFLATED) as new_zip:
-        for file_path in tmp_dir.rglob("*"):
-            if file_path.is_file():
-                new_zip.write(file_path, file_path.relative_to(tmp_dir))
-
-    old_wheel.unlink()
-    shutil.rmtree(tmp_dir)
-
-
 def update_wheel_platform_tag():
     wheel_dir = Path("dist")
     old_wheel = next(wheel_dir.glob("*.whl"))
@@ -58,6 +22,12 @@ def update_wheel_platform_tag():
     old_wheel.rename(new_wheel)
 
 
+cutlass = root / "3rdparty" / "cutlass"
+include_dirs = [
+    cutlass.resolve() / "include",
+    cutlass.resolve() / "tools" / "util" / "include",
+    root / "src" / "sgl-kernel" / "csrc",
+]
 nvcc_flags = [
     "-O3",
     "-Xcompiler",
@@ -76,12 +46,14 @@ ext_modules = [
     CUDAExtension(
         name="sgl_kernel.ops._kernels",
         sources=[
-            "src/sgl-kernel/csrc/warp_reduce_kernel.cu",
             "src/sgl-kernel/csrc/trt_reduce_internal.cu",
             "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
+            "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
+            "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
+        include_dirs=include_dirs,
         extra_compile_args={
             "nvcc": nvcc_flags,
             "cxx": cxx_flags,

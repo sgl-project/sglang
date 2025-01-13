@@ -4,6 +4,8 @@ The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVI
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
+For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://sgl-project.github.io/references/deepseek.html).
+
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
 
@@ -29,7 +31,7 @@ For high QPS scenarios, add the `--enable-dp-attention` argument to boost throug
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]>=0.4.1.post3" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
+pip install "sglang[all]>=0.4.1.post5" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -61,13 +63,62 @@ For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `
 
 ```bash
 # node 1
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
 
 # node 2
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --nccl-init 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
 ```
 
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
+
+### Example serving with Docker two H200*8 nodes
+There are two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 192.168.114.10:20000`.
+A single H200 with 8 devices can run DeepSeek V3, the dual H200 setup is just to demonstrate multi-node usage.
+
+```bash
+# node 1
+docker run --gpus all \
+    --shm-size 32g \
+    --network=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --name sglang_multinode1 \
+    -it \
+    --rm \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 40000
+```
+
+```bash
+# node 2
+docker run --gpus all \
+    --shm-size 32g \
+    --network=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --name sglang_multinode2 \
+    -it \
+    --rm \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 1 --trust-remote-code --host 0.0.0.0 --port 40000
+```
+
+To ensure functionality, we include a test from a client Docker container.
+```bash
+docker run --gpus all \
+    --shm-size 32g \
+    --network=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --name sglang_multinode_client \
+    -it \
+    --rm \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1 --random-output 512 --random-range-ratio 1 --num-prompts 1 --host 0.0.0.0 --port 40000 --output-file "deepseekv3_multinode.jsonl"
+```
 
 ## DeepSeek V3 Optimization Plan
 

@@ -74,11 +74,6 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
-        if forward_batch.spec_info:
-            capture_hidden_mode = forward_batch.spec_info.capture_hidden_mode
-        else:
-            capture_hidden_mode = CaptureHiddenMode.NULL
-
         if forward_batch.forward_mode.is_extend() and forward_batch.return_logprob:
             extend_return_logprob = True
             extend_return_top_logprob = any(
@@ -98,7 +93,7 @@ class LogitsMetadata:
 
         return cls(
             forward_mode=forward_batch.forward_mode,
-            capture_hidden_mode=capture_hidden_mode,
+            capture_hidden_mode=forward_batch.capture_hidden_mode,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
@@ -122,6 +117,11 @@ class LogitsProcessor(nn.Module):
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
+        if (
+            self.final_logit_softcapping is not None
+            and self.final_logit_softcapping < 0
+        ):
+            self.final_logit_softcapping = None
 
     def forward(
         self,
@@ -146,7 +146,10 @@ class LogitsProcessor(nn.Module):
 
         # Compute logits
         last_logits = self._get_logits(last_hidden, lm_head)
-        if not logits_metadata.extend_return_logprob:
+        if (
+            not logits_metadata.extend_return_logprob
+            or logits_metadata.capture_hidden_mode.need_capture()
+        ):
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=last_logits,

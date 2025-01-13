@@ -96,6 +96,7 @@ def run_program_batch(
     default_sampling_para,
     num_threads,
     progress_bar,
+    generator_style=False,
 ):
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
@@ -109,6 +110,17 @@ def run_program_batch(
         num_threads = max(96, multiprocessing.cpu_count() * 16)
     num_threads = min(num_threads, len(batch_arguments))
 
+    if generator_style:
+        return _run_program_batch_generator(
+            program,
+            backend,
+            batch_arguments,
+            default_sampling_para,
+            num_threads,
+            progress_bar,
+        )
+
+    # Original code path when generator_style=False
     if num_threads == 1:
         rets = []
         if progress_bar:
@@ -166,6 +178,64 @@ def run_program_batch(
             pbar.close()
 
     return rets
+
+
+def _run_program_batch_generator(
+    program,
+    backend,
+    batch_arguments,
+    default_sampling_para,
+    num_threads,
+    progress_bar,
+):
+    """Helper function that yields results one by one using chunking to avoid overwhelming ThreadPoolExecutor."""
+    if num_threads == 1:
+        iterator = tqdm.tqdm(batch_arguments) if progress_bar else batch_arguments
+        for arguments in iterator:
+            yield run_program(
+                program,
+                backend,
+                (),
+                arguments,
+                default_sampling_para,
+                False,
+                True,
+            )
+    else:
+        pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
+
+        # Process in chunks to avoid overwhelming ThreadPoolExecutor
+        # Otherwise, ThreadPoolExecutor.submit will block after adding certain number of tasks
+        # so we will never reach "yield" until all tasks are done
+        chunk_size = 200
+
+        with ThreadPoolExecutor(num_threads) as executor:
+            for chunk_start in range(0, len(batch_arguments), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(batch_arguments))
+                chunk_futures = []
+
+                # Submit chunk of tasks
+                for i in range(chunk_start, chunk_end):
+                    future = executor.submit(
+                        run_program,
+                        program,
+                        backend,
+                        (),
+                        batch_arguments[i],
+                        default_sampling_para,
+                        False,
+                        True,
+                    )
+                    if pbar:
+                        future.add_done_callback(lambda _: pbar.update())
+                    chunk_futures.append(future)
+
+                # Yield results from this chunk as they complete
+                for future in chunk_futures:
+                    yield future.result()
+
+        if pbar:
+            pbar.close()
 
 
 def cache_program(program, backend):
@@ -277,7 +347,7 @@ class StreamExecutor:
         size: int = 1,
         position_ids_offset: Optional[List[int]] = None,
     ):
-        if size > 1:
+        if size > 1 and str(self.text_):
             self.submit(SglCommitLazy())
 
         self.sync()

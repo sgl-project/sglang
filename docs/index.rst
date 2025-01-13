@@ -29,7 +29,7 @@ The core features include:
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
    backend/structured_outputs.ipynb
-   backend/backend.md
+   backend/server_arguments.md
 
 
 .. toctree::
@@ -56,7 +56,10 @@ The core features include:
    references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
    references/custom_chat_template.md
-   references/contributor_guide.md
+   references/deepseek.md
+   references/llama_405B.md
+   references/modelscope.md
+   references/contribution_guide.md
    references/troubleshooting.md
    references/faq.md
    references/learn_more.md

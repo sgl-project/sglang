@@ -14,7 +14,7 @@
 
 | [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/)
 | [**Documentation**](https://sgl-project.github.io/)
-| [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2tmmp6flg-89dOlJW2TjnBrTRk1I_~GA)
+| [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2um0ad92q-LkU19KQTxCGzlCgRiOiQEw)
 | [**Join Bi-Weekly Development Meeting**](https://docs.google.com/document/d/1xEow4eIM152xNcRxqZz9VEcOiTQo8-CEuuQ5qTmkt-E/edit?usp=sharing)
 | [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
 
@@ -46,12 +46,13 @@ The core features include:
 
 ## Getting Started
 - [Install SGLang](https://sgl-project.github.io/start/install.html)
-- [Send requests](https://sgl-project.github.io/start/send_request.html)
-- [Backend: SGLang Runtime (SRT)](https://sgl-project.github.io/backend/backend.html)
-- [Frontend: Structured Generation Language (SGLang)](https://sgl-project.github.io/frontend/frontend.html)
+- [Quick Start](https://sgl-project.github.io/start/send_request.html)
+- [Backend Tutorial](https://sgl-project.github.io/backend/openai_api_completions.html)
+- [Frontend Tutorial](https://sgl-project.github.io/frontend/frontend.html)
+- [Contribution Guide](https://sgl-project.github.io/references/contribution_guide.html)
 
 ## Benchmark and Performance
-Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
+Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
 
 ## Roadmap
 [Development Roadmap (2024 Q4)](https://github.com/sgl-project/sglang/issues/1487)
@@ -60,5 +61,4 @@ Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-s
 The project is supported by (alphabetically): AMD, Baseten, DataCrunch, Etched, Hyperbolic, Jam & Tea Studios, LinkedIn, LMSYS.org, Meituan, NVIDIA, RunPod, Stanford, UC Berkeley, UCLA, xAI, 01.AI.
 
 ## Acknowledgment and Citation
-We learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
-Please cite the paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
+We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql). Please cite the paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.

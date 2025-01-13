@@ -12,4 +12,5 @@
 /python/sglang/srt/sampling @merrymercy @hnyls2002
 /test/lang @merrymercy @Ying1123 @ByronHsu
 /test/srt @merrymercy @Ying1123 @zhyncs
-/sglang-router @ByronHsu @Ying1123
+/sgl-router @ByronHsu @Ying1123
+/sgl-kernel @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @merrymercy

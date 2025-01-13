@@ -323,9 +323,7 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when --return-token-ids` is set
-    origin_input_ids: Optional[List[int]]
-    # Only used when `--skip-tokenizer-init` or `--return-token-ids` is set
+    # Only used when `--skip-tokenizer-init` is on
     output_ids: Optional[List[int]]
     # Detokenization configs
     skip_special_tokens: List[bool]
@@ -355,10 +353,6 @@ class BatchStrOut:
     finished_reasons: List[dict]
     # The output decoded strings
     output_strs: List[str]
-
-    # The token ids
-    origin_input_ids: Optional[List[int]]
-    output_ids: Optional[List[int]]
 
     # Token counts
     # real input and output tokens can be get from
@@ -426,8 +420,7 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    name: str
-    tensor: torch.Tensor
+    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
 
 
 @dataclass

@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -31,6 +32,7 @@ from sglang.srt.utils import (
     is_hip,
     is_ipv6,
     is_port_available,
+    nullable_str,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ class ServerArgs:
     trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
+    quantization_param_path: nullable_str = None
     quantization: Optional[str] = None
     context_length: Optional[int] = None
     device: str = "cuda"
@@ -54,7 +57,6 @@ class ServerArgs:
     is_embedding: bool = False
     revision: Optional[str] = None
     skip_tokenizer_init: bool = False
-    return_token_ids: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -108,14 +110,6 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
 
-    # Double Sparsity
-    enable_double_sparsity: bool = False
-    ds_channel_config_path: str = None
-    ds_heavy_channel_num: int = 32
-    ds_heavy_token_num: int = 256
-    ds_heavy_channel_type: str = "qk"
-    ds_sparse_decode_threshold: int = 4096
-
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
@@ -124,6 +118,21 @@ class ServerArgs:
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = "outlines"
+
+    # Speculative decoding
+    speculative_draft_model_path: Optional[str] = None
+    speculative_algorithm: Optional[str] = None
+    speculative_num_steps: int = 5
+    speculative_num_draft_tokens: int = 64
+    speculative_eagle_topk: int = 8
+
+    # Double Sparsity
+    enable_double_sparsity: bool = False
+    ds_channel_config_path: str = None
+    ds_heavy_channel_num: int = 32
+    ds_heavy_token_num: int = 256
+    ds_heavy_channel_type: str = "qk"
+    ds_sparse_decode_threshold: int = 4096
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -140,6 +149,7 @@ class ServerArgs:
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
+    cuda_graph_bs: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -241,6 +251,17 @@ class ServerArgs:
                 "Overlap scheduler is disabled."
             )
 
+        # Speculative Decoding
+        if self.speculative_algorithm == "EAGLE":
+            self.prefill_only_one_req = True
+            self.disable_cuda_graph_padding = True
+            self.disable_radix_cache = True
+            self.disable_overlap_schedule = True
+            self.chunked_prefill_size = -1
+            logger.info(
+                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
+            )
+
         # GGUF
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -276,6 +297,11 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--skip-tokenizer-init",
+            action="store_true",
+            help="If set, skip init tokenizer and pass input_ids in generate request",
         )
         parser.add_argument(
             "--load-format",
@@ -327,8 +353,17 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--quantization-param-path",
+            type=nullable_str,
+            default=None,
+            help="Path to the JSON file containing the KV cache "
+            "scaling factors. This should generally be supplied, when "
+            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+            "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--quantization",
@@ -343,6 +378,7 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
+                "modelopt",
             ],
             help="The quantization method.",
         )
@@ -384,18 +420,6 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
-        parser.add_argument(
-            "--skip-tokenizer-init",
-            action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request",
-        )
-        parser.add_argument(
-            "--return-token-ids",
-            action="store_true",
-            default=ServerArgs.return_token_ids,
-            help="Whether to return token IDs in the output, this may introduce additional overhead.",
-        )
-
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -603,43 +627,6 @@ class ServerArgs:
             default=ServerArgs.json_model_override_args,
         )
 
-        # Double Sparsity
-        parser.add_argument(
-            "--enable-double-sparsity",
-            action="store_true",
-            help="Enable double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-channel-config-path",
-            type=str,
-            default=ServerArgs.ds_channel_config_path,
-            help="The path of the double sparsity channel config",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-num",
-            type=int,
-            default=ServerArgs.ds_heavy_channel_num,
-            help="The number of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-token-num",
-            type=int,
-            default=ServerArgs.ds_heavy_token_num,
-            help="The number of heavy tokens in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-type",
-            type=str,
-            default=ServerArgs.ds_heavy_channel_type,
-            help="The type of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-sparse-decode-threshold",
-            type=int,
-            default=ServerArgs.ds_sparse_decode_threshold,
-            help="The type of heavy channels in double sparsity attention",
-        )
-
         # LoRA
         parser.add_argument(
             "--lora-paths",
@@ -677,6 +664,75 @@ class ServerArgs:
             choices=["xgrammar", "outlines"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
+        )
+
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE"],
+            help="Speculative algorithm.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of token sampled from draft model in eagle2 each step.",
+            choices=[1, 2, 4, 8],
+            default=ServerArgs.speculative_eagle_topk,
+        )
+
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-channel-config-path",
+            type=str,
+            default=ServerArgs.ds_channel_config_path,
+            help="The path of the double sparsity channel config",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-num",
+            type=int,
+            default=ServerArgs.ds_heavy_channel_num,
+            help="The number of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-token-num",
+            type=int,
+            default=ServerArgs.ds_heavy_token_num,
+            help="The number of heavy tokens in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-type",
+            type=str,
+            default=ServerArgs.ds_heavy_channel_type,
+            help="The type of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-sparse-decode-threshold",
+            type=int,
+            default=ServerArgs.ds_sparse_decode_threshold,
+            help="The type of heavy channels in double sparsity attention",
         )
 
         # Optimization/debug options
@@ -751,6 +807,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
             help="Set the maximum batch size for cuda graph.",
+        )
+        parser.add_argument(
+            "--cuda-graph-bs",
+            type=int,
+            nargs="+",
+            help="Set the list of batch sizes for cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -875,7 +937,10 @@ class PortArgs:
         while True:
             if is_port_available(port):
                 break
-            port += 42
+            if port < 60000:
+                port += 42
+            else:
+                port -= 43
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
