@@ -611,9 +611,19 @@ def _set_envs_and_config(server_args: ServerArgs):
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
+        logger.error(
+            "Received sigquit from a child proces. It usually means the child hanged."
+        )
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
+
+    def sigchld_handler(signum, frame):
+        pid, exitcode = os.waitpid(0, os.WNOHANG)
+        time.sleep(5)  # Sleep enough so that it can print error messages accordingly.
+        raise RuntimeError(f"Child process died! {pid=} {exitcode=}")
+
+    signal.signal(signal.SIGCHLD, sigchld_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
