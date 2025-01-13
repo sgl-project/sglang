@@ -278,4 +278,7 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
 
 
 if __name__ == "__main__":
+    """
+    Run it: LD_PRELOAD=/usr/local/lib/python3.10/dist-packages/torch_memory_saver_cpp.cpython-310-x86_64-linux-gnu.so torchrun --nproc_per_node=4 adhoc_verl_torchrun.py
+    """
     main()
