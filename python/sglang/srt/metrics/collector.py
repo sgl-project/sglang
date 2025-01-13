@@ -192,9 +192,9 @@ class TokenizerMetricsCollector:
         counter.labels(**self.labels).inc(data)
 
     def observe_one_finished_request(self, prompt_tokens: int, generation_tokens: int):
-        self.prompt_tokens_total.label(**self.labels).inc(prompt_tokens)
-        self.generation_tokens_total.label(**self.labels).inc(generation_tokens)
-        self.num_requests_total.label(**self.labels).inc(1)
+        self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
+        self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
+        self.num_requests_total.labels(**self.labels).inc(1)
 
     def observe_time_to_first_token(self, value: Union[float, int]):
         self._log_histogram(self.histogram_time_to_first_token, value)
