@@ -142,7 +142,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_overlap_schedule: bool = False
-    enable_mixed_chunk: bool = False
+    enable_mixed_chunk: bool = True
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
     enable_torch_compile: bool = False
@@ -775,6 +775,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
+            default=True,
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(

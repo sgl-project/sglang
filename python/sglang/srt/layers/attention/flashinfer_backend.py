@@ -185,7 +185,9 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens_extend = forward_batch.extend_prefix_lens[:extend_bs]
 
             extend_prefix_lens_origin = len(forward_batch.extend_prefix_lens)
-            assert extend_prefix_lens_origin == extend_bs
+            assert (
+                extend_prefix_lens_origin == extend_bs
+            ), f"Assertion failed: extend_prefix_lens_origin={extend_prefix_lens_origin}, extend_bs={extend_bs}"
             encoder_lens_extend = (
                 forward_batch.encoder_lens[:extend_bs]
                 if forward_batch.encoder_lens is not None
