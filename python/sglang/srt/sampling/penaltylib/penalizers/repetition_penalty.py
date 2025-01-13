@@ -1,6 +1,7 @@
 from typing import List
 
 import torch
+
 if torch.cuda.is_available() and torch.version.cuda:
     from sgl_kernel import sampling_scaling_penalties
 
