@@ -246,7 +246,7 @@ class InternLM2Model(nn.Module):
         return hidden_states
 
 
-class InternLM2ForCausalLM:
+class InternLM2ForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,

@@ -217,7 +217,7 @@ class GPT2Model(nn.Module):
         return hidden_states
 
 
-class GPT2LMHeadModel:
+class GPT2LMHeadModel(BaseCausalLM):
 
     def __init__(
         self,

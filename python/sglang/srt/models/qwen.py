@@ -237,7 +237,7 @@ class QWenModel(nn.Module):
         return hidden_states
 
 
-class QWenLMHeadModel:
+class QWenLMHeadModel(BaseCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,

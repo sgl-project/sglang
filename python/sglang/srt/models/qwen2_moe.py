@@ -338,7 +338,7 @@ class Qwen2MoeModel(nn.Module):
         return hidden_states
 
 
-class Qwen2MoeForCausalLM:
+class Qwen2MoeForCausalLM(BaseCausalLM):
 
     fall_back_to_pt_during_load = False
 

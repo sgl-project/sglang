@@ -288,7 +288,7 @@ class ExaoneModel(nn.Module):
         return hidden_states
 
 
-class ExaoneForCausalLM:
+class ExaoneForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config,

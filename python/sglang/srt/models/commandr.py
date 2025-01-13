@@ -313,7 +313,7 @@ class CohereModel(nn.Module):
         return hidden_states
 
 
-class CohereForCausalLM:
+class CohereForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,

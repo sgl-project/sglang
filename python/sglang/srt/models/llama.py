@@ -328,7 +328,7 @@ class LlamaModel(nn.Module):
                 )
 
 
-class LlamaForCausalLM:
+class LlamaForCausalLM(BaseCausalLM):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",

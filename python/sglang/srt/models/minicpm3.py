@@ -537,7 +537,7 @@ class MiniCPM3Model(nn.Module):
         return hidden_states
 
 
-class MiniCPM3ForCausalLM:
+class MiniCPM3ForCausalLM(BaseCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,
