@@ -260,7 +260,9 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
-async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput, request: Request):
+async def release_memory_occupation(
+    obj: ReleaseMemoryOccupationReqInput, request: Request
+):
     """Release GPU occupation temporarily"""
     try:
         await tokenizer_manager.release_memory_occupation(obj, request)
@@ -269,7 +271,9 @@ async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput, reques
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
-async def resume_memory_occupation(obj: ResumeMemoryOccupationReqInput, request: Request):
+async def resume_memory_occupation(
+    obj: ResumeMemoryOccupationReqInput, request: Request
+):
     """Resume GPU occupation"""
     try:
         await tokenizer_manager.resume_memory_occupation(obj, request)
