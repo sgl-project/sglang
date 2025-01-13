@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,10 @@ def launch(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=server_args.memory_saver
+    )
+
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
@@ -61,7 +66,8 @@ def launch(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
             )
-            proc.start()
+            with memory_saver_adapter.configure_subprocess():
+                proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
@@ -78,7 +84,8 @@ def launch(
             target=run_data_parallel_controller_process,
             args=(server_args, port_args, writer),
         )
-        proc.start()
+        with memory_saver_adapter.configure_subprocess():
+            proc.start()
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
