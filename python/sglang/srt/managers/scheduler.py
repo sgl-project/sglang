@@ -1549,14 +1549,14 @@ class Scheduler:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return parameter
 
-    def release_gpu_occupation(self):
+    def release_memory_occupation(self):
         self.stashed_model_static_state = (
             self.tp_worker.worker.model_runner.model.export_static_state()
         )
         self.memory_saver_adapter.pause()
         self.flush_cache()
 
-    def resume_gpu_occupation(self):
+    def resume_memory_occupation(self):
         self.memory_saver_adapter.resume()
         self.tp_worker.worker.model_runner.model.import_static_state(
             self.stashed_model_static_state

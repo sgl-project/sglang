@@ -194,7 +194,7 @@ class TokenizerManager:
         self.release_gpu_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.resume_gpu_occupation_communicator = _Communicator(
+        self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -557,21 +557,21 @@ class TokenizerManager:
         else:
             return all_parameters
 
-    async def release_gpu_occupation(
+    async def release_memory_occupation(
             self,
             obj: ReleaseMemoryOccupationReqInput,
             request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.release_gpu_occupation_communicator(obj)
+        await self.release_memory_occupation_communicator(obj)
 
-    async def resume_gpu_occupation(
+    async def resume_memory_occupation(
             self,
             obj: ResumeMemoryOccupationReqInput,
             request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.resume_gpu_occupation_communicator(obj)
+        await self.resume_memory_occupation_communicator(obj)
 
     async def open_session(
             self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
@@ -775,9 +775,9 @@ class TokenizerManager:
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, ReleaseMemoryOccupationReqOutput):
-                self.release_gpu_occupation_communicator.handle_recv(recv_obj)
+                self.release_memory_occupation_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, ResumeMemoryOccupationReqOutput):
-                self.resume_gpu_occupation_communicator.handle_recv(recv_obj)
+                self.resume_memory_occupation_communicator.handle_recv(recv_obj)
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
 
