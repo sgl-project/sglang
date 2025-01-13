@@ -182,6 +182,11 @@ def main():
         ),
     )
 
+    print('release_gpu_occupation')
+    llm.release_gpu_occupation()
+    print('resume_gpu_occupation')
+    llm.resume_gpu_occupation()
+
     t = time.time()
     if 0:
         # most naive way
