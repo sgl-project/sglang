@@ -358,7 +358,7 @@ class XverseModel(nn.Module):
         return hidden_states
 
 
-class XverseMoeForCausalLM(BaseCausalLM):
+class XverseMoeForCausalLM(nn.Module):
 
     def __init__(
         self,

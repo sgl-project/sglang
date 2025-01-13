@@ -295,7 +295,7 @@ class GraniteModel(nn.Module):
         return hidden_states
 
 
-class GraniteForCausalLM(BaseCausalLM):
+class GraniteForCausalLM(nn.Module):
     def __init__(
         self,
         config: GraniteConfig,

@@ -332,7 +332,7 @@ class ChatGLMM(nn.Module):
         return hidden_states
 
 
-class ChatGLMForCausalLM(BaseCausalLM):
+class ChatGLMForCausalLM(nn.Module):
     packed_modules_mapping = {
         "query_key_value": ["query_key_value"],
         "dense_h_to_4h": ["dense_h_to_4h"],

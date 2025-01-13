@@ -304,7 +304,7 @@ class Olmo2Model(nn.Module):
         return hidden_states
 
 
-class Olmo2ForCausalLM(BaseCausalLM):
+class Olmo2ForCausalLM(nn.Module):
     """
     Extremely barebones HF model wrapper.
     """

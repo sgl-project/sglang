@@ -719,7 +719,7 @@ class MllamaTextModel(nn.Module):
         return hidden_states
 
 
-class MllamaForCausalLM(BaseCausalLM):
+class MllamaForCausalLM(nn.Module):
     config_class = config_mllama.MllamaTextConfig
     base_model_prefix = "language_model"
     _no_split_modules = [

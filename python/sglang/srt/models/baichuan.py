@@ -307,7 +307,7 @@ class BaiChuanModel(nn.Module):
         return hidden_states
 
 
-class BaiChuanBaseForCausalLM(BaseCausalLM):
+class BaiChuanBaseForCausalLM(nn.Module):
     packed_modules_mapping = {
         "W_pack": ["W_pack"],
         "gate_up_proj": [

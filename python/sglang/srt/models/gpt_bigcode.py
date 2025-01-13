@@ -219,7 +219,7 @@ class GPTBigCodeModel(nn.Module):
         return hidden_states
 
 
-class GPTBigCodeForCausalLM(BaseCausalLM):
+class GPTBigCodeForCausalLM(nn.Module):
     packed_modules_mapping = {"c_attn": ["c_attn"]}
 
     supported_lora_modules = ["c_fc", "c_proj", "wte", "c_attn"]

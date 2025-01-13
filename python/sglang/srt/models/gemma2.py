@@ -306,7 +306,7 @@ class Gemma2Model(nn.Module):
         return hidden_states
 
 
-class Gemma2ForCausalLM(BaseCausalLM):
+class Gemma2ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",

@@ -292,7 +292,7 @@ class OlmoeModel(nn.Module):
         return hidden_states
 
 
-class OlmoeForCausalLM(BaseCausalLM):
+class OlmoeForCausalLM(nn.Module):
 
     fall_back_to_pt_during_load = False
 

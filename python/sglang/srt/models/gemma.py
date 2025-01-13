@@ -249,7 +249,7 @@ class GemmaModel(nn.Module):
         return hidden_states
 
 
-class GemmaForCausalLM(BaseCausalLM):
+class GemmaForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
