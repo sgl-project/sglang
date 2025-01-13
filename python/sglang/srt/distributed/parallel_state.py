@@ -216,6 +216,10 @@ def _group_coordinator_init(
     if use_tpu_communicator and self.world_size > 1:
         self.tpu_communicator = TpuCommunicator(group=self.cpu_group)
 
+    # TODO temporary hack, will have copy-pasted vllm.distributed package
+    self.xpu_communicator = None
+    self.hpu_communicator = None
+
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
     self.mq_broadcaster: Optional[MessageQueue] = None
