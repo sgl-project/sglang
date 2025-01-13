@@ -14,7 +14,6 @@
 
 import json
 import logging
-import sys
 from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
 
@@ -231,7 +230,7 @@ class ModelConfig:
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
 
-        if quant_cfg is not None and not quantization_in_turbomind(self.quantization):
+        if quant_cfg is not None:
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
@@ -402,10 +401,3 @@ def is_multimodal_model(model_architectures: List[str]):
 
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
-
-
-def quantization_in_turbomind(quantization: str) -> bool:
-    if quantization in ["awq_turbomind"]:
-        return True
-    else:
-        return False
