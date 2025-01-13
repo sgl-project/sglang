@@ -52,3 +52,7 @@ def verify_turbomind_supported(quant_bit: int, group_size: int) -> bool:
         )
 
     return True
+
+
+def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
+    return any(module_name in prefix for module_name in modules_to_not_convert)

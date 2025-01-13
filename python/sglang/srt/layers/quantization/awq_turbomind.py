@@ -11,7 +11,6 @@ turbomind_dir = os.path.split(turbomind.__file__)[0]
 sys.path.append(os.path.join(turbomind_dir, "lib"))
 import _turbomind_ext
 from vllm.model_executor.layers.linear import LinearBase, set_weight_attrs
-from vllm.model_executor.layers.quantization.awq import is_layer_skipped_awq
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 
@@ -22,6 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.turbomind_utils import (
     get_u4_slices,
+    is_layer_skipped_awq,
     pack_u4_row,
     unpack_awq_gemm,
     verify_turbomind_supported,
