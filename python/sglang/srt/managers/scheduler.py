@@ -525,10 +525,10 @@ class Scheduler:
                 parameter = self.get_weights_by_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, ReleaseMemoryOccupationReqInput):
-                self.release_gpu_occupation()
+                self.release_memory_occupation()
                 self.send_to_tokenizer.send_pyobj(ReleaseMemoryOccupationReqOutput())
             elif isinstance(recv_req, ResumeMemoryOccupationReqInput):
-                self.resume_gpu_occupation()
+                self.resume_memory_occupation()
                 self.send_to_tokenizer.send_pyobj(ResumeMemoryOccupationReqOutput())
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:

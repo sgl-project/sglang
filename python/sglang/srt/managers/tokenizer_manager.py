@@ -191,7 +191,7 @@ class TokenizerManager:
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.release_gpu_occupation_communicator = _Communicator(
+        self.release_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.resume_memory_occupation_communicator = _Communicator(
