@@ -489,6 +489,13 @@ class ProfileReq(Enum):
 
 
 @dataclass
+class ConfigureLoggingReq:
+    log_requests: Optional[bool] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
+
+
+@dataclass
 class OpenSessionReqInput:
     capacity_of_str_len: int
     session_id: Optional[str] = None

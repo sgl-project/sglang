@@ -91,7 +91,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
-    file_storage_pth: str = "SGLang_storage"
+    file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
 
     # Data parallelism
@@ -554,7 +554,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch",
+            help="The log interval of decode batch.",
         )
 
         # API related
