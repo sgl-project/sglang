@@ -246,7 +246,14 @@ class SamplingBatchInfo:
 
         # repetition
         if self.scaling_penalties is not None:
-            logits[:] = sampling_scaling_penalties(logits, self.scaling_penalties)
+            if torch.cuda.is_available() and torch.version.cuda:
+                logits[:] = sampling_scaling_penalties(logits, self.scaling_penalties)
+            else:
+                logits[:] = torch.where(
+                    logits > 0,
+                    logits / self.scaling_penalties,
+                    logits * self.scaling_penalties,
+                )
 
         # Apply regex vocab_mask
         if self.vocab_mask is not None:

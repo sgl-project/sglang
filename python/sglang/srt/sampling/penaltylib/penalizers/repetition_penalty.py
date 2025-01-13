@@ -57,7 +57,16 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
         self.cumulated_repetition_penalties[mask] = self.repetition_penalties[mask]
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        return sampling_scaling_penalties(logits, self.cumulated_repetition_penalties)
+        if torch.cuda.is_available() and torch.version.cuda:
+            return sampling_scaling_penalties(
+                logits, self.cumulated_repetition_penalties
+            )
+        else:
+            return torch.where(
+                logits > 0,
+                logits / self.cumulated_repetition_penalties,
+                logits * self.cumulated_repetition_penalties,
+            )
 
     def _filter(self, indices_to_keep: List[int], indices_tensor_to_keep: torch.Tensor):
         self.repetition_penalties = self.repetition_penalties[indices_tensor_to_keep]
