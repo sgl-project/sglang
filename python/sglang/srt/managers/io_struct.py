@@ -19,9 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
-
-import torch
+from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -457,6 +455,26 @@ class GetWeightsByNameReqInput:
 @dataclass
 class GetWeightsByNameReqOutput:
     parameter: list
+
+
+@dataclass
+class ReleaseMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ReleaseMemoryOccupationReqOutput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqOutput:
+    pass
 
 
 @dataclass
