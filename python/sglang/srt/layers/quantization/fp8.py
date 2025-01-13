@@ -40,9 +40,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
+    permute_weight,
     print_warning_once,
     set_weight_attrs,
-    permute_weight,
 )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -620,13 +620,13 @@ class Fp8MoEMethod:
             if is_hip():
                 if bool(int(os.getenv("CK_MOE", "0"))):
                     layer.w13_weight = torch.nn.Parameter(
-                            permute_weight(layer.w13_weight.data), 
-                            requires_grad=False,
+                        permute_weight(layer.w13_weight.data),
+                        requires_grad=False,
                     )
                     torch.cuda.empty_cache()
                     layer.w2_weight = torch.nn.Parameter(
-                            permute_weight(layer.w2_weight.data), 
-                            requires_grad=False,
+                        permute_weight(layer.w2_weight.data),
+                        requires_grad=False,
                     )
                     torch.cuda.empty_cache()
                 elif bool(int(os.getenv("MOE_PADDING", "0"))):
@@ -724,13 +724,13 @@ class Fp8MoEMethod:
             if is_hip():
                 if bool(int(os.getenv("CK_MOE", "0"))):
                     layer.w13_weight = torch.nn.Parameter(
-                            permute_weight(layer.w13_weight.data), 
-                            requires_grad=False,
+                        permute_weight(layer.w13_weight.data),
+                        requires_grad=False,
                     )
                     torch.cuda.empty_cache()
                     layer.w2_weight = torch.nn.Parameter(
-                            permute_weight(layer.w2_weight.data), 
-                            requires_grad=False,
+                        permute_weight(layer.w2_weight.data),
+                        requires_grad=False,
                     )
                     torch.cuda.empty_cache()
                 elif bool(int(os.getenv("MOE_PADDING", "0"))):
@@ -780,6 +780,7 @@ class Fp8MoEMethod:
         if is_hip() and bool(int(os.getenv("CK_MOE", "0"))):
             import ater
             from ater.fused_moe import fused_experts_ck
+
             return fused_experts_ck(
                 x,
                 layer.w13_weight,
@@ -793,12 +794,14 @@ class Fp8MoEMethod:
                     else layer.w13_weight_scale
                 ),
                 w2_scale=(
-                    layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
                 ),
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
-        
+
         else:
             # Expert fusion with FP8 quantization
             return fused_experts(
@@ -815,12 +818,15 @@ class Fp8MoEMethod:
                     else layer.w13_weight_scale
                 ),
                 w2_scale=(
-                    layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
                 ),
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
             )
+
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """

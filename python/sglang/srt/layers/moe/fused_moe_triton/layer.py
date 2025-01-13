@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import os
-
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -20,12 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-
-from sglang.srt.utils import (
-    is_hip,
-    set_weight_attrs,
-    permute_weight,
-)
+from sglang.srt.utils import is_hip, permute_weight, set_weight_attrs
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -172,6 +166,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if is_hip() and bool(int(os.getenv("CK_MOE", "0"))):
             import ater
             from ater.fused_moe import fused_experts_ck
+
             return fused_experts_ck(
                 hidden_states=x,
                 w1=layer.w13_weight,
