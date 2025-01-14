@@ -65,7 +65,6 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    detokenizer_max_states: int = 1 << 16
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
@@ -436,12 +435,6 @@ class ServerArgs:
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
             "This option is typically used for development and debugging purposes.",
-        )
-        parser.add_argument(
-            "--detokenizer-max-states",
-            type=int,
-            default=ServerArgs.detokenizer_max_states,
-            help="Maximum number of request states that detokenizer can hold. When exceeded, oldest request states will be evicted. Default: 65536 (1<<16). Use power of 2 values for better memory allocation.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
