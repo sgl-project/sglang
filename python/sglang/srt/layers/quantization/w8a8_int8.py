@@ -7,6 +7,7 @@ from sglang.srt.utils import is_cuda_available
 is_cuda = is_cuda_available()
 if is_cuda:
     from sgl_kernel import int8_scaled_mm
+
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.linear import LinearMethodBase
