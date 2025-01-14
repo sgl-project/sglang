@@ -13,11 +13,11 @@ __global__ void rms_norm_kernel(
     const scalar_t* __restrict__ weight,  // [hidden_size]
     const float epsilon,
     const int32_t hidden_size) {
-    
+
     using BlockReduce = cub::BlockReduce<float, 1024>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ float s_variance;
-    
+
     float thread_variance = 0.0f;
 
     // Compute sum of squares in FP32
@@ -38,7 +38,7 @@ __global__ void rms_norm_kernel(
     for (int32_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
         const float x = static_cast<float>(input[blockIdx.x * hidden_size + idx]);
         const float w = static_cast<float>(weight[idx]);
-        out[blockIdx.x * hidden_size + idx] = 
+        out[blockIdx.x * hidden_size + idx] =
             static_cast<scalar_t>(x * s_variance * w);
     }
 }
@@ -48,15 +48,15 @@ void rms_norm(
     const torch::Tensor& input, // [..., hidden_size]
     const torch::Tensor& weight,// [hidden_size]
     const float epsilon) {
-    
+
     const auto shape = input.sizes();
-    const int32_t num_tokens = shape.size() > 1 ? 
+    const int32_t num_tokens = shape.size() > 1 ?
         static_cast<int32_t>(shape[0]) : 1;
     const int32_t hidden_size = static_cast<int32_t>(shape.back());
-    
+
     const int threads = 1024;
     const int blocks = num_tokens;
-    
+
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
