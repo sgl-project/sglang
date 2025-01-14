@@ -4,7 +4,6 @@ from sgl_kernel.ops import (
     init_custom_reduce,
     int8_scaled_mm,
     moe_align_block_size,
-    rms_norm,
     sampling_scaling_penalties,
 )
 
@@ -15,5 +14,4 @@ __all__ = [
     "custom_reduce",
     "int8_scaled_mm",
     "sampling_scaling_penalties",
-    "rms_norm",
 ]
