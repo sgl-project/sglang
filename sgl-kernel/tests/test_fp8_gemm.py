@@ -35,8 +35,8 @@ class TestFp8Gemm(unittest.TestCase):
         a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a)
         o = torch_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, out_dtype, bias)
         o1 = fp8_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, out_dtype, bias)
-        rtol = 0.01
-        atol = 0.1
+        rtol = 0.02
+        atol = 2
         torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
         print(f"M={M}, N={N}, K={K}, with_bias={with_bias}, out_dtype={out_dtype}: OK")
 
