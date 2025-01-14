@@ -5,12 +5,12 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, _key_match
 from sglang.srt.mem_cache.memory_pool import (
     BaseTokenToKVPool,
     MLATokenToKVPoolHost,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, _key_match
 
 
 class HiRadixCache(RadixCache):

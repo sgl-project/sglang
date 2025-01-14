@@ -1,12 +1,22 @@
 import argparse
 import asyncio
+import json
+import queue
 import random
+import threading
 import time
+from typing import Optional
 
 import aiohttp
 import requests
-from lorem_text import lorem
 from tqdm.asyncio import tqdm
+
+from sglang.bench_serving import (
+    RequestFuncOutput,
+    get_tokenizer,
+    remove_prefix,
+    sample_random_requests,
+)
 
 
 def parse_args():
@@ -16,38 +26,39 @@ def parse_args():
     parser.add_argument(
         "--num-clients",
         type=int,
-        default=10,
+        default=100,
         help="Number of concurrent clients",
     )
     parser.add_argument(
         "--request-length",
         type=int,
-        default=512,
+        default=1024,
         help="Length of each new request",
     )
     parser.add_argument(
         "--output-length",
         type=int,
-        default=256,
+        default=128,
         help="Length of each output",
     )
     parser.add_argument(
         "--num-rounds",
         type=int,
-        default=10,
+        default=8,
         help="Number of rounds per client",
     )
     parser.add_argument(
-        "--time-interval",
-        type=float,
-        default=1.0,
-        help="Average time interval between requests for each client (seconds)",
+        "--distribution",
+        type=str,
+        default="poisson",
+        choices=["poisson", "uniform"],
+        help="Distribution type for request intervals (poisson or uniform)",
     )
     parser.add_argument(
-        "--max-parallel-threads",
-        type=int,
-        default=64,
-        help="Max concurrency for outgoing requests",
+        "--request-rate",
+        type=float,
+        default=1.0,
+        help="Average number of requests per second",
     )
     parser.add_argument(
         "--host",
@@ -61,129 +72,259 @@ def parse_args():
         default=30000,
         help="Server port (default: 30000)",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="meta-llama/Llama-3.1-8B-Instruct",
+        help="model path compatible with Hugging Face Transformers",
+    )
     return parser.parse_args()
 
 
-def generate_text(num_tokens: int) -> str:
-    """Generates a text with approximately `num_tokens` tokens."""
-    # Approximate 1 word ~ 1.93 tokens
-    num_words = int(num_tokens / 1.93)
-    return lorem.words(num_words)
-
-
-async def make_request(
-    session: aiohttp.ClientSession,
-    history_context: str,
-    request_length: int,
-    output_length: int,
-    url: str,
-) -> tuple[str, float]:
-    """Make a single inference request to the server and return
-    updated history and latency.
+async def async_request_sglang_generate(
+    payload,
+    url,
+    pbar: Optional[tqdm] = None,
+):
     """
-    # Build request payload
-    new_request = "\n".join([history_context, generate_text(request_length)])
+    Sends a streaming request to the server. Gathers text token-by-token.
+    """
+    async with aiohttp.ClientSession() as session:
+        headers = {}
+        generated_text = ""
+        ttft = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        output = RequestFuncOutput()
+
+        try:
+            async with session.post(url=url, json=payload, headers=headers) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+                        if chunk == "[DONE]":
+                            pass
+                        else:
+                            data = json.loads(chunk)
+
+                            if data["text"]:
+                                timestamp = time.perf_counter()
+                                # First token
+                                if ttft == 0.0:
+                                    ttft = time.perf_counter() - st
+                                    output.ttft = ttft
+
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
+
+                                most_recent_timestamp = timestamp
+                                generated_text = data["text"]
+
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception as e:
+            output.success = False
+            output.error = str(e)
+            print(f"Request failed: {e}")
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+def gen_payload(prompt, output_len):
     payload = {
-        "text": new_request,
+        "text": prompt,
         "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": output_length,
+            "temperature": 0.0,
+            "max_new_tokens": output_len,
             "ignore_eos": True,
         },
+        "stream": True,
+        "lora_path": "",
+        "return_logprob": False,
+        "logprob_start_len": -1,
     }
-
-    start_time = asyncio.get_event_loop().time()
-    async with session.post(url, json=payload) as response:
-        response.raise_for_status()
-        data = await response.json()
-        latency = asyncio.get_event_loop().time() - start_time
-
-    # Extract the text from the response and append to history context
-    response_text = data.get("text", "")
-    updated_history = "".join([new_request, response_text])
-    return updated_history, latency
+    return payload
 
 
-async def client_task(
-    client_id: int,
-    num_rounds: int,
-    request_length: int,
-    output_length: int,
-    interval: float,
-    session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
-    progress_bar,
-    url: str,
-) -> float:
-    """Simulate a single client sending requests num_rounds times,
-    measuring average latency.
+class ReadyQueue:
     """
-    latencies = []
-    history_context = ""
+    Thread-safe queue that can pop requests in different orders based on given policy.
+    """
 
-    for _ in range(num_rounds):
-        # Random sleep to spread out requests (exponential distribution)
-        await asyncio.sleep(random.expovariate(1 / interval))
+    def __init__(self, init_requests=None, policy="random"):
+        self.lock = threading.Lock()
+        self.requests = init_requests or []
+        self.policy = policy
 
-        # Limit concurrency using semaphore
-        async with semaphore:
-            history_context, latency = await make_request(
-                session, history_context, request_length, output_length, url
-            )
-            latencies.append(latency)
+    def append(self, item):
+        with self.lock:
+            self.requests.append(item)
 
-        # Update overall progress
-        progress_bar.update(1)
+    def pop(self):
+        with self.lock:
+            if not self.requests:
+                return None
+            if self.policy == "random":
+                index = random.randrange(len(self.requests))
+                return self.requests.pop(index)
+            elif self.policy == "fifo":
+                return self.requests.pop(0)
+            else:
+                raise ValueError(f"{self.policy} not implemented")
 
-    avg_latency = sum(latencies) / len(latencies) if latencies else 0
-    # print(f"Client {client_id}: Average latency = {avg_latency:.4f}s")
-    return avg_latency
 
+class WorkloadGenerator:
+    def __init__(self, args):
+        # Construct the base URL for requests
+        self.url = f"http://{args.host}:{args.port}/generate"
 
-async def main(args):
-    """Main coroutine to coordinate the benchmark."""
-    # Build URLs if user hasn't specified full endpoints
-    args.url = f"http://{args.host}:{args.port}/generate"
-    args.flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
+        self.tokenizer = get_tokenizer(args.model)
+        self.distribution = args.distribution
+        self.request_rate = args.request_rate
+        self.start_time = None
+        self.finished_time = None
 
-    requests.post(args.flush_cache_url)
+        self.candidate_inputs = sample_random_requests(
+            input_len=args.request_length,
+            output_len=args.output_length,
+            num_prompts=args.num_clients * args.num_rounds,
+            range_ratio=1.0,
+            tokenizer=self.tokenizer,
+            dataset_path="",
+        )
+        self.candidate_inputs = [i[0] for i in self.candidate_inputs]
 
-    print(f"Using endpoint: {args.url}")
-    print(f"Using flush cache endpoint: {args.flush_cache_url}")
+        init_requests = [
+            (i, gen_payload(self.candidate_inputs[i], args.output_length))
+            for i in range(args.num_clients)
+        ]
+        self.client_records = {
+            i: {"round": 0, "history": init_requests[i][1]["text"]}
+            for i in range(args.num_clients)
+        }
+        self.ready_queue = ReadyQueue(init_requests=init_requests)
+        self.candidate_inputs = self.candidate_inputs[args.num_clients :]
 
-    async with aiohttp.ClientSession() as session:
-        # Create a semaphore to cap concurrency
-        semaphore = asyncio.Semaphore(args.max_parallel_threads)
+        self.response_queue = queue.Queue()
+        self.pbar = tqdm(total=args.num_clients * args.num_rounds)
+        self.performance_metrics = {"ttft": [], "latency": []}
 
-        # Set up a progress bar for total requests
-        total_requests = args.num_clients * args.num_rounds
-        with tqdm(total=total_requests, desc="Progress", unit="req") as progress_bar:
-            tasks = [
-                client_task(
-                    client_id=i,
-                    num_rounds=args.num_rounds,
-                    request_length=args.request_length,
-                    output_length=args.output_length,
-                    interval=args.time_interval,
-                    session=session,
-                    semaphore=semaphore,
-                    progress_bar=progress_bar,
-                    url=args.url,
-                )
-                for i in range(args.num_clients)
-            ]
+    async def handle_request(self, item):
+        try:
+            client_id, payload = item
+            response = await async_request_sglang_generate(payload, self.url, self.pbar)
+            if self.pbar.n == self.pbar.total:
+                self.finished_time = time.time()
+            self.response_queue.put((client_id, response))
+        except Exception as e:
+            print(f"Request failed: {e}")
 
-            results = await asyncio.gather(*tasks)
+    def request_sender(self):
+        async def request_loop():
+            while True:
+                # Calculate Poisson-distributed wait time
+                if self.distribution == "poisson":
+                    sleep_time = random.expovariate(self.request_rate)
+                elif self.distribution == "uniform":
+                    avg_interval = (
+                        1.0 / self.request_rate if self.request_rate > 0 else 1.0
+                    )
+                    sleep_time = random.uniform(0, 2 * avg_interval)
+                else:
+                    raise ValueError("Invalid distribution type")
+                await asyncio.sleep(sleep_time)  # Wait before sending the next request
 
-    # Summarize results
-    overall_avg_latency = sum(results) / len(results) if results else 0
-    print(f"Overall Average Latency: {overall_avg_latency:.4f}s")
+                new_request = self.ready_queue.pop()
+                # Submit async request
+                if new_request:
+                    asyncio.create_task(self.handle_request(new_request))
+                else:
+                    if self.pbar.n == self.pbar.total:
+                        break
+
+        # Create and run the event loop for asynchronous requests
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(request_loop())
+        loop.close()
+
+    def response_handler(self):
+        while True:
+            try:
+                client_id, response = self.response_queue.get(
+                    timeout=10
+                )  # Block until response is available
+                if not response.success:
+                    raise ValueError(f"Request failed with error: {response.error}")
+                self.client_records[client_id]["history"] += response.generated_text
+                self.client_records[client_id]["round"] += 1
+                self.performance_metrics["ttft"].append(response.ttft)
+                self.performance_metrics["latency"].append(response.latency)
+
+                if self.client_records[client_id]["round"] < args.num_rounds:
+                    self.client_records[client_id][
+                        "history"
+                    ] += self.candidate_inputs.pop()
+                    self.ready_queue.append(
+                        (
+                            client_id,
+                            gen_payload(
+                                self.client_records[client_id]["history"],
+                                args.output_length,
+                            ),
+                        )
+                    )
+            except queue.Empty:
+                if self.pbar.n == self.pbar.total:
+                    break
+
+    def run(self):
+        request_thread = threading.Thread(target=self.request_sender, daemon=True)
+        response_thread = threading.Thread(target=self.response_handler, daemon=True)
+
+        self.start_time = time.time()
+        request_thread.start()
+        response_thread.start()
+
+        request_thread.join()
+        response_thread.join()
+
+        self.pbar.close()
+        print("All requests completed.")
+        print("Performance metrics summary:")
+        print(
+            f"  Average TTFT: {sum(self.performance_metrics['ttft']) / len(self.performance_metrics['ttft'])}"
+        )
+        print(
+            f"  Median TTFT: {sorted(self.performance_metrics['ttft'])[len(self.performance_metrics['ttft']) // 2]}"
+        )
+        print(
+            f"  Average latency: {sum(self.performance_metrics['latency']) / len(self.performance_metrics['latency'])}"
+        )
+        print(
+            f"  Median latency: {sorted(self.performance_metrics['latency'])[len(self.performance_metrics['latency']) // 2]}"
+        )
+        throughput = self.pbar.total / (self.finished_time - self.start_time)
+        print(f"Throughput: {throughput:.2f} requests per second")
 
 
 if __name__ == "__main__":
     args = parse_args()
+    flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    start_time = time.time()
-    asyncio.run(main(args))
-    duration = time.time() - start_time
-    print(f"All clients finished {args.num_rounds} rounds in {duration:.2f} seconds.")
+    for request_rate in range(1, 11, 1):
+        args.request_rate = request_rate
+        requests.post(flush_cache_url)
+        WorkloadGenerator(args).run()
