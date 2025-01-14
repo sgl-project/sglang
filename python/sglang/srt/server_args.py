@@ -23,7 +23,6 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -92,7 +91,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
-    file_storage_pth: str = "SGLang_storage"
+    file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
 
     # Data parallelism
@@ -157,6 +156,7 @@ class ServerArgs:
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
+    enable_memory_saver: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -554,7 +554,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch",
+            help="The log interval of decode batch.",
         )
 
         # API related
@@ -853,6 +853,11 @@ class ServerArgs:
             "--delete-ckpt-after-loading",
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
+        )
+        parser.add_argument(
+            "--enable-memory-saver",
+            action="store_true",
+            help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
 
     @classmethod
