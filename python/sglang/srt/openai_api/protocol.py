@@ -341,14 +341,6 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
-class ToolCallItem(BaseModel):
-    """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
-
-    tool_index: int
-    name: Optional[str] = None
-    parameters: str  # JSON string
-
-
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None

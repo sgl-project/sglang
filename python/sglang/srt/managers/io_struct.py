@@ -17,7 +17,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -536,3 +536,21 @@ class CloseSessionReqInput:
 class OpenSessionReqOutput:
     session_id: Optional[str]
     success: bool
+
+
+@dataclass
+class FunctionTool:
+    description: Optional[str]
+    name: Optional[str]
+    parameters: Optional[object]
+
+
+@dataclass
+class FunctionCallReqInput:
+    text: str  # The text to parse.
+    tools: List[FunctionTool] = field(
+        default_factory=list
+    )  # A list of available function tools (name, parameters, etc.).
+    tool_call_parser: Optional[str] = (
+        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+    )
