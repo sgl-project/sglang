@@ -7,7 +7,7 @@ class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
 
     def test_ngram_accuracy(self):
         prompt = "In 2020, I was supposed to be 20. In 2021, I was"
-        target_model_path = "daryl149/llama-2-7b-chat-hf"
+        target_model_path = "meta-llama/Llama-2-7b-chat-hf"
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
@@ -28,7 +28,6 @@ class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
             speculative_algorithm="NGRAM",
             speculative_ngram_window_size=3,
             speculative_num_draft_tokens=16,
-            watchdog_timeout=10000000,
             disable_cuda_graph=True,
             attention_backend="torch_native",
         )

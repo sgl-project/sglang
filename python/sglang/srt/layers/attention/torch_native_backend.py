@@ -71,6 +71,7 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             extend_seq_len_q = extend_seq_lens[seq_idx]
             prefill_seq_len_q = extend_prefix_lens[seq_idx]
+
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
             end_kv = start_kv + seq_len_kv
@@ -90,7 +91,6 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            print(per_req_tokens)
             per_req_out_redudant = (
                 scaled_dot_product_attention(
                     per_req_query_redudant.unsqueeze(0),
@@ -122,7 +122,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         enable_gqa=False,
         causal=False,
     ):
-        """Run the extend forward by using torch native sdpa op.
+        """Run the target verify forward by using torch native sdpa op.
 
         Args:
             query: [num_tokens, num_heads, head_size]
@@ -225,6 +225,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
+
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
@@ -237,6 +238,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + seq_len_q
             end_kv = start_kv + seq_len_kv
+
             per_req_query = query[:, start_q:end_q, :]
 
             # get key and value from cache. per_req_tokens contains the kv cache
@@ -260,6 +262,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             )
             output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
+
         return output
 
     def forward_extend(
@@ -282,6 +285,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 

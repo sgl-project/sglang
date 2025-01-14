@@ -794,6 +794,7 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
