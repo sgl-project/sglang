@@ -4,7 +4,6 @@ from sgl_kernel.ops import (
     init_custom_reduce,
     int8_scaled_mm,
     fp8_scaled_mm,
-    fp8_scaled_mm_profile,
     moe_align_block_size,
 )
 
