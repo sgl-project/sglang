@@ -47,6 +47,7 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from uvicorn.config import LOGGING_CONFIG
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -56,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    FunctionCallReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -365,6 +367,30 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Close the session"""
     tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
+
+
+@app.post("/function_call")
+async def function_call_request(obj: FunctionCallReqInput, request: Request):
+    """
+    A native API endpoint to parse function calls from a text.
+    """
+    # 1) Initialize the parser based on the request body
+    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+
+    # 2) Call the non-stream parsing method (non-stream)
+    normal_text, calls = parser.parse_non_stream(obj.text)
+
+    # 3) Organize the response content
+    #    'calls' is a List[ToolCallItem], which contains (tool_index, name, parameters)
+    #    'normal_text' is the remaining text that the parser did not recognize as function calls (if any)
+    response_data = {
+        "normal_text": normal_text,
+        "calls": [
+            call.dict() for call in calls
+        ],  # Convert pydantic objects to dictionaries
+    }
+
+    return ORJSONResponse(content=response_data, status_code=200)
 
 
 ##### OpenAI-compatible API endpoints #####

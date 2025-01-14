@@ -6,8 +6,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
+from pydantic import BaseModel, Field
 
-from sglang.srt.openai_api.protocol import Tool, ToolCallItem
+
+class FunctionTool(BaseModel):
+    """Function Tool Template."""
+
+    description: Optional[str] = Field(default=None, examples=[None])
+    name: Optional[str] = None
+    parameters: Optional[object] = None
+
+
+class ToolCallItem(BaseModel):
+    """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
+
+    tool_index: int
+    name: Optional[str] = None
+    parameters: str  # JSON string
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -104,7 +119,9 @@ class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     @abstractmethod
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def detect_and_parse(
+        self, text: str, tools: List[FunctionTool]
+    ) -> List[ToolCallItem]:
         """
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
@@ -113,7 +130,7 @@ class BaseFormatDetector(ABC):
 
     @abstractmethod
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
+        self, new_text: str, tools: List[FunctionTool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing, internally maintains a buffer or state.
@@ -149,7 +166,9 @@ class Qwen25Detector(BaseFormatDetector):
 
         self.tool_call_regex = re.compile(r"\[{.*?}\]", re.DOTALL)
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def detect_and_parse(
+        self, text: str, tools: List[FunctionTool]
+    ) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -169,7 +188,7 @@ class Qwen25Detector(BaseFormatDetector):
                 action.get("parameters", action.get("arguments", {})),
                 ensure_ascii=False,
             )
-            tool_index = [tool.function.name for tool in tools].index(name)
+            tool_index = [tool.name for tool in tools].index(name)
             tool_call_item = ToolCallItem(
                 tool_index=tool_index, name=name, parameters=parameters
             )
@@ -177,7 +196,7 @@ class Qwen25Detector(BaseFormatDetector):
         return calls
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
+        self, new_text: str, tools: List[FunctionTool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing, referencing the logic of Llama32Detector.
@@ -381,7 +400,9 @@ class MistralDetector(BaseFormatDetector):
         """
         return re.findall(r"\[TOOL_CALLS\] \[.*?\]", text, re.DOTALL)[0]
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def detect_and_parse(
+        self, text: str, tools: List[FunctionTool]
+    ) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -400,7 +421,7 @@ class MistralDetector(BaseFormatDetector):
                 action.get("parameters", action.get("arguments", {})),
                 ensure_ascii=False,
             )
-            tool_index = [tool.function.name for tool in tools].index(name)
+            tool_index = [tool.name for tool in tools].index(name)
             tool_call_item = ToolCallItem(
                 tool_index=tool_index, name=name, parameters=parameters
             )
@@ -408,7 +429,7 @@ class MistralDetector(BaseFormatDetector):
         return calls
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
+        self, new_text: str, tools: List[FunctionTool]
     ) -> StreamingParseResult:
 
         delta_text = new_text
@@ -626,7 +647,9 @@ class Llama32Detector(BaseFormatDetector):
 
         self.tool_call_regex = re.compile(r"\[{.*?}\]", re.DOTALL)
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def detect_and_parse(
+        self, text: str, tools: List[FunctionTool]
+    ) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -643,7 +666,7 @@ class Llama32Detector(BaseFormatDetector):
             action.get("parameters", action.get("arguments", {})),
             ensure_ascii=False,
         )
-        tool_index = [tool.function.name for tool in tools].index(name)
+        tool_index = [tool.name for tool in tools].index(name)
         tool_call_item = ToolCallItem(
             tool_index=tool_index, name=name, parameters=parameters
         )
@@ -651,7 +674,7 @@ class Llama32Detector(BaseFormatDetector):
         return calls
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
+        self, new_text: str, tools: List[FunctionTool]
     ) -> StreamingParseResult:
         self._buffer += new_text
         current_text = self._buffer
@@ -822,7 +845,7 @@ class MultiFormatParser:
         """
         self.detectors = detectors
 
-    def parse_once(self, text: str, tools: List[Tool]):
+    def parse_once(self, text: str, tools: List[FunctionTool]):
         """
         One-time parsing: Loop through detectors until there are no new matches or text is exhausted
         Return: (final_text, all_calls)
@@ -840,7 +863,7 @@ class MultiFormatParser:
         # leftover_text is the normal text not consumed by any Detector
         return final_normal_text, final_calls
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]):
+    def parse_streaming_increment(self, new_text: str, tools: List[FunctionTool]):
         """
         Streaming incremental parsing: Feed new_text to each detector's parse_streaming_increment
         and merge their produced normal_text/calls to return.
@@ -877,7 +900,7 @@ class FunctionCallParser:
         "mistral": MistralDetector,
     }
 
-    def __init__(self, tools: List["Tool"], tool_call_parser: str):
+    def __init__(self, tools: List[FunctionTool], tool_call_parser: str):
         detectors = []
         if tool_call_parser:
             detector_class = self.ToolCallParserEnum.get(tool_call_parser)
