@@ -692,12 +692,22 @@ class Scheduler:
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) > self.max_req_input_len:
-            logger.warning(
-                "Request length is longer than the KV cache pool size or "
-                "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {self.max_req_input_len=}."
-            )
-            req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    "Request length is longer than the KV cache pool size or "
+                    "the max context length. Truncated."
+                f"{len(req.origin_input_ids)=}, {self.max_req_input_len=}.")
+                req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
+            else:
+                origin_input_ids_len = len(req.origin_input_ids)
+                error_msg = (
+                    f"Input length ({origin_input_ids_len} tokens) exceeds the maximum allowed length "
+                    f"({self.max_req_input_len} tokens). Use a shorter input or enable --allow-auto-truncate."
+                )
+                logger.error(error_msg)
+                req.finished_reason = FINISH_ABORT(error_msg)
+                self.waiting_queue.append(req)
+                return
 
         req.sampling_params.max_new_tokens = min(
             (
@@ -747,11 +757,22 @@ class Scheduler:
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
-            logger.warning(
-                "Request length is longer than the KV cache pool size or "
-                "the max context length. Truncated!!!"
-            )
-            req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    "Request length is longer than the KV cache pool size or "
+                    "the max context length. Truncated."
+                    f"{len(req.origin_input_ids)=}, {self.max_req_input_len=}.")
+                req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
+            else:
+                origin_input_ids_len = len(req.origin_input_ids)
+                error_msg = (
+                    f"Input length ({origin_input_ids_len} tokens) exceeds the maximum allowed length "
+                    f"({self.max_req_input_len} tokens). Use a shorter input or enable --allow-auto-truncate."
+                )
+                logger.error(error_msg)
+                req.finished_reason = FINISH_ABORT(error_msg)
+                self.waiting_queue.append(req)
+                return
 
         self.waiting_queue.append(req)
 
