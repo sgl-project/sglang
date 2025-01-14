@@ -166,7 +166,7 @@ class CudaGraphRunner:
         if model_runner.spec_algorithm.is_ngram():
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
-                self.model_runner.server_args.speculative_num_draft_tokens
+                self.model_runner.server_args.speculative_num_draft_tokens + 1
             )
 
         self.compile_bs = (
@@ -476,8 +476,9 @@ class CudaGraphRunner:
             from sglang.srt.speculative.ngram_worker import NGramSpecInfo
 
             spec_info = NGramSpecInfo(
-                verified_tokens=None,
-                candidate_tokens=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                verified_ids=None,
+                draft_tokens=None,
                 positions=None,
             )
         return spec_info

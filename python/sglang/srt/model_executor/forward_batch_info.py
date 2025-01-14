@@ -285,8 +285,7 @@ class ForwardBatch:
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
-            print("xiaotong", ret.spec_info.positions - 2)
-            ret.positions = ret.spec_info.positions - 2
+            ret.positions = ret.spec_info.positions
 
         # Init position information
         if ret.forward_mode.is_decode():

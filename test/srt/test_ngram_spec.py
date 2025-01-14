@@ -6,10 +6,22 @@ import sglang as sgl
 class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
 
     def test_ngram_accuracy(self):
-        prompt = "Today is a sunny day and I like"
+        prompt = "In 2020, I was supposed to be 20. In 2021, I was"
         target_model_path = "daryl149/llama-2-7b-chat-hf"
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
+        engine = sgl.Engine(
+            model_path=target_model_path,
+            disable_cuda_graph=True,
+            disable_overlap_schedule=True,
+            attention_backend="torch_native",
+        )
+        out2 = engine.generate(prompt, sampling_params)["text"]
+        engine.shutdown()
+
+        print("==== Answer 2 ====")
+        print(out2)
 
         engine = sgl.Engine(
             model_path=target_model_path,
@@ -18,7 +30,7 @@ class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
             speculative_num_draft_tokens=16,
             watchdog_timeout=10000000,
             disable_cuda_graph=True,
-            # attention_backend="torch_native",
+            attention_backend="torch_native",
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
@@ -26,18 +38,7 @@ class TestEngineWithNGramSpeculativeDecoding(unittest.TestCase):
         print("==== Answer 1 ====")
         print(out1)
 
-        # engine = sgl.Engine(
-        #     model_path=target_model_path,
-        #     disable_cuda_graph=True,
-        #     disable_overlap_schedule=True,
-        #     attention_backend="torch_native",
-        # )
-        # out2 = engine.generate(prompt, sampling_params)["text"]
-        # engine.shutdown()
-
-        # print("==== Answer 2 ====")
-        # print(out2)
-        # self.assertEqual(out1, out2)
+        self.assertEqual(out1, out2)
 
 
 if __name__ == "__main__":

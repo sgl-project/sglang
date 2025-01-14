@@ -110,10 +110,6 @@ class DetokenizerManager:
                 continue
             else:
                 assert isinstance(recv_obj, BatchTokenIDOut)
-                print("DetokenizerManager: received object")
-                print(recv_obj.output_ids)
-                print(recv_obj.decode_ids)
-                print(recv_obj.decoded_texts)
 
             bs = len(recv_obj.rids)
 
