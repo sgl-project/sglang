@@ -436,6 +436,15 @@ typename Gemm::Arguments prepare_sm90_fp8_args(torch::Tensor& out, const torch::
     StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
     StrideC stride_c;
     StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
+    std::cout << "m: " << m << std::endl;
+    std::cout << "n: " << n << std::endl;
+    std::cout << "k: " << k << std::endl;
+    std::cout << "stride_a: " << stride_a << std::endl;
+    std::cout << "stride_b: " << stride_b << std::endl;
+    std::cout << "stride_d: " << stride_d << std::endl;
+    std::cout << "ptr_a: " << ptr_a << std::endl;
+    std::cout << "ptr_b: " << ptr_b << std::endl;
+    std::cout << "ptr_d: " << ptr_d << std::endl;
     typename Gemm::Arguments args
         = {cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, {ptr_a, stride_a, ptr_b, stride_b},
             {{}, // epilogue.thread
@@ -482,6 +491,36 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
     TORCH_CHECK(can_implement == cutlass::Status::kSuccess)
 
     auto status = gemm_op.run(args, workspace.data_ptr(), stream);
+    
+    if (status != cutlass::Status::kSuccess) {
+        std::stringstream error_msg;
+        error_msg << "GEMM execution failed. Status: " 
+                  << cutlass::cutlassGetStatusString(status) << "\n"
+                  << "Problem size: M=" << a.size(0) << ", N=" << b.size(1) << ", K=" << a.size(1) << "\n"
+                  << "Device: " << a.device() << "\n"
+                  << "Data types - A: " << a.dtype() 
+                  << ", B: " << b.dtype() 
+                  << ", Out: " << out.dtype() << "\n"
+                  << "Memory alignment - A: " << reinterpret_cast<std::uintptr_t>(a.data_ptr()) % 16 
+                  << ", B: " << reinterpret_cast<std::uintptr_t>(b.data_ptr()) % 16 
+                  << ", Out: " << reinterpret_cast<std::uintptr_t>(out.data_ptr()) % 16
+                  << ", workspace_size: " << workspace_size
+                  << ", workspace_options: " << workspace_options;
+        
+        // 检查CUDA错误
+        cudaError_t cuda_err = cudaGetLastError();
+        if (cuda_err != cudaSuccess) {
+            error_msg << "\nCUDA error: " << cudaGetErrorString(cuda_err);
+        }
+        
+        TORCH_CHECK(false, error_msg.str());
+    }
+
+    // 5. 同步并检查最终状态
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    if (sync_err != cudaSuccess) {
+        TORCH_CHECK(false, "CUDA sync error: ", cudaGetErrorString(sync_err));
+    }
     TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
@@ -515,16 +554,16 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     uint32_t const mp2 =
         std::max(static_cast<uint32_t>(64), next_pow_2(m));  // next power of 2
 
-    // if (mp2 <= 64) {
-    //     // m in [1, 64]
-    //     return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>>(out, a, b, scales_a, scales_b, bias);
-    // } else if (mp2 <= 128) {
-    //     // m in (64, 128]
-    //     return sm90_dispatch_bias<OutType, Shape<_64, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
-    // } else {
-    //     // m in (128, inf)
-    //     return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
-    // }
+    if (mp2 <= 64) {
+        // m in [1, 64]
+        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>>(out, a, b, scales_a, scales_b, bias);
+    } else if (mp2 <= 128) {
+        // m in (64, 128]
+        return sm90_dispatch_bias<OutType, Shape<_64, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+    } else {
+        // m in (128, inf)
+        return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+    }
 }
 
 #define DISPATCH_FP8_GEMM_CONFIG(TB_M, TB_N, TB_K, WP_M, WP_N, WP_K, STAGES) \
@@ -549,21 +588,21 @@ void sm89_dispatch_shape_explicit(torch::Tensor& out, const torch::Tensor& mat_a
         case 1:
             DISPATCH_FP8_GEMM_CONFIG(32, 64, 128, 16, 64, 64, 5);
             break;
-        case 2:
-            DISPATCH_FP8_GEMM_CONFIG(16, 64, 128, 16, 64, 64, 5);
-            break;
-        case 3:
-            DISPATCH_FP8_GEMM_CONFIG(64, 64, 128, 32, 64, 64, 5);
-            break;
-        case 4:
-            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 5);
-            break;
-        case 5:
-            DISPATCH_FP8_GEMM_CONFIG(128, 128, 64, 64, 32, 64, 2);
-            break;
-        case 6:
-            DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 6);
-            break;
+        // case 2:
+        //     DISPATCH_FP8_GEMM_CONFIG(16, 64, 128, 16, 64, 64, 5);
+        //     break;
+        // case 3:
+        //     DISPATCH_FP8_GEMM_CONFIG(64, 64, 128, 32, 64, 64, 5);
+        //     break;
+        // case 4:
+        //     DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 5);
+        //     break;
+        // case 5:
+        //     DISPATCH_FP8_GEMM_CONFIG(128, 128, 64, 64, 32, 64, 2);
+        //     break;
+        // case 6:
+        //     DISPATCH_FP8_GEMM_CONFIG(64, 128, 64, 32, 64, 64, 6);
+        //     break;
         default:
             throw std::runtime_error("Invalid config_id in debug mode: " + std::to_string(config_id));
     }
