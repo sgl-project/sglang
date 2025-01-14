@@ -73,7 +73,13 @@ from sglang.srt.openai_api.protocol import (
     UsageInfo,
 )
 
-TOOLS_TAG_LIST = ["<|plugin|>", "<function=", "<tool_call>", "<|python_tag|>"]
+TOOLS_TAG_LIST = [
+    "<|plugin|>",
+    "<function=",
+    "<tool_call>",
+    "<|python_tag|>",
+    "[TOOL_CALLS]",
+]
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
