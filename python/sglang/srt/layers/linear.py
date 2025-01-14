@@ -31,7 +31,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import (
+    get_tensor_model_parallel_rank_wrapper,
+    get_tensor_model_parallel_world_size_wrapper,
+    set_weight_attrs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -309,11 +313,11 @@ class ColumnParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank(
+            tp_rank = get_tensor_model_parallel_rank_wrapper(
                 get_global_server_args_dict()["device"]
             )
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size(
+            tp_size = get_tensor_model_parallel_world_size_wrapper(
                 get_global_server_args_dict()["device"]
             )
         self.tp_rank, self.tp_size = tp_rank, tp_size
@@ -457,11 +461,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         self.output_sizes = output_sizes
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank(
+            tp_rank = get_tensor_model_parallel_rank_wrapper(
                 get_global_server_args_dict()["device"]
             )
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size(
+            tp_size = get_tensor_model_parallel_world_size_wrapper(
                 get_global_server_args_dict()["device"]
             )
         self.tp_rank, self.tp_size = tp_rank, tp_size
@@ -1105,11 +1109,11 @@ class RowParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank(
+            tp_rank = get_tensor_model_parallel_rank_wrapper(
                 get_global_server_args_dict()["device"]
             )
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size(
+            tp_size = get_tensor_model_parallel_world_size_wrapper(
                 get_global_server_args_dict()["device"]
             )
         self.tp_rank, self.tp_size = tp_rank, tp_size
