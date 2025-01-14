@@ -436,15 +436,6 @@ typename Gemm::Arguments prepare_sm90_fp8_args(torch::Tensor& out, const torch::
     StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
     StrideC stride_c;
     StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
-    std::cout << "m: " << m << std::endl;
-    std::cout << "n: " << n << std::endl;
-    std::cout << "k: " << k << std::endl;
-    std::cout << "stride_a: " << stride_a << std::endl;
-    std::cout << "stride_b: " << stride_b << std::endl;
-    std::cout << "stride_d: " << stride_d << std::endl;
-    std::cout << "ptr_a: " << ptr_a << std::endl;
-    std::cout << "ptr_b: " << ptr_b << std::endl;
-    std::cout << "ptr_d: " << ptr_d << std::endl;
     typename Gemm::Arguments args
         = {cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, {ptr_a, stride_a, ptr_b, stride_b},
             {{}, // epilogue.thread
@@ -507,7 +498,6 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
                   << ", workspace_size: " << workspace_size
                   << ", workspace_options: " << workspace_options;
         
-        // 检查CUDA错误
         cudaError_t cuda_err = cudaGetLastError();
         if (cuda_err != cudaSuccess) {
             error_msg << "\nCUDA error: " << cudaGetErrorString(cuda_err);
@@ -516,7 +506,6 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
         TORCH_CHECK(false, error_msg.str());
     }
 
-    // 5. 同步并检查最终状态
     cudaError_t sync_err = cudaStreamSynchronize(stream);
     if (sync_err != cudaSuccess) {
         TORCH_CHECK(false, "CUDA sync error: ", cudaGetErrorString(sync_err));
