@@ -40,6 +40,7 @@ class EAGLEWorker(TpModelWorker):
         )
         self.target_worker = target_worker
         self.server_args = server_args
+        self.finish_extend_len = []
 
         # Share the embedding and lm_head
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
