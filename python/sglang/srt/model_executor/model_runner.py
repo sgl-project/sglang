@@ -491,11 +491,12 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
         
-        self.lora_manager.load_lora_adapter(lora_name, lora_path)
-        self.server_args.lora_paths.append(lora_path)
+        success, message = self.lora_manager.load_lora_adapter(lora_name, lora_path)
+        if success:
+            self.server_args.lora_paths.append(lora_path)
 
         logger.info("Lora loading end.")
-        return True, "Succeeded to load Lora adapter."
+        return success, message
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(

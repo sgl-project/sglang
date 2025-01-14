@@ -324,6 +324,7 @@ class LoRAAdapter(nn.Module):
         self.weights = {}
         self.weights_gpu = {}
 
+    @classmethod
     def get_stacked_multiply(self, module_name):
         stacked_rank = {
             "qkv_proj": 3,

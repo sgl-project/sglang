@@ -131,16 +131,16 @@ class LoRAManager:
     def init_loras(self):
         # get configs and target modules
         self.configs = {}
-        self.origin_target_modules = set()
+        origin_target_modules = set()
         for name, path in self.lora_paths.items():
             self.configs[name] = LoRAConfig(path)
-            self.origin_target_modules = set(self.origin_target_modules) | set(
+            origin_target_modules = set(origin_target_modules) | set(
                 self.configs[name].target_modules
             )
         if hasattr(self.base_model, "get_module_name"):
             self.target_modules = {
                 self.base_model.get_module_name(module)
-                for module in self.origin_target_modules
+                for module in origin_target_modules
             }
         else:
             logger.warning(
@@ -149,10 +149,10 @@ class LoRAManager:
                 "Use the default one, but please check if it is correct for your model."
             )
             self.target_modules = {
-                get_module_name(module) for module in self.origin_target_modules
+                get_module_name(module) for module in origin_target_modules
             }
         self.target_weights = set(
-            [get_stacked_name(module) for module in self.origin_target_modules]
+            [get_stacked_name(module) for module in origin_target_modules]
         )
 
         # load all weights to cpu
@@ -197,7 +197,7 @@ class LoRAManager:
                     "Use the default one, but please check if it is correct for your model."
                 )
                 hidden_dim_A, _ = get_hidden_dim(module_A, self.base_hf_config)
-            c = self.loras[-1].get_stacked_multiply(module_A)
+            c = LoRAAdapter.get_stacked_multiply(module_A)
             if module_A not in self.A_buffer:
                 self.A_buffer[module_A] = [
                     torch.empty(
@@ -221,7 +221,7 @@ class LoRAManager:
                     "Use the default one, but please check if it is correct for your model."
                 )
                 _, hidden_dim_B = get_hidden_dim(module_B, self.base_hf_config)
-            c = self.loras[-1].get_stacked_multiply(module_B)
+            c = LoRAAdapter.get_stacked_multiply(module_B)
             if module_B not in self.B_buffer:
                 self.B_buffer[module_B] = [
                     torch.empty(
@@ -329,5 +329,118 @@ class LoRAManager:
                 )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str):
-        # TODO: implement this!
-        pass
+        if lora_name in self.lora_paths:
+            error_msg = f"There has been a Lora adapter named as {lora_name}! Please change for another name."
+            logger.error(error_msg)
+            return False, error_msg
+
+        # Load lora config. Return false if the loading of config is failed.
+        try: 
+            self.configs[lora_name] = LoRAConfig(lora_path)
+        except Exception as e:
+            error_msg = (
+                f"Failed to load lora config from path {lora_path}.
+                  Error Log: {e}. "
+            )
+            logger.error(error_msg)
+            return False, error_msg
+        
+        # Update target modules.
+        added_target_modules = set(self.configs[lora_name].target_modules)
+        if hasattr(self.base_model, "get_module_name"):    
+            self.target_modules = set(self.target_modules) | {
+                self.base_model.get_module_name(module)
+                for module in added_target_modules
+            }
+        else:
+            logger.warning(
+                "WARNING: get_module_name() is not defined, "
+                "which is used to map config module name to model implementation module name."
+                "Use the default one, but please check if it is correct for your model."
+            )
+            self.target_modules = set(self.target_modules) | {
+                get_module_name(module) for module in added_target_modules
+            }
+        self.target_weights = set(self.target_weights) | set(
+            [get_stacked_name(module) for module in added_target_modules]
+        )
+
+        # Load adapter weights to cpu.
+        self.lora_id[lora_name] = len(self.loras)
+        lora_adapter = LoRAAdapter(lora_name, self.configs[lora_name], self.base_hf_config, self.load_config)
+        self.loras.append(lora_adapter)
+        lora_adapter.initialize_weights()
+
+        # Check the lora adapter matches the demand of lora_dim and scaling.
+        # FIXME: Should be removed after supporting multi-rank loras.
+        if (self.max_lora_dim != self.configs[lora_name].r) or (self.scaling != lora_adapter.scaling):
+            error_msg = (
+                f"Currently sglang only supports serving of lora adapters with identical lora ranks"
+                f"and scaling. Newly loaded adapter has rank={self.configs[lora_name].r} and scaling={lora_adapter.scaling},"
+                f"but running adapters has rank={self.max_lora_dim} and scaling={self.scaling}. Please make sure they are equal!"
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+        # Replace with Lora module if there are new modules that match target.
+        processed_module_names = set(lora_module[0] for lora_module in self.lora_modules)
+        for module_name, module in self.base_model.named_modules():
+            if self.match_target_modules(module_name) and module_name not in processed_module_names:
+                self.lora_modules.append(
+                    (module_name, self.set_lora_module(module_name, module))
+                )
+                
+        # Create new spaces to memory buffer if there are newly added target modules.
+        # TODO(Baizhou): This piece of logic can be reused in a helper function.
+        num_layer = self.base_hf_config.num_hidden_layers
+        for module_A, module_B in self.target_weights:
+            if module_A not in self.A_buffer:
+                if hasattr(self.base_model, "get_hidden_dim"):
+                    hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
+                else:
+                    logger.warning(
+                        "WARNING: get_hidden_dim() is not defined, "
+                        "which is used to get the hidden dim for different lora modules"
+                        "Use the default one, but please check if it is correct for your model."
+                    )
+                    hidden_dim_A, _ = get_hidden_dim(module_A, self.base_hf_config)
+                c = LoRAAdapter.get_stacked_multiply(module_A)
+                if module_A not in self.A_buffer:
+                    self.A_buffer[module_A] = [
+                        torch.empty(
+                            (
+                                self.max_loras_per_batch,
+                                self.max_lora_dim * c,
+                                hidden_dim_A,
+                            ),
+                            dtype=self.dtype,
+                            device="cuda",
+                        )
+                        for i in range(num_layer)
+                    ]
+                    
+            if module_B not in self.B_buffer:
+                if hasattr(self.base_model, "get_hidden_dim"):
+                    _, hidden_dim_B = self.base_model.get_hidden_dim(module_B)
+                else:
+                    logger.warning(
+                        "WARNING: get_hidden_dim() is not defined, "
+                        "which is used to get the hidden dim for different lora modules"
+                        "Use the default one, but please check if it is correct for your model."
+                    )
+                    _, hidden_dim_B = get_hidden_dim(module_B, self.base_hf_config)
+                c = LoRAAdapter.get_stacked_multiply(module_B)
+                self.B_buffer[module_B] = [
+                    torch.empty(
+                        (
+                            self.max_loras_per_batch,
+                            hidden_dim_B * c,
+                            self.max_lora_dim,
+                        ),
+                        dtype=self.dtype,
+                        device="cuda",
+                    )
+                    for i in range(num_layer)
+                ]
+        
+        return True, "Success"
