@@ -50,6 +50,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -62,8 +64,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    LoadLoRAAdapterReqInput,
-    LoadLoRAAdapterReqOutput
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -172,9 +172,7 @@ class TokenizerManager:
             None
         )
         self.lora_update_lock = RWLock()
-        self.lora_update_result: Optional[Awaitable[LoadLoRAAdapterReqOutput]] = (
-            None
-        )
+        self.lora_update_result: Optional[Awaitable[LoadLoRAAdapterReqOutput]] = None
         self.asyncio_tasks = set()
 
         # For session info
@@ -802,7 +800,7 @@ class TokenizerManager:
                     self.lora_update_tmp_result.append(recv_obj)
                     # set future if the all results are recevied
                     if len(self.lora_update_tmp_result) == self.server_args.dp_size:
-                        self.lora_update_result.set_result(self.lora_update_tmp_result)  
+                        self.lora_update_result.set_result(self.lora_update_tmp_result)
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
 

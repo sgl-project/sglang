@@ -335,7 +335,7 @@ class LoRAManager:
             return False, error_msg
 
         # Load lora config. Return false if the loading of config is failed.
-        try: 
+        try:
             self.configs[lora_name] = LoRAConfig(lora_path)
         except Exception as e:
             error_msg = (
@@ -344,10 +344,10 @@ class LoRAManager:
             )
             logger.error(error_msg)
             return False, error_msg
-        
+
         # Update target modules.
         added_target_modules = set(self.configs[lora_name].target_modules)
-        if hasattr(self.base_model, "get_module_name"):    
+        if hasattr(self.base_model, "get_module_name"):
             self.target_modules = set(self.target_modules) | {
                 self.base_model.get_module_name(module)
                 for module in added_target_modules
@@ -389,7 +389,7 @@ class LoRAManager:
                 self.lora_modules.append(
                     (module_name, self.set_lora_module(module_name, module))
                 )
-                
+
         # Create new spaces to memory buffer if there are newly added target modules.
         # TODO(Baizhou): This piece of logic can be reused in a helper function.
         num_layer = self.base_hf_config.num_hidden_layers
@@ -418,7 +418,7 @@ class LoRAManager:
                         )
                         for i in range(num_layer)
                     ]
-                    
+
             if module_B not in self.B_buffer:
                 if hasattr(self.base_model, "get_hidden_dim"):
                     _, hidden_dim_B = self.base_model.get_hidden_dim(module_B)
@@ -442,5 +442,5 @@ class LoRAManager:
                     )
                     for i in range(num_layer)
                 ]
-        
+
         return True, "Success"
