@@ -40,9 +40,7 @@ logger = logging.getLogger(__name__)
 # oldest request states will be evicted. Default: 65536 (1<<16).
 # For more details, see: https://github.com/sgl-project/sglang/issues/2812
 # Use power of 2 values for better memory allocation.
-DETOKENIZER_MAX_STATES = int(
-    os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16)
-)
+DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
 
 @dataclasses.dataclass
@@ -82,9 +80,7 @@ class DetokenizerManager:
                 trust_remote_code=server_args.trust_remote_code,
             )
 
-        self.decode_status = LimitedCapacityDict(
-            capacity=DETOKENIZER_MAX_STATES
-        )
+        self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
