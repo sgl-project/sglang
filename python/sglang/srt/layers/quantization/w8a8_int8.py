@@ -3,12 +3,9 @@ from typing import Any, Dict, List, Optional
 import torch
 from sgl_kernel import int8_scaled_mm
 from torch.nn.parameter import Parameter
-from vllm.model_executor.parameter import (
-    ChannelQuantScaleParameter,
-    ModelWeightParameter,
-)
 
 from sglang.srt.layers.linear import LinearMethodBase
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
