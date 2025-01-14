@@ -6,6 +6,7 @@ from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_siz
 from sgl_kernel.ops._kernels import (
     sampling_scaling_penalties as _sampling_scaling_penalties,
 )
+from sgl_kernel.ops._kernels import rms_norm as _rms_norm
 
 
 def init_custom_reduce(rank_id, num_devices, buffers, barrier_in, barrier_out):
@@ -45,6 +46,8 @@ def moe_align_block_size(
 def sampling_scaling_penalties(logits, scaling_penalties):
     return _sampling_scaling_penalties(logits, scaling_penalties)
 
+def rms_norm(out, input, weight, epsilon):
+    return _rms_norm(out, input, weight, epsilon)
 
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return _int8_scaled_mm(

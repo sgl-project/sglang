@@ -15,6 +15,9 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
 // sampling_scaling_penalties
 torch::Tensor sampling_scaling_penalties(const torch::Tensor& logits, const torch::Tensor& scaling_penalties);
 
+// rms_norm
+void rms_norm(torch::Tensor& out, const torch::Tensor& input, const torch::Tensor& weight, const float epsilon);
+
 // int8_scaled_mm
 torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
@@ -29,6 +32,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_align_block_size", &moe_align_block_size, "MOE Align Block Size (CUDA)");
   // sampling_scaling_penalties
   m.def("sampling_scaling_penalties", &sampling_scaling_penalties, "Sampling scaling penalties (CUDA)");
+  // rms_norm
+  m.def("rms_norm", &rms_norm, "RMS Normalization (CUDA)");
   // int8_scaled_mm
   m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
 }
