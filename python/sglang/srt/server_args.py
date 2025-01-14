@@ -378,6 +378,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "gguf",
                 "modelopt",
+                "w8a8_int8",
             ],
             help="The quantization method.",
         )
