@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 """
 Memory pool.
 
@@ -27,6 +29,7 @@ from enum import IntEnum
 from functools import wraps
 from typing import List, Tuple, Union
 
+import numpy as np
 import psutil
 import torch
 
@@ -35,17 +38,31 @@ from sglang.srt.utils import debug_timing, get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
+GB = 1024 * 1024 * 1024
+
 
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
-    def __init__(self, size: int, max_context_len: int, device: str, use_records: bool):
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        use_records: bool,
+        enable_memory_saver: bool,
+    ):
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        self.req_to_token = torch.zeros(
-            (size, max_context_len), dtype=torch.int32, device=device
-        )
+        with memory_saver_adapter.region():
+            self.req_to_token = torch.zeros(
+                (size, max_context_len), dtype=torch.int32, device=device
+            )
         self.free_slots = list(range(size))
         self.write_records = []
         self.use_records = use_records
@@ -109,8 +126,8 @@ class BaseTokenToKVPool:
     ):
         self.size = size
         self.dtype = dtype
-        if dtype == torch.float8_e5m2:
-            # NOTE: Store as torch.uint8 because Tensor index_put is not implemented for torch.float8_e5m2
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
@@ -186,36 +203,59 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         head_dim: int,
         layer_num: int,
         device: str,
+        enable_memory_saver: bool,
     ):
         super().__init__(size, dtype, device)
+
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
         self._create_buffers()
 
+        k_size, v_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB."
+        )
+
     def _create_buffers(self):
-        # [size, head_num, head_dim] for each layer
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.k_buffer = [
-            torch.empty(
-                (self.size + 1, self.head_num, self.head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            for _ in range(self.layer_num)
-        ]
-        self.v_buffer = [
-            torch.empty(
-                (self.size + 1, self.head_num, self.head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            for _ in range(self.layer_num)
-        ]
+        with self.memory_saver_adapter.region():
+            # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.k_buffer = [
+                torch.empty(
+                    (self.size + 1, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.empty(
+                    (self.size + 1, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
 
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        k_size_bytes = 0
+        for k_cache in self.k_buffer:
+            k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
+        v_size_bytes = 0
+        for v_cache in self.v_buffer:
+            v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+        return k_size_bytes, v_size_bytes
 
     # Todo: different memory layout
     def get_flat_data(self, indices):
@@ -256,11 +296,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+            cache_k = (cache_k / k_scale).to(self.dtype)
+            cache_v = (cache_v / v_scale).to(self.dtype)
         if self.store_dtype != self.dtype:
             self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
             self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
@@ -286,19 +328,26 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         qk_rope_head_dim: int,
         layer_num: int,
         device: str,
+        enable_memory_saver: bool,
     ):
         super().__init__(size, dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.kv_buffer = [
-            torch.empty(
-                (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
-                dtype=self.store_dtype,
-                device=device,
-            )
-            for _ in range(layer_num)
-        ]
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
+        with memory_saver_adapter.region():
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.kv_buffer = [
+                torch.empty(
+                    (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
+                    dtype=self.store_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
@@ -339,26 +388,32 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         layer_num: int,
         device: str,
         heavy_channel_num: int,
+        enable_memory_saver: bool,
     ):
         super().__init__(size, dtype, device)
 
-        # [size, head_num, head_dim] for each layer
-        self.k_buffer = [
-            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
-            for _ in range(layer_num)
-        ]
-        self.v_buffer = [
-            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
-            for _ in range(layer_num)
-        ]
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
 
-        # [size, head_num, heavy_channel_num] for each layer
-        self.label_buffer = [
-            torch.empty(
-                (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
-            )
-            for _ in range(layer_num)
-        ]
+        with memory_saver_adapter.region():
+            # [size, head_num, head_dim] for each layer
+            self.k_buffer = [
+                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                for _ in range(layer_num)
+            ]
+            self.v_buffer = [
+                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                for _ in range(layer_num)
+            ]
+
+            # [size, head_num, heavy_channel_num] for each layer
+            self.label_buffer = [
+                torch.empty(
+                    (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
+                )
+                for _ in range(layer_num)
+            ]
 
     def get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id]
