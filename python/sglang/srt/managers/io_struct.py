@@ -462,11 +462,31 @@ class GetWeightsByNameReqInput:
     name: str
     truncate_size: int = 100
 
-
 @dataclass
 class GetWeightsByNameReqOutput:
     parameter: list
 
+@dataclass
+class LoadLoRAAdapterReqInput:
+    # The name of the lora module to newly loaded.
+    lora_name: str
+    # The path of loading.
+    lora_path: str
+
+@dataclass
+class LoadLoRAAdapterReqOutput:
+    success: bool
+    message: str
+    
+@dataclass
+class UnLoadLoRAAdapterReqInput:
+    # The name of lora module to unload.
+    lora_name: str
+
+@dataclass
+class UnLoadLoRAAdapterReqOutput:
+    success: bool
+    message: str
 
 @dataclass
 class AbortReq:

@@ -327,3 +327,7 @@ class LoRAManager:
                     seg_indptr,
                     weight_indices,
                 )
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        # TODO: implement this!
+        pass

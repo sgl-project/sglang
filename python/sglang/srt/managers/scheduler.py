@@ -54,6 +54,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -512,10 +514,15 @@ class Scheduler:
                 success, message = self.update_weights_from_tensor(recv_req)
                 self.send_to_tokenizer.send_pyobj(
                     UpdateWeightsFromTensorReqOutput(success, message)
-                )
+                )    
             elif isinstance(recv_req, GetWeightsByNameReqInput):
                 parameter = self.get_weights_by_name(recv_req)
                 self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+            elif isinstance(recv_req, LoadLoRAAdapterReqInput):
+                success, message = self.load_lora_adapter(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    LoadLoRAAdapterReqOutput(success, message)
+                )   
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
                     self.start_profile()
@@ -1542,6 +1549,21 @@ class Scheduler:
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return parameter
+
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        """In-place loading a new lora adapater from disk or huggingface."""
+        
+        if (not self.server_args.disable_radix_cache) or (not self.server_args.disable_cuda_graph):
+            success, message = False, "Radix cache or cuda graph not supported when Lora is enabled, please try turning it off." 
+        else:
+            success, message = self.tp_worker.load_lora_adapter(recv_req)
+            
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        return success, message   
 
     def start_profile(self) -> None:
         if self.profiler is None:

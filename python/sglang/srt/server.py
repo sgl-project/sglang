@@ -60,6 +60,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    LoadLoRAAdapterReqInput,
+    UnLoadLoRAAdapterReqInput
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -253,6 +255,24 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/load_lora_adapter")
+@time_func_latency
+async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
+    """Load a new Lora adapter without re-launching the server."""
+    success, message = await tokenizer_manager.load_lora_adapter(obj, request)
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])

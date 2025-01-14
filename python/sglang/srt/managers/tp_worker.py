@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    LoadLoRAAdapterReqInput
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -212,3 +213,9 @@ class TpModelWorker:
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+    
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        success, message = self.model_runner.load_lora_adapter(
+            recv_req.lora_name, recv_req.lora_path
+        )
+        return success, message    

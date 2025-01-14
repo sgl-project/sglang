@@ -466,6 +466,11 @@ class ModelRunner:
             return None
 
     def init_lora_manager(self):
+        
+        # TODO: remove this if-else condition after supporting radix cache or cuda graph.
+        if (not self.server_args.disable_radix_cache) or (not self.server_args.disable_cuda_graph):
+            success, message = False, "Radix cache or cuda graph not supported when Lora is enabled, please try turning it off." 
+
         self.lora_manager = LoRAManager(
             base_model=self.model,
             lora_paths=self.server_args.lora_paths,
@@ -475,6 +480,22 @@ class ModelRunner:
             dtype=self.dtype,
         )
         logger.info("LoRA manager ready.")
+        
+    def load_lora_adapter(
+        self, lora_name: str, lora_path: str
+    ) -> tuple[bool, str]:
+        """Load a new lora adapter from disk or huggingface."""
+        
+        logger.info(
+            f"Begin loading a new lora adapter: name={lora_name}, path={lora_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+        
+        self.lora_manager.load_lora_adapter(lora_name, lora_path)
+        self.server_args.lora_paths.append(lora_path)
+
+        logger.info("Lora loading end.")
+        return True, "Succeeded to load Lora adapter."
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(

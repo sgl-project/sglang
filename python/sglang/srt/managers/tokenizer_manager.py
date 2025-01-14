@@ -62,6 +62,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -167,6 +169,10 @@ class TokenizerManager:
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
+            None
+        )
+        self.lora_update_lock = RWLock()
+        self.lora_update_result: Optional[Awaitable[LoadLoRAAdapterReqOutput]] = (
             None
         )
         self.asyncio_tasks = set()
@@ -548,6 +554,44 @@ class TokenizerManager:
         else:
             return all_parameters
 
+    async def load_lora_adapter(
+        self,
+        obj: LoadLoRAAdapterReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+
+        # default the load format to the server_args
+        if obj.load_format is None:
+            obj.load_format = self.server_args.load_format
+        logger.info("Start load Lora weights. Load format=%s", obj.load_format)
+
+        if True:
+            # Hold the lock if it is not async. This means that lora loading
+            # cannot begin until requests have been processed.
+            async with self.lora_update_lock.writer_lock:
+                return await self._wait_for_lora_loading(obj)
+
+    async def _wait_for_lora_loading(
+        self, obj: LoadLoRAAdapterReqInput
+    ) -> Tuple[bool, str]:
+        self.send_to_scheduler.send_pyobj(obj)
+        self.lora_update_result = asyncio.Future()
+        if self.server_args.dp_size == 1:
+            result = await self.lora_update_result
+            if result.success:
+                self.server_args.lora_paths[obj.lora_name] = obj.lora_path
+            return result.success, result.message
+        else:  # self.server_args.dp_size > 1
+            self.lora_update_tmp_result = []
+            result = await self.lora_update_result
+            all_success = all([r.success for r in result])
+            if all_success:
+                self.server_args.lora_paths[obj.lora_name] = obj.lora_path
+            all_message = [r.message for r in result]
+            all_message = " | ".join(all_message)
+            return all_success, all_message
+
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -627,6 +671,7 @@ class TokenizerManager:
                 UpdateWeightsFromDistributedReqOutput,
                 GetWeightsByNameReqOutput,
                 InitWeightsUpdateGroupReqOutput,
+                LoadLoRAAdapterReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
@@ -750,6 +795,14 @@ class TokenizerManager:
                 self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, LoadLoRAAdapterReqOutput):
+                if self.server_args.dp_size == 1:
+                    self.lora_update_result.set_result(recv_obj)
+                else:
+                    self.lora_update_tmp_result.append(recv_obj)
+                    # set future if the all results are recevied
+                    if len(self.lora_update_tmp_result) == self.server_args.dp_size:
+                        self.lora_update_result.set_result(self.lora_update_tmp_result)  
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
 
