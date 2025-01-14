@@ -8,7 +8,7 @@ import multiprocessing
 
 root = Path(__file__).parent.resolve()
 
-# 添加调试模式控制
+# add debug mode control
 debug_build = os.environ.get('DEBUG_BUILD', '0').lower() in ('1', 'true', 'yes', 'on')
 print(f"Debug build: {'enabled' if debug_build else 'disabled'}")
 
@@ -55,12 +55,12 @@ nvcc_flags = [
     "-fPIC",
     "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
-    "-gencode=arch=compute_90a,code=sm_90a",  # 只保留这个
+    "-gencode=arch=compute_90a,code=sm_90a",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
 
-# 如果是调试模式，添加调试标志
+# if debug, add debug flag
 if debug_build:
     nvcc_flags.extend([
         "-DSGL_DEBUG_BUILD",

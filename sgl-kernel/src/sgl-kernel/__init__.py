@@ -15,5 +15,4 @@ __all__ = [
     "custom_reduce",
     "int8_scaled_mm",
     "fp8_scaled_mm",
-    "fp8_scaled_mm_profile",
 ]

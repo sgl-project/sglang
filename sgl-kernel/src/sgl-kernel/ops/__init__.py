@@ -4,7 +4,6 @@ from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
 # from sgl_kernel.ops._kernels import int8_scaled_mm as _int8_scaled_mm
 from sgl_kernel.ops._kernels import fp8_scaled_mm as _fp8_scaled_mm
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
-from sgl_kernel.ops._kernels import fp8_scaled_mm_profile as _fp8_scaled_mm_profile
 
 def init_custom_reduce(rank_id, num_devices, buffers, barrier_in, barrier_out):
     return _init_custom_ar(rank_id, num_devices, buffers, barrier_in, barrier_out)
@@ -60,14 +59,4 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None, is_pro
         out_dtype,
         bias,
         is_profile,
-    )
-
-def fp8_scaled_mm_profile(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-    _fp8_scaled_mm_profile(
-        mat_a,
-        mat_b,
-        scales_a,
-        scales_b,
-        out_dtype,
-        bias,
     )
