@@ -24,7 +24,6 @@ class NGramWorker:
         self.target_worker = target_worker
         self.max_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.ngram_window_size = server_args.speculative_ngram_window_size
-        # Don't support prefix share now.
 
     def finish_request(self, reqs: Union[Req, List[Req]]):
         pass
