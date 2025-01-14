@@ -26,6 +26,9 @@ class NGramWorker:
         self.ngram_window_size = server_args.speculative_ngram_window_size
         # Don't support prefix share now.
 
+    def finish_request(self, reqs: Union[Req, List[Req]]):
+        pass
+
     def find_candidate_pred_tokens(self, batch: ScheduleBatch):
         input_tokens = torch.cat(
             [

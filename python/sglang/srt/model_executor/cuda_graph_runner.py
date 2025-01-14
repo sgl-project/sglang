@@ -476,7 +476,7 @@ class CudaGraphRunner:
             from sglang.srt.speculative.ngram_worker import NGramSpecInfo
 
             spec_info = NGramSpecInfo(
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                max_num_draft_tokens=self.model_runner.server_args.speculative_num_draft_tokens,
                 verified_ids=None,
                 draft_tokens=None,
                 positions=None,
