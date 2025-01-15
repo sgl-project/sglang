@@ -34,3 +34,13 @@ struct cuda_error : public std::runtime_error {
 #define CHECK_CUDA_INPUT(x) \
   CHECK_IS_CUDA(x);         \
   CHECK_IS_CONTIGUOUS(x)
+
+inline int getSMVersion() {
+  int device{-1};
+  CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
+  int sm_major = 0;
+  int sm_minor = 0;
+  CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
+  CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
+  return sm_major * 10 + sm_minor;
+}

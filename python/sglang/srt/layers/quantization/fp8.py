@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-import os
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -25,9 +24,9 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
 
 from sglang.srt.layers.linear import LinearMethodBase, UnquantizedLinearMethod
+from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -40,11 +39,14 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
+    permute_weight,
     print_warning_once,
     set_weight_attrs,
 )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+
+is_hip_ = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +163,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
         # Disable marlin for ROCm
-        if is_hip():
+        if is_hip_:
             self.use_marlin = False
 
         self.block_quant = self.quant_config.weight_block_size is not None
@@ -272,6 +274,19 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if is_hip_:
+                # activation_scheme: dynamic
+                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                )
+                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    weight_scale, requires_grad=False
+                )
+                layer.input_scale = None
             return
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         # If checkpoint not serialized fp8, quantize the weights.
@@ -317,7 +332,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale = layer.weight_scale
 
                 # If ROCm, normalize the weights and scales to e4m3fnuz
-                if is_hip():
+                if is_hip_:
                     weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                         weight=weight,
                         weight_scale=weight_scale,
@@ -369,7 +384,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight=layer.weight,
                 block_size=self.quant_config.weight_block_size,
                 weight_scale=layer.weight_scale_inv,
-                input_scale=layer.input_scale,
+                input_scale=None,
                 bias=bias,
             )
 
@@ -553,11 +568,35 @@ class Fp8MoEMethod:
 
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if is_hip_:
+                # activation_scheme: dynamic
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                # Reset the parameter
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w2_input_scale = None
             return
         # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
             # If ROCm, use float8_e4m3fnuz instead (MI300x HW)
-            fp8_dtype = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+            fp8_dtype = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
@@ -579,18 +618,30 @@ class Fp8MoEMethod:
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-            # If ROCm, apply weight padding (min. Mem channel contention) only if set
-            if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
-                layer.w13_weight = torch.nn.Parameter(
-                    F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-                layer.w2_weight = torch.nn.Parameter(
-                    F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
+            if is_hip_:
+                if get_bool_env_var("CK_MOE"):
+                    layer.w13_weight = torch.nn.Parameter(
+                        permute_weight(layer.w13_weight.data),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        permute_weight(layer.w2_weight.data),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                elif get_bool_env_var("MOE_PADDING"):
+                    # If ROCm, apply weight padding (min. Mem channel contention) only if set
+                    layer.w13_weight = torch.nn.Parameter(
+                        F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -621,7 +672,7 @@ class Fp8MoEMethod:
                 )
 
             # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip():
+            if is_hip_:
                 # Normalize the weights and scales
                 w13_weight, w13_weight_scale, w13_input_scale = (
                     normalize_e4m3fn_to_e4m3fnuz(
@@ -671,18 +722,30 @@ class Fp8MoEMethod:
                 max_w13_scales, requires_grad=False
             )
 
-            # If ROCm, apply weight padding (min. Mem channel contention) only if set
-            if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
-                layer.w13_weight = torch.nn.Parameter(
-                    F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-                layer.w2_weight = torch.nn.Parameter(
-                    F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
+            if is_hip_:
+                if get_bool_env_var("CK_MOE"):
+                    layer.w13_weight = torch.nn.Parameter(
+                        permute_weight(layer.w13_weight.data),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        permute_weight(layer.w2_weight.data),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                elif get_bool_env_var("MOE_PADDING"):
+                    # If ROCm, apply weight padding (min. Mem channel contention) only if set
+                    layer.w13_weight = torch.nn.Parameter(
+                        F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
             return
 
     def apply(
@@ -715,27 +778,55 @@ class Fp8MoEMethod:
             correction_bias=correction_bias,
         )
 
-        # Expert fusion with FP8 quantization
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-            use_fp8_w8a8=True,
-            w1_scale=(
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            ),
-            w2_scale=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            ),
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
-        )
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            import ater
+            from ater.fused_moe import fused_experts_ck
+
+            return fused_experts_ck(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+
+        else:
+            # Expert fusion with FP8 quantization
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.quant_config.weight_block_size,
+            )
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):

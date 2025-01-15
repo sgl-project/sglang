@@ -12,11 +12,22 @@
 # limitations under the License.
 # ==============================================================================
 
-from typing import List, Tuple
+import functools
+import json
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils import get_device_name, is_hip
+
+is_hip_ = is_hip()
+fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -65,7 +76,7 @@ def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = torch.float8_e4m3fn,
+    dtype: torch.dtype = fp8_type_,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -87,8 +98,12 @@ def per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
-    fp8_min = finfo.min
     fp8_max = finfo.max
+
+    if is_hip_:
+        fp8_max = 224.0
+
+    fp8_min = -fp8_max
 
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     M = x.numel() // group_size
@@ -205,6 +220,48 @@ def _w8a8_block_fp8_matmul(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@functools.lru_cache
+def get_w8a8_block_fp8_configs(
+    N: int, K: int, block_n: int, block_k: int
+) -> Optional[Dict[int, Any]]:
+    """
+    Return optimized configurations for the w8a8 block fp8 kernel.
+
+    The return value will be a dictionary that maps an irregular grid of
+    batch sizes to configurations of the w8a8 block fp8 kernel. To evaluate the
+    kernel on a given batch size bs, the closest batch size in the grid should
+    be picked and the associated configuration chosen to invoke the kernel.
+    """
+
+    # First look up if an optimized configuration is available in the configs
+    # directory
+    device_name = get_device_name().replace(" ", "_")
+    json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
+
+    config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    if os.path.exists(config_file_path):
+        with open(config_file_path) as f:
+            logger.info(
+                "Using configuration from %s for W8A8 Block FP8 kernel.",
+                config_file_path,
+            )
+            # If a configuration has been found, return it
+            return {int(key): val for key, val in json.load(f).items()}
+
+    # If no optimized configuration is available, we will use the default
+    # configuration
+    logger.warning(
+        (
+            "Using default W8A8 Block FP8 kernel config. Performance might be sub-optimal! "
+            "Config file not found at %s"
+        ),
+        config_file_path,
+    )
+    return None
+
+
 def w8a8_block_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -245,17 +302,22 @@ def w8a8_block_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    # TODO(HandH1998):
-    # BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N can be optimized.
-    # BLOCK_SIZE_K must be divisable by block_k
-    # BLOCK_SIZE_N and BLOCK_SIZE_M has no requirements
-    BLOCK_SIZE_M = 128
-    if M < BLOCK_SIZE_M:
-        BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_M = max(BLOCK_SIZE_M, 16)
-    BLOCK_SIZE_K = block_k
-    assert block_k % BLOCK_SIZE_K == 0
-    BLOCK_SIZE_N = block_n
+    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+    if configs:
+        # If an optimal configuration map has been found, look up the
+        # optimal config
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    else:
+        # Default config
+        # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": block_size[0],
+            "BLOCK_SIZE_K": block_size[1],
+            "GROUP_SIZE_M": 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
 
     def grid(META):
         return (
@@ -283,10 +345,7 @@ def w8a8_block_fp8_matmul(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
+        **config,
     )
 
     return C

@@ -17,14 +17,20 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
-not_hip = False
+is_hip_flag = False
 if not is_hip():
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
-    not_hip = True
+    is_hip_flag = False
+else:
+    is_hip_flag = True
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
+
+enable_moe_align_block_size_triton = bool(
+    int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
+)
 
 
 @triton.jit
@@ -222,6 +228,139 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+@triton.jit
+def moe_align_block_size_stage1(
+    topk_ids_ptr,
+    tokens_cnts_ptr,
+    num_experts: tl.constexpr,
+    numel: tl.constexpr,
+    tokens_per_thread: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    start_idx = pid * tokens_per_thread
+
+    off_c = (pid + 1) * num_experts
+
+    for i in range(tokens_per_thread):
+        if start_idx + i < numel:
+            idx = tl.load(topk_ids_ptr + start_idx + i)
+            token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
+            tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
+
+
+@triton.jit
+def moe_align_block_size_stage2(
+    tokens_cnts_ptr,
+    num_experts: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    last_cnt = 0
+    for i in range(1, num_experts + 1):
+        token_cnt = tl.load(tokens_cnts_ptr + i * num_experts + pid)
+        last_cnt = last_cnt + token_cnt
+        tl.store(tokens_cnts_ptr + i * num_experts + pid, last_cnt)
+
+
+@triton.jit
+def moe_align_block_size_stage3(
+    total_tokens_post_pad_ptr,
+    tokens_cnts_ptr,
+    cumsum_ptr,
+    num_experts: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    last_cumsum = 0
+    off_cnt = num_experts * num_experts
+    for i in range(1, num_experts + 1):
+        token_cnt = tl.load(tokens_cnts_ptr + off_cnt + i - 1)
+        last_cumsum = last_cumsum + tl.cdiv(token_cnt, block_size) * block_size
+        tl.store(cumsum_ptr + i, last_cumsum)
+    tl.store(total_tokens_post_pad_ptr, last_cumsum)
+
+
+@triton.jit
+def moe_align_block_size_stage4(
+    topk_ids_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    tokens_cnts_ptr,
+    cumsum_ptr,
+    num_experts: tl.constexpr,
+    block_size: tl.constexpr,
+    numel: tl.constexpr,
+    tokens_per_thread: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    start_idx = tl.load(cumsum_ptr + pid)
+    end_idx = tl.load(cumsum_ptr + pid + 1)
+
+    for i in range(start_idx, end_idx, block_size):
+        tl.store(expert_ids_ptr + i // block_size, pid)
+
+    start_idx = pid * tokens_per_thread
+    off_t = pid * num_experts
+
+    for i in range(start_idx, tl.minimum(start_idx + tokens_per_thread, numel)):
+        expert_id = tl.load(topk_ids_ptr + i)
+        token_cnt = tl.load(tokens_cnts_ptr + off_t + expert_id)
+        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
+        tl.store(sorted_token_ids_ptr + rank_post_pad, i)
+        tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
+
+
+def moe_align_block_size_triton(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    numel = topk_ids.numel()
+    grid = (num_experts,)
+    tokens_cnts = torch.zeros(
+        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
+    )
+    cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
+    tokens_per_thread = ceil_div(numel, num_experts)
+
+    moe_align_block_size_stage1[grid](
+        topk_ids,
+        tokens_cnts,
+        num_experts,
+        numel,
+        tokens_per_thread,
+    )
+    moe_align_block_size_stage2[grid](
+        tokens_cnts,
+        num_experts,
+    )
+    moe_align_block_size_stage3[(1,)](
+        num_tokens_post_pad,
+        tokens_cnts,
+        cumsum,
+        num_experts,
+        block_size,
+    )
+    moe_align_block_size_stage4[grid](
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        tokens_cnts,
+        cumsum,
+        num_experts,
+        block_size,
+        numel,
+        tokens_per_thread,
+    )
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -272,24 +411,36 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    if not_hip and num_experts >= 224:
-        token_cnts_buffer = torch.empty(
-            (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
-        )
-        cumsum_buffer = torch.empty(
-            num_experts + 1, dtype=torch.int32, device=topk_ids.device
-        )
+    if num_experts >= 224:
+        if enable_moe_align_block_size_triton or is_hip_flag:
+            moe_align_block_size_triton(
+                topk_ids,
+                num_experts,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+            )
+        else:
+            token_cnts_buffer = torch.empty(
+                (num_experts + 1) * num_experts,
+                dtype=torch.int32,
+                device=topk_ids.device,
+            )
+            cumsum_buffer = torch.empty(
+                num_experts + 1, dtype=torch.int32, device=topk_ids.device
+            )
 
-        sgl_moe_align_block_size(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            token_cnts_buffer,
-            cumsum_buffer,
-        )
+            sgl_moe_align_block_size(
+                topk_ids,
+                num_experts,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                token_cnts_buffer,
+                cumsum_buffer,
+            )
     else:
         ops.moe_align_block_size(
             topk_ids,
@@ -326,9 +477,9 @@ def invoke_fused_moe_kernel(
 
     padded_size = 0
     if use_fp8_w8a8:
-        padded_size = padding_size
         assert B_scale is not None
         if block_shape is None:
+            padded_size = padding_size
             A, A_scale = ops.scaled_fp8_quant(A, A_scale)
         else:
             assert len(block_shape) == 2
@@ -392,14 +543,25 @@ def invoke_fused_moe_kernel(
     )
 
 
-def get_config_file_name(E: int, N: int, dtype: Optional[str]) -> str:
+def get_config_file_name(
+    E: int, N: int, dtype: Optional[str], block_shape: Optional[int] = None
+) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}.json"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    )
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"
 
 
 @functools.lru_cache
-def get_moe_configs(E: int, N: int, dtype: Optional[str]) -> Optional[Dict[int, Any]]:
+def get_moe_configs(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_n: Optional[int] = 0,
+    block_k: Optional[int] = 0,
+) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
 
@@ -411,7 +573,7 @@ def get_moe_configs(E: int, N: int, dtype: Optional[str]) -> Optional[Dict[int, 
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    json_file_name = get_config_file_name(E, N, dtype)
+    json_file_name = get_config_file_name(E, N, dtype, [block_n, block_k])
 
     config_file_path = os.path.join(
         os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
@@ -442,24 +604,36 @@ def get_default_config(
     topk: int,
     dtype: Optional[str],
     is_marlin: bool,
+    block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
     if dtype == "fp8_w8a8":
-        config = {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 32,
-            "num_warps": 8,
-            "num_stages": 4,
-        }
-        if M <= E:
+        if block_shape is None:
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 32,
+                "num_warps": 8,
+                "num_stages": 2 if is_hip_flag else 4,
+            }
+            if M <= E:
+                config = {
+                    "BLOCK_SIZE_M": 64,
+                    "BLOCK_SIZE_N": 128,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 4,
+                    "num_stages": 2 if is_hip_flag else 4,
+                }
+        else:
+            # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
             config = {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
+                "BLOCK_SIZE_N": block_shape[0],
+                "BLOCK_SIZE_K": block_shape[1],
+                "GROUP_SIZE_M": 32,
                 "num_warps": 4,
-                "num_stages": 4,
+                "num_stages": 2 if is_hip_flag else 3,
             }
     else:
         config = {
@@ -496,7 +670,9 @@ def try_get_optimal_moe_config(
     else:
         # First try to load optimal config from the file
         E, _, N = w2_shape
-        configs = get_moe_configs(E, N, dtype)
+        block_n = block_shape[0] if block_shape else 0
+        block_k = block_shape[1] if block_shape else 0
+        configs = get_moe_configs(E, N, dtype, block_n, block_k)
 
         if configs:
             # If an optimal configuration map has been found, look up the
@@ -504,14 +680,9 @@ def try_get_optimal_moe_config(
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         else:
             # Else use the default config
-            config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, is_marlin)
-    # TODO(HandH1998): Optimize the configs of block-wise quant.
-    # NOTE(HandH1998): For block-wise quant,
-    # BLOCK_K must be divisable by block_shape[1]
-    # BLOCK_N and BLOCK_M has no requirements
-    if block_shape is not None:
-        config["BLOCK_SIZE_N"] = block_shape[0]
-        config["BLOCK_SIZE_K"] = block_shape[1]
+            config = get_default_config(
+                M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
+            )
     return config
 
 
@@ -707,7 +878,7 @@ def fused_experts_impl(
     block_shape: Optional[List[int]] = None,
 ):
     padded_size = padding_size
-    if not use_fp8_w8a8:
+    if not use_fp8_w8a8 or block_shape is not None:
         padded_size = 0
 
     # Check constraints.
@@ -834,11 +1005,29 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
 
-        torch.sum(
-            intermediate_cache3.view(*intermediate_cache3.shape),
-            dim=1,
-            out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-        )
+        if is_hip_flag:
+            ops.moe_sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            )
+        else:
+            if topk_ids.shape[1] == 1:
+                out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(
+                    intermediate_cache3[:, 0]
+                )
+            elif topk_ids.shape[1] == 2:
+                torch.add(
+                    intermediate_cache3[:, 0],
+                    intermediate_cache3[:, 1],
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                ).squeeze(dim=1)
+            elif topk_ids.shape[1] > 2:
+                torch.sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    dim=1,
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
+
     return out_hidden_states
 
 

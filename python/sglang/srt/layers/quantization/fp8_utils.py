@@ -1,12 +1,15 @@
 from typing import List, Optional, Tuple
 
 import torch
-from vllm.model_executor.parameter import RowvLLMParameter, _ColumnvLLMParameter
 
+from sglang.srt.layers.parameter import RowvLLMParameter, _ColumnvLLMParameter
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+from sglang.srt.utils import is_hip
+
+is_hip_ = is_hip()
 
 
 def normalize_e4m3fn_to_e4m3fnuz(
@@ -63,8 +66,11 @@ def input_to_float8(
     finfo = torch.finfo(dtype)
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-    scale = finfo.max / amax
-    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    fp8_max = finfo.max
+    if is_hip_:
+        fp8_max = 224.0
+    scale = fp8_max / amax
+    x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 

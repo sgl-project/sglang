@@ -19,6 +19,14 @@ _SAMPLING_EPS = 1e-6
 
 
 class SamplingParams:
+    """
+    The sampling parameters.
+
+    See docs/references/sampling_params.md or
+    https://docs.sglang.ai/references/sampling_params.html
+    for the documentation.
+    """
+
     def __init__(
         self,
         max_new_tokens: int = 128,
@@ -33,9 +41,9 @@ class SamplingParams:
         repetition_penalty: float = 1.0,
         min_new_tokens: int = 0,
         spaces_between_special_tokens: bool = True,
-        regex: Optional[str] = None,
         n: int = 1,
         json_schema: Optional[str] = None,
+        regex: Optional[str] = None,
         ebnf: Optional[str] = None,
         no_stop_trim: bool = False,
         ignore_eos: bool = False,

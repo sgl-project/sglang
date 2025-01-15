@@ -28,7 +28,7 @@ jobs:
           pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 120
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly --timeout-per-file 2400

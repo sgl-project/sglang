@@ -331,6 +331,7 @@ def throughput_test(
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
     )
+    backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
