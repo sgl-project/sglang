@@ -131,6 +131,7 @@ class Session:
             sampling_params=req.sampling_params,
             lora_path=req.lora_path,
             session_id=self.session_id,
+            custom_logit_processor=req.custom_logit_processor,
         )
         if last_req is not None:
             new_req.image_inputs = last_req.image_inputs

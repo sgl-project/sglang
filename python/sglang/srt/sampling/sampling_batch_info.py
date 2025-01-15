@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -36,6 +36,9 @@ class SamplingBatchInfo:
     # Dispatch in CUDA graph
     need_min_p_sampling: bool
 
+    # Whether any request has custom logit processor
+    has_custom_logit_processor: bool
+
     # Bias Tensors
     vocab_size: int
     grammars: Optional[List] = None
@@ -51,6 +54,12 @@ class SamplingBatchInfo:
 
     # Device
     device: str = "cuda"
+
+    # Custom Parameters
+    custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # Custom Logit Processor
+    custom_logit_processor: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def from_schedule_batch(
@@ -76,6 +85,29 @@ class SamplingBatchInfo:
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
 
+        # Check if any request has custom logit processor
+        has_custom_logit_processor = any(r.custom_logit_processor for r in reqs)
+
+        if has_custom_logit_processor:
+            # Merge the same type of custom logit processors together
+            processor_dict = {}
+            for i, r in enumerate(reqs):
+                if r.custom_logit_processor is None:
+                    continue
+                processor_str = r.custom_logit_processor
+                if processor_str not in processor_dict:
+                    processor_dict[processor_str] = []
+                processor_dict[processor_str].append(i)
+
+            merged_custom_logit_processor = {
+                processor_str: torch.zeros(len(reqs), dtype=torch.bool)
+                .scatter_(0, torch.tensor(true_indices), True)
+                .to(device, non_blocking=True)
+                for processor_str, true_indices in processor_dict.items()
+            }
+        else:
+            merged_custom_logit_processor = {}
+
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -83,8 +115,11 @@ class SamplingBatchInfo:
             min_ps=min_ps,
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
+            has_custom_logit_processor=has_custom_logit_processor,
             vocab_size=vocab_size,
             device=device,
+            custom_params=[r.sampling_params.custom_params for r in reqs],
+            custom_logit_processor=merged_custom_logit_processor,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
@@ -221,6 +256,23 @@ class SamplingBatchInfo:
 
         return None
 
+    @staticmethod
+    def merge_custom_logit_processor(
+        lhs: Dict[str, torch.Tensor], rhs: Dict[str, torch.Tensor], device: str
+    ):
+        keys = set(lhs.keys()).union(set(rhs.keys()))
+        merged_dict = {}
+
+        for k in keys:
+            left_values = lhs.get(
+                k, torch.zeros(len(lhs), dtype=torch.bool, device=device)
+            )
+            right_values = rhs.get(
+                k, torch.zeros(len(rhs), dtype=torch.bool, device=device)
+            )
+            merged_dict[k] = torch.cat([left_values, right_values])
+        return merged_dict
+
     def merge_batch(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
@@ -238,6 +290,15 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
+        self.custom_params = self.custom_params + other.custom_params
+        if self.has_custom_logit_processor or other.has_custom_logit_processor:
+            self.custom_logit_processor = (
+                SamplingBatchInfo.merge_custom_logit_processor(
+                    self.custom_logit_processor,
+                    other.custom_logit_processor,
+                    self.device,
+                )
+            )
         self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
 
     def apply_logits_bias(self, logits: torch.Tensor):

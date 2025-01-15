@@ -9,6 +9,7 @@ import unittest
 import numpy as np
 import requests
 
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -247,6 +248,52 @@ class TestSRTEndpoint(unittest.TestCase):
             logprobs[idx] = output_top_logprobs[i][0]
 
         self.assertTrue(all(x is not None for x in logprobs))
+
+    def test_custom_logit_processor(self):
+        """Test custom logit processor with custom params."""
+
+        class DummyLogitProcessor(CustomLogitProcessor):
+            """A dummy logit processor that changes the logits into a tensor of
+            the same shape with a single value input from the custom params.
+            """
+
+            def __call__(self, logits, custom_param_list, device):
+                import torch
+
+                assert logits.shape[0] == len(custom_param_list)
+                key = "value"
+
+                merged_params = torch.tensor(
+                    [custom_param_list[i][key] for i in range(len(custom_param_list))],
+                    dtype=torch.float,
+                ).to(device=device, non_blocking=True)
+
+                return merged_params.unsqueeze(1) * torch.ones_like(logits)
+
+        prompts = "Question: Is Paris the Capital of France? Answer:"
+
+        # Base case json data to be posted to the server.
+        base_json = {
+            "text": prompts,
+            "sampling_params": {"temperature": 0.0},
+            "return_logprob": True,
+        }
+
+        # Custom json data with custom logit processor and params.
+        custom_json = base_json.copy()
+        custom_json["custom_logit_processor"] = DummyLogitProcessor().to_str()
+        custom_json["sampling_params"]["custom_params"] = {"value": 5.0}
+
+        custom_response = requests.post(
+            self.base_url + "/generate",
+            json=custom_json,
+        ).json()
+
+        output_token_logprobs = custom_response["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+
+        # The logit processor should always sample the same token as the logits is deterministic.
+        self.assertEqual(len(set(sampled_tokens)), 1)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")
