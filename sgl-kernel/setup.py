@@ -40,7 +40,7 @@ nvcc_flags = [
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda"]
+libraries = ["c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
 ext_modules = [
     CUDAExtension(
