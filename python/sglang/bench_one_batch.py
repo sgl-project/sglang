@@ -78,7 +78,7 @@ class BenchArgs:
     # This is only used for correctness test
     cut_len: int = 4
     profile: bool = False
-    profile_filename: str = "profile.trace.json.gz"
+    profile_filename_prefix: str = "profile"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -104,7 +104,11 @@ class BenchArgs:
             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
-            "--profile-filename", type=str, default=BenchArgs.profile_filename
+            "--profile-filename-prefix",
+            type=str,
+            default=BenchArgs.profile_filename_prefix,
+            help="Prefix of the profiling file names. The full profiling result file(s) be "
+            '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
 
     @classmethod
@@ -306,7 +310,7 @@ def latency_test_run_once(
     output_len,
     device,
     profile,
-    profile_filename,
+    profile_filename_prefix,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -371,7 +375,8 @@ def latency_test_run_once(
 
     if profile:
         profiler.stop()
-        parent_dir = os.path.dirname(profile_filename)
+        profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.trace.json.gz"
+        parent_dir = os.path.dirname(os.path.abspath(profile_filename))
         os.makedirs(parent_dir, exist_ok=True)
         profiler.export_chrome_trace(profile_filename)
 
@@ -424,7 +429,7 @@ def latency_test(
         8,  # shorter decoding to speed up the warmup
         server_args.device,
         profile=False,
-        profile_filename="",  # not used
+        profile_filename_prefix="",  # not used
     )
 
     rank_print("Benchmark ...")
@@ -445,7 +450,7 @@ def latency_test(
             ol,
             server_args.device,
             bench_args.profile,
-            bench_args.profile_filename,
+            bench_args.profile_filename_prefix,
         )
         if ret is not None:
             result_list.append(ret)
