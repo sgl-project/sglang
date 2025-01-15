@@ -21,6 +21,7 @@ import os
 import pickle
 import signal
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -265,10 +266,16 @@ class TokenizerManager:
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
-        elif obj.input_ids is None:
-            input_ids = self.tokenizer.encode(input_text)
-        else:
+        elif obj.input_ids is not None:
             input_ids = obj.input_ids
+        else:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept text prompts. Please provide input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
+                )
+            input_ids = self.tokenizer.encode(input_text)
 
         if self.is_generation:
             # TODO: also support getting embeddings for multimodal models
@@ -635,8 +642,17 @@ class TokenizerManager:
         loop = asyncio.get_event_loop()
         self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
 
-        signal_handler = SignalHandler(self)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        # We cannot add signal handler when the tokenizer manager is not in
+        # the main thread due to the CPython limitation.
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = SignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        else:
+            logger.warning(
+                "Signal handler is not added because the tokenizer manager is "
+                "not in the main thread. This disables graceful shutdown of the "
+                "tokenizer manager when SIGTERM is received."
+            )
         self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
 
     async def sigterm_watchdog(self):
