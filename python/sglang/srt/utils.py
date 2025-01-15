@@ -97,6 +97,10 @@ def is_flashinfer_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
+def is_cuda_available():
+    return torch.cuda.is_available() and torch.version.cuda
+
+
 def is_ipv6(address):
     try:
         ipaddress.IPv6Address(address)

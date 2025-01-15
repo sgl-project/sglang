@@ -5,3 +5,8 @@
 [submodule "sgl-kernel/3rdparty/turbomind"]
 	path = sgl-kernel/3rdparty/turbomind
 	url = https://github.com/InternLM/turbomind.git
+
+[submodule "sgl-kernel/3rdparty/cub"]
+	path = sgl-kernel/3rdparty/cub
+	url = https://github.com/NVIDIA/cub.git
+

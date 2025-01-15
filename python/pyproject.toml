@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.1.post5"
+version = "0.4.1.post6"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -27,7 +27,7 @@ runtime_common = [
 ]
 srt = [
     "sglang[runtime_common]", "cuda-python",
-    "sgl-kernel>=0.0.2.post11", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1",
+    "sgl-kernel>=0.0.2.post12", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1",
     "flashinfer==0.1.6"
 ]
 
@@ -44,6 +44,7 @@ srt_hpu = ["sglang[runtime_common]"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
+torch_memory_saver = ["torch_memory_saver"]
 test = [
     "jsonlines",
     "matplotlib",

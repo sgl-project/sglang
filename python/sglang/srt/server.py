@@ -31,6 +31,8 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -52,11 +54,14 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
+    ConfigureLoggingReq,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -157,10 +162,66 @@ async def get_model_info():
 @app.get("/get_server_info")
 async def get_server_info():
     return {
-        **dataclasses.asdict(tokenizer_manager.server_args),  # server args
+        **dataclasses.asdict(tokenizer_manager.server_args),
         **scheduler_info,
         "version": __version__,
     }
+
+
+# fastapi implicitly converts json in the request to obj (dataclass)
+@app.api_route("/generate", methods=["POST", "PUT"])
+@time_func_latency
+async def generate_request(obj: GenerateReqInput, request: Request):
+    """Handle a generate request."""
+    if obj.stream:
+
+        async def stream_results() -> AsyncIterator[bytes]:
+            try:
+                async for out in tokenizer_manager.generate_request(obj, request):
+                    yield b"data: " + orjson.dumps(
+                        out, option=orjson.OPT_NON_STR_KEYS
+                    ) + b"\n\n"
+            except ValueError as e:
+                out = {"error": {"message": str(e)}}
+                yield b"data: " + orjson.dumps(
+                    out, option=orjson.OPT_NON_STR_KEYS
+                ) + b"\n\n"
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+            background=tokenizer_manager.create_abort_task(obj),
+        )
+    else:
+        try:
+            ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+            return ret
+        except ValueError as e:
+            logger.error(f"Error: {e}")
+            return _create_error_response(e)
+
+
+@app.api_route("/encode", methods=["POST", "PUT"])
+@time_func_latency
+async def encode_request(obj: EmbeddingReqInput, request: Request):
+    """Handle an embedding request."""
+    try:
+        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/classify", methods=["POST", "PUT"])
+@time_func_latency
+async def classify_request(obj: EmbeddingReqInput, request: Request):
+    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
+    try:
+        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        return _create_error_response(e)
 
 
 @app.post("/flush_cache")
@@ -174,8 +235,7 @@ async def flush_cache():
     )
 
 
-@app.get("/start_profile")
-@app.post("/start_profile")
+@app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async():
     """Start profiling."""
     tokenizer_manager.start_profile()
@@ -185,8 +245,7 @@ async def start_profile_async():
     )
 
 
-@app.get("/stop_profile")
-@app.post("/stop_profile")
+@app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
     tokenizer_manager.stop_profile()
@@ -255,6 +314,28 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
         return _create_error_response(e)
 
 
+@app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+async def release_memory_occupation(
+    obj: ReleaseMemoryOccupationReqInput, request: Request
+):
+    """Release GPU occupation temporarily"""
+    try:
+        await tokenizer_manager.release_memory_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
+async def resume_memory_occupation(
+    obj: ResumeMemoryOccupationReqInput, request: Request
+):
+    """Resume GPU occupation"""
+    try:
+        await tokenizer_manager.resume_memory_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
@@ -279,60 +360,11 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         return _create_error_response(e)
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
-@app.api_route("/generate", methods=["POST", "PUT"])
-@time_func_latency
-async def generate_request(obj: GenerateReqInput, request: Request):
-    """Handle a generate request."""
-    if obj.stream:
-
-        async def stream_results() -> AsyncIterator[bytes]:
-            try:
-                async for out in tokenizer_manager.generate_request(obj, request):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
-            except ValueError as e:
-                out = {"error": {"message": str(e)}}
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
-            yield b"data: [DONE]\n\n"
-
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
-            background=tokenizer_manager.create_abort_task(obj),
-        )
-    else:
-        try:
-            ret = await tokenizer_manager.generate_request(obj, request).__anext__()
-            return ret
-        except ValueError as e:
-            logger.error(f"Error: {e}")
-            return _create_error_response(e)
-
-
-@app.api_route("/encode", methods=["POST", "PUT"])
-@time_func_latency
-async def encode_request(obj: EmbeddingReqInput, request: Request):
-    """Handle an embedding request."""
-    try:
-        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
-        return ret
-    except ValueError as e:
-        return _create_error_response(e)
-
-
-@app.api_route("/classify", methods=["POST", "PUT"])
-@time_func_latency
-async def classify_request(obj: EmbeddingReqInput, request: Request):
-    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
-    try:
-        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
-        return ret
-    except ValueError as e:
-        return _create_error_response(e)
+@app.api_route("/configure_logging", methods=["GET", "POST"])
+async def configure_logging(obj: ConfigureLoggingReq, request: Request):
+    """Close the session"""
+    tokenizer_manager.configure_logging(obj)
+    return Response(status_code=200)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -438,6 +470,10 @@ def launch_engine(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=server_args.enable_memory_saver
+    )
+
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
@@ -454,7 +490,8 @@ def launch_engine(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
             )
-            proc.start()
+            with memory_saver_adapter.configure_subprocess():
+                proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
@@ -471,7 +508,8 @@ def launch_engine(
             target=run_data_parallel_controller_process,
             args=(server_args, port_args, writer),
         )
-        proc.start()
+        with memory_saver_adapter.configure_subprocess():
+            proc.start()
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -896,6 +934,18 @@ class Engine:
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
+
+    def release_memory_occupation(self):
+        """Release GPU occupation temporarily"""
+        obj = ReleaseMemoryOccupationReqInput()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(tokenizer_manager.release_memory_occupation(obj, None))
+
+    def resume_memory_occupation(self):
+        """Resume GPU occupation"""
+        obj = ResumeMemoryOccupationReqInput()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(tokenizer_manager.resume_memory_occupation(obj, None))
 
 
 class Runtime:

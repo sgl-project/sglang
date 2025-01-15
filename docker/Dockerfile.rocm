@@ -1,8 +1,8 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.1.post5 -t v0.4.1.post5-rocm620 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.1.post6 -t v0.4.1.post6-rocm620 -f Dockerfile.rocm .
 
 # default base image
-ARG BASE_IMAGE="rocmshared/vllm-rocm:20250113-tuned-elementwise"
+ARG BASE_IMAGE="rocmshared/vllm-rocm:20250114-tuned-elementwise-layernorm"
 
 FROM $BASE_IMAGE AS base
 USER root
