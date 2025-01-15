@@ -27,7 +27,7 @@ runtime_common = [
 ]
 srt = [
     "sglang[runtime_common]", "cuda-python",
-    "sgl-kernel>=0.0.2.post12", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1",
+    "sgl-kernel>=0.0.2.post13", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1",
     "flashinfer==0.1.6"
 ]
 
