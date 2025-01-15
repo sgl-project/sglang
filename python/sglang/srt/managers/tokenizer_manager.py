@@ -738,9 +738,13 @@ class TokenizerManager:
                     state.finished = recv_obj.finished_reasons[i] is not None
                     state.event.set()
 
-                    if self.enable_metrics:
+                    if self.enable_metrics and state.obj.log_metrics:
                         self.collect_metrics(state, recv_obj, i)
-                    if self.dump_requests_folder and state.finished:
+                    if (
+                        self.dump_requests_folder
+                        and state.finished
+                        and state.obj.log_metrics
+                    ):
                         self.dump_requests(state, out_dict)
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
