@@ -166,10 +166,7 @@ class FlashInferAttnBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_mixed():
             # Part 0: prepare
             extend_bs = forward_batch.decode_start_idx
-            print(
-                f"init_forward_metadata: batch_size={forward_batch.batch_size}, extend_bs={extend_bs}"
-            )
-
+            assert extend_bs > 0, f"extent_bs = {extend_bs}"
             req_pool_indices_extend, req_pool_indices_decode = (
                 forward_batch.req_pool_indices[:extend_bs],
                 forward_batch.req_pool_indices[extend_bs:],
@@ -182,6 +179,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens[:extend_bs].sum().item(),
                 forward_batch.seq_lens[extend_bs:].sum().item(),
             )
+            assert (
+                seq_lens_sum_extend + seq_lens_sum_decode == forward_batch.seq_lens_sum
+            ), f"{seq_lens_sum_extend} + {seq_lens_sum_ex} != {forward_batch.seq_lens_sum}"
             prefix_lens_extend = forward_batch.extend_prefix_lens[:extend_bs]
 
             encoder_lens_extend = (
