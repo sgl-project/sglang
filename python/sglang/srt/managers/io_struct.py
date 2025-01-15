@@ -340,7 +340,6 @@ class BatchTokenIDOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    normalized_prompt_logprob: List[float]
 
 
 @dataclass
@@ -366,7 +365,6 @@ class BatchStrOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    normalized_prompt_logprob: List[float]
 
 
 @dataclass
