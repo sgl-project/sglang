@@ -36,6 +36,10 @@ enum class AllReduceStrategyType : int8_t {
   AUTO = 3,
 };
 
+struct RankData {
+  void* ptrs[MAX_RANKS_PER_NODE];
+};
+
 struct AllReduceParams {
   size_t elts_size;
   size_t elts_total;
@@ -46,9 +50,11 @@ struct AllReduceParams {
   uint32_t barrier_flag;
   uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
   uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
-  void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
+  uint32_t* tmp_result_buffers[MAX_RANKS_PER_NODE];
+  RankData* peer_comm_buffer_ptrs;
   void* local_input_buffer_ptr;
   void* local_output_buffer_ptr;
+  bool is_capturing;
 };
 
 inline size_t GetMaxRequiredWorkspaceSize(int world_size) {
