@@ -1,4 +1,6 @@
-# Server Args
+# Server Arguments
+
+In this document we aim to give an overview of the possible arguments when deploying an SGLang Server.
 
 ## Model and tokenizer
 
@@ -17,9 +19,32 @@
 * `skip_tokenizer_init`: Set to true if you want to provide the tokens to the engine and get the output tokens directly. 
 
 
-## Port for the HTTP server
+## Serving: HTTP & API
+
+### HTTP Server configuration
 
 * Use `port` and `host` to setup the host for your HTTP server. By default `host: str = "127.0.0.1"` and `port: int = 30000`
+
+### API configuration
+
+* `api_key`: Sets an API key for the server or the OpenAI-compatible API. Clients must provide this key for authorized requests.
+* `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
+* `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
+
+## Parallelism
+
+### Tensor parallelism
+
+* `tp_size`: The number of GPUs the model weights get sharded over. Mainly for memory efficency rather than for high throughput, see [this blogpost](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works).
+
+### Data parallelism
+
+* `dp_size`: The number of data-parallel copies of the model. We recommend using [SGLang router](https://docs.sglang.ai/router/router.html) instead of a naive data-parallel.
+* `load_balance_method`: Load balancing strategy for data parallel requests.
+
+### Expert parallelism
+
+* `ep_size`: Distribute the experts onto multiple GPUs for MoE models. Remember to shard the model weights with tp_size=ep_size, for detailed benchmarking refer to [this PR](https://github.com/sgl-project/sglang/pull/2203).
 
 ## Memory and scheduling
 
@@ -29,13 +54,12 @@
 * `chunked_prefill_size`: Perform the prefill in chunks of these size. Larger chunk size speeds up the prefill phase but increases the VRAM consumption.
 * `max_prefill_tokens`: Token budget of how many tokens to accept in one prefill batch is the max of this parameter and the `context_length`.
 * `schedule_policy`: The scheduling policy to control the processing order of waiting prefill requests.
-* `schedule_conservativeness`: TODO
-* `cpu_offload_gb`: TODO
+* `schedule_conservativeness`: Can be used to decrease/increase the conservativeness of the server when taking new requests. Use in case of low/high (i.e. < 0.9 or > 0.99) `token_usage`.
+* `cpu_offload_gb`: Reserve this amount of RAM in GB for offloading to the CPU.
 * `prefill_only_one_req`: When this flag is turned on we prefill only one request at a time.
 
 ## Other runtime options
 
-* `tp_size`: The number of GPUs the model weights get sharded over. Mainly for memory efficency rather than for high throughput, see [this blogpost](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works).
 * `stream_interval`: Interval (in tokens) for streaming responses. Smaller = smoother streaming, larger = better throughput.
 * `random_seed`: Can be used to enforce more deterministic behavior. 
 * `watchdog_timeout`: Adjusts the watchdog thread’s timeout before killing the server if batch generation takes too long.
@@ -52,25 +76,10 @@
 * `enable_metrics`: Exports Prometheus-like metrics for request usage and performance.
 * `decode_log_interval`: How often (in tokens) to log decode progress.
 
-## API related
-
-* `api_key`: Sets an API key for the server or the OpenAI-compatible API. Clients must provide this key for authorized requests.
-* `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
-* `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
-
-## Data parallelism 
-
-* `dp_size`: The number of data-parallel copies of the model. For maximum throughput, maximize `dp_size` and only split weights via tensor parallelism as needed for memory. Ensure `dp_size * tp_size = N` where `N` is the total number of GPUs.
-* `load_balance_method`: Load balancing strategy for data parallel requests.
-
-## Expert parallelism
-
-* `ep_size`: For MoE models we can distribute the experts onto this number of GPUs. Remember to shard the rest of the model weights with `tp_size=ep_size`, for detailed benchmarking [see the PR that implemented this technique](https://github.com/sgl-project/sglang/pull/2203).
-
 ## Multi-node distributed serving
 
 * `dist_init_addr`: The TCP address used for initializing PyTorch’s distributed backend (e.g. `192.168.0.2:25000`).
-* `nnodes`: Total number of nodes in the cluster.
+* `nnodes`: Total number of nodes in the cluster. Refer to how to run the [Llama 405B model](https://docs.sglang.ai/references/llama_405B.html#run-405b-fp16-on-two-nodes).
 * `node_rank`: Rank (ID) of this node among the `nnodes` in the distributed setup.
 
 
@@ -87,25 +96,28 @@
 
 * `attention_backend`: If you want to change the attention backend for some reason you may adjust the default `flashinfer` backend to `triton` or `torch_native` backend. 
 * `sampling_backend`: If you want to change the sampling backend for some reason you may adjust the default `flashinfer` backend to `torch_native` backend.
-* `grammar_backend`: You may want to change the default `outlines` grammar backend to `xgrammar` backend for [10 x speedup](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#fast-structured-outputs-with-xgrammar) in case you want to perform constrained decoding.
+
+## Constrained Decoding
+
+* `grammar_backend`: The grammar backend for constraint decoding. Detailed usage can be found in this [document](https://docs.sglang.ai/backend/structured_outputs.html).
 
 ## Speculative decoding
 
-* `speculative_draft_model_path`: In case we want to perform speculative decoding we can use this parameter for selection of the draft model.
+* `speculative_draft_model_path`: The draft model path for speculative decoding.
 * `speculative_algorithm`: The algorithm for speculative decoding. Currently only [Eagle](https://arxiv.org/html/2406.16858v1) is supported. Note that the radix cache, chunked prefill, and overlap scheduler are disabled when using eagle speculative decoding.
 * `speculative_num_steps`: How many draft passes we run before verifying.
 * `speculative_num_draft_tokens`: The number of tokens proposed in a draft.
-* `speculative_eagle_topk`: The number of top candidates we keep for verification at each step.
+* `speculative_eagle_topk`: The number of top candidates we keep for verification at each step for [Eagle](https://arxiv.org/html/2406.16858v1).
 
 
 ## Double Sparsity
 
-* `enable_double_sparsity`: Enables [double sparsity](https://arxiv.org/html/2408.07092v2) option.
-* `ds_channel_config_path`: After identifiying important channels offline we may place this information into a JSON and use only these during inference.
-* `ds_heavy_channel_num`: How many channel indices we keep for each layer. 
-* `ds_heavy_token_num`: How many tokens we choose for attention. Starting from the one with highest attention score for current query token.
-* `ds_heavy_channel_type`: The type of heavy channels.
-* `ds_sparse_decode_threshold`: Skip applying the sparse decode path if `max_seq_len` < this threshold.
+* `enable_double_sparsity`: Enables [double sparsity](https://arxiv.org/html/2408.07092v2) which increases throughput.
+* `ds_channel_config_path`: The double sparsity config. For a guide on how to generate the config for your model see [this repo](https://github.com/andy-yang-1/DoubleSparse/tree/main/config).
+* `ds_heavy_channel_num`: Number of channel indices to keep for each layer. 
+* `ds_heavy_token_num`: Number of tokens used for attention during decode. Skip sparse decoding if `min_seq_len` in batch < this number.
+* `ds_heavy_channel_type`: The type of heavy channels. Either `q`, `k` or `qk`.
+* `ds_sparse_decode_threshold`: Don't apply sparse decoding if `max_seq_len` in batch < this threshold.
 
 ## Optimization/debug options
 
