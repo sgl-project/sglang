@@ -42,7 +42,6 @@ def test_decode_stream(url, return_logprob, top_logprobs_num):
             if return_logprob:
                 assert data["meta_info"]["input_token_logprobs"] is not None
                 assert data["meta_info"]["output_token_logprobs"] is not None
-                assert data["meta_info"]["normalized_prompt_logprob"] is not None
                 for logprob, token_id, token_text in data["meta_info"][
                     "output_token_logprobs"
                 ][prev:]:

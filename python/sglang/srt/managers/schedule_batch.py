@@ -280,7 +280,6 @@ class Req:
         self.top_logprobs_num = top_logprobs_num
 
         # Logprobs (return value)
-        self.normalized_prompt_logprob = None
         self.input_token_logprobs_val = None
         self.input_token_logprobs_idx = None
         self.input_top_logprobs_val = None
@@ -344,9 +343,6 @@ class Req:
             max_prefix_len = min(max_prefix_len, input_len - 1)
 
         if self.return_logprob:
-            if self.normalized_prompt_logprob is None:
-                # Need at least two tokens to compute normalized logprob
-                max_prefix_len = min(max_prefix_len, input_len - 2)
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
