@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -640,7 +641,9 @@ class TokenizerManager:
 
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.handle_loop))
+        )
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
@@ -653,7 +656,9 @@ class TokenizerManager:
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
-        self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -907,6 +912,20 @@ class TokenizerManager:
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
+
+
+async def print_exception_wrapper(func):
+    """
+    Sometimes an asyncio function does not print exception.
+    We do another wrapper to handle the exception.
+    """
+    try:
+        await func()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(1)
 
 
 class SignalHandler:
