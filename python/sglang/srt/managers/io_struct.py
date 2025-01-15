@@ -19,9 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
-
-import torch
+from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -323,9 +321,7 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when --return-token-ids` is set
-    origin_input_ids: Optional[List[int]]
-    # Only used when `--skip-tokenizer-init` or `--return-token-ids` is set
+    # Only used when `--skip-tokenizer-init` is on
     output_ids: Optional[List[int]]
     # Detokenization configs
     skip_special_tokens: List[bool]
@@ -344,7 +340,6 @@ class BatchTokenIDOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    normalized_prompt_logprob: List[float]
 
 
 @dataclass
@@ -356,14 +351,7 @@ class BatchStrOut:
     # The output decoded strings
     output_strs: List[str]
 
-    # The token ids
-    origin_input_ids: Optional[List[int]]
-    output_ids: Optional[List[int]]
-
     # Token counts
-    # real input and output tokens can be get from
-    # origin_input_ids and output_ids by enabling --return_token_ids
-    # TODO (Shuai): Rename this to clarify the meaning.
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
@@ -377,7 +365,6 @@ class BatchStrOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    normalized_prompt_logprob: List[float]
 
 
 @dataclass
@@ -469,6 +456,26 @@ class GetWeightsByNameReqOutput:
 
 
 @dataclass
+class ReleaseMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ReleaseMemoryOccupationReqOutput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqOutput:
+    pass
+
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str
@@ -477,6 +484,13 @@ class AbortReq:
 class ProfileReq(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+
+
+@dataclass
+class ConfigureLoggingReq:
+    log_requests: Optional[bool] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
 
 
 @dataclass

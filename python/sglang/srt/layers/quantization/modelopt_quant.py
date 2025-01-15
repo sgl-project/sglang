@@ -11,9 +11,9 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
     requantize_with_max_scale,
 )
-from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
 
 from sglang.srt.layers.linear import LinearMethodBase
+from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
