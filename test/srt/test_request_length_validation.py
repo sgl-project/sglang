@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestInputLengthValidation(unittest.TestCase):
+class TestRequestLengthValidation(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -44,7 +44,27 @@ class TestInputLengthValidation(unittest.TestCase):
                 temperature=0,
             )
 
-        self.assertIn("longer than model\\'s context length", str(cm.exception))
+        self.assertIn("is longer than the model's context length", str(cm.exception))
+
+    def test_max_tokens_validation(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+
+        long_text = "hello "
+
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.chat.completions.create(
+                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                messages=[
+                    {"role": "user", "content": long_text},
+                ],
+                temperature=0,
+                max_tokens=500,
+            )
+
+        self.assertIn(
+            "Requested token count exceeds the model's maximum context",
+            str(cm.exception),
+        )
 
 
 if __name__ == "__main__":
