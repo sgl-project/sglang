@@ -41,7 +41,7 @@ nvcc_flags = [
 ]
 cxx_flags = ["-O3"]
 libraries = ["c10", "torch", "torch_python", "cuda"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 ext_modules = [
     CUDAExtension(
         name="sgl_kernel.ops._kernels",
