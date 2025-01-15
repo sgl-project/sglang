@@ -31,6 +31,7 @@ suites = {
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
         "test_release_memory_occupation.py",
+        "test_request_length_validation.py",
         "test_retract_decode.py",
         "test_server_args.py",
         "test_session_control.py",
