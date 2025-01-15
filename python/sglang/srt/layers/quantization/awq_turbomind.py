@@ -1,14 +1,14 @@
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-import turbomind
 from torch.nn import Parameter
 
-turbomind_dir = os.path.split(turbomind.__file__)[0]
-sys.path.append(os.path.join(turbomind_dir, "lib"))
+root = str(list(Path(__file__).parents)[5])
+sys.path.append(root + "/sgl-kernel/build/lib")
 import _turbomind_ext
 from vllm.model_executor.layers.linear import LinearBase
 

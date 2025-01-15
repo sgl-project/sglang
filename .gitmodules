@@ -1,3 +1,7 @@
 [submodule "sgl-kernel/3rdparty/cutlass"]
 	path = sgl-kernel/3rdparty/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+
+[submodule "sgl-kernel/3rdparty/turbomind"]
+	path = sgl-kernel/3rdparty/turbomind
+	url = https://github.com/InternLM/turbomind.git

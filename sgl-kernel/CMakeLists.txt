@@ -14,6 +14,15 @@ set(CUTLASS_DIR "3rdparty/cutlass")
 set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
 message(STATUS "Building for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
+find_package(pybind11 CONFIG)
+if(NOT pybind11_FOUND)
+    execute_process(COMMAND "pybind11-config" "--cmakedir"
+                    RESULT_VARIABLE _COMMAND_SUCCESS
+                    OUTPUT_VARIABLE pybind11_DIR
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    find_package(pybind11 CONFIG)
+endif()
+
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 # Find PyTorch
@@ -61,3 +70,5 @@ foreach(target _kernels)
         SUFFIX ".so"
     )
 endforeach()
+
+add_subdirectory(3rdparty/turbomind)
