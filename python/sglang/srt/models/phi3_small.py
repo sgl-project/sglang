@@ -5,9 +5,9 @@ import torch
 from torch import nn
 from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,

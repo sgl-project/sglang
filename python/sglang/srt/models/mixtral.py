@@ -21,12 +21,12 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import MixtralConfig
-from vllm.distributed import (
+from vllm.model_executor.layers.rotary_embedding import get_rope
+
+from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.rotary_embedding import get_rope
-
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
