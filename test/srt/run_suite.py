@@ -47,6 +47,7 @@ suites = {
         "test_update_weights_from_tensor.py",
         "test_vision_chunked_prefill.py",
         "test_vision_openai_server.py",
+        "test_w8a8_quantization.py",
         "test_session_control.py",
     ],
     "nightly": [
