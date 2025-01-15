@@ -891,14 +891,18 @@ class TokenizerManager:
         )
 
         if len(self.dump_request_list) >= self.dump_requests_threshold:
+            filename = os.path.join(
+                self.dump_requests_folder,
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
+            )
+            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
+
             to_dump = self.dump_request_list
             self.dump_request_list = []
 
             def background_task():
                 os.makedirs(self.dump_requests_folder, exist_ok=True)
-                current_time = datetime.now()
-                filename = current_time.strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
-                with open(os.path.join(self.dump_requests_folder, filename), "wb") as f:
+                with open(filename, "wb") as f:
                     pickle.dump(to_dump, f)
 
             # Schedule the task to run in the background without awaiting it
