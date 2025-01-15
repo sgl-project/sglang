@@ -752,6 +752,7 @@ class ScheduleBatch:
                     req.logprob_start_len - pre_len, req.extend_input_len - 1
                 )
             else:
+                assert False
                 extend_logprob_start_len = req.extend_input_len - 1
 
             req.extend_logprob_start_len = extend_logprob_start_len
