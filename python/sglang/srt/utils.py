@@ -59,11 +59,6 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -112,19 +107,6 @@ def is_ipv6(address):
         return True
     except ipaddress.AddressValueError:
         return False
-
-
-# TODO: directly call functions in vllm.distributed and remove the below wrappers when CPU TP support is ready
-def get_tp_group_wrapper(device: Optional[str] = None):
-    return get_tp_group() if device != "cpu" else None
-
-
-def get_tensor_model_parallel_world_size_wrapper(device: Optional[str] = None):
-    return get_tensor_model_parallel_world_size() if device != "cpu" else 1
-
-
-def get_tensor_model_parallel_rank_wrapper(device: Optional[str] = None):
-    return get_tensor_model_parallel_rank() if device != "cpu" else 0
 
 
 def enable_show_time_cost():

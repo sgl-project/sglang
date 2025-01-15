@@ -57,11 +57,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import (
-    get_tensor_model_parallel_world_size_wrapper,
-    is_flashinfer_available,
-    is_hip,
-)
+from sglang.srt.utils import is_flashinfer_available, is_hip
 
 is_hip_ = is_hip()
 
@@ -129,9 +125,7 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size_wrapper(
-            global_server_args_dict["device"]
-        )
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -228,9 +222,7 @@ class DeepseekV2Attention(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size_wrapper(
-            global_server_args_dict["device"]
-        )
+        tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
         self.scaling = self.qk_head_dim**-0.5
@@ -379,9 +371,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size_wrapper(
-            global_server_args_dict["device"]
-        )
+        tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads if use_dp else num_heads // tp_size
         self.scaling = self.qk_head_dim**-0.5
@@ -803,8 +793,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"]
-            and global_server_args_dict["device"] != "cpu",
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.layers = nn.ModuleList(
             [
@@ -858,9 +847,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.lm_head = ParallelLMHead(
                 config.vocab_size, config.hidden_size, quant_config=quant_config
             )
-            self.logits_processor = LogitsProcessor(
-                config, skip_all_gather=global_server_args_dict["device"] == "cpu"
-            )
+            self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
     def forward(

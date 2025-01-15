@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from vllm.distributed import (
+    get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
@@ -53,7 +54,6 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
-    get_tp_group_wrapper,
     init_custom_process_group,
     is_cuda,
     is_hip,
@@ -219,6 +219,8 @@ class ModelRunner:
             backend = "gloo"
         elif self.device == "hpu":
             backend = "hccl"
+        elif self.device == "cpu":
+            backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
@@ -228,7 +230,7 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
-        if not self.is_draft_worker and self.device != "cpu":
+        if not self.is_draft_worker:
             # Only initilzie the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
@@ -242,7 +244,7 @@ class ModelRunner:
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
-        self.tp_group = get_tp_group_wrapper(self.device)
+        self.tp_group = get_tp_group()
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:

@@ -5,25 +5,21 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.custom_op_util import register_custom_op
-from sglang.srt.layers.linear import get_global_server_args_dict
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_tensor_model_parallel_rank_wrapper,
-    get_tensor_model_parallel_world_size_wrapper,
-    is_hip,
-    permute_weight,
-    set_weight_attrs,
-)
+from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -268,11 +264,7 @@ class FusedMoE(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
 
         self.tp_size = (
-            tp_size
-            if tp_size is not None
-            else get_tensor_model_parallel_world_size_wrapper(
-                get_global_server_args_dict()["device"]
-            )
+            tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
         self.top_k = top_k
         self.num_experts = num_experts
@@ -482,9 +474,7 @@ class FusedMoE(torch.nn.Module):
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
         expert_data = param.data[expert_id]
-        tp_rank = get_tensor_model_parallel_rank_wrapper(
-            get_global_server_args_dict()["device"]
-        )
+        tp_rank = get_tensor_model_parallel_rank()
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
