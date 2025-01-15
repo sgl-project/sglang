@@ -99,10 +99,10 @@ class ReqToTokenPool:
         self.write_records = []
 
     def write_without_records(self, indices, values):
-        self.req_to_token[indices] = values
+        self.req_to_token[indices].copy_(values, non_blocking=True)
 
     def write_with_records(self, indices, values):
-        self.req_to_token[indices] = values
+        self.write_without_records(indices, values)
         self.write_records.append((indices, values))
 
     def get_write_records(self):
@@ -133,29 +133,37 @@ class BaseTokenToKVPool:
             self.store_dtype = dtype
         self.device = device
 
-        self.free_slots = None
+        self.slots = None
+        self.free_slot_idx = 0
         self.is_not_in_free_group = True
         self.free_group = []
         self.clear()
 
     def available_size(self):
-        return len(self.free_slots)
+        return self.size - self.free_slot_idx
 
     def alloc(self, need_size: int):
-        if need_size > len(self.free_slots):
+        if need_size > self.available_size():
             return None
 
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        next_free_slot_idx = self.free_slot_idx + need_size
+        select_index = self.slots[self.free_slot_idx : next_free_slot_idx]
+        self.free_slot_idx = next_free_slot_idx
 
-        return select_index.to(self.device, non_blocking=True)
+        return select_index
 
     def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
+        num_slots_2_free = free_index.numel()
+        if num_slots_2_free == 0:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+            assert self.free_slot_idx >= num_slots_2_free
+            next_free_slot_idx = self.free_slot_idx - num_slots_2_free
+            self.slots[next_free_slot_idx : self.free_slot_idx].copy_(
+                free_index, non_blocking=True
+            )
+            self.free_slot_idx = next_free_slot_idx
         else:
             self.free_group.append(free_index)
 
@@ -170,7 +178,9 @@ class BaseTokenToKVPool:
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
         self.is_in_free_group = False
         self.free_group = []
 
@@ -515,7 +525,8 @@ class MLATokenToKVPoolHost:
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int32)
+        self.slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.free_slot_idx = 0
         self.can_use_mem_size = self.size
 
         # A lock for synchronized operations on memory allocation and state transitions.
@@ -535,7 +546,7 @@ class MLATokenToKVPoolHost:
     def clear(self):
         self.mem_state.fill_(0)
         self.can_use_mem_size = self.size
-        self.free_slots = torch.arange(self.size, dtype=torch.int32)
+        self.slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
 
     @synchronized
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
@@ -552,8 +563,9 @@ class MLATokenToKVPoolHost:
             return None
 
         # todo: de-fragementation
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        next_free_slot_idx = self.free_slot_idx + need_size
+        select_index = self.slots[self.free_slot_idx : next_free_slot_idx]
+        self.free_slot_idx = next_free_slot_idx
 
         self.mem_state[select_index] = MemoryStateInt.RESERVED
         self.can_use_mem_size -= need_size
@@ -613,11 +625,17 @@ class MLATokenToKVPoolHost:
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
     def available_size(self):
-        return len(self.free_slots)
+        return self.size - self.free_slot_idx
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        num_slots_2_free = len(indices)
         self.mem_state[indices] = MemoryStateInt.IDLE
-        self.free_slots = torch.concat([self.free_slots, indices])
-        self.can_use_mem_size += len(indices)
-        return len(indices)
+        assert self.free_slot_idx >= num_slots_2_free
+        next_free_slot_idx = self.free_slot_idx - num_slots_2_free
+        self.slots[next_free_slot_idx : self.free_slot_idx].copy_(
+            indices, non_blocking=True
+        )
+        self.free_slot_idx = next_free_slot_idx
+        self.can_use_mem_size += num_slots_2_free
+        return num_slots_2_free

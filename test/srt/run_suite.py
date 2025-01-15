@@ -21,6 +21,7 @@ suites = {
         "test_input_embeddings.py",
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
+        "test_memory_pool.py",
         "test_metrics.py",
         "test_mla.py",
         "test_mla_fp8.py",
