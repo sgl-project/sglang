@@ -261,7 +261,7 @@ class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: str
+    name: Optional[str] = None
     parameters: Optional[object] = None
 
 
@@ -275,7 +275,7 @@ class Tool(BaseModel):
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
-    name: str
+    name: Optional[str] = None
 
 
 class ToolChoice(BaseModel):
@@ -327,8 +327,8 @@ class ChatCompletionRequest(BaseModel):
 class FunctionResponse(BaseModel):
     """Function response."""
 
-    name: str
-    arguments: str
+    name: Optional[str] = None
+    arguments: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -365,6 +365,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
