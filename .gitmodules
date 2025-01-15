@@ -9,4 +9,3 @@
 [submodule "sgl-kernel/3rdparty/cub"]
 	path = sgl-kernel/3rdparty/cub
 	url = https://github.com/NVIDIA/cub.git
-
