@@ -183,6 +183,7 @@ class BaseTokenToKVPool:
         )
         self.is_in_free_group = False
         self.free_group = []
+        self.free_slot_idx = 0
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -547,6 +548,7 @@ class MLATokenToKVPoolHost:
         self.mem_state.fill_(0)
         self.can_use_mem_size = self.size
         self.slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.free_slot_idx = 0
 
     @synchronized
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
