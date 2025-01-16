@@ -99,10 +99,10 @@ class ReqToTokenPool:
         self.write_records = []
 
     def write_without_records(self, indices, values):
-        self.req_to_token[indices].copy_(values, non_blocking=True)
+        self.req_to_token[indices] = values
 
     def write_with_records(self, indices, values):
-        self.write_without_records(indices, values)
+        self.req_to_token[indices] = values
         self.write_records.append((indices, values))
 
     def get_write_records(self):
@@ -160,9 +160,7 @@ class BaseTokenToKVPool:
         if self.is_not_in_free_group:
             assert self.free_slot_idx >= num_slots_2_free
             next_free_slot_idx = self.free_slot_idx - num_slots_2_free
-            self.slots[next_free_slot_idx : self.free_slot_idx].copy_(
-                free_index, non_blocking=True
-            )
+            self.slots[next_free_slot_idx : self.free_slot_idx] = free_index
             self.free_slot_idx = next_free_slot_idx
         else:
             self.free_group.append(free_index)
@@ -179,7 +177,7 @@ class BaseTokenToKVPool:
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
+            1, self.size + 1, dtype=torch.int32, device=self.device
         )
         self.is_in_free_group = False
         self.free_group = []
@@ -526,7 +524,7 @@ class MLATokenToKVPoolHost:
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
-        self.slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.slots = torch.arange(self.size, dtype=torch.int32, device=self.device)
         self.free_slot_idx = 0
         self.can_use_mem_size = self.size
 
@@ -547,7 +545,7 @@ class MLATokenToKVPoolHost:
     def clear(self):
         self.mem_state.fill_(0)
         self.can_use_mem_size = self.size
-        self.slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.slots = torch.arange(self.size, dtype=torch.int32, device=self.device)
         self.free_slot_idx = 0
 
     @synchronized
@@ -635,9 +633,7 @@ class MLATokenToKVPoolHost:
         self.mem_state[indices] = MemoryStateInt.IDLE
         assert self.free_slot_idx >= num_slots_2_free
         next_free_slot_idx = self.free_slot_idx - num_slots_2_free
-        self.slots[next_free_slot_idx : self.free_slot_idx].copy_(
-            indices, non_blocking=True
-        )
+        self.slots[next_free_slot_idx : self.free_slot_idx] = indices
         self.free_slot_idx = next_free_slot_idx
         self.can_use_mem_size += num_slots_2_free
         return num_slots_2_free
