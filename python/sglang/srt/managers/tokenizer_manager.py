@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -640,7 +641,9 @@ class TokenizerManager:
 
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.handle_loop))
+        )
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
@@ -653,7 +656,9 @@ class TokenizerManager:
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
-        self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -738,9 +743,13 @@ class TokenizerManager:
                     state.finished = recv_obj.finished_reasons[i] is not None
                     state.event.set()
 
-                    if self.enable_metrics:
+                    if self.enable_metrics and state.obj.log_metrics:
                         self.collect_metrics(state, recv_obj, i)
-                    if self.dump_requests_folder and state.finished:
+                    if (
+                        self.dump_requests_folder
+                        and state.finished
+                        and state.obj.log_metrics
+                    ):
                         self.dump_requests(state, out_dict)
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
@@ -887,18 +896,36 @@ class TokenizerManager:
         )
 
         if len(self.dump_request_list) >= self.dump_requests_threshold:
+            filename = os.path.join(
+                self.dump_requests_folder,
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
+            )
+            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
+
             to_dump = self.dump_request_list
             self.dump_request_list = []
 
             def background_task():
                 os.makedirs(self.dump_requests_folder, exist_ok=True)
-                current_time = datetime.now()
-                filename = current_time.strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
-                with open(os.path.join(self.dump_requests_folder, filename), "wb") as f:
+                with open(filename, "wb") as f:
                     pickle.dump(to_dump, f)
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
+
+
+async def print_exception_wrapper(func):
+    """
+    Sometimes an asyncio function does not print exception.
+    We do another wrapper to handle the exception.
+    """
+    try:
+        await func()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(1)
 
 
 class SignalHandler:

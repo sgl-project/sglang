@@ -135,9 +135,13 @@ async def health_generate(request: Request) -> Response:
     sampling_params = {"max_new_tokens": 1, "temperature": 0.7}
 
     if tokenizer_manager.is_generation:
-        gri = GenerateReqInput(input_ids=[0], sampling_params=sampling_params)
+        gri = GenerateReqInput(
+            input_ids=[0], sampling_params=sampling_params, log_metrics=False
+        )
     else:
-        gri = EmbeddingReqInput(input_ids=[0], sampling_params=sampling_params)
+        gri = EmbeddingReqInput(
+            input_ids=[0], sampling_params=sampling_params, log_metrics=False
+        )
 
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
