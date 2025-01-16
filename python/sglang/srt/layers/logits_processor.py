@@ -127,7 +127,7 @@ class LogitsProcessor(nn.Module):
         hidden_states,
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
-    ):
+    ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 

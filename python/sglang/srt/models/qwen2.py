@@ -242,17 +242,20 @@ class Qwen2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+        inputs_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
+        if inputs_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
-            hidden_states = input_embeds
+            hidden_states = inputs_embeds
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -267,7 +270,6 @@ class Qwen2Model(nn.Module):
 
 
 class Qwen2ForCausalLM(nn.Module):
-
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -305,16 +307,19 @@ class Qwen2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+        inputs_embeds: torch.Tensor = None,
         get_embedding: bool = False,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
         if not get_embedding:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
