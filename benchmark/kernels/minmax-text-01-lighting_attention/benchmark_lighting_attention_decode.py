@@ -269,7 +269,7 @@ class MiniMaxText01RMSNorm(nn.Module):
 def test_lightning_attention_implementations(model_params):
     torch.manual_seed(42)
 
-    batch_size = 2
+    batch_size = 64
     seq_len = 1
     dtype = torch.bfloat16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -285,7 +285,6 @@ def test_lightning_attention_implementations(model_params):
     model_attn = MiniMaxText01LightningAttention(**model_params).to(dtype).to(device)
     model_attn.eval()
 
-    # 创建一个假的past_key_value
     d = model_params["head_dim"]
     past_kv = torch.randn(
         batch_size,
@@ -398,7 +397,6 @@ def get_benchmark():
         model_attn = MiniMaxText01LightningAttention(**params).to(dtype).to(device)
         model_attn.eval()
 
-        # 创建一个假的past_key_value
         d = params["head_dim"]
         past_kv = torch.randn(
             batch_size,
@@ -460,15 +458,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # 运行正确性测试
     params = {
         "hidden_size": 6144,
         "num_attention_heads": 64,
         "head_dim": 96,
         "hidden_act": "silu",
     }
+
+    # Run correctness test first
+    # Adapted from https://huggingface.co/MiniMaxAI/MiniMax-Text-01/blob/main/config.json
     test_lightning_attention_implementations(params)
 
-    # 运行性能测试
+    # Run performance benchmark
     benchmark = get_benchmark()
     benchmark.run(print_data=True, save_path=args.save_path)
