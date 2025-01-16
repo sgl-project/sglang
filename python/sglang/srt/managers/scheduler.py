@@ -411,16 +411,16 @@ class Scheduler:
         self.watchdog_last_time = time.time()
 
         while True:
+            current = time.time()
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
-                    if time.time() > self.watchdog_last_time + self.watchdog_timeout:
+                    if current > self.watchdog_last_time + self.watchdog_timeout:
                         logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
                         break
                 else:
                     self.watchdog_last_forward_ct = self.forward_ct
-                    self.watchdog_last_time = time.time()
-            time.sleep(self.watchdog_timeout / 2)
-
+                    self.watchdog_last_time = current
+            time.sleep(self.watchdog_timeout // 2)
         # Wait sometimes so that the parent process can print the error.
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)

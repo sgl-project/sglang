@@ -280,10 +280,10 @@ class Req:
         self.top_logprobs_num = top_logprobs_num
 
         # Logprobs (return value)
-        self.input_token_logprobs_val = None
-        self.input_token_logprobs_idx = None
-        self.input_top_logprobs_val = None
-        self.input_top_logprobs_idx = None
+        self.input_token_logprobs_val: Optional[List[float]] = None
+        self.input_token_logprobs_idx: Optional[List[int]] = None
+        self.input_top_logprobs_val: Optional[List[float]] = None
+        self.input_top_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
             self.output_token_logprobs_val = []
