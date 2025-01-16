@@ -474,13 +474,13 @@ def launch_engine(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    memory_saver_adapter = TorchMemorySaverAdapter.create(
-        enable=server_args.enable_memory_saver
-    )
-
     scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
+
         scheduler_pipe_readers = []
         tp_size_per_node = server_args.tp_size // server_args.nnodes
         tp_rank_range = range(
