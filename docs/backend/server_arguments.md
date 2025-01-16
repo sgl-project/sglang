@@ -17,7 +17,8 @@ In this document we aim to give an overview of the possible arguments when deplo
 * `is_embedding`: Set to true if we want to perform embedding task.
 * `revision`: Adjust if a specific version of the model should be used.
 * `skip_tokenizer_init`: Set to true if you want to provide the tokens to the engine and get the output tokens directly. 
-
+* `json_model_override_args`: If you want to override the model config provide the adjustment in this argument as a JSON file.
+* `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
 ## Serving: HTTP & API
 
@@ -83,10 +84,6 @@ In this document we aim to give an overview of the possible arguments when deplo
 * `node_rank`: Rank (ID) of this node among the `nnodes` in the distributed setup.
 
 
-## Model override args in JSON
-
-* `json_model_override_args`: If you want to override the model config provide the adjustment in this argument as a JSON file.
-
 ## LoRA
 
 * `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supportet with this option so you need to disable them manually.
@@ -119,6 +116,33 @@ In this document we aim to give an overview of the possible arguments when deplo
 * `ds_heavy_channel_type`: The type of heavy channels. Either `q`, `k` or `qk`.
 * `ds_sparse_decode_threshold`: Don't apply sparse decoding if `max_seq_len` in batch < this threshold.
 
-## Optimization/debug options
+## Debug options 
 
-TODO
+*Note: We recommend to stay with the defaults and only use these options for debugging for best possible performance.*
+
+* `disable_radix_cache`: Disable [Radix](https://lmsys.org/blog/2024-01-17-sglang/) backend for prefix caching.
+* `disable_jump_forward`: Disable [jump-forward](https://lmsys.org/blog/2024-02-05-compressed-fsm/#our-method-jump-forward-decoding-with-a-compressed-finite-state-machine) for outlines grammar backend.
+* `disable_cuda_graph`: Disable [cuda graph](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) for model forward.
+* `disable_cuda_graph_padding`: Disable cuda graph when padding is needed. In other case still use cuda graph.
+* `disable_outlines_disk_cache`: Disable disk cache for outlines grammar backend.
+* `disable_custom_all_reduce`: Disable usage of custom all reduce kernel.
+* `disable_mla`: Disable [Multi-Head Latent Attention](https://arxiv.org/html/2405.04434v5) for Deepseek model.
+* `disable_overlap_schedule`: Disable the [Overhead-Scheduler](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#zero-overhead-batch-scheduler).
+* `enable_nan_detection`: Turning this on makes the sampler print a warning if the logits contain `NaN`.
+* `enable_p2p_check`: Turns off the default of allowing always p2p check when accessing GPU.
+* `triton_attention_reduce_in_fp32`: In triton kernels this will cast the intermediate attention result to `float32`.
+
+## Optimization
+
+*Note: Some of these options are still in experimental stage.*
+
+* `enable_mixed_chunk`: Enables mixing prefill and decode, see [this discussion](https://github.com/sgl-project/sglang/discussions/1163).
+* `enable_dp_attention`: Enable [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models) for Deepseek models. Note that you need to choose `dp_size = tp_size` for this.
+* `enable_ep_moe`: Enables expert parallelism, see the description of `ep_size`.
+* `enable_torch_compile`: Torch compile the model. This is an experimental feature.
+* `torch_compile_max_bs`: The maximum batch size when using `torch_compile`.
+* `cuda_graph_max_bs`: Adjust the maximum batchsize when using cuda graph. By default this is chosen for you based on GPU specifics.
+* `cuda_graph_bs`: The batch sizes to capture by `CudaGraphRunner`. By default this is done for you.
+* `torchao_config`: Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row.
+* `triton_attention_num_kv_splits`: Use to adjust the number of KV splits in triton kernels. Default is 8.
+* `num_continuous_decode_steps` 
