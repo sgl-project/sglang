@@ -59,6 +59,7 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
+from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -1404,3 +1405,14 @@ def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
+
+
+def set_uvicorn_logging_configs():
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    LOGGING_CONFIG["formatters"]["access"][
+        "fmt"
+    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
