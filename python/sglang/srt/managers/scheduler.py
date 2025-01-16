@@ -162,21 +162,21 @@ class Scheduler:
 
         if self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name
+                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
             self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_ipc_name
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
             else:
                 # Send to the DetokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
         else:
             self.recv_from_tokenizer = None

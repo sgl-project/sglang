@@ -66,7 +66,7 @@ class DataParallelController:
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
-                self.context, zmq.PULL, port_args.scheduler_input_ipc_name
+                self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
 
         # Dispatch method
@@ -93,6 +93,7 @@ class DataParallelController:
                     self.context,
                     zmq.PUSH,
                     dp_port_args[dp_rank].scheduler_input_ipc_name,
+                    True,
                 )
 
     def launch_dp_schedulers(self, server_args, port_args):
