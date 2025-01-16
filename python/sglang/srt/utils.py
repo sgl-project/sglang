@@ -97,6 +97,10 @@ def is_flashinfer_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
+def is_cuda_available():
+    return torch.cuda.is_available() and torch.version.cuda
+
+
 def is_ipv6(address):
     try:
         ipaddress.IPv6Address(address)
@@ -335,6 +339,8 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
+        except OverflowError:
+            return False
 
 
 def decode_video_base64(video_base64):
@@ -568,13 +574,13 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
 
 
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
         GGUFEmbeddingMethod,
         GGUFLinearMethod,
     )
 
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
@@ -1338,6 +1344,25 @@ def parse_tool_response(text, tools, **kwargs):
     return text, call_info_list
 
 
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    b_ = x.shape[0]
+    n_ = x.shape[1]
+    k_ = x.shape[2]
+
+    x_ = x
+    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
+    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
+    else:
+        return x_
+
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
+
 class MultiprocessingSerializer:
     @staticmethod
     def serialize(obj):
@@ -1373,3 +1398,9 @@ def debug_timing(func):
             return func(*args, **kwargs)
 
     return wrapper
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val

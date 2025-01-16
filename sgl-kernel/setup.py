@@ -15,11 +15,12 @@ def get_version():
 
 def update_wheel_platform_tag():
     wheel_dir = Path("dist")
-    old_wheel = next(wheel_dir.glob("*.whl"))
-    new_wheel = wheel_dir / old_wheel.name.replace(
-        "linux_x86_64", "manylinux2014_x86_64"
-    )
-    old_wheel.rename(new_wheel)
+    if wheel_dir.exists() and wheel_dir.is_dir():
+        old_wheel = next(wheel_dir.glob("*.whl"))
+        new_wheel = wheel_dir / old_wheel.name.replace(
+            "linux_x86_64", "manylinux2014_x86_64"
+        )
+        old_wheel.rename(new_wheel)
 
 
 cutlass = root / "3rdparty" / "cutlass"
@@ -40,8 +41,8 @@ nvcc_flags = [
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
+libraries = ["c10", "torch", "torch_python", "cuda"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 ext_modules = [
     CUDAExtension(
         name="sgl_kernel.ops._kernels",
@@ -50,6 +51,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
             "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
+            "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
         include_dirs=include_dirs,

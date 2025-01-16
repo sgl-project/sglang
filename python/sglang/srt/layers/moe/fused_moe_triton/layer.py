@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -26,6 +26,8 @@ else:
     fused_experts = None  # type: ignore
 
 import logging
+
+is_hip_ = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            layer.w13_weight = torch.nn.Parameter(
+                permute_weight(layer.w13_weight.data),
+                requires_grad=False,
+            )
+            torch.cuda.empty_cache()
+            layer.w2_weight = torch.nn.Parameter(
+                permute_weight(layer.w2_weight.data),
+                requires_grad=False,
+            )
+            torch.cuda.empty_cache()
+        return
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -148,14 +164,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             correction_bias=correction_bias,
         )
 
-        return fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-        )
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            import ater
+            from ater.fused_moe import fused_experts_ck
+
+            return fused_experts_ck(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+        else:
+            return fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+            )
 
     def forward_cpu(self, *args, **kwargs):
         raise NotImplementedError("The CPU backend currently does not support MoE.")
