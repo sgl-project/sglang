@@ -880,6 +880,14 @@ def v1_chat_generate_request(
                 if request.stream:
                     logger.warning("Streaming is not supported with tools.")
                     request.stream = False
+
+                # TODO: remove this after the parallel_tool_calls is fully supported
+                if request.parallel_tool_calls:
+                    logger.warning(
+                        "parallel_tool_calls=True is not supported now, turn it into False."
+                    )
+                    request.parallel_tool_calls = False
+
                 if not isinstance(request.tool_choice, str):
                     tools = [
                         item.function.model_dump()

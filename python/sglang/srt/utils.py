@@ -1301,11 +1301,6 @@ def parse_tool_response(text, tools, **kwargs):
             action.get("parameters", action.get("arguments", {})), ensure_ascii=False
         )
         call_info_list = [(name, parameters)]
-    elif "<function=" in text:  # llama3.1
-        action, _ = text.split("</function>")
-        parameters = action[action.find("{") :]
-        name = action.split("<function=")[1].split(">{")[0]
-        call_info_list = [(name, parameters)]
     elif "<tool_call>" in text and "</tool_call>" in text:  # qwen2.5
         # get tool_call in text
         pattern = r"<tool_call>(.*?)</tool_call>"
@@ -1316,6 +1311,18 @@ def parse_tool_response(text, tools, **kwargs):
             call_info_list.append(
                 (action["name"], json.dumps(action["arguments"], ensure_ascii=False))
             )
+            break
+    elif "<|python_tag|>" in text:  # llama3.1+ JSON-based Tooling Calling
+        _, action = text.split("<|python_tag|>")
+        # split multiple actions and only select the first one
+        # e.g. {"name": "A", "parameters": {"arg": "x"}}; {"name": "B", "parameters": {"arg": "y"}}
+        if "}};" in action:
+            action = action.split("}};")[0] + "}}"
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
         # get text outside of tags
         if not text.startswith("<tool_call>"):
             text = text[: text.find("<tool_call>")]
@@ -1323,12 +1330,10 @@ def parse_tool_response(text, tools, **kwargs):
             text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
         else:
             text = ""
-    elif "<|python_tag|>" in text:  # llama3.2
-        _, action = text.split("<|python_tag|>")
-        action = json.loads(action)
-        name, parameters = action["name"], json.dumps(
-            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
-        )
+    elif "<function=" in text:  # llama3.1+ User-defined Tooling Calling
+        action, _ = text.split("</function>")
+        parameters = action[action.find("{") :]
+        name = action.split("<function=")[1].split(">{")[0]
         call_info_list = [(name, parameters)]
     else:
         raise RuntimeError(f"Unexpected model response: {text}")
