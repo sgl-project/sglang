@@ -326,11 +326,6 @@ async def generate_from_file_request(
 
     obj = GenerateReqInput(
         input_embeds=input_embeds,
-        sampling_params={
-            "repetition_penalty": 1.2,
-            "temperature": 0.2,
-            "max_new_tokens": 512,
-        },
     )
 
     if stream:
