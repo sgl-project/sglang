@@ -1,0 +1,45 @@
+name: PR Test (sgl-kernel)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "sgl-kernel/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "sgl-kernel/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-sgl-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+          cd sgl-kernel
+          pip3 install -e . --force-reinstall
+          pip3 list | grep sgl-kernel
+
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          cd sgl-kernel
+          find tests -name "test_*.py" | xargs -n 1 python3
+
+  finish:
+    needs: [unit-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."
