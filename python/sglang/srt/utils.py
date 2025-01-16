@@ -802,11 +802,11 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     if socket_type == zmq.PUSH:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-        socket.connect(f"ipc://{endpoint}")
+        socket.connect(endpoint)
     elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-        socket.bind(f"ipc://{endpoint}")
+        socket.bind(endpoint)
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
