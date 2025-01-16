@@ -22,6 +22,8 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+# from python.sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
 
@@ -35,6 +37,8 @@ class LlamaForClassification(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = LlamaModel(config, quant_config=quant_config)
+
+        print("LlamaForClassification init")
 
         self.classification_head = nn.Linear(
             config.hidden_size, config.classification_out_size, bias=False

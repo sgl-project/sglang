@@ -9,6 +9,8 @@ from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
 
 import torch.nn as nn
 
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,6 +59,16 @@ class _ModelRegistry:
     ) -> Tuple[Type[nn.Module], str]:
         architectures = self._normalize_archs(architectures)
 
+        # 添加对TE模型的特殊处理
+        if hasattr(global_server_args_dict, "model_arch_to_class"):
+            arch_map = global_server_args_dict["model_arch_to_class"]
+            for arch in architectures:
+                if arch.lower() in arch_map:
+                    module_path, class_name = arch_map[arch.lower()]
+                    module = importlib.import_module(f"sglang.srt.models.{module_path}")
+                    return (getattr(module, class_name), arch)
+
+        # 原有的模型解析逻辑
         for arch in architectures:
             model_cls = self._try_load_model_cls(arch)
             if model_cls is not None:

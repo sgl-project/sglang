@@ -148,15 +148,13 @@ class ModelRunner:
             }
         )
 
-        if server_args.enable_te:
-            global_server_args_dict.update(
-                {
-                    "TELLaMAForCausalLM": (
-                        "llama",
-                        "LlamaForCausalLM",
-                    ),  # TODO update TELLaMAForCausalLM with TE integreated (zhuohaol)
-                }
-            )
+        # if server_args.enable_te:
+        #     global_server_args_dict.update({
+        #         "model_arch_to_class": {
+        #             "llama": ("llama_te_sgl", "TELlamaForCausalLM"),
+        #             "llamaforcausallm": ("llama_te_sgl", "TELlamaForCausalLM"),
+        #         }
+        #     })
 
         # Init componnets
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
@@ -196,6 +194,9 @@ class ModelRunner:
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
+
+        if self.server_args.enable_te:
+            self.model_config.enable_te = True
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -266,6 +267,18 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         # Load the model
+        if self.server_args.enable_te:
+            logger.info("ModelRunner: Enabling Transformer Engine integration...")
+
+            # 只需修改模型配置中的 architectures
+            if hasattr(self.model_config.hf_config, "architectures"):
+                original_arch = self.model_config.hf_config.architectures
+                new_arch = [f"TE{arch}" for arch in original_arch]
+                logger.info(
+                    f"Changing model architecture from {original_arch} to {new_arch}"
+                )
+                self.model_config.hf_config.architectures = new_arch
+
         self.model = get_model(
             model_config=self.model_config,
             load_config=self.load_config,

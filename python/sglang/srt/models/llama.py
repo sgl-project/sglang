@@ -322,6 +322,11 @@ class LlamaForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+
+        # print("="*50)
+        # print("Initializing LLaMA model!!!!!!")
+        # print("="*50)
+
         self.config = config
         self.quant_config = quant_config
         self.model = LlamaModel(config, quant_config=quant_config)
@@ -429,6 +434,7 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
+
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break

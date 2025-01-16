@@ -43,10 +43,13 @@ class ModelConfig:
         is_embedding: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        enable_te: bool = False,
+        **kwargs,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.enable_te = enable_te
 
         # Parse args
         self.model_override_args = json.loads(model_override_args)
@@ -136,6 +139,13 @@ class ModelConfig:
 
         # Multimodel attrs
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+
+        # 在初始化时检查是否启用TE
+        # if self.enable_te:
+        #     logger.info("TE integration enabled for model loading")
+        #     if any("LlamaForCausalLM" in arch for arch in self.hf_config.architectures):
+        #         # 强制将架构改为TE版本
+        #         self.hf_config.architectures = ["TELlamaForCausalLM"]
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
