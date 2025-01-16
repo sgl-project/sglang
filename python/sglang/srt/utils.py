@@ -222,6 +222,10 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
 
+    elif device == "cpu":
+        # TODO: rename the variables in the current function to be not GPU specific
+        free_gpu_memory = psutil.virtual_memory().available
+
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
             torch.device(device, gpu_id)
