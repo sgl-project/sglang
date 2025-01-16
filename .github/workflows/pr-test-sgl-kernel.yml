@@ -28,6 +28,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
           cd sgl-kernel
+          git submodule update --init --recursive
           pip3 install -e . --force-reinstall
           pip3 list | grep sgl-kernel
 
