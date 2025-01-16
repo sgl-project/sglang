@@ -18,7 +18,7 @@ class TestFp8Kvcache(unittest.TestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         dirpath = os.path.dirname(__file__)
-        config_file = os.path.join(dirpath, "kv_cache_scales_llama3_8b_chat.json")
+        config_file = os.path.join(dirpath, "kv_cache_scales_qwen2_1_5b.json.json")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -45,7 +45,7 @@ class TestFp8Kvcache(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.835)
+        self.assertGreater(metrics["score"], 0.75)
 
     def test_mmlu(self):
         args = SimpleNamespace(
