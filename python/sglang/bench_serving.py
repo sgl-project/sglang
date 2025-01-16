@@ -452,6 +452,7 @@ def get_dataset(args, tokenizer):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
+            context_len=args.sharegpt_context_len,
         )
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
@@ -560,6 +561,7 @@ def sample_sharegpt_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    context_len: Optional[int] = None,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -602,10 +604,7 @@ def sample_sharegpt_requests(
             # Prune too short sequences.
             continue
 
-        if (
-            args.sharegpt_context_len
-            and prompt_len + output_len > args.sharegpt_context_len
-        ):
+        if args.context_len and prompt_len + output_len > args.context_len:
             # Prune too long sequences.
             continue
 
