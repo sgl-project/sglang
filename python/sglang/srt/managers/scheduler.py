@@ -1038,9 +1038,6 @@ class Scheduler:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.tolist()
                     )
-                    logits_output.normalized_prompt_logprobs = (
-                        logits_output.normalized_prompt_logprobs.tolist()
-                    )
 
             # Check finish conditions
             logprob_pt = 0
@@ -1188,9 +1185,6 @@ class Scheduler:
         # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
         num_input_logprobs = req.extend_input_len - req.extend_logprob_start_len
 
-        if req.normalized_prompt_logprob is None:
-            req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
-
         if req.input_token_logprobs_val is None:
             input_token_logprobs_val = output.input_token_logprobs[
                 pt : pt + num_input_logprobs - 1 - req.last_update_decode_tokens
@@ -1288,15 +1282,12 @@ class Scheduler:
                 input_top_logprobs_idx = []
                 output_top_logprobs_val = []
                 output_top_logprobs_idx = []
-                normalized_prompt_logprob = []
             else:
                 input_token_logprobs_val = input_token_logprobs_idx = (
                     output_token_logprobs_val
                 ) = output_token_logprobs_idx = input_top_logprobs_val = (
                     input_top_logprobs_idx
-                ) = output_top_logprobs_val = output_top_logprobs_idx = (
-                    normalized_prompt_logprob
-                ) = None
+                ) = output_top_logprobs_val = output_top_logprobs_idx = None
 
             for req in reqs:
                 if req is skip_req:
@@ -1343,7 +1334,6 @@ class Scheduler:
                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
-                        normalized_prompt_logprob.append(req.normalized_prompt_logprob)
 
             # Send to detokenizer
             if rids:
@@ -1370,7 +1360,6 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
-                        normalized_prompt_logprob,
                     )
                 )
         else:  # embedding or reward model
