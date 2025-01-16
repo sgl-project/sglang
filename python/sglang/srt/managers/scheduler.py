@@ -1198,7 +1198,6 @@ class Scheduler:
             result.next_token_ids,
             result.bid,
         )
-        logits_output, next_token_ids, bid = result
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
