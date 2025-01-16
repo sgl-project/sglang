@@ -21,16 +21,16 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from vllm.distributed import (
+
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.distributed import (
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
 )
-
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

@@ -21,10 +21,10 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
-from vllm.distributed import get_tensor_model_parallel_rank
-from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache

@@ -7,7 +7,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
-from vllm.distributed import (
+
+from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -15,7 +16,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     PackedColumnParameter,
