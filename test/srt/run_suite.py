@@ -12,6 +12,7 @@ suites = {
         "sampling/penaltylib",
         "test_abort.py",
         "test_chunked_prefill.py",
+        "test_custom_allreduce.py",
         "test_double_sparsity.py",
         "test_eagle_infer.py",
         "test_embedding_openai_server.py",
