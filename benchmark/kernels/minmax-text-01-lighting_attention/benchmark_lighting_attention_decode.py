@@ -175,7 +175,7 @@ class MiniMaxText01LightningAttention(nn.Module):
         q, k, v = torch.split(qkv, [self.head_dim] * 3, dim=3)
         q = q.transpose(1, 2)  # [b, n, h, d] -> [b, h, n, d]
         k = k.transpose(1, 2)  # [b, n, h, d] -> [b, h, n, d]
-        v = v.transpose(1, 2)  # [b, n, h, d] -> [b, h, n, d]
+        v = v.transpose(1, 2)  # [b, n, h, d] -> [b, h, n, e]
 
         self.offset += 1
         ratio = torch.exp(-slope_rate)  # [h, 1, 1]
@@ -207,7 +207,7 @@ class MiniMaxText01LightningAttention(nn.Module):
             # torch.einsum(
             #     "... n e, ... e d -> ... n d", q[:, :, i : i + 1], kv.to(q.dtype)
             # )
-            # [b, h, 1, e] * [b, h, d, e] -> [b, h, 1, d]
+            # [b, h, 1, d] * [b, h, d, e] -> [b, h, 1, e]
             qkv = torch.einsum(
                 "... n e, ... e d -> ... n d", q[:, :, i : i + 1], kv.to(q.dtype)
             )
