@@ -239,6 +239,7 @@ class ServerArgs:
 
         # Others
         if self.enable_dp_attention:
+            assert self.tp_size % self.dp_size == 0
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -880,8 +881,8 @@ class ServerArgs:
             self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
         assert not (
-            self.dp_size > 1 and self.nnodes != 1
-        ), "multi-node data parallel is not supported"
+            self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
+        ), "multi-node data parallel is not supported unless dp attention!"
         assert (
             self.max_loras_per_batch > 0
             # FIXME
@@ -932,7 +933,7 @@ class PortArgs:
     nccl_port: int
 
     @staticmethod
-    def init_new(server_args) -> "PortArgs":
+    def init_new(server_args, dp_rank=None) -> "PortArgs":
         port = server_args.port + random.randint(100, 1000)
         while True:
             if is_port_available(port):
@@ -942,12 +943,34 @@ class PortArgs:
             else:
                 port -= 43
 
-        return PortArgs(
-            tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            nccl_port=port,
-        )
+        if server_args.enable_dp_attention:
+            if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+                dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+            else:
+                dist_init_addr = server_args.dist_init_addr.split(":")
+            assert (
+                len(dist_init_addr) == 2
+            ), "please provide --dist-init-addr as host:port of head node"
+            dist_init_host, dist_init_port = dist_init_addr
+            zmq_port = int(dist_init_port) + 1
+            if dp_rank is not None:
+                scheduler_input_port = zmq_port + 2 + dp_rank + 1
+            else:
+                scheduler_input_port = zmq_port + 2  # tok to dp controller
+
+            return PortArgs(
+                tokenizer_ipc_name=f"tcp://{dist_init_host}:{zmq_port}",
+                scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+                detokenizer_ipc_name=f"tcp://{dist_init_host}:{zmq_port + 1}",
+                nccl_port=port,
+            )
+        else:
+            return PortArgs(
+                tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                nccl_port=port,
+            )
 
 
 class LoRAPathAction(argparse.Action):

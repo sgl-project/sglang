@@ -18,6 +18,7 @@ import triton.language as tl
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
@@ -62,9 +63,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
-            // model_runner.tp_size,
+            // get_attention_tp_size(),
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                model_runner.tp_size
+                get_attention_tp_size()
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
@@ -453,10 +454,10 @@ class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
+            get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
@@ -625,10 +626,10 @@ class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
+            get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
