@@ -478,9 +478,9 @@ def launch_engine(
         enable=server_args.enable_memory_saver
     )
 
+    scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
-        scheduler_procs = []
         scheduler_pipe_readers = []
         tp_size_per_node = server_args.tp_size // server_args.nnodes
         tp_rank_range = range(
@@ -507,6 +507,7 @@ def launch_engine(
             args=(server_args, port_args, writer),
         )
         proc.start()
+        scheduler_procs.append(proc)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
