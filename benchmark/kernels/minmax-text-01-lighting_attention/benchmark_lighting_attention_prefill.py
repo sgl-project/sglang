@@ -587,6 +587,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Run correctness test first
+    # Adapted from https://huggingface.co/MiniMaxAI/MiniMax-Text-01/blob/main/config.json
     params = {
         "hidden_size": 6144,
         "num_attention_heads": 64,
