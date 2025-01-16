@@ -173,22 +173,41 @@ class MiniMaxText01LightningAttention(nn.Module):
         new_shape = qkv.size()[:-1] + (self.num_heads, -1)
         qkv = qkv.view(*new_shape)
         q, k, v = torch.split(qkv, [self.head_dim] * 3, dim=3)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.transpose(1, 2)  # [b, n, h, d] -> [b, h, n, d]
+        k = k.transpose(1, 2)  # [b, n, h, d] -> [b, h, n, d]
+        v = v.transpose(1, 2)  # [b, n, h, d] -> [b, h, n, d]
 
         self.offset += 1
-        ratio = torch.exp(-slope_rate)
+        ratio = torch.exp(-slope_rate)  # [h, 1, 1]
 
         # decode mode
-        kv = past_key_value
+        kv = past_key_value  # [b, h, d, e]
         output = []
         for i in range(n):
+            # kv: [b, h, d, e]
+            # ratio: [h, 1, 1]
+            # k: [b, h, n, d]
+            # v: [b, h, n, e]
+            # k[:, :, i : i + 1]: [b, h, 1, d]
+            # v[:, :, i : i + 1]: [b, h, 1, e]
+            # ratio * kv: [b, h, d, e]
+            # torch.einsum(
+            #     "... n d, ... n e -> ... d e",
+            #     k[:, :, i : i + 1],
+            #     v[:, :, i : i + 1],
+            # )
+            # [b, h, d, e] + [b, h, d, e] -> [b, h, d, e]
             kv = ratio * kv + torch.einsum(
                 "... n d, ... n e -> ... d e",
                 k[:, :, i : i + 1],
                 v[:, :, i : i + 1],
             )
+            # q[:, :, i : i + 1]: [b, h, 1, d]
+            # kv.to(q.dtype): [b, h, d, e]
+            # torch.einsum(
+            #     "... n e, ... e d -> ... n d", q[:, :, i : i + 1], kv.to(q.dtype)
+            # )
+            # [b, h, 1, e] * [b, h, d, e] -> [b, h, 1, d]
             qkv = torch.einsum(
                 "... n e, ... e d -> ... n d", q[:, :, i : i + 1], kv.to(q.dtype)
             )
@@ -464,7 +483,6 @@ if __name__ == "__main__":
         "head_dim": 96,
         "hidden_act": "silu",
     }
-
     # Run correctness test first
     # Adapted from https://huggingface.co/MiniMaxAI/MiniMax-Text-01/blob/main/config.json
     test_lightning_attention_implementations(params)
