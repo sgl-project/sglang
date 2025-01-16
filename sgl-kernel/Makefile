@@ -1,15 +1,18 @@
-.PHONY: tree ln install build clean test format
+.PHONY: tree ln submodule install build clean test format
 
 tree:
 	@tree --prune -I "__pycache__|*.egg-info|*.so|build"
 
-ln:
-	@rm -rf build && git submodule update --init --recursive && bear python3 setup.py build
+submodule:
+	@git submodule update --init --recursive
 
-install:
+ln: submodule
+	@rm -rf build && bear python3 setup.py build
+
+install: submodule
 	@pip install -e .
 
-build:
+build: submodule
 	@export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel
 
 clean:
