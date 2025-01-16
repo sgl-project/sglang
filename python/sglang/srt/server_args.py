@@ -239,8 +239,8 @@ class ServerArgs:
 
         # Others
         if self.enable_dp_attention:
-            assert self.tp_size % self.dp_size == 0
             self.dp_size = self.tp_size
+            assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // 2
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             logger.warning(
