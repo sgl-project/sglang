@@ -133,35 +133,29 @@ class BaseTokenToKVPool:
             self.store_dtype = dtype
         self.device = device
 
-        self.slots = None
-        self.free_slot_idx = 0
+        self.free_slots = None
         self.is_not_in_free_group = True
         self.free_group = []
         self.clear()
 
     def available_size(self):
-        return self.size - self.free_slot_idx
+        return len(self.free_slots)
 
     def alloc(self, need_size: int):
-        if need_size > self.available_size():
+        if need_size > len(self.free_slots):
             return None
 
-        next_free_slot_idx = self.free_slot_idx + need_size
-        select_index = self.slots[self.free_slot_idx : next_free_slot_idx]
-        self.free_slot_idx = next_free_slot_idx
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
 
-        return select_index
+        return select_index.to(self.device, non_blocking=True)
 
     def free(self, free_index: torch.Tensor):
-        num_slots_2_free = free_index.numel()
-        if num_slots_2_free == 0:
+        if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            assert self.free_slot_idx >= num_slots_2_free
-            next_free_slot_idx = self.free_slot_idx - num_slots_2_free
-            self.slots[next_free_slot_idx : self.free_slot_idx] = free_index
-            self.free_slot_idx = next_free_slot_idx
+            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
         else:
             self.free_group.append(free_index)
 
@@ -176,12 +170,9 @@ class BaseTokenToKVPool:
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.slots = torch.arange(
-            1, self.size + 1, dtype=torch.int32, device=self.device
-        )
+        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
         self.is_in_free_group = False
         self.free_group = []
-        self.free_slot_idx = 0
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -524,8 +515,7 @@ class MLATokenToKVPoolHost:
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
-        self.slots = torch.arange(self.size, dtype=torch.int32, device=self.device)
-        self.free_slot_idx = 0
+        self.free_slots = torch.arange(self.size, dtype=torch.int32)
         self.can_use_mem_size = self.size
 
         # A lock for synchronized operations on memory allocation and state transitions.
@@ -545,8 +535,7 @@ class MLATokenToKVPoolHost:
     def clear(self):
         self.mem_state.fill_(0)
         self.can_use_mem_size = self.size
-        self.slots = torch.arange(self.size, dtype=torch.int32, device=self.device)
-        self.free_slot_idx = 0
+        self.free_slots = torch.arange(self.size, dtype=torch.int32)
 
     @synchronized
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
@@ -563,9 +552,8 @@ class MLATokenToKVPoolHost:
             return None
 
         # todo: de-fragementation
-        next_free_slot_idx = self.free_slot_idx + need_size
-        select_index = self.slots[self.free_slot_idx : next_free_slot_idx]
-        self.free_slot_idx = next_free_slot_idx
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
 
         self.mem_state[select_index] = MemoryStateInt.RESERVED
         self.can_use_mem_size -= need_size
@@ -625,15 +613,12 @@ class MLATokenToKVPoolHost:
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
     def available_size(self):
-        return self.size - self.free_slot_idx
+        return len(self.free_slots)
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        num_slots_2_free = len(indices)
         self.mem_state[indices] = MemoryStateInt.IDLE
-        assert self.free_slot_idx >= num_slots_2_free
-        next_free_slot_idx = self.free_slot_idx - num_slots_2_free
-        self.slots[next_free_slot_idx : self.free_slot_idx] = indices
-        self.free_slot_idx = next_free_slot_idx
-        self.can_use_mem_size += num_slots_2_free
-        return num_slots_2_free
+        self.free_slots = torch.concat([self.free_slots, indices])
+        self.can_use_mem_size += len(indices)
+        return len(indices)
+
