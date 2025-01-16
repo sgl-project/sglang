@@ -476,7 +476,6 @@ class Scheduler:
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                        global_num_tokens=[],
                     )
                     self.process_batch_result(tmp_batch, None)
 
