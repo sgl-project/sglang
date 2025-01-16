@@ -453,12 +453,12 @@ def suppress_other_loggers():
     from vllm.logger import logger as vllm_default_logger
 
     vllm_default_logger.setLevel(logging.WARN)
-    logging.getLogger("sglang.srt.distributed.device_communicators.pynccl").setLevel(
+    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
-    logging.getLogger(
-        "sglang.srt.distributed.device_communicators.shm_broadcast"
-    ).setLevel(logging.WARN)
+    logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
+        logging.WARN
+    )
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -517,14 +517,12 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
     # Suppress the warnings from this delete function when using sglang.bench_one_batch
-    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-        CustomAllreduce,
-    )
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
@@ -535,8 +533,7 @@ vllm_all_gather_backup = None
 def monkey_patch_vllm_all_gather(reverse: bool = False):
     """Monkey patch all-gather to remove in-place operations."""
     from torch.distributed import _functional_collectives as funcol
-
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from vllm.distributed.parallel_state import GroupCoordinator
 
     global vllm_all_gather_backup
     if vllm_all_gather_backup is None:
@@ -816,7 +813,7 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
 
 
 def dump_to_file(dirpath, name, value):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from vllm.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() != 0:
         return
