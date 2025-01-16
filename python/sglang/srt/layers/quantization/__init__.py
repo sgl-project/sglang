@@ -17,12 +17,13 @@ from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
 from vllm.model_executor.layers.quantization.gptq_marlin_24 import GPTQMarlin24Config
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -42,6 +43,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
     "experts_int8": ExpertsInt8Config,
+    "w8a8_int8": W8A8Int8Config,
 }
 
 
