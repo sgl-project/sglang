@@ -151,11 +151,6 @@ class TpModelWorkerClient:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                     )
-                    logits_output.normalized_prompt_logprobs = (
-                        logits_output.normalized_prompt_logprobs.to(
-                            "cpu", non_blocking=True
-                        )
-                    )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
@@ -173,9 +168,6 @@ class TpModelWorkerClient:
             if logits_output.input_token_logprobs is not None:
                 logits_output.input_token_logprobs = (
                     logits_output.input_token_logprobs.tolist()
-                )
-                logits_output.normalized_prompt_logprobs = (
-                    logits_output.normalized_prompt_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids

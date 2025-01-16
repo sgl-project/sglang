@@ -796,9 +796,6 @@ class TokenizerManager:
             recv_obj.output_token_logprobs_idx[recv_obj_index],
             return_text_in_logprobs,
         )
-        meta_info["normalized_prompt_logprob"] = recv_obj.normalized_prompt_logprob[
-            recv_obj_index
-        ]
 
         if top_logprobs_num > 0:
             meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
