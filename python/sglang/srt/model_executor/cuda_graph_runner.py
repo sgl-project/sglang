@@ -24,10 +24,7 @@ import tqdm
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.parallel_state import (
-    graph_capture,
-    monkey_patch_vllm_parallel_state,
-)
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -76,7 +73,6 @@ def patch_model(
         if enable_compile:
             _to_torch(model, reverse=False, batch_size=batch_size)
             monkey_patch_vllm_all_gather()
-            monkey_patch_vllm_parallel_state()
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -92,7 +88,6 @@ def patch_model(
     finally:
         if enable_compile:
             _to_torch(model, reverse=True, batch_size=batch_size)
-            monkey_patch_vllm_parallel_state(reverse=True)
             monkey_patch_vllm_all_gather(reverse=True)
             tp_group.ca_comm = backup_ca_comm
 
