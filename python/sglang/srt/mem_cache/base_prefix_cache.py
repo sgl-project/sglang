@@ -41,6 +41,10 @@ class BasePrefixCache(ABC):
     def evictable_size(self):
         pass
 
+    @abstractmethod
+    def protected_size(self):
+        pass
+
     def total_size(self):
         raise NotImplementedError()
 
