@@ -4,7 +4,7 @@ tree:
 	@tree --prune -I "__pycache__|*.egg-info|*.so|build"
 
 ln:
-	@rm -rf build && cmake . -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_CUDA_COMPILER=nvcc -B build && rm -rf compile_commands.json && ln -s build/compile_commands.json compile_commands.json
+	@rm -rf build && git submodule update --init --recursive && bear python3 setup.py build
 
 install:
 	@pip install -e .
