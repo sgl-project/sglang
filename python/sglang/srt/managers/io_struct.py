@@ -59,6 +59,9 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
+
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # LoRA related
@@ -196,6 +199,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
+            log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
         )
@@ -243,6 +247,8 @@ class EmbeddingReqInput:
     sampling_params: Union[List[Dict], Dict] = None
     # Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
