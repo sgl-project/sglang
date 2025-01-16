@@ -604,7 +604,7 @@ def sample_sharegpt_requests(
             # Prune too short sequences.
             continue
 
-        if args.context_len and prompt_len + output_len > args.context_len:
+        if context_len and prompt_len + output_len > context_len:
             # Prune too long sequences.
             continue
 
