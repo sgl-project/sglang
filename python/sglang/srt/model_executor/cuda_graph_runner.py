@@ -109,7 +109,7 @@ def set_torch_compile_config():
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: "ModelRunner"):
+    def __init__(self, model_runner: "ModelRunner", is_spec=False):
         # Parse args
         self.model_runner = model_runner
         self.graphs = {}
@@ -122,12 +122,16 @@ class CudaGraphRunner:
         self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
         self.tp_size = self.model_runner.tp_size
+        self.is_spec = is_spec
 
         # Batch sizes to capture
         self.capture_bs = self.model_runner.server_args.cuda_graph_bs
         if self.capture_bs is None:
             if model_runner.server_args.disable_cuda_graph_padding:
                 self.capture_bs = list(range(1, 33)) + [64, 128]
+            elif self.is_spec:
+                # For speculative inference, large batch sizes are not effective.
+                self.capture_bs = [1, 2, 3, 4]
             else:
                 self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
 
@@ -164,6 +168,12 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+
+        if model_runner.spec_algorithm.is_lookahead() and self.is_spec:
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = (
+                self.model_runner.server_args.speculative_num_draft_tokens
+            )
 
         self.compile_bs = (
             [
@@ -205,6 +215,11 @@ class CudaGraphRunner:
                 self.hidden_states = torch.zeros(
                     (self.max_num_token, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
+                )
+            if self.is_spec:
+                self.draft_token_num = (
+                    torch.ones((len(self.capture_bs),), dtype=torch.int32)
+                    * self.num_tokens_per_bs
                 )
 
             if self.is_encoder_decoder:
@@ -273,7 +288,14 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        is_token_num_supported = True
+        if self.is_spec:
+            is_token_num_supported = (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+        return is_token_num_supported and is_bs_supported and is_encoder_lens_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -473,5 +495,23 @@ class CudaGraphRunner:
                     device="cuda",
                 )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+        if self.model_runner.spec_algorithm.is_lookahead() and self.is_spec:
+            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+
+            bs = int(num_tokens / self.num_tokens_per_bs)
+            spec_info = LookaheadVerifyInput(
+                None,
+                None,
+                None,
+                None,
+                None,
+                self.draft_token_num[:bs],
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+            spec_info.custom_mask = torch.zeros(
+                (num_tokens * self.model_runner.model_config.context_len),
+                dtype=torch.bool,
+                device="cuda",
+            )
 
         return spec_info

@@ -128,7 +128,7 @@ class Scheduler:
         )
         self.decode_mem_cache_buf_multiplier = (
             self.server_args.speculative_num_draft_tokens
-            if not self.spec_algorithm.is_none()
+            if self.spec_algorithm.is_eagle()
             else 1
         )
 
@@ -225,6 +225,17 @@ class Scheduler:
                 nccl_port=port_args.nccl_port,
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_worker import LOOKAHEADWorker
+
+            self.draft_worker = LOOKAHEADWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                dp_rank=dp_rank,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
             )
         else:
             self.draft_worker = None
@@ -964,6 +975,8 @@ class Scheduler:
         if batch.batch_size() < initial_bs:
             self.batch_is_full = False
 
+        if self.spec_algorithm.is_lookahead():
+            batch.spec_info = self.draft_worker.prepare_for_verify(batch)
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
