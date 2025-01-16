@@ -35,6 +35,10 @@ from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttn
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    initialize_dp_attention,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -235,11 +239,18 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            initialize_dp_attention(
+                enable_dp_attention=self.server_args.enable_dp_attention,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                dp_size=self.server_args.dp_size,
+            )
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
+        self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
