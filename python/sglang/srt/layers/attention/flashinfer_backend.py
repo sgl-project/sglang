@@ -99,6 +99,7 @@ class FlashInferAttnBackend(AttentionBackend):
             device=model_runner.device,
         )
         max_bs = model_runner.req_to_token_pool.size
+        print(f"max batch size = {max_bs}")
         self.kv_indptr = [
             torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
             for _ in range(self.num_wrappers)
@@ -153,6 +154,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        print(
+            f"mode={forward_batch.forward_mode},batch_size={forward_batch.batch_size}, req_pool_indices={forward_batch.req_pool_indices}, seq_lens={forward_batch.seq_lens}，decode_start_idx={forward_batch.decode_start_idx}"
+        )
         if forward_batch.forward_mode.is_decode():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -198,7 +202,11 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             # Part1: Prefill
-            if forward_batch.decode_start_idx >= 4096 and self.num_wrappers == 1:
+            decode_running_bs = (
+                forward_batch.batch_size - forward_batch.decode_start_idx
+            )
+            extend_tokens = forward_batch.extend_num_tokens - decode_running_bs
+            if extend_tokens >= 4096 and self.num_wrappers == 1:
                 use_ragged = True
                 extend_no_prefix = not any(
                     forward_batch.extend_prefix_lens_cpu[:extend_bs]
@@ -219,6 +227,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             # Part2: Decode
+            self.indices_updater_decode.decode_start_idx = extend_bs
             self.indices_updater_decode.update(
                 req_pool_indices_decode,
                 seq_lens_decode,
@@ -229,7 +238,6 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             # since the `decode_start_idx` only used in the mixed mode
             # Manually update it so we do not need change the update method
-            self.indices_updater_decode.decode_start_idx = extend_bs
 
             self.forward_metadata = MixedMetadata(
                 self.prefill_wrappers_paged,
@@ -493,14 +501,22 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+
         # Part0: split the prefill and decode
-        extend_tokens = forward_batch.decode_start_idx
+        decode_running_bs = forward_batch.batch_size - forward_batch.decode_start_idx
+        # each decode request only use one token
+        extend_tokens = forward_batch.extend_num_tokens - decode_running_bs
 
-        print(f"forward_mixed: extend_tokens={extend_tokens}")
+        print(
+            f"mixed forward: q={q.shape}, k={k.shape}, extend_tokens={extend_tokens}, decode_running_bs={decode_running_bs}"
+        )
 
+        q_extend, q_decode = q[:extend_tokens], q[extend_tokens:]
         k_extend, k_decode = k[:extend_tokens], k[extend_tokens:]
         v_extend, v_decode = v[:extend_tokens], v[extend_tokens:]
-        q_extend, q_decode = q[:extend_tokens], q[extend_tokens:]
+
+        print(f"q_extend={q_extend.shape}, q_decode={q_decode.shape}")
+        print(f"k_extend={k_extend.shape}, k_decode={k_decode.shape}")
 
         out_cache_loc_extend = forward_batch.out_cache_loc[:extend_tokens]
         out_cache_loc_decode = forward_batch.out_cache_loc[extend_tokens:]
@@ -774,13 +790,17 @@ class FlashInferIndicesUpdaterDecode:
         kv_start_idx: torch.Tensor,
         spec_info: Optional[SpecInfo],
     ):
+        shift_pos = self.decode_start_idx
         if spec_info is None:
             bs = len(req_pool_indices)
-            shift_pos = self.decode_start_idx
-            kv_indptr[1 + shift_pos : bs + 1 + shift_pos] = torch.cumsum(
-                paged_kernel_lens, dim=0
+            print("====Decode call_begin_forward====")
+            print(
+                f"req_pool_indices={req_pool_indices}, paged_kernel_lens={paged_kernel_lens}, decode_start_idx={self.decode_start_idx}, shift_pos = {shift_pos}"
             )
-            kv_indptr = kv_indptr[shift_pos : bs + 1 + shift_pos]
+            print(f"kv_indptr before modification:, {kv_indptr[:20]}")
+            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr[0] = 0
+            # kv_indptr = kv_indptr[shift_pos : bs + 1 + shift_pos]
 
             kv_indices = torch.empty(
                 paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
@@ -789,11 +809,14 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                kv_indptr,
+                kv_indptr[: bs + 1],
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            print(f"kv_indptr after modification:, {kv_indptr[:20]}")
+            print(f"kv_indices={kv_indices}")
+            print("========")
         else:
             bs, kv_indices, kv_indptr = spec_info.generate_attn_arg_decode(
                 req_pool_indices,
@@ -803,15 +826,18 @@ class FlashInferIndicesUpdaterDecode:
 
         wrapper.end_forward()
         wrapper.begin_forward(
-            kv_indptr,
+            kv_indptr[: bs + 1],
             kv_indices,
-            self.kv_last_page_len[:bs],
+            self.kv_last_page_len[shift_pos : bs + shift_pos],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
             1,
             data_type=self.data_type,
             q_data_type=self.q_data_type,
+        )
+        print(
+            f"decode kv_last_page_len = {self.kv_last_page_len[shift_pos:bs+shift_pos]}"
         )
 
 
@@ -990,8 +1016,14 @@ class FlashInferIndicesUpdaterPrefill:
         bs = len(req_pool_indices)
         if spec_info is None:
             # Normal extend
+            print("****Prefill call_begin_forward****")
+            print(
+                f"req_pool_indices={req_pool_indices}, paged_kernel_lens={paged_kernel_lens}"
+            )
+            print(f"kv_indptr before modification:, {kv_indptr[:20]}")
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
+            kv_indptr[0] = 0
+            # kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
                 paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
             )
@@ -999,7 +1031,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                kv_indptr,
+                kv_indptr[: bs + 1],
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
@@ -1008,6 +1040,10 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
+            print(f"kv_indptr after modification:, {kv_indptr[:20]}")
+            print(f"kv_indices={kv_indices}")
+            print(f"qo_indptr={qo_indptr}")
+            print("========")
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -1033,7 +1069,9 @@ class FlashInferIndicesUpdaterPrefill:
         wrapper_paged.end_forward()
         wrapper_paged.begin_forward(
             qo_indptr,
-            kv_indptr,
+            kv_indptr[
+                : bs + 1
+            ],  # TODO(lihu): spec_info is not empty should consider, pass or modified?
             kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
@@ -1043,6 +1081,7 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             custom_mask=custom_mask,
         )
+        print(f"forward kv_last_page_len = {self.kv_last_page_len[:bs]}")
 
 
 @triton.jit

@@ -841,6 +841,13 @@ class ScheduleBatch:
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
+        print("After merging:")
+        print(f"decode_start_idx={self.decode_start_idx}")
+        print(f"seq_lens: {self.seq_lens}")
+        print(f"seq_lens_sum: {self.seq_lens_sum}")
+        print(f"batch_size: {self.batch_size()}")
+        print(f"self.out_cache_loc: {self.out_cache_loc}")
+
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
 
@@ -1088,6 +1095,19 @@ class ScheduleBatch:
         self.sampling_info.filter_batch(keep_indices, new_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
+        print("Before merging:")
+        print(f"self.bs={self.batch_size()}, other.bs={other.batch_size()}")
+        print(
+            f"self.req_pool_indices: {self.req_pool_indices}, other.req_pool_indices: {other.req_pool_indices}"
+        )
+        print(f"self.seq_lens: {self.seq_lens}, other.seq_lens: {other.seq_lens}")
+        print(
+            f"self.seq_lens_sum: {self.seq_lens_sum}, other.seq_lens_sum: {other.seq_lens_sum}"
+        )
+        print(
+            f"self.out_cache_loc: {self.out_cache_loc}, other.out_cache_loc: {other.out_cache_loc}"
+        )
+
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -1105,6 +1125,7 @@ class ScheduleBatch:
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
+
         if self.output_ids is not None:
             self.output_ids = torch.concat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
