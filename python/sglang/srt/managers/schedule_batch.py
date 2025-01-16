@@ -226,8 +226,9 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-        self.output_ids = []  # Each decode stage's output ids
-        self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+        # Each decode stage's output ids
+        self.output_ids = []
+        # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -265,6 +266,7 @@ class Req:
         # Prefix info
         self.prefix_indices = []
         # Tokens to run prefill. input_tokens - shared_prefix_tokens.
+        # Updated if chunked.
         self.extend_input_len = 0
         self.last_node = None
 
