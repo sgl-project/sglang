@@ -112,7 +112,7 @@ class GenerationBatchResult:
 
 @dataclass
 class EmbeddingBatchResult:
-    embedding: torch.Tensor
+    embeddings: torch.Tensor
     bid: int
 
 
@@ -1164,7 +1164,7 @@ class Scheduler:
                 batch.next_batch_sampling_info.sampling_info_done.set()
 
         else:  # embedding or reward model
-            embeddings, bid = result.embedding, result.bid
+            embeddings, bid = result.embeddings, result.bid
             embeddings = embeddings.tolist()
 
             # Check finish conditions
