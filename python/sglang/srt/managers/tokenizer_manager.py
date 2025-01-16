@@ -119,10 +119,10 @@ class TokenizerManager:
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name
+            context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
 
         # Read model args
