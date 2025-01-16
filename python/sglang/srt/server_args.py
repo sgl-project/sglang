@@ -157,6 +157,7 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
+    allow_auto_truncate: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -858,6 +859,11 @@ class ServerArgs:
             "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+        )
+        parser.add_argument(
+            "--allow-auto-truncate",
+            action="store_true",
+            help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
         )
 
     @classmethod
