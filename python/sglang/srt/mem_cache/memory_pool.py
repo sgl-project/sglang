@@ -621,4 +621,3 @@ class MLATokenToKVPoolHost:
         self.free_slots = torch.concat([self.free_slots, indices])
         self.can_use_mem_size += len(indices)
         return len(indices)
-
