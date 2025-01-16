@@ -243,6 +243,7 @@ class ServerArgs:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            self.disable_overlap_schedule = True
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "

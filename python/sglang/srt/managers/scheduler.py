@@ -1024,7 +1024,7 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
+            if batch.forward_mode.is_decode_or_idle() or batch.extend_num_tokens != 0:
                 if self.spec_algorithm.is_none():
                     model_worker_batch = batch.get_model_worker_batch()
                     logits_output, next_token_ids = (
@@ -1038,18 +1038,8 @@ class Scheduler:
                         num_accepted_tokens,
                     ) = self.draft_worker.forward_batch_speculative_generation(batch)
                     self.num_generated_tokens += num_accepted_tokens
-            elif batch.forward_mode.is_idle():
-                model_worker_batch = batch.get_model_worker_batch()
-                self.tp_worker.forward_batch_idle(model_worker_batch)
-                return
             else:
-                logits_output = None
-                if self.skip_tokenizer_init:
-                    next_token_ids = torch.full(
-                        (batch.batch_size(),), self.tokenizer.eos_token_id
-                    )
-                else:
-                    next_token_ids = torch.full((batch.batch_size(),), 0)
+                assert False, "batch.extend_num_tokens == 0, this is unexpected!"
             batch.output_ids = next_token_ids
             ret = logits_output, next_token_ids, model_worker_batch.bid
         else:  # embedding or reward model
@@ -1455,12 +1445,7 @@ class Scheduler:
             # Check forward mode for cuda graph
             if not self.server_args.disable_cuda_graph:
                 forward_mode_state = torch.tensor(
-                    (
-                        1
-                        if local_batch.forward_mode.is_decode()
-                        or local_batch.forward_mode.is_idle()
-                        else 0
-                    ),
+                    (1 if local_batch.forward_mode.is_decode_or_idle() else 0),
                     dtype=torch.int32,
                 )
                 torch.distributed.all_reduce(

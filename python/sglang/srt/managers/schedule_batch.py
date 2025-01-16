@@ -1122,7 +1122,7 @@ class ScheduleBatch:
             self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(self):
-        if self.forward_mode.is_decode() or self.forward_mode.is_idle():
+        if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens

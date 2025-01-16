@@ -148,7 +148,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -239,7 +239,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        if forward_mode.is_decode():
+        if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
                 decode_wrappers.append(
@@ -308,7 +308,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        if forward_mode.is_decode():
+        if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
