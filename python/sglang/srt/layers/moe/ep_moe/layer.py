@@ -4,13 +4,13 @@ from typing import Callable, List, Optional, Tuple
 import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,

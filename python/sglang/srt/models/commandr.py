@@ -44,12 +44,12 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import PretrainedConfig
-from vllm.distributed import (
+from vllm.model_executor.layers.rotary_embedding import get_rope
+
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.layers.rotary_embedding import get_rope
-
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
