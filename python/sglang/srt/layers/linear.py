@@ -18,6 +18,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
+    BlockQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     PerTensorScaleParameter,
@@ -27,7 +28,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)

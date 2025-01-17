@@ -66,7 +66,8 @@ def _per_token_group_quant_fp8(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / fp8_max
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_s_inv = 1.0 / y_s
+    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -87,7 +88,7 @@ def per_token_group_quant_fp8(
         x: The input tenosr with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
-        dtype: The dype of output tensor. Note that only `torch.float8_e4m3fn` is supported for now.
+        dtype: The dype of output tensor.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
@@ -132,6 +133,113 @@ def per_token_group_quant_fp8(
         num_stages=num_stages,
     )
 
+    return x_q, x_s
+
+
+@triton.jit
+def _static_quant_fp8(
+    # Pointers to inputs and output
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    y_s_repeat_ptr,
+    # Stride of input
+    y_stride,
+    # Collums of input
+    N,
+    # Information for float8
+    fp8_min,
+    fp8_max,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
+    REPEAT_SCALE: tl.constexpr,
+):
+    """A Triton-accelerated function to perform quantization using the given scale on a
+    tensor
+
+    This function converts the tensor values into float8 values.
+    """
+    # Map the program id to the row of X and Y it should compute.
+    g_id = tl.program_id(0)
+    y_ptr += g_id * y_stride
+    y_q_ptr += g_id * y_stride
+    if REPEAT_SCALE:
+        y_s_repeat_ptr += g_id
+
+    cols = tl.arange(0, BLOCK)  # N <= BLOCK
+    mask = cols < N
+
+    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y_s = tl.load(y_s_ptr).to(tl.float32)
+    y_s_inv = 1.0 / y_s
+    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+
+    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    if REPEAT_SCALE:
+        tl.store(y_s_repeat_ptr, y_s)
+
+
+def static_quant_fp8(
+    x: torch.Tensor,
+    x_s: torch.Tensor,
+    repeat_scale: bool = False,
+    dtype: torch.dtype = fp8_type_,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Function to perform static quantization using the given scale on an input tensor `x`.
+
+    It converts the tensor values into signed float8 values and returns the
+    quantized tensor along with the scaling factor used for quantization.
+
+    Args:
+        x: The input tenosr with ndim >= 2.
+        x_s: The quantization scale.
+        repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
+        dtype: The dype of output tensor.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
+    """
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert x_s.numel() == 1, "only supports per-tensor scale"
+    finfo = torch.finfo(dtype)
+    fp8_max = finfo.max
+
+    if is_hip_:
+        fp8_max = 224.0
+
+    fp8_min = -fp8_max
+
+    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    M = x.numel() // x.shape[-1]
+    N = x.shape[-1]
+    if repeat_scale:
+        x_s_repeat = torch.empty(
+            (M, 1),
+            device=x.device,
+            dtype=torch.float32,
+        )
+    else:
+        x_s_repeat = None
+
+    BLOCK = triton.next_power_of_2(N)
+    # heuristics for number of warps
+    num_warps = min(max(BLOCK // 256, 1), 8)
+    num_stages = 1
+    _static_quant_fp8[(M,)](
+        x,
+        x_q,
+        x_s,
+        x_s_repeat,
+        N,
+        N,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        BLOCK=BLOCK,
+        REPEAT_SCALE=repeat_scale,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    x_s = x_s_repeat if repeat_scale else x_s
     return x_q, x_s
 
 
