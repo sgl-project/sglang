@@ -122,6 +122,7 @@ class CudaGraphRunner:
         self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
         self.tp_size = self.model_runner.tp_size
+        self.dp_size = self.model_runner.server_args.dp_size
 
         # Batch sizes to capture
         self.capture_bs = self.model_runner.server_args.cuda_graph_bs
@@ -218,7 +219,7 @@ class CudaGraphRunner:
             if self.enable_dp_attention:
                 self.gathered_buffer = torch.zeros(
                     (
-                        self.max_bs * self.tp_size,
+                        self.max_bs * self.dp_size,
                         self.model_runner.model_config.hidden_size,
                     ),
                     dtype=self.model_runner.dtype,

@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.custom_op_util import register_custom_op
+from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -185,8 +186,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 inplace=True,
             )
 
-    def forward_cpu(self, *args, **kwargs):
-        raise NotImplementedError("The CPU backend currently does not support MoE.")
+    def forward_cpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return moe_forward_native(
+            layer,
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            custom_routing_function,
+            correction_bias,
+        )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")

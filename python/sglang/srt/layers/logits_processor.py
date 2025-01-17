@@ -133,7 +133,7 @@ class LogitsProcessor(nn.Module):
 
         # Get the last hidden states and last logits for the next token prediction
         if (
-            logits_metadata.forward_mode.is_decode()
+            logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
         ):
             last_index = None
