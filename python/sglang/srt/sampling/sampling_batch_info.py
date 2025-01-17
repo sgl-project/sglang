@@ -105,8 +105,10 @@ class SamplingBatchInfo:
                 .to(device, non_blocking=True)
                 for processor_str, true_indices in processor_dict.items()
             }
+            custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
             merged_custom_logit_processor = {}
+            custom_params = None
 
         ret = cls(
             temperatures=temperatures,
@@ -118,7 +120,7 @@ class SamplingBatchInfo:
             has_custom_logit_processor=has_custom_logit_processor,
             vocab_size=vocab_size,
             device=device,
-            custom_params=[r.sampling_params.custom_params for r in reqs],
+            custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
@@ -290,16 +292,25 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
-        self.custom_params = self.custom_params + other.custom_params
+        self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
+
+        # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
+            # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
-                    self.custom_logit_processor,
-                    other.custom_logit_processor,
+                    self.custom_logit_processor or {},
+                    other.custom_logit_processor or {},
                     self.device,
                 )
             )
-        self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
+            # Merge the custom params lists
+            self.custom_params = self.custom_params or [None] * len(self)
+            other.custom_params = other.custom_params or [None] * len(other)
+            self.custom_params.extend(other.custom_params)
+
+            # Set the flag to True if any of the two has custom logit processor
+            self.has_custom_logit_processor = True
 
     def apply_logits_bias(self, logits: torch.Tensor):
         # Apply logit_bias
