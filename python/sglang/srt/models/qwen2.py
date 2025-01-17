@@ -356,6 +356,8 @@ class Qwen2ForCausalLM(nn.Module):
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
+                if "lm_head.weight" in name:
+                    continue
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]

@@ -226,8 +226,9 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-        self.output_ids = []  # Each decode stage's output ids
-        self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+        # Each decode stage's output ids
+        self.output_ids = []
+        # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -265,6 +266,7 @@ class Req:
         # Prefix info
         self.prefix_indices = []
         # Tokens to run prefill. input_tokens - shared_prefix_tokens.
+        # Updated if chunked.
         self.extend_input_len = 0
         self.last_node = None
 
@@ -280,10 +282,10 @@ class Req:
         self.top_logprobs_num = top_logprobs_num
 
         # Logprobs (return value)
-        self.input_token_logprobs_val = None
-        self.input_token_logprobs_idx = None
-        self.input_top_logprobs_val = None
-        self.input_top_logprobs_idx = None
+        self.input_token_logprobs_val: Optional[List[float]] = None
+        self.input_token_logprobs_idx: Optional[List[int]] = None
+        self.input_top_logprobs_val: Optional[List[float]] = None
+        self.input_top_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
             self.output_token_logprobs_val = []
@@ -1003,6 +1005,11 @@ class ScheduleBatch:
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+            enable_overlap_schedule=self.enable_overlap,
+        )
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
@@ -1117,7 +1124,7 @@ class ScheduleBatch:
             self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(self):
-        if self.forward_mode.is_decode() or self.forward_mode.is_idle():
+        if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens

@@ -560,6 +560,7 @@ def run_bench_serving(
         tokenizer=tokenizer,
         num_prompts=num_prompts,
         sharegpt_output_len=None,
+        sharegpt_context_len=None,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
         random_range_ratio=0.0,
