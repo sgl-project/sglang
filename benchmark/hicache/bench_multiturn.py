@@ -32,13 +32,13 @@ def parse_args():
     parser.add_argument(
         "--request-length",
         type=int,
-        default=1024,
+        default=512,
         help="Length of each new request",
     )
     parser.add_argument(
         "--output-length",
         type=int,
-        default=128,
+        default=64,
         help="Length of each output",
     )
     parser.add_argument(
@@ -163,7 +163,7 @@ class ReadyQueue:
     Thread-safe queue that can pop requests in different orders based on given policy.
     """
 
-    def __init__(self, init_requests=None, policy="random"):
+    def __init__(self, init_requests=None, policy="fifo"):
         self.lock = threading.Lock()
         self.requests = init_requests or []
         self.policy = policy
@@ -305,16 +305,19 @@ class WorkloadGenerator:
         print("All requests completed.")
         print("Performance metrics summary:")
         print(
-            f"  Average TTFT: {sum(self.performance_metrics['ttft']) / len(self.performance_metrics['ttft'])}"
+            f"  Total requests: {len(self.performance_metrics['ttft'])} at {self.request_rate} requests per second"
         )
         print(
-            f"  Median TTFT: {sorted(self.performance_metrics['ttft'])[len(self.performance_metrics['ttft']) // 2]}"
+            f"  Average TTFT: {sum(self.performance_metrics['ttft']) / len(self.performance_metrics['ttft']):.2f}"
         )
         print(
-            f"  Average latency: {sum(self.performance_metrics['latency']) / len(self.performance_metrics['latency'])}"
+            f"  Median TTFT: {sorted(self.performance_metrics['ttft'])[len(self.performance_metrics['ttft']) // 2]:.2f}"
         )
         print(
-            f"  Median latency: {sorted(self.performance_metrics['latency'])[len(self.performance_metrics['latency']) // 2]}"
+            f"  Average latency: {sum(self.performance_metrics['latency']) / len(self.performance_metrics['latency']):.2f}"
+        )
+        print(
+            f"  Median latency: {sorted(self.performance_metrics['latency'])[len(self.performance_metrics['latency']) // 2]:.2f}"
         )
         throughput = self.pbar.total / (self.finished_time - self.start_time)
         print(f"Throughput: {throughput:.2f} requests per second")
@@ -324,7 +327,7 @@ if __name__ == "__main__":
     args = parse_args()
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    for request_rate in range(1, 11, 1):
+    for request_rate in range(1, 41, 2):
         args.request_rate = request_rate
         requests.post(flush_cache_url)
         WorkloadGenerator(args).run()
