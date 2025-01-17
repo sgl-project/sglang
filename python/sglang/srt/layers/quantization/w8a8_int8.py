@@ -54,7 +54,7 @@ class W8A8Int8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from vllm.model_executor.layers.linear import LinearBase
+        from sglang.srt.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
             return W8A8Int8LinearMethod(self)

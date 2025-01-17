@@ -15,11 +15,12 @@ def get_version():
 
 def update_wheel_platform_tag():
     wheel_dir = Path("dist")
-    old_wheel = next(wheel_dir.glob("*.whl"))
-    new_wheel = wheel_dir / old_wheel.name.replace(
-        "linux_x86_64", "manylinux2014_x86_64"
-    )
-    old_wheel.rename(new_wheel)
+    if wheel_dir.exists() and wheel_dir.is_dir():
+        old_wheel = next(wheel_dir.glob("*.whl"))
+        new_wheel = wheel_dir / old_wheel.name.replace(
+            "linux_x86_64", "manylinux2014_x86_64"
+        )
+        old_wheel.rename(new_wheel)
 
 
 cutlass = root / "3rdparty" / "cutlass"
