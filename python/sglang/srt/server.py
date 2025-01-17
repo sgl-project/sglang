@@ -842,7 +842,6 @@ class Engine:
             generator = ret.body_iterator
 
             async def generator_wrapper():
-
                 offset = 0
 
                 while True:
