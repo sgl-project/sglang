@@ -7,6 +7,7 @@ from sgl_kernel.ops import (
     moe_align_block_size,
     register_graph_buffers,
     sampling_scaling_penalties,
+    lightning_attention_decode,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "sampling_scaling_penalties",
     "get_graph_buffer_ipc_meta",
     "register_graph_buffers",
+    "lightning_attention_decode",
 ]

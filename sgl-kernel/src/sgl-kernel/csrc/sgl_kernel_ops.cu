@@ -24,6 +24,10 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                              const c10::optional<torch::Tensor>& bias);
 
+// lightning_attention_decode
+void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor &k, const torch::Tensor &v, const torch::Tensor &past_kv,
+                              const torch::Tensor &slope, torch::Tensor output, torch::Tensor new_kv);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -37,4 +41,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sampling_scaling_penalties", &sampling_scaling_penalties, "Sampling scaling penalties (CUDA)");
   // int8_scaled_mm
   m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
+  m.def("lightning_attention_decode", &lightning_attention_decode, "Lightning Attention Ddecode (CUDA)");
 }

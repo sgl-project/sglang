@@ -10,6 +10,7 @@ from sgl_kernel.ops._kernels import register_graph_buffers as _register_graph_bu
 from sgl_kernel.ops._kernels import (
     sampling_scaling_penalties as _sampling_scaling_penalties,
 )
+from sgl_kernel.ops._kernels import lightning_attention_decode as _lightning_attention_decode
 
 
 def init_custom_reduce(
@@ -71,3 +72,6 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         out_dtype,
         bias,
     )
+
+def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
+    _lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv)
