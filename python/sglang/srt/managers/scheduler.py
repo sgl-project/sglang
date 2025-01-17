@@ -317,6 +317,8 @@ class Scheduler:
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
+        if self.device == "cpu":
+            self.current_stream.synchronize = lambda: None  # No-op for CPU
 
         # Session info
         self.sessions: Dict[str, Session] = {}
