@@ -15,6 +15,7 @@
 
 import base64
 import dataclasses
+import io
 import ipaddress
 import itertools
 import json
@@ -34,6 +35,7 @@ import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
@@ -57,9 +59,9 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
+from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
-
 
 show_time_cost = False
 time_infos = {}
@@ -93,6 +95,10 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
+    return torch.cuda.is_available() and torch.version.cuda
+
+
+def is_cuda_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
@@ -217,6 +223,10 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
 
+    elif device == "cpu":
+        # TODO: rename the variables in the current function to be not GPU specific
+        free_gpu_memory = psutil.virtual_memory().available
+
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
             torch.device(device, gpu_id)
@@ -333,6 +343,8 @@ def is_port_available(port):
             s.listen(1)
             return True
         except socket.error:
+            return False
+        except OverflowError:
             return False
 
 
@@ -567,13 +579,13 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
 
 
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
         GGUFEmbeddingMethod,
         GGUFLinearMethod,
     )
 
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
@@ -708,13 +720,14 @@ def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -723,19 +736,19 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -780,7 +793,9 @@ def first_rank_print(*args, **kwargs):
         pass
 
 
-def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -793,13 +808,16 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     if socket_type == zmq.PUSH:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-        socket.connect(f"ipc://{endpoint}")
     elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-        socket.bind(f"ipc://{endpoint}")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
 
     return socket
 
@@ -1206,7 +1224,6 @@ def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> 
     # https://github.com/pytorch/pytorch/blob/
     # c1cd946818442aca8c7f812b16d187ce1586c3bc/
     # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.cuda
     import torch.version
 
     if not torch.cuda._is_compiled():
@@ -1337,6 +1354,38 @@ def parse_tool_response(text, tools, **kwargs):
     return text, call_info_list
 
 
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    b_ = x.shape[0]
+    n_ = x.shape[1]
+    k_ = x.shape[2]
+
+    x_ = x
+    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
+    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
+    else:
+        return x_
+
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
+
+class MultiprocessingSerializer:
+    @staticmethod
+    def serialize(obj):
+        buf = io.BytesIO()
+        ForkingPickler(buf).dump(obj)
+        buf.seek(0)
+        return buf.read()
+
+    @staticmethod
+    def deserialize(data):
+        return ForkingPickler.loads(data)
+
+
 def debug_timing(func):
     # todo: replace with a more organized instrumentation
     def wrapper(*args, **kwargs):
@@ -1359,3 +1408,20 @@ def debug_timing(func):
             return func(*args, **kwargs)
 
     return wrapper
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
+
+
+def set_uvicorn_logging_configs():
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    LOGGING_CONFIG["formatters"]["access"][
+        "fmt"
+    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"

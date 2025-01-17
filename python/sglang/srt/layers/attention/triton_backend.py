@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -28,12 +29,9 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
-        if model_runner.server_args.enable_dp_attention:
-            self.num_head = model_runner.model_config.num_attention_heads
-        else:
-            self.num_head = (
-                model_runner.model_config.num_attention_heads // model_runner.tp_size
-            )
+        self.num_head = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
 
         self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
@@ -81,7 +79,7 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_token: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],

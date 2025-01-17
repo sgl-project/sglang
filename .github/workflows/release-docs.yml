@@ -39,7 +39,7 @@ jobs:
 
       - name: Execute notebooks and push to documents
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.DOCUMENTATION_PAT_TOKEN }}
         run: |
           cd docs
           make clean
@@ -49,7 +49,7 @@ jobs:
           cd _build/html
 
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1
-          rm -rf  ../sgl-project.github.io/*
+          find ../sgl-project.github.io/ -mindepth 1 -not -path "../sgl-project.github.io/.git*" -not -name CNAME -not -name ".jekyll" -not -name ".nojekyll" -delete
           cp -r * ../sgl-project.github.io
           cp ../../README.md ../sgl-project.github.io/README.md
           cd ../sgl-project.github.io

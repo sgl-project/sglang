@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
+from sglang.srt.utils import is_cuda_available
+
+is_cuda = is_cuda_available()
+if is_cuda:
+    from sgl_kernel import sampling_scaling_penalties
+
 import sglang.srt.sampling.penaltylib as penaltylib
 
 logger = logging.getLogger(__name__)
@@ -232,6 +238,7 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
+        self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
 
     def apply_logits_bias(self, logits: torch.Tensor):
         # Apply logit_bias
@@ -244,11 +251,14 @@ class SamplingBatchInfo:
 
         # repetition
         if self.scaling_penalties is not None:
-            logits[:] = torch.where(
-                logits > 0,
-                logits / self.scaling_penalties,
-                logits * self.scaling_penalties,
-            )
+            if is_cuda:
+                logits[:] = sampling_scaling_penalties(logits, self.scaling_penalties)
+            else:
+                logits[:] = torch.where(
+                    logits > 0,
+                    logits / self.scaling_penalties,
+                    logits * self.scaling_penalties,
+                )
 
         # Apply regex vocab_mask
         if self.vocab_mask is not None:

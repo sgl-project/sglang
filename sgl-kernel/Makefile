@@ -1,15 +1,18 @@
-.PHONY: tree ln install build clean test format
+.PHONY: tree ln submodule install build clean test format
 
 tree:
 	@tree --prune -I "__pycache__|*.egg-info|*.so|build"
 
-ln:
-	@rm -rf build && cmake . -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_CUDA_COMPILER=nvcc -B build && rm -rf compile_commands.json && ln -s build/compile_commands.json compile_commands.json
+submodule:
+	@git submodule update --init --recursive
 
-install:
+ln: submodule
+	@rm -rf build && bear python3 setup.py build
+
+install: submodule
 	@pip install -e .
 
-build:
+build: submodule
 	@export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel
 
 clean:

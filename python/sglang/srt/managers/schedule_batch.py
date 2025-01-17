@@ -44,7 +44,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -65,6 +65,7 @@ global_server_args_dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "device": ServerArgs.device,
 }
 
 
@@ -226,8 +227,9 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-        self.output_ids = []  # Each decode stage's output ids
-        self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+        # Each decode stage's output ids
+        self.output_ids = []
+        # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -265,6 +267,7 @@ class Req:
         # Prefix info
         self.prefix_indices = []
         # Tokens to run prefill. input_tokens - shared_prefix_tokens.
+        # Updated if chunked.
         self.extend_input_len = 0
         self.last_node = None
 
@@ -280,11 +283,10 @@ class Req:
         self.top_logprobs_num = top_logprobs_num
 
         # Logprobs (return value)
-        self.normalized_prompt_logprob = None
-        self.input_token_logprobs_val = None
-        self.input_token_logprobs_idx = None
-        self.input_top_logprobs_val = None
-        self.input_top_logprobs_idx = None
+        self.input_token_logprobs_val: Optional[List[float]] = None
+        self.input_token_logprobs_idx: Optional[List[int]] = None
+        self.input_top_logprobs_val: Optional[List[float]] = None
+        self.input_top_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
             self.output_token_logprobs_val = []
@@ -344,9 +346,6 @@ class Req:
             max_prefix_len = min(max_prefix_len, input_len - 1)
 
         if self.return_logprob:
-            if self.normalized_prompt_logprob is None:
-                # Need at least two tokens to compute normalized logprob
-                max_prefix_len = min(max_prefix_len, input_len - 2)
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
@@ -575,8 +574,8 @@ class ScheduleBatch:
     device: str = "cuda"
 
     # Speculative decoding
+    spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
-    spec_algorithm: Optional[SpeculativeAlgorithm] = None
 
     @classmethod
     def init_new(
@@ -587,7 +586,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
-        speculative_algorithm: Optional[SpeculativeAlgorithm] = None,
+        spec_algorithm: SpeculativeAlgorithm,
     ):
         return cls(
             reqs=reqs,
@@ -600,7 +599,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
-            spec_algorithm=speculative_algorithm,
+            spec_algorithm=spec_algorithm,
         )
 
     def batch_size(self):
@@ -1007,9 +1006,16 @@ class ScheduleBatch:
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+            enable_overlap_schedule=self.enable_overlap,
+        )
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        if self.spec_algorithm.is_eagle():
+            return
 
         self.input_ids = self.output_ids
         self.output_ids = None
@@ -1119,7 +1125,7 @@ class ScheduleBatch:
             self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(self):
-        if self.forward_mode.is_decode() or self.forward_mode.is_idle():
+        if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
@@ -1161,6 +1167,11 @@ class ScheduleBatch:
             input_embeds=self.input_embeds,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            capture_hidden_mode=(
+                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
+                if self.spec_info
+                else CaptureHiddenMode.NULL
+            ),
         )
 
     def copy(self):
@@ -1172,6 +1183,7 @@ class ScheduleBatch:
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def __str__(self):
@@ -1232,8 +1244,9 @@ class ModelWorkerBatch:
     input_embeds: Optional[torch.tensor] = None
 
     # Speculative decoding
+    spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
-    spec_algorithm: Optional[SpeculativeAlgorithm] = None
+    capture_hidden_mode: CaptureHiddenMode = None
 
 
 @triton.jit

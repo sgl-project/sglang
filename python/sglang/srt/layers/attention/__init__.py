@@ -26,7 +26,7 @@ class AttentionBackend(ABC):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_token: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
@@ -66,7 +66,14 @@ class AttentionBackend(ABC):
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         else:
-            return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+            )
 
     def forward_decode(
         self,
