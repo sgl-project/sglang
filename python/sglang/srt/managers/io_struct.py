@@ -250,6 +250,7 @@ class TokenizedGenerateReqInput:
     session_params: Optional[SessionParams] = None
 
     # Custom logit processor (serialized function)
+    # TODO (hpguo): Add an example and update doc string here
     custom_logit_processor: Optional[str] = None
 
 
