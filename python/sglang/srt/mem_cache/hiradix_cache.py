@@ -207,7 +207,9 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)
 
-    def load_back(self, node: TreeNode) -> Optional[torch.Tensor]:
+    def load_back(
+        self, node: TreeNode, mem_quota: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
         # todo: more loading policies
 
         last_hit_node = node
@@ -223,7 +225,9 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold:
+        if len(host_indices) < self.load_back_threshold or (
+            len(host_indices) > mem_quota if mem_quota is not None else False
+        ):
             # skip loading back if the total size is too small
             return None
 
@@ -257,22 +261,28 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         return node.loading == False
 
-    def match_prefix(self, key: List, load_cache: bool = True, **kwargs):
-        value, last_node = super().match_prefix(key, **kwargs)
-
+    def init_load_back(
+        self,
+        last_node: TreeNode,
+        prefix_indices: torch.Tensor,
+        mem_quota: Optional[int] = None,
+    ):
+        assert (
+            len(prefix_indices) == 0 or prefix_indices.is_cuda
+        ), "indices of device kV caches should be on GPU"
         if last_node.evicted:
-            if load_cache:
-                loading_values = self.load_back(last_node)
-                if loading_values is not None:
-                    if len(value) == 0:
-                        value = loading_values
-                    else:
-                        value = torch.cat([value, loading_values])
+            loading_values = self.load_back(last_node, mem_quota)
+            if loading_values is not None:
+                prefix_indices = (
+                    loading_values
+                    if len(prefix_indices) == 0
+                    else torch.cat([prefix_indices, loading_values])
+                )
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return value, last_node
+        return last_node, prefix_indices
 
     def _match_prefix_helper(
         self, node: TreeNode, key: List, value, last_node: TreeNode

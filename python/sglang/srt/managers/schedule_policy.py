@@ -86,8 +86,6 @@ class SchedulePolicy:
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
                     rid=r.rid, key=prefix_ids
                 )
-                # to prevent evicting nodes referenced by other requests in waiting queue
-                self.tree_cache.inc_lock_ref(r.last_node)
 
                 # NOTE(sang): This logic is for in-batch prefix caching;
                 # If there are more than 1 request that have small matching prefix from
@@ -113,9 +111,6 @@ class SchedulePolicy:
                             prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool)
                         )
 
-            for r in waiting_queue:
-                self.tree_cache.dec_lock_ref(r.last_node)
-
             prefix_computed = True
 
         if policy == "lpm":
@@ -136,6 +131,9 @@ class SchedulePolicy:
         elif policy == "random":
             random.shuffle(waiting_queue)
         elif policy == "dfs-weight":
+            # todo: make load back compatible with this policy
+            while req.last_node.evicted:
+                req.last_node = req.last_node.parent
             # Experimental policy based on custom weights
             last_node_to_reqs = defaultdict(list)
             for req in waiting_queue:

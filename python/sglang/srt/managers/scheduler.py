@@ -814,9 +814,17 @@ class Scheduler:
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if req.last_node and req.last_node.loading:
-                if not self.tree_cache.loading_complete(req.last_node):
+            if req.last_node:
+                if req.last_node.loading and not self.tree_cache.loading_complete(
+                    req.last_node
+                ):
                     continue
+                elif req.last_node.evicted:
+                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
+                        req.last_node, req.prefix_indices, adder.rem_total_tokens
+                    )
+                    if req.last_node.loading:
+                        continue
             if (
                 self.lora_paths
                 and len(
