@@ -654,7 +654,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
         kill_process_tree(os.getpid())
 
-    signal.signal(signal.SIGQUIT, sigquit_handler)
+    # signal.signal(signal.SIGQUIT, sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
