@@ -468,8 +468,8 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if "lm_head.weight" in name:
-                    continue
+                # if "lm_head.weight" in name:
+                #     continue
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
