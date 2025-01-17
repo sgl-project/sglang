@@ -76,7 +76,7 @@ class HiPAttentionConfig:
     mask_refresh_interval: Union[int, List[int]] = field(default_factory=lambda: [12, 8, 4])
     using_extend: bool = True
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
-        HiPAttentionPerLayerConfig(parsed_json={'second_stage_k': 4096, 'sliding_window_size': 1024, 'sink_token_size': 256}),
+        HiPAttentionPerLayerConfig(parsed_json={"second_stage_k": 4096, "sliding_window_size": 1024, "sink_token_size": 256}),
         HiPAttentionPerLayerConfig(),
     ])
     
