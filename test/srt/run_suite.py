@@ -12,6 +12,7 @@ suites = {
         "sampling/penaltylib",
         "test_abort.py",
         "test_chunked_prefill.py",
+        "test_custom_allreduce.py",
         "test_double_sparsity.py",
         "test_eagle_infer.py",
         "test_embedding_openai_server.py",
@@ -47,6 +48,7 @@ suites = {
         "test_update_weights_from_tensor.py",
         "test_vision_chunked_prefill.py",
         "test_vision_openai_server.py",
+        "test_w8a8_quantization.py",
         "test_session_control.py",
     ],
     "nightly": [
