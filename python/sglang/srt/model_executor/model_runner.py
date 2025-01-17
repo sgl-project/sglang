@@ -35,6 +35,11 @@ from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttn
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_size,
+    initialize_dp_attention,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -50,10 +55,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     init_custom_process_group,
+    is_cuda,
     is_hip,
     monkey_patch_vllm_gguf_config,
     monkey_patch_vllm_p2p_access_check,
@@ -165,6 +172,10 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.enable_memory_saver
+        )
+
         # Load the model
         self.sampler = Sampler()
         self.load_model()
@@ -229,11 +240,18 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            initialize_dp_attention(
+                enable_dp_attention=self.server_args.enable_dp_attention,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                dp_size=self.server_args.dp_size,
+            )
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
+        self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
@@ -271,11 +289,35 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         # Load the model
-        self.model = get_model(
-            model_config=self.model_config,
-            load_config=self.load_config,
-            device_config=DeviceConfig(self.device),
-        )
+        with self.memory_saver_adapter.region():
+            self.model = get_model(
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device_config=DeviceConfig(self.device),
+            )
+
+        if self.server_args.kv_cache_dtype == "fp8_e4m3":
+            if self.server_args.quantization_param_path is not None:
+                if callable(getattr(self.model, "load_kv_cache_scales", None)):
+                    self.model.load_kv_cache_scales(
+                        self.server_args.quantization_param_path
+                    )
+                    logger.info(
+                        "Loaded KV cache scaling factors from %s",
+                        self.server_args.quantization_param_path,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Using FP8 KV cache and scaling factors provided but "
+                        "model %s does not support loading scaling factors.",
+                        self.model.__class__,
+                    )
+            else:
+                logger.warning(
+                    "Using FP8 KV cache but no scaling factors "
+                    "provided. Defaulting to scaling factors of 1.0. "
+                    "This may lead to less accurate results!"
+                )
 
         # Parse other args
         self.sliding_window_size = (
@@ -393,7 +435,7 @@ class ModelRunner:
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
         try:
@@ -491,7 +533,7 @@ class ModelRunner:
             )
         else:
             cell_size = (
-                self.model_config.get_num_kv_heads(self.tp_size)
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
                 * self.model_config.head_dim
                 * self.model_config.num_hidden_layers
                 * 2
@@ -516,6 +558,9 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e5m2fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
+        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+            if is_cuda():
+                self.kv_cache_dtype = torch.float8_e4m3fn
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -563,6 +608,7 @@ class ModelRunner:
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
             use_records=False,
+            enable_memory_saver=self.server_args.enable_memory_saver,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -575,25 +621,28 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
+                enable_memory_saver=self.server_args.enable_memory_saver,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
             )
         logger.info(
             f"Memory pool end. "
@@ -724,7 +773,7 @@ class ModelRunner:
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)
         else:
-            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     def sample(
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch

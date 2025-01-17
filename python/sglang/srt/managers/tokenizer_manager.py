@@ -18,10 +18,13 @@ import copy
 import dataclasses
 import logging
 import os
+import pickle
 import signal
 import sys
+import threading
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
@@ -43,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     CloseSessionReqInput,
+    ConfigureLoggingReq,
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
@@ -53,6 +57,10 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -71,6 +79,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -105,14 +114,15 @@ class TokenizerManager:
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
+        self.log_requests = server_args.log_requests
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name
+            context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
 
         # Read model args
@@ -163,6 +173,9 @@ class TokenizerManager:
         # Store states
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.dump_requests_folder = ""  # By default do not dump
+        self.dump_requests_threshold = 1000
+        self.dump_request_list: List[Tuple] = []
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
@@ -186,6 +199,12 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_weights_by_name_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.release_memory_occupation_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -215,7 +234,7 @@ class TokenizerManager:
 
         obj.normalize_batch_and_arguments()
 
-        if self.server_args.log_requests:
+        if self.log_requests:
             logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)}")
 
         async with self.model_update_lock.reader_lock:
@@ -248,10 +267,16 @@ class TokenizerManager:
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
-        elif obj.input_ids is None:
-            input_ids = self.tokenizer.encode(input_text)
-        else:
+        elif obj.input_ids is not None:
             input_ids = obj.input_ids
+        else:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept text prompts. Please provide input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
+                )
+            input_ids = self.tokenizer.encode(input_text)
 
         if self.is_generation:
             # TODO: also support getting embeddings for multimodal models
@@ -267,10 +292,26 @@ class TokenizerManager:
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-        if obj.input_ids is not None and len(input_ids) >= self.context_len:
+        input_token_num = len(input_ids) if input_ids is not None else 0
+        if input_token_num >= self.context_len:
             raise ValueError(
-                f"The input ({len(input_ids)} tokens) is longer than the "
+                f"The input ({input_token_num} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
+            )
+
+        if (
+            obj.sampling_params.get("max_new_tokens") is not None
+            and obj.sampling_params.get("max_new_tokens") + input_token_num
+            >= self.context_len
+        ):
+            raise ValueError(
+                f"Requested token count exceeds the model's maximum context length "
+                f"of {self.context_len} tokens. You requested a total of "
+                f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
+                f"tokens: {input_token_num} tokens from the input messages and "
+                f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
+                f"completion. Please reduce the number of tokens in the input "
+                f"messages or the completion to fit within the limit."
             )
 
         # Parse sampling parameters
@@ -336,7 +377,7 @@ class TokenizerManager:
 
             state.out_list = []
             if state.finished:
-                if self.server_args.log_requests:
+                if self.log_requests:
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
                     logger.info(msg)
                 del self.rid_to_state[obj.rid]
@@ -548,6 +589,22 @@ class TokenizerManager:
         else:
             return all_parameters
 
+    async def release_memory_occupation(
+        self,
+        obj: ReleaseMemoryOccupationReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        await self.release_memory_occupation_communicator(obj)
+
+    async def resume_memory_occupation(
+        self,
+        obj: ResumeMemoryOccupationReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        await self.resume_memory_occupation_communicator(obj)
+
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -571,6 +628,15 @@ class TokenizerManager:
         assert not self.to_create_loop, "close session should not be the first request"
         await self.send_to_scheduler.send_pyobj(obj)
 
+    def configure_logging(self, obj: ConfigureLoggingReq):
+        if obj.log_requests is not None:
+            self.log_requests = obj.log_requests
+        if obj.dump_requests_folder is not None:
+            self.dump_requests_folder = obj.dump_requests_folder
+        if obj.dump_requests_threshold is not None:
+            self.dump_requests_threshold = obj.dump_requests_threshold
+        logging.info(f"Config logging: {obj=}")
+
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
@@ -591,17 +657,30 @@ class TokenizerManager:
 
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.handle_loop))
+        )
 
-        signal_handler = SignalHandler(self)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
-        self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
+        # We cannot add signal handler when the tokenizer manager is not in
+        # the main thread due to the CPython limitation.
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = SignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        else:
+            logger.warning(
+                "Signal handler is not added because the tokenizer manager is "
+                "not in the main thread. This disables graceful shutdown of the "
+                "tokenizer manager when SIGTERM is received."
+            )
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
 
-        # drain requests
+        # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
             logger.info(
@@ -627,6 +706,8 @@ class TokenizerManager:
                 UpdateWeightsFromDistributedReqOutput,
                 GetWeightsByNameReqOutput,
                 InitWeightsUpdateGroupReqOutput,
+                ReleaseMemoryOccupationReqOutput,
+                ResumeMemoryOccupationReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
@@ -663,13 +744,6 @@ class TokenizerManager:
                             "text": recv_obj.output_strs[i],
                             "meta_info": meta_info,
                         }
-                        if self.server_args.return_token_ids:
-                            out_dict.update(
-                                {
-                                    "input_ids": recv_obj.origin_input_ids[i],
-                                    "output_ids": recv_obj.output_ids[i],
-                                }
-                            )
                     elif isinstance(recv_obj, BatchTokenIDOut):
                         out_dict = {
                             "token_ids": recv_obj.output_ids[i],
@@ -685,42 +759,14 @@ class TokenizerManager:
                     state.finished = recv_obj.finished_reasons[i] is not None
                     state.event.set()
 
-                    if self.enable_metrics:
-                        completion_tokens = (
-                            recv_obj.completion_tokens[i]
-                            if recv_obj.completion_tokens
-                            else 0
-                        )
-
-                        if state.first_token_time is None:
-                            state.first_token_time = time.time()
-                            self.metrics_collector.observe_time_to_first_token(
-                                state.first_token_time - state.created_time
-                            )
-                        else:
-                            if completion_tokens >= 2:
-                                # Compute time_per_output_token for the streaming case
-                                self.metrics_collector.observe_time_per_output_token(
-                                    (time.time() - state.first_token_time)
-                                    / (completion_tokens - 1)
-                                )
-
-                        if state.finished:
-                            self.metrics_collector.inc_prompt_tokens(
-                                recv_obj.prompt_tokens[i]
-                            )
-                            self.metrics_collector.inc_generation_tokens(
-                                completion_tokens
-                            )
-                            self.metrics_collector.observe_e2e_request_latency(
-                                time.time() - state.created_time
-                            )
-                            # Compute time_per_output_token for the non-streaming case
-                            if not state.obj.stream and completion_tokens >= 1:
-                                self.metrics_collector.observe_time_per_output_token(
-                                    (time.time() - state.created_time)
-                                    / completion_tokens
-                                )
+                    if self.enable_metrics and state.obj.log_metrics:
+                        self.collect_metrics(state, recv_obj, i)
+                    if (
+                        self.dump_requests_folder
+                        and state.finished
+                        and state.obj.log_metrics
+                    ):
+                        self.dump_requests(state, out_dict)
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
                     recv_obj.session_id if recv_obj.success else None
@@ -750,6 +796,10 @@ class TokenizerManager:
                 self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
             elif isinstance(recv_obj, GetWeightsByNameReqOutput):
                 self.get_weights_by_name_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, ReleaseMemoryOccupationReqOutput):
+                self.release_memory_occupation_communicator.handle_recv(recv_obj)
+            elif isinstance(recv_obj, ResumeMemoryOccupationReqOutput):
+                self.resume_memory_occupation_communicator.handle_recv(recv_obj)
             else:
                 raise ValueError(f"Invalid object: {recv_obj=}")
 
@@ -771,9 +821,6 @@ class TokenizerManager:
             recv_obj.output_token_logprobs_idx[recv_obj_index],
             return_text_in_logprobs,
         )
-        meta_info["normalized_prompt_logprob"] = recv_obj.normalized_prompt_logprob[
-            recv_obj_index
-        ]
 
         if top_logprobs_num > 0:
             meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
@@ -822,6 +869,79 @@ class TokenizerManager:
             else:
                 ret.append(None)
         return ret
+
+    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
+        completion_tokens = (
+            recv_obj.completion_tokens[i]
+            if getattr(recv_obj, "completion_tokens", None)
+            else 0
+        )
+
+        if state.first_token_time is None:
+            state.first_token_time = time.time()
+            self.metrics_collector.observe_time_to_first_token(
+                state.first_token_time - state.created_time
+            )
+        else:
+            if completion_tokens >= 2:
+                # Compute time_per_output_token for the streaming case
+                self.metrics_collector.observe_time_per_output_token(
+                    (time.time() - state.first_token_time) / (completion_tokens - 1)
+                )
+
+        if state.finished:
+            self.metrics_collector.observe_one_finished_request(
+                recv_obj.prompt_tokens[i], completion_tokens
+            )
+            self.metrics_collector.observe_e2e_request_latency(
+                time.time() - state.created_time
+            )
+            # Compute time_per_output_token for the non-streaming case
+            if (
+                hasattr(state.obj, "stream")
+                and not state.obj.stream
+                and completion_tokens >= 1
+            ):
+                self.metrics_collector.observe_time_per_output_token(
+                    (time.time() - state.created_time) / completion_tokens
+                )
+
+    def dump_requests(self, state: ReqState, out_dict: dict):
+        self.dump_request_list.append(
+            (state.obj, out_dict, state.created_time, time.time())
+        )
+
+        if len(self.dump_request_list) >= self.dump_requests_threshold:
+            filename = os.path.join(
+                self.dump_requests_folder,
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
+            )
+            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
+
+            to_dump = self.dump_request_list
+            self.dump_request_list = []
+
+            def background_task():
+                os.makedirs(self.dump_requests_folder, exist_ok=True)
+                with open(filename, "wb") as f:
+                    pickle.dump(to_dump, f)
+
+            # Schedule the task to run in the background without awaiting it
+            asyncio.create_task(asyncio.to_thread(background_task))
+
+
+async def print_exception_wrapper(func):
+    """
+    Sometimes an asyncio function does not print exception.
+    We do another wrapper to handle the exception.
+    """
+    try:
+        await func()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(1)
 
 
 class SignalHandler:
