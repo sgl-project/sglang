@@ -252,23 +252,23 @@ class TestSRTEndpoint(unittest.TestCase):
     def test_custom_logit_processor(self):
         """Test custom logit processor with custom params."""
 
-        class DummyLogitProcessor(CustomLogitProcessor):
-            """A dummy logit processor that changes the logits into a tensor of
-            the same shape with a single value input from the custom params.
+        custom_params = {"token_id": 5}
+
+        class DeterministicLogitProcessor(CustomLogitProcessor):
+            """A dummy logit processor that changes the logits to always
+            sample the given token id.
             """
 
             def __call__(self, logits, custom_param_list):
-                import torch
-
                 assert logits.shape[0] == len(custom_param_list)
-                key = "value"
+                key = "token_id"
 
-                merged_params = torch.tensor(
-                    [custom_param_list[i][key] for i in range(len(custom_param_list))],
-                    dtype=torch.float,
-                ).to(device=logits.device, non_blocking=True)
-
-                return merged_params.unsqueeze(1) * torch.ones_like(logits)
+                for i, param_dict in enumerate(custom_param_list):
+                    # Mask all other tokens
+                    logits[i, :] = -float("inf")
+                    # Assign highest probability to the specified token
+                    logits[i, param_dict[key]] = 0.0
+                return logits
 
         prompts = "Question: Is Paris the Capital of France? Answer:"
 
@@ -281,8 +281,8 @@ class TestSRTEndpoint(unittest.TestCase):
 
         # Custom json data with custom logit processor and params.
         custom_json = base_json.copy()
-        custom_json["custom_logit_processor"] = DummyLogitProcessor().to_str()
-        custom_json["sampling_params"]["custom_params"] = {"value": 5.0}
+        custom_json["custom_logit_processor"] = DeterministicLogitProcessor().to_str()
+        custom_json["sampling_params"]["custom_params"] = custom_params
 
         custom_response = requests.post(
             self.base_url + "/generate",
@@ -292,8 +292,8 @@ class TestSRTEndpoint(unittest.TestCase):
         output_token_logprobs = custom_response["meta_info"]["output_token_logprobs"]
         sampled_tokens = [x[1] for x in output_token_logprobs]
 
-        # The logit processor should always sample the same token as the logits is deterministic.
-        self.assertEqual(len(set(sampled_tokens)), 1)
+        # The logit processor should always sample the given token as the logits is deterministic.
+        self.assertTrue(all(x == custom_params["token_id"] for x in sampled_tokens))
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")
