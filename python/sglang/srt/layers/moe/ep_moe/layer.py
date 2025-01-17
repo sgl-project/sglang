@@ -5,7 +5,6 @@ import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -25,6 +24,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.utils import is_hip, set_weight_attrs
 
 logger = logging.getLogger(__name__)
