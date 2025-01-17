@@ -100,8 +100,11 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         max_bs = model_runner.req_to_token_pool.size
         print(f"max batch size = {max_bs}")
+        # mixed mode: one fore prefill, one for decode
         self.kv_indptr = [
-            torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+            torch.zeros(
+                (max_bs + 1 + 1,), dtype=torch.int32, device=model_runner.device
+            )
             for _ in range(self.num_wrappers)
         ]
         self.kv_last_page_len = torch.ones(
@@ -227,6 +230,8 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             # Part2: Decode
+            # since the `decode_start_idx` only used in the mixed mode
+            # Manually update it so we do not need change the update method
             self.indices_updater_decode.decode_start_idx = extend_bs
             self.indices_updater_decode.update(
                 req_pool_indices_decode,
@@ -236,8 +241,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens_decode,
                 spec_info=forward_batch.spec_info,
             )
-            # since the `decode_start_idx` only used in the mixed mode
-            # Manually update it so we do not need change the update method
 
             self.forward_metadata = MixedMetadata(
                 self.prefill_wrappers_paged,
@@ -395,6 +398,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
+        print(
+            f"init_forward_metadata_replay_cuda_graph for bs={bs}, forward mode = {forward_mode}"
+        )
         if forward_mode.is_decode():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -791,17 +797,65 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInfo],
     ):
         shift_pos = self.decode_start_idx
+        if shift_pos > 0:
+            if spec_info is None:
+                bs = len(req_pool_indices)
+                print("====Decode call_begin_forward====")
+                print(
+                    f"req_pool_indices={req_pool_indices}, paged_kernel_lens={paged_kernel_lens}, shift_pos = {shift_pos}"
+                )
+                print(f"kv_indptr init :, {kv_indptr[:20]}")
+
+                kv_indptr[1 + shift_pos] = 0
+                kv_indptr[2 + shift_pos : 2 + shift_pos + bs] = torch.cumsum(
+                    paged_kernel_lens, dim=0
+                )
+                kv_indptr_decode = kv_indptr[1 + shift_pos : 2 + shift_pos + bs].clone()
+
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+                )
+                print(f"kv_indptr before modification:, {kv_indptr[:20]}")
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr_decode,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
+                print(f"kv_indptr after modification:, {kv_indptr[:20]}")
+                print(f"kv_indices={kv_indices}")
+            else:
+                bs, kv_indices, kv_indptr_decode = spec_info.generate_attn_arg_decode(
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    self.req_to_token,
+                )
+
+            wrapper.end_forward()
+
+            kv_last_page_len_decode = self.kv_last_page_len[
+                shift_pos : shift_pos + bs
+            ].clone()
+            wrapper.begin_forward(
+                kv_indptr_decode,
+                kv_indices,
+                kv_last_page_len_decode,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                data_type=self.data_type,
+                q_data_type=self.q_data_type,
+            )
+            return
+
         if spec_info is None:
             bs = len(req_pool_indices)
-            print("====Decode call_begin_forward====")
-            print(
-                f"req_pool_indices={req_pool_indices}, paged_kernel_lens={paged_kernel_lens}, decode_start_idx={self.decode_start_idx}, shift_pos = {shift_pos}"
-            )
-            print(f"kv_indptr before modification:, {kv_indptr[:20]}")
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr[0] = 0
-            # kv_indptr = kv_indptr[shift_pos : bs + 1 + shift_pos]
-
+            kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
                 paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
             )
@@ -809,14 +863,11 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                kv_indptr[: bs + 1],
+                kv_indptr,
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
             )
-            print(f"kv_indptr after modification:, {kv_indptr[:20]}")
-            print(f"kv_indices={kv_indices}")
-            print("========")
         else:
             bs, kv_indices, kv_indptr = spec_info.generate_attn_arg_decode(
                 req_pool_indices,
@@ -826,18 +877,15 @@ class FlashInferIndicesUpdaterDecode:
 
         wrapper.end_forward()
         wrapper.begin_forward(
-            kv_indptr[: bs + 1],
+            kv_indptr,
             kv_indices,
-            self.kv_last_page_len[shift_pos : bs + shift_pos],
+            self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
             1,
             data_type=self.data_type,
             q_data_type=self.q_data_type,
-        )
-        print(
-            f"decode kv_last_page_len = {self.kv_last_page_len[shift_pos:bs+shift_pos]}"
         )
 
 
@@ -1020,18 +1068,19 @@ class FlashInferIndicesUpdaterPrefill:
             print(
                 f"req_pool_indices={req_pool_indices}, paged_kernel_lens={paged_kernel_lens}"
             )
-            print(f"kv_indptr before modification:, {kv_indptr[:20]}")
+            print(f"kv_indptr init :, {kv_indptr[:20]}")
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr[0] = 0
-            # kv_indptr = kv_indptr[: bs + 1]
+            kv_indptr = kv_indptr[: bs + 1]
+            assert kv_indptr[0] == 0, "the first element should be zero"
             kv_indices = torch.empty(
                 paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
             )
+            print(f"kv_indptr before modification:, {kv_indptr[:20]}")
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                kv_indptr[: bs + 1],
+                kv_indptr,
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
@@ -1069,9 +1118,7 @@ class FlashInferIndicesUpdaterPrefill:
         wrapper_paged.end_forward()
         wrapper_paged.begin_forward(
             qo_indptr,
-            kv_indptr[
-                : bs + 1
-            ],  # TODO(lihu): spec_info is not empty should consider, pass or modified?
+            kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
@@ -1081,7 +1128,6 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             custom_mask=custom_mask,
         )
-        print(f"forward kv_last_page_len = {self.kv_last_page_len[:bs]}")
 
 
 @triton.jit
