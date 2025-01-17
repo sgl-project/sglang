@@ -640,6 +640,7 @@ class Scheduler:
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 stream=recv_req.stream,
+                enable_custom_logit_processor=self.server_args.enable_custom_logit_processor,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
