@@ -27,18 +27,14 @@ import logging
 import threading
 from enum import IntEnum
 from functools import wraps
-import threading
-from enum import IntEnum
-from functools import wraps
 from typing import List, Tuple, Union
 
-import psutil
 import numpy as np
 import psutil
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import debug_timing, debug_timing, get_compiler_backend
+from sglang.srt.utils import debug_timing, get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
