@@ -1,4 +1,5 @@
 import heapq
+import logging
 import time
 from typing import List, Optional
 
@@ -11,6 +12,8 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, _key_match
+
+logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
@@ -25,7 +28,10 @@ class HiRadixCache(RadixCache):
             token_to_kv_pool, self.token_to_kv_pool_host
         )
 
-        self.id_to_node = {}
+        # record the nodes with ongoing write through
+        self.ongoing_write_through = {}
+        # record the node segments with ongoing load back
+        self.ongoing_load_back = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = 1
         self.load_back_threshold = 10
@@ -33,6 +39,7 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
+        self.token_to_kv_pool_host.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -61,25 +68,39 @@ class HiRadixCache(RadixCache):
                 )
             if host_indices is not None:
                 node.host_value = host_indices
-                self.id_to_node[node.id] = node
+                self.ongoing_write_through[node.id] = node
                 self.inc_lock_ref(node)
             else:
                 # todo, check broken chains
                 pass
 
+    def writing_check(self):
+        while not self.cache_controller.ack_write_queue.empty():
+            try:
+                ack_id = self.cache_controller.ack_write_queue.get_nowait()
+                self.dec_lock_ref(self.ongoing_write_through[ack_id])
+                # clear the reference
+                del self.ongoing_write_through[ack_id]
+            except Exception:
+                break
+
+    def loading_check(self):
+        while not self.cache_controller.ack_load_queue.empty():
+            try:
+                ack_id = self.cache_controller.ack_load_queue.get_nowait()
+                start_node, end_node = self.ongoing_load_back[ack_id]
+                self.dec_lock_ref(end_node)
+                while end_node != start_node:
+                    assert end_node.loading
+                    end_node.loading = False
+                    end_node = end_node.parent
+                # clear the reference
+                del self.ongoing_load_back[ack_id]
+            except Exception:
+                break
+
     def evictable_size(self):
-        if (
-            self.cache_controller.write_policy == "write_through"
-            or self.cache_controller.write_policy == "write_through_selective"
-        ):
-            while not self.cache_controller.ack_write_queue.empty():
-                try:
-                    ack_id = self.cache_controller.ack_write_queue.get_nowait()
-                    self.dec_lock_ref(self.id_to_node[ack_id])
-                    # clear the reference
-                    del self.id_to_node[ack_id]
-                except Exception:
-                    break
+        self.writing_check()
         self.loading_check()
         return self.evictable_size_
 
@@ -103,6 +124,9 @@ class HiRadixCache(RadixCache):
                 elif self.cache_controller.write_policy == "write_through_selective":
                     num_evicted += self._evict_write_through_selective(x)
                 else:
+                    assert (
+                        self.cache_controller.write_policy != "write_through"
+                    ), "write_through should be inclusive"
                     raise NotImplementedError
             else:
                 # assert self.token_to_kv_pool_host.is_synced(x.host_value), (
@@ -169,6 +193,7 @@ class HiRadixCache(RadixCache):
             x = heapq.heappop(leaves)
             if x == self.root_node:
                 break
+            # only evict the host value of evicted nodes
             if not x.evicted:
                 continue
             assert x.lock_ref == 0 and x.host_value is not None
@@ -194,7 +219,7 @@ class HiRadixCache(RadixCache):
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
-            last_node = node
+            ancester_node = node
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
@@ -202,7 +227,8 @@ class HiRadixCache(RadixCache):
             # skip loading back if the total size is too small
             return None
 
-        self.inc_lock_ref(last_node)
+        # protect the ancestor nodes from eviction
+        self.inc_lock_ref(ancester_node)
         device_indices = self.cache_controller.load(
             host_indices=host_indices, node_id=last_hit_node.id
         )
@@ -211,36 +237,25 @@ class HiRadixCache(RadixCache):
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
             )
-        self.dec_lock_ref(last_node)
+        self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
             return None
 
-        self.id_to_node[last_hit_node.id] = last_hit_node
+        self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
+            node.loading = True
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
-        last_hit_node.loading = True
 
         return device_indices
 
     def loading_complete(self, node: TreeNode):
         self.loading_check()
-        return node.loading
-
-    def loading_check(self):
-        while not self.cache_controller.ack_load_queue.empty():
-            try:
-                ack_id = self.cache_controller.ack_load_queue.get_nowait()
-                node = self.id_to_node[ack_id]
-                node.loading = False
-                self.dec_lock_ref(node)
-                del self.id_to_node[ack_id]
-            except Exception:
-                break
+        return node.loading == False
 
     def match_prefix(self, key: List, load_cache: bool = True, **kwargs):
         value, last_node = super().match_prefix(key, **kwargs)
@@ -289,6 +304,7 @@ class HiRadixCache(RadixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
+        new_node.loading = child.loading
 
         # split value and host value if exists
         if child.evicted:
