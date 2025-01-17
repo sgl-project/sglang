@@ -106,8 +106,10 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            logger.info("MLA optimization is turned on. Use triton backend.")
-            self.server_args.attention_backend = "triton"
+            # TODO: add MLA optimization on CPU
+            if self.server_args.device != "cpu":
+                logger.info("MLA optimization is turned on. Use triton backend.")
+                self.server_args.attention_backend = "triton"
 
         if self.server_args.enable_double_sparsity:
             logger.info(
@@ -164,6 +166,7 @@ class ModelRunner:
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
+                "device": server_args.device,
             }
         )
 
@@ -221,6 +224,8 @@ class ModelRunner:
             backend = "gloo"
         elif self.device == "hpu":
             backend = "hccl"
+        elif self.device == "cpu":
+            backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
@@ -269,7 +274,8 @@ class ModelRunner:
         )
 
         # This can reduce thread conflicts and speed up weight loading.
-        torch.set_num_threads(1)
+        if self.device != "cpu":
+            torch.set_num_threads(1)
         if self.device == "cuda":
             if torch.cuda.get_device_capability()[0] < 8:
                 logger.info(
