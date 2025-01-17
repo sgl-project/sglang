@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 from vllm import _custom_ops as ops
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
@@ -24,6 +23,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
 )
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
