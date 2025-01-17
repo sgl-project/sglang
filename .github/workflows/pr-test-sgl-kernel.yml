@@ -38,6 +38,10 @@ jobs:
           cd sgl-kernel
           find tests -name "test_*.py" | xargs -n 1 python3
 
+      - name: Uninstall dependencies
+        run: |
+          pip3 uninstall sgl-kernel -y
+
   finish:
     needs: [unit-test]
     runs-on: ubuntu-latest
