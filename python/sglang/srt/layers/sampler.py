@@ -146,7 +146,6 @@ class Sampler(nn.Module):
             logits[batch_mask] = processor(
                 logits[batch_mask],
                 [sampling_batch_info.custom_params[i] for i in batch_indices],
-                sampling_batch_info.device,
             )
 
             logger.debug(

@@ -257,7 +257,7 @@ class TestSRTEndpoint(unittest.TestCase):
             the same shape with a single value input from the custom params.
             """
 
-            def __call__(self, logits, custom_param_list, device):
+            def __call__(self, logits, custom_param_list):
                 import torch
 
                 assert logits.shape[0] == len(custom_param_list)
@@ -266,7 +266,7 @@ class TestSRTEndpoint(unittest.TestCase):
                 merged_params = torch.tensor(
                     [custom_param_list[i][key] for i in range(len(custom_param_list))],
                     dtype=torch.float,
-                ).to(device=device, non_blocking=True)
+                ).to(device=logits.device, non_blocking=True)
 
                 return merged_params.unsqueeze(1) * torch.ones_like(logits)
 
