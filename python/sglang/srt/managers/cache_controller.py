@@ -1,7 +1,9 @@
+import concurrent.futures
 import logging
+import math
 import threading
 from queue import PriorityQueue, Queue
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -38,9 +40,26 @@ class CacheOperation:
         self.priority = min(self.priority, other.priority)
         self.node_ids.extend(other.node_ids)
 
-    def split(self) -> "CacheOperation":
+    def split(self, factor) -> List["CacheOperation"]:
         # split an operation into smaller operations to reduce the size of intermediate buffers
-        pass
+        if factor <= 1:
+            return [self]
+
+        chunk_size = math.ceil(len(self.host_indices) / factor)
+        split_ops = []
+        for i in range(0, len(self.host_indices), chunk_size):
+            split_ops.append(
+                CacheOperation(
+                    host_indices=self.host_indices[i : i + chunk_size],
+                    device_indices=self.device_indices[i : i + chunk_size],
+                    node_id=0,
+                )
+            )
+        # Inherit the node_ids on the final chunk
+        if split_ops:
+            split_ops[-1].node_ids = self.node_ids
+
+        return split_ops
 
     def __lt__(self, other: "CacheOperation"):
         return self.priority < other.priority
@@ -99,7 +118,7 @@ class HiCacheController:
         self.ack_load_queue = Queue()
 
         self.write_buffer = TransferBuffer()
-        self.load_buffer = TransferBuffer()
+        self.load_buffer = TransferBuffer(buffer_count=10, max_buffer_size=100)
 
         self.write_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
@@ -163,7 +182,8 @@ class HiCacheController:
                     self.mem_pool_host.transfer(operation.host_indices, operation.data)
                     self.mem_pool_host.complete_io(operation.host_indices)
                     for node_id in operation.node_ids:
-                        self.ack_write_queue.put(node_id)
+                        if node_id != 0:
+                            self.ack_write_queue.put(node_id)
                 except Exception as e:
                     logger.error(e)
 
@@ -183,7 +203,8 @@ class HiCacheController:
                     )
                     self.mem_pool_host.complete_io(operation.host_indices)
                     for node_id in operation.node_ids:
-                        self.ack_load_queue.put(node_id)
+                        if node_id != 0:
+                            self.ack_load_queue.put(node_id)
                 except Exception as e:
                     logger.error(e)
 
@@ -220,10 +241,46 @@ class HiCacheController:
         """
         Auxiliary function to prepare the buffer for load operations.
         """
+        # todo, more auxiliary threads concurrently preparing the buffers
+
+        def _pin_op(op_, put=True):
+            op_.data = (
+                self.mem_pool_host.get_flat_data(op_.host_indices)
+                .contiguous()
+                .pin_memory()
+            )
+            if put:
+                self.load_buffer.put(op_, block=True)
+            return op_
+
         buffer = None
         while True:
             try:
                 operation = self.load_queue.get(block=True)
+                factor = len(operation.host_indices) // self.load_buffer.max_buffer_size
+
+                if factor >= 1:
+                    if buffer is not None:
+                        _pin_op(buffer)
+                        buffer = None
+
+                    if factor < 2:
+                        _pin_op(operation)
+                    else:
+                        split_ops = operation.split(factor)
+                        split_args = [(op_, True) for op_ in split_ops[:-1]]
+                        split_args.append((split_ops[-1], False))
+                        # Spawn threads to pin each op concurrently
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            pinned_ops = list(
+                                executor.map(
+                                    lambda x: _pin_op(x[0], put=x[1]), split_args
+                                )
+                            )
+                        # preserve the order of last op to ensure correct ack
+                        self.load_buffer.put(pinned_ops[-1], block=True)
+                    continue
+
                 if buffer is None:
                     buffer = operation
                 else:
@@ -233,12 +290,7 @@ class HiCacheController:
                     or self.load_queue.empty()
                     or self.load_buffer.empty()
                 ):
-                    buffer.data = (
-                        self.mem_pool_host.get_flat_data(buffer.host_indices)
-                        .contiguous()
-                        .pin_memory()
-                    )
-                    self.load_buffer.put(buffer, block=True)
+                    _pin_op(buffer)
                     buffer = None
             except Exception as e:
                 logger.error(e)
@@ -254,7 +306,8 @@ class HiCacheController:
                 self.mem_pool_host.transfer(operation.host_indices, operation.data)
                 self.mem_pool_host.complete_io(operation.host_indices)
                 for node_id in operation.node_ids:
-                    self.ack_write_queue.put(node_id)
+                    if node_id != 0:
+                        self.ack_write_queue.put(node_id)
 
     def load_thread_func_buffer(self):
         aux_thread = threading.Thread(target=self.load_aux_func, daemon=True)
@@ -267,7 +320,8 @@ class HiCacheController:
                 self.mem_pool_device.transfer(operation.device_indices, operation.data)
                 self.mem_pool_host.complete_io(operation.host_indices)
                 for node_id in operation.node_ids:
-                    self.ack_load_queue.put(node_id)
+                    if node_id != 0:
+                        self.ack_load_queue.put(node_id)
 
     def evict_device(
         self, device_indices: torch.Tensor, host_indices: torch.Tensor
