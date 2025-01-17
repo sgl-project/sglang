@@ -228,6 +228,21 @@ class EAGLEDraftInput(SpecInfo):
         assert len(batch.extend_lens) == 1
         batch.input_ids = torch.concat((batch.input_ids[1:], self.verified_id))
 
+    def retract_reqs(
+        self,
+        keep_indices: List[int] = None,
+    ):
+        # just keep sample output in keep_indices
+        self.sample_output = self.sample_output[keep_indices]
+        self.hidden_states = self.hidden_states[keep_indices]
+        self.verified_id = self.verified_id[keep_indices]
+    def filter_batch(
+        self,
+        keep_indices: List[int] = None,
+    ):
+        self.sample_output = self.sample_output[:len(keep_indices)]
+        self.hidden_states = self.hidden_states[:len(keep_indices)]
+        self.verified_id = self.verified_id[:len(keep_indices)]
     def prepare_for_decode(self, batch: ScheduleBatch):
         prob = self.sample_output  # shape: (b * top_k, vocab) or (b, vocab)
         top = torch.topk(prob, self.topk, dim=-1)
