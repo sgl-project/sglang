@@ -19,7 +19,10 @@ from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
 is_hip_flag = False
 if not is_hip():
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    if torch.cuda.is_available():
+        from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    else:
+        sgl_moe_align_block_size = None
 
     is_hip_flag = False
 else:
