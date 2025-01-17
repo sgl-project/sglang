@@ -18,7 +18,7 @@ class TestFp8Kvcache(unittest.TestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         dirpath = os.path.dirname(__file__)
-        config_file = os.path.join(dirpath, "kv_cache_scales_qwen2_1_5b.json.json")
+        config_file = os.path.join(dirpath, "kv_cache_scales_qwen2_1_5b.json")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
