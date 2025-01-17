@@ -38,6 +38,10 @@ class CacheOperation:
         self.priority = min(self.priority, other.priority)
         self.node_ids.extend(other.node_ids)
 
+    def split(self) -> "CacheOperation":
+        # split an operation into smaller operations to reduce the size of intermediate buffers
+        pass
+
     def __lt__(self, other: "CacheOperation"):
         return self.priority < other.priority
 
@@ -121,10 +125,10 @@ class HiCacheController:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
+        self.mem_pool_host.protect_write(host_indices)
         self.write_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
-        self.mem_pool_host.protect_write(host_indices)
         return host_indices
 
     def load(
@@ -139,10 +143,10 @@ class HiCacheController:
         device_indices = self.mem_pool_device.alloc(len(host_indices))
         if device_indices is None:
             return None
+        self.mem_pool_host.protect_load(host_indices)
         self.load_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
-        self.mem_pool_host.protect_load(host_indices)
         return device_indices
 
     def write_thread_func_direct(self):
