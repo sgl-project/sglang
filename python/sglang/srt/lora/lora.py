@@ -19,18 +19,11 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 
-import json
-import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
 
-import safetensors.torch
 import torch
 from torch import nn
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -38,7 +31,6 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
 

@@ -21,10 +21,10 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
-from vllm.distributed import get_tensor_model_parallel_rank
-from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -122,6 +122,7 @@ class CudaGraphRunner:
         self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
         self.tp_size = self.model_runner.tp_size
+        self.dp_size = self.model_runner.server_args.dp_size
 
         # Batch sizes to capture
         self.capture_bs = self.model_runner.server_args.cuda_graph_bs
@@ -130,11 +131,6 @@ class CudaGraphRunner:
                 self.capture_bs = list(range(1, 33)) + [64, 128]
             else:
                 self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
-
-        if model_runner.server_args.disable_cuda_graph_padding:
-            self.capture_bs = list(range(1, 33)) + [64, 128]
-        else:
-            self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
 
         if max(self.capture_bs) > model_runner.req_to_token_pool.size:
             # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -223,7 +219,7 @@ class CudaGraphRunner:
             if self.enable_dp_attention:
                 self.gathered_buffer = torch.zeros(
                     (
-                        self.max_bs * self.tp_size,
+                        self.max_bs * self.dp_size,
                         self.model_runner.model_config.hidden_size,
                     ),
                     dtype=self.model_runner.dtype,

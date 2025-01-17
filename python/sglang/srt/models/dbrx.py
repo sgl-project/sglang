@@ -19,14 +19,14 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from vllm.distributed import (
+from vllm.model_executor.layers.rotary_embedding import get_rope
+
+from sglang.srt.configs import DbrxConfig
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.transformers_utils.configs.dbrx import DbrxConfig
-
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
