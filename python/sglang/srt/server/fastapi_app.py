@@ -2,12 +2,11 @@ import dataclasses
 import dataclasses
 import logging
 from http import HTTPStatus
-from typing import AsyncIterator, Optional
+from typing import Optional
 
-import orjson
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.responses import ORJSONResponse, Response
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -126,33 +125,7 @@ async def get_server_info():
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    if obj.stream:
-
-        async def stream_results() -> AsyncIterator[bytes]:
-            try:
-                async for out in _global_state.engine.tokenizer_manager.generate_request(obj, request):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
-            except ValueError as e:
-                out = {"error": {"message": str(e)}}
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
-            yield b"data: [DONE]\n\n"
-
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
-            background=_global_state.engine.tokenizer_manager.create_abort_task(obj),
-        )
-    else:
-        try:
-            ret = await _global_state.engine.tokenizer_manager.generate_request(obj, request).__anext__()
-            return ret
-        except ValueError as e:
-            logger.error(f"Error: {e}")
-            return create_error_response(e)
+    return await _global_state.engine._generate_raw(obj, request)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
