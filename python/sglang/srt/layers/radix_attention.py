@@ -20,10 +20,7 @@ import torch
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
-
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 class RadixAttention(nn.Module):
     """
@@ -64,10 +61,15 @@ class RadixAttention(nn.Module):
             if isinstance(rope, (list, tuple)):
                 _, self.rope_cos, self.rope_sin = rope
             else:
-                cos_sin = rope.cos_sin_cache
-                cos, sin = cos_sin.chunk(2, dim=-1)
-                self.rope_cos = cos.repeat(1, 2)
-                self.rope_sin = sin.repeat(1, 2)
+                assert isinstance(rope, RotaryEmbedding)
+                if hasattr(rope, 'repeated_cos_sin_cache'):
+                    self.rope_cos, self.rope_sin = rope.repeated_cos_sin_cache
+                else:
+                    cos_sin = rope.cos_sin_cache
+                    cos, sin = cos_sin.chunk(2, dim=-1)
+                    self.rope_cos = cos.repeat(1, 2)
+                    self.rope_sin = sin.repeat(1, 2)
+                    rope.repeated_cos_sin_cache = (self.rope_cos, self.rope_sin)
         else:
             self.rope_cos = self.rope_sin = None
 
