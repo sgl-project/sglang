@@ -39,7 +39,7 @@ jobs:
 
       - name: Execute notebooks and push to documents
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.DOCUMENTATION_PAT_TOKEN }}
         run: |
           cd docs
           make clean

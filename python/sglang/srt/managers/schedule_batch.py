@@ -65,6 +65,7 @@ global_server_args_dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "device": ServerArgs.device,
 }
 
 
@@ -226,8 +227,9 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-        self.output_ids = []  # Each decode stage's output ids
-        self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+        # Each decode stage's output ids
+        self.output_ids = []
+        # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -265,6 +267,7 @@ class Req:
         # Prefix info
         self.prefix_indices = []
         # Tokens to run prefill. input_tokens - shared_prefix_tokens.
+        # Updated if chunked.
         self.extend_input_len = 0
         self.last_node = None
 
@@ -280,11 +283,10 @@ class Req:
         self.top_logprobs_num = top_logprobs_num
 
         # Logprobs (return value)
-        self.normalized_prompt_logprob = None
-        self.input_token_logprobs_val = None
-        self.input_token_logprobs_idx = None
-        self.input_top_logprobs_val = None
-        self.input_top_logprobs_idx = None
+        self.input_token_logprobs_val: Optional[List[float]] = None
+        self.input_token_logprobs_idx: Optional[List[int]] = None
+        self.input_top_logprobs_val: Optional[List[float]] = None
+        self.input_top_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
             self.output_token_logprobs_val = []
@@ -344,9 +346,6 @@ class Req:
             max_prefix_len = min(max_prefix_len, input_len - 1)
 
         if self.return_logprob:
-            if self.normalized_prompt_logprob is None:
-                # Need at least two tokens to compute normalized logprob
-                max_prefix_len = min(max_prefix_len, input_len - 2)
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
@@ -1007,6 +1006,11 @@ class ScheduleBatch:
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+            enable_overlap_schedule=self.enable_overlap,
+        )
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
@@ -1121,7 +1125,7 @@ class ScheduleBatch:
             self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(self):
-        if self.forward_mode.is_decode() or self.forward_mode.is_idle():
+        if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens

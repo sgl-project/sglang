@@ -21,6 +21,7 @@ import os
 import pickle
 import signal
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -78,6 +79,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -117,10 +119,10 @@ class TokenizerManager:
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name
+            context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
 
         # Read model args
@@ -265,10 +267,16 @@ class TokenizerManager:
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
-        elif obj.input_ids is None:
-            input_ids = self.tokenizer.encode(input_text)
-        else:
+        elif obj.input_ids is not None:
             input_ids = obj.input_ids
+        else:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept text prompts. Please provide input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
+                )
+            input_ids = self.tokenizer.encode(input_text)
 
         if self.is_generation:
             # TODO: also support getting embeddings for multimodal models
@@ -284,10 +292,26 @@ class TokenizerManager:
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-        if obj.input_ids is not None and len(input_ids) >= self.context_len:
+        input_token_num = len(input_ids) if input_ids is not None else 0
+        if input_token_num >= self.context_len:
             raise ValueError(
-                f"The input ({len(input_ids)} tokens) is longer than the "
+                f"The input ({input_token_num} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
+            )
+
+        if (
+            obj.sampling_params.get("max_new_tokens") is not None
+            and obj.sampling_params.get("max_new_tokens") + input_token_num
+            >= self.context_len
+        ):
+            raise ValueError(
+                f"Requested token count exceeds the model's maximum context length "
+                f"of {self.context_len} tokens. You requested a total of "
+                f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
+                f"tokens: {input_token_num} tokens from the input messages and "
+                f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
+                f"completion. Please reduce the number of tokens in the input "
+                f"messages or the completion to fit within the limit."
             )
 
         # Parse sampling parameters
@@ -633,11 +657,24 @@ class TokenizerManager:
 
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.handle_loop))
+        )
 
-        signal_handler = SignalHandler(self)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
-        self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
+        # We cannot add signal handler when the tokenizer manager is not in
+        # the main thread due to the CPython limitation.
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = SignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        else:
+            logger.warning(
+                "Signal handler is not added because the tokenizer manager is "
+                "not in the main thread. This disables graceful shutdown of the "
+                "tokenizer manager when SIGTERM is received."
+            )
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -722,9 +759,13 @@ class TokenizerManager:
                     state.finished = recv_obj.finished_reasons[i] is not None
                     state.event.set()
 
-                    if self.enable_metrics:
+                    if self.enable_metrics and state.obj.log_metrics:
                         self.collect_metrics(state, recv_obj, i)
-                    if self.dump_requests_folder and state.finished:
+                    if (
+                        self.dump_requests_folder
+                        and state.finished
+                        and state.obj.log_metrics
+                    ):
                         self.dump_requests(state, out_dict)
             elif isinstance(recv_obj, OpenSessionReqOutput):
                 self.session_futures[recv_obj.session_id].set_result(
@@ -780,9 +821,6 @@ class TokenizerManager:
             recv_obj.output_token_logprobs_idx[recv_obj_index],
             return_text_in_logprobs,
         )
-        meta_info["normalized_prompt_logprob"] = recv_obj.normalized_prompt_logprob[
-            recv_obj_index
-        ]
 
         if top_logprobs_num > 0:
             meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
@@ -874,18 +912,36 @@ class TokenizerManager:
         )
 
         if len(self.dump_request_list) >= self.dump_requests_threshold:
+            filename = os.path.join(
+                self.dump_requests_folder,
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
+            )
+            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
+
             to_dump = self.dump_request_list
             self.dump_request_list = []
 
             def background_task():
                 os.makedirs(self.dump_requests_folder, exist_ok=True)
-                current_time = datetime.now()
-                filename = current_time.strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
-                with open(os.path.join(self.dump_requests_folder, filename), "wb") as f:
+                with open(filename, "wb") as f:
                     pickle.dump(to_dump, f)
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
+
+
+async def print_exception_wrapper(func):
+    """
+    Sometimes an asyncio function does not print exception.
+    We do another wrapper to handle the exception.
+    """
+    try:
+        await func()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(1)
 
 
 class SignalHandler:

@@ -22,13 +22,12 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import LlamaConfig
-from vllm.distributed import (
+from vllm.model_executor.layers.rotary_embedding import get_rope
+
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import kv_cache_scales_loader
-
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -45,7 +44,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    kv_cache_scales_loader,
+)
 from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
 
