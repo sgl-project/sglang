@@ -61,6 +61,8 @@ class Engine:
 
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
         tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+        self.tokenizer_manager = tokenizer_manager
+        self.scheduler_info = scheduler_info
 
     def generate(
         self,
@@ -164,12 +166,10 @@ class Engine:
         kill_process_tree(os.getpid(), include_parent=False)
 
     def get_tokenizer(self):
-        global tokenizer_manager
-
-        if tokenizer_manager is None:
+        if self.tokenizer_manager is None:
             raise ReferenceError("Tokenizer Manager is not initialized.")
         else:
-            return tokenizer_manager.tokenizer
+            return self.tokenizer_manager.tokenizer
 
     def encode(
         self,
@@ -182,15 +182,15 @@ class Engine:
         return loop.run_until_complete(encode_request(obj, None))
 
     def start_profile(self):
-        tokenizer_manager.start_profile()
+        self.tokenizer_manager.start_profile()
 
     def stop_profile(self):
-        tokenizer_manager.stop_profile()
+        self.tokenizer_manager.stop_profile()
 
     def get_server_info(self):
         return {
-            **dataclasses.asdict(tokenizer_manager.server_args),  # server args
-            **scheduler_info,
+            **dataclasses.asdict(self.tokenizer_manager.server_args),  # server args
+            **self.scheduler_info,
             "version": __version__,
         }
 
@@ -214,7 +214,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            tokenizer_manager.init_weights_update_group(obj, None)
+            self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
     def update_weights_from_distributed(self, name, dtype, shape):
@@ -226,7 +226,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            tokenizer_manager.update_weights_from_distributed(obj, None)
+            self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
     def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
@@ -236,26 +236,26 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            tokenizer_manager.update_weights_from_tensor(obj, None)
+            self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
     def get_weights_by_name(self, name, truncate_size=100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(tokenizer_manager.get_weights_by_name(obj, None))
+        return loop.run_until_complete(self.tokenizer_manager.get_weights_by_name(obj, None))
 
     def release_memory_occupation(self):
         """Release GPU occupation temporarily"""
         obj = ReleaseMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(tokenizer_manager.release_memory_occupation(obj, None))
+        loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
 
     def resume_memory_occupation(self):
         """Resume GPU occupation"""
         obj = ResumeMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(tokenizer_manager.resume_memory_occupation(obj, None))
+        loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
 
 
 def _launch_subprocesses(
