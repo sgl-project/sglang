@@ -3,10 +3,11 @@ import dataclasses
 import logging
 import multiprocessing as mp
 from http import HTTPStatus
-from typing import AsyncIterator, Dict
+from typing import AsyncIterator, Dict, Optional
 
 import torch
 
+from sglang.srt.server import Engine
 from sglang.srt.server.utils import create_error_response
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -62,6 +63,21 @@ app.add_middleware(
 
 tokenizer_manager: TokenizerManager = None
 scheduler_info: Dict = None
+
+##### Global States #####
+
+
+@dataclasses.dataclass
+class _GlobalState:
+    engine: Engine
+
+
+_global_state: Optional[_GlobalState] = None
+
+
+def setup_global_state(engine: Engine):
+    global _global_state
+    _global_state = _GlobalState(engine=engine)
 
 
 ##### Native API endpoints #####
