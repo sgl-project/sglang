@@ -565,6 +565,7 @@ def launch_engine(
 
     # Assume all schedulers have same scheduler_info
     scheduler_info = scheduler_infos[0]
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
 
 def launch_server(

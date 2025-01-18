@@ -52,7 +52,6 @@ from sglang.srt.server_args import ServerArgs
 if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
-
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 # Put some global args for easy access
@@ -67,7 +66,6 @@ global_server_args_dict = {
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "device": ServerArgs.device,
 }
-
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +147,16 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    # MiniCPMV related
+    # All the images in the batch should share the same special image
+    # bound token ids.
+    im_start_id: Optional[torch.Tensor] = None
+    im_end_id: Optional[torch.Tensor] = None
+    slice_start_id: Optional[torch.Tensor] = None
+    slice_end_id: Optional[torch.Tensor] = None
+
+    tgt_sizes: Optional[list] = None
+
     @staticmethod
     def from_dict(obj: dict):
         ret = ImageInputs(
@@ -168,6 +176,11 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "im_start_id",
+            "im_end_id",
+            "slice_start_id",
+            "slice_end_id",
+            "tgt_sizes",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -1167,7 +1180,6 @@ class ScheduleBatch:
 
         global bid
         bid += 1
-
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
