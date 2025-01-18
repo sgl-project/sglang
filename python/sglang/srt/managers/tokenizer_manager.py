@@ -79,7 +79,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
-from sglang.utils import get_exception_traceback
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -216,6 +216,35 @@ class TokenizerManager:
                     # TODO: Add lora name/path in the future,
                 },
             )
+
+        self._dispatcher = TypeBasedDispatcher(
+            [
+                (BatchStrOut, self._handle_batch_output),
+                (BatchEmbeddingOut, self._handle_batch_output),
+                (BatchTokenIDOut, self._handle_batch_output),
+                (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (
+                    UpdateWeightFromDiskReqOutput,
+                    self._handle_update_weights_from_disk_req_output,
+                ),
+                (
+                    InitWeightsUpdateGroupReqOutput,
+                    self.init_weights_update_group_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromDistributedReqOutput,
+                    self.update_weights_from_distributed_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromTensorReqOutput,
+                    self.update_weights_from_tensor_communicator.handle_recv,
+                ),
+                (
+                    GetWeightsByNameReqOutput,
+                    self.get_weights_by_name_communicator.handle_recv,
+                ),
+            ]
+        )
 
     async def generate_request(
         self,
@@ -698,17 +727,8 @@ class TokenizerManager:
         """The event loop that handles requests"""
 
         while True:
-            recv_obj: Union[
-                BatchStrOut,
-                BatchEmbeddingOut,
-                BatchTokenIDOut,
-                UpdateWeightFromDiskReqOutput,
-                UpdateWeightsFromDistributedReqOutput,
-                GetWeightsByNameReqOutput,
-                InitWeightsUpdateGroupReqOutput,
-                ReleaseMemoryOccupationReqOutput,
-                ResumeMemoryOccupationReqOutput,
-            ] = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            self._dispatcher(recv_obj)
 
             if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
                 for i, rid in enumerate(recv_obj.rids):
