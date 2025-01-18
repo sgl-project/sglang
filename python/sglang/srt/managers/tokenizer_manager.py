@@ -788,17 +788,9 @@ class TokenizerManager:
                     ):
                         self.dump_requests(state, out_dict)
             elif isinstance(recv_obj, OpenSessionReqOutput):
-                self.session_futures[recv_obj.session_id].set_result(
-                    recv_obj.session_id if recv_obj.success else None
-                )
+                pass
             elif isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
-                if self.server_args.dp_size == 1:
-                    self.model_update_result.set_result(recv_obj)
-                else:  # self.server_args.dp_size > 1
-                    self.model_update_tmp.append(recv_obj)
-                    # set future if the all results are recevied
-                    if len(self.model_update_tmp) == self.server_args.dp_size:
-                        self.model_update_result.set_result(self.model_update_tmp)
+                pass
             elif isinstance(recv_obj, InitWeightsUpdateGroupReqOutput):
                 assert (
                     self.server_args.dp_size == 1
@@ -948,6 +940,20 @@ class TokenizerManager:
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
+
+    def _handle_open_session_req_output(self, recv_obj):
+        self.session_futures[recv_obj.session_id].set_result(
+            recv_obj.session_id if recv_obj.success else None
+        )
+
+    def _handle_update_weights_from_disk_req_output(self, recv_obj):
+        if self.server_args.dp_size == 1:
+            self.model_update_result.set_result(recv_obj)
+        else:  # self.server_args.dp_size > 1
+            self.model_update_tmp.append(recv_obj)
+            # set future if the all results are recevied
+            if len(self.model_update_tmp) == self.server_args.dp_size:
+                self.model_update_result.set_result(self.model_update_tmp)
 
 
 async def print_exception_wrapper(func):
