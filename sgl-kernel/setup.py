@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
@@ -67,7 +67,7 @@ ext_modules = [
 setup(
     name="sgl-kernel",
     version=get_version(),
-    packages=["sgl_kernel"],
+    packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
