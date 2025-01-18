@@ -96,7 +96,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.utils import get_exception_traceback
+from sglang.utils import get_exception_traceback, TypeBasedDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +422,26 @@ class Scheduler:
                 },
             )
 
+        self._dispatcher = TypeBasedDispatcher(
+            [
+                (TokenizedGenerateReqInput, self.handle_generate_request),
+                (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (FlushCacheReq, self.flush_cache_wrapped),
+                (AbortReq, self.abort_request),
+                (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
+                (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
+                (
+                    UpdateWeightsFromDistributedReqInput,
+                    self.update_weights_from_distributed,
+                ),
+                (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
+                (GetWeightsByNameReqInput, self.get_weights_by_name),
+                (ProfileReq, self.profile),
+                (OpenSessionReqInput, self.open_session),
+                (CloseSessionReqInput, self.close_session),
+            ]
+        )
+
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one batch takes too long."""
         self.watchdog_last_forward_ct = 0
@@ -563,6 +583,11 @@ class Scheduler:
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
+            output = self._dispatcher(recv_req)
+            if output is not None:
+                self.send_to_tokenizer.send_pyobj(output)
+
+            # TODO rm
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 self.handle_generate_request(recv_req)
             elif isinstance(recv_req, TokenizedEmbeddingReqInput):
