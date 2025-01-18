@@ -439,8 +439,14 @@ class Scheduler:
                 (ProfileReq, self.profile),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
-                (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
-                (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+                (
+                    ReleaseMemoryOccupationReqInput,
+                    lambda _: self.release_memory_occupation(),
+                ),
+                (
+                    ResumeMemoryOccupationReqInput,
+                    lambda _: self.resume_memory_occupation(),
+                ),
             ]
         )
 
