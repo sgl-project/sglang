@@ -1,34 +1,23 @@
 import atexit
-import dataclasses
 import json
 import logging
 import multiprocessing as mp
 import os
 import threading
 import time
-from http import HTTPStatus
 from typing import Dict, List, Optional, Union
-
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 import aiohttp
 import requests
 import uvicorn
-from fastapi.middleware.cors import CORSMiddleware
-
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.server import Engine
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
-    assert_pkg_version,
     delete_directory,
     is_port_available,
     kill_process_tree,
@@ -214,7 +203,11 @@ def launch_server(
     1. The HTTP server and TokenizerManager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-    launch_engine(server_args=server_args)
+    from sglang.srt.server import fastapi_app
+    from sglang.srt.server.fastapi_app import app
+
+    engine = Engine(server_args=server_args)
+    fastapi_app.setup_global_state(engine=engine)
 
     # Add api key authorization
     if server_args.api_key:
