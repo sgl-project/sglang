@@ -82,15 +82,12 @@ class SchedulePolicy:
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False
+        unschedulable_reqs: List[Req] = []
         if isinstance(policy, CacheAwarePolicy):
             prefix_computed = True
-            temporary_deprioritized = self._compute_prefix_matches(
-                waiting_queue, policy
-            )
+            unschedulable_reqs = self._compute_prefix_matches(waiting_queue, policy)
             if policy == CacheAwarePolicy.LPM:
-                SchedulePolicy._sort_by_longest_prefix(
-                    waiting_queue, temporary_deprioritized
-                )
+                SchedulePolicy._sort_by_longest_prefix(waiting_queue)
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
             else:
@@ -105,7 +102,7 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        return prefix_computed
+        return prefix_computed, unschedulable_reqs
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if len(waiting_queue) > 128 and self.policy == CacheAwarePolicy.LPM:
@@ -138,9 +135,12 @@ class SchedulePolicy:
         Computes and caches the matching prefixes for requests in the waiting queue,
             and handles in-batch prefix caching logic.
         """
-        temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
+        # We will remove the requests from the waiting queue and put them into this queue
+        # if they have a matching prefix from the existing batch.
+        # In the next round, we will re-add them to the waiting queue.
+        unschedulable_reqs: List[Req] = []
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
 
@@ -166,26 +166,24 @@ class SchedulePolicy:
                     len(in_batch_matching_prefixes)
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
-                    temporary_deprioritized.add(r.rid)
+                    # Remove from the waiting queue and put into a secondary queue
+                    # so that we don't schedule them unnecessarily.
+                    # In the next round, we will re-add them to the waiting queue.
+                    # TODO (MrAta): since the number of unschedulable requests can be large,
+                    # it might make more sense to modify the waiting_queue in place by swapping it.
+                    r = waiting_queue.pop(waiting_queue.index(r))
+                    unschedulable_reqs.append(r)
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool)
                     )
-        return temporary_deprioritized
+        return unschedulable_reqs
 
     @staticmethod
-    def _sort_by_longest_prefix(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
-    ) -> None:
+    def _sort_by_longest_prefix(waiting_queue: List[Req]) -> None:
         """Sorts the waiting queue based on the longest prefix match."""
-        waiting_queue.sort(
-            key=lambda r: (
-                -len(r.prefix_indices)
-                if r.rid not in temporary_deprioritized
-                else float("inf")
-            )
-        )
+        waiting_queue.sort(key=lambda r: (-len(r.prefix_indices)))
 
     @staticmethod
     def _sort_by_dfs_weight(

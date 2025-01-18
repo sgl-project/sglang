@@ -909,7 +909,9 @@ class Scheduler:
             return None
 
         # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+        prefix_computed, unschedulable_reqs = self.policy.calc_priority(
+            self.waiting_queue
+        )
 
         # Prefill policy
         adder = PrefillAdder(
@@ -969,6 +971,8 @@ class Scheduler:
                 break
 
         # Update waiting queue
+        self.waiting_queue.extend(unschedulable_reqs)
+        del unschedulable_reqs
         can_run_list = adder.can_run_list
         if len(can_run_list) == 0:
             return None
