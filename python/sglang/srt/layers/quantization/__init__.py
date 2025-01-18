@@ -56,25 +56,6 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     return QUANTIZATION_METHODS[quantization]
 
 
-def fp8_get_quant_method(self, layer, prefix):
-    """Enhanced get_quant_method for FP8 config."""
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        is_layer_skipped,
-    )
-
-    from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
-
-    if isinstance(layer, LinearBase):
-        if is_layer_skipped(prefix, self.ignored_layers):
-            return UnquantizedLinearMethod()
-        return Fp8LinearMethod(self)
-    elif isinstance(layer, FusedMoE):
-        return Fp8MoEMethod(self)
-    return None
-
-
 def gptq_get_quant_method(self, layer, prefix):
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
@@ -126,7 +107,6 @@ def patch_vllm_linear_base_isinstance():
 
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
-    setattr(Fp8Config, "get_quant_method", fp8_get_quant_method)
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
 
