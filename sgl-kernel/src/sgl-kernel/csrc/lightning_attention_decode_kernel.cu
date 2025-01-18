@@ -14,14 +14,14 @@ __global__ void lightning_attention_decode_kernel(
     const T* __restrict__ q,      // [b, h, 1, d]
     const T* __restrict__ k,      // [b, h, 1, d]
     const T* __restrict__ v,      // [b, h, 1, e]
-    const float* __restrict__ past_kv,// [b, h, d, e]
-    const float* __restrict__ slope,  // [h, 1, 1]
+    const float* __restrict__ past_kv, // [b, h, d, e]
+    const float* __restrict__ slope,   // [h, 1, 1]
     T* __restrict__ output,       // [b, h, 1, e]
     float* __restrict__ new_kv,   // [b, h, d, e]
     const int batch_size,
     const int num_heads,
-    const int qk_dim,
-    const int v_dim) {
+    const int dim,
+    const int embed_dim) {
     
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -33,26 +33,42 @@ __global__ void lightning_attention_decode_kernel(
     
     if (b >= batch_size) return;
     
-    const int64_t qk_offset = b * num_heads * qk_dim + h * qk_dim;
-    const int64_t v_offset = b * num_heads * v_dim + h * v_dim;
-    const int64_t kv_offset = b * num_heads * qk_dim * v_dim + h * qk_dim * v_dim;
+    const int64_t qk_offset = b * num_heads * dim + h * dim;
+    const int64_t v_offset = b * num_heads * embed_dim + h * embed_dim;
+    const int64_t kv_offset = b * num_heads * dim * embed_dim + h * dim * embed_dim;
     
-    // 1. Calculate new kv: kv = ratio * kv + k * v^T
-    const float ratio = exp(-1.0f * slope[h]);
-    for (int d = lane_id; d < qk_dim; d += WARP_SIZE) {
-        for (int e = 0; e < v_dim; e++) {
-            float val = ratio * past_kv[kv_offset + d * v_dim + e];
-            val = val + k[qk_offset + d] * v[v_offset + e];
-            new_kv[kv_offset + d * v_dim + e] = val;
+    // 声明共享内存数组
+    __shared__ T shared_q[WARPS_PER_BLOCK][96];
+    __shared__ T shared_k[WARPS_PER_BLOCK][96];
+    __shared__ T shared_v[WARPS_PER_BLOCK][96];
+    
+    // 加载数据到共享内存
+    for (int d = tx; d < dim; d += WARP_SIZE) {
+        shared_k[ty][d] = k[qk_offset + d];
+        shared_q[ty][d] = q[qk_offset + d];
+    }
+    for (int e = tx; e < embed_dim; e += WARP_SIZE) {
+        shared_v[ty][e] = v[v_offset + e];
+    }
+    __syncthreads();
+    
+    // 1. 计算新的kv: new_kv = ratio * past_kv + k * v^T
+    const float ratio = expf(-1.0f * slope[h]);
+    for (int d = lane_id; d < dim; d += WARP_SIZE) {
+        for (int e = 0; e < embed_dim; e++) {
+            float val = ratio * past_kv[kv_offset + d * embed_dim + e];
+            val += shared_k[ty][d] * shared_v[ty][e];
+            new_kv[kv_offset + d * embed_dim + e] = val;
         }
     }
     
-    // 2. Calculate qkv attention output: output = q * kv
-    for (int e = lane_id; e < v_dim; e += WARP_SIZE) {
+    __syncthreads();
+    
+    // 2. 计算qkv attention输出: output = q * new_kv
+    for (int e = lane_id; e < embed_dim; e += WARP_SIZE) {
         float sum = 0.0f;
-        for (int d = 0; d < qk_dim; d++) {
-            sum += q[qk_offset + d] * 
-                  new_kv[kv_offset + d * v_dim + e];
+        for (int d = 0; d < dim; d++) {
+            sum += static_cast<float>(shared_q[ty][d]) * new_kv[kv_offset + d * embed_dim + e];
         }
         output[v_offset + e] = static_cast<T>(sum);
     }
@@ -74,10 +90,10 @@ void lightning_attention_decode(
     
     auto batch_size = q.size(0);
     auto num_heads = q.size(1);
-    auto qk_dim = q.size(3);
-    auto v_dim = v.size(3);
+    auto dim = q.size(3);
+    auto embed_dim = v.size(3);
     
-    dim3 block(WARP_SIZE, WARPS_PER_BLOCK);  // (32, 4)
+    dim3 block(WARP_SIZE, WARPS_PER_BLOCK);  // (32, 8)
     dim3 grid((batch_size * num_heads + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
     
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -94,8 +110,8 @@ void lightning_attention_decode(
             new_kv.data_ptr<float>(),
             batch_size,
             num_heads,
-            qk_dim,
-            v_dim
+            dim,
+            embed_dim
         );
     }));
 }
