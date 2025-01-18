@@ -1,5 +1,4 @@
 import dataclasses
-import dataclasses
 import logging
 from http import HTTPStatus
 from typing import Optional
@@ -132,11 +131,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 @time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
-    try:
-        ret = await _global_state.engine.tokenizer_manager.generate_request(obj, request).__anext__()
-        return ret
-    except ValueError as e:
-        return create_error_response(e)
+    return await _global_state.engine._encode_raw(obj, request)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])

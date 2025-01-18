@@ -212,7 +212,14 @@ class Engine:
 
         # get the current event loop
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(encode_request(obj, None))
+        return loop.run_until_complete(self._encode_raw(obj, None))
+
+    async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
+        try:
+            ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
+            return ret
+        except ValueError as e:
+            return create_error_response(e)
 
     def start_profile(self):
         self.tokenizer_manager.start_profile()
