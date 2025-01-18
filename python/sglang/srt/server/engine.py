@@ -60,7 +60,7 @@ class Engine:
         atexit.register(self.shutdown)
 
         server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-        launch_engine(server_args=server_args)
+        _launch_subprocesses(server_args=server_args)
 
     def generate(
         self,
@@ -258,7 +258,7 @@ class Engine:
         loop.run_until_complete(tokenizer_manager.resume_memory_occupation(obj, None))
 
 
-def launch_engine(
+def _launch_subprocesses(
     server_args: ServerArgs,
 ):
     """
