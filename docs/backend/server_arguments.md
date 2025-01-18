@@ -13,7 +13,7 @@ In this document we aim to give an overview of the possible arguments when deplo
 * `kv_cache_dtype`: Dtype of the kv cache, defaults to the `dtype`.
 * `context_length`: The number of tokens our model can process *including the input*. Not that extending the default might lead to strange behavior.
 * `device`: The device we put the model, defaults to `cuda`.
-* `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses.
+* `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.html#Chat-Template).
 * `is_embedding`: Set to true to perform [embedding](https://docs.sglang.ai/backend/openai_api_embeddings.html) / [enocode](https://docs.sglang.ai/backend/native_api.html#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api.html#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
 * `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. 
@@ -28,7 +28,7 @@ In this document we aim to give an overview of the possible arguments when deplo
 
 ### API configuration
 
-* `api_key`: Sets an API key for the server or the OpenAI-compatible API.
+* `api_key`: Sets an API key for the server and the OpenAI-compatible API.
 * `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
 * `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
@@ -49,10 +49,10 @@ In this document we aim to give an overview of the possible arguments when deplo
 
 ## Memory and scheduling
 
-* `mem_fraction_static`: Fraction of the free GPU memory used for static memory like model weights and KV cache. If build KV cache failed, should be increased. In case of OOM should be decreased.
+* `mem_fraction_static`: Fraction of the free GPU memory used for static memory like model weights and KV cache. If building KV cache fails, it should be increased. If CUDA runs out of memory, it should be decreased.
 * `max_running_requests`: The maximum number of requests to run concurrently.
 * `max_total_tokens`: The maximum number of tokens that can be stored into the KV cache. Use mainly for debugging.
-* `chunked_prefill_size`: Perform the prefill in chunks of these size. Larger chunk size speeds up the prefill phase but increases the VRAM consumption. In case of OOM should be decreased.
+* `chunked_prefill_size`: Perform the prefill in chunks of these size. Larger chunk size speeds up the prefill phase but increases the VRAM consumption. If CUDA runs out of memory, it should be decreased.
 * `max_prefill_tokens`: Token budget of how many tokens to accept in one prefill batch. The actual number is the max of this parameter and the `context_length`.
 * `schedule_policy`: The scheduling policy to control the processing order of waiting prefill requests in a single engine.
 * `schedule_conservativeness`: Can be used to decrease/increase the conservativeness of the server when taking new requests. Highly conservative behavior leads to starvation, but low conservativeness leads to slowed-down performance.
@@ -66,7 +66,7 @@ In this document we aim to give an overview of the possible arguments when deplo
 * `watchdog_timeout`: Adjusts the watchdog thread’s timeout before killing the server if batch generation takes too long.
 * `download_dir`: Use to override the default Hugging Face cache directory for model weights.
 * `base_gpu_id`: Use to adjust first GPU used to distribute the model across available GPUs.
-
+* `allow_auto_truncate`: Automatically truncate requests that exceed the maximum input length.
 
 ## Logging
 
@@ -86,7 +86,7 @@ In this document we aim to give an overview of the possible arguments when deplo
 
 ## LoRA
 
-* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supportet with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues?q=is%3Aissue%20lora%20).
+* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supportet with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues/2929).
 * `max_loras_per_batch`: Maximum number of LoRAs in a running batch including base model.
 
 ## Kernel backend
@@ -97,6 +97,7 @@ In this document we aim to give an overview of the possible arguments when deplo
 ## Constrained Decoding
 
 * `grammar_backend`: The grammar backend for constraint decoding. Detailed usage can be found in this [document](https://docs.sglang.ai/backend/structured_outputs.html).
+* `constrained_json_whitespace_pattern`: Use with `Outlines` grammar backend to allow JSON with syntatic newlines, tabs or multiple spaces. Details can be found [here](https://dottxt-ai.github.io/outlines/latest/reference/generation/json/#using-pydantic).
 
 ## Speculative decoding
 
