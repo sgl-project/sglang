@@ -52,7 +52,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/moe_align_kernel.cu",
             "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
             "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
-            "src/sgl-kernel/csrc/lighting_attention_decode_kernel.cu",
+            "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
         ],
         include_dirs=include_dirs,
