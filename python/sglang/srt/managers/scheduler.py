@@ -890,9 +890,9 @@ class Scheduler:
         # Prefill policy
         adder = PrefillAdder(
             self.tree_cache,
+            self.token_to_kv_pool,
             self.running_batch,
             self.new_token_ratio,
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
