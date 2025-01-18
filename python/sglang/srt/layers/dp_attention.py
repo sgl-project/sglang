@@ -1,5 +1,6 @@
 import torch
-from vllm.distributed import GroupCoordinator, get_tp_group
+
+from sglang.srt.distributed import GroupCoordinator, get_tp_group
 
 _ATTN_TP_GROUP = None
 _ATTN_TP_RANK = None
