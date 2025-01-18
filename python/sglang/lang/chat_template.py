@@ -88,7 +88,6 @@ register_chat_template(
     )
 )
 
-
 register_chat_template(
     ChatTemplate(
         name="claude",
@@ -100,7 +99,6 @@ register_chat_template(
         },
     )
 )
-
 
 register_chat_template(
     ChatTemplate(
@@ -116,7 +114,6 @@ register_chat_template(
     )
 )
 
-
 register_chat_template(
     ChatTemplate(
         name="chatml-llava",
@@ -131,7 +128,6 @@ register_chat_template(
         image_token="<image>\n",
     )
 )
-
 
 # There is default system prompt for qwen
 # reference: https://modelscope.cn/models/qwen/Qwen2-72B-Instruct/file/view/master?fileName=tokenizer_config.json&status=1
@@ -216,6 +212,21 @@ register_chat_template(
         },
         stop_str=("<|eot_id|>",),
         image_token="<|image|>",
+    )
+)
+
+# https://huggingface.co/openbmb/MiniCPM-V-2_6
+register_chat_template(
+    ChatTemplate(
+        name="minicpmv",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", " "),
+            "user": ("user:", " "),
+            "assistant": ("assistant:", "</s>"),
+        },
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
     )
 )
 

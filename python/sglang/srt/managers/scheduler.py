@@ -274,7 +274,6 @@ class Scheduler:
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
-
         # Print debug info
         logger.info(
             f"max_total_num_tokens={self.max_total_num_tokens}, "
@@ -1729,7 +1728,11 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send(
-            {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
+            {
+                "status": "ready",
+                "max_total_num_tokens": scheduler.max_total_num_tokens,
+                "max_req_input_len": scheduler.max_req_input_len,
+            }
         )
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap()
