@@ -229,64 +229,6 @@ def launch_engine(
     scheduler_info = scheduler_infos[0]
 
 
-def launch_server(
-    server_args: ServerArgs,
-    pipe_finish_writer: Optional[mp.connection.Connection] = None,
-):
-    """
-    Launch SRT (SGLang Runtime) Server
-
-    The SRT server consists of an HTTP server and the SRT engine.
-
-    1. HTTP server: A FastAPI server that routes requests to the engine.
-    2. SRT engine:
-        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
-
-    Note:
-    1. The HTTP server and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
-    """
-    launch_engine(server_args=server_args)
-
-    # Add api key authorization
-    if server_args.api_key:
-        add_api_key_middleware(app, server_args.api_key)
-
-    # Add prometheus middleware
-    if server_args.enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-
-    # Send a warmup request
-    t = threading.Thread(
-        target=_wait_and_warmup,
-        args=(
-            server_args,
-            pipe_finish_writer,
-            tokenizer_manager.image_token_id,
-        ),
-    )
-    t.start()
-
-    try:
-        # Update logging configs
-        set_uvicorn_logging_configs()
-
-        # Listen for HTTP requests
-        uvicorn.run(
-            app,
-            host=server_args.host,
-            port=server_args.port,
-            log_level=server_args.log_level_http or server_args.log_level,
-            timeout_keep_alive=5,
-            loop="uvloop",
-        )
-    finally:
-        t.join()
-
-
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
