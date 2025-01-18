@@ -44,7 +44,7 @@ class TestEpMoE(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.5
+        self.assertGreater(metrics["score"], 0.5)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -56,7 +56,7 @@ class TestEpMoE(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.8
+        self.assertGreater(metrics["score"], 0.8)
 
 
 class TestEpMoEFP8(unittest.TestCase):

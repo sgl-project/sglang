@@ -101,6 +101,7 @@ class TpModelWorker:
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
                 else server_args.max_running_requests
+                // (server_args.dp_size if server_args.enable_dp_attention else 1)
             ),
             self.model_runner.req_to_token_pool.size,
         )
@@ -142,15 +143,14 @@ class TpModelWorker:
     def get_tp_cpu_group(self):
         return self.model_runner.tp_group.cpu_group
 
+    def get_attention_tp_cpu_group(self):
+        return self.model_runner.attention_tp_group.cpu_group
+
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool,
         )
-
-    def forward_batch_idle(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        self.model_runner.forward(forward_batch)
 
     def forward_batch_generation(
         self,
