@@ -30,7 +30,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -376,8 +375,8 @@ class Scheduler:
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Tells whether the current running batch is full so that we can skip
@@ -786,9 +785,9 @@ class Scheduler:
 
     def log_prefill_stats(self, adder, can_run_list, running_bs, has_being_chunked):
         self.tree_cache_metrics["total"] += (
-            adder.log_input_tokens + adder.log_hit_tokens
-        ) / 10**9
-        self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
+                                                adder.log_input_tokens + adder.log_hit_tokens
+                                            ) / 10 ** 9
+        self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10 ** 9
         tree_cache_hit_rate = (
             self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
         )
@@ -941,10 +940,10 @@ class Scheduler:
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.batch_is_full = True
@@ -1159,7 +1158,7 @@ class Scheduler:
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                    self.token_to_kv_pool.free(batch.out_cache_loc[j: j + 1])
                     continue
 
                 if req.is_being_chunked <= 0:
@@ -1246,7 +1245,7 @@ class Scheduler:
 
             if self.enable_overlap and req.finished():
                 # Free the one delayed token
-                self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
+                self.token_to_kv_pool.free(batch.out_cache_loc[i: i + 1])
                 continue
 
             if batch.spec_algorithm.is_none():
@@ -1306,15 +1305,15 @@ class Scheduler:
 
         if req.input_token_logprobs_val is None:
             input_token_logprobs_val = output.input_token_logprobs[
-                pt : pt + num_input_logprobs - 1 - req.last_update_decode_tokens
-            ]
+                                       pt: pt + num_input_logprobs - 1 - req.last_update_decode_tokens
+                                       ]
 
             input_token_logprobs_idx = req.fill_ids[
-                len(req.fill_ids)
-                - num_input_logprobs
-                + 1 : len(req.fill_ids)
-                - req.last_update_decode_tokens
-            ]
+                                       len(req.fill_ids)
+                                       - num_input_logprobs
+                                       + 1: len(req.fill_ids)
+                                            - req.last_update_decode_tokens
+                                       ]
             # Clip the padded hash values from image tokens.
             # Otherwise, it will lead to detokenization errors.
             input_token_logprobs_idx = [
@@ -1335,18 +1334,18 @@ class Scheduler:
             # Some decode tokens are re-computed in an extend batch
             req.output_token_logprobs_val.extend(
                 output.input_token_logprobs[
-                    pt
-                    + num_input_logprobs
-                    - 1
-                    - req.last_update_decode_tokens : pt
-                    + num_input_logprobs
-                    - 1
+                pt
+                + num_input_logprobs
+                - 1
+                - req.last_update_decode_tokens: pt
+                                                 + num_input_logprobs
+                                                 - 1
                 ],
             )
             req.output_token_logprobs_idx.extend(
                 req.fill_ids[
-                    len(req.fill_ids)
-                    - req.last_update_decode_tokens : len(req.fill_ids)
+                len(req.fill_ids)
+                - req.last_update_decode_tokens: len(req.fill_ids)
                 ]
             )
 
@@ -1360,10 +1359,10 @@ class Scheduler:
 
             if req.last_update_decode_tokens != 0:
                 req.output_top_logprobs_val.extend(
-                    output.input_top_logprobs_val[i][-req.last_update_decode_tokens :]
+                    output.input_top_logprobs_val[i][-req.last_update_decode_tokens:]
                 )
                 req.output_top_logprobs_idx.extend(
-                    output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
+                    output.input_top_logprobs_idx[i][-req.last_update_decode_tokens:]
                 )
 
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
@@ -1569,6 +1568,9 @@ class Scheduler:
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
+    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
+        self.flush_cache()
+
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if len(self.waiting_queue) == 0 and (
@@ -1621,12 +1623,12 @@ class Scheduler:
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        return success, message
+        return UpdateWeightFromDiskReqOutput(success, message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return success, message
+        return InitWeightsUpdateGroupReqOutput(success, message)
 
     def update_weights_from_distributed(
         self,
@@ -1639,7 +1641,7 @@ class Scheduler:
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        return success, message
+        return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
@@ -1650,11 +1652,11 @@ class Scheduler:
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        return success, message
+        return UpdateWeightsFromTensorReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return parameter
+        return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self):
         self.stashed_model_static_state = _export_static_state(
@@ -1670,6 +1672,12 @@ class Scheduler:
         )
         del self.stashed_model_static_state
 
+    def profile(self, recv_req: ProfileReq):
+        if recv_req == ProfileReq.START_PROFILE:
+            self.start_profile()
+        else:
+            self.stop_profile()
+
     def start_profile(self) -> None:
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
@@ -1684,20 +1692,20 @@ class Scheduler:
         )
         logger.info("Profiler is done")
 
-    def open_session(self, recv_req: OpenSessionReqInput) -> Tuple[Optional[str], bool]:
+    def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
-            return session_id, False
+            return OpenSessionReqOutput(session_id, False)
         elif session_id is None:
             logger.warning(f"session id is None, cannot open.")
-            return session_id, False
+            return OpenSessionReqOutput(session_id, False)
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len, session_id
             )
-            return session_id, True
+            return OpenSessionReqOutput(session_id, True)
 
     def close_session(self, recv_req: CloseSessionReqInput):
         # handle error
