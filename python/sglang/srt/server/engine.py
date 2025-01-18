@@ -53,14 +53,14 @@ class Engine:
     launching the HTTP server adds unnecessary complexity or overhead,
     """
 
-    def __init__(self, log_level: str = "error", *args, **kwargs):
+    def __init__(self, log_level: str = "error", *args, server_args=None, **kwargs):
         """See the arguments in server_args.py::ServerArgs"""
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
 
-        server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-        _launch_subprocesses(server_args=server_args)
+        server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
+        tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
 
     def generate(
         self,
@@ -265,9 +265,6 @@ def _launch_subprocesses(
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
 
-    global tokenizer_manager
-    global scheduler_info
-
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
@@ -373,6 +370,8 @@ def _launch_subprocesses(
 
     # Assume all schedulers have same scheduler_info
     scheduler_info = scheduler_infos[0]
+
+    return tokenizer_manager, scheduler_info
 
 
 def _set_envs_and_config(server_args: ServerArgs):
