@@ -26,6 +26,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -385,8 +386,6 @@ class Qwen2ForCausalLM(nn.Module):
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if "lm_head.weight" in name:
-                    continue
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]

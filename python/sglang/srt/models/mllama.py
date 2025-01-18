@@ -8,14 +8,14 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers.models.mllama.configuration_mllama as config_mllama
-import vllm.distributed.parallel_state as ps
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
 from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
 
+import sglang.srt.distributed.parallel_state as ps
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
