@@ -409,7 +409,7 @@ def _build_slope_tensor(n_attention_heads: int):
 
 
 def get_benchmark():
-    batch_size_range = [range(1, 129)]  # max 128
+    batch_size_range = [i for i in range(1, 129)]  # max 128
     seq_length_range = [1]  # decode mode sequence length is fixed to 1
     configs = list(itertools.product(batch_size_range, seq_length_range))
 
