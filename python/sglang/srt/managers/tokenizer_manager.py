@@ -112,6 +112,7 @@ class TokenizerManager:
         port_args: PortArgs,
     ):
         # Parse args
+
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
@@ -207,6 +208,8 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        # Set after scheduler is initialized
+        self.max_req_input_len = None
 
         # Metrics
         if self.enable_metrics:
@@ -281,7 +284,7 @@ class TokenizerManager:
         if self.is_generation:
             # TODO: also support getting embeddings for multimodal models
             image_inputs: Dict = await self.image_processor.process_images_async(
-                obj.image_data, input_text or input_ids, obj
+                obj.image_data, input_text or input_ids, obj, self.max_req_input_len
             )
             if image_inputs and "input_ids" in image_inputs:
                 input_ids = image_inputs["input_ids"]
