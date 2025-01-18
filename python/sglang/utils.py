@@ -15,7 +15,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Optional, Union
+from typing import Optional, Union, Tuple, List, Type, Callable, Any
 
 import numpy as np
 import requests
@@ -363,3 +363,13 @@ def terminate_process(process):
 def print_highlight(html_content: str):
     html_content = str(html_content).replace("\n", "<br>")
     display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
+
+class TypeBasedDispatcher:
+    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+        self._mapping = mapping
+
+    def __call__(self, obj: Any):
+        for ty, fn in self._mapping:
+            if isinstance(obj, ty):
+                return fn(obj)
+        raise ValueError(f"Invalid request: {obj}")
