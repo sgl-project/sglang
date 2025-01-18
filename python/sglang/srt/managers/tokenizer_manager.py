@@ -58,9 +58,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
-    ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -730,90 +728,61 @@ class TokenizerManager:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._dispatcher(recv_obj)
 
-            if isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
-                for i, rid in enumerate(recv_obj.rids):
-                    state = self.rid_to_state.get(rid, None)
-                    if state is None:
-                        continue
+    def _handle_batch_output(
+        self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
+    ):
+        for i, rid in enumerate(recv_obj.rids):
+            state = self.rid_to_state.get(rid, None)
+            if state is None:
+                continue
 
-                    meta_info = {
-                        "id": rid,
-                        "finish_reason": recv_obj.finished_reasons[i],
-                        "prompt_tokens": recv_obj.prompt_tokens[i],
+            meta_info = {
+                "id": rid,
+                "finish_reason": recv_obj.finished_reasons[i],
+                "prompt_tokens": recv_obj.prompt_tokens[i],
+            }
+
+            if getattr(state.obj, "return_logprob", False):
+                self.convert_logprob_style(
+                    meta_info,
+                    state.obj.top_logprobs_num,
+                    state.obj.return_text_in_logprobs,
+                    recv_obj,
+                    i,
+                )
+
+            if not isinstance(recv_obj, BatchEmbeddingOut):
+                meta_info.update(
+                    {
+                        "completion_tokens": recv_obj.completion_tokens[i],
+                        "cached_tokens": recv_obj.cached_tokens[i],
                     }
+                )
 
-                    if getattr(state.obj, "return_logprob", False):
-                        self.convert_logprob_style(
-                            meta_info,
-                            state.obj.top_logprobs_num,
-                            state.obj.return_text_in_logprobs,
-                            recv_obj,
-                            i,
-                        )
-
-                    if not isinstance(recv_obj, BatchEmbeddingOut):
-                        meta_info.update(
-                            {
-                                "completion_tokens": recv_obj.completion_tokens[i],
-                                "cached_tokens": recv_obj.cached_tokens[i],
-                            }
-                        )
-
-                    if isinstance(recv_obj, BatchStrOut):
-                        out_dict = {
-                            "text": recv_obj.output_strs[i],
-                            "meta_info": meta_info,
-                        }
-                    elif isinstance(recv_obj, BatchTokenIDOut):
-                        out_dict = {
-                            "token_ids": recv_obj.output_ids[i],
-                            "meta_info": meta_info,
-                        }
-                    else:
-                        assert isinstance(recv_obj, BatchEmbeddingOut)
-                        out_dict = {
-                            "embedding": recv_obj.embeddings[i],
-                            "meta_info": meta_info,
-                        }
-                    state.out_list.append(out_dict)
-                    state.finished = recv_obj.finished_reasons[i] is not None
-                    state.event.set()
-
-                    if self.enable_metrics and state.obj.log_metrics:
-                        self.collect_metrics(state, recv_obj, i)
-                    if (
-                        self.dump_requests_folder
-                        and state.finished
-                        and state.obj.log_metrics
-                    ):
-                        self.dump_requests(state, out_dict)
-            elif isinstance(recv_obj, OpenSessionReqOutput):
-                pass
-            elif isinstance(recv_obj, UpdateWeightFromDiskReqOutput):
-                pass
-            elif isinstance(recv_obj, InitWeightsUpdateGroupReqOutput):
-                assert (
-                    self.server_args.dp_size == 1
-                ), "dp_size must be 1 for init parameter update group"
-                self.init_weights_update_group_communicator.handle_recv(recv_obj)
-            elif isinstance(recv_obj, UpdateWeightsFromDistributedReqOutput):
-                assert (
-                    self.server_args.dp_size == 1
-                ), "dp_size must be 1 for update weights from distributed"
-                self.update_weights_from_distributed_communicator.handle_recv(recv_obj)
-            elif isinstance(recv_obj, UpdateWeightsFromTensorReqOutput):
-                assert (
-                    self.server_args.dp_size == 1
-                ), "dp_size must be 1 for update weights from distributed"
-                self.update_weights_from_tensor_communicator.handle_recv(recv_obj)
-            elif isinstance(recv_obj, GetWeightsByNameReqOutput):
-                self.get_weights_by_name_communicator.handle_recv(recv_obj)
-            elif isinstance(recv_obj, ReleaseMemoryOccupationReqOutput):
-                self.release_memory_occupation_communicator.handle_recv(recv_obj)
-            elif isinstance(recv_obj, ResumeMemoryOccupationReqOutput):
-                self.resume_memory_occupation_communicator.handle_recv(recv_obj)
+            if isinstance(recv_obj, BatchStrOut):
+                out_dict = {
+                    "text": recv_obj.output_strs[i],
+                    "meta_info": meta_info,
+                }
+            elif isinstance(recv_obj, BatchTokenIDOut):
+                out_dict = {
+                    "token_ids": recv_obj.output_ids[i],
+                    "meta_info": meta_info,
+                }
             else:
-                raise ValueError(f"Invalid object: {recv_obj=}")
+                assert isinstance(recv_obj, BatchEmbeddingOut)
+                out_dict = {
+                    "embedding": recv_obj.embeddings[i],
+                    "meta_info": meta_info,
+                }
+            state.out_list.append(out_dict)
+            state.finished = recv_obj.finished_reasons[i] is not None
+            state.event.set()
+
+            if self.enable_metrics and state.obj.log_metrics:
+                self.collect_metrics(state, recv_obj, i)
+            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+                self.dump_requests(state, out_dict)
 
     def convert_logprob_style(
         self,
