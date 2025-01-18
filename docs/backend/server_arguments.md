@@ -4,31 +4,31 @@ In this document we aim to give an overview of the possible arguments when deplo
 
 ## Model and tokenizer
 
-* `model_path`: Path to the model we want to serve.
+* `model_path`: Path to the model that will be served.
 * `tokenizer_path`: Defaults to the `model_path`.
-* `tokenizer_mode`: By default `auto`, see [here](https://huggingface.co/docs/transformers/en/main_classes/tokenizer)
+* `tokenizer_mode`: By default `auto`, see [here](https://huggingface.co/docs/transformers/en/main_classes/tokenizer) for different mode.
 * `load_format`: The format the weights are loaded in. Defaults to `*.safetensors`/`*.bin`.
-* `trust_remote_code`:  If `True`, will use local cached config files, other wise use remote configs in HuggingFace..
-* `dtype`: Dtype we use for the model, defaults to `bfloat16`. 
+* `trust_remote_code`:  If `True`, will use locally cached config files, other wise use remote configs in HuggingFace.
+* `dtype`: Dtype used for the model, defaults to `bfloat16`. 
 * `kv_cache_dtype`: Dtype of the kv cache, defaults to the `dtype`.
 * `context_length`: The number of tokens our model can process *including the input*. Not that extending the default might lead to strange behavior.
 * `device`: The device we put the model, defaults to `cuda`.
-* `chat_template`: The chat template we use. Not that deviating from the default might lead to unexpected responses. 
-* `is_embedding`: Set to true if we want to perform embedding task.
+* `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses.
+* `is_embedding`: Set to true to perform [embedding](https://docs.sglang.ai/backend/openai_api_embeddings.html) / [enocode](https://docs.sglang.ai/backend/native_api.html#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api.html#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
-* `skip_tokenizer_init`: Set to true if you want to provide the tokens to the engine and get the output tokens directly. 
-* `json_model_override_args`: If you want to override the model config provide the adjustment in this argument as a JSON file.
+* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. 
+* `json_model_override_args`: Override model config with the provided JSON.
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
 ## Serving: HTTP & API
 
 ### HTTP Server configuration
 
-* Use `port` and `host` to setup the host for your HTTP server. By default `host: str = "127.0.0.1"` and `port: int = 30000`
+* `port` and `host`: Setup the host for HTTP server. By default `host: str = "127.0.0.1"` and `port: int = 30000`
 
 ### API configuration
 
-* `api_key`: Sets an API key for the server or the OpenAI-compatible API. Clients must provide this key for authorized requests.
+* `api_key`: Sets an API key for the server or the OpenAI-compatible API.
 * `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
 * `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
@@ -36,32 +36,32 @@ In this document we aim to give an overview of the possible arguments when deplo
 
 ### Tensor parallelism
 
-* `tp_size`: The number of GPUs the model weights get sharded over. Mainly for memory efficency rather than for high throughput, see [this blogpost](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works).
+* `tp_size`: The number of GPUs the model weights get sharded over. Mainly for saving memory rather than for high throughput, see [this blogpost](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works).
 
 ### Data parallelism
 
-* `dp_size`: The number of data-parallel copies of the model. We recommend using [SGLang router](https://docs.sglang.ai/router/router.html) instead of a naive data-parallel.
-* `load_balance_method`: Load balancing strategy for data parallel requests.
+* `dp_size`: Will be deprecated. The number of data-parallel copies of the model. [SGLang router](https://docs.sglang.ai/router/router.html) is recommended instead of the current naive data parallel.
+* `load_balance_method`: Will be deprecated. Load balancing strategy for data parallel requests.
 
 ### Expert parallelism
 
-* `ep_size`: Distribute the experts onto multiple GPUs for MoE models. Remember to shard the model weights with tp_size=ep_size, for detailed benchmarking refer to [this PR](https://github.com/sgl-project/sglang/pull/2203).
+* `ep_size`: Distribute the experts onto multiple GPUs for MoE models. Remember to shard the model weights with `tp_size=ep_size`, for detailed benchmarking refer to [this PR](https://github.com/sgl-project/sglang/pull/2203).
 
 ## Memory and scheduling
 
-* `mem_fraction_static`: Fraction of the free GPU memory used for static memory like model weights and KV cache. Decrease this if you meet OOM errors.
+* `mem_fraction_static`: Fraction of the free GPU memory used for static memory like model weights and KV cache. If build KV cache failed, should be increased. In case of OOM should be decreased.
 * `max_running_requests`: The maximum number of requests to run concurrently.
 * `max_total_tokens`: The maximum number of tokens that can be stored into the KV cache. Use mainly for debugging.
-* `chunked_prefill_size`: Perform the prefill in chunks of these size. Larger chunk size speeds up the prefill phase but increases the VRAM consumption.
-* `max_prefill_tokens`: Token budget of how many tokens to accept in one prefill batch is the max of this parameter and the `context_length`.
-* `schedule_policy`: The scheduling policy to control the processing order of waiting prefill requests.
-* `schedule_conservativeness`: Can be used to decrease/increase the conservativeness of the server when taking new requests. Use in case of low/high (i.e. < 0.9 or > 0.99) `token_usage`.
-* `cpu_offload_gb`: Reserve this amount of RAM in GB for offloading to the CPU.
-* `prefill_only_one_req`: When this flag is turned on we prefill only one request at a time.
+* `chunked_prefill_size`: Perform the prefill in chunks of these size. Larger chunk size speeds up the prefill phase but increases the VRAM consumption. In case of OOM should be decreased.
+* `max_prefill_tokens`: Token budget of how many tokens to accept in one prefill batch. The actual number is the max of this parameter and the `context_length`.
+* `schedule_policy`: The scheduling policy to control the processing order of waiting prefill requests in a single engine.
+* `schedule_conservativeness`: Can be used to decrease/increase the conservativeness of the server when taking new requests. Highly conservative behavior leads to starvation, but low conservativeness leads to slowed-down performance.
+* `cpu_offload_gb`: Reserve this amount of RAM in GB for offloading of model parameters to the CPU.
+* `prefill_only_one_req`: When this flag is turned on, the engine prefills only one request at a time.
 
 ## Other runtime options
 
-* `stream_interval`: Interval (in tokens) for streaming responses. Smaller = smoother streaming, larger = better throughput.
+* `stream_interval`: Interval (in tokens) for streaming responses. Smaller values lead to smoother streaming, and larger values lead to better throughput.
 * `random_seed`: Can be used to enforce more deterministic behavior. 
 * `watchdog_timeout`: Adjusts the watchdog thread’s timeout before killing the server if batch generation takes too long.
 * `download_dir`: Use to override the default Hugging Face cache directory for model weights.
@@ -86,13 +86,13 @@ In this document we aim to give an overview of the possible arguments when deplo
 
 ## LoRA
 
-* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supportet with this option so you need to disable them manually.
+* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supportet with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues?q=is%3Aissue%20lora%20).
 * `max_loras_per_batch`: Maximum number of LoRAs in a running batch including base model.
 
 ## Kernel backend
 
-* `attention_backend`: If you want to change the attention backend for some reason you may adjust the default `flashinfer` backend to `triton` or `torch_native` backend. 
-* `sampling_backend`: If you want to change the sampling backend for some reason you may adjust the default `flashinfer` backend to `torch_native` backend.
+* `attention_backend`: The backend for attention computation and KV cache management.
+* `sampling_backend`: The backend for sampling.
 
 ## Constrained Decoding
 
