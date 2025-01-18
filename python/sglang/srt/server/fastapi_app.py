@@ -1,32 +1,22 @@
-import asyncio
 import atexit
 import dataclasses
-import json
 import logging
 import multiprocessing as mp
-import os
-import threading
 from http import HTTPStatus
-from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
+from typing import AsyncIterator, Dict
 
 import torch
 
+from sglang.srt.server.utils import create_error_response
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
-import aiohttp
 import orjson
-import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -41,11 +31,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import time_func_latency
 from sglang.srt.openai_api.adapter import (
-    load_chat_template_for_openai_api,
     v1_batches,
     v1_cancel_batch,
     v1_chat_completions,
@@ -58,8 +46,6 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -162,7 +148,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return ret
         except ValueError as e:
             logger.error(f"Error: {e}")
-            return _create_error_response(e)
+            return create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -173,7 +159,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return _create_error_response(e)
+        return create_error_response(e)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
@@ -184,7 +170,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return _create_error_response(e)
+        return create_error_response(e)
 
 
 @app.post("/flush_cache")
@@ -270,11 +256,11 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     try:
         ret = await tokenizer_manager.get_weights_by_name(obj, request)
         if ret is None:
-            return _create_error_response("Get parameter by name failed")
+            return create_error_response("Get parameter by name failed")
         else:
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
-        return _create_error_response(e)
+        return create_error_response(e)
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
@@ -285,7 +271,7 @@ async def release_memory_occupation(
     try:
         await tokenizer_manager.release_memory_occupation(obj, request)
     except Exception as e:
-        return _create_error_response(e)
+        return create_error_response(e)
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
@@ -296,7 +282,7 @@ async def resume_memory_occupation(
     try:
         await tokenizer_manager.resume_memory_occupation(obj, request)
     except Exception as e:
-        return _create_error_response(e)
+        return create_error_response(e)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
@@ -310,7 +296,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
             )
         return session_id
     except Exception as e:
-        return _create_error_response(e)
+        return create_error_response(e)
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
@@ -320,7 +306,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         await tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
-        return _create_error_response(e)
+        return create_error_response(e)
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
