@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
@@ -33,6 +32,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -43,10 +43,6 @@ from sglang.srt.utils import make_layers
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
-
-
-# FIXME: temporary solution, remove after next vllm release
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 
 class Gemma2MLP(nn.Module):
