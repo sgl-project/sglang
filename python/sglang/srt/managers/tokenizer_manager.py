@@ -58,7 +58,9 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -240,6 +242,14 @@ class TokenizerManager:
                 (
                     GetWeightsByNameReqOutput,
                     self.get_weights_by_name_communicator.handle_recv,
+                ),
+                (
+                    ReleaseMemoryOccupationReqOutput,
+                    self.release_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    ResumeMemoryOccupationReqOutput,
+                    self.resume_memory_occupation_communicator.handle_recv,
                 ),
             ]
         )
