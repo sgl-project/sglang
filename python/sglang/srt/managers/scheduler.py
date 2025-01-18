@@ -49,6 +49,10 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -435,6 +439,8 @@ class Scheduler:
                 (ProfileReq, self.profile),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
+                (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
             ]
         )
 
@@ -1608,6 +1614,7 @@ class Scheduler:
         )
         self.memory_saver_adapter.pause()
         self.flush_cache()
+        return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self):
         self.memory_saver_adapter.resume()
@@ -1615,6 +1622,7 @@ class Scheduler:
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
         )
         del self.stashed_model_static_state
+        return ResumeMemoryOccupationReqOutput()
 
     def profile(self, recv_req: ProfileReq):
         if recv_req == ProfileReq.START_PROFILE:
