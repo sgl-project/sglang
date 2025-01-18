@@ -25,8 +25,6 @@ from transformers import GPT2Config
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
-
-# from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
