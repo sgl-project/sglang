@@ -21,6 +21,7 @@ import os
 import pickle
 import signal
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -634,9 +635,9 @@ class TokenizerManager:
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
         self.asyncio_tasks.add(loop.create_task(self.handle_loop()))
-
-        signal_handler = SignalHandler(self)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = SignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
         self.asyncio_tasks.add(loop.create_task(self.sigterm_watchdog()))
 
     async def sigterm_watchdog(self):
