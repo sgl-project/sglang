@@ -6,33 +6,20 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-from http import HTTPStatus
-from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
-import aiohttp
-import requests
-import uvloop
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
-    CloseSessionReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
-    OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
-    UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -40,18 +27,13 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
-    v1_batches,
-    v1_chat_completions,
-    v1_completions,
-    v1_files_create,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
-    add_prometheus_middleware,
     assert_pkg_version,
     configure_logger,
-    delete_directory,
     kill_process_tree,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
@@ -436,3 +418,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+STREAM_END_SYMBOL = b"data: [DONE]"
+STREAM_CHUNK_START_SYMBOL = b"data:"

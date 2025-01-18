@@ -111,6 +111,3 @@ def _create_error_response(e):
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
 
-STREAM_END_SYMBOL = b"data: [DONE]"
-STREAM_CHUNK_START_SYMBOL = b"data:"
-
