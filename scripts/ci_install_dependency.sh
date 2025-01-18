@@ -23,3 +23,6 @@ pip install cutex
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
+
+# reinstall sgl-kernel
+pip install sgl-kernel --force-reinstall --no-deps
