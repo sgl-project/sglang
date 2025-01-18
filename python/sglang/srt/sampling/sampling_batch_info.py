@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -14,6 +14,7 @@ if is_cuda:
     from sgl_kernel import sampling_scaling_penalties
 
 import sglang.srt.sampling.penaltylib as penaltylib
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,9 @@ class SamplingBatchInfo:
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # Custom Logit Processor
-    custom_logit_processor: Optional[Dict[str, torch.Tensor]] = None
+    custom_logit_processor: Optional[
+        Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
+    ] = None
 
     @classmethod
     def from_schedule_batch(
@@ -100,9 +103,14 @@ class SamplingBatchInfo:
                 processor_dict[processor_str].append(i)
 
             merged_custom_logit_processor = {
-                processor_str: torch.zeros(len(reqs), dtype=torch.bool)
-                .scatter_(0, torch.tensor(true_indices), True)
-                .to(device, non_blocking=True)
+                hash(processor_str): (
+                    # The deserialized custom logit processor object
+                    CustomLogitProcessor.from_str(processor_str),
+                    # The mask tensor for the requests that use this custom logit processor
+                    torch.zeros(len(reqs), dtype=torch.bool)
+                    .scatter_(0, torch.tensor(true_indices), True)
+                    .to(device, non_blocking=True),
+                )
                 for processor_str, true_indices in processor_dict.items()
             }
             custom_params = [r.sampling_params.custom_params for r in reqs]
@@ -260,19 +268,35 @@ class SamplingBatchInfo:
 
     @staticmethod
     def merge_custom_logit_processor(
-        lhs: Dict[str, torch.Tensor], rhs: Dict[str, torch.Tensor], device: str
+        lhs: Optional[Dict[str, torch.Tensor]],
+        rhs: Optional[Dict[str, torch.Tensor]],
+        bs1: int,
+        bs2: int,
+        device: str,
     ):
+        if lhs is None and rhs is None:
+            return None
+        lhs, rhs = lhs or {}, rhs or {}
+
         keys = set(lhs.keys()).union(set(rhs.keys()))
         merged_dict = {}
 
         for k in keys:
-            left_values = lhs.get(
-                k, torch.zeros(len(lhs), dtype=torch.bool, device=device)
+            # Get the logit processor object
+            processor = lhs[k][0] if k in lhs else rhs[k][0]
+            # Get and merge the mask tensors from the two dicts
+            left_mask = (
+                lhs[k][1]
+                if k in lhs
+                else torch.zeros(bs1, dtype=torch.bool, device=device)
             )
-            right_values = rhs.get(
-                k, torch.zeros(len(rhs), dtype=torch.bool, device=device)
+            right_mask = (
+                rhs[k][1]
+                if k in rhs
+                else torch.zeros(bs2, dtype=torch.bool, device=device)
             )
-            merged_dict[k] = torch.cat([left_values, right_values])
+            merged_dict[k] = (processor, torch.cat([left_mask, right_mask]))
+
         return merged_dict
 
     def merge_batch(self, other: "SamplingBatchInfo"):
@@ -299,8 +323,10 @@ class SamplingBatchInfo:
             # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
-                    self.custom_logit_processor or {},
-                    other.custom_logit_processor or {},
+                    self.custom_logit_processor,
+                    other.custom_logit_processor,
+                    len(self),
+                    len(other),
                     self.device,
                 )
             )

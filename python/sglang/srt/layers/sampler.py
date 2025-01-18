@@ -26,7 +26,6 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
-        self.custom_logit_processor_cache: Dict[int, CustomLogitProcessor] = {}
 
     def forward(
         self,
@@ -133,18 +132,10 @@ class Sampler(nn.Module):
         """Apply custom logit processors to the logits.
         This function will modify the logits in-place."""
 
-        for (
-            processor_str,
+        for _, (
+            processor,
             batch_mask,
         ) in sampling_batch_info.custom_logit_processor.items():
-            # Get the processor from the string representation or the local cache
-            processor_hash = hash(processor_str)
-            if processor_hash in self.custom_logit_processor_cache:
-                processor = self.custom_logit_processor_cache[processor_hash]
-            else:
-                processor = CustomLogitProcessor.from_str(processor_str)
-                self.custom_logit_processor_cache[processor_hash] = processor
-
             # Get the batch indices that need to be processed
             batch_indices = batch_mask.nonzero(as_tuple=True)[0]
 
