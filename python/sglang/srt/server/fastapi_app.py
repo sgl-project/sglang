@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response
+
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -91,7 +92,9 @@ async def health_generate(request: Request) -> Response:
         )
 
     try:
-        async for _ in _global_state.engine.tokenizer_manager.generate_request(gri, request):
+        async for _ in _global_state.engine.tokenizer_manager.generate_request(
+            gri, request
+        ):
             break
         return Response(status_code=200)
     except Exception as e:
@@ -139,7 +142,9 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
-        ret = await _global_state.engine.tokenizer_manager.generate_request(obj, request).__anext__()
+        ret = await _global_state.engine.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
         return ret
     except ValueError as e:
         return create_error_response(e)
@@ -151,7 +156,7 @@ async def flush_cache():
     _global_state.engine.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-                "(When there are running or waiting requests, the operation will not be performed.)\n",
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -180,7 +185,11 @@ async def stop_profile_async():
 @time_func_latency
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk in-place without re-launching the server."""
-    success, message = await _global_state.engine.tokenizer_manager.update_weights_from_disk(obj, request)
+    success, message = (
+        await _global_state.engine.tokenizer_manager.update_weights_from_disk(
+            obj, request
+        )
+    )
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(
@@ -199,7 +208,11 @@ async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    success, message = await _global_state.engine.tokenizer_manager.init_weights_update_group(obj, request)
+    success, message = (
+        await _global_state.engine.tokenizer_manager.init_weights_update_group(
+            obj, request
+        )
+    )
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -212,8 +225,10 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = await _global_state.engine.tokenizer_manager.update_weights_from_distributed(
-        obj, request
+    success, message = (
+        await _global_state.engine.tokenizer_manager.update_weights_from_distributed(
+            obj, request
+        )
     )
     content = {"success": success, "message": message}
     if success:
@@ -226,7 +241,9 @@ async def update_weights_from_distributed(
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.engine.tokenizer_manager.get_weights_by_name(obj, request)
+        ret = await _global_state.engine.tokenizer_manager.get_weights_by_name(
+            obj, request
+        )
         if ret is None:
             return create_error_response("Get parameter by name failed")
         else:
@@ -241,7 +258,9 @@ async def release_memory_occupation(
 ):
     """Release GPU occupation temporarily"""
     try:
-        await _global_state.engine.tokenizer_manager.release_memory_occupation(obj, request)
+        await _global_state.engine.tokenizer_manager.release_memory_occupation(
+            obj, request
+        )
     except Exception as e:
         return create_error_response(e)
 
@@ -252,7 +271,9 @@ async def resume_memory_occupation(
 ):
     """Resume GPU occupation"""
     try:
-        await _global_state.engine.tokenizer_manager.resume_memory_occupation(obj, request)
+        await _global_state.engine.tokenizer_manager.resume_memory_occupation(
+            obj, request
+        )
     except Exception as e:
         return create_error_response(e)
 
@@ -261,7 +282,9 @@ async def resume_memory_occupation(
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await _global_state.engine.tokenizer_manager.open_session(obj, request)
+        session_id = await _global_state.engine.tokenizer_manager.open_session(
+            obj, request
+        )
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
@@ -300,7 +323,9 @@ async def openai_v1_completions(raw_request: Request):
 @app.post("/v1/chat/completions")
 @time_func_latency
 async def openai_v1_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.engine.tokenizer_manager, raw_request)
+    return await v1_chat_completions(
+        _global_state.engine.tokenizer_manager, raw_request
+    )
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
@@ -323,7 +348,9 @@ def available_models():
 @app.post("/v1/files")
 async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
     return await v1_files_create(
-        file, purpose, _global_state.engine.tokenizer_manager.server_args.file_storage_pth
+        file,
+        purpose,
+        _global_state.engine.tokenizer_manager.server_args.file_storage_pth,
     )
 
 

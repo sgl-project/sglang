@@ -6,11 +6,13 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-from typing import Dict, List, Optional, Tuple, Union, AsyncIterator
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import orjson
 import torch
 from fastapi import Request
+from starlette.responses import StreamingResponse
+
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -27,9 +29,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import (
-    load_chat_template_for_openai_api,
-)
+from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.server.utils import create_error_response
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -44,7 +44,6 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.version import __version__
-from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +63,9 @@ class Engine:
         atexit.register(self.shutdown)
 
         server_args = server_args or ServerArgs(*args, log_level=log_level, **kwargs)
-        tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+        tokenizer_manager, scheduler_info = _launch_subprocesses(
+            server_args=server_args
+        )
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
@@ -108,7 +109,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -157,7 +158,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL):])
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
@@ -171,7 +172,9 @@ class Engine:
 
             async def stream_results() -> AsyncIterator[bytes]:
                 try:
-                    async for out in self.tokenizer_manager.generate_request(obj, request):
+                    async for out in self.tokenizer_manager.generate_request(
+                        obj, request
+                    ):
                         yield b"data: " + orjson.dumps(
                             out, option=orjson.OPT_NON_STR_KEYS
                         ) + b"\n\n"
@@ -189,7 +192,9 @@ class Engine:
             )
         else:
             try:
-                ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
+                ret = await self.tokenizer_manager.generate_request(
+                    obj, request
+                ).__anext__()
                 return ret
             except ValueError as e:
                 logger.error(f"Error: {e}")
@@ -216,7 +221,9 @@ class Engine:
 
     async def _encode_raw(self, obj: EmbeddingReqInput, request: Request):
         try:
-            ret = await self.tokenizer_manager.generate_request(obj, request).__anext__()
+            ret = await self.tokenizer_manager.generate_request(
+                obj, request
+            ).__anext__()
             return ret
         except ValueError as e:
             return create_error_response(e)
@@ -283,19 +290,25 @@ class Engine:
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.get_weights_by_name(obj, None))
+        return loop.run_until_complete(
+            self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
 
     def release_memory_occupation(self):
         """Release GPU occupation temporarily"""
         obj = ReleaseMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
+        loop.run_until_complete(
+            self.tokenizer_manager.release_memory_occupation(obj, None)
+        )
 
     def resume_memory_occupation(self):
         """Resume GPU occupation"""
         obj = ResumeMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
+        loop.run_until_complete(
+            self.tokenizer_manager.resume_memory_occupation(obj, None)
+        )
 
 
 def _launch_subprocesses(
