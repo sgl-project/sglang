@@ -20,11 +20,11 @@ import torch
 import triton
 import triton.language as tl
 from torch import nn
-from vllm.distributed import (
+
+from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -133,7 +133,7 @@ class LogitsProcessor(nn.Module):
 
         # Get the last hidden states and last logits for the next token prediction
         if (
-            logits_metadata.forward_mode.is_decode()
+            logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
         ):
             last_index = None

@@ -119,10 +119,10 @@ class TokenizerManager:
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name
+            context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
 
         # Read model args
@@ -292,10 +292,26 @@ class TokenizerManager:
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-        if obj.input_ids is not None and len(input_ids) >= self.context_len:
+        input_token_num = len(input_ids) if input_ids is not None else 0
+        if input_token_num >= self.context_len:
             raise ValueError(
-                f"The input ({len(input_ids)} tokens) is longer than the "
+                f"The input ({input_token_num} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
+            )
+
+        if (
+            obj.sampling_params.get("max_new_tokens") is not None
+            and obj.sampling_params.get("max_new_tokens") + input_token_num
+            >= self.context_len
+        ):
+            raise ValueError(
+                f"Requested token count exceeds the model's maximum context length "
+                f"of {self.context_len} tokens. You requested a total of "
+                f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
+                f"tokens: {input_token_num} tokens from the input messages and "
+                f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
+                f"completion. Please reduce the number of tokens in the input "
+                f"messages or the completion to fit within the limit."
             )
 
         # Parse sampling parameters
