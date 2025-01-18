@@ -82,10 +82,9 @@ class SchedulePolicy:
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False
-        unschedulable_reqs: List[Req] = []
         if isinstance(policy, CacheAwarePolicy):
             prefix_computed = True
-            unschedulable_reqs = self._compute_prefix_matches(waiting_queue, policy)
+            self._compute_prefix_matches(waiting_queue, policy)
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(waiting_queue)
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
@@ -102,7 +101,7 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        return prefix_computed, unschedulable_reqs
+        return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if len(waiting_queue) > 128 and self.policy == CacheAwarePolicy.LPM:
@@ -130,7 +129,7 @@ class SchedulePolicy:
 
     def _compute_prefix_matches(
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
-    ) -> Set[int]:
+    ):
         """
         Computes and caches the matching prefixes for requests in the waiting queue,
             and handles in-batch prefix caching logic.
@@ -166,19 +165,12 @@ class SchedulePolicy:
                     len(in_batch_matching_prefixes)
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
-                    # Remove from the waiting queue and put into a secondary queue
-                    # so that we don't schedule them unnecessarily.
-                    # In the next round, we will re-add them to the waiting queue.
-                    # TODO (MrAta): since the number of unschedulable requests can be large,
-                    # it might make more sense to modify the waiting_queue in place by swapping it.
-                    r = waiting_queue.pop(waiting_queue.index(r))
-                    unschedulable_reqs.append(r)
+                    r.schedulable = False
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool)
                     )
-        return unschedulable_reqs
 
     @staticmethod
     def _sort_by_longest_prefix(waiting_queue: List[Req]) -> None:

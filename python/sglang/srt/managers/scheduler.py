@@ -909,9 +909,7 @@ class Scheduler:
             return None
 
         # Get priority queue
-        prefix_computed, unschedulable_reqs = self.policy.calc_priority(
-            self.waiting_queue
-        )
+        prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
         adder = PrefillAdder(
@@ -938,6 +936,10 @@ class Scheduler:
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if not req.schedulable:
+                # Skip unschedulable requests marked
+                # by in batch prefix caching optimization
+                continue
             if (
                 self.lora_paths
                 and len(
@@ -971,13 +973,14 @@ class Scheduler:
                 break
 
         # Update waiting queue
-        self.waiting_queue.extend(unschedulable_reqs)
         can_run_list = adder.can_run_list
         if len(can_run_list) == 0:
             return None
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        for i, req in enumerate(self.waiting_queue):
+            if req in can_run_list:
+                self.waiting_queue.pop(i)
+            if not req.schedulable:
+                req.schedulable = True
 
         if adder.new_being_chunked_req is not None:
             assert self.being_chunked_req is None
