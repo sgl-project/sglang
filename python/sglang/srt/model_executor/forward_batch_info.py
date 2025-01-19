@@ -43,7 +43,7 @@ from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultiModalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -176,7 +176,7 @@ class ForwardBatch:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For multimodal
-    image_inputs: Optional[List[ImageInputs]] = None
+    multimodal_inputs: Optional[List[MultiModalInputs]] = None
 
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -242,7 +242,7 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            image_inputs=batch.image_inputs,
+            multimodal_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,
@@ -378,8 +378,8 @@ class ForwardBatch:
             for i, _ in enumerate(mrope_positions_list):
                 mrope_position_delta = (
                     0
-                    if batch.image_inputs[i] is None
-                    else batch.image_inputs[i].mrope_position_delta
+                    if batch.multimodal_inputs[i] is None
+                    else batch.multimodal_inputs[i].mrope_position_delta
                 )
                 mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
                     mrope_position_delta,
@@ -388,13 +388,13 @@ class ForwardBatch:
                 )
         elif self.forward_mode.is_extend():
             extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
-            for i, image_inputs in enumerate(batch.image_inputs):
+            for i, multimodal_inputs in enumerate(batch.multimodal_inputs):
                 extend_start_loc, extend_seq_len, extend_prefix_len = (
                     extend_start_loc_cpu[i],
                     batch.extend_seq_lens[i],
                     batch.extend_prefix_lens[i],
                 )
-                if image_inputs is None:
+                if multimodal_inputs is None:
                     # text only
                     mrope_positions = [
                         [
@@ -411,7 +411,7 @@ class ForwardBatch:
                             input_tokens=self.input_ids[
                                 extend_start_loc : extend_start_loc + extend_seq_len
                             ],
-                            image_grid_thw=image_inputs.image_grid_thws,
+                            image_grid_thw=multimodal_inputs.image_grid_thws,
                             video_grid_thw=image_inputs.video_grid_thws,
                             image_token_id=image_inputs.im_token_id,
                             video_token_id=image_inputs.video_token_id,
@@ -424,7 +424,9 @@ class ForwardBatch:
                             tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
-                    batch.image_inputs[i].mrope_position_delta = mrope_position_delta
+                    batch.multimodal_inputs[i].mrope_position_delta = (
+                        mrope_position_delta
+                    )
                 mrope_positions_list[i] = mrope_positions
 
         self.mrope_positions = torch.cat(

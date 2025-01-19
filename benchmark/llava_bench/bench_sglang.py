@@ -16,7 +16,7 @@ from sglang.utils import dump_state_text, read_jsonl
 @sgl.function
 def image_qa(s, image_file, question):
     s += sgl.user(sgl.image(image_file) + question)
-    s += sgl.assistant(sgl.gen("answer", max_tokens=args.max_tokens))
+    s += sgl.assistant(sgl.gen("answer", max_tokens=args.max_completion_tokens))
 
 
 def main(args):

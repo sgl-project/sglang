@@ -1,12 +1,15 @@
 """
 """
 
+import multiprocessing as mp
 import unittest
 from io import BytesIO
+from typing import Type
 
 import numpy as np
 import requests
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
@@ -16,6 +19,30 @@ from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
+
+
+def init_process_group():
+    """Initialize the default process group"""
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            init_method="tcp://127.0.0.1:29500",
+            world_size=1,
+            rank=0,
+        )
+
+
+def run_test_class(test_class):
+    """Run a single test class in its own process"""
+    # Initialize test class
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromTestCase(test_class)
+    runner = unittest.TextTestRunner()
+    result = runner.run(suite)
+
+    if not result.wasSuccessful():
+        raise RuntimeError(f"Tests failed for {test_class.__name__}")
 
 
 # Test the logits output between HF and SGLang
@@ -29,6 +56,14 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         cls.processor = ""
         response = requests.get(cls.image_url)
         cls.main_image = Image.open(BytesIO(response.content))
+        cls.model_runner = None
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.model_runner is not None:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            cls.model_runner = None
 
     def compare_outputs(self, sglang_output: torch.Tensor, hf_output: torch.Tensor):
         # Convert to float32 for numerical stability if needed
@@ -134,7 +169,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         return inputs
 
     def get_sglang_model(self):
-        model_runner = ModelRunner(
+        self.model_runner = ModelRunner(
             model_config=ModelConfig(self.model_path, model_override_args="{}"),
             mem_fraction_static=0.8,
             gpu_id=0,
@@ -146,7 +181,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
                 disable_cuda_graph=True,
             ),
         )
-        return model_runner.model
+        return self.model_runner.model
 
 
 class TestMiniCPMVLogits(VisionLLMLogitsBase):
@@ -163,10 +198,13 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         cls.chat_template = "minicpmv"
 
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cls.model = AutoModel.from_pretrained(
-            cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-        ).eval()
-        cls.model.to(cls.device)
+        cls.hf_model = (
+            AutoModel.from_pretrained(
+                cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+            .eval()
+            .to(cls.device)
+        )
 
     async def test_encode_output(self):
         inputs = self.get_processor_output()
@@ -178,7 +216,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 "pixel_values": inputs.pixel_values,
                 "tgt_sizes": inputs.tgt_sizes,
             }
-            (hf_output, _) = self.model.get_vllm_embedding(
+            (hf_output, _) = self.hf_model.get_vlm_embedding(
                 model_inputs,
             )
             hf_output = hf_output.squeeze(0)
@@ -186,7 +224,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         with torch.no_grad():
             model = self.get_sglang_model()
             input_ids = inputs["input_ids"].to(self.device).flatten()
-            image_inputs = model._parse_and_validate_inputs(
+            image_inputs = model.get_image_pixel_inputs(
                 input_ids=input_ids,
                 **{
                     "pixel_values": [inputs["pixel_values"]],
@@ -197,12 +235,102 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                     "slice_end_id": self.tokenizer.slice_end_id,
                 },
             )
-            (sglang_output, _) = model.get_embedding(
+            (sglang_output, _) = model.get_vlm_embedding(
                 input_ids=input_ids, image_inputs=image_inputs
             )
 
         self.compare_outputs(sglang_output, hf_output)
 
 
+class TestMiniCPMOLogits(VisionLLMLogitsBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = "openbmb/MiniCPM-o-2_6"
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.chat_template = "minicpmo"
+
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.hf_model = (
+            AutoModel.from_pretrained(
+                cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+            .eval()
+            .to(cls.device)
+        )
+
+    async def test_encode_output(self):
+        inputs = self.get_processor_output()
+
+        with torch.no_grad():
+            model_inputs = {
+                "input_ids": inputs.input_ids,
+                "image_bound": inputs.image_bound,
+                "pixel_values": inputs.pixel_values,
+                "tgt_sizes": inputs.tgt_sizes,
+            }
+            (hf_output, _) = self.hf_model.get_vlm_embedding(
+                model_inputs,
+            )
+            hf_output = hf_output.squeeze(0)
+
+        with torch.no_grad():
+            model = self.get_sglang_model()
+            input_ids = inputs["input_ids"].to(self.device).flatten()
+            image_inputs = model.get_image_pixel_inputs(
+                input_ids=input_ids,
+                **{
+                    "pixel_values": [inputs["pixel_values"]],
+                    "tgt_sizes": [inputs["tgt_sizes"]],
+                    "im_start_id": self.tokenizer.im_start_id,
+                    "im_end_id": self.tokenizer.im_end_id,
+                    "slice_start_id": self.tokenizer.slice_start_id,
+                    "slice_end_id": self.tokenizer.slice_end_id,
+                },
+            )
+            (sglang_output, _) = model.get_vlm_embedding(
+                input_ids=input_ids, image_inputs=image_inputs
+            )
+
+        self.compare_outputs(sglang_output, hf_output)
+
+
+def find_vision_llm_test_classes() -> list[Type[VisionLLMLogitsBase]]:
+    """Automatically find all test classes inheriting from VisionLLMLogitsBase"""
+    test_classes = []
+    for name, obj in globals().items():
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, VisionLLMLogitsBase)
+            and obj != VisionLLMLogitsBase
+        ):
+            test_classes.append(obj)
+    return test_classes
+
+
 if __name__ == "__main__":
-    unittest.main()
+
+    # TODO: Use standard unittest
+    mp.set_start_method("spawn", force=True)
+
+    # Run each test class in sequence in its own process
+    test_classes = find_vision_llm_test_classes()
+
+    for test_class in test_classes:
+        print(f"\nRunning tests for {test_class.__name__}")
+        process = mp.Process(target=run_test_class, args=(test_class,))
+        process.start()
+        process.join()
+        kill_process_tree(process.pid)
+
+        if process.exitcode != 0:
+            print(
+                f"Test class {test_class.__name__} failed with exit code {process.exitcode}"
+            )
+            exit(1)
+        print(f"Completed tests for {test_class.__name__}\n")

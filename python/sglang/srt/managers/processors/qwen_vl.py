@@ -62,7 +62,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         else:
             return self._process_images_task(images, input_text, self.hf_config)
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_ids,
@@ -78,10 +78,10 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
             image_data = [image_data]
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_images(
+        base_output = self.load_multimodal_data(
             input_ids=input_ids,
             image_data=image_data,
-            image_token=image_token,
+            multimodal_tokens=MultiModalEmbedTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,
         )
 
@@ -143,7 +143,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
             """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
             return math.floor(number / factor) * factor
 
-        images = [resize_image(image) for image in base_output.all_frames]
+        images = [resize_image(image) for image in base_output.images]
 
         # res = []
         # for image in images:
@@ -174,11 +174,10 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         )
         image_grid_thws = torch.concat([ret["image_grid_thw"]])
         video_grid_thws = None
-
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
             "pixel_values": ret["pixel_values"],
-            "image_hashes": base_output.image_hashes,
+            "image_hashes": base_output.data_hashes,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": image_grid_thws,
             "video_grid_thws": video_grid_thws,

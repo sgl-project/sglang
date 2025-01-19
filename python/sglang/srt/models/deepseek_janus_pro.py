@@ -48,11 +48,11 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
+    MultiModalDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.managers.schedule_batch import MultiModalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.utils import logger
@@ -2005,12 +2005,12 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultiModalInputs):
         im_start_id = image_inputs.im_start_id
         im_end_id = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]
 
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        helper = MultiModalDataPaddingPatternTokenPairs(media_token_pairs)
 
         return helper.pad_input_tokens(input_ids, image_inputs)
 

@@ -3,8 +3,8 @@ from typing import List, Optional, Union
 
 import numpy as np
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
-from sglang.srt.managers.image_processors.base_image_processor import (
+from sglang.srt.managers.processors.base_processor import (
+    BaseProcessor,
     get_global_processor,
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
@@ -14,7 +14,7 @@ from sglang.srt.utils import load_image, logger
 from sglang.utils import get_exception_traceback
 
 
-class LlavaImageProcessor(BaseImageProcessor):
+class LlavaProcessor(BaseProcessor):
     models = [LlavaVidForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor):
@@ -76,7 +76,7 @@ class LlavaImageProcessor(BaseImageProcessor):
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.executor,
-                LlavaImageProcessor._process_single_image_task,
+                LlavaProcessor._process_single_image_task,
                 image_data,
                 aspect_ratio,
                 grid_pinpoints,
@@ -86,7 +86,7 @@ class LlavaImageProcessor(BaseImageProcessor):
                 image_data, aspect_ratio, grid_pinpoints
             )
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_text,

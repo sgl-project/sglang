@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 import base64
 import builtins
 import ctypes
@@ -55,14 +54,12 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from packaging.version import Version, parse
+from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
-from torch.utils._contextlib import _DecoratorContextManager
-from torch.utils.cpp_extension import CUDA_HOME
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -507,9 +504,37 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file: Union[str, bytes]):
-    from PIL import Image
+def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+    # Use soundfile here, since librosa use it under the hood,
+    # and librosa will not support audio loading in the future
+    import soundfile as sf
+    from scipy.signal import resample
 
+    # print(f"loading {audio_file}")
+    # Load audio data
+    if isinstance(audio_file, bytes):
+        audio, original_sr = sf.read(BytesIO(audio_file))
+    elif audio_file.startswith("data:"):
+        audio_file = audio_file.split(",")[1]
+        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif isinstance(audio_file, str):
+        audio, original_sr = sf.read(audio_file)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    # Resample audio if the original sample rate is different from the desired sample rate
+    if original_sr != sr:
+        num_samples = int(len(audio) * float(sr) / original_sr)
+        audio = resample(audio, num_samples)
+
+    # Convert to mono if requested and audio is stereo
+    if mono and len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    return audio
+
+
+def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
     image = image_size = None
 
     if isinstance(image_file, bytes):
@@ -1682,27 +1707,61 @@ def add_prefix(name: str, prefix: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
-def is_remote_url(url: Union[str, Path]) -> bool:
+def get_multimodal_data_bounds(
+    input_ids: torch.Tensor,
+    pad_values: List[int],
+    data_start_id: int,
+    data_end_id: int,
+    slice_start_id: Optional[torch.Tensor] = None,
+    slice_end_id: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
-    Check if the URL is a remote URL of the format:
-    <connector_type>://<host>:<port>/<model_name>
+    Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
+
+    Returns:
+        [bounds_count, 2]
     """
-    if isinstance(url, Path):
-        return False
+    # All the images in the batch should share the same special image
+    # bound token ids.
+    start_cond = input_ids == data_start_id
+    end_cond = input_ids == data_end_id
+    if slice_start_id is not None:
+        start_cond |= input_ids == slice_start_id
+        end_cond |= input_ids == slice_end_id
 
-    pattern = r"(.+)://(.*)"
-    m = re.match(pattern, url)
-    return m is not None
+    (data_start_tokens,) = torch.where(start_cond)
+    data_start_tokens += 1
+    (data_end_tokens,) = torch.where(end_cond)
 
+    # the im_start_id sometimes can be cached as prefix, but it is needed for the embedding of the images
+    if len(data_start_tokens) != len(data_end_tokens):
+        if (
+            len(data_start_tokens) + 1 == len(data_end_tokens)
+            and input_ids[0] in pad_values
+            and data_end_tokens[0] < data_start_tokens[0]
+        ):
+            data_start_tokens = torch.cat(
+                [
+                    torch.tensor([0], device=data_start_tokens.device),
+                    data_start_tokens,
+                ]
+            )
+    valid_image_nums = min(len(data_start_tokens), len(data_end_tokens))
 
-def parse_connector_type(url: str) -> str:
-    """
-    Parse the connector type from the URL of the format:
-    <connector_type>://<path>
-    """
-    pattern = r"(.+)://(.*)"
-    m = re.match(pattern, url)
-    if m is None:
-        return ""
+    if valid_image_nums == 0:
+        return torch.zeros((0, 2), device=input_ids.device)
 
-    return m.group(1)
+    # Filter out pairs where start_token >= end_token
+    valid_pairs = []
+    for i in range(valid_image_nums):
+        start_token = data_start_tokens[i]
+        end_token = data_end_tokens[i]
+        if start_token < end_token:
+            valid_pairs.append((start_token, end_token))
+
+    if not valid_pairs:
+        return torch.zeros((0, 2), device=input_ids.device)
+
+    # Convert valid pairs to tensor
+    valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
+    return valid_pairs_tensor
