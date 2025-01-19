@@ -20,7 +20,6 @@ from sglang.lang.ir import (
     SglSamplingParams,
 )
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available, kill_process_tree
 from sglang.utils import http_request
@@ -353,6 +352,8 @@ class Runtime:
         **kwargs,
     ):
         """See the arguments in server_args.py::ServerArgs"""
+        from sglang.srt.server import launch_server
+
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()

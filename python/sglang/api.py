@@ -33,7 +33,7 @@ def function(
 
 def Runtime(*args, **kwargs):
     # Avoid importing unnecessary dependency
-    from sglang.lang.backend import Runtime
+    from sglang.lang.backend.runtime_endpoint import Runtime
 
     return Runtime(*args, **kwargs)
 
