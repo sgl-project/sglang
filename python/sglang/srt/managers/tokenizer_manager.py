@@ -381,6 +381,7 @@ class TokenizerManager:
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,
+                custom_logit_processor=obj.custom_logit_processor,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

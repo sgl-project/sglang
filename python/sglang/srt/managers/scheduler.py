@@ -614,6 +614,19 @@ class Scheduler:
                 fake_input_ids = [1] * seq_length
                 recv_req.input_ids = fake_input_ids
 
+            # Handle custom logit processor passed to the request
+            custom_logit_processor = recv_req.custom_logit_processor
+            if (
+                not self.server_args.enable_custom_logit_processor
+                and custom_logit_processor is not None
+            ):
+                logger.warning(
+                    "The SGLang server is not configured to enable custom logit processor."
+                    "The custom logit processor passed in will be ignored."
+                    "Please set --enable-custom-logits-processor to enable this feature."
+                )
+                custom_logit_processor = None
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -624,6 +637,7 @@ class Scheduler:
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
+                custom_logit_processor=custom_logit_processor,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
