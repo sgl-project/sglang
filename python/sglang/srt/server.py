@@ -711,7 +711,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [10, 11, 12]
     else:
-        json_data["text"] = "The capital city of France is\n"
+        json_data["text"] = "The capital city of France is"
 
     try:
         for _ in range(server_args.dp_size):
