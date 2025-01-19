@@ -39,10 +39,14 @@ from PIL import Image
 from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
-from vllm.model_executor.layers.resampler import get_2d_sincos_pos_embed
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
-from vllm.model_executor.models.module_mapping import MultiModelKeys
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+
+try:
+    from vllm.model_executor.layers.resampler import get_2d_sincos_pos_embed
+    from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+    from vllm.model_executor.models.module_mapping import MultiModelKeys
+    from vllm.model_executor.sampling_metadata import SamplingMetadata
+except ImportError:
+    pass
 
 from sglang.srt.distributed import divide, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
