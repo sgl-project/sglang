@@ -149,6 +149,7 @@ class Qwen2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rope=self.rotary_emb,
         )
 
     def forward(

@@ -701,7 +701,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
+    max_new_tokens = 32 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -711,7 +711,15 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [10, 11, 12]
     else:
-        json_data["text"] = "The capital city of France is"
+        # json_data["text"] = "The capital city of France is"
+        json_data["text"] = "You need to find the passkey. Read carefully following text, and remember the passkey\n\n"
+        filler = "Sky is blue, grass is green, sun is red. And here we go again"
+        json_data["text"] += filler * 1000
+        json_data["text"] += "\n\nThe passkey is $76192$. Remember, the passkey is $76192$.\n\n"
+        json_data["text"] += "\n\nThe passkey is $76192$. Remember, the passkey is $76192$.\n\n"
+        json_data["text"] += "\n\nThe passkey is $76192$. Remember, the passkey is $76192$.\n\n"
+        json_data["text"] += filler * 1000
+        json_data["text"] += "What was the passkey? The passkey is"
 
     try:
         for _ in range(server_args.dp_size):
@@ -722,6 +730,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
+            logger.info(f'Warmup response: {res.json()}')
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:

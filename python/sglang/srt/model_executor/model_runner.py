@@ -32,6 +32,12 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.hf_transformers_utils import update_context_length, get_context_length
+
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -52,6 +58,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import ServerArgs
@@ -294,6 +301,13 @@ class ModelRunner:
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
+
+        if self.server_args.enable_hip_attention:
+            orig_context_length = get_context_length(self.model_config.hf_config)
+            update_context_length(self.model_config.hf_config, self.server_args.context_length)
+            self.model_config.hf_config.orig_context_len = orig_context_length
+            logger.info(f"Update model config for HiP context extension "
+                        f"{orig_context_length} -> {self.server_args.context_length}.")
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
@@ -604,9 +618,10 @@ class ModelRunner:
                 logging.warning(
                     f"max_total_tokens={max_total_tokens} is larger than the profiled value "
                     f"{self.max_total_num_tokens}. "
-                    f"Use the profiled value instead."
+                    # f"Use the given value instead."
                 )
-            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+            # self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+            self.max_total_num_tokens = max_total_tokens
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -644,6 +659,18 @@ class ModelRunner:
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+        elif self.server_args.enable_hip_attention and self.server_args.enable_hip_offload:
+            self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
+                max_token_size=self.max_total_num_tokens,
+                max_mask_cache_token_size=self.server_args.hip_max_mask_cache_token_size,
+                max_sa_cache_token_size=self.server_args.hip_max_sa_cache_token_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=torch.device(self.gpu_id),
+                hip_config=self.hip_attention_config,
+            )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
@@ -654,6 +681,7 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -712,6 +740,7 @@ class ModelRunner:
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        from sglang.srt.layers.attention.hip_attention import HiPCudaGraphRunner
 
         self.cuda_graph_runner = None
 
@@ -723,9 +752,15 @@ class ModelRunner:
             return
 
         tic = time.time()
+        CudaGraphRunnerClass = CudaGraphRunner
+        if self.server_args.enable_hip_attention:
+            CudaGraphRunnerClass = HiPCudaGraphRunner
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
-        self.cuda_graph_runner = CudaGraphRunner(self)
-        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
+        self.cuda_graph_runner = CudaGraphRunnerClass(self)
+        logger.info(
+            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s, "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")

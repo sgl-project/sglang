@@ -72,6 +72,11 @@ class TpModelWorkerClient:
             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
         )
 
+        # Init hip mask refresh interval
+        self.hip_mask_refresh_interval = None
+        if server_args.enable_hip_attention:
+            self.hip_mask_refresh_interval = self.worker.model_runner.hip_attention_config.mask_refresh_interval
+
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
@@ -117,10 +122,50 @@ class TpModelWorkerClient:
         batch_pt = 0
         batch_lists = [None] * 2
 
+        decode_index = 0
+
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
+
+            model_worker_batch: ModelWorkerBatch
+            if model_worker_batch.forward_mode.is_decode():
+                if self.hip_mask_refresh_interval is not None:
+                    # NOTE: for debug
+                    # if decode_index % self.hip_mask_refresh_interval == 0:
+                    #     model_worker_batch.hip_use_cached_mask = False
+                    #     # logger.info(f"Refreshing attention mask for decode index {decode_index}.")
+                    # else:
+                    #     model_worker_batch.hip_use_cached_mask = True
+                    #     # logger.info(f"Using cached attention mask for decode index {decode_index}.")
+                    
+                    # NOTE: for debug
+                    # if decode_index % 8 == 0: # first stage refresh interval
+                    #     model_worker_batch.hip_use_cached_mask = False
+                    #     model_worker_batch.hip_metadata_cached_stages = 0       # NOTE: no cached stages
+                    # elif decode_index % 4 == 0: # second stage refresh interval
+                    #     model_worker_batch.hip_use_cached_mask = False
+                    #     model_worker_batch.hip_metadata_cached_stages = 1
+                    # elif decode_index % 2 == 0: # third stage refresh interval
+                    #     model_worker_batch.hip_use_cached_mask = False
+                    #     model_worker_batch.hip_metadata_cached_stages = 2
+                    # else:
+                    #     model_worker_batch.hip_use_cached_mask = True
+                    #     model_worker_batch.hip_metadata_cached_stages = None    # NOTE: use cache every stage
+                    
+                    require_refresh = False
+                    for i_stage, refresh_inteval in enumerate(self.hip_mask_refresh_interval):
+                        if (decode_index % refresh_inteval == 0) and (not require_refresh):
+                            model_worker_batch.hip_use_cached_mask = False
+                            model_worker_batch.hip_metadata_cached_stages = i_stage
+                            require_refresh = True
+                    if not require_refresh:
+                        model_worker_batch.hip_use_cached_mask = True
+                        model_worker_batch.hip_metadata_cached_stages = None    # NOTE: use cache every stage
+                decode_index += 1
+            elif model_worker_batch.forward_mode.is_extend():
+                decode_index = 0
 
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released

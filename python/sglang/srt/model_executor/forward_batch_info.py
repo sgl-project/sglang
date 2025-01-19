@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
+    from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
 
 
 class ForwardMode(IntEnum):
@@ -183,6 +184,11 @@ class ForwardBatch:
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
+
+    # For HiP attention
+    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
+    hip_use_cached_mask: Optional[bool] = None
+    hip_metadata_cached_stage: Optional[int] = None
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -341,12 +347,29 @@ class ForwardBatch:
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
         ret.attn_backend = model_runner.attn_backend
 
+        # Init HiP attention information
+        if hasattr(model_runner, 'hip_metadata_cache_pool'):
+            ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
+            ret.hip_use_cached_mask = batch.hip_use_cached_mask
+            ret.hip_metadata_cached_stage = batch.hip_metadata_cached_stages
+
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
 
+    def on_model_start(self):
+        self.token_to_kv_pool.on_model_start(self)
+
+    def on_model_end(self):
+        self.token_to_kv_pool.on_model_end(self)
+
+    def on_layer_start(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_start(self, layer_id)
+
+    def on_layer_end(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_end(self, layer_id)
 
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum

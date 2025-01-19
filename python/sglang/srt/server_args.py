@@ -109,6 +109,15 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
 
+    # HiP Attention
+    enable_hip_attention: bool = False
+    hip_attention_config: str = None
+
+    # HiP Attention Offload
+    enable_hip_offload: bool = False
+    hip_max_mask_cache_token_size: int = 128 * 1024
+    hip_max_sa_cache_token_size: int = 16 * 1024
+    
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
@@ -625,6 +634,44 @@ class ServerArgs:
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
+        )
+
+        # HiP Attention
+        parser.add_argument(
+            "--enable-hip-attention",
+            action="store_true",
+            help="Enable HiP attention. This flag is not compatible with other sparse attention flags (e.g., double sparsity).",
+        )
+        parser.add_argument(
+            "--hip-attention-config",
+            type=str,
+            default=ServerArgs.hip_attention_config,
+            help="Path to the HiP attention config file, or the json in string format.",
+        )
+        
+        # HiP Attention Offload
+        parser.add_argument(
+            "--enable-hip-offload",
+            action="store_true",
+            help="Enable HiP offloading. This flag should be set with --enable--hip-attention.",
+        )
+        parser.add_argument(
+            '--hip-max-mask-cache-token-size',
+            type=int,
+            default=128 * 1024,
+            help=(
+                "On-gpu cache size of HiP masking kernels. "
+                "This will be major factor to determine mask refreshing decoding step."
+            )
+        )
+        parser.add_argument(
+            '--hip-max-sa-cache-token-size',
+            type=int,
+            default=16 * 1024,
+            help=(
+                "On-gpu cache size of sparse attention kernels. "
+                "This will be major factor to determine mask cached decoding step."
+            )
         )
 
         # LoRA

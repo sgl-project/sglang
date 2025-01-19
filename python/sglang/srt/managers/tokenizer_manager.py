@@ -271,6 +271,16 @@ class TokenizerManager:
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
+        elif obj.input_ids is None:
+            input_ids = self.tokenizer.encode(input_text)
+
+            # HACK: Remove duplicate bos tokens
+            while (
+                (len(input_ids) > 1) and
+                (input_ids[0] == self.tokenizer.bos_token_id) and
+                (input_ids[1] == self.tokenizer.bos_token_id)
+            ):
+                input_ids.pop(0)
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
         else:
