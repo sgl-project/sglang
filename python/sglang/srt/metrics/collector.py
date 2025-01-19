@@ -109,31 +109,31 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.num_requests_total = Counter(
+            name="sglang:num_requests_total",
+            documentation="Number of requests processed.",
+            labelnames=labels.keys(),
+        )
+
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             labelnames=labels.keys(),
             buckets=[
-                0.001,
-                0.005,
-                0.01,
-                0.02,
-                0.04,
-                0.06,
-                0.08,
                 0.1,
                 0.25,
                 0.5,
                 0.75,
-                1.0,
-                2.5,
-                5.0,
-                7.5,
-                10.0,
-                15.0,
-                20.0,
-                25.0,
-                30.0,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+                160,
             ],
         )
 
@@ -168,21 +168,19 @@ class TokenizerMetricsCollector:
             documentation="Histogram of End-to-end request latency in seconds",
             labelnames=labels.keys(),
             buckets=[
-                0.3,
+                0.1,
+                0.25,
                 0.5,
-                0.8,
-                1.0,
-                1.5,
-                2.0,
-                2.5,
-                5.0,
-                10.0,
-                15.0,
-                20.0,
-                30.0,
-                40.0,
-                50.0,
-                60.0,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+                160,
             ],
         )
 
@@ -193,11 +191,10 @@ class TokenizerMetricsCollector:
         # Convenience function for logging to counter.
         counter.labels(**self.labels).inc(data)
 
-    def inc_prompt_tokens(self, value: int):
-        self._log_counter(self.prompt_tokens_total, value)
-
-    def inc_generation_tokens(self, value: int):
-        self._log_counter(self.generation_tokens_total, value)
+    def observe_one_finished_request(self, prompt_tokens: int, generation_tokens: int):
+        self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
+        self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
+        self.num_requests_total.labels(**self.labels).inc(1)
 
     def observe_time_to_first_token(self, value: Union[float, int]):
         self._log_histogram(self.histogram_time_to_first_token, value)

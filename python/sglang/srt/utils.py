@@ -14,6 +14,8 @@
 """Common utilities."""
 
 import base64
+import dataclasses
+import io
 import ipaddress
 import itertools
 import json
@@ -33,6 +35,7 @@ import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
@@ -56,9 +59,9 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
+from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
-
 
 show_time_cost = False
 time_infos = {}
@@ -92,6 +95,10 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
+    return torch.cuda.is_available() and torch.version.cuda
+
+
+def is_cuda_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
@@ -215,6 +222,10 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
+
+    elif device == "cpu":
+        # TODO: rename the variables in the current function to be not GPU specific
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -349,6 +360,8 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
+        except OverflowError:
+            return False
 
 
 def decode_video_base64(video_base64):
@@ -454,6 +467,8 @@ def load_image(image_file: Union[str, bytes]):
     else:
         raise ValueError(f"Invalid image: {image}")
 
+    # if image_size is None:
+    #     image_size = image.size
     return image, image_size
 
 
@@ -582,13 +597,13 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
 
 
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
         GGUFEmbeddingMethod,
         GGUFLinearMethod,
     )
 
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
@@ -723,13 +738,14 @@ def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -738,19 +754,19 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -795,7 +811,9 @@ def first_rank_print(*args, **kwargs):
         pass
 
 
-def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -808,13 +826,16 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     if socket_type == zmq.PUSH:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-        socket.connect(f"ipc://{endpoint}")
     elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-        socket.bind(f"ipc://{endpoint}")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
 
     return socket
 
@@ -1221,7 +1242,6 @@ def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> 
     # https://github.com/pytorch/pytorch/blob/
     # c1cd946818442aca8c7f812b16d187ce1586c3bc/
     # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.cuda
     import torch.version
 
     if not torch.cuda._is_compiled():
@@ -1254,49 +1274,172 @@ def cuda_device_count_stateless() -> int:
     return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
 
 
-def should_use_tensor_core(
-    kv_cache_dtype: torch.dtype,
-    num_attention_heads: int,
-    num_kv_heads: int,
-) -> bool:
-    """
-    Determine whether to use tensor cores for attention computation.
+def dataclass_to_string_truncated(data, max_length=2048):
+    if isinstance(data, str):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return f'"{data[:half_length]} ... {data[-half_length:]}"'
+        else:
+            return f'"{data}"'
+    elif isinstance(data, (list, tuple)):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+        else:
+            return str(data)
+    elif isinstance(data, dict):
+        return (
+            "{"
+            + ", ".join(
+                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+                for k, v in data.items()
+            )
+            + "}"
+        )
+    elif dataclasses.is_dataclass(data):
+        fields = dataclasses.fields(data)
+        return (
+            f"{data.__class__.__name__}("
+            + ", ".join(
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                for f in fields
+            )
+            + ")"
+        )
+    else:
+        return str(data)
+
+
+TOOLS_TAG_LIST = ["<|plugin|>", "<function=", "<tool_call>", "<|python_tag|>"]
+
+
+def parse_tool_response(text, tools, **kwargs):
+    """Parse model response containing tool information.
 
     Args:
-        kv_cache_dtype: Data type of the KV cache
-        num_attention_heads: Number of attention heads
-        num_kv_heads: Number of key/value heads
-
-    Returns:
-        bool: Whether to use tensor cores
+        text(str): model response in string format
+        tools(List): tools from user request
     """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
-
-    # Try to use _grouped_size_compiled_for_decode_kernels if available
-    # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
-    try:
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
-        if not _grouped_size_compiled_for_decode_kernels(
-            num_attention_heads,
-            num_kv_heads,
-        ):
-            return True
+    if "<|plugin|>" in text:  # internlm2
+        text, action = text.split("<|action_start|><|plugin|>")
+        action = action.split("<|action_end|>".strip())[0]
+        action = action[action.find("{") :]
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
+    elif "<function=" in text:  # llama3.1
+        action, _ = text.split("</function>")
+        parameters = action[action.find("{") :]
+        name = action.split("<function=")[1].split(">{")[0]
+        call_info_list = [(name, parameters)]
+    elif "<tool_call>" in text and "</tool_call>" in text:  # qwen2.5
+        # get tool_call in text
+        pattern = r"<tool_call>(.*?)</tool_call>"
+        match_result_list = re.findall(pattern, text, re.DOTALL)
+        call_info_list = []
+        for match_result in match_result_list:
+            action = json.loads(match_result)
+            call_info_list.append(
+                (action["name"], json.dumps(action["arguments"], ensure_ascii=False))
+            )
+        # get text outside of tags
+        if not text.startswith("<tool_call>"):
+            text = text[: text.find("<tool_call>")]
+        elif not text.endswith("</tool_call>"):
+            text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
         else:
-            return False
-    except (ImportError, AttributeError):
-        pass
-
-    # Calculate GQA group size
-    gqa_group_size = num_attention_heads // num_kv_heads
-
-    # Determine based on dtype and GQA group size
-    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return True
-    elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
+            text = ""
+    elif "<|python_tag|>" in text:  # llama3.2
+        _, action = text.split("<|python_tag|>")
+        action = json.loads(action)
+        name, parameters = action["name"], json.dumps(
+            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
+        )
+        call_info_list = [(name, parameters)]
     else:
-        return False
+        raise RuntimeError(f"Unexpected model response: {text}")
+
+    call_info_list = [
+        (
+            [tool.function.name for tool in tools].index(call_info[0]),
+            call_info[0],
+            call_info[1],
+        )
+        for call_info in call_info_list
+    ]
+    return text, call_info_list
+
+
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    b_ = x.shape[0]
+    n_ = x.shape[1]
+    k_ = x.shape[2]
+
+    x_ = x
+    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
+    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
+    else:
+        return x_
+
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
+
+class MultiprocessingSerializer:
+    @staticmethod
+    def serialize(obj):
+        buf = io.BytesIO()
+        ForkingPickler(buf).dump(obj)
+        buf.seek(0)
+        return buf.read()
+
+    @staticmethod
+    def deserialize(data):
+        return ForkingPickler.loads(data)
+
+
+def debug_timing(func):
+    # todo: replace with a more organized instrumentation
+    def wrapper(*args, **kwargs):
+        if logger.isEnabledFor(logging.DEBUG):
+            tic = torch.cuda.Event(enable_timing=True)
+            toc = torch.cuda.Event(enable_timing=True)
+            tic.record()
+            result = func(*args, **kwargs)
+            toc.record()
+            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
+            elapsed = tic.elapsed_time(toc)
+            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
+            num_tokens = len(indices) if indices is not None else 0
+            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
+            logger.debug(
+                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
+            )
+            return result
+        else:
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
+
+
+def set_uvicorn_logging_configs():
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    LOGGING_CONFIG["formatters"]["access"][
+        "fmt"
+    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"

@@ -5,7 +5,7 @@
 - Mistral / Mixtral / Mistral NeMo
 - Gemma / Gemma 2
 - Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL
-- DeepSeek / DeepSeek 2
+- DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
 - OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
   - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --port=30000 --chat-template=chatml-llava`
@@ -24,7 +24,7 @@
 - InternLM 2
 - Exaone 3
 - BaiChuan2
-- MiniCPM / MiniCPM 3
+- MiniCPM / MiniCPM 3 / MiniCPMV
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4

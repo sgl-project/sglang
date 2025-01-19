@@ -58,10 +58,10 @@ class DetokenizerManager:
         # Init inter-process communication
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
-            context, zmq.PULL, port_args.detokenizer_ipc_name
+            context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
         self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name
+            context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
         if server_args.skip_tokenizer_init:
@@ -191,7 +191,6 @@ class DetokenizerManager:
                     input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
                     output_top_logprobs_val=recv_obj.output_top_logprobs_val,
                     output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
-                    normalized_prompt_logprob=recv_obj.normalized_prompt_logprob,
                 )
             )
 

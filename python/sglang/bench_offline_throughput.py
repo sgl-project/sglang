@@ -39,14 +39,15 @@ class BenchArgs:
     dataset_path: str = ""
     num_prompts: int = 1000
     sharegpt_output_len: Optional[int] = None
+    sharegpt_context_len: Optional[int] = None
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
-    gen_num_groups: int = 64
-    gen_prompts_per_group: int = 16
-    gen_system_prompt_len: int = 2048
-    gen_question_len: int = 128
-    gen_output_len: int = 256
+    gsp_num_groups: int = 64
+    gsp_prompts_per_group: int = 16
+    gsp_system_prompt_len: int = 2048
+    gsp_question_len: int = 128
+    gsp_output_len: int = 256
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
     seed: int = 1
@@ -83,6 +84,12 @@ class BenchArgs:
             help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
         )
         parser.add_argument(
+            "--sharegpt-context-len",
+            type=int,
+            default=BenchArgs.sharegpt_context_len,
+            help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
+        )
+        parser.add_argument(
             "--random-input-len",
             type=int,
             default=BenchArgs.random_input_len,
@@ -102,35 +109,35 @@ class BenchArgs:
             "used only for random dataset.",
         )
         parser.add_argument(
-            "--gen-num-groups",
+            "--gsp-num-groups",
             type=int,
-            default=BenchArgs.gen_num_groups,
+            default=BenchArgs.gsp_num_groups,
             help="Number of groups with shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-prompts-per-group",
+            "--gsp-prompts-per-group",
             type=int,
-            default=BenchArgs.gen_prompts_per_group,
+            default=BenchArgs.gsp_prompts_per_group,
             help="Number of prompts per group of shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-system-prompt-len",
+            "--gsp-system-prompt-len",
             type=int,
-            default=BenchArgs.gen_system_prompt_len,
+            default=BenchArgs.gsp_system_prompt_len,
             help="System prompt length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-question-len",
+            "--gsp-question-len",
             type=int,
-            default=BenchArgs.gen_question_len,
+            default=BenchArgs.gsp_question_len,
             help="Question length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-output-len",
+            "--gsp-output-len",
             type=int,
-            default=BenchArgs.gen_output_len,
+            default=BenchArgs.gsp_output_len,
             help="Target length in tokens for outputs in generated-shared-prefix dataset",
         )
         parser.add_argument(
@@ -331,6 +338,7 @@ def throughput_test(
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
     )
+    backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
