@@ -158,6 +158,7 @@ class TokenizerManager:
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
+                    tokenizer_revision=server_args.revision,
                 )
                 self.tokenizer = self.processor.tokenizer
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -171,6 +172,7 @@ class TokenizerManager:
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
+                    tokenizer_revision=server_args.revision,
                 )
 
         # Store states
