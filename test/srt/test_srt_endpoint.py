@@ -300,11 +300,11 @@ class TestSRTEndpoint(unittest.TestCase):
         self.assertTrue(all(x == custom_params["token_id"] for x in sampled_tokens))
 
     def test_custom_logit_processor(self):
-        """Test custom logit processor with a single target token id."""
+        """Test custom logit processor with a single request."""
         self.run_custom_logit_processor(target_token_id=5)
 
     def test_custom_logit_processor_batch(self):
-        """Test custom logit processor with multiple target token ids."""
+        """Test custom logit processor with a batch of requests."""
         target_token_ids = list(range(32))
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
