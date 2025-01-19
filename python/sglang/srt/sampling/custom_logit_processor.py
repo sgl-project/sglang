@@ -1,9 +1,19 @@
 import json
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import dill
 import torch
+
+
+@lru_cache(maxsize=None)
+def _cache_from_str(json_str: str):
+    """Deserialize a json string to a Callable object.
+    This function is cached to avoid redundant deserialization.
+    """
+    data = json.loads(json_str)
+    return dill.loads(bytes.fromhex(data["callable"]))
 
 
 class CustomLogitProcessor(ABC):
@@ -25,5 +35,4 @@ class CustomLogitProcessor(ABC):
     @classmethod
     def from_str(cls, json_str: str):
         """Deserialize a callable function from a JSON string."""
-        data = json.loads(json_str)
-        return dill.loads(bytes.fromhex(data["callable"]))
+        return _cache_from_str(json_str)
