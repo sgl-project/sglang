@@ -86,12 +86,8 @@ class TestRegexConstrained(unittest.TestCase):
             if not text:
                 self.fail("Generated text is empty.")
 
-            match = False
-            if self.regex_match(text, regex):
-                match = True
-                break
-            if not match:
-                self.fail(f"Text '{text}' does not match any of the allowed patterns.")
+            if not self.regex_match(text, regex):
+                self.fail(f"Text '{text}' does not match regex pattern.")
 
     def regex_match(self, text, pattern):
         import re
