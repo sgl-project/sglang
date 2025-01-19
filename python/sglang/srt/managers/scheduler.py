@@ -206,6 +206,7 @@ class Scheduler:
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
                 )
                 self.tokenizer = self.processor.tokenizer
             else:
@@ -213,6 +214,7 @@ class Scheduler:
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
                 )
 
         # Check whether overlap can be enabled
