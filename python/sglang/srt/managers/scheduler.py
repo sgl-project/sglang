@@ -317,6 +317,7 @@ class Scheduler:
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        self.spec_accept_length = 0
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
@@ -463,10 +464,6 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
-
-            if self.server_args.enable_dp_attention:  # TODO: simplify this
-                batch = self.prepare_dp_attn_batch(batch)
-
             self.cur_batch = batch
 
             if batch:
@@ -489,10 +486,6 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
-
-            if self.server_args.enable_dp_attention:  # TODO: simplify this
-                batch = self.prepare_dp_attn_batch(batch)
-
             self.cur_batch = batch
 
             if batch:
@@ -500,7 +493,7 @@ class Scheduler:
                 result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
-                    # Create a dummy first batch to start the pipeline for overlap scheduler.
+                    # Create a dummy first batch to start the pipeline for overlap schedule.
                     # It is now used for triggering the sampling_info_done event.
                     tmp_batch = ScheduleBatch(
                         reqs=None,
@@ -824,16 +817,23 @@ class Scheduler:
                 else:
                     self.running_batch.merge_batch(self.last_batch)
 
-        # Run prefill first if possible
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
-            return new_batch
+            # Run prefill first if possible
+            ret = new_batch
+        else:
+            # Run decode
+            if self.running_batch is None:
+                ret = None
+            else:
+                self.running_batch = self.update_running_batch(self.running_batch)
+                ret = self.running_batch
 
-        # Run decode
-        if self.running_batch is None:
-            return None
-        self.running_batch = self.update_running_batch(self.running_batch)
-        return self.running_batch
+        # Handle DP attention
+        if self.server_args.enable_dp_attention:
+            ret = self.prepare_dp_attn_batch(ret)
+
+        return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
