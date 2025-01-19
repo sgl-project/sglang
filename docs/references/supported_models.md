@@ -81,6 +81,7 @@ To port a model from vLLM to SGLang, you can compare these two files [SGLang Lla
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.
   - Add `EntryClass` at the end.
+  - Please ensure the new implementation uses **only SGLang components and does not rely on any vLLM components**.
 
 ### Registering an external model implementation
 

@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 import signal
 from collections import OrderedDict
 from typing import Dict, List, Union
@@ -34,6 +35,12 @@ from sglang.srt.utils import configure_logger, get_zmq_socket
 from sglang.utils import find_printable_text, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of request states that detokenizer can hold. When exceeded,
+# oldest request states will be evicted. Default: 65536 (1<<16).
+# For more details, see: https://github.com/sgl-project/sglang/issues/2812
+# Use power of 2 values for better memory allocation.
+DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
 
 @dataclasses.dataclass
@@ -71,9 +78,10 @@ class DetokenizerManager:
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
             )
 
-        self.decode_status = LimitedCapacityDict()
+        self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -155,7 +163,17 @@ class DetokenizerManager:
             # Incremental decoding
             output_strs = []
             for i in range(bs):
-                s = self.decode_status[recv_obj.rids[i]]
+                try:
+                    s = self.decode_status[recv_obj.rids[i]]
+                except KeyError:
+                    raise RuntimeError(
+                        f"Decode status not found for request {recv_obj.rids[i]}. "
+                        "It may be due to the request being evicted from the decode status due to memory pressure. "
+                        "Please increase the maximum number of requests by setting "
+                        "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
+                        f"The current value is {DETOKENIZER_MAX_STATES}. "
+                        "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                    )
                 new_text = read_texts[i][len(surr_texts[i]) :]
                 if recv_obj.finished_reasons[i] is None:
                     # Streaming chunk: update the decode status
@@ -196,7 +214,7 @@ class DetokenizerManager:
 
 
 class LimitedCapacityDict(OrderedDict):
-    def __init__(self, capacity=1 << 15, *args, **kwargs):
+    def __init__(self, capacity: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.capacity = capacity
 
