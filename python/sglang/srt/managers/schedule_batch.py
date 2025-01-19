@@ -340,19 +340,16 @@ class Req:
         Validate and set the custom logit processor. Set to None if the server is not
         configured to enable this feature.
         """
-        if not custom_logit_processor:
+        if not enable_custom_logit_processor:
+            if custom_logit_processor:
+                logger.warning(
+                    "The SGLang server is not configured to enable custom logit processor."
+                    "The custom logit processor passed in will be ignored."
+                    "Please set --enable-custom-logits-processor to enable this feature."
+                )
             self.custom_logit_processor = None
-            return
-
-        if enable_custom_logit_processor:
-            self.custom_logit_processor = custom_logit_processor
         else:
-            logger.warning(
-                "The SGLang server is not configured to enable custom logit processor."
-                "The custom logit processor passed in will be ignored."
-                "Please set --enable-custom-logits-processor to enable this feature."
-            )
-            self.custom_logit_processor = None
+            self.custom_logit_processor = custom_logit_processor
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
