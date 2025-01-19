@@ -23,7 +23,7 @@ def setup_logger():
     logger.setLevel(logging.INFO)
 
     formatter = logging.Formatter(
-        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s - %(filename)s:%(lineno)d",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
