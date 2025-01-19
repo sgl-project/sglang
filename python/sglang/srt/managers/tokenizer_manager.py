@@ -117,6 +117,7 @@ class TokenizerManager:
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
+        self.log_requests_level = 0
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -276,7 +277,10 @@ class TokenizerManager:
         obj.normalize_batch_and_arguments()
 
         if self.log_requests:
-            logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)}")
+            max_length = 2048 if self.log_requests_level == 0 else 1 << 30
+            logger.info(
+                f"Receive: obj={dataclass_to_string_truncated(obj, max_length)}"
+            )
 
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
@@ -419,7 +423,8 @@ class TokenizerManager:
             state.out_list = []
             if state.finished:
                 if self.log_requests:
-                    msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
+                    max_length = 2048 if self.log_requests_level == 0 else 1 << 30
+                    msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length)}, out={dataclass_to_string_truncated(out, max_length)}"
                     logger.info(msg)
                 del self.rid_to_state[obj.rid]
 
@@ -682,6 +687,8 @@ class TokenizerManager:
     def configure_logging(self, obj: ConfigureLoggingReq):
         if obj.log_requests is not None:
             self.log_requests = obj.log_requests
+        if obj.log_requests_level is not None:
+            self.log_requests_level = obj.log_requests_level
         if obj.dump_requests_folder is not None:
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
