@@ -65,7 +65,7 @@ jobs:
           python3 run_suite.py
 
   finish:
-    needs: [unit-test-rust, e2e-rust]
+    needs: [unit-test-rust, e2e-python]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
