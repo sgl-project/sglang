@@ -26,7 +26,7 @@ global global_processor
 
 
 def init_global_processor(server_args: ServerArgs):
-    """Init the global processor for multi modal models."""
+    """Init the global processor for multi-modal models."""
     global global_processor
     transformers.logging.set_verbosity_error()
     global_processor = get_processor(
@@ -324,6 +324,7 @@ class LlavaImageProcessor(BaseImageProcessor):
 class MllamaImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
+        self.support_audio_input = "MiniCPMO" in hf_config.architectures
 
     @staticmethod
     def _process_single_image_task(images, input_text):
@@ -372,27 +373,38 @@ class MllamaImageProcessor(BaseImageProcessor):
 class MiniCPMVImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "(<image>./</image>)"
+        self.image_token = "(<image>./</image>)"
+        self.audio_token = "(<audio>./</audio>)"
 
     @staticmethod
-    def _process_images_task(images, input_text):
+    def _process_images_task(input_text, images, audios=None):
         result = global_processor.__call__(
-            text=input_text, images=images, return_tensors="pt"
+            text=input_text, images=images, audios=audios, return_tensors="pt"
         )
         return {
             "input_ids": result.input_ids,
             "pixel_values": result.pixel_values,
             "tgt_sizes": result.tgt_sizes,
+            "audio_features": (
+                result["audio_features"] if "audio_features" in result else None
+            ),
+            "audio_feature_lens": (
+                result["audio_feature_lens"] if "audio_feature_lens" in result else None
+            ),
+            "audio_bounds": (
+                result["audio_bounds"] if "audio_bounds" in result else None
+            ),
         }
 
-    async def _process_images(self, images, input_text):
+    async def _process_images(self, images, input_text, audios=None):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             image_inputs = await loop.run_in_executor(
                 self.executor,
                 MiniCPMVImageProcessor._process_images_task,
-                images,
                 input_text,
+                images,
+                audios,
             )
         else:
             image_inputs = self._processor(
@@ -401,6 +413,17 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
         return image_inputs
 
+    def load_audio(self, path: str) -> np.ndarray:
+        import librosa
+
+        if not path.startswith("audio:"):
+            print(f"malformed audio path: {path}")
+            return None
+        path = path.replace("audio:", "")
+
+        ref_audio, _ = librosa.load(path, sr=16000, mono=True)
+        return ref_audio
+
     async def process_images_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -408,10 +431,13 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         request_obj,
         max_req_input_len,
     ):
-        if not image_data:
+        audio_data = request_obj.audio_data
+        if not image_data and not audio_data:
             return None
         if not isinstance(image_data, list):
             image_data = [image_data]
+        if not isinstance(audio_data, list):
+            audio_data = [audio_data]
 
         base_output = self.load_images(
             max_req_input_len, input_ids, image_data, self.IMAGE_TOKEN
@@ -427,17 +453,29 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
         # Collect special token ids
         tokenizer = self._processor.tokenizer
-        im_start_id = [tokenizer.im_start_id]
-        im_end_id = [tokenizer.im_end_id]
+        slice_start_id, slice_end_id, audio_start_id, audio_end_id = (
+            None,
+            None,
+            None,
+            None,
+        )
         if tokenizer.slice_start_id:
-            slice_start_id = [tokenizer.slice_start_id]
-            slice_end_id = [tokenizer.slice_end_id]
+            slice_start_id = tokenizer.slice_start_id
+            slice_end_id = tokenizer.slice_end_id
+        if hasattr(tokenizer, "audio_start_id"):
+            audio_start_id = tokenizer.audio_start_id
+            audio_end_id = tokenizer.audio_end_id
         return {
             "input_ids": res["input_ids"].flatten().tolist(),
             "pixel_values": res["pixel_values"],
             "tgt_sizes": res["tgt_sizes"],
             "image_hashes": base_output.image_hashes,
             "modalities": request_obj.modalities or ["image"],
+            "audio_start_id": audio_start_id,
+            "audio_end_id": audio_end_id,
+            "audio_features": res["audio_features"],
+            "audio_bounds": res["audio_bounds"],
+            "audio_feature_lens": res["audio_feature_lens"],
             "im_start_id": im_start_id,
             "im_end_id": im_end_id,
             "slice_start_id": slice_start_id,
@@ -446,9 +484,9 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _image_processor):
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
         self.hf_config = hf_config
-        self._image_processor = _image_processor
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
             mp_context=mp.get_context("fork"),
@@ -639,7 +677,7 @@ def get_image_processor(
     elif "Qwen2_5_VLForConditionalGeneration" in hf_config.architectures:
         return Qwen2_5VLImageProcessor(hf_config, server_args, processor)
 
-    elif "MiniCPMV" in hf_config.architectures:
+    elif "MiniCPMV" in hf_config.architectures or "MiniCPMO" in hf_config.architectures:
         return MiniCPMVImageProcessor(hf_config, server_args, processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)

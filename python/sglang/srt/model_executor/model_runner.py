@@ -251,6 +251,10 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
+        # Add cleanup of existing distributed environment
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
@@ -793,7 +797,6 @@ class ModelRunner:
             and self.cuda_graph_runner.can_run(forward_batch)
         ):
             return self.cuda_graph_runner.replay(forward_batch)
-
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
