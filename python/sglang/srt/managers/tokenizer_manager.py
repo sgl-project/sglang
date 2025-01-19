@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
@@ -112,6 +113,7 @@ class TokenizerManager:
         port_args: PortArgs,
     ):
         # Parse args
+
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
@@ -207,6 +209,8 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        # Set after scheduler is initialized
+        self.max_req_input_len = None
 
         # Metrics
         if self.enable_metrics:
@@ -318,7 +322,7 @@ class TokenizerManager:
         if self.is_generation:
             # TODO: also support getting embeddings for multimodal models
             image_inputs: Dict = await self.image_processor.process_images_async(
-                obj.image_data, input_text or input_ids, obj
+                obj.image_data, input_text or input_ids, obj, self.max_req_input_len
             )
             if image_inputs and "input_ids" in image_inputs:
                 input_ids = image_inputs["input_ids"]
@@ -418,6 +422,16 @@ class TokenizerManager:
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
                     logger.info(msg)
                 del self.rid_to_state[obj.rid]
+
+                # Check if this was an abort/error created by scheduler
+                if isinstance(out["meta_info"].get("finish_reason"), dict):
+                    finish_reason = out["meta_info"]["finish_reason"]
+                    if (
+                        finish_reason.get("type") == "abort"
+                        and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
+                    ):
+                        raise ValueError(finish_reason["message"])
+
                 yield out
                 break
 

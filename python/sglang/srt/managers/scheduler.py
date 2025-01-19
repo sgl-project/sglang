@@ -23,6 +23,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
+from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -274,7 +275,6 @@ class Scheduler:
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
-
         # Print debug info
         logger.info(
             f"max_total_num_tokens={self.max_total_num_tokens}, "
@@ -653,15 +653,16 @@ class Scheduler:
             req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                logger.error(
+                error_msg = (
                     "Multimodal prompt is too long after expanding multimodal tokens. "
-                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                 )
+                logger.error(error_msg)
                 req.origin_input_ids = [0]
                 req.image_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
-                    "Multimodal prompt is too long. Check server logs for details."
+                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
                 self.waiting_queue.append(req)
                 return
@@ -871,9 +872,9 @@ class Scheduler:
         # Prefill policy
         adder = PrefillAdder(
             self.tree_cache,
+            self.token_to_kv_pool,
             self.running_batch,
             self.new_token_ratio,
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
@@ -1720,7 +1721,11 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send(
-            {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
+            {
+                "status": "ready",
+                "max_total_num_tokens": scheduler.max_total_num_tokens,
+                "max_req_input_len": scheduler.max_req_input_len,
+            }
         )
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap()
