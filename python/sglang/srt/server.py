@@ -1027,6 +1027,7 @@ class Runtime:
             self.server_args.tokenizer_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
             trust_remote_code=self.server_args.trust_remote_code,
+            revision=self.server_args.revision,
         )
 
     async def async_generate(
