@@ -373,4 +373,4 @@ class TypeBasedDispatcher:
         for ty, fn in self._mapping:
             if isinstance(obj, ty):
                 return fn(obj)
-        raise ValueError(f"Invalid request: {obj}")
+        raise ValueError(f"Invalid object: {obj}")
