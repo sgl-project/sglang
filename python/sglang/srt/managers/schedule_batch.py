@@ -158,7 +158,6 @@ class ImageInputs:
     im_end_id: Optional[torch.Tensor] = None
     slice_start_id: Optional[torch.Tensor] = None
     slice_end_id: Optional[torch.Tensor] = None
-
     tgt_sizes: Optional[list] = None
 
     @staticmethod
