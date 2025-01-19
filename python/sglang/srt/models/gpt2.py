@@ -17,16 +17,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import GPT2Config
-from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-# from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,

@@ -451,6 +451,8 @@ def load_image(image_file: Union[str, bytes]):
     else:
         raise ValueError(f"Invalid image: {image}")
 
+    # if image_size is None:
+    #     image_size = image.size
     return image, image_size
 
 
@@ -1260,9 +1262,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
-            return f'"{data[:half_length]} ... {data[-half_length:]}"'
+            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
         else:
-            return f'"{data}"'
+            return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -1273,7 +1275,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             "{"
             + ", ".join(
-                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
                 for k, v in data.items()
             )
             + "}"

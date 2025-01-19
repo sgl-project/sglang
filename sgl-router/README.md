@@ -67,6 +67,16 @@ $ pip install -e .
 
 **Note:** When modifying Rust code, you must rebuild the wheel for changes to take effect.
 
+### Troubleshooting
+
+1. If rust analyzer is not working in VSCode, set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml` in your repo. For example:
+
+```json
+{
+  "rust-analyzer.linkedProjects":  ["/workspaces/sglang/sgl-router/Cargo.toml"]
+}
+```
+
 ### CI/CD Setup
 
 The continuous integration pipeline consists of three main steps:

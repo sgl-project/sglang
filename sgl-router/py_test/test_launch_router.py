@@ -22,11 +22,9 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
 
 
 class TestLaunchRouter(unittest.TestCase):
-    def test_launch_router_no_exception(self):
-
-        # Create SimpleNamespace with default arguments
-        args = SimpleNamespace(
-            worker_urls=["http://localhost:8000"],
+    def setUp(self):
+        """Set up default arguments for router tests."""
+        self.default_args = SimpleNamespace(
             host="127.0.0.1",
             port=30000,
             policy="cache_aware",
@@ -38,6 +36,15 @@ class TestLaunchRouter(unittest.TestCase):
             max_payload_size=4 * 1024 * 1024,  # 4MB
             verbose=False,
         )
+
+    def create_router_args(self, **kwargs):
+        """Create router arguments by updating default args with provided kwargs."""
+        args_dict = vars(self.default_args).copy()
+        args_dict.update(kwargs)
+        return SimpleNamespace(**args_dict)
+
+    def run_router_process(self, args):
+        """Run router in a separate process and verify it starts successfully."""
 
         def run_router():
             try:
@@ -51,7 +58,6 @@ class TestLaunchRouter(unittest.TestCase):
                 print(e)
                 return 1
 
-        # Start router in separate process
         process = multiprocessing.Process(target=run_router)
         try:
             process.start()
@@ -61,6 +67,14 @@ class TestLaunchRouter(unittest.TestCase):
             self.assertTrue(process.is_alive())
         finally:
             terminate_process(process)
+
+    def test_launch_router_common(self):
+        args = self.create_router_args(worker_urls=["http://localhost:8000"])
+        self.run_router_process(args)
+
+    def test_launch_router_with_empty_worker_urls(self):
+        args = self.create_router_args(worker_urls=[])
+        self.run_router_process(args)
 
 
 if __name__ == "__main__":
