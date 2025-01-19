@@ -21,8 +21,6 @@ class TestMLA(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--tp",
-                "2",
                 "--trust-remote-code",
                 "--kv-cache-dtype",
                 "fp8_e5m2",
