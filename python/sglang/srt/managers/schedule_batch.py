@@ -225,7 +225,6 @@ class Req:
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         stream: bool = False,
-        enable_custom_logit_processor: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
@@ -251,10 +250,7 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.lora_path = lora_path
-        self._set_custom_logit_processor(
-            custom_logit_processor,
-            enable_custom_logit_processor,
-        )
+        self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
         self.req_pool_idx = None
@@ -332,24 +328,6 @@ class Req:
 
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
-
-    def _set_custom_logit_processor(
-        self, custom_logit_processor: Optional[str], enable_custom_logit_processor: bool
-    ) -> Optional[str]:
-        """
-        Validate and set the custom logit processor. Set to None if the server is not
-        configured to enable this feature.
-        """
-        if not enable_custom_logit_processor:
-            if custom_logit_processor:
-                logger.warning(
-                    "The SGLang server is not configured to enable custom logit processor."
-                    "The custom logit processor passed in will be ignored."
-                    "Please set --enable-custom-logits-processor to enable this feature."
-                )
-            self.custom_logit_processor = None
-        else:
-            self.custom_logit_processor = custom_logit_processor
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
