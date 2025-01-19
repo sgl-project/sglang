@@ -23,7 +23,7 @@ runtime_common = [
     "packaging", "pillow", "prometheus-client>=0.20.0",
     "psutil", "pydantic", "python-multipart",
     "pyzmq>=25.1.2", "torchao>=0.7.0", "uvicorn", "uvloop",
-    "xgrammar>=0.1.6"
+    "xgrammar>=0.1.10"
 ]
 srt = [
     "sglang[runtime_common]", "cuda-python",
