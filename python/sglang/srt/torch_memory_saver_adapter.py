@@ -1,12 +1,15 @@
 from abc import ABC
 from contextlib import contextmanager
 
-try:
-    import torch_memory_saver
+import torch
 
-    _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
-except ImportError:
-    pass
+if hasattr(torch.cuda, "MemPool"):
+    try:
+        import torch_memory_saver
+
+        _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
+    except ImportError:
+        pass
 
 
 class TorchMemorySaverAdapter(ABC):
