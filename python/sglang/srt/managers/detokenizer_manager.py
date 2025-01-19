@@ -71,6 +71,7 @@ class DetokenizerManager:
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
             )
 
         self.decode_status = LimitedCapacityDict()
