@@ -26,7 +26,6 @@ def _decode_kernel(
     d_original: tl.constexpr,
     e: tl.constexpr,
     e_original: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr = 32,
 ):
     off_bh = tl.program_id(0)
     off_h = off_bh % h
