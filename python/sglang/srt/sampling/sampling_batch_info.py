@@ -115,7 +115,7 @@ class SamplingBatchInfo:
             }
             custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
-            merged_custom_logit_processor = {}
+            merged_custom_logit_processor = None
             custom_params = None
 
         ret = cls(
