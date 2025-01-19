@@ -773,6 +773,7 @@ class Engine:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
     ):
         obj = GenerateReqInput(
@@ -784,6 +785,7 @@ class Engine:
             top_logprobs_num=top_logprobs_num,
             lora_path=lora_path,
             stream=stream,
+            custom_logit_processor=custom_logit_processor,
         )
 
         # get the current event loop
@@ -824,6 +826,7 @@ class Engine:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        custom_logit_processor: Optional[Union[str, List[str]]] = None,
         stream: bool = False,
     ):
         obj = GenerateReqInput(
@@ -835,6 +838,7 @@ class Engine:
             top_logprobs_num=top_logprobs_num,
             lora_path=lora_path,
             stream=stream,
+            custom_logit_processor=custom_logit_processor,
         )
 
         ret = await generate_request(obj, None)
