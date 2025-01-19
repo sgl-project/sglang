@@ -73,7 +73,7 @@ class HiPAttentionConfig:
     dense_layers: list[int] = field(default_factory=lambda: [0, 1, 2])
     block_sparse_block_size_q: int = 64
     metadata_cache_max_batch_size: int = 32
-    mask_refresh_interval: Union[int, List[int]] = field(default_factory=lambda: [12, 8, 4])
+    mask_refresh_interval: Union[int, List[int]] = field(default_factory=lambda: [16, 8, 4])
     using_extend: bool = True
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
         HiPAttentionPerLayerConfig(parsed_json={"second_stage_k": 4096, "sliding_window_size": 1024, "sink_token_size": 256}),

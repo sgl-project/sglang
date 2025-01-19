@@ -148,12 +148,15 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 if is_offload_cache:
                     # BUG: this padding is neccesary to match non offload scenario. why?
                     pad_size = self.max_context_len
-                    k_chunk_padded = torch.zeros((k_chunk.shape[0], pad_size, k_chunk.shape[2], k_chunk.shape[3]), dtype=k_chunk.dtype, device=k_chunk.device)
-                    k_chunk_padded[:, :k_chunk.shape[1]] = k_chunk
-                    v_chunk_padded = torch.zeros((v_chunk.shape[0], pad_size, v_chunk.shape[2], v_chunk.shape[3]), dtype=v_chunk.dtype, device=v_chunk.device)
-                    v_chunk_padded[:, :v_chunk.shape[1]] = v_chunk
-                    k_chunk = k_chunk_padded
-                    v_chunk = v_chunk_padded
+                    if k_chunk.shape[1] != pad_size:
+                        k_chunk_padded = torch.zeros((k_chunk.shape[0], pad_size, k_chunk.shape[2], k_chunk.shape[3]), dtype=k_chunk.dtype, device=k_chunk.device)
+                        k_chunk_padded[:, :k_chunk.shape[1]] = k_chunk
+                        del k_chunk
+                        v_chunk_padded = torch.zeros((v_chunk.shape[0], pad_size, v_chunk.shape[2], v_chunk.shape[3]), dtype=v_chunk.dtype, device=v_chunk.device)
+                        v_chunk_padded[:, :v_chunk.shape[1]] = v_chunk
+                        del v_chunk
+                        k_chunk = k_chunk_padded
+                        v_chunk = v_chunk_padded
 
                     o_req, _ = self.forward_paged_hip(
                         query=q_reshaped[start_len:start_len+seq_len],
@@ -509,7 +512,7 @@ online_update={online_update}
 
         layer: RadixAttention,
 
-        cached_metadata=None,
+        cached_metadata: Optional[HiPAttentionOutputMetadata] = None,
         is_dense: bool = False,
 
         k: Optional[torch.Tensor] = None,
@@ -537,6 +540,7 @@ online_update={online_update}
             k_cache = k_cache.view(N_PAGE, 1, num_heads_kv, hidden_dims)
             v_cache = v_cache.view(N_PAGE, 1, num_heads_kv, hidden_dims)
 
+        # FIXME: this operation is linear during decoding
         block_table = req_to_tokens.index_select(dim=0, index=req_pool_indices)
 
         BLOCK_TABLE_BSZ, MODEL_SEQ_LEN = block_table.shape
@@ -553,6 +557,12 @@ online_update={online_update}
         else:
             raise Exception()
         is_gemma = hidden_size > 128
+        
+        require_cache_statistics = False
+        if cached_metadata is None:
+            require_cache_statistics = True
+        elif cached_metadata.indices is None:
+            require_cache_statistics = True
 
         args = HiPAttentionArgs(
             k_cache=k_cache.view(torch.uint8) if isinstance(k_cache, torch.Tensor) and k_cache.dtype == torch.float8_e5m2 else k_cache,
@@ -588,6 +598,7 @@ online_update={online_update}
             ),
             sa_extend_backend=layer_config.sa_extend_backend,
             online_update_cache=online_update_cache,
+            require_cache_statistics=require_cache_statistics,
         )
         
         context, metadata = dual_stage_quadratic_hip_attention(

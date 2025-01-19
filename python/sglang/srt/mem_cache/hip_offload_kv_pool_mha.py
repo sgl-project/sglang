@@ -49,32 +49,41 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         self.max_sa_cache_token_size = max_sa_cache_token_size * head_num
         
         self.online_update_cache = os.getenv('DEBUG_ONLINE', '0') == '1'
-        self.layer_buffer = [
-            HiPOffloadCache(
-                layer_id=layer_id,
-                max_token_size=max_token_size + 1,
-                max_mask_cache_token_size=self.max_mask_cache_token_size,
-                max_sa_cache_token_size=self.max_sa_cache_token_size,
-                head_num=head_num,
-                head_dim=head_dim,
-                dtype=dtype,
-                device=device,
-                online_cache_update=self.online_update_cache,
+        self.layer_buffer = []
+        for layer_id in range(layer_num):
+            self.layer_buffer.append(
+                HiPOffloadCache(
+                    layer_id=layer_id,
+                    max_token_size=max_token_size + 1,
+                    max_mask_cache_token_size=min(max_token_size * head_num, self.max_mask_cache_token_size),
+                    max_sa_cache_token_size=min(max_token_size * head_num, self.max_sa_cache_token_size),
+                    head_num=head_num,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                    device=device,
+                    online_cache_update=self.online_update_cache,
+                )
+                if layer_id not in hip_config.dense_layers else
+                HiPOffloadCache(
+                    layer_id=layer_id,
+                    max_token_size=max_token_size + 1,
+                    max_mask_cache_token_size=min(max_token_size * head_num, self.max_mask_cache_token_size * 2),
+                    max_sa_cache_token_size=min(max_token_size * head_num, self.max_sa_cache_token_size * 2),
+                    head_num=head_num,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                    device=device,
+                    online_cache_update=self.online_update_cache,
+                )
             )
-            if layer_id not in hip_config.dense_layers else
-            HiPOffloadCache(
-                layer_id=layer_id,
-                max_token_size=max_token_size + 1,
-                max_mask_cache_token_size=self.max_mask_cache_token_size * 2,
-                max_sa_cache_token_size=self.max_sa_cache_token_size * 2,
-                head_num=head_num,
-                head_dim=head_dim,
-                dtype=dtype,
-                device=device,
-                online_cache_update=self.online_update_cache,
+            
+            uvm_allocated_bytes, gpu_allocated_bytes = self.calc_allocated_bytes()
+            logger.info(
+                f'[{layer_id + 1}/{layer_num}] '
+                f'Allocated total CPU (UVM) bytes: {format_size_bytes(uvm_allocated_bytes)}, '
+                f'Allocated total GPU bytes: {format_size_bytes(gpu_allocated_bytes)}, '
+                f'{self.dtype} on {self.device}'
             )
-            for layer_id in range(layer_num)
-        ]
         
         # (layer_id, batch_id) -> (K, V, seq_len)
         self.prefetch_threads: Dict[Tuple[int, int], threading.Thread] = {}
@@ -84,20 +93,12 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         
         self.enable_async = os.getenv('HIP_DISABLE_AYSNC', '0') == '0'
         
-        uvm_allocated_bytes = 0
-        gpu_allocated_bytes = 0
-        for cache in self.layer_buffer:
-            uvm_allocated_bytes += cache.k_uvm.allocated_cpu_bytes
-            gpu_allocated_bytes += cache.k_uvm.allocated_gpu_bytes
-            uvm_allocated_bytes += cache.v_uvm.allocated_cpu_bytes
-            gpu_allocated_bytes += cache.v_uvm.allocated_gpu_bytes
-            gpu_allocated_bytes += cache.mask_k_cache.allocated_gpu_bytes
-            gpu_allocated_bytes += cache.sa_kv_cache.allocated_gpu_bytes
-        logger.info(
-            f'Allocated total CPU (UVM) bytes: {format_size_bytes(uvm_allocated_bytes)}, '
-            f'Allocated total GPU bytes: {format_size_bytes(gpu_allocated_bytes)}, '
-            f'{self.dtype} on {self.device}'
-        )
+        # uvm_allocated_bytes, gpu_allocated_bytes = self.calc_allocated_bytes()
+        # logger.info(
+        #     f'Allocated total CPU (UVM) bytes: {format_size_bytes(uvm_allocated_bytes)}, '
+        #     f'Allocated total GPU bytes: {format_size_bytes(gpu_allocated_bytes)}, '
+        #     f'{self.dtype} on {self.device}'
+        # )
 
         self.require_validation = os.getenv('HIP_OFFLOAD_CACHE_VALIDATION', '0') == '1'
         if self.require_validation:
@@ -111,6 +112,18 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             )
         else:
             self.validation_cache = None
+    
+    def calc_allocated_bytes(self):
+        uvm_allocated_bytes = 0
+        gpu_allocated_bytes = 0
+        for cache in self.layer_buffer:
+            uvm_allocated_bytes += cache.k_uvm.allocated_cpu_bytes
+            gpu_allocated_bytes += cache.k_uvm.allocated_gpu_bytes
+            uvm_allocated_bytes += cache.v_uvm.allocated_cpu_bytes
+            gpu_allocated_bytes += cache.v_uvm.allocated_gpu_bytes
+            gpu_allocated_bytes += cache.mask_k_cache.allocated_gpu_bytes
+            gpu_allocated_bytes += cache.sa_kv_cache.allocated_gpu_bytes
+        return uvm_allocated_bytes, gpu_allocated_bytes
 
     def get_key_buffer(self, layer_id: int):
         raise NotImplementedError()
@@ -129,7 +142,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         layer_id: int, 
         batch_id: int, 
         table: Tensor, 
-        prefix_seq_len: int,
+        prefix_seq_len: int
     ) -> threading.Thread:
         # you must call before get fetched prefix
         assert table.ndim == 1
@@ -143,10 +156,12 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         assert handle_id not in self.prefetch_threads, handle_id
         assert handle_id not in self.prefetched_kv, handle_id
 
-        start_event = torch.cuda.Event()
-        start_event.record()
 
         if self.enable_async:
+            start_event = torch.cuda.Event()
+            table = table.to(torch.int64).to('cpu')
+            start_event.record()
+            # torch.cuda.synchronize()
             def thread_main():
                 try:
                     # BUG(heejun): i think this line is quite suspicious hmm
@@ -155,7 +170,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
 
                     with torch.cuda.stream(stream):
                         k, v = hip_offload_cache.prefetch_prefix_kv_buffer(
-                            table=table.to(torch.int64),
+                            table=table,
                             device=self.device,
                         )
                         assert k.device == self.device
@@ -163,6 +178,9 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                     
                     stream.synchronize()
                     self.prefetched_kv[handle_id] = (k, v, prefix_seq_len, table)
+                except Exception as ex:
+                    print(f'{handle_id} thread dead')
+                    raise Exception('thread dead') from ex
                 finally:
                     self.prefetch_threads.pop(handle_id)
             
@@ -194,7 +212,19 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         handle_id = (layer_id, batch_id)
         prefetch_thread = self.prefetch_threads.get(handle_id, None)
         if prefetch_thread is not None:
-            prefetch_thread.join()
+            while handle_id not in self.prefetched_kv:
+                time.sleep(0.0001)
+            # print('start join', flush=True)
+            # while True:
+            #     try:
+            #         prefetch_thread.join(timeout=1.0)
+            #         print('joined')
+            #         break
+            #     except TimeoutError:
+            #         print('timeout', layer_id, batch_id)
+            #     except RuntimeError:
+            #         print('runtime error wtf')
+            #         raise RuntimeError('deadlock')
         
         assert handle_id in self.prefetched_kv, "did prefetch successed?"
         k, v, prefix_seq_len, table = self.prefetched_kv.pop(handle_id)
@@ -338,12 +368,29 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 prefix_seq_len=forward_batch.extend_prefix_lens_cpu[ibatch]
             )
     
+    def wait_prefetch_layer(self, forward_batch: ForwardBatch, layer_id: int):
+        assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
+        assert forward_batch.token_to_kv_pool == self
+
+        for ibatch in range(forward_batch.batch_size):
+            while (layer_id, ibatch) not in self.prefetched_kv:
+                time.sleep(0.0001)
+    
     def on_model_start(self, forward_batch: ForwardBatch):
         require_prefetch = forward_batch.forward_mode.is_extend()
         assert forward_batch.token_to_kv_pool == self
 
         if require_prefetch:
+            # FIXME: find better way to detect this.
+            is_first_chunk = forward_batch.extend_prefix_lens_cpu[0] == 0
+            # FIXME: find better way to detect this.
+            is_inter_chunk = forward_batch.extend_seq_lens_cpu[0] in map(lambda x: 2**x, range(0, 20))
+            # BUG(heejun): at the last chunk of prefill, prefetch layer sometimes failes... so disable async
+            if not (forward_batch.batch_size == 1 and (is_first_chunk or is_inter_chunk)):
+                self.onetime_disable = self.enable_async
+                self.enable_async = False
             self.prefetch_layer(forward_batch, 0)
+            # self.wait_prefetch_layer(forward_batch, 0)
 
     def on_model_end(self, forward_batch: ForwardBatch):
         require_prefetch = forward_batch.forward_mode.is_extend()
@@ -351,6 +398,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         
         if require_prefetch:
             self.synchronize()
+            self.enable_async = self.enable_async or self.onetime_disable
+            self.onetime_disable = False
 
     def on_layer_start(self, forward_batch: ForwardBatch, layer_id: int):
         require_prefetch = forward_batch.forward_mode.is_extend()

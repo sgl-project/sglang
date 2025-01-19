@@ -47,6 +47,7 @@ class HiPMetadataCachePool:
         self,
         query_head_num: int,
         layer_num: int,
+        context_length: int,
         device: str,
         hip_config: HiPAttentionConfig,
     ):
@@ -85,10 +86,11 @@ class HiPMetadataCachePool:
             
             for i_stage, stage in enumerate(layer_config.stages):
                 if i_stage > 0:
-                    chunk_count = stage.stage_k // stage.stage_chunk_size
+                    max_context_length = context_length - layer_config.sliding_window_size - layer_config.sink_token_size
+                    chunk_count = min(stage.stage_k, max_context_length) // stage.stage_chunk_size
                     self.init_buffer(layer_idx, f'stage_{i_stage}_indices_left', [chunk_count,], torch.int64, 'B,1,H', torch.uint32)
                     self.init_buffer(layer_idx, f'stage_{i_stage}_indices_right', [chunk_count,], torch.int64, 'B,1,H', torch.uint32)
-                    self.init_buffer(layer_idx, f'stage_{i_stage}_out_scores', [triton.next_power_of_2(chunk_count)], torch.float32, 'B,1,H', torch.bfloat16)
+                    self.init_buffer(layer_idx, f'stage_{i_stage}_out_scores', [chunk_count, ], torch.float32, 'B,1,H', torch.bfloat16)
 
         self.allocated_gpu_bytes = self.compute_allocated_bytes()
         logger.info(f"Allocated HiP metadata cache pool size: {self.allocated_gpu_bytes / 1024 / 1024:.2f} MB")
@@ -219,9 +221,10 @@ class HiPMetadataCachePool:
                 unique_access_count = computed_statistics['unique_access_count']
                 cache_miss_count = computed_statistics['cache_miss_count']
             
-            self.set_buffer(layer_id, f'{prefix}_access_count', access_count.view(1, 1).expand(self.max_batch_size, 1))
-            self.set_buffer(layer_id, f'{prefix}_unique_access_count', unique_access_count.view(1, 1).expand(self.max_batch_size, 1))
-            self.set_buffer(layer_id, f'{prefix}_cache_miss_count', cache_miss_count.view(1, 1).expand(self.max_batch_size, 1))
+            if access_count is not None:
+                self.set_buffer(layer_id, f'{prefix}_access_count', access_count.view(1, 1).expand(self.max_batch_size, 1))
+                self.set_buffer(layer_id, f'{prefix}_unique_access_count', unique_access_count.view(1, 1).expand(self.max_batch_size, 1))
+                self.set_buffer(layer_id, f'{prefix}_cache_miss_count', cache_miss_count.view(1, 1).expand(self.max_batch_size, 1))
 
         update_cache_stats(metadata.sa_cache_statistics, 'sa')
         update_cache_stats(metadata.mask_cache_statistics, 'mask')
