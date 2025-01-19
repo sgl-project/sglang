@@ -3,6 +3,7 @@
     "build": {
         "dockerfile": "../docker/Dockerfile.dev"
     },
+    "remoteUser": "devuser",
     "customizations": {
         "vscode": {
             "extensions": [
