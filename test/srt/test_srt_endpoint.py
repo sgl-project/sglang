@@ -5,6 +5,7 @@ python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_logprob_with_chunked_
 
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -252,10 +253,10 @@ class TestSRTEndpoint(unittest.TestCase):
 
         self.assertTrue(all(x is not None for x in logprobs))
 
-    def test_custom_logit_processor(self):
+    def run_custom_logit_processor(self, target_token_id: int):
         """Test custom logit processor with custom params."""
 
-        custom_params = {"token_id": 5}
+        custom_params = {"token_id": target_token_id}
 
         class DeterministicLogitProcessor(CustomLogitProcessor):
             """A dummy logit processor that changes the logits to always
@@ -297,6 +298,16 @@ class TestSRTEndpoint(unittest.TestCase):
 
         # The logit processor should always sample the given token as the logits is deterministic.
         self.assertTrue(all(x == custom_params["token_id"] for x in sampled_tokens))
+
+    def test_custom_logit_processor(self):
+        """Test custom logit processor with a single target token id."""
+        self.run_custom_logit_processor(target_token_id=5)
+
+    def test_custom_logit_processor_batch(self):
+        """Test custom logit processor with multiple target token ids."""
+        target_token_ids = list(range(32))
+        with ThreadPoolExecutor(len(target_token_ids)) as executor:
+            list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")

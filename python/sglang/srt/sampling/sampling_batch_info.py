@@ -229,6 +229,8 @@ class SamplingBatchInfo:
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
+        if self.has_custom_logit_processor:
+            self._filter_batch_custom_logit_processor(unfinished_indices, new_indices)
 
         for item in [
             "temperatures",
@@ -240,6 +242,26 @@ class SamplingBatchInfo:
             value = getattr(self, item, None)
             if value is not None:  # logit_bias can be None
                 setattr(self, item, value[new_indices])
+
+    def _filter_batch_custom_logit_processor(
+        self, unfinished_indices: List[int], new_indices: torch.Tensor
+    ):
+        """Filter the custom logit processor and custom params"""
+        if not self.custom_logit_processor:
+            return
+        self.custom_logit_processor = {
+            k: (p, mask[new_indices])
+            for k, (p, mask) in self.custom_logit_processor.items()
+            if any(
+                mask[new_indices]
+            )  # ignore the custom logit processor whose mask is all False
+        }
+        self.custom_params = [self.custom_params[i] for i in unfinished_indices]
+
+        if len(self) == 0:
+            self.custom_logit_processor = None
+            self.custom_params = None
+            self.has_custom_logit_processor = False
 
     @staticmethod
     def merge_bias_tensor(
