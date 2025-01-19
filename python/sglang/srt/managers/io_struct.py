@@ -514,6 +514,7 @@ class ProfileReq(Enum):
 @dataclass
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
 
