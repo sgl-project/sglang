@@ -45,9 +45,11 @@ class TestLaunchRouter(unittest.TestCase):
 
     def run_router_process(self, args):
         """Run router in a separate process and verify it starts successfully."""
+
         def run_router():
             try:
                 from sglang_router.launch_router import launch_router
+
                 router = launch_router(args)
                 if router is None:
                     return 1
