@@ -48,6 +48,7 @@ suites = {
         "test_update_weights_from_disk.py",
         "test_update_weights_from_tensor.py",
         "test_vision_chunked_prefill.py",
+        "test_vision_llm.py",
         "test_vision_openai_server.py",
         "test_w8a8_quantization.py",
         "test_fp8_kvcache.py",
@@ -71,7 +72,6 @@ for target_suite_name, target_tests in suites.items():
         if target_suite_name in tests:
             tests.remove(target_suite_name)
             tests.extend(target_tests)
-
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
