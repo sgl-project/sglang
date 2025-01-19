@@ -15,6 +15,9 @@
             ]
         }
     },
-    "workspaceFolder": "/sgl-workspace/sglang",
-    "forwardPorts": []
+    "forwardPorts": [],
+    "runArgs": [
+        "--gpus",
+        "all"
+    ]
 }
