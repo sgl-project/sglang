@@ -191,7 +191,7 @@ class LogitsProcessor(nn.Module):
             )
         else:
             input_logprobs = logits
-            del logits
+            del hidden_states, logits
 
             # Normalize the logprob w/o temperature, top-p
             input_logprobs = self.compute_temp_top_p_normalized_logprobs(
@@ -208,11 +208,11 @@ class LogitsProcessor(nn.Module):
                 input_top_logprobs_val = input_top_logprobs_idx = None
 
             input_token_logprobs = input_logprobs[
-                torch.arange(input_logprobs.shape[0], device="cuda"),
+                torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
                 torch.cat(
                     [
                         torch.cat(pruned_input_ids)[1:],
-                        torch.tensor([0], device="cuda"),
+                        torch.tensor([0], device=input_logprobs.device),
                     ]
                 ),
             ]
