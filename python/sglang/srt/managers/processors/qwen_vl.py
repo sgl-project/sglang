@@ -4,8 +4,9 @@ from typing import List, Union
 
 from PIL import Image
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
-from sglang.srt.managers.image_processors.base_image_processor import (
+from sglang.srt.managers.processors.base_processor import (
+    BaseProcessor,
+    MultiModalEmbedTokens,
     get_global_processor,
 )
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -13,7 +14,7 @@ from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
 
 # Compatible with Qwen2VL and Qwen2_5VL
-class Qwen2_5VLImageProcessor(BaseImageProcessor):
+class Qwen2_5VLImageProcessor(BaseProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
@@ -57,7 +58,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         else:
             return self._process_images_task(images, input_text, self.hf_config)
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_ids,
@@ -72,11 +73,11 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
             image_data = [image_data]
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_images(
-            input_ids,
-            image_data,
-            image_token,
-            max_req_input_len,
+        base_output = self.load_multimodal_data(
+            input_ids=input_ids,
+            image_data=image_data,
+            multimodal_tokens=MultiModalEmbedTokens(image_token=image_token),
+            max_req_input_len=max_req_input_len,
         )
 
         def smart_resize(
@@ -137,13 +138,14 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
             """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
             return math.floor(number / factor) * factor
 
-        images = [resize_image(image) for image in base_output.all_frames]
+        images = [resize_image(image) for image in base_output.images]
 
         ret = await self._process_images(images, base_output.input_text)
+
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
             "pixel_values": ret["pixel_values"],
-            "image_hashes": base_output.image_hashes,
+            "image_hashes": base_output.data_hashes,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": ret["image_grid_thw"],
             "video_grid_thws": ret["video_grid_thws"],
@@ -155,7 +157,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         }
 
 
-ImageProcessorMapping = {
+ProcessorMapping = {
     Qwen2VLForConditionalGeneration: Qwen2_5VLImageProcessor,
     Qwen2_5_VLForConditionalGeneration: Qwen2_5VLImageProcessor,
 }
