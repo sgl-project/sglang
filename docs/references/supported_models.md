@@ -24,7 +24,7 @@
 - InternLM 2
 - Exaone 3
 - BaiChuan2
-- MiniCPM / MiniCPM 3 / MiniCPMV
+- MiniCPM / MiniCPM 3 / MiniCPMV / MiniCPM-o
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4

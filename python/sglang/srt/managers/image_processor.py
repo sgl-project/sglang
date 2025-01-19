@@ -24,7 +24,7 @@ global global_processor
 
 
 def init_global_processor(server_args: ServerArgs):
-    """Init the global processor for multi modal models."""
+    """Init the global processor for multi-modal models."""
     global global_processor
     transformers.logging.set_verbosity_error()
     global_processor = get_processor(
@@ -192,6 +192,7 @@ class LlavaImageProcessor(BaseImageProcessor):
 class MllamaImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
+        self.support_audio_input = "MiniCPMO" in hf_config.architectures
 
     @staticmethod
     def _process_single_image_task(images, input_text):
@@ -240,27 +241,38 @@ class MllamaImageProcessor(BaseImageProcessor):
 class MiniCPMVImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "(<image>./</image>)"
+        self.image_token = "(<image>./</image>)"
+        self.audio_token = "(<audio>./</audio>)"
 
     @staticmethod
-    def _process_images_task(images, input_text):
+    def _process_images_task(input_text, images, audios=None):
         result = global_processor.__call__(
-            text=input_text, images=images, return_tensors="pt"
+            text=input_text, images=images, audios=audios, return_tensors="pt"
         )
         return {
             "input_ids": result["input_ids"],
             "pixel_values": result["pixel_values"],
             "tgt_sizes": result["tgt_sizes"],
+            "audio_features": (
+                result["audio_features"] if "audio_features" in result else None
+            ),
+            "audio_feature_lens": (
+                result["audio_feature_lens"] if "audio_feature_lens" in result else None
+            ),
+            "audio_bounds": (
+                result["audio_bounds"] if "audio_bounds" in result else None
+            ),
         }
 
-    async def _process_images(self, images, input_text):
+    async def _process_images(self, images, input_text, audios=None):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             image_inputs = await loop.run_in_executor(
                 self.executor,
                 MiniCPMVImageProcessor._process_images_task,
-                images,
                 input_text,
+                images,
+                audios,
             )
         else:
             image_inputs = self._processor(
@@ -269,6 +281,17 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
         return image_inputs
 
+    def load_audio(self, path: str) -> np.ndarray:
+        import librosa
+
+        if not path.startswith("audio:"):
+            print(f"malformed audio path: {path}")
+            return None
+        path = path.replace("audio:", "")
+
+        ref_audio, _ = librosa.load(path, sr=16000, mono=True)
+        return ref_audio
+
     async def process_images_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -276,14 +299,21 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         request_obj,
         max_req_input_len,
     ):
-        if not image_data:
+        audio_data = request_obj.audio_data
+        if not image_data and not audio_data:
             return None
 
         if not isinstance(image_data, list):
             image_data = [image_data]
+        if not isinstance(audio_data, list):
+            audio_data = [audio_data]
 
-        image_hashes, image_sizes = [], []
+        audio_hashes, audio_index = [], 0
+        # image and audio data are both included
+        data_hashes = []
+        image_sizes, image_index = [], 0
         all_frames = []
+        audios = []
 
         # roughly calculate the max number of frames under the max_req_input_len limit
         def calculate_max_num_frames() -> int:
@@ -294,8 +324,6 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
             return min(ret, 100)
 
         MAX_NUM_FRAMES = calculate_max_num_frames()
-
-        # print(f"MAX_NUM_FRAMES: {MAX_NUM_FRAMES}")
 
         def get_estimated_frames_list():
             """
@@ -318,7 +346,10 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
         estimated_frames_list = get_estimated_frames_list()
         total_frame_count = sum(estimated_frames_list)
-        scaling_factor = min(1.0, MAX_NUM_FRAMES / total_frame_count)
+        if total_frame_count == 0:
+            scaling_factor = 1
+        else:
+            scaling_factor = min(1.0, MAX_NUM_FRAMES / total_frame_count)
 
         def encode_video(video_path, frame_count_limit=None):
             if not os.path.exists(video_path):
@@ -347,80 +378,107 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
             input_text = self._processor.tokenizer.decode(input_ids)
         else:
             input_text = input_ids
+
+        import re
+
         # MiniCPMV requires each frame of video as a single image token
-        text_parts = input_text.split(self.IMAGE_TOKEN)
+        separators = [self.audio_token, self.image_token]
+        pattern = "(" + "|".join(re.escape(sep) for sep in separators) + ")"
+        text_parts = re.split(pattern, input_text)
         new_text_parts = []
 
-        # Process each input with allocated frames
-        for image_index, (image, estimated_frames) in enumerate(
-            zip(image_data, estimated_frames_list)
-        ):
-            if len(all_frames) >= MAX_NUM_FRAMES:
-                frames_to_process = 0
-            else:
-                frames_to_process = max(1, int(estimated_frames * scaling_factor))
-
-            if frames_to_process == 0:
-                frames = []
-            else:
-                try:
-                    if isinstance(image, str) and image.startswith("video:"):
-                        path = image[len("video:") :]
-                        frames = encode_video(path, frame_count_limit=frames_to_process)
-                    else:
-                        raw_image, _size = load_image(image)
-                        frames = [raw_image]
-                    if len(frames) == 0:
+        for text_part_index, part in enumerate(text_parts):
+            try:
+                if part == self.audio_token:
+                    audio = self.load_audio(audio_data[audio_index])
+                    if audio is None:
                         continue
-                except FileNotFoundError as e:
-                    print(e)
-                    return None
-                image_sizes += frames[0].size * len(frames)
-                image_hashes += [hash(image)] * len(frames)
-                all_frames += frames
+                    audios += [audio]
+                    audio_index += 1
+                    data_hashes += [hash(audio.tobytes())]
+                    new_text_parts.append(self.audio_token)
 
-            assert frames_to_process == len(frames)
+                elif part == self.image_token:
+                    image = image_data[image_index]
+                    estimated_frames = estimated_frames_list[image_index]
+                    image_index += 1
+                    if len(all_frames) >= MAX_NUM_FRAMES:
+                        frames_to_process = 0
+                    else:
+                        frames_to_process = max(
+                            1, int(estimated_frames * scaling_factor)
+                        )
+                    # print(f"MAX_NUM_FRAMES: {MAX_NUM_FRAMES}")
 
-            new_text_parts.append(text_parts[image_index])
+                    if frames_to_process == 0:
+                        pass
+                    else:
+                        if isinstance(image, str) and image.startswith("video:"):
+                            path = image[len("video:") :]
+                            frames = encode_video(
+                                path, frame_count_limit=frames_to_process
+                            )
+                        else:
+                            raw_image, _size = load_image(image)
+                            frames = [raw_image]
+                        if len(frames) == 0:
+                            continue
 
-            if frames_to_process != 0:
-                new_text_parts.append(self.IMAGE_TOKEN * len(frames))
+                        image_sizes += frames[0].size * len(frames)
+                        data_hashes += [hash(image)] * len(frames)
+                        all_frames += frames
+                        new_text_parts.append(self.image_token * len(frames))
 
-        new_text_parts.append(text_parts[-1])
+                else:
+                    # plain text
+                    new_text_parts.append(part)
+            except FileNotFoundError as e:
+                print(e)
+                return None
 
         input_text = "".join(new_text_parts)
-
-        if len(all_frames) == 0:
-            return None
-        res = await self._process_images(images=all_frames, input_text=input_text)
-        pixel_values = res["pixel_values"]
-        tgt_sizes = res["tgt_sizes"]
-        input_ids = res["input_ids"]
+        # print(f"input_text: {input_text}")
+        res = await self._process_images(
+            images=None if len(all_frames) == 0 else all_frames,
+            input_text=input_text,
+            audios=None if len(audios) == 0 else audios,
+        )
 
         # Collect special token ids
         tokenizer = self._processor.tokenizer
-        im_start_id = [tokenizer.im_start_id]
-        im_end_id = [tokenizer.im_end_id]
+        slice_start_id, slice_end_id, audio_start_id, audio_end_id = (
+            None,
+            None,
+            None,
+            None,
+        )
         if tokenizer.slice_start_id:
-            slice_start_id = [tokenizer.slice_start_id]
-            slice_end_id = [tokenizer.slice_end_id]
+            slice_start_id = tokenizer.slice_start_id
+            slice_end_id = tokenizer.slice_end_id
+        if hasattr(tokenizer, "audio_start_id"):
+            audio_start_id = tokenizer.audio_start_id
+            audio_end_id = tokenizer.audio_end_id
         return {
-            "input_ids": input_ids.flatten().tolist(),
-            "pixel_values": pixel_values,
-            "tgt_sizes": tgt_sizes,
-            "image_hashes": image_hashes,
-            "modalities": request_obj.modalities or ["image"],
-            "im_start_id": im_start_id,
-            "im_end_id": im_end_id,
+            "input_ids": res["input_ids"].flatten().tolist(),
+            "pixel_values": res["pixel_values"],
+            "tgt_sizes": res["tgt_sizes"],
+            "image_hashes": data_hashes,
+            "audio_start_id": audio_start_id,
+            "audio_end_id": audio_end_id,
+            "audio_features": res["audio_features"],
+            "audio_bounds": res["audio_bounds"],
+            "audio_feature_lens": res["audio_feature_lens"],
+            "im_start_id": tokenizer.im_start_id,
+            "im_end_id": tokenizer.im_end_id,
             "slice_start_id": slice_start_id,
             "slice_end_id": slice_end_id,
         }
 
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _image_processor):
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
         self.hf_config = hf_config
-        self._image_processor = _image_processor
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
             mp_context=mp.get_context("fork"),
@@ -543,7 +601,7 @@ def get_image_processor(
         return MllamaImageProcessor(hf_config, server_args, processor)
     elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
         return Qwen2VLImageProcessor(hf_config, server_args, processor.image_processor)
-    elif "MiniCPMV" in hf_config.architectures:
+    elif "MiniCPMV" in hf_config.architectures or "MiniCPMO" in hf_config.architectures:
         return MiniCPMVImageProcessor(hf_config, server_args, processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)

@@ -160,6 +160,11 @@ class ImageInputs:
     slice_end_id: Optional[torch.Tensor] = None
     tgt_sizes: Optional[list] = None
 
+    audio_start_id: Optional[torch.Tensor] = None
+    audio_end_id: Optional[torch.Tensor] = None
+    audio_features: Optional[List[torch.Tensor]] = None
+    audio_feature_lens: Optional[List[torch.Tensor]] = None
+
     @staticmethod
     def from_dict(obj: dict):
         ret = ImageInputs(
@@ -184,6 +189,10 @@ class ImageInputs:
             "slice_start_id",
             "slice_end_id",
             "tgt_sizes",
+            "audio_start_id",
+            "audio_end_id",
+            "audio_features",
+            "audio_feature_lens",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -206,7 +215,6 @@ class ImageInputs:
             "image_sizes",
             "image_offsets",
             "image_pad_len",
-            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",

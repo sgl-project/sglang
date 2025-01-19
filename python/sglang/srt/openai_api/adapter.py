@@ -92,7 +92,6 @@ file_id_response: Dict[str, FileResponse] = {}
 # map file id to file path in SGLang backend
 file_id_storage: Dict[str, str] = {}
 
-
 # backend storage directory
 storage_dir = None
 
@@ -509,7 +508,7 @@ def v1_generate_request(
         sampling_params_list.append(
             {
                 "temperature": request.temperature,
-                "max_new_tokens": request.max_tokens,
+                "max_new_tokens": request.get_max_output_tokens(),
                 "min_new_tokens": request.min_tokens,
                 "stop": request.stop,
                 "stop_token_ids": request.stop_token_ids,
@@ -697,6 +696,8 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    print(f"request: {request_json}")
+
     all_requests = [CompletionRequest(**request_json)]
     adapted_request, request = v1_generate_request(all_requests)
 
@@ -859,6 +860,7 @@ def v1_chat_generate_request(
     input_ids = []
     sampling_params_list = []
     image_data_list = []
+    audio_data_list = []
     return_logprobs = []
     logprob_start_lens = []
     top_logprobs_nums = []
@@ -872,6 +874,7 @@ def v1_chat_generate_request(
         #  - prompt: The full prompt string.
         #  - stop: Custom stop tokens.
         #  - image_data: None or a list of image strings (URLs or base64 strings).
+        #  - audio_data: None or a list of audio strings (URLs or base64 strings).
         #    None skips any image processing in GenerateReqInput.
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
@@ -916,7 +919,8 @@ def v1_chat_generate_request(
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
-                    #  has a different tools input format that is not compatiable
+                    #  has a different tools
+                    #  input format that is not compatiable
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
@@ -930,11 +934,13 @@ def v1_chat_generate_request(
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
                 stop = request.stop
                 image_data = None
+                audio_data = None
                 modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
                 prompt = conv.get_prompt()
                 image_data = conv.image_data
+                audio_data = conv.audio_data
                 modalities = conv.modalities
                 stop = conv.stop_str or []
                 if request.stop:
@@ -948,6 +954,7 @@ def v1_chat_generate_request(
             prompt_ids = request.messages
             stop = request.stop
             image_data = None
+            audio_data = None
             modalities = []
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
@@ -957,7 +964,7 @@ def v1_chat_generate_request(
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.get_max_output_tokens(),
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
@@ -981,6 +988,7 @@ def v1_chat_generate_request(
         sampling_params_list.append(sampling_params)
 
         image_data_list.append(image_data)
+        audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
         if isinstance(input_ids[0], str):
@@ -989,6 +997,7 @@ def v1_chat_generate_request(
             prompt_kwargs = {"input_ids": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
+        audio_data_list = audio_data_list[0]
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
@@ -1003,6 +1012,7 @@ def v1_chat_generate_request(
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
         image_data=image_data_list,
+        audio_data=audio_data_list,
         sampling_params=sampling_params_list,
         return_logprob=return_logprobs,
         logprob_start_len=logprob_start_lens,
@@ -1184,6 +1194,7 @@ def v1_chat_generate_response(
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
+
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
     if adapted_request.stream:

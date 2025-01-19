@@ -252,6 +252,17 @@ class TestOpenAIVisionServer(unittest.TestCase):
         print("-" * 30)
 
         # Add assertions to validate the video response
+        assert "iPod" in video_response or "device" in video_response, video_response
+        assert (
+            "person" in video_response or "individual" in video_response
+        ), video_response
+        assert "hold" in video_response
+        assert (
+            "present" in video_response
+            or "examine" in video_response
+            or "display" in video_response
+        )
+        assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
 
@@ -365,6 +376,9 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+    def test_audio_chat_completion(self):
+        pass
+
 
 class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
     @classmethod
@@ -383,6 +397,7 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
                 "--context-length",
                 "300",
                 "--mem-fraction-static=0.80",
+                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
@@ -444,6 +459,9 @@ class TestMllamaServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
+    def test_audio_chat_completion(self):
+        pass
+
 
 class TestMinicpmvServer(TestOpenAIVisionServer):
     @classmethod
@@ -462,6 +480,91 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+    def test_audio_chat_completion(self):
+        pass
+
+
+class TestMinicpmoServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-o-2_6"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "minicpmo",
+                "--disable-cuda-graph",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def _test_audio_chat_completion(self):
+        url = "MiniCPM-o-2_6/assets/mimick.wav"
+        cache_dir = os.path.expanduser("~/.cache")
+        file_path = os.path.join(cache_dir, "jobs.mp4")
+        file_path = ""
+
+        os.makedirs(cache_dir, exist_ok=True)
+
+        if not os.path.exists(file_path):
+            response = requests.get(url)
+            response.raise_for_status()
+
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        messages = self.prepare_audio_messages(file_path)
+
+        audio_request = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=1024,
+            stream=True,
+        )
+
+        print("-" * 30)
+        audio_response = ""
+        for chunk in audio_request:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                audio_response += content
+                print(content, end="", flush=True)
+        print("-" * 30)
+
+        assert "两年半" in audio_response
+        assert "练习生" in audio_response
+        assert "rap" in audio_response.lower()
+
+        self.assertIsNotNone(audio_response)
+        self.assertGreater(len(audio_response), 0)
+
+    def prepare_audio_messages(self, audio_path):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"audio:{audio_path}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Please describe what do you hear in the audio.",
+                    },
+                ],
+            }
+        ]
+
+        return messages
 
 
 if __name__ == "__main__":
