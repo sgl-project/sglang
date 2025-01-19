@@ -94,9 +94,6 @@ RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master
     && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
-# Build turbomind
-WORKDIR /workspace/sglang
-RUN cd sgl-kernel && mkdir build && cd build && cmake .. && make -j8
 
 # Configure Vim
 COPY --chown=root:root <<-"EOF" /root/.vimrc

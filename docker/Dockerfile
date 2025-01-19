@@ -60,7 +60,4 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
 
 RUN python3 -m pip cache purge
 
-# Build turbomind
-RUN cd sglang/sgl-kernel && mkdir build && cd build && cmake .. && make -j8
-
 ENV DEBIAN_FRONTEND=interactive
