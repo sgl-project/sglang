@@ -493,6 +493,8 @@ def test_lightning_attention_implementations(model_params):
         msg="Lightning attention implementations produce different results",
     )
 
+    print("✅ Two implementations match")
+
 
 def get_benchmark():
     batch_size_range = [2**i for i in range(0, 7)]  # max 64

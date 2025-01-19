@@ -406,7 +406,7 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: tuple = (),
+    other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
 ):

@@ -27,7 +27,7 @@ def setup_logger():
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
-    worker_urls: List[str]
+    worker_urls: List[str] = dataclasses.field(default_factory=list)
     host: str = "127.0.0.1"
     port: int = 30000
 
@@ -141,8 +141,9 @@ class RouterArgs:
             use_router_prefix: If True, look for arguments with 'router-' prefix
         """
         prefix = "router_" if use_router_prefix else ""
+        worker_urls = args.worker_urls if args.worker_urls is not None else []
         return cls(
-            worker_urls=args.worker_urls,
+            worker_urls=worker_urls,
             host=args.host,
             port=args.port,
             policy=getattr(args, f"{prefix}policy"),
@@ -237,7 +238,6 @@ Examples:
 
 
 def main() -> None:
-    logger = setup_logger()
     router_args = parse_router_args(sys.argv[1:])
     router = launch_router(router_args)
 
