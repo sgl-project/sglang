@@ -29,6 +29,7 @@ class HiPModelRunner(ModelRunner):
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        is_draft_worker: bool = False,
     ):
         if server_args.enable_hip_attention:
             logger.info("HIP attention is turned on.")
@@ -45,6 +46,7 @@ class HiPModelRunner(ModelRunner):
             tp_size=tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            is_draft_worker=is_draft_worker,
         )
 
     def init_attention_backend(self):
@@ -83,38 +85,3 @@ class HiPModelRunner(ModelRunner):
             f"Memory + HiP pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
-    
-    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        if forward_batch.forward_mode.is_decode():
-            start_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            
-        if forward_batch.forward_mode.is_decode():
-            result = self.forward_decode(forward_batch)
-        elif forward_batch.forward_mode.is_extend():
-            result = self.forward_extend(forward_batch)
-        elif forward_batch.forward_mode.is_idle():
-            result = self.forward_idle(forward_batch)
-        else:
-            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
-
-        if forward_batch.forward_mode.is_decode():
-            end_event = torch.cuda.Event(enable_timing=True)
-            end_event.record()
-            
-            end_event.synchronize()
-            elapsed = start_event.elapsed_time(end_event)
-        
-        if (forward_batch.hip_metadata_cache_pool is not None) and forward_batch.forward_mode.is_decode():
-            cache = forward_batch.hip_metadata_cache_pool
-            statistics = cache.compute_cache_statistics(forward_batch.batch_size)
-            statistics = dict(map(lambda x: (x[0], x[1].item()), statistics.items()))
-            logger.info(
-                f'took {elapsed:.3f} ms, '
-                f'SA hit = {statistics["sa_hit_ratio"]*100:.2f}% (miss = {statistics["sa_miss"] / 1024 / 1024:.2f}M / {statistics["sa_access"] / 1024 / 1024:.2f}M), '
-                f'Mask hit = {statistics["mask_hit_ratio"] * 100:.2f}% (miss = {statistics["mask_miss"] / 1024 / 1024:.2f}M / {statistics["mask_access"] / 1024 / 1024:.2f}M)'
-            )
-        elif forward_batch.forward_mode.is_decode():
-            logger.info(f'took {elapsed:.3f} ms')
-
-        return result

@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding import get_rope, RotaryEmbedding
 
 class RadixAttention(nn.Module):
     """

@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.hip_model_runner import HiPModelRunner
     from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 from hip.models.hip_attention.gen3.attention_extend import dual_stage_quadratic_hip_attention
 from hip.models.hip_attention.gen3.attention_metadata import HiPAttentionArgs, HiPAttentionOutputMetadata
@@ -53,9 +55,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: torch.Tensor = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
     ):
         pass
 
@@ -65,7 +70,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: torch.Tensor = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
     ):
         pass
 

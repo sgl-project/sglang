@@ -16,6 +16,7 @@
 import gc
 import json
 import logging
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -803,7 +804,7 @@ class ModelRunner:
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
-    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+    def _forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
@@ -820,6 +821,35 @@ class ModelRunner:
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
+    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        require_decode_profiling = os.getenv('SRT_MODEL_RUNNER_PROFILING', '0') == '1'
+        if require_decode_profiling:
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        
+        result = self._forward(forward_batch)
+
+        if require_decode_profiling:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            
+            end_event.synchronize()
+            elapsed = start_event.elapsed_time(end_event)
+        
+        if require_decode_profiling and (forward_batch.hip_metadata_cache_pool is not None) and forward_batch.forward_mode.is_decode():
+            cache = forward_batch.hip_metadata_cache_pool
+            statistics = cache.compute_cache_statistics(forward_batch.batch_size)
+            statistics = dict(map(lambda x: (x[0], x[1].item()), statistics.items()))
+            logger.info(
+                f'took {elapsed:.3f} ms, '
+                f'SA hit = {statistics["sa_hit_ratio"]*100:.2f}% (miss = {statistics["sa_miss"] / 1024 / 1024:.2f}M / {statistics["sa_access"] / 1024 / 1024:.2f}M), '
+                f'Mask hit = {statistics["mask_hit_ratio"] * 100:.2f}% (miss = {statistics["mask_miss"] / 1024 / 1024:.2f}M / {statistics["mask_access"] / 1024 / 1024:.2f}M)'
+            )
+        elif require_decode_profiling:
+            logger.info(f'took {elapsed:.3f} ms')
+
+        return result
+    
     def sample(
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> torch.Tensor:
