@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
@@ -384,6 +385,16 @@ class TokenizerManager:
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
                     logger.info(msg)
                 del self.rid_to_state[obj.rid]
+
+                # Check if this was an abort/error created by scheduler
+                if isinstance(out["meta_info"].get("finish_reason"), dict):
+                    finish_reason = out["meta_info"]["finish_reason"]
+                    if (
+                        finish_reason.get("type") == "abort"
+                        and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
+                    ):
+                        raise ValueError(finish_reason["message"])
+
                 yield out
                 break
 

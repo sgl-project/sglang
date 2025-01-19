@@ -1,4 +1,5 @@
 import logging
+from http import HTTPStatus
 from typing import Optional
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
@@ -35,7 +36,9 @@ def validate_input_length(
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             logger.error(error_msg)
-            req.finished_reason = FINISH_ABORT(error_msg)
+            req.finished_reason = FINISH_ABORT(
+                error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+            )
             return error_msg
 
     return None
