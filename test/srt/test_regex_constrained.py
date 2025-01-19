@@ -159,7 +159,7 @@ class TestRegexConstrained(unittest.TestCase):
         )
 
     def test_regex_generate_complex_json(self):
-        pattern = r'^{\s*"name"\s*:\s*"[a-zA-Z0-9 ]+"\s*,\s*"age"\s*:\s*[1-9][0-9]*\s*,\s*"city"\s*:\s*"[a-zA-Z0-9 ]+"\s*}$'
+        pattern = r'^\{\s*"name"\s*:\s*"[a-zA-Z0-9 ]+"\s*,\s*"age"\s*:\s*[1-9][0-9]*\s*,\s*"city"\s*:\s*"[a-zA-Z0-9 ]+"\s*\}$'
         prompt = "Generate a simple JSON with name, age, and city:"
 
         self.run_decode(
