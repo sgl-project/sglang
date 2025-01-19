@@ -3,14 +3,11 @@
 
 #pragma once
 
-#include "cutlass/complex.h"
-#include "cutlass/cutlass.h"
-#include "cutlass/fast_math.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/matrix_coord.h"
-#include "cutlass/semaphore.h"
-#include "cutlass/trace.h"
-#include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
+#include <cutlass/complex.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/fast_math.h>
+#include <cutlass/matrix_coord.h>
+#include <cutlass/trace.h>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
