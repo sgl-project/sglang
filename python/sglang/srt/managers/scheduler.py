@@ -317,7 +317,8 @@ class Scheduler:
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.spec_accept_length = 0
+        self.spec_num_total_accepted_tokens = 0
+        self.spec_num_total_forward_ct = 0
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
@@ -760,15 +761,32 @@ class Scheduler:
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.time()
         num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
-        logger.info(
-            f"Decode batch. "
-            f"#running-req: {num_running_reqs}, "
-            f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"gen throughput (token/s): {gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
-        )
 
+        if self.spec_algorithm.is_none():
+            msg = (
+                f"Decode batch. "
+                f"#running-req: {num_running_reqs}, "
+                f"#token: {num_used}, "
+                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                f"gen throughput (token/s): {gen_throughput:.2f}, "
+                f"#queue-req: {len(self.waiting_queue)}"
+            )
+        else:
+            accept_length = (
+                self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
+            )
+            self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
+            msg = (
+                f"Decode batch. "
+                f"#running-req: {num_running_reqs}, "
+                f"#token: {num_used}, "
+                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                f"accept len: {accept_length:.2f}, "
+                f"gen throughput (token/s): {gen_throughput:.2f}, "
+                f"#queue-req: {len(self.waiting_queue)}"
+            )
+
+        logger.info(msg)
         if self.enable_metrics:
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
@@ -1022,6 +1040,10 @@ class Scheduler:
                         model_worker_batch,
                         num_accepted_tokens,
                     ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                    self.spec_num_total_accepted_tokens += (
+                        num_accepted_tokens + batch.batch_size()
+                    )
+                    self.spec_num_total_forward_ct += batch.batch_size()
                     self.num_generated_tokens += num_accepted_tokens
             else:
                 assert False, "batch.extend_num_tokens == 0, this is unexpected!"
