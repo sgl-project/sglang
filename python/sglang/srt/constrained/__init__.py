@@ -11,6 +11,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-# TODO(lmzheng): make this an optional dependency
-from sglang.srt.constrained.outlines_backend import build_regex_from_object

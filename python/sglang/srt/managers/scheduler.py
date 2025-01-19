@@ -34,6 +34,7 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -149,9 +150,7 @@ class Scheduler:
             else 1
         )
 
-        # Init inter-process communication
-        context = zmq.Context(2)
-
+        # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.dp_rank = (
             compute_dp_attention_world_info(
@@ -162,6 +161,8 @@ class Scheduler:
             )
         )
 
+        # Init inter-process communication
+        context = zmq.Context(2)
         if self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -243,7 +244,7 @@ class Scheduler:
             nccl_port=port_args.nccl_port,
         )
 
-        # Launch worker for speculative decoding if need
+        # Launch a worker for speculative decoding if needed
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
@@ -337,28 +338,9 @@ class Scheduler:
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
-            if server_args.grammar_backend == "outlines":
-                from sglang.srt.constrained.outlines_backend import (
-                    OutlinesGrammarBackend,
-                )
-
-                self.grammar_backend = OutlinesGrammarBackend(
-                    self.tokenizer,
-                    whitespace_pattern=server_args.constrained_json_whitespace_pattern,
-                    allow_jump_forward=not server_args.disable_jump_forward,
-                )
-            elif server_args.grammar_backend == "xgrammar":
-                from sglang.srt.constrained.xgrammar_backend import (
-                    XGrammarGrammarBackend,
-                )
-
-                self.grammar_backend = XGrammarGrammarBackend(
-                    self.tokenizer, vocab_size=self.model_config.vocab_size
-                )
-            else:
-                raise ValueError(
-                    f"Invalid grammar backend: {server_args.grammar_backend}"
-                )
+            self.grammar_backend = create_grammar_backend(
+                server_args, self.tokenizer, self.model_config.vocab_size
+            )
         else:
             self.grammar_backend = None
 
@@ -424,7 +406,8 @@ class Scheduler:
                 },
             )
 
-        self._dispatcher = TypeBasedDispatcher(
+        # Init request dispatcher
+        self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
@@ -593,7 +576,7 @@ class Scheduler:
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
-            output = self._dispatcher(recv_req)
+            output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
 
