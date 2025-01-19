@@ -115,14 +115,18 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message="Unknown error"):
+    def __init__(self, message="Unknown error", status_code=None, err_type=None):
         super().__init__(is_error=True)
         self.message = message
+        self.status_code = status_code
+        self.err_type = err_type
 
     def to_json(self):
         return {
             "type": "abort",
             "message": self.message,
+            "status_code": self.status_code,
+            "err_type": self.err_type,
         }
 
 

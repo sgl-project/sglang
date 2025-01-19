@@ -23,6 +23,7 @@ import warnings
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
+from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -672,15 +673,16 @@ class Scheduler:
             req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                logger.error(
+                error_msg = (
                     "Multimodal prompt is too long after expanding multimodal tokens. "
-                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                 )
+                logger.error(error_msg)
                 req.origin_input_ids = [0]
                 req.image_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
-                    "Multimodal prompt is too long. Check server logs for details."
+                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
                 self.waiting_queue.append(req)
                 return
