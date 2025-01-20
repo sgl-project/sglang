@@ -785,8 +785,9 @@ class Scheduler:
                 f"gen throughput (token/s): {gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}"
             )
+            spec_accept_length = 0
         else:
-            accept_length = (
+            spec_accept_length = (
                 self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
             )
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
@@ -795,7 +796,7 @@ class Scheduler:
                 f"#running-req: {num_running_reqs}, "
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"accept len: {accept_length:.2f}, "
+                f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}"
             )
@@ -807,6 +808,7 @@ class Scheduler:
             self.stats.token_usage = num_used / self.max_total_num_tokens
             self.stats.gen_throughput = gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
 
     def check_memory(self):
