@@ -191,6 +191,9 @@ class GenerateReqInput:
             elif not isinstance(self.custom_logit_processor, list):
                 self.custom_logit_processor = [self.custom_logit_processor] * num
             else:
+                assert num == len(
+                    self.custom_logit_processor
+                ), "The length of custom_logit_processor should be the same as the batch size."
                 assert self.parallel_sample_num == 1
 
     def regenerate_rid(self):

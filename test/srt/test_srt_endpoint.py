@@ -301,7 +301,8 @@ class TestSRTEndpoint(unittest.TestCase):
 
     def test_custom_logit_processor(self):
         """Test custom logit processor with a single request."""
-        self.run_custom_logit_processor(target_token_id=5)
+        for _ in range(100):
+            self.run_custom_logit_processor(target_token_id=5)
 
     def test_custom_logit_processor_batch(self):
         """Test custom logit processor with a batch of requests."""
