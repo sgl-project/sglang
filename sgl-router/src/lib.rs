@@ -18,6 +18,7 @@ struct Router {
     worker_urls: Vec<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
+    worker_startup_check_interval: u64,
     cache_threshold: f32,
     balance_abs_threshold: usize,
     balance_rel_threshold: f32,
@@ -36,6 +37,7 @@ impl Router {
         host = String::from("127.0.0.1"),
         port = 3001,
         worker_startup_timeout_secs = 300,
+        worker_startup_check_interval = 10,
         cache_threshold = 0.50,
         balance_abs_threshold = 32,
         balance_rel_threshold = 1.0001,
@@ -50,6 +52,7 @@ impl Router {
         host: String,
         port: u16,
         worker_startup_timeout_secs: u64,
+        worker_startup_check_interval: u64,
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
@@ -64,6 +67,7 @@ impl Router {
             worker_urls,
             policy,
             worker_startup_timeout_secs,
+            worker_startup_check_interval,
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
@@ -78,12 +82,15 @@ impl Router {
         let policy_config = match &self.policy {
             PolicyType::Random => router::PolicyConfig::RandomConfig {
                 timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
             },
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig {
                 timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
             },
             PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
                 timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,

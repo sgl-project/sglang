@@ -34,6 +34,7 @@ class RouterArgs:
     # Routing policy
     policy: str = "cache_aware"
     worker_startup_timeout_secs: int = 300
+    worker_startup_check_interval: int = 10
     cache_threshold: float = 0.5
     balance_abs_threshold: int = 32
     balance_rel_threshold: float = 1.0001
@@ -93,6 +94,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.worker_startup_timeout_secs,
             help="Timeout in seconds for worker startup",
+        )
+        parser.add_argument(
+            f"--{prefix}worker-startup-check-interval",
+            type=int,
+            default=RouterArgs.worker_startup_check_interval,
+            help="Interval in seconds between checks for worker startup",
         )
         parser.add_argument(
             f"--{prefix}cache-threshold",
@@ -157,6 +164,9 @@ class RouterArgs:
             worker_startup_timeout_secs=getattr(
                 args, f"{prefix}worker_startup_timeout_secs"
             ),
+            worker_startup_check_interval=getattr(
+                args, f"{prefix}worker_startup_check_interval"
+            ),
             cache_threshold=getattr(args, f"{prefix}cache_threshold"),
             balance_abs_threshold=getattr(args, f"{prefix}balance_abs_threshold"),
             balance_rel_threshold=getattr(args, f"{prefix}balance_rel_threshold"),
@@ -202,6 +212,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             port=router_args.port,
             policy=policy_from_str(router_args.policy),
             worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
+            worker_startup_check_interval=router_args.worker_startup_check_interval,
             cache_threshold=router_args.cache_threshold,
             balance_abs_threshold=router_args.balance_abs_threshold,
             balance_rel_threshold=router_args.balance_rel_threshold,
