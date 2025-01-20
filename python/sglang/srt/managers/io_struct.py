@@ -539,16 +539,22 @@ class OpenSessionReqOutput:
 
 
 @dataclass
-class FunctionTool:
-    description: Optional[str]
-    name: Optional[str]
-    parameters: Optional[object]
+class Function:
+    description: Optional[str] = None
+    name: Optional[str] = None
+    parameters: Optional[object] = None
+
+
+@dataclass
+class Tool:
+    function: Function
+    type: Optional[str] = "function"
 
 
 @dataclass
 class FunctionCallReqInput:
     text: str  # The text to parse.
-    tools: List[FunctionTool] = field(
+    tools: List[Tool] = field(
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (

@@ -72,14 +72,6 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
-
-TOOLS_TAG_LIST = [
-    "<|plugin|>",
-    "<function=",
-    "<tool_call>",
-    "<|python_tag|>",
-    "[TOOL_CALLS]",
-]
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -1081,7 +1073,15 @@ def v1_chat_generate_response(
             tool_choice = request.tool_choice
             tools = request.tools
 
-        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
+        tool_tag_list = [
+            "<|plugin|>",
+            "<function=",
+            "<tool_call>",
+            "<|python_tag|>",
+            "[TOOL_CALLS]",
+        ]
+
+        if tool_choice != "none" and any([i in text for i in tool_tag_list]):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:
