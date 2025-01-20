@@ -175,10 +175,10 @@ void sm80_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const t
   }
 }
 
+template <typename ElementOutput, bool WithBias>
 void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
                                  const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                                  const c10::optional<torch::Tensor>& bias) {
-  using ElementOutput = cutlass::half_t;
   using ArchTag = cutlass::arch::Sm90;
 
   using ElementAccumulator = int32_t;
@@ -190,8 +190,6 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
   static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementInputB>::value;
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementOutput>::value;
   static constexpr int AlignmentOutput = 128 / cutlass::sizeof_bits<ElementOutput>::value;
-
-  static constexpr bool WithBias = true;
 
   using TileShape = Shape<_128, _128, _128>;
   using ClusterShape = Shape<_2, _1, _1>;
@@ -262,11 +260,6 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
   auto a_s_ptr = static_cast<ElementCompute*>(scales_a.data_ptr());
   auto b_s_ptr = static_cast<ElementCompute*>(scales_b.data_ptr());
 
-  ElementOutput* bias_ptr = nullptr;
-  if (bias) {
-    bias_ptr = static_cast<ElementOutput*>(bias->data_ptr());
-  }
-
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using StrideB = typename Gemm::GemmKernel::StrideB;
   using StrideC = typename Gemm::GemmKernel::StrideC;
@@ -280,20 +273,27 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
   typename Gemm::Arguments args = {cutlass::gemm::GemmUniversalMode::kGemm,
                                    {m, n, k, 1},
                                    {a_ptr, stride_a, b_ptr, stride_b},
-                                   {{
-                                        {a_s_ptr},
-                                        {
-                                            {b_s_ptr},
-                                            {},  // Accumulator
-                                            {}   // Multiplies
-                                        },
-                                        {bias_ptr},
-                                        {},  // Multiplies
-                                    },
+                                   {{},  // epilogue.thread
                                     nullptr,
                                     stride_c,
                                     o_ptr,
                                     stride_d}};
+
+  if constexpr (WithBias) {
+    ElementOutput* bias_ptr = static_cast<ElementOutput*>(bias->data_ptr());
+    args.epilogue.thread = {
+        {a_s_ptr},
+        {{b_s_ptr}, {}, {}},
+        {bias_ptr},
+        {},
+    };
+  } else {
+    args.epilogue.thread = {
+        {a_s_ptr},
+        {{b_s_ptr}, {}, {}},
+        {},
+    };
+  }
 
   auto workspace = torch::empty(gemm_op.get_workspace_size(args),
                                 torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device()));
@@ -306,6 +306,17 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
 
   auto status = gemm_op(args, workspace.data_ptr(), stream);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm executioin failed, error: ", cutlassGetStatusString(status));
+}
+
+template <typename ElementOutput>
+void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                        const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                        const c10::optional<torch::Tensor>& bias) {
+  if (bias) {
+    cutlass_int8_scaled_mm_sm90<ElementOutput, true>(out, mat_a, mat_b, scales_a, scales_b, bias);
+  } else {
+    cutlass_int8_scaled_mm_sm90<ElementOutput, false>(out, mat_a, mat_b, scales_a, scales_b, bias);
+  }
 }
 
 torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
@@ -356,7 +367,11 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
     }
   } else if (sm_version == 90) {
     // conditional compile
-    cutlass_int8_scaled_mm_sm90(out, mat_a, mat_b, scales_a, scales_b, bias);
+    if (out_dtype == torch::kBFloat16) {
+      sm90_dispatch_bias<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      sm90_dispatch_bias<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
   } else {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability.");
   }
