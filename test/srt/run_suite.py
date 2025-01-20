@@ -8,6 +8,7 @@ suites = {
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
+        "models/test_qwen_models.py",
         "models/test_reward_models.py",
         "sampling/penaltylib",
         "test_abort.py",
@@ -30,6 +31,7 @@ suites = {
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
+        "test_regex_constrained.py",
         "test_release_memory_occupation.py",
         "test_request_length_validation.py",
         "test_retract_decode.py",
@@ -51,6 +53,7 @@ suites = {
         "test_vision_openai_server.py",
         "test_w8a8_quantization.py",
         "test_session_control.py",
+        "test_fp8_kvcache.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",

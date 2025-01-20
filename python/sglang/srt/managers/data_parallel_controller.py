@@ -56,6 +56,7 @@ class DataParallelController:
 
     def __init__(self, server_args, port_args) -> None:
         # Parse args
+        self.max_total_num_tokens = None
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
@@ -95,6 +96,8 @@ class DataParallelController:
                     dp_port_args[dp_rank].scheduler_input_ipc_name,
                     True,
                 )
+
+        self.max_req_input_len = None
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -189,6 +192,7 @@ class DataParallelController:
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
+        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def round_robin_scheduler(self, req):
         self.workers[self.round_robin_counter].send_pyobj(req)
@@ -231,7 +235,11 @@ def run_data_parallel_controller_process(
     try:
         controller = DataParallelController(server_args, port_args)
         pipe_writer.send(
-            {"status": "ready", "max_total_num_tokens": controller.max_total_num_tokens}
+            {
+                "status": "ready",
+                "max_total_num_tokens": controller.max_total_num_tokens,
+                "max_req_input_len": controller.max_req_input_len,
+            }
         )
         if server_args.node_rank == 0:
             controller.event_loop()

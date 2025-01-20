@@ -21,16 +21,17 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from vllm.distributed import (
+
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.distributed import (
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
 )
-
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -106,8 +107,10 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            logger.info("MLA optimization is turned on. Use triton backend.")
-            self.server_args.attention_backend = "triton"
+            # TODO: add MLA optimization on CPU
+            if self.server_args.device != "cpu":
+                logger.info("MLA optimization is turned on. Use triton backend.")
+                self.server_args.attention_backend = "triton"
 
         if self.server_args.enable_double_sparsity:
             logger.info(
@@ -164,6 +167,7 @@ class ModelRunner:
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
+                "device": server_args.device,
             }
         )
 
@@ -221,6 +225,8 @@ class ModelRunner:
             backend = "gloo"
         elif self.device == "hpu":
             backend = "hccl"
+        elif self.device == "cpu":
+            backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
@@ -231,7 +237,7 @@ class ModelRunner:
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
         if not self.is_draft_worker:
-            # Only initilzie the distributed environment on the target model worker.
+            # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size,
@@ -269,7 +275,8 @@ class ModelRunner:
         )
 
         # This can reduce thread conflicts and speed up weight loading.
-        torch.set_num_threads(1)
+        if self.device != "cpu":
+            torch.set_num_threads(1)
         if self.device == "cuda":
             if torch.cuda.get_device_capability()[0] < 8:
                 logger.info(
@@ -289,12 +296,15 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         # Load the model
+        # Remove monkey_patch when linear.py quant remove dependencies with vllm
+        monkey_patch_vllm_parallel_state()
         with self.memory_saver_adapter.region():
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
                 device_config=DeviceConfig(self.device),
             )
+        monkey_patch_vllm_parallel_state(reverse=True)
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -607,7 +617,6 @@ class ModelRunner:
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
-            use_records=False,
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
         if (

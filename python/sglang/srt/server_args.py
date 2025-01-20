@@ -159,6 +159,9 @@ class ServerArgs:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
 
+    # Custom logit processor
+    enable_custom_logit_processor: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -392,7 +395,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda", "xpu", "hpu"],
+            choices=["cuda", "xpu", "hpu", "cpu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -864,6 +867,11 @@ class ServerArgs:
             "--allow-auto-truncate",
             action="store_true",
             help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
+        )
+        parser.add_argument(
+            "--enable-custom-logit-processor",
+            action="store_true",
+            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
 
     @classmethod
