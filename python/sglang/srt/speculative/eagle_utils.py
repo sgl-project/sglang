@@ -180,7 +180,6 @@ def generate_draft_decode_kv_indices(
 class EAGLEDraftInput(SpecInfo):
     def __init__(self):
         self.prev_mode = ForwardMode.DECODE
-        self.sample_output = None
 
         self.scores: torch.Tensor = None
         self.score_list: List[torch.Tensor] = []
@@ -190,8 +189,13 @@ class EAGLEDraftInput(SpecInfo):
         self.cache_list: List[torch.Tenor] = []
         self.iter = 0
 
+        # shape: (b, hidden_size)
         self.hidden_states: torch.Tensor = None
+        # shape: (b,)
         self.verified_id: torch.Tensor = None
+        # shape: (b, vocab_size)
+        self.sample_output: torch.Tensor = None
+
         self.positions: torch.Tensor = None
         self.accept_length: torch.Tensor = None
         self.has_finished: bool = False
@@ -287,7 +291,9 @@ class EAGLEDraftInput(SpecInfo):
         self.cache_list.append(batch.out_cache_loc)
         self.positions = (
             batch.seq_lens[:, None]
-            + torch.ones([1, self.topk], device="cuda", dtype=torch.long) * self.iter
+            + torch.full(
+                [1, self.topk], fill_value=self.iter, device="cuda", dtype=torch.long
+            )
         ).flatten()
 
         bs = len(batch.seq_lens)
