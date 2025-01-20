@@ -18,10 +18,12 @@ pub enum Router {
         worker_urls: Arc<RwLock<Vec<String>>>,
         current_index: AtomicUsize,
         timeout_secs: u64,
+        interval_secs: u64,
     },
     Random {
         worker_urls: Arc<RwLock<Vec<String>>>,
         timeout_secs: u64,
+        interval_secs: u64,
     },
     CacheAware {
         /*
@@ -92,6 +94,7 @@ pub enum Router {
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         timeout_secs: u64,
+        interval_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
     },
 }
@@ -100,9 +103,11 @@ pub enum Router {
 pub enum PolicyConfig {
     RandomConfig {
         timeout_secs: u64,
+        interval_secs: u64,
     },
     RoundRobinConfig {
         timeout_secs: u64,
+        interval_secs: u64,
     },
     CacheAwareConfig {
         cache_threshold: f32,
@@ -111,31 +116,50 @@ pub enum PolicyConfig {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         timeout_secs: u64,
+        interval_secs: u64,
     },
 }
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
-        // Get timeout from policy config
-        let timeout_secs = match &policy_config {
-            PolicyConfig::RandomConfig { timeout_secs } => *timeout_secs,
-            PolicyConfig::RoundRobinConfig { timeout_secs } => *timeout_secs,
-            PolicyConfig::CacheAwareConfig { timeout_secs, .. } => *timeout_secs,
+        // Get timeout and interval from policy config
+        let (timeout_secs, interval_secs) = match &policy_config {
+            PolicyConfig::RandomConfig {
+                timeout_secs,
+                interval_secs,
+            } => (*timeout_secs, *interval_secs),
+            PolicyConfig::RoundRobinConfig {
+                timeout_secs,
+                interval_secs,
+            } => (*timeout_secs, *interval_secs),
+            PolicyConfig::CacheAwareConfig {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
         };
 
         // Wait until all workers are healthy
-        Self::wait_for_healthy_workers(&worker_urls, timeout_secs, 10)?;
+        Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
 
         // Create router based on policy...
         Ok(match policy_config {
-            PolicyConfig::RandomConfig { timeout_secs } => Router::Random {
+            PolicyConfig::RandomConfig {
+                timeout_secs,
+                interval_secs,
+            } => Router::Random {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 timeout_secs,
+                interval_secs,
             },
-            PolicyConfig::RoundRobinConfig { timeout_secs } => Router::RoundRobin {
+            PolicyConfig::RoundRobinConfig {
+                timeout_secs,
+                interval_secs,
+            } => Router::RoundRobin {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 current_index: std::sync::atomic::AtomicUsize::new(0),
                 timeout_secs,
+                interval_secs,
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
@@ -144,6 +168,7 @@ impl Router {
                 eviction_interval_secs,
                 max_tree_size,
                 timeout_secs,
+                interval_secs,
             } => {
                 let mut running_queue = HashMap::new();
                 for url in &worker_urls {
@@ -195,6 +220,7 @@ impl Router {
                     balance_abs_threshold,
                     balance_rel_threshold,
                     timeout_secs,
+                    interval_secs,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -594,11 +620,22 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        let interval_secs = 10; // check every 10 seconds
-        let timeout_secs = match self {
-            Router::Random { timeout_secs, .. } => *timeout_secs,
-            Router::RoundRobin { timeout_secs, .. } => *timeout_secs,
-            Router::CacheAware { timeout_secs, .. } => *timeout_secs,
+        let (timeout_secs, interval_secs) = match self {
+            Router::Random {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
+            Router::RoundRobin {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
+            Router::CacheAware {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
         };
 
         let start_time = std::time::Instant::now();
