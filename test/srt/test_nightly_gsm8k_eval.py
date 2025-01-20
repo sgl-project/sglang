@@ -45,7 +45,7 @@ def parse_models(model_string):
     return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
-def launch_server(base_url, model, is_fp8, is_tp2):
+def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
     other_args = ["--log-level-http", "warning", "--trust-remote-code"]
     if is_fp8:
         if "Llama-3" in model or "gemma-2" in model:
@@ -148,7 +148,9 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    process = launch_server(self.base_url, model, is_fp8, is_tp2)
+                    process = popen_launch_server_wrapper(
+                        self.base_url, model, is_fp8, is_tp2
+                    )
 
                     args = SimpleNamespace(
                         base_url=self.base_url,
