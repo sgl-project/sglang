@@ -250,8 +250,7 @@ class SamplingBatchInfo:
         self, unfinished_indices: List[int], new_indices: torch.Tensor
     ):
         """Filter the custom logit processor and custom params"""
-        if not self.custom_logit_processor:
-            return
+
         self.custom_logit_processor = {
             k: (p, mask[new_indices])
             for k, (p, mask) in self.custom_logit_processor.items()
