@@ -412,15 +412,14 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                # qk = tl.dot(q, k.to(q.dtype))
-                qk = tl.dot(q, (((k - 0.01) * 1).to(q.dtype)))
+                qk = tl.dot(q, k.to(q.dtype))
             else:
                 k_int8 = tl.load(
                     K_Buffer + offs_buf_k,
                     mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                #'''
+
                 offs_scale_k = (
                     kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 )
@@ -436,9 +435,6 @@ def _fwd_grouped_kernel_stage1(
                     other=0,
                 )
                 qk = tl.dot(q, (((k_int8 - k_zeros) * k_scales).to(q.dtype)))
-
-                #'''
-                # qk = tl.dot(q, (((k_int8 - 1)*1).to(q.dtype)))
 
             # MLA does not support kv cache int8 quantization.
             if BLOCK_DPE > 0:
@@ -486,7 +482,6 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                     other=0.0,
                 )
-                #'''
                 offs_scale_v = (
                     kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )

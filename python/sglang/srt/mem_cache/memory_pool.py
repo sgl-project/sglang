@@ -364,14 +364,14 @@ class MLATokenToKVPool(BaseTokenToKVPool):
     def __init__(
         self,
         size: int,
-        dtype: torch.dtype,
+        kv_cache_dtype: torch.dtype,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
     ):
-        super().__init__(size, dtype, device)
+        super().__init__(size, kv_cache_dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
 
@@ -404,6 +404,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
+        return None, None
 
     def set_kv_buffer(
         self,
@@ -475,6 +478,9 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_buffer(self, layer_id: int):
         return self.k_buffer[layer_id], self.v_buffer[layer_id]
+
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
+        return None, None
 
     def set_kv_buffer(
         self,
