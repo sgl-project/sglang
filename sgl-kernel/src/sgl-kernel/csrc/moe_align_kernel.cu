@@ -84,7 +84,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
 
   int active_threads = CEILDIV(num_experts, kElementsPerThr);
   if (tid == 0) {
-    local_offsets[0] = 0; 
+    local_offsets[0] = 0;
   }
   if (tid < active_threads - 1) { // NOTE(yaikwy) : algo here assumes single block execution
 
@@ -121,7 +121,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
     }
 
     local_offsets_buf[tid] = local_offsets[num_experts];
-    
+
   }
 
   __syncthreads();
@@ -137,7 +137,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
       local_offsets[i] += offset;
     }
   }
-    
+
   // NOTE (yiakwy) : step 2, loop tail
   if (tid == active_threads - 1) {
     int offset = 0;
@@ -157,7 +157,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
 #define kElementsPerAccess 4
 
   {
-  
+
   int active_threads = CEILDIV(num_experts+1, kElementsPerThr);
   if (tid < active_threads - 1) {
 
@@ -178,7 +178,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
   if (tid == active_threads) {
     *total_tokens_post_pad = local_offsets[num_experts];
   }
-  
+
   } // code block of storing to cumsum
 
   __syncthreads();
@@ -210,4 +210,3 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
                                    num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
   });
 }
-   

@@ -300,11 +300,6 @@ def benchmark(batch_size, seq_len, provider):
 
 
 if __name__ == "__main__":
-    torch.manual_seed(SEED)
-
-    import numpy as np
-    np.random.seed(SEED)
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--save_path",
