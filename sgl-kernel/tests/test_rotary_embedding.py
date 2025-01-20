@@ -16,6 +16,7 @@ class SGLRotaryEmbedding(VLLMRotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sgl_kernel import rotary_embedding
+
         self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
         rotary_embedding(
