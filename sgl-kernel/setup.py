@@ -69,6 +69,7 @@ setup(
     version=get_version(),
     packages=find_packages(),
     package_dir={"": "src"},
+    include_package_data=True,
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch"],

@@ -4,3 +4,6 @@
 [submodule "sgl-kernel/3rdparty/cccl"]
 	path = sgl-kernel/3rdparty/cccl
 	url = https://github.com/NVIDIA/cccl.git
+[submodule "sgl-kernel/3rdparty/turbomind"]
+	path = sgl-kernel/3rdparty/turbomind
+	url = https://github.com/InternLM/turbomind.git

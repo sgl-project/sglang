@@ -9,6 +9,9 @@ from sgl_kernel.ops import (
     sampling_scaling_penalties,
 )
 
+from sgl_kernel.turbomind import _turbomind_ext as turbomind
+
+
 __all__ = [
     "moe_align_block_size",
     "init_custom_reduce",
@@ -18,4 +21,5 @@ __all__ = [
     "sampling_scaling_penalties",
     "get_graph_buffer_ipc_meta",
     "register_graph_buffers",
+    "turbomind",
 ]
