@@ -28,7 +28,7 @@ from sglang.bench_serving import (
     set_ulimit,
 )
 from sglang.lang.backend.runtime_endpoint import Runtime
-from sglang.srt.server import Engine
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
 
 
