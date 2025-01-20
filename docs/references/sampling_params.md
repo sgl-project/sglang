@@ -276,8 +276,6 @@ response = requests.post(
 print(response.json())
 ```
 ### Custom Logit Processor
-
-### Normal
 Launch a server with `--enable-custom-logit-processor` flag on.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --enable-custom-logit-processor
