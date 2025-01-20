@@ -226,9 +226,10 @@ class TokenizerManager:
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
-                (BatchStrOut, self._handle_batch_output),
-                (BatchEmbeddingOut, self._handle_batch_output),
-                (BatchTokenIDOut, self._handle_batch_output),
+                (
+                    (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut),
+                    self._handle_batch_output,
+                ),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
