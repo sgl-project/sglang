@@ -593,6 +593,15 @@ def sample_sharegpt_requests(
 
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
+
+        if args.apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prompt = prompt.replace(tokenizer.bos_token, "")
+
         prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
         completion_token_ids = tokenizer.encode(completion)
@@ -1448,6 +1457,11 @@ if __name__ == "__main__":
         type=str,
         help="Append given JSON object to the request payload. You can use this to specify"
         "additional generate params like sampling params.",
+    )
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="Apply chat template",
     )
     parser.add_argument(
         "--profile",
