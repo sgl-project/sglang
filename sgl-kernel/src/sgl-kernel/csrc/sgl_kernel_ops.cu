@@ -27,8 +27,8 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
                              const c10::optional<torch::Tensor>& bias);
 
 // rotary embedding
-void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key,
-                     int64_t head_size, torch::Tensor& cos_sin_cache, bool is_neox);
+void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
+                      torch::Tensor& cos_sin_cache, bool is_neox);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
