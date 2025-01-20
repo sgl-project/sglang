@@ -63,8 +63,8 @@ from sglang.srt.utils import (
     init_custom_process_group,
     is_cuda,
     is_hip,
+    monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
-    monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
 
@@ -233,7 +233,8 @@ class ModelRunner:
             backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
-            monkey_patch_vllm_p2p_access_check(self.gpu_id)
+            monkey_patch_p2p_access_check()
+
         if self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
