@@ -183,6 +183,7 @@ def _fwd_kernel(
                 mask=mask_n[None, :],
                 other=0.0,
             )
+            qk += tl.dot(qpe.to(kpe.dtype), kpe)
         qk *= sm_scale
 
         if logit_cap > 0:

@@ -241,7 +241,7 @@ class ModelRunner:
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
         if not self.is_draft_worker:
-            # Only initialize the distributed environment on the target model worker.
+            # Only initilzie the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size,
@@ -543,14 +543,6 @@ class ModelRunner:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * self.model_config.num_hidden_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
-            )
-        elif self.kv_cache_dtype == "int8":
-            cell_size = (
-                self.model_config.get_num_kv_heads(self.tp_size)
-                * (self.model_config.head_dim + 1)  # scale
-                * self.model_config.num_hidden_layers
-                * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
