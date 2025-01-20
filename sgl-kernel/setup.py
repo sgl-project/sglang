@@ -53,6 +53,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
             "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
+            "src/sgl-kernel/csrc/rotary_embedding.cu",
         ],
         include_dirs=include_dirs,
         extra_compile_args={
