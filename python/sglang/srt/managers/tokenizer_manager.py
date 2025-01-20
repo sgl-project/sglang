@@ -176,7 +176,7 @@ class TokenizerManager:
                 )
 
         # Store states
-        self.to_create_loop = True
+        self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
@@ -224,11 +224,12 @@ class TokenizerManager:
                 },
             )
 
-        self._dispatcher = TypeBasedDispatcher(
+        self._result_dispatcher = TypeBasedDispatcher(
             [
-                (BatchStrOut, self._handle_batch_output),
-                (BatchEmbeddingOut, self._handle_batch_output),
-                (BatchTokenIDOut, self._handle_batch_output),
+                (
+                    (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut),
+                    self._handle_batch_output,
+                ),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -684,7 +685,6 @@ class TokenizerManager:
     async def close_session(
         self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
-        assert not self.to_create_loop, "close session should not be the first request"
         await self.send_to_scheduler.send_pyobj(obj)
 
     def configure_logging(self, obj: ConfigureLoggingReq):
@@ -713,10 +713,10 @@ class TokenizerManager:
         return background_tasks
 
     def auto_create_handle_loop(self):
-        if not self.to_create_loop:
+        if self.no_create_loop:
             return
 
-        self.to_create_loop = False
+        self.no_create_loop = True
         loop = asyncio.get_event_loop()
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
@@ -760,7 +760,7 @@ class TokenizerManager:
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._dispatcher(recv_obj)
+            self._result_dispatcher(recv_obj)
 
     def _handle_batch_output(
         self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
