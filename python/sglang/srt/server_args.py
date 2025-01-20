@@ -29,8 +29,8 @@ from sglang.srt.utils import (
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
-    is_ipv6,
     is_port_available,
+    is_valid_ipv6_address,
     nullable_str,
 )
 
@@ -883,7 +883,7 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_ipv6(self.host):
+        if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
