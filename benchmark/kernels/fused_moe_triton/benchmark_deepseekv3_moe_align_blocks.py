@@ -209,7 +209,6 @@ seq_length_range = [2**i for i in range(0, 16)]
 configs = list(itertools.product(batch_size_range, seq_length_range))
 
 
-@torch.jit.script # JIT decorator
 def get_topk_ids(num_tokens : int, num_experts : int, topk : int) -> torch.Tensor:
     topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int32, device="cuda")
     for i in range(num_tokens):
