@@ -306,7 +306,7 @@ class TestSRTEndpoint(unittest.TestCase):
 
     def test_custom_logit_processor_batch(self):
         """Test custom logit processor with a batch of requests."""
-        target_token_ids = list(range(32))
+        target_token_ids = list(range(128))
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
