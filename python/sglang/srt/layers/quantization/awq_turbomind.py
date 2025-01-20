@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn import Parameter
 
-from sgl_kernel import _turbomind_ext
+from sgl_kernel import turbomind
 from vllm.model_executor.layers.linear import LinearBase
 
 from sglang.srt.layers.linear import LinearMethodBase, UnquantizedLinearMethod
@@ -246,7 +246,7 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
         scales_turbomind = scales_turbomind.contiguous()
         qzeros_turbomind = qzeros_turbomind.contiguous()
 
-        self.linear = _turbomind_ext.Linear(
+        self.linear = turbomind.Linear(
             layer.input_size_per_partition,
             layer.output_size_per_partition,
             self.quant_config.weight_bits,
