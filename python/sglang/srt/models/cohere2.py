@@ -39,6 +39,7 @@
 
 from sglang.srt.models.commandr import *
 
+
 class Cohere2ForCausalLM(CohereForCausalLM):
     def __init__(
         self,
@@ -46,5 +47,6 @@ class Cohere2ForCausalLM(CohereForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config, quant_config)
+
 
 EntryClass = Cohere2ForCausalLM
