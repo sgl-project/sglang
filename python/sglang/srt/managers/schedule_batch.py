@@ -232,6 +232,7 @@ class Req:
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
+        custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
@@ -252,6 +253,7 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
         self.req_pool_idx = None
