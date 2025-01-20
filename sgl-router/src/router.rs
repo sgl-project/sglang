@@ -3,7 +3,7 @@ use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicUsize;
@@ -17,9 +17,11 @@ pub enum Router {
     RoundRobin {
         worker_urls: Arc<RwLock<Vec<String>>>,
         current_index: AtomicUsize,
+        timeout_secs: u64,
     },
     Random {
         worker_urls: Arc<RwLock<Vec<String>>>,
+        timeout_secs: u64,
     },
     CacheAware {
         /*
@@ -89,36 +91,51 @@ pub enum Router {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
+        timeout_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
     },
 }
 
 #[derive(Debug, Clone)]
 pub enum PolicyConfig {
-    RandomConfig,
-    RoundRobinConfig,
+    RandomConfig {
+        timeout_secs: u64,
+    },
+    RoundRobinConfig {
+        timeout_secs: u64,
+    },
     CacheAwareConfig {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        timeout_secs: u64,
     },
 }
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
+        // Get timeout from policy config
+        let timeout_secs = match &policy_config {
+            PolicyConfig::RandomConfig { timeout_secs } => *timeout_secs,
+            PolicyConfig::RoundRobinConfig { timeout_secs } => *timeout_secs,
+            PolicyConfig::CacheAwareConfig { timeout_secs, .. } => *timeout_secs,
+        };
+
         // Wait until all workers are healthy
-        Self::wait_for_healthy_workers(&worker_urls, 300, 10)?;
+        Self::wait_for_healthy_workers(&worker_urls, timeout_secs, 10)?;
 
         // Create router based on policy...
         Ok(match policy_config {
-            PolicyConfig::RandomConfig => Router::Random {
+            PolicyConfig::RandomConfig { timeout_secs } => Router::Random {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
+                timeout_secs,
             },
-            PolicyConfig::RoundRobinConfig => Router::RoundRobin {
+            PolicyConfig::RoundRobinConfig { timeout_secs } => Router::RoundRobin {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 current_index: std::sync::atomic::AtomicUsize::new(0),
+                timeout_secs,
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
@@ -126,6 +143,7 @@ impl Router {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                timeout_secs,
             } => {
                 let mut running_queue = HashMap::new();
                 for url in &worker_urls {
@@ -176,6 +194,7 @@ impl Router {
                     cache_threshold,
                     balance_abs_threshold,
                     balance_rel_threshold,
+                    timeout_secs,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -192,6 +211,10 @@ impl Router {
 
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
+                error!(
+                    "Timeout {}s waiting for workers to become healthy",
+                    timeout_secs
+                );
                 return Err(format!(
                     "Timeout {}s waiting for workers to become healthy",
                     timeout_secs
@@ -238,7 +261,7 @@ impl Router {
     fn select_first_worker(&self) -> Result<String, String> {
         match self {
             Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls }
+            | Router::Random { worker_urls, .. }
             | Router::CacheAware { worker_urls, .. } => {
                 if worker_urls.read().unwrap().is_empty() {
                     Err("No workers are available".to_string())
@@ -349,6 +372,7 @@ impl Router {
             Router::RoundRobin {
                 worker_urls,
                 current_index,
+                ..
             } => {
                 let idx = current_index
                     .fetch_update(
@@ -360,7 +384,7 @@ impl Router {
                 worker_urls.read().unwrap()[idx].clone()
             }
 
-            Router::Random { worker_urls } => worker_urls.read().unwrap()
+            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
                 [rand::random::<usize>() % worker_urls.read().unwrap().len()]
             .clone(),
 
@@ -571,13 +595,21 @@ impl Router {
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
         let interval_secs = 10; // check every 10 seconds
-        let timeout_secs = 300; // 5 minutes
+        let timeout_secs = match self {
+            Router::Random { timeout_secs, .. } => *timeout_secs,
+            Router::RoundRobin { timeout_secs, .. } => *timeout_secs,
+            Router::CacheAware { timeout_secs, .. } => *timeout_secs,
+        };
 
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::new();
 
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
+                error!(
+                    "Timeout {}s waiting for worker {} to become healthy",
+                    timeout_secs, worker_url
+                );
                 return Err(format!(
                     "Timeout {}s waiting for worker {} to become healthy",
                     timeout_secs, worker_url
@@ -589,7 +621,7 @@ impl Router {
                     if res.status().is_success() {
                         match self {
                             Router::RoundRobin { worker_urls, .. }
-                            | Router::Random { worker_urls }
+                            | Router::Random { worker_urls, .. }
                             | Router::CacheAware { worker_urls, .. } => {
                                 info!("Worker {} health check passed", worker_url);
                                 let mut urls = worker_urls.write().unwrap();
@@ -663,7 +695,7 @@ impl Router {
     pub fn remove_worker(&self, worker_url: &str) {
         match self {
             Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls }
+            | Router::Random { worker_urls, .. }
             | Router::CacheAware { worker_urls, .. } => {
                 let mut urls = worker_urls.write().unwrap();
                 if let Some(index) = urls.iter().position(|url| url == &worker_url) {
