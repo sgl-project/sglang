@@ -1085,9 +1085,7 @@ def v1_chat_generate_response(
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:
-                parser = FunctionCallParser(
-                    [item.function for item in tools], tool_call_parser
-                )
+                parser = FunctionCallParser(tools, tool_call_parser)
                 full_normal_text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = [
                     ToolCall(
@@ -1292,7 +1290,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:
                             parser_dict[index] = FunctionCallParser(
-                                tools=[item.function for item in request.tools],
+                                tools=request.tools,
                                 tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
                             )
                         parser = parser_dict[index]
