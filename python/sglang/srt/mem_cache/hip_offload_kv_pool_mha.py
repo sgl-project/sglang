@@ -389,6 +389,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             if not (forward_batch.batch_size == 1 and (is_first_chunk or is_inter_chunk)):
                 self.onetime_disable = self.enable_async
                 self.enable_async = False
+            else:
+                self.onetime_disable = False
             self.prefetch_layer(forward_batch, 0)
             # self.wait_prefetch_layer(forward_batch, 0)
 
