@@ -1,3 +1,5 @@
+// Reference: https://github.com/vllm-project/vllm/blob/main/csrc/pos_encoding_kernels.cu
+
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
