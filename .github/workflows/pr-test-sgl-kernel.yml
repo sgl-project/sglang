@@ -27,7 +27,7 @@ jobs:
         with:
           source: sgl-kernel
           extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 14
+          clangFormatVersion: 16
           style: file
 
   unit-test:
