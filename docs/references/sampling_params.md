@@ -278,9 +278,9 @@ print(response.json())
 ### Custom Logit Processor
 
 ### Normal
-Launch a server
+Launch a server with `--enable-custom-logit-processor` flag on.
 ```
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --enable-custom-logit-processor
 ```
 
 Define a custom logit processor that will always sample a specific token id.
@@ -313,11 +313,11 @@ response = requests.post(
     "http://localhost:30000/generate",
     json={
         "text": "The capital of France is",
+        "custom_logit_processor": DeterministicLogitProcessor().to_str(),
         "sampling_params": {
-            "temperature": 0,
+            "temperature": 0.0,
             "max_new_tokens": 32,
-            "custom_logit_processor": DeterministicLogitProcessor().to_str(),
-            "custom_params": [{"token_id": 5}],
+            "custom_params": {"token_id": 5},
         },
     },
 )
