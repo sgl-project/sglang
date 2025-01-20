@@ -222,3 +222,6 @@ work_dirs/
 compile_commands.json
 
 *.iml
+
+# VSCode
+.vscode

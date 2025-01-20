@@ -26,6 +26,14 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                              const c10::optional<torch::Tensor>& bias);
 
+// rotary embedding
+void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key,
+                     int64_t head_size, torch::Tensor& cos_sin_cache, bool is_neox);
+
+void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key,
+                            int64_t head_size, torch::Tensor& cos_sin_cache, bool is_neox,
+                            int64_t rot_dim, torch::Tensor& cos_sin_cache_offsets);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -39,4 +47,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sampling_scaling_penalties", &sampling_scaling_penalties, "Sampling scaling penalties (CUDA)");
   // int8_scaled_mm
   m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
+  // rotary embedding
+  m.def("rotary_embedding", &rotary_embedding, "Rotary Embedding (CUDA)");
+  m.def("batched_rotary_embedding", &batched_rotary_embedding, "Batched Rotary Embedding (CUDA)");
 }

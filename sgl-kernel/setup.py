@@ -45,7 +45,7 @@ libraries = ["c10", "torch", "torch_python", "cuda"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 ext_modules = [
     CUDAExtension(
-        name="sgl_kernel.ops._kernels",
+        name="sgl_kernel.ops._kernels", # the name of cuda kernel module
         sources=[
             "src/sgl-kernel/csrc/trt_reduce_internal.cu",
             "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
@@ -53,6 +53,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
             "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
+            "src/sgl-kernel/csrc/rotary_embedding.cu",
         ],
         include_dirs=include_dirs,
         extra_compile_args={
