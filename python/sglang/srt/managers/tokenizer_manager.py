@@ -224,7 +224,7 @@ class TokenizerManager:
                 },
             )
 
-        self._dispatcher = TypeBasedDispatcher(
+        self._result_dispatcher = TypeBasedDispatcher(
             [
                 (BatchStrOut, self._handle_batch_output),
                 (BatchEmbeddingOut, self._handle_batch_output),
@@ -381,6 +381,7 @@ class TokenizerManager:
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,
+                custom_logit_processor=obj.custom_logit_processor,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -759,7 +760,7 @@ class TokenizerManager:
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._dispatcher(recv_obj)
+            self._result_dispatcher(recv_obj)
 
     def _handle_batch_output(
         self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
