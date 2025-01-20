@@ -1564,6 +1564,15 @@ class Scheduler:
                 self.grammar_backend.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
+
+            if not self.spec_algorithm.is_none():
+                self.draft_worker.model_runner.req_to_token_pool.clear()
+                self.draft_worker.model_runner.token_to_kv_pool.clear()
+
+            self.num_generated_tokens = 0
+            self.forward_ct_decode = 0
+            self.spec_num_total_accepted_tokens = 0
+            self.spec_num_total_forward_ct = 0
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             if_success = True

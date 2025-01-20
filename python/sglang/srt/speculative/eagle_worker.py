@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_utils import EAGLEDraftInput
+from sglang.srt.utils import rank0_print
 
 
 class EAGLEWorker(TpModelWorker):
