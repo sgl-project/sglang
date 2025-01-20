@@ -464,12 +464,10 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-    _global_state.tokenizer_manager, scheduler_info = _launch_subprocesses(
-        server_args=server_args
-    )
+    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     set_global_state(
         _GlobalState(
-            tokenizer_manager=_global_state.tokenizer_manager,
+            tokenizer_manager=tokenizer_manager,
             scheduler_info=scheduler_info,
         )
     )
