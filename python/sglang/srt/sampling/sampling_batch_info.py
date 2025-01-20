@@ -260,7 +260,9 @@ class SamplingBatchInfo:
         }
         self.custom_params = [self.custom_params[i] for i in unfinished_indices]
 
-        if len(self) == 0:
+        # If the custom logit processor is an empty dict, set the flag to False,
+        # and set the custom logit processor and custom params to None.
+        if len(self.custom_logit_processor) == 0:
             self.custom_logit_processor = None
             self.custom_params = None
             self.has_custom_logit_processor = False
