@@ -45,7 +45,7 @@ libraries = ["c10", "torch", "torch_python", "cuda"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 ext_modules = [
     CUDAExtension(
-        name="sgl_kernel.ops._kernels", # the name of cuda kernel module
+        name="sgl_kernel.ops._kernels",  # the name of cuda kernel module
         sources=[
             "src/sgl-kernel/csrc/trt_reduce_internal.cu",
             "src/sgl-kernel/csrc/trt_reduce_kernel.cu",

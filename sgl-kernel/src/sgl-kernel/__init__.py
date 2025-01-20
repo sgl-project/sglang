@@ -1,4 +1,5 @@
 from sgl_kernel.ops import (
+    batched_rotary_embedding,
     custom_dispose,
     custom_reduce,
     get_graph_buffer_ipc_meta,
@@ -6,9 +7,8 @@ from sgl_kernel.ops import (
     int8_scaled_mm,
     moe_align_block_size,
     register_graph_buffers,
-    sampling_scaling_penalties,
     rotary_embedding,
-    batched_rotary_embedding,
+    sampling_scaling_penalties,
 )
 
 __all__ = [
