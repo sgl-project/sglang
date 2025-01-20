@@ -232,6 +232,7 @@ def extend(reqs, model_runner):
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        enable_custom_logit_processor=False,
     )
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()

@@ -89,7 +89,10 @@ class SamplingBatchInfo:
         ).to(device, non_blocking=True)
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = any(r.custom_logit_processor for r in reqs)
+        has_custom_logit_processor = (
+            batch.enable_custom_logit_processor  # check the flag first.
+            and any(r.custom_logit_processor for r in reqs)  # then check the requests.
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
