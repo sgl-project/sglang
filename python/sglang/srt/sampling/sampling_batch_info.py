@@ -294,8 +294,8 @@ class SamplingBatchInfo:
 
     @staticmethod
     def merge_custom_logit_processor(
-        lhs: Optional[Dict[str, torch.Tensor]],
-        rhs: Optional[Dict[str, torch.Tensor]],
+        lhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
+        rhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
         bs1: int,
         bs2: int,
         device: str,
@@ -323,26 +323,17 @@ class SamplingBatchInfo:
             )
             merged_dict[k] = (processor, torch.cat([left_mask, right_mask]))
 
+            assert merged_dict[k][1].shape[0] == bs1 + bs2, (
+                f"The batch size of merged mask ({merged_dict[k][1].shape[0]}) does not match "
+                f"the sum of the batch sizes of the two masks ({bs1 + bs2})"
+                f"\n{left_mask=}\n{right_mask=}\n{bs1=}\n{bs2=}"
+                f"\n{lhs=}\n{rhs=}"
+            )
+
         return merged_dict
 
     def merge_batch(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
-
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            setattr(self, item, torch.concat([self_val, other_val]))
-
-        self.is_all_greedy = self.is_all_greedy and other.is_all_greedy
-        self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device
-        )
-        self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
@@ -363,6 +354,25 @@ class SamplingBatchInfo:
 
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
+
+        # Note: becasue the __len()__ operator is defined on the temperatures tensor,
+        # please make sure any merge operation with len(self) or len(other) is done before
+        # the merge operation of the temperatures tensor below.
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+        ]:
+            self_val = getattr(self, item, None)
+            other_val = getattr(other, item, None)
+            setattr(self, item, torch.concat([self_val, other_val]))
+
+        self.is_all_greedy = self.is_all_greedy and other.is_all_greedy
+        self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
+            self.logit_bias, other.logit_bias, len(self), len(other), self.device
+        )
+        self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
 
     def apply_logits_bias(self, logits: torch.Tensor):
         # Apply logit_bias
