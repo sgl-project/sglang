@@ -25,7 +25,7 @@ jobs:
       - name: Check clang-format
         uses: DoozyX/clang-format-lint-action@v0.18.1
         with:
-          source: src
+          source: sgl-kernel
           extensions: h,c,cpp,hpp,cu,cuh,cc
           clangFormatVersion: 18
           style: file
