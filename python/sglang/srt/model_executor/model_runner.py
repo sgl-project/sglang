@@ -305,6 +305,8 @@ class ModelRunner:
 
         if self.server_args.enable_hip_attention:
             orig_context_length = get_context_length(self.model_config.hf_config)
+            if self.server_args.context_length is None:
+                self.server_args.context_length = orig_context_length
             update_context_length(self.model_config.hf_config, self.server_args.context_length)
             self.model_config.hf_config.orig_context_len = orig_context_length
             logger.info(f"Update model config for HiP context extension "

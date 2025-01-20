@@ -80,8 +80,8 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             uvm_allocated_bytes, gpu_allocated_bytes = self.calc_allocated_bytes()
             logger.info(
                 f'[{layer_id + 1}/{layer_num}] '
-                f'CPU (UVM) bytes: {format_size_bytes(uvm_allocated_bytes)} and '
-                f'GPU bytes: {format_size_bytes(gpu_allocated_bytes)} are allocated. '
+                f'CPU (UVM): {format_size_bytes(uvm_allocated_bytes)} and '
+                f'GPU: {format_size_bytes(gpu_allocated_bytes)} are allocated. '
                 f'({self.dtype} on {self.device})'
             )
         

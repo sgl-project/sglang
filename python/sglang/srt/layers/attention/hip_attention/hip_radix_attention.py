@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 """
 Support different attention backends.
@@ -569,6 +570,8 @@ online_update={online_update}
         if cached_metadata is None:
             require_cache_statistics = True
         elif cached_metadata.indices is None:
+            require_cache_statistics = True
+        elif os.getenv('HIP_DISABLE_COMPUTE_STATISTICS', '1') == '0':
             require_cache_statistics = True
 
         args = HiPAttentionArgs(
