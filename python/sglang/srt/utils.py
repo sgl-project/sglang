@@ -536,52 +536,6 @@ def monkey_patch_p2p_access_check():
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
-vllm_all_gather_backup = None
-
-
-def monkey_patch_vllm_all_gather(reverse: bool = False):
-    """Monkey patch all-gather to remove in-place operations."""
-    from torch.distributed import _functional_collectives as funcol
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    global vllm_all_gather_backup
-    if vllm_all_gather_backup is None:
-        vllm_all_gather_backup = GroupCoordinator.all_gather
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        input_size = input_.size()
-        # Allocate output tensor.
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-
-        output_tensor = funcol.all_gather_tensor(
-            input_, gather_dim=0, group=self.device_group
-        ).view((world_size,) + input_size)
-
-        # Reshape
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
-        return output_tensor
-
-    if reverse:
-        setattr(GroupCoordinator, "all_gather", vllm_all_gather_backup)
-    else:
-        setattr(GroupCoordinator, "all_gather", all_gather)
-
-
 def monkey_patch_vllm_gguf_config():
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
