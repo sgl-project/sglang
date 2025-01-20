@@ -1,5 +1,4 @@
 from sgl_kernel.ops import (
-    batched_rotary_embedding,
     custom_dispose,
     custom_reduce,
     get_graph_buffer_ipc_meta,
@@ -21,5 +20,4 @@ __all__ = [
     "get_graph_buffer_ipc_meta",
     "register_graph_buffers",
     "rotary_embedding",
-    "batched_rotary_embedding",
 ]

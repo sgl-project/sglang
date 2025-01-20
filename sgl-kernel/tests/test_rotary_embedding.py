@@ -15,31 +15,17 @@ class SGLRotaryEmbedding(VLLMRotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sgl_kernel import batched_rotary_embedding, rotary_embedding
-
+        from sgl_kernel import rotary_embedding
         self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-        # ops.rotary_embedding()/batched_rotary_embedding()
-        # are in-place operations that update the query and key tensors.
-        if offsets is not None:
-            batched_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-                self.rotary_dim,
-                offsets,
-            )
-        else:
-            rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+
+        rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
         return query, key
 
 
@@ -96,28 +82,6 @@ def test_rotary_embedding():
         torch.testing.assert_close(query_sgl_out, query_vllm_out, rtol=1e-3, atol=1e-3)
         torch.testing.assert_close(key_sgl_out, key_vllm_out, rtol=1e-3, atol=1e-3)
 
-        # Forward pass with offsets
-        offsets = torch.randint(
-            0, max_position // 2, (batch_size * seq_len,), device="cuda"
-        )
-
-        # Make copies for both implementations
-        query_sgl = query.clone()
-        key_sgl = key.clone()
-        query_vllm = query.clone()
-        key_vllm = key.clone()
-
-        # Run both implementations with offsets
-        query_sgl_out, key_sgl_out = sgl_rope.forward_cuda(
-            positions, query_sgl, key_sgl, offsets
-        )
-        query_vllm_out, key_vllm_out = vllm_rope.forward_native(
-            positions, query_vllm, key_vllm, offsets
-        )
-
-        # Compare outputs
-        torch.testing.assert_close(query_sgl_out, query_vllm_out, rtol=1e-3, atol=1e-3)
-        torch.testing.assert_close(key_sgl_out, key_vllm_out, rtol=1e-3, atol=1e-3)
         print(f"{test_name} passed!")
 
     # Test Case 1: FP32 with larger dimensions

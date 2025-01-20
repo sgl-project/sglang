@@ -1,7 +1,4 @@
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
-from sgl_kernel.ops._kernels import (
-    batched_rotary_embedding as _batched_rotary_embedding,
-)
 from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import (
     get_graph_buffer_ipc_meta as _get_graph_buffer_ipc_meta,
@@ -79,25 +76,3 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 
 def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
     return _rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
-
-
-def batched_rotary_embedding(
-    positions,
-    query,
-    key,
-    head_size,
-    cos_sin_cache,
-    is_neox,
-    rot_dim,
-    cos_sin_cache_offsets,
-):
-    return _batched_rotary_embedding(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        is_neox,
-        rot_dim,
-        cos_sin_cache_offsets,
-    )
