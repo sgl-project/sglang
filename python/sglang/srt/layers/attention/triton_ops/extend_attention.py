@@ -171,39 +171,18 @@ def _fwd_kernel(
             k = (k_int8 - k_zeros).to(scale_dtype) * k_scales
 
         qk = tl.dot(q.to(k.dtype), k)
+        # MLA not support int8 kv cache
         if BLOCK_DPE > 0:
             offs_kpe = (
                 offs_kv_loc[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
                 + offs_dpe[:, None]
             )
-            if not USE_INT8_KV:
-                kpe = tl.load(
-                    K_Buffer + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
-            else:
-                kpe_int8 = tl.load(
-                    K_Buffer + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
-                offs_scales_kpe = (
-                    offs_kv_loc[None, :] * stride_scale_kbs
-                    + cur_kv_head * stride_scale_kh
-                )
-                kpe_scales = tl.load(
-                    K_Scale_Zeros_Buffer + offs_scales_kpe,
-                    mask=mask_n[None, :],
-                    other=1.0,
-                )
-                offs_zeros_kpe = offs_scales_kpe + 1
-                kpe_zeros = tl.load(
-                    K_Scale_Zeros_Buffer + offs_zeros_kpe, mask=mask_n[None, :], other=0
-                )
-                kpe = (kpe_int8 - kpe_zeros).to(scale_dtype) * kpe_scales
-            qk += tl.dot(qpe.to(kpe.dtype), kpe)
+            kpe = tl.load(
+                K_Buffer + offs_kpe,
+                mask=mask_n[None, :],
+                other=0.0,
+            )
         qk *= sm_scale
 
         if logit_cap > 0:

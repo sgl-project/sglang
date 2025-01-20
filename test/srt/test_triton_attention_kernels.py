@@ -93,6 +93,8 @@ class TestTritonAttention(unittest.TestCase):
         b_start_loc_extend = torch.zeros_like(b_seq_len)
         b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
         max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
+        k_scales_zeros = None
+        v_scales_zeros = None
         extend_attention_fwd(
             q_extend,
             k_extend,
@@ -100,6 +102,8 @@ class TestTritonAttention(unittest.TestCase):
             o_extend,
             k_buffer,
             v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
             req_to_tokens,
             b_req_idx,
             b_seq_len,
@@ -203,11 +207,14 @@ class TestTritonAttention(unittest.TestCase):
             dtype=torch.float32,
             device="cuda",
         )
-
+        k_scales_zeros = None
+        v_scales_zeros = None
         decode_attention_fwd(
             q,
             k_buffer,
             v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
             o,
             req_to_token,
             b_req_idx,
@@ -259,11 +266,14 @@ class TestTritonAttention(unittest.TestCase):
             dtype=torch.float32,
             device="cuda",
         )
-
+        k_scales_zeros = None
+        v_scales_zeros = None
         decode_attention_fwd_normal(
             q,
             k_buffer,
             v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
             o,
             req_to_token,
             b_req_idx,
@@ -283,6 +293,8 @@ class TestTritonAttention(unittest.TestCase):
             q,
             k_buffer,
             v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
             o_grouped,
             req_to_token,
             b_req_idx,

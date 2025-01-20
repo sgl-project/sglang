@@ -133,7 +133,7 @@ def _fwd_kernel_stage1(
                 )
                 # load k scale
                 offs_scale_k = (
-                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_buf_kh
+                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )
                 k_scales = tl.load(
                     K_Scale_Zeros_Buffer + offs_scale_k,
@@ -147,7 +147,7 @@ def _fwd_kernel_stage1(
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
-                k = (k_int8 - k_zeros).to(scale_dtype) * k_scales
+                k = ((k_int8 - k_zeros) * k_scales).to(scale_dtype)
 
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
@@ -176,20 +176,20 @@ def _fwd_kernel_stage1(
                 )
                 # load v scale
                 offs_scale_v = (
-                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_buf_vh
+                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )
                 v_scales = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
-                offs_zeros_v = offs_scale_v
+                offs_zeros_v = offs_scale_v + 1
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
-                v = (v_int8 - v_zeros).to(scale_dtype) * v_scales
+                v = ((v_int8 - v_zeros) * v_scales).to(scale_dtype)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -412,8 +412,8 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk = tl.dot(q, k.to(q.dtype))
-                # qk = tl.dot(q, (((k - 0.01)*1).to(q.dtype)))
+                # qk = tl.dot(q, k.to(q.dtype))
+                qk = tl.dot(q, (((k - 0.01) * 1).to(q.dtype)))
             else:
                 k_int8 = tl.load(
                     K_Buffer + offs_buf_k,
@@ -436,6 +436,7 @@ def _fwd_grouped_kernel_stage1(
                     other=0,
                 )
                 qk = tl.dot(q, (((k_int8 - k_zeros) * k_scales).to(q.dtype)))
+
                 #'''
                 # qk = tl.dot(q, (((k_int8 - 1)*1).to(q.dtype)))
 
@@ -479,7 +480,6 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                 )
                 acc += tl.dot(p.to(v.dtype), v)
-                # acc += tl.dot(p.to(v.dtype),((v -  0.0001) * 1).to(scale_dtype))
             else:
                 v_int8 = tl.load(
                     V_Buffer + offs_buf_v,
@@ -505,8 +505,6 @@ def _fwd_grouped_kernel_stage1(
                 acc += tl.dot(
                     p.to(scale_dtype), ((v_int8 - v_zeros) * v_scales).to(scale_dtype)
                 )
-                #'''
-                # acc += tl.dot(p.to(scale_dtype),((v_int8 -  1) * 1).to(scale_dtype))
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -992,9 +990,9 @@ def quantize_cache_kv(
     v_status,
     dest_idx,
     k_quantized_out,
-    k_scale_zeros,
+    k_scales_zeros,
     v_quantized_out,
-    v_scale_zeros,
+    v_scales_zeros,
 ):
     bs = dest_idx.shape[0]
     k_head_num = k_status.shape[1]
@@ -1013,17 +1011,17 @@ def quantize_cache_kv(
         dest_idx,
         k_quantized_out,
         v_quantized_out,
-        k_scale_zeros,
-        v_scale_zeros,
+        k_scales_zeros,
+        v_scales_zeros,
         k_status.stride(0),
         k_status.stride(1),
         k_status.stride(2),
         v_status.stride(0),
         v_status.stride(1),
         v_status.stride(2),
-        k_scale_zeros.stride(0),
-        k_scale_zeros.stride(1),
-        k_scale_zeros.stride(2),
+        k_scales_zeros.stride(0),
+        k_scales_zeros.stride(1),
+        k_scales_zeros.stride(2),
         k_head_num,
         BLOCK_DMODEL=k_head_dim,
         BLOCK_HEAD=BLOCK_HEAD,

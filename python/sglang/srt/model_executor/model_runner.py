@@ -649,7 +649,7 @@ class ModelRunner:
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
@@ -660,7 +660,7 @@ class ModelRunner:
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
