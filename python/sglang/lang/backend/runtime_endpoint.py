@@ -19,9 +19,6 @@ from sglang.lang.ir import (
     REGEX_STR,
     SglSamplingParams,
 )
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_port_available, kill_process_tree
 from sglang.utils import http_request
 
 
@@ -342,7 +339,7 @@ class Runtime:
     using the commond line interface.
 
     It is mainly used for the frontend language.
-    You should use the Engine class if you want to do normal offline processing.
+    You should use the Engine class if you want to do normal offline processing without the frontend language.
     """
 
     def __init__(
@@ -352,12 +349,13 @@ class Runtime:
         **kwargs,
     ):
         """See the arguments in server_args.py::ServerArgs"""
+        # We delay the import of any `sglang.srt` components in `sglang.lang`, so users can run
+        # client code without installing SRT server and its dependency if they want.
         from sglang.srt.server import launch_server
+        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.utils import is_port_available
 
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-
-        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
-        atexit.register(self.shutdown)
 
         # Pre-allocate ports
         for port in range(self.server_args.port, 40000):
@@ -380,6 +378,10 @@ class Runtime:
         pipe_writer.close()
         self.pid = proc.pid
 
+        # Before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
+        atexit.register(self.shutdown)
+
+        # TODO: remove this pipe_writer mechanism and use `/health_generate` instead.
         try:
             init_state = pipe_reader.recv()
         except EOFError:
@@ -394,6 +396,8 @@ class Runtime:
         self.endpoint = RuntimeEndpoint(self.url)
 
     def shutdown(self):
+        from sglang.srt.utils import kill_process_tree
+
         if self.pid is not None:
             kill_process_tree(self.pid)
             self.pid = None
@@ -402,6 +406,8 @@ class Runtime:
         self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+
         return get_tokenizer(
             self.server_args.tokenizer_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
