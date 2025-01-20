@@ -1,8 +1,10 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/device_communicators/pynccl.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
+
 import logging
 from contextlib import contextmanager
 from typing import Optional, Union
 
+# ===================== import region =====================
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp

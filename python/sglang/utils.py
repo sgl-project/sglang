@@ -1,7 +1,6 @@
 """Common utilities"""
 
 import base64
-import gc
 import importlib
 import json
 import logging
