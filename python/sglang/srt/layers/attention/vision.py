@@ -5,9 +5,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-from vllm.distributed import parallel_state
-from vllm.distributed import utils as dist_utils
 
+from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed import utils as dist_utils
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )

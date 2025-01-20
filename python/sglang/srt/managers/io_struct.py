@@ -69,6 +69,8 @@ class GenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+    # Custom logit processor (serialized function)
+    custom_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -183,6 +185,13 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
+            if self.custom_logit_processor is None:
+                self.custom_logit_processor = [None] * num
+            elif not isinstance(self.custom_logit_processor, list):
+                self.custom_logit_processor = [self.custom_logit_processor] * num
+            else:
+                assert self.parallel_sample_num == 1
+
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
@@ -202,6 +211,11 @@ class GenerateReqInput:
             log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            custom_logit_processor=(
+                self.custom_logit_processor[i]
+                if self.custom_logit_processor is not None
+                else None
+            ),
         )
 
 
@@ -233,6 +247,10 @@ class TokenizedGenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
+
+    # Custom logit processor (serialized function)
+    # TODO (hpguo): Add an example and update doc string here
+    custom_logit_processor: Optional[str] = None
 
 
 @dataclass
@@ -495,6 +513,7 @@ class ProfileReq(Enum):
 @dataclass
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
 

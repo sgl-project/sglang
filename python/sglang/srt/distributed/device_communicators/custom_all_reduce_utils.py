@@ -1,4 +1,5 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/device_communicators/custom_all_reduce_utils.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce_utils.py
+
 import ctypes
 import json
 import logging
@@ -7,7 +8,6 @@ import pickle
 import subprocess
 import sys
 import tempfile
-from functools import lru_cache
 from itertools import product
 from typing import Dict, List, Optional, Sequence
 

@@ -4,7 +4,7 @@ import signal
 import subprocess
 import unittest
 
-from test_nightly_gsm8k_eval import launch_server, parse_models
+from test_nightly_gsm8k_eval import parse_models, popen_launch_server_wrapper
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -93,7 +93,7 @@ class TestNightlyHumanEval(unittest.TestCase):
                 # NOTE: only Llama for now
                 if "Llama" in model:
                     with self.subTest(model=model):
-                        self.process = launch_server(
+                        self.process = popen_launch_server_wrapper(
                             self.base_url, model, is_fp8, is_tp2
                         )
                         self.run_evalplus(model)

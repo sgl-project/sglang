@@ -115,14 +115,18 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message="Unknown error"):
+    def __init__(self, message="Unknown error", status_code=None, err_type=None):
         super().__init__(is_error=True)
         self.message = message
+        self.status_code = status_code
+        self.err_type = err_type
 
     def to_json(self):
         return {
             "type": "abort",
             "message": self.message,
+            "status_code": self.status_code,
+            "err_type": self.err_type,
         }
 
 
@@ -154,7 +158,6 @@ class ImageInputs:
     im_end_id: Optional[torch.Tensor] = None
     slice_start_id: Optional[torch.Tensor] = None
     slice_end_id: Optional[torch.Tensor] = None
-
     tgt_sizes: Optional[list] = None
 
     @staticmethod
@@ -229,6 +232,7 @@ class Req:
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
+        custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
@@ -249,6 +253,7 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
         self.req_pool_idx = None
@@ -590,6 +595,9 @@ class ScheduleBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
 
+    # Enable custom logit processor
+    enable_custom_logit_processor: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -600,6 +608,7 @@ class ScheduleBatch:
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
+        enable_custom_logit_processor: bool,
     ):
         return cls(
             reqs=reqs,
@@ -613,6 +622,7 @@ class ScheduleBatch:
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
+            enable_custom_logit_processor=enable_custom_logit_processor,
         )
 
     def batch_size(self):
@@ -668,7 +678,7 @@ class ScheduleBatch:
                     or len(req.prefix_indices) >= im.num_image_tokens
                 )
 
-        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int32).to(
+        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
 
@@ -702,7 +712,7 @@ class ScheduleBatch:
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
 
@@ -778,10 +788,10 @@ class ScheduleBatch:
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
+        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
         self.input_embeds = (
@@ -1014,9 +1024,9 @@ class ScheduleBatch:
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1084,7 +1094,7 @@ class ScheduleBatch:
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
-        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
+        new_indices = torch.tensor(keep_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
@@ -1196,6 +1206,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            enable_custom_logit_processor=self.enable_custom_logit_processor,
         )
 
     def __str__(self):

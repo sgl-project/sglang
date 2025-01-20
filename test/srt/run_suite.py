@@ -31,6 +31,7 @@ suites = {
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
+        "test_regex_constrained.py",
         "test_release_memory_occupation.py",
         "test_request_length_validation.py",
         "test_retract_decode.py",
@@ -41,8 +42,7 @@ suites = {
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torch_compile_moe.py",
-        # Temporarily disable this because it requires PyTorch >= 2.5
-        # "test_torch_native_attention_backend.py",
+        "test_torch_native_attention_backend.py",
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",

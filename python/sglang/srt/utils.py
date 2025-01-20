@@ -102,14 +102,6 @@ def is_cuda_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
-def is_ipv6(address):
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ipaddress.AddressValueError:
-        return False
-
-
 def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
@@ -518,66 +510,22 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
-def monkey_patch_vllm_p2p_access_check(gpu_id: int):
+def monkey_patch_p2p_access_check():
     """
-    Monkey patch the slow p2p access check in vllm.
+    Monkey patch the slow p2p access check.
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
     # Suppress the warnings from this delete function when using sglang.bench_one_batch
-    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
-
-
-vllm_all_gather_backup = None
-
-
-def monkey_patch_vllm_all_gather(reverse: bool = False):
-    """Monkey patch all-gather to remove in-place operations."""
-    from torch.distributed import _functional_collectives as funcol
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    global vllm_all_gather_backup
-    if vllm_all_gather_backup is None:
-        vllm_all_gather_backup = GroupCoordinator.all_gather
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        input_size = input_.size()
-        # Allocate output tensor.
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-
-        output_tensor = funcol.all_gather_tensor(
-            input_, gather_dim=0, group=self.device_group
-        ).view((world_size,) + input_size)
-
-        # Reshape
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
-        return output_tensor
-
-    if reverse:
-        setattr(GroupCoordinator, "all_gather", vllm_all_gather_backup)
-    else:
-        setattr(GroupCoordinator, "all_gather", all_gather)
 
 
 def monkey_patch_vllm_gguf_config():
@@ -1262,9 +1210,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
-            return f'"{data[:half_length]} ... {data[-half_length:]}"'
+            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
         else:
-            return f'"{data}"'
+            return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -1275,7 +1223,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             "{"
             + ", ".join(
-                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
                 for k, v in data.items()
             )
             + "}"
@@ -1427,3 +1375,70 @@ def set_uvicorn_logging_configs():
         "fmt"
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+
+def get_ip() -> str:
+    # SGLANG_HOST_IP env can be ignore
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
+
+    # IP is not set, try to get it from the network interface
+
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    warnings.warn(
+        "Failed to get the IP address, using 0.0.0.0 by default."
+        "The value can be set by the environment variable"
+        " SGLANG_HOST_IP or HOST_IP.",
+        stacklevel=2,
+    )
+    return "0.0.0.0"
+
+
+def get_open_port() -> int:
+
+    port = os.getenv("SGLANG_PORT")
+    if port is not None:
+        while True:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    return port
+            except OSError:
+                port += 1  # Increment port number if already in use
+                logger.info("Port %d is already in use, trying port %d", port - 1, port)
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ValueError:
+        return False

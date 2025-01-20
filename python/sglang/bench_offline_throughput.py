@@ -27,7 +27,8 @@ from sglang.bench_serving import (
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Engine, Runtime
+from sglang.lang.backend.runtime_endpoint import Runtime
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
 
 

@@ -13,7 +13,7 @@ import requests
 from setproctitle import setproctitle
 from sglang_router.launch_router import RouterArgs, launch_router
 
-from sglang.srt.server import launch_server
+from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
 
@@ -23,7 +23,7 @@ def setup_logger():
     logger.setLevel(logging.INFO)
 
     formatter = logging.Formatter(
-        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s - %(filename)s:%(lineno)d",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 

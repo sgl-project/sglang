@@ -2,16 +2,9 @@
 // https://github.com/NVIDIA/TensorRT-LLM/blob/be1788106245496872d18e702978e59b6bfd50e0/cpp/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/device/gemm_universal_base_compat.h
 #pragma once
 
-#include "cutlass/arch/arch.h"
-#include "cutlass/cutlass.h"
-#include "cutlass/device_kernel.h"
-#include "cutlass/gemm/device/default_gemm_configuration.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/gemm/kernel/default_gemm_universal.h"
-#include "cutlass/gemm/kernel/gemm_universal.h"
-#include "cutlass/gemm/threadblock/threadblock_swizzle.h"
-#include "cutlass/numeric_types.h"
-#include "cutlass/trace.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/device_kernel.h>
+#include <cutlass/trace.h>
 
 ////////////////////////////////////////////////////////////////////////////////
 
