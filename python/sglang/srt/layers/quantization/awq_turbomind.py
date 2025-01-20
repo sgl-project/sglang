@@ -7,9 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn import Parameter
 
-root = str(list(Path(__file__).parents)[5])
-sys.path.append(root + "/sgl-kernel/build/lib")
-import _turbomind_ext
+from sgl_kernel import _turbomind_ext
 from vllm.model_executor.layers.linear import LinearBase
 
 from sglang.srt.layers.linear import LinearMethodBase, UnquantizedLinearMethod

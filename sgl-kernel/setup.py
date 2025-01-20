@@ -69,6 +69,8 @@ setup(
     version=get_version(),
     packages=find_packages(),
     package_dir={"": "src"},
+    package_data={"turbomind": ["lib/_turbomind_ext.cpython-312-x86_64-linux-gnu.so"]},
+    include_package_data=True,
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch"],
