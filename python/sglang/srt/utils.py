@@ -518,18 +518,20 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
-def monkey_patch_vllm_p2p_access_check(gpu_id: int):
+def monkey_patch_p2p_access_check():
     """
-    Monkey patch the slow p2p access check in vllm.
+    Monkey patch the slow p2p access check.
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
     # Suppress the warnings from this delete function when using sglang.bench_one_batch
-    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
