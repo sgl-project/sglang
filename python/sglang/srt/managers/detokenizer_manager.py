@@ -193,6 +193,32 @@ class DetokenizerManager:
                     )
                 )
 
+            # beam search
+            if recv_obj.beam_search_output is not None:
+                beam_ids = []
+                beam_output_ids = 0
+                for i, beam_output in enumerate(recv_obj.beam_search_output):
+                    for beam in beam_output.sequences:
+                        beam.vid = beam_output_ids
+                        beam_output_ids += 1
+                        beam_ids.append(
+                            self.trim_matched_stop(
+                                beam.tokens,
+                                recv_obj.finished_reasons[i],
+                                recv_obj.no_stop_trim[i],
+                            )
+                        )
+                
+                beam_texts = self.tokenizer.batch_decode(
+                    beam_ids,
+                    skip_special_tokens=recv_obj.skip_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+                )
+
+                for i, beam_output in enumerate(recv_obj.beam_search_output):
+                    for beam in beam_output.sequences:
+                        beam.text = beam_texts[beam.vid]
+
             self.send_to_tokenizer.send_pyobj(
                 BatchStrOut(
                     rids=recv_obj.rids,
@@ -209,6 +235,7 @@ class DetokenizerManager:
                     input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
                     output_top_logprobs_val=recv_obj.output_top_logprobs_val,
                     output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+                    beam_search_output=recv_obj.beam_search_output,
                 )
             )
 

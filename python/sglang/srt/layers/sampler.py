@@ -124,6 +124,9 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
+            # in beam search case, top logprobs are wrong
+            logits_output.next_token_top_logprobs = logprobs
+
         return batch_next_token_ids
 
     def _apply_custom_logit_processor(

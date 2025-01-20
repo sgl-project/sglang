@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Union
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.beam_search import BeamSearchOutput
 
 
 @dataclass
@@ -365,6 +366,8 @@ class BatchTokenIDOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
+    # beam search
+    beam_search_output: List[BeamSearchOutput]
 
 
 @dataclass
@@ -390,6 +393,9 @@ class BatchStrOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
+
+    # beam search
+    beam_search_output: List[BeamSearchOutput]
 
 
 @dataclass

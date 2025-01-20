@@ -51,6 +51,8 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
+    # beam search needs
+    next_token_top_logprobs: Optional[torch.Tensor] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
