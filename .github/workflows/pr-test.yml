@@ -52,7 +52,7 @@ jobs:
     runs-on: 1-gpu-runner
     strategy:
       matrix:
-        range: [0-6, 6-15, 15-22, 22-32, 32-39, 39-100]
+        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-100]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
