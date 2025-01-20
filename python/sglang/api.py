@@ -40,7 +40,7 @@ def Runtime(*args, **kwargs):
 
 def Engine(*args, **kwargs):
     # Avoid importing unnecessary dependency
-    from sglang.srt.server import Engine
+    from sglang.srt.entrypoints.engine import Engine
 
     return Engine(*args, **kwargs)
 
