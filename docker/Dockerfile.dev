@@ -18,8 +18,18 @@ RUN apt-get update && apt-get install -y \
     silversearcher-ag \
     cloc \
     unzip \
+    pkg-config \
+    libssl-dev \
+    bear \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+RUN apt update -y \
+    && apt install -y --no-install-recommends gnupg \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+    && apt update -y \
+    && apt install nsight-systems-cli -y
 
 # Set up locale
 RUN locale-gen en_US.UTF-8
@@ -32,7 +42,8 @@ RUN python3 -m pip install --no-cache-dir \
     pytest \
     black \
     isort \
-    icdiff
+    icdiff \
+    pre-commit
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
@@ -55,6 +66,12 @@ RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1
     && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
     && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank

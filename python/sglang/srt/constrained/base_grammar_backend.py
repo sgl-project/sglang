@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from threading import Event, Lock
 from typing import Any, Optional, Tuple
 
+from sglang.srt.server_args import ServerArgs
+
 
 @dataclass
 class CacheEntry:
@@ -69,3 +71,22 @@ class BaseGrammarBackend:
     def reset(self):
         with self.cache_lock:
             self.cache.clear()
+
+
+def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
+    if server_args.grammar_backend == "outlines":
+        from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
+
+        grammar_backend = OutlinesGrammarBackend(
+            tokenizer,
+            whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            allow_jump_forward=not server_args.disable_jump_forward,
+        )
+    elif server_args.grammar_backend == "xgrammar":
+        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+
+        grammar_backend = XGrammarGrammarBackend(tokenizer, vocab_size=vocab_size)
+    else:
+        raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
+
+    return grammar_backend

@@ -15,7 +15,7 @@
 import json
 import logging
 from enum import IntEnum, auto
-from typing import List, Optional, Union
+from typing import List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -47,6 +47,7 @@ class ModelConfig:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+
         # Parse args
         self.model_override_args = json.loads(model_override_args)
         self.hf_config = get_config(
@@ -94,7 +95,10 @@ class ModelConfig:
         )
 
         # FIXME: temporary special judge for MLA architecture
-        if "DeepseekV2ForCausalLM" in self.hf_config.architectures:
+        if (
+            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV3ForCausalLM" in self.hf_config.architectures
+        ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
@@ -124,7 +128,12 @@ class ModelConfig:
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
+        # Verify quantization
         self._verify_quantization()
+
+        # Cache attributes
+        self.hf_eos_token_id = self.get_hf_eos_token_id()
+        self.image_token_id = getattr(self.hf_config, "image_token_id", None)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -214,7 +223,11 @@ class ModelConfig:
             "compressed_tensors",
             "compressed-tensors",
             "experts_int8",
+            "w8a8_int8",
         ]
+        compatible_quantization_methods = {
+            "w8a8_int8": ["compressed-tensors", "compressed_tensors"]
+        }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
@@ -238,12 +251,17 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                raise ValueError(
-                    "Quantization method specified in the model config "
-                    f"({quant_method}) does not match the quantization "
-                    f"method specified in the `quantization` argument "
-                    f"({self.quantization})."
-                )
+                if (
+                    self.quantization not in compatible_quantization_methods
+                    or quant_method
+                    not in compatible_quantization_methods[self.quantization]
+                ):
+                    raise ValueError(
+                        "Quantization method specified in the model config "
+                        f"({quant_method}) does not match the quantization "
+                        f"method specified in the `quantization` argument "
+                        f"({self.quantization})."
+                    )
 
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
@@ -263,6 +281,13 @@ class ModelConfig:
                     "non-quantized models.",
                     self.quantization,
                 )
+
+    def get_hf_eos_token_id(self) -> Optional[Set[int]]:
+        eos_ids = getattr(self.hf_config, "eos_token_id", None)
+        if eos_ids:
+            # it can be either int or list of int
+            eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        return eos_ids
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -377,6 +402,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaVidForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
+        or "MiniCPMV" in model_architectures
     ):
         return True
     else:

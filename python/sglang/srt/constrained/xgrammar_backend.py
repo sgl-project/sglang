@@ -19,6 +19,7 @@ from typing import List, Tuple
 import torch
 from xgrammar import (
     CompiledGrammar,
+    Grammar,
     GrammarCompiler,
     GrammarMatcher,
     TokenizerInfo,
@@ -126,11 +127,20 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
                 return None
+        elif key_type == "ebnf":
+            try:
+                ctx = self.grammar_compiler.compile_grammar(key_string)
+            except RuntimeError as e:
+                logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
+                return None
         elif key_type == "regex":
-            logger.warning(
-                "regex hasn't been supported by xgrammar yet. This is skipped."
-            )
-            return None
+            try:
+                ctx = self.grammar_compiler.compile_grammar(
+                    Grammar.from_regex(key_string)
+                )
+            except RuntimeError as e:
+                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+                return None
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 

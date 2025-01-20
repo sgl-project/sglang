@@ -25,6 +25,7 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
+    spec_accept_length: float = 0.0
 
 
 class SchedulerMetricsCollector:
@@ -37,42 +38,49 @@ class SchedulerMetricsCollector:
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
-            documentation="The number of running requests",
+            documentation="The number of running requests.",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.num_used_tokens = Gauge(
             name="sglang:num_used_tokens",
-            documentation="The number of used tokens",
+            documentation="The number of used tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.token_usage = Gauge(
             name="sglang:token_usage",
-            documentation="The token usage",
+            documentation="The token usage.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
 
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
-            documentation="The generate throughput (token/s)",
+            documentation="The generation throughput (token/s).",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.num_queue_reqs = Gauge(
             name="sglang:num_queue_reqs",
-            documentation="The number of requests in the waiting queue",
+            documentation="The number of requests in the waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
-            documentation="The cache hit rate",
+            documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.spec_accept_length = Gauge(
+            name="sglang:spec_accept_length",
+            documentation="The average acceptance length of speculative decoding.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -88,6 +96,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
 
 
 class TokenizerMetricsCollector:
@@ -109,31 +118,31 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.num_requests_total = Counter(
+            name="sglang:num_requests_total",
+            documentation="Number of requests processed.",
+            labelnames=labels.keys(),
+        )
+
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             labelnames=labels.keys(),
             buckets=[
-                0.001,
-                0.005,
-                0.01,
-                0.02,
-                0.04,
-                0.06,
-                0.08,
                 0.1,
                 0.25,
                 0.5,
                 0.75,
-                1.0,
-                2.5,
-                5.0,
-                7.5,
-                10.0,
-                15.0,
-                20.0,
-                25.0,
-                30.0,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+                160,
             ],
         )
 
@@ -168,21 +177,19 @@ class TokenizerMetricsCollector:
             documentation="Histogram of End-to-end request latency in seconds",
             labelnames=labels.keys(),
             buckets=[
-                0.3,
+                0.1,
+                0.25,
                 0.5,
-                0.8,
-                1.0,
-                1.5,
-                2.0,
-                2.5,
-                5.0,
-                10.0,
-                15.0,
-                20.0,
-                30.0,
-                40.0,
-                50.0,
-                60.0,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+                160,
             ],
         )
 
@@ -193,11 +200,10 @@ class TokenizerMetricsCollector:
         # Convenience function for logging to counter.
         counter.labels(**self.labels).inc(data)
 
-    def inc_prompt_tokens(self, value: int):
-        self._log_counter(self.prompt_tokens_total, value)
-
-    def inc_generation_tokens(self, value: int):
-        self._log_counter(self.generation_tokens_total, value)
+    def observe_one_finished_request(self, prompt_tokens: int, generation_tokens: int):
+        self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
+        self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
+        self.num_requests_total.labels(**self.labels).inc(1)
 
     def observe_time_to_first_token(self, value: Union[float, int]):
         self._log_histogram(self.histogram_time_to_first_token, value)

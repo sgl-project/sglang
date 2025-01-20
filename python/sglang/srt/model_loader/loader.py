@@ -21,14 +21,14 @@ from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
 from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
@@ -496,7 +496,8 @@ class ShardedStateLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from safetensors.torch import safe_open
-        from vllm.distributed import get_tensor_model_parallel_rank
+
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
@@ -556,7 +557,8 @@ class ShardedStateLoader(BaseModelLoader):
         max_size: Optional[int] = None,
     ) -> None:
         from safetensors.torch import save_file
-        from vllm.distributed import get_tensor_model_parallel_rank
+
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
@@ -770,6 +772,21 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             quant_state_dict,
         )
 
+    def _is_8bit_weight_name(self, weight_name: str):
+        quantized_suffix = {".scb", ".weight_format"}
+        return any(weight_name.lower().endswith(suffix) for suffix in quantized_suffix)
+
+    def _is_4bit_weight_name(self, weight_name: str):
+        quantized_suffix = {
+            "absmax",
+            "quant_map",
+            "nested_absmax",
+            "nested_quant_map",
+            "bitsandbytes",
+        }
+        suffix = weight_name.split(".")[-1]
+        return any(q_suffix in suffix for q_suffix in quantized_suffix)
+
     def _quantized_8bit_generator(
         self, hf_weights_files, use_safetensors, quant_state_dict
     ) -> Generator:
@@ -779,21 +796,18 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             if not weight_name.lower().endswith(".scb"):
                 continue
 
-            weight_key = weight_name.lower().replace(".scb", ".qweight")
+            weight_key = weight_name.lower().replace(".scb", ".weight")
             quant_state_dict[weight_key] = weight_tensor
 
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
-            if not weight_name.endswith((".weight", ".bias")):
+            if self._is_8bit_weight_name(weight_name):
                 continue
 
-            qweight_name = weight_name.replace(".weight", ".qweight")
-
-            if qweight_name in quant_state_dict:
+            if weight_name in quant_state_dict:
                 set_weight_attrs(weight_tensor, {"load_in_8bit": True})
-                yield qweight_name, weight_tensor
+                yield weight_name, weight_tensor
             else:
                 yield weight_name, weight_tensor
 
@@ -806,7 +820,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         weight_iterator = self._hf_weight_iter(hf_weights_files, use_safetensors)
         temp_state_dict = {}
         for weight_name, weight_tensor in weight_iterator:
-            if weight_name.endswith((".weight", ".bias")):
+            if not self._is_4bit_weight_name(weight_name):
                 continue
             # bitsandbytes library requires
             # weight.quant_state.bitsandbytes__* in CPU
@@ -830,16 +844,15 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             hf_weights_files, use_safetensors
         ):
 
-            if not weight_name.endswith((".weight", ".bias")):
+            if self._is_4bit_weight_name(weight_name):
                 continue
 
             if (f"{weight_name}.quant_state.bitsandbytes__nf4" in temp_state_dict) or (
                 f"{weight_name}.quant_state.bitsandbytes__fp4" in temp_state_dict
             ):
                 quant_state = _parse_quant_state(weight_name, temp_state_dict)
-                weight_name = weight_name.replace(".weight", ".qweight")
                 quant_state_dict[weight_name] = quant_state
-                yield weight_name.replace(".weight", ".qweight"), weight_tensor
+                yield weight_name, weight_tensor
             else:
                 yield weight_name, weight_tensor
 
