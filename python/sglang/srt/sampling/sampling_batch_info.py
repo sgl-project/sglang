@@ -335,6 +335,10 @@ class SamplingBatchInfo:
     def merge_batch(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
+        # Merge the logit bias tensor
+        self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
+            self.logit_bias, other.logit_bias, len(self), len(other), self.device
+        )
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
             # Merge the custom logit processors
@@ -369,9 +373,6 @@ class SamplingBatchInfo:
             setattr(self, item, torch.concat([self_val, other_val]))
 
         self.is_all_greedy = self.is_all_greedy and other.is_all_greedy
-        self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device
-        )
         self.need_min_p_sampling = self.need_min_p_sampling or other.need_min_p_sampling
 
     def apply_logits_bias(self, logits: torch.Tensor):
