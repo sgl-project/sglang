@@ -62,8 +62,8 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
-        default_weight_loader,
-        maybe_remap_kv_scale_name,
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import get_compiler_backend, set_weight_attrs
 
