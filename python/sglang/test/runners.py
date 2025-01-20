@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import json
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
@@ -22,8 +21,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server import Engine
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
 DEFAULT_PROMPTS = [

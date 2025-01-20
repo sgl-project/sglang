@@ -176,7 +176,7 @@ class TokenizerManager:
                 )
 
         # Store states
-        self.to_create_loop = True
+        self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
@@ -684,7 +684,6 @@ class TokenizerManager:
     async def close_session(
         self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
-        assert not self.to_create_loop, "close session should not be the first request"
         await self.send_to_scheduler.send_pyobj(obj)
 
     def configure_logging(self, obj: ConfigureLoggingReq):
@@ -713,10 +712,10 @@ class TokenizerManager:
         return background_tasks
 
     def auto_create_handle_loop(self):
-        if not self.to_create_loop:
+        if self.no_create_loop:
             return
 
-        self.to_create_loop = False
+        self.no_create_loop = True
         loop = asyncio.get_event_loop()
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))

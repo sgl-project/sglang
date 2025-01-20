@@ -351,7 +351,7 @@ class Runtime:
         """See the arguments in server_args.py::ServerArgs"""
         # We delay the import of any `sglang.srt` components in `sglang.lang`, so users can run
         # client code without installing SRT server and its dependency if they want.
-        from sglang.srt.server import launch_server
+        from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.utils import is_port_available
 
