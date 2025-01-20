@@ -1,3 +1,5 @@
+#include <vector>
+
 #include "utils.hpp"
 
 // trt_reduce

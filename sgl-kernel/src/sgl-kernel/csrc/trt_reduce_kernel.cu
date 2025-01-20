@@ -3,9 +3,6 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <cassert>
-#include <iostream>
-#include <sstream>
-#include <unordered_map>
 
 #include "trt_reduce_internal.cuh"
 
