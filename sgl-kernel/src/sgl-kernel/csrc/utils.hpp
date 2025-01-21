@@ -3,14 +3,6 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
-// 在头文件中定义
-#ifdef SGL_DEBUG_BUILD
-constexpr int MAX_CONFIG_ID = 6;  // debug模式下的最大配置ID
-#else
-constexpr int MAX_CONFIG_ID = 90; // 正常模式下的最大配置ID
-#endif
-
-using json = nlohmann::json;
 
 struct cuda_error : public std::runtime_error {
   /**
@@ -52,9 +44,4 @@ inline int getSMVersion() {
   CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
   CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
   return sm_major * 10 + sm_minor;
-}
-
-inline uint32_t next_pow_2(uint32_t const num) {
-  if (num <= 1) return num;
-  return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
 }

@@ -44,7 +44,7 @@ def benchmark(batch_size, provider):
         )
     elif "sglang-fp8" in provider:
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None, is_profile=False),
+            lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None),
             quantiles=quantiles,
         )
 
