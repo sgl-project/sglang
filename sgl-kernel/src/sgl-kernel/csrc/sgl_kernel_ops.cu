@@ -12,7 +12,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
                           torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
                           torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer);
 
-int8_scaled_mm
+// int8_scaled_mm
 torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                              const c10::optional<torch::Tensor>& bias);
