@@ -35,15 +35,13 @@ jobs:
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
-        with:
-            fetch-depth: 0
-            submodules: 'recursive'
 
       - name: Install
         run: |
           pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm
           pip3 uninstall sgl-kernel -y || true
           cd sgl-kernel
+          git submodule deinit --all --force && git submodule sync --recursive && git submodule update --init --force --recursive
           pip3 install .
           pip3 list | grep sgl-kernel
 
