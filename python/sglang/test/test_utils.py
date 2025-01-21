@@ -567,15 +567,16 @@ def run_bench_serving(
         random_range_ratio=0.0,
         request_rate=request_rate,
         multi=None,
-        seed=0,
         output_file=None,
         disable_tqdm=False,
         disable_stream=disable_stream,
-        disable_ignore_eos=False,
         return_logprob=False,
-        lora_name=None,
+        seed=0,
+        disable_ignore_eos=False,
         extra_request_body=None,
+        apply_chat_template=False,
         profile=None,
+        lora_name=None,
     )
 
     try:
