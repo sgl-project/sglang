@@ -22,8 +22,7 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
-
+from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -65,6 +64,8 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.disable = disable
+        self.root_node = None
+        self.evictable_size_ = 0
         self.reset()
 
     ##### Public API #####
@@ -76,61 +77,69 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
 
-    def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
-        """Find the matching prefix from the radix tree.
-        Args:
-            key: A list of token IDs to find a matching prefix.
-        Returns:
-            A tuple of a tensor of matching prefix token IDs and
-            the last node that contains the prefix values. Note that
-            this API can modify the internal state of the Radix tree.
-            The last node create a new child if the prefix is shorter
-            than the last node's value.
-        """
-        if self.disable:
-            return [], self.root_node
+    def _match_prefix_helper(self, key: List):
+        current_node = self.root_node
+        current_node.last_access_time = time.time()
+        # key: the rest elements of key those are not compared or not part of prefix
 
-        value = []
-        last_node = [self.root_node]
-        self._match_prefix_helper(self.root_node, key, value, last_node)
-        if value:
-            value = torch.concat(value)
-        else:
-            value = torch.tensor([], dtype=torch.int32)
-        return value, last_node[0]
+        prefix_len = 0
+        total_length = 0
+        current_key = key
+        while len(current_key) > 0:
+            prefix_len = _key_match(current_node.key, current_key)
+            total_length += prefix_len
+            if prefix_len == len(current_node.key) and \
+                    len(current_key) > prefix_len and \
+                    current_key[prefix_len] in current_node.children.keys():
+                current_node = current_node.children[current_key[prefix_len]]
+                current_node.last_access_time = time.time()
+                current_key = current_key[prefix_len:]
+            else:
+                break
+
+        matched_value = key[:total_length]
+        return matched_value, current_node, prefix_len
+    
+    def match_prefix(self, key: List, **kwargs):
+        if self.disable:
+            return torch.tensor([], dtype=torch.int32), self.root_node
+        val, last_node, _ = self._match_prefix_helper(key)
+        return val, last_node
 
     def insert(self, key: List, value=None):
         if self.disable:
             return 0
-
         if value is None:
-            value = [x for x in key]
-        return self._insert_helper(self.root_node, key, value)
+            value = key
+
+        assert hasattr(value, "__getitem__")
+        assert hasattr(value, "__len__")
+        assert len(value) == len(key)
+
+        current_node = self.root_node
+        current_node.last_access_time = time.time()
+        match_value, current_node, last_prefix_len = self._match_prefix_helper(key)
+        total_match_length = len(match_value)
+        if last_prefix_len != len(current_node.key) or total_match_length != len(key):
+            self._insert_node(key[total_match_length - last_prefix_len:], value[total_match_length - last_prefix_len:], current_node, last_prefix_len)
+        return total_match_length
 
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         """Cache request when it finishes."""
-        if self.disable:
-            if token_ids is None:
-                token_ids_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-            else:
-                token_ids_len = len(token_ids)
-
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :token_ids_len
-            ]
-            self.token_to_kv_pool.free(kv_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-            return
-
         if token_ids is None:
             token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
 
+        if self.disable:
+            self.token_to_kv_pool.free(kv_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+            return
+
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(token_ids, kv_indices.clone())
-        self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
+        self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices): new_prefix_len])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -155,10 +164,9 @@ class RadixCache(BasePrefixCache):
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node = self.match_prefix(token_ids)
         assert len(new_indices) == len(token_ids)
-        self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices[len(req.prefix_indices) :],
-        )
+        self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, len(req.prefix_indices): len(new_indices)
+        ] = new_indices[len(req.prefix_indices): ]
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
@@ -224,76 +232,37 @@ class RadixCache(BasePrefixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    ##### Internal Helper Functions #####
+    @staticmethod
+    def _insert_node(key, value, child: TreeNode, split_len: int):
+        if split_len < len(child.value):
+            append_node = TreeNode()
+            append_node.key = child.key[split_len:]
+            append_node.value = child.value[split_len:]
+            append_node.parent = child
+            append_node.lock_ref = child.lock_ref
+            append_node.children = child.children
+            child.value = child.value[:split_len]
+            child.key = child.key[:split_len]
+            child.children = {append_node.key[0]: append_node}
+        new_node = child
 
-    def _match_prefix_helper(
-        self, node: TreeNode, key: List, value, last_node: TreeNode
-    ):
-        node.last_access_time = time.time()
-        if len(key) == 0:
-            return
-
-        if key[0] in node.children.keys():
-            child = node.children[key[0]]
-            prefix_len = _key_match(child.key, key)
-            if prefix_len < len(child.key):
-                new_node = self._split_node(child.key, child, prefix_len)
-                value.append(new_node.value)
-                last_node[0] = new_node
-            else:
-                value.append(child.value)
-                last_node[0] = child
-                self._match_prefix_helper(child, key[prefix_len:], value, last_node)
-
-    def _split_node(self, key, child: TreeNode, split_len: int):
-        # new_node -> child
-        new_node = TreeNode()
-        new_node.children = {key[split_len]: child}
-        new_node.parent = child.parent
-        new_node.lock_ref = child.lock_ref
-        new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len]
-        child.parent = new_node
-        child.key = child.key[split_len:]
-        child.value = child.value[split_len:]
-        new_node.parent.children[key[0]] = new_node
+        if split_len < len(key):
+            append_node = TreeNode()
+            append_node.key = key[split_len:]
+            append_node.value = value[split_len:]
+            append_node.parent = new_node
+            child_dict = {key[split_len]: append_node}
+            new_node.children.update(child_dict)
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List, value):
-        node.last_access_time = time.time()
-        if len(key) == 0:
-            return 0
-
-        if key[0] in node.children.keys():
-            child = node.children[key[0]]
-            prefix_len = _key_match(child.key, key)
-
-            if prefix_len == len(child.key):
-                if prefix_len == len(key):
-                    return prefix_len
-                else:
-                    key = key[prefix_len:]
-                    value = value[prefix_len:]
-                    return prefix_len + self._insert_helper(child, key, value)
-
-            new_node = self._split_node(child.key, child, prefix_len)
-            return prefix_len + self._insert_helper(
-                new_node, key[prefix_len:], value[prefix_len:]
-            )
-
-        if len(key):
-            new_node = TreeNode()
-            new_node.parent = node
-            new_node.key = key
-            new_node.value = value
-            node.children[key[0]] = new_node
-            self.evictable_size_ += len(value)
-        return 0
-
-    def _print_helper(self, node: TreeNode, indent: int):
-        for _, child in node.children.items():
-            print(" " * indent, len(child.key), child.key[:10], f"r={child.lock_ref}")
-            self._print_helper(child, indent=indent + 2)
+    @staticmethod
+    def _print_helper(node: TreeNode, indent: int):
+        stack = [(node, indent)]
+        while stack:
+            current_node, current_indent = stack.pop()
+            print(" " * current_indent, len(current_node.key), current_node.key[:10], f"r={current_node.lock_ref}")
+            for _, child in current_node.children.items():
+                stack.append((child, current_indent + 2))
 
     def _delete_leaf(self, node):
         for k, v in node.parent.children.items():
@@ -302,11 +271,15 @@ class RadixCache(BasePrefixCache):
         del node.parent.children[k]
         self.evictable_size_ -= len(node.key)
 
-    def _total_size_helper(self, node: TreeNode):
-        x = len(node.value)
-        for child in node.children.values():
-            x += self._total_size_helper(child)
-        return x
+    @staticmethod
+    def _total_size_helper(node: TreeNode):
+        total_size = 0
+        stack = [node]
+        while stack:
+            current_node = stack.pop()
+            total_size += len(current_node.value)
+            stack.extend(current_node.children.values())
+        return total_size
 
     def _collect_leaves(self):
         ret_list = []
@@ -328,16 +301,20 @@ if __name__ == "__main__":
     tree.insert("Hello")
     tree.insert("Hello")
     tree.insert("Hello_L.A.!")
-    # tree.insert("Hello_world! Happy")
-    # tree.insert("I love you!")
+    tree.insert("Hello_world! Happy")
+    tree.insert("I love you!")
+    tree.pretty_print()
+
+    print(tree.match_prefix("I love her!")[1].key)
+
     tree.pretty_print()
 
     # print(tree.match_prefix("I love you! aha"))
+    #
+    def evict_callback(x):
+       print("evict", x)
+       return len(x)
 
-    # def evict_callback(x):
-    #    print("evict", x)
-    #    return len(x)
-
-    # tree.evict(5, evict_callback)
-    # tree.evict(10, evict_callback)
-    # tree.pretty_print()
+    tree.evict(5, evict_callback)
+    tree.evict(10, evict_callback)
+    tree.pretty_print()
