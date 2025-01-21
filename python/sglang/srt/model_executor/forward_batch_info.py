@@ -282,6 +282,9 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            attn_backend=model_runner.attn_backend,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
@@ -335,11 +338,6 @@ class ForwardBatch:
 
         if model_runner.model_is_mrope:
             ret.compute_mrope_positions(model_runner, batch)
-
-        # Init attention information
-        ret.req_to_token_pool = model_runner.req_to_token_pool
-        ret.token_to_kv_pool = model_runner.token_to_kv_pool
-        ret.attn_backend = model_runner.attn_backend
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:

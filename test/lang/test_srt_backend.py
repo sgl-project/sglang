@@ -1,6 +1,7 @@
 """
 Usage:
 python3 -m unittest test_srt_backend.TestSRTBackend.test_gen_min_new_tokens
+python3 -m unittest test_srt_backend.TestSRTBackend.test_hellaswag_select
 """
 
 import unittest
