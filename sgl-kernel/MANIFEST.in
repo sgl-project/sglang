@@ -1,0 +1,4 @@
+include src/sgl-kernel/*.py
+
+recursive-include src/sgl-kernel/csrc *
+recursive-include src/sgl-kernel/ops *
