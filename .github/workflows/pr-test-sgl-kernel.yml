@@ -41,8 +41,9 @@ jobs:
       - name: Install
         run: |
           pip3 install torch==2.5.1
+          pip3 uninstall sgl-kernel -y || true
           cd sgl-kernel
-          pip3 install -e . --force-reinstall
+          pip3 install .
           pip3 list | grep sgl-kernel
 
       - name: Run test
