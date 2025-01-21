@@ -1105,7 +1105,11 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=ret_item["text"] if tool_calls is None else None,
+                    content=(
+                        ret_item["meta_info"]["beam_search_outputs"].sequences[0].text
+                        if tool_calls is None
+                        else None
+                    ),
                     tool_calls=tool_calls,
                 ),
                 logprobs=choice_logprobs,
