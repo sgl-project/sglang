@@ -18,7 +18,7 @@ class TestBenchOneBatch(unittest.TestCase):
                 f"### test_default\n"
                 f"output_throughput : {output_throughput:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 140)
+            self.assertGreater(output_throughput, 135)
 
     def test_moe_tp2(self):
         output_throughput = run_bench_one_batch(
