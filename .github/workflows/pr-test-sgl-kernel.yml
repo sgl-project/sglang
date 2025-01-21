@@ -41,6 +41,7 @@ jobs:
       - name: Install
         run: |
           pip3 install torch==2.5.1
+          pip3 install pytest
           pip3 uninstall sgl-kernel -y || true
           cd sgl-kernel
           pip3 install .
