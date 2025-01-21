@@ -6,6 +6,7 @@ from sgl_kernel.ops import (
     int8_scaled_mm,
     moe_align_block_size,
     register_graph_buffers,
+    rotary_embedding,
     sampling_scaling_penalties,
 )
 from sgl_kernel.turbomind import _turbomind_ext as turbomind
@@ -20,4 +21,5 @@ __all__ = [
     "get_graph_buffer_ipc_meta",
     "register_graph_buffers",
     "turbomind",
+    "rotary_embedding",
 ]

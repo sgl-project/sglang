@@ -1,7 +1,7 @@
 .PHONY: tree ln submodule install build clean test format
 
 tree:
-	@tree --prune -I "__pycache__|*.egg-info|*.so|build"
+	@tree --prune -I "__pycache__|*.egg-info|*.so|build|3rdparty|dist"
 
 submodule:
 	@git submodule update --init --recursive
@@ -19,7 +19,7 @@ clean:
 	@rm -rf build dist *.egg-info
 
 test:
-	@pytest tests/
+	@find tests -name "test_*.py" | xargs -n 1 python3
 
 format:
 	@find src tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i && find src tests -name '*.py' | xargs isort && find src tests -name '*.py' | xargs black

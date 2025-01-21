@@ -33,7 +33,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -72,7 +71,6 @@ def patch_model(
     try:
         if enable_compile:
             _to_torch(model, reverse=False, batch_size=batch_size)
-            monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -88,7 +86,6 @@ def patch_model(
     finally:
         if enable_compile:
             _to_torch(model, reverse=True, batch_size=batch_size)
-            monkey_patch_vllm_all_gather(reverse=True)
             tp_group.ca_comm = backup_ca_comm
 
 
