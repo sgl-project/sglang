@@ -239,6 +239,7 @@ def _decode_att_m_fwd(
     num_kv_splits,
     sm_scale,
     logit_cap,
+    kv_cache_dtype,
 ):
     BLOCK = 64
     NUM_KV_SPLITS = num_kv_splits
@@ -246,8 +247,7 @@ def _decode_att_m_fwd(
     Lv = v_buffer.shape[-1]
 
     # assert kv dtype
-    # print(k_buffer.dtype)
-    USE_INT8_KV = k_buffer[0].dtype == torch.uint8
+    USE_INT8_KV = kv_cache_dtype == torch.int8
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -544,13 +544,14 @@ def _decode_grouped_att_m_fwd(
     num_kv_splits,
     sm_scale,
     logit_cap,
+    kv_cache_dtype,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
     # assert kv dtype
-    USE_INT8_KV = k_buffer[0].dtype == torch.uint8
+    USE_INT8_KV = kv_cache_dtype == torch.int8
 
     # [TODO] work around shmem limit on MI3xx
     if is_hip_ and Lk >= 576:
@@ -747,6 +748,7 @@ def decode_attention_fwd_normal(
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    kv_cache_dtype=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -761,6 +763,7 @@ def decode_attention_fwd_normal(
         num_kv_splits,
         sm_scale,
         logit_cap,
+        kv_cache_dtype,
     )
     _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
@@ -779,6 +782,7 @@ def decode_attention_fwd_grouped(
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    kv_cache_dtype=None,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -793,6 +797,7 @@ def decode_attention_fwd_grouped(
         num_kv_splits,
         sm_scale,
         logit_cap,
+        kv_cache_dtype,
     )
     _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
@@ -801,8 +806,6 @@ def decode_attention_fwd(
     q,
     k_buffer,
     v_buffer,
-    k_scale_zeros_buffer,
-    v_scale_zeros_buffer,
     o,
     req_to_token,
     b_req_idx,
@@ -811,6 +814,9 @@ def decode_attention_fwd(
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    k_scale_zeros_buffer=None,
+    v_scale_zeros_buffer=None,
+    kv_cache_dtype=None,
 ):
     assert num_kv_splits == attn_logits.shape[2]
     kv_group_num = q.shape[1] // v_buffer.shape[1]
@@ -831,6 +837,7 @@ def decode_attention_fwd(
             num_kv_splits,
             sm_scale,
             logit_cap,
+            kv_cache_dtype,
         )
     else:
         # GQA/MQA/MLA
@@ -848,6 +855,7 @@ def decode_attention_fwd(
             num_kv_splits,
             sm_scale,
             logit_cap,
+            kv_cache_dtype,
         )
 
 

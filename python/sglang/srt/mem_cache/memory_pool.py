@@ -335,6 +335,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.kv_cache_dtype)
+            cache_v = cache_v.to(self.kv_cache_dtype)
             self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
             self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
         elif self.kv_cache_dtype == torch.int8:
