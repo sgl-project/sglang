@@ -175,7 +175,8 @@ void sm80_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const t
   }
 }
 
-template <typename ElementOutput, bool WithBias>
+template <typename ElementOutput, typename TileShape, typename ClusterShape, typename MainloopScheduleType,
+          bool WithBias>
 void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
                                  const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                                  const c10::optional<torch::Tensor>& bias) {
@@ -191,12 +192,8 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementOutput>::value;
   static constexpr int AlignmentOutput = 128 / cutlass::sizeof_bits<ElementOutput>::value;
 
-  using TileShape = Shape<_128, _128, _128>;
-  using ClusterShape = Shape<_2, _1, _1>;
-
   using OperatorClass = cutlass::arch::OpClassTensorOp;
 
-  using MainloopScheduleType = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
   using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
   using TileSchedulerType = cutlass::gemm::PersistentScheduler;
 
@@ -308,14 +305,53 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
   TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm executioin failed, error: ", cutlassGetStatusString(status));
 }
 
-template <typename ElementOutput>
+template <typename ElementOutput, typename TileShape, typename ClusterShape, typename MainloopScheduleType>
 void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                         const c10::optional<torch::Tensor>& bias) {
   if (bias) {
-    cutlass_int8_scaled_mm_sm90<ElementOutput, true>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    cutlass_int8_scaled_mm_sm90<ElementOutput, TileShape, ClusterShape, MainloopScheduleType, true>(
+        out, mat_a, mat_b, scales_a, scales_b, bias);
   } else {
-    cutlass_int8_scaled_mm_sm90<ElementOutput, false>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    cutlass_int8_scaled_mm_sm90<ElementOutput, TileShape, ClusterShape, MainloopScheduleType, false>(
+        out, mat_a, mat_b, scales_a, scales_b, bias);
+  }
+}
+
+template <typename ElementOutput>
+void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                         const c10::optional<torch::Tensor>& bias) {
+  int m = mat_a.size(0);
+  int n = mat_b.size(1);
+  if (m <= 32) {
+    if (n < 8192) {
+      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _128>, Shape<_1, _8, _1>,
+                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      return sm90_dispatch_bias<ElementOutput, Shape<_64, _128, _128>, Shape<_1, _8, _1>,
+                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
+  } else if (m <= 64) {
+    if (n < 8192) {
+      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _128>, Shape<_1, _4, _1>,
+                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _256>, Shape<_1, _1, _1>,
+                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
+  } else if (m <= 128) {
+    if (n <= 4096) {
+      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _128>, Shape<_2, _1, _1>,
+                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      return sm90_dispatch_bias<ElementOutput, Shape<_64, _128, _128>, Shape<_2, _1, _1>,
+                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
+  } else {
+    return sm90_dispatch_bias<ElementOutput, Shape<_128, _128, _128>, Shape<_2, _1, _1>,
+                              cutlass::gemm::KernelTmaWarpSpecializedPingpong>(out, mat_a, mat_b, scales_a, scales_b,
+                                                                               bias);
   }
 }
 
@@ -366,12 +402,23 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
           out, mat_a, mat_b, scales_a, scales_b, bias);
     }
   } else if (sm_version == 90) {
-    // conditional compile
+#if defined CUDA_VERSION && CUDA_VERSION >= 12000
+    // cutlass 3.x
     if (out_dtype == torch::kBFloat16) {
-      sm90_dispatch_bias<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      sm90_dispatch_bias<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm90_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
+#else
+    // fallback to cutlass 2.x
+    if (out_dtype == torch::kBFloat16) {
+      sm80_dispatch_shape<cutlass::bfloat16_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      sm80_dispatch_shape<cutlass::half_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
+#endif
   } else {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability.");
   }
