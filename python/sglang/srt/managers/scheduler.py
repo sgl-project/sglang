@@ -65,10 +65,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
     FINISH_ABORT,
-    FINISH_MATCHED_TOKEN,
+    FINISH_LENGTH,
     FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
     BaseFinishReason,
     ImageInputs,
     Req,
@@ -108,8 +108,14 @@ logger = logging.getLogger(__name__)
 # Test retract decode for debugging purposes
 test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
 
-from sglang.srt.beam_search import BeamSearchSequence, sort_by_beam_search_score, BeamSearchOutput
+from sglang.srt.beam_search import (
+    BeamSearchOutput,
+    BeamSearchSequence,
+    sort_by_beam_search_score,
+)
+
 xlx_test_beam_width = int(os.getenv("SGLANG_TEST_BEAM_WIDTH", 0))
+
 
 @dataclass
 class GenerationBatchResult:
@@ -668,9 +674,9 @@ class Scheduler:
         # Copy more attributes
         req.logprob_start_len = recv_req.logprob_start_len
 
-        if xlx_test_beam_width>0:
+        if xlx_test_beam_width > 0:
             req.return_logprob = True
-            req.top_logprobs_num = xlx_test_beam_width*2
+            req.top_logprobs_num = xlx_test_beam_width * 2
 
         if req.logprob_start_len == -1:
             # By default, only return the logprobs for output tokens
@@ -833,7 +839,9 @@ class Scheduler:
             if crash_on_warnings():
                 raise ValueError(msg)
 
-        if len(set(self.req_to_token_pool.free_slots)) != len(self.req_to_token_pool.free_slots):
+        if len(set(self.req_to_token_pool.free_slots)) != len(
+            self.req_to_token_pool.free_slots
+        ):
             msg = (
                 "Memory pool leak detected!"
                 f"available_set_size={len(set(self.req_to_token_pool.free_slots))}, "
@@ -1013,7 +1021,7 @@ class Scheduler:
 
         initial_bs = batch.batch_size()
 
-        if batch.beam_width>0:
+        if batch.beam_width > 0:
             batch.filter_beam_search_batch()
         else:
             batch.filter_batch()
@@ -1186,22 +1194,33 @@ class Scheduler:
                             batch.beam_width = xlx_test_beam_width
                             incompleted = [
                                 BeamSearchSequence(
-                                    last_token = top_token,
-                                    tokens = [top_token],
-                                    cum_logprob = top_logprob,
-                                    finish = self._check_token_finish(req, top_token),
+                                    last_token=top_token,
+                                    tokens=[top_token],
+                                    cum_logprob=top_logprob,
+                                    finish=self._check_token_finish(req, top_token),
                                     # for new prepare_for_beam_search
-                                    prefix_len = len(req.origin_input_ids)+len(req.output_ids)-1,
+                                    prefix_len=len(req.origin_input_ids)
+                                    + len(req.output_ids)
+                                    - 1,
                                     # prefix = req.output_ids.copy() if next_token_id==top_token \
                                     #     else req.output_ids[:-1],
-                                ) for top_logprob, top_token in zip(logits_output.next_token_top_logprobs_val[i], \
-                                                                    logits_output.next_token_top_logprobs_idx[i])
+                                )
+                                for top_logprob, top_token in zip(
+                                    logits_output.next_token_top_logprobs_val[i],
+                                    logits_output.next_token_top_logprobs_idx[i],
+                                )
                             ]
-                            incompleted = sorted(incompleted, key=sort_by_beam_search_score, reverse=True)
+                            incompleted = sorted(
+                                incompleted, key=sort_by_beam_search_score, reverse=True
+                            )
                             if req.finished():
-                                req.beam_list.completed = incompleted[:req.beam_list.beam_width]
+                                req.beam_list.completed = incompleted[
+                                    : req.beam_list.beam_width
+                                ]
                             else:
-                                req.beam_list.incompleted = incompleted[:req.beam_list.beam_width]
+                                req.beam_list.incompleted = incompleted[
+                                    : req.beam_list.beam_width
+                                ]
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
@@ -1328,19 +1347,17 @@ class Scheduler:
                 matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
         if matched_eos and not req.sampling_params.ignore_eos:
             return FINISH_MATCHED_TOKEN(matched=last_token_id)
-        
+
     def check_beam_finished(self, req: Req, beam: BeamSearchSequence):
         if beam.finished():
             return
-        
+
         if req.to_abort:
             beam.finish = FINISH_ABORT()
             return
 
         if len(beam.tokens) >= req.sampling_params.max_new_tokens:
-            beam.finish = FINISH_LENGTH(
-                length=req.sampling_params.max_new_tokens
-            )
+            beam.finish = FINISH_LENGTH(length=req.sampling_params.max_new_tokens)
             return
 
         last_token_id = beam.last_token
@@ -1380,14 +1397,16 @@ class Scheduler:
         # Move next_token_ids and logprobs to cpu
         next_token_ids = next_token_ids.tolist()
         next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        
-        next_token_logprobs = next_token_logprobs[::batch.beam_width+1]
-        next_token_ids = next_token_ids[::batch.beam_width+1]
-        batch.output_ids = batch.output_ids[::batch.beam_width+1]
+
+        next_token_logprobs = next_token_logprobs[:: batch.beam_width + 1]
+        next_token_ids = next_token_ids[:: batch.beam_width + 1]
+        batch.output_ids = batch.output_ids[:: batch.beam_width + 1]
 
         # [bs*(1+beam_width), vocab_size] -> [bs*(1+beam_width), top_logprobs_nums]
         max_k = max(batch.top_logprobs_nums)
-        beam_top_token_logprobs = logits_output.next_token_top_logprobs.topk(max_k, dim=1)
+        beam_top_token_logprobs = logits_output.next_token_top_logprobs.topk(
+            max_k, dim=1
+        )
         beam_output_top_token = beam_top_token_logprobs.indices.tolist()
         beam_output_top_logprob = beam_top_token_logprobs.values.tolist()
 
@@ -1396,11 +1415,12 @@ class Scheduler:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
-            
+
             req.output_ids.append(next_token_id)
             req.check_finished()
-            if isinstance(req.finished_reason, FINISH_MATCHED_TOKEN) or \
-                isinstance(req.finished_reason, FINISH_MATCHED_STR):
+            if isinstance(req.finished_reason, FINISH_MATCHED_TOKEN) or isinstance(
+                req.finished_reason, FINISH_MATCHED_STR
+            ):
                 req.finished_reason = None
 
             if req.return_logprob:
@@ -1416,22 +1436,29 @@ class Scheduler:
 
             assert not req.beam_list.empty()
 
-            req_top_tokens = beam_output_top_token[i*(batch.beam_width+1)+1: (i+1)*(batch.beam_width+1)]
-            req_top_logprobs = beam_output_top_logprob[i*(batch.beam_width+1)+1: (i+1)*(batch.beam_width+1)]
+            req_top_tokens = beam_output_top_token[
+                i * (batch.beam_width + 1) + 1 : (i + 1) * (batch.beam_width + 1)
+            ]
+            req_top_logprobs = beam_output_top_logprob[
+                i * (batch.beam_width + 1) + 1 : (i + 1) * (batch.beam_width + 1)
+            ]
 
             assert len(req_top_tokens) == len(req.beam_list.incompleted)
 
             all_beams = []
-            for beam_seq, seq_top_logprob, seq_top_token in zip(req.beam_list.incompleted, req_top_logprobs, req_top_tokens):
+            for beam_seq, seq_top_logprob, seq_top_token in zip(
+                req.beam_list.incompleted, req_top_logprobs, req_top_tokens
+            ):
                 one_beams = [
                     BeamSearchSequence(
-                        last_token = top_token,
-                        tokens = beam_seq.tokens+[top_token],
-                        cum_logprob = beam_seq.cum_logprob + top_logprob,
+                        last_token=top_token,
+                        tokens=beam_seq.tokens + [top_token],
+                        cum_logprob=beam_seq.cum_logprob + top_logprob,
                         # for new prepare_for_beam_search
-                        last_req_pool_idx = beam_seq.last_req_pool_idx,
-                        prefix_len = beam_seq.prefix_len,
-                    ) for top_logprob, top_token in zip(seq_top_logprob, seq_top_token)
+                        last_req_pool_idx=beam_seq.last_req_pool_idx,
+                        prefix_len=beam_seq.prefix_len,
+                    )
+                    for top_logprob, top_token in zip(seq_top_logprob, seq_top_token)
                 ]
                 all_beams += one_beams
 
@@ -1441,21 +1468,26 @@ class Scheduler:
 
             incompleted = [beam for beam in all_beams if not beam.finished()]
             completed = [beam for beam in all_beams if beam.finished()]
-            incompleted = sorted(incompleted, key=sort_by_beam_search_score, reverse=True)
-            req.beam_list.incompleted = incompleted[:req.beam_list.beam_width]
+            incompleted = sorted(
+                incompleted, key=sort_by_beam_search_score, reverse=True
+            )
+            req.beam_list.incompleted = incompleted[: req.beam_list.beam_width]
             req.beam_list.completed += completed
 
-            if (len(req.beam_list.incompleted) < batch.beam_width or 
-                len(req.beam_list.completed) > 10 * batch.beam_width) and \
-                not req.finished():
+            if (
+                len(req.beam_list.incompleted) < batch.beam_width
+                or len(req.beam_list.completed) > 10 * batch.beam_width
+            ) and not req.finished():
                 req.finished_reason = req.beam_list.completed[0].finish
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
 
                 completed = req.beam_list.completed + req.beam_list.incompleted
-                completed = sorted(completed, key=sort_by_beam_search_score, reverse=True)
-                req.beam_list.completed = completed[:batch.beam_width]
+                completed = sorted(
+                    completed, key=sort_by_beam_search_score, reverse=True
+                )
+                req.beam_list.completed = completed[: batch.beam_width]
                 req.beam_list.incompleted = []
 
             if req.grammar is not None:
@@ -1647,7 +1679,9 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                        beam_search_output.append(BeamSearchOutput(sequences=req.beam_list.completed))
+                        beam_search_output.append(
+                            BeamSearchOutput(sequences=req.beam_list.completed)
+                        )
 
             # Send to detokenizer
             if rids:

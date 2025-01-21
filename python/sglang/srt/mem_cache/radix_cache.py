@@ -141,31 +141,57 @@ class RadixCache(BasePrefixCache):
         # NOTE:  We do not cache beam search sequences; self.disable does not effect
 
         # consider all reqs' pool index
-        req_pool_indices = torch.tensor([req.req_pool_idx for req in batch.reqs],
-                                                 dtype=torch.int32, device=batch.device)
-        req_pool_end = torch.tensor([batch.seq_lens[i] for i in range(0, len(batch.seq_lens), batch.beam_width+1)],
-                                                 dtype=torch.int32, device=batch.device)
-        keep_kv_indices = torch.concat([
-            self.req_to_token_pool.req_to_token[_req_pool_index, : _seq_len]
-            for _req_pool_index, _seq_len in zip(req_pool_indices, req_pool_end)
-        ]).unique()
-        
+        req_pool_indices = torch.tensor(
+            [req.req_pool_idx for req in batch.reqs],
+            dtype=torch.int32,
+            device=batch.device,
+        )
+        req_pool_end = torch.tensor(
+            [
+                batch.seq_lens[i]
+                for i in range(0, len(batch.seq_lens), batch.beam_width + 1)
+            ],
+            dtype=torch.int32,
+            device=batch.device,
+        )
+        keep_kv_indices = torch.concat(
+            [
+                self.req_to_token_pool.req_to_token[_req_pool_index, :_seq_len]
+                for _req_pool_index, _seq_len in zip(req_pool_indices, req_pool_end)
+            ]
+        ).unique()
+
         # free finished reqs' beam search
-        beam_width = batch.reqs[0].beam_list.beam_width # only support same beam width
-        req_pool_start_indices = torch.tensor([req.beam_list.req_pool_start_idx for req in batch.reqs if req.finished()],
-                                              dtype=torch.int32, device=batch.device)
-        req_beam_pool_indices = torch.concat([
-            batch.req_pool_indices[_req_pool_start_idx+1: _req_pool_start_idx+beam_width+1]
-            for _req_pool_start_idx in req_pool_start_indices
-        ])
-        req_beam_pool_end = torch.concat([
-            batch.seq_lens[_req_pool_start_idx+1: _req_pool_start_idx+beam_width+1]
-            for _req_pool_start_idx in req_pool_start_indices
-        ])
-        beam_kv_indices = torch.concat([
-            self.req_to_token_pool.req_to_token[_req_beam_pool_idx, : _req_pool_end]
-            for _req_beam_pool_idx, _req_pool_end in zip(req_beam_pool_indices, req_beam_pool_end)
-        ]).unique()
+        beam_width = batch.reqs[0].beam_list.beam_width  # only support same beam width
+        req_pool_start_indices = torch.tensor(
+            [req.beam_list.req_pool_start_idx for req in batch.reqs if req.finished()],
+            dtype=torch.int32,
+            device=batch.device,
+        )
+        req_beam_pool_indices = torch.concat(
+            [
+                batch.req_pool_indices[
+                    _req_pool_start_idx + 1 : _req_pool_start_idx + beam_width + 1
+                ]
+                for _req_pool_start_idx in req_pool_start_indices
+            ]
+        )
+        req_beam_pool_end = torch.concat(
+            [
+                batch.seq_lens[
+                    _req_pool_start_idx + 1 : _req_pool_start_idx + beam_width + 1
+                ]
+                for _req_pool_start_idx in req_pool_start_indices
+            ]
+        )
+        beam_kv_indices = torch.concat(
+            [
+                self.req_to_token_pool.req_to_token[_req_beam_pool_idx, :_req_pool_end]
+                for _req_beam_pool_idx, _req_pool_end in zip(
+                    req_beam_pool_indices, req_beam_pool_end
+                )
+            ]
+        ).unique()
 
         # remove difference
         free_kv_indices = beam_kv_indices[~torch.isin(beam_kv_indices, keep_kv_indices)]

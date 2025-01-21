@@ -31,8 +31,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 import os
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 from sglang.srt.beam_search import BeamSearchList
+
 xlx_test_beam_width = int(os.getenv("SGLANG_TEST_BEAM_WIDTH", 0))
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -310,7 +311,7 @@ class Req:
         self.input_top_logprobs_val: Optional[List[float]] = None
         self.input_top_logprobs_idx: Optional[List[int]] = None
 
-        if return_logprob or xlx_test_beam_width>0:
+        if return_logprob or xlx_test_beam_width > 0:
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
             self.output_top_logprobs_val = []
@@ -1043,7 +1044,7 @@ class ScheduleBatch:
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
 
-        if self.beam_width>0:
+        if self.beam_width > 0:
             self.prepare_for_beam_search()
             return
 
@@ -1051,7 +1052,7 @@ class ScheduleBatch:
             return
 
         self.forward_mode = ForwardMode.DECODE
-        
+
         self.input_ids = self.output_ids
         self.output_ids = None
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.input_ids)
@@ -1085,21 +1086,30 @@ class ScheduleBatch:
 
         # self.input_ids = self.output_ids
         beam_ids = [
-            [beam.last_token for beam in req.beam_list.incompleted]
-                for req in self.reqs 
+            [beam.last_token for beam in req.beam_list.incompleted] for req in self.reqs
         ]
-        beam_ids = torch.tensor(beam_ids, dtype=torch.int32).to(self.device, non_blocking=True)
-        self.input_ids = torch.concat([self.output_ids[:, None], beam_ids], dim=1).reshape(-1)
+        beam_ids = torch.tensor(beam_ids, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.input_ids = torch.concat(
+            [self.output_ids[:, None], beam_ids], dim=1
+        ).reshape(-1)
 
         self.output_ids = None
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.input_ids)
 
         # TODO: use trition kernel
-        first_mask = [self.reqs[i].beam_list.req_pool_start_idx == -1 for i in range(len(self.reqs))]
+        first_mask = [
+            self.reqs[i].beam_list.req_pool_start_idx == -1
+            for i in range(len(self.reqs))
+        ]
         first_reqs_num = sum(first_mask)
         second_reqs_num = len(self.reqs) - first_reqs_num
-        assert len(self.req_pool_indices) == second_reqs_num*(self.beam_width+1)+first_reqs_num
-        
+        assert (
+            len(self.req_pool_indices)
+            == second_reqs_num * (self.beam_width + 1) + first_reqs_num
+        )
+
         self._prepare_for_first_beam_search(first_mask)
 
         self._prepare_for_second_beam_search(first_mask)
@@ -1114,35 +1124,55 @@ class ScheduleBatch:
         if bs == 0:
             return bs
 
-        beam_width = self.beam_width + 1 # 1 for normal decoding
+        beam_width = self.beam_width + 1  # 1 for normal decoding
         start_idx = len(self.reqs) - len(reqs)
-        req_pool_indices = self.req_pool_indices[start_idx*beam_width:]
-        seq_lens = self.seq_lens[start_idx*beam_width:]
+        req_pool_indices = self.req_pool_indices[start_idx * beam_width :]
+        seq_lens = self.seq_lens[start_idx * beam_width :]
 
-        beam_req_pool_indices = self.alloc_req_slots(bs*(beam_width-1))
-        req_pool_indices = req_pool_indices.unsqueeze(1).repeat(1, beam_width).reshape(-1)
+        beam_req_pool_indices = self.alloc_req_slots(bs * (beam_width - 1))
+        req_pool_indices = (
+            req_pool_indices.unsqueeze(1).repeat(1, beam_width).reshape(-1)
+        )
         seq_lens = seq_lens.unsqueeze(1).repeat(1, beam_width).reshape(-1)
         for i in range(bs):
-            req_pool_indices[1+i*beam_width: (i+1)*beam_width] = \
-                torch.tensor(beam_req_pool_indices[i*(beam_width-1): (i+1)*(beam_width-1)],
-                                dtype=torch.int32, device=self.device)
-            reqs[i].beam_list.req_pool_start_idx = i*beam_width
-        
-        last_beam_indices = [req.beam_list.req_pool_start_idx for req in reqs for _ in range(1, beam_width)]
-        cur_beam_indices = [req.beam_list.req_pool_start_idx+bias for req in reqs for bias in range(1, beam_width)]
-        for i, (_req_pool_indice, _seq_len) in enumerate(zip(req_pool_indices[cur_beam_indices], seq_lens[cur_beam_indices])):
-            origin_pool_indice = req_pool_indices[last_beam_indices[i]]
-            locs = (
-                _req_pool_indice, slice(0, _seq_len)
+            req_pool_indices[1 + i * beam_width : (i + 1) * beam_width] = torch.tensor(
+                beam_req_pool_indices[
+                    i * (beam_width - 1) : (i + 1) * (beam_width - 1)
+                ],
+                dtype=torch.int32,
+                device=self.device,
             )
+            reqs[i].beam_list.req_pool_start_idx = i * beam_width
+
+        last_beam_indices = [
+            req.beam_list.req_pool_start_idx
+            for req in reqs
+            for _ in range(1, beam_width)
+        ]
+        cur_beam_indices = [
+            req.beam_list.req_pool_start_idx + bias
+            for req in reqs
+            for bias in range(1, beam_width)
+        ]
+        for i, (_req_pool_indice, _seq_len) in enumerate(
+            zip(req_pool_indices[cur_beam_indices], seq_lens[cur_beam_indices])
+        ):
+            origin_pool_indice = req_pool_indices[last_beam_indices[i]]
+            locs = (_req_pool_indice, slice(0, _seq_len))
             self.req_to_token_pool.write(
                 locs, self.req_to_token_pool.req_to_token[origin_pool_indice, :_seq_len]
             )
-            reqs[int(i/(beam_width-1))].beam_list.incompleted[i%(beam_width-1)].last_req_pool_idx = cur_beam_indices[i]
+            reqs[int(i / (beam_width - 1))].beam_list.incompleted[
+                i % (beam_width - 1)
+            ].last_req_pool_idx = cur_beam_indices[i]
 
         # append to last and add bias
-        self.req_pool_indices = torch.concat([self.req_pool_indices[:start_idx*beam_width], req_pool_indices])
-        self.seq_lens = torch.concat([self.seq_lens[:start_idx*beam_width], seq_lens])
+        self.req_pool_indices = torch.concat(
+            [self.req_pool_indices[: start_idx * beam_width], req_pool_indices]
+        )
+        self.seq_lens = torch.concat(
+            [self.seq_lens[: start_idx * beam_width], seq_lens]
+        )
         for req in reqs:
             req.beam_list.req_pool_start_idx += start_idx * beam_width
             for beam in req.beam_list.incompleted:
@@ -1156,16 +1186,30 @@ class ScheduleBatch:
         if end_idx == 0:
             return end_idx
 
-        beam_width = self.beam_width + 1 # 1 for normal decoding
-        req_pool_indices = self.req_pool_indices[:end_idx*beam_width]
-        seq_lens = self.seq_lens[:end_idx*beam_width]
+        beam_width = self.beam_width + 1  # 1 for normal decoding
+        req_pool_indices = self.req_pool_indices[: end_idx * beam_width]
+        seq_lens = self.seq_lens[: end_idx * beam_width]
 
         # get last beam indices
-        last_beam_indices = torch.tensor([beam.last_req_pool_idx for req in reqs for beam in req.beam_list.incompleted],
-                                            dtype=torch.int32, device=self.device)
-        last_beam_prefix_lens = torch.tensor([beam.prefix_len for req in reqs for beam in req.beam_list.incompleted],
-                                            dtype=torch.int32, device=self.device)
-        cur_beam_indices = [req.beam_list.req_pool_start_idx+bias for req in reqs for bias in range(1, beam_width)]
+        last_beam_indices = torch.tensor(
+            [
+                beam.last_req_pool_idx
+                for req in reqs
+                for beam in req.beam_list.incompleted
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        last_beam_prefix_lens = torch.tensor(
+            [beam.prefix_len for req in reqs for beam in req.beam_list.incompleted],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        cur_beam_indices = [
+            req.beam_list.req_pool_start_idx + bias
+            for req in reqs
+            for bias in range(1, beam_width)
+        ]
 
         # TODO: consider more prefix
         # collect prefix
@@ -1175,38 +1219,42 @@ class ScheduleBatch:
             prefix_len = last_beam_prefix_lens[i]
             last_indices = req_pool_indices[last_index]
             last_seq_len = seq_lens[last_index]
-            dummy_req_to_token.append(self.req_to_token_pool.req_to_token[last_indices, prefix_len:last_seq_len].clone())
+            dummy_req_to_token.append(
+                self.req_to_token_pool.req_to_token[
+                    last_indices, prefix_len:last_seq_len
+                ].clone()
+            )
             # update to current index
-            reqs[int(i/(beam_width-1))].beam_list.incompleted[i%(beam_width-1)].last_req_pool_idx = cur_beam_indices[i]
+            reqs[int(i / (beam_width - 1))].beam_list.incompleted[
+                i % (beam_width - 1)
+            ].last_req_pool_idx = cur_beam_indices[i]
 
         # collect last pool
         beam_kv_indices = self.req_to_token_pool.req_to_token[
-            req_pool_indices, last_beam_prefix_lens.min(): seq_lens.max()
+            req_pool_indices, last_beam_prefix_lens.min() : seq_lens.max()
         ].unique()
-        
+
         # write new indices
         try:
-            for i, (_req_pool_indice, _seq_len) in enumerate(zip(req_pool_indices[cur_beam_indices], seq_lens[cur_beam_indices])):
+            for i, (_req_pool_indice, _seq_len) in enumerate(
+                zip(req_pool_indices[cur_beam_indices], seq_lens[cur_beam_indices])
+            ):
                 prefix_len = last_beam_prefix_lens[i]
-                locs = (
-                    _req_pool_indice, slice(prefix_len, _seq_len)
-                )
-                self.req_to_token_pool.write(
-                    locs, dummy_req_to_token[i]
-                )
+                locs = (_req_pool_indice, slice(prefix_len, _seq_len))
+                self.req_to_token_pool.write(locs, dummy_req_to_token[i])
         except Exception:
             pass
-            
+
         # free non-inherited indices in pool
         keep_kv_indices = self.req_to_token_pool.req_to_token[
-            req_pool_indices, last_beam_prefix_lens.min(): seq_lens.max()
+            req_pool_indices, last_beam_prefix_lens.min() : seq_lens.max()
         ].unique()
         free_kv_indices = beam_kv_indices[~torch.isin(beam_kv_indices, keep_kv_indices)]
         self.token_to_kv_pool.free(free_kv_indices)
 
     def _update_common_beam_search(self):
         # Alloc mem
-        beam_width = self.beam_width + 1 # 1 for normal decoding
+        beam_width = self.beam_width + 1  # 1 for normal decoding
         bs = len(self.reqs)
         self.out_cache_loc = self.alloc_token_slots(bs * beam_width)
 
@@ -1292,12 +1340,18 @@ class ScheduleBatch:
         old_indices = []
         extend_idx = 0
         for req in self.reqs:
-            if req.beam_list.req_pool_start_idx!=-1:
+            if req.beam_list.req_pool_start_idx != -1:
                 old_indices.append(
-                    torch.tensor([req.beam_list.req_pool_start_idx+i for i in range(self.beam_width+1)],
-                                 dtype=torch.int32, device=self.device)
+                    torch.tensor(
+                        [
+                            req.beam_list.req_pool_start_idx + i
+                            for i in range(self.beam_width + 1)
+                        ],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
                 )
-                extend_idx += (self.beam_width + 1)
+                extend_idx += self.beam_width + 1
             else:
                 # occasional: extend requests are not yet processed by prepare_for_beam_search at tail
                 old_indices.append(
@@ -1308,20 +1362,30 @@ class ScheduleBatch:
         self.reqs = [self.reqs[i] for i in keep_indices]
 
         # update beam pointer to last: last_req_pool_idx, req_pool_start_idx
-        origin_row_index = torch.arange(len(self.req_pool_indices), dtype=torch.int32, device=self.device)
-        row_to_index = torch.arange(len(new_indices), dtype=torch.int32, device=self.device)
+        origin_row_index = torch.arange(
+            len(self.req_pool_indices), dtype=torch.int32, device=self.device
+        )
+        row_to_index = torch.arange(
+            len(new_indices), dtype=torch.int32, device=self.device
+        )
         origin_row_index[new_indices] = row_to_index
         for req in self.reqs:
             if req.beam_list.req_pool_start_idx != -1:
-                req.beam_list.req_pool_start_idx = origin_row_index[req.beam_list.req_pool_start_idx].item()
+                req.beam_list.req_pool_start_idx = origin_row_index[
+                    req.beam_list.req_pool_start_idx
+                ].item()
                 for beam in req.beam_list.incompleted:
-                        beam.last_req_pool_idx = origin_row_index[beam.last_req_pool_idx].item()
+                    beam.last_req_pool_idx = origin_row_index[
+                        beam.last_req_pool_idx
+                    ].item()
 
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.int32, device=self.device)
+        keep_indices_tensor = torch.tensor(
+            keep_indices, dtype=torch.int32, device=self.device
+        )
         self.output_ids = self.output_ids[keep_indices_tensor]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:

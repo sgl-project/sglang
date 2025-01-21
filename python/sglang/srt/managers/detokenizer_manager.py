@@ -208,11 +208,13 @@ class DetokenizerManager:
                                 recv_obj.no_stop_trim[i],
                             )
                         )
-                
+
                 beam_texts = self.tokenizer.batch_decode(
                     beam_ids,
                     skip_special_tokens=recv_obj.skip_special_tokens[0],
-                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                        0
+                    ],
                 )
 
                 for i, beam_output in enumerate(recv_obj.beam_search_output):
