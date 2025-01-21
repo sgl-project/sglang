@@ -36,12 +36,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+            fetch-depth: 0
+            submodules: 'recursive'
 
       - name: Install
         run: |
-          pip3 install torch==2.5.1
-          pip3 install pytest
+          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm
           pip3 uninstall sgl-kernel -y || true
           cd sgl-kernel
           pip3 install .
