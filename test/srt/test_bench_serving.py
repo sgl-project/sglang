@@ -139,6 +139,7 @@ class TestBenchServing(unittest.TestCase):
             num_prompts=50,
             request_rate=1,
             disable_ignore_eos=True,
+            dataset_name="sharegpt",
             other_server_args=[
                 "--speculative-algorithm",
                 "EAGLE",
