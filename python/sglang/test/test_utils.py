@@ -574,7 +574,7 @@ def run_bench_serving(
         seed=0,
         disable_ignore_eos=False,
         extra_request_body=None,
-        apply_chat_tempalte=False,
+        apply_chat_template=False,
         profile=None,
         lora_name=None,
     )
