@@ -453,6 +453,7 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
+            apply_chat_template=args.apply_chat_template,
         )
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
@@ -563,6 +564,7 @@ def sample_sharegpt_requests(
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
     context_len: Optional[int] = None,
+    apply_chat_template=False,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -594,7 +596,7 @@ def sample_sharegpt_requests(
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
 
-        if args.apply_chat_template:
+        if apply_chat_template:
             prompt = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
