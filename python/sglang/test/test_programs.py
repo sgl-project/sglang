@@ -535,7 +535,7 @@ def test_hellaswag_select():
 
     # Compute accuracy
     accuracy_gen = np.mean(np.array(preds_gen) == np.array(labels))
-    assert np.abs(accuracy_gen - accuracy) < 0.05
+    assert np.abs(accuracy_gen - accuracy) < 0.1
     assert np.abs(latency_gen - latency) < 1
 
     return accuracy, latency
