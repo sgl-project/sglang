@@ -378,4 +378,7 @@ class CohereForCausalLM(nn.Module):
             loaded_params.add(name)
 
 
-EntryClass = CohereForCausalLM
+class Cohere2ForCausalLM(CohereForCausalLM):
+    pass
+
+EntryClass = [CohereForCausalLM, Cohere2ForCausalLM]
