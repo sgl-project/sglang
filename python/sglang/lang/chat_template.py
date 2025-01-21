@@ -354,6 +354,37 @@ register_chat_template(
 )
 
 
+register_chat_template(
+    ChatTemplate(
+        name="deepseek-v3",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "",
+                "",
+            ),
+            "user": (
+                "<｜User｜>",
+                "",
+            ),
+            "assistant": (
+                "<｜Assistant｜>",
+                "<｜end▁of▁sentence｜>",
+            ),
+        },
+        stop_str=("<｜end▁of▁sentence｜>",),
+    )
+)
+
+
+@register_chat_template_matching_function
+def match_deepseek(model_path: str):
+    if (
+        "deepseek-v3" in model_path.lower() or "deepseek-r1" in model_path.lower()
+    ) and "base" not in model_path.lower():
+        return get_chat_template("deepseek-v3")
+
+
 @register_chat_template_matching_function
 def match_dbrx(model_path: str):
     if "dbrx" in model_path.lower() and "instruct" in model_path.lower():

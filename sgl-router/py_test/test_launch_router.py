@@ -28,6 +28,8 @@ class TestLaunchRouter(unittest.TestCase):
             host="127.0.0.1",
             port=30000,
             policy="cache_aware",
+            worker_startup_timeout_secs=600,
+            worker_startup_check_interval=10,
             cache_threshold=0.5,
             balance_abs_threshold=32,
             balance_rel_threshold=1.0001,
