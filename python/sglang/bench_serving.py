@@ -1044,7 +1044,7 @@ async def benchmark(
             "Total token throughput (tok/s):", metrics.total_throughput
         )
     )
-    print("{:<40} {:<10.2f}".format("Concurrency :", metrics.concurrency))
+    print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
