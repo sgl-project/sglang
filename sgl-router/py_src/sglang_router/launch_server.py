@@ -13,7 +13,7 @@ import requests
 from setproctitle import setproctitle
 from sglang_router.launch_router import RouterArgs, launch_router
 
-from sglang.srt.server import launch_server
+from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
 
@@ -68,7 +68,7 @@ def run_server(server_args, dp_rank):
     # create new process group
     os.setpgrp()
 
-    setproctitle(f"sglang::server")
+    setproctitle("sglang::server")
     # Set SGLANG_DP_RANK environment variable
     os.environ["SGLANG_DP_RANK"] = str(dp_rank)
 
@@ -120,9 +120,26 @@ def find_available_ports(base_port: int, count: int) -> List[int]:
 
 def cleanup_processes(processes: List[mp.Process]):
     for process in processes:
-        logger.info(f"Terminating process {process.pid}")
-        process.terminate()
-    logger.info("All processes terminated")
+        logger.info(f"Terminating process group {process.pid}")
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # Process group may already be terminated
+            pass
+
+    # Wait for processes to terminate
+    for process in processes:
+        process.join(timeout=5)
+        if process.is_alive():
+            logger.warning(
+                f"Process {process.pid} did not terminate gracefully, forcing kill"
+            )
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    logger.info("All process groups terminated")
 
 
 def main():
@@ -173,7 +190,12 @@ def main():
     ]
 
     # Start the router
-    router = launch_router(router_args)
+    try:
+        launch_router(router_args)
+    except Exception as e:
+        logger.error(f"Failed to start router: {e}")
+        cleanup_processes(server_processes)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

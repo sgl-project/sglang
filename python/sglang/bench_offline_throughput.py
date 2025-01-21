@@ -27,7 +27,8 @@ from sglang.bench_serving import (
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Engine, Runtime
+from sglang.lang.backend.runtime_endpoint import Runtime
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
 
 
@@ -48,12 +49,13 @@ class BenchArgs:
     gsp_system_prompt_len: int = 2048
     gsp_question_len: int = 128
     gsp_output_len: int = 256
+    seed: int = 1
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
-    seed: int = 1
+    apply_chat_template: bool = False
+    profile: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
-    profile: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -140,20 +142,31 @@ class BenchArgs:
             default=BenchArgs.gsp_output_len,
             help="Target length in tokens for outputs in generated-shared-prefix dataset",
         )
+        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
         parser.add_argument(
             "--disable-ignore-eos",
-            type=bool,
-            default=BenchArgs.disable_ignore_eos,
+            action="store_true",
             help="Disable ignore EOS token",
         )
         parser.add_argument(
             "--extra-request-body",
             metavar='{"key1": "value1", "key2": "value2"}',
             type=str,
+            default=BenchArgs.extra_request_body,
             help="Append given JSON object to the request payload. You can use this to specify"
             "additional generate params like sampling params.",
         )
-        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument(
+            "--apply-chat-template",
+            action="store_true",
+            help="Apply chat template",
+        )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
         parser.add_argument(
             "--skip-warmup",
             action="store_true",
@@ -163,12 +176,6 @@ class BenchArgs:
             "--do-not-exit",
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
-        )
-        parser.add_argument(
-            "--profile",
-            action="store_true",
-            help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
 
     @classmethod

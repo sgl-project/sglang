@@ -1,3 +1,5 @@
+#include <vector>
+
 #include "utils.hpp"
 
 // trt_reduce
@@ -28,6 +30,10 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
 void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor &k, const torch::Tensor &v, const torch::Tensor &past_kv,
                               const torch::Tensor &slope, torch::Tensor output, torch::Tensor new_kv);
 
+// rotary embedding
+void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
+                      torch::Tensor& cos_sin_cache, bool is_neox);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -43,4 +49,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
   // lightning_attention_decode
   m.def("lightning_attention_decode", &lightning_attention_decode, "Lightning Attention Ddecode (CUDA)");
+  // rotary embedding
+  m.def("rotary_embedding", &rotary_embedding, "Rotary Embedding (CUDA)");
 }

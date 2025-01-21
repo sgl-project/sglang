@@ -232,6 +232,7 @@ class Req:
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
+        custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
@@ -252,6 +253,7 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
         self.req_pool_idx = None
@@ -593,6 +595,9 @@ class ScheduleBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
 
+    # Enable custom logit processor
+    enable_custom_logit_processor: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -603,6 +608,7 @@ class ScheduleBatch:
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
+        enable_custom_logit_processor: bool,
     ):
         return cls(
             reqs=reqs,
@@ -616,6 +622,7 @@ class ScheduleBatch:
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
+            enable_custom_logit_processor=enable_custom_logit_processor,
         )
 
     def batch_size(self):
@@ -1105,6 +1112,8 @@ class ScheduleBatch:
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
+        if self.spec_info:
+            self.spec_info.filter_batch(new_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1199,6 +1208,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            enable_custom_logit_processor=self.enable_custom_logit_processor,
         )
 
     def __str__(self):

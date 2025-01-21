@@ -69,6 +69,10 @@ class GenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -183,6 +187,13 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
+            if self.custom_logit_processor is None:
+                self.custom_logit_processor = [None] * num
+            elif not isinstance(self.custom_logit_processor, list):
+                self.custom_logit_processor = [self.custom_logit_processor] * num
+            else:
+                assert self.parallel_sample_num == 1
+
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
@@ -202,6 +213,11 @@ class GenerateReqInput:
             log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            custom_logit_processor=(
+                self.custom_logit_processor[i]
+                if self.custom_logit_processor is not None
+                else None
+            ),
         )
 
 
@@ -233,6 +249,11 @@ class TokenizedGenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
+
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[str] = None
 
 
 @dataclass

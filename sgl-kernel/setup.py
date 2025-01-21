@@ -30,6 +30,7 @@ include_dirs = [
     root / "src" / "sgl-kernel" / "csrc",
 ]
 nvcc_flags = [
+    "-DNDEBUG",
     "-O3",
     "-Xcompiler",
     "-fPIC",
@@ -37,6 +38,7 @@ nvcc_flags = [
     "-gencode=arch=compute_80,code=sm_80",
     "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
+    "-gencode=arch=compute_90a,code=sm_90a",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
@@ -54,6 +56,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
             "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
+            "src/sgl-kernel/csrc/rotary_embedding.cu",
         ],
         include_dirs=include_dirs,
         extra_compile_args={
