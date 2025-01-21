@@ -407,7 +407,7 @@ def test_lightning_attention_implementations(model_params):
         msg="SGL lightning attention implementation produces different kv results",
     )
 
-    print("✅ Two implementations match")
+    print("✅ All implementations match")
 
 
 def _build_slope_tensor(n_attention_heads: int):

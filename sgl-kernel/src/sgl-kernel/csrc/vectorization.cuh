@@ -18,18 +18,6 @@ struct __align__(8) vec4_t {
   scalar_t w;
 };
 
-// 8-element vector for half and bfloat16
-template <typename scalar_t>
-struct __align__(16) vec8_t {
-  scalar_t x1;
-  scalar_t x2;
-  scalar_t x3;
-  scalar_t x4;
-  scalar_t x5;
-  scalar_t x6;
-  scalar_t x7;
-  scalar_t x8;
-};
 
 template <typename quant_type_t>
 struct __align__(4) q8x4_t {
