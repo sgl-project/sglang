@@ -69,8 +69,10 @@ class GenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
-    # Custom logit processor (serialized function)
-    custom_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -248,8 +250,9 @@ class TokenizedGenerateReqInput:
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
-    # Custom logit processor (serialized function)
-    # TODO (hpguo): Add an example and update doc string here
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[str] = None
 
 
