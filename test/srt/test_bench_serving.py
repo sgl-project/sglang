@@ -150,6 +150,8 @@ class TestBenchServing(unittest.TestCase):
                 "8",
                 "--speculative-num-draft-tokens",
                 "64",
+                "--mem-fraction-static",
+                "0.7",
             ],
         )
 
