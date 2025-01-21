@@ -313,10 +313,10 @@ class EAGLEDraftInput(SpecInfo):
         batch.out_cache_loc = batch.alloc_token_slots(self.verified_id.numel())
         accept_length_cpu = batch.spec_info.accept_length_cpu
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
-
-        pt = 0
+        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         seq_lens_cpu = batch.seq_lens.tolist()
 
+        pt = 0
         i = 0
         for req in batch.reqs:
             if req.finished():
@@ -329,6 +329,7 @@ class EAGLEDraftInput(SpecInfo):
             ] = batch.out_cache_loc[pt : pt + input_len]
             pt += input_len
             i += 1
+        assert pt == batch.out_cache_loc.shape[0]
 
         self.positions = torch.empty_like(self.verified_id)
         new_verified_id = torch.empty_like(self.accept_length, dtype=torch.long)
@@ -624,6 +625,10 @@ class EagleVerifyInput(SpecInfo):
                 accept_length_cpu[i] for i in unfinished_index
             ]
             draft_input.unfinished_index = unfinished_index
+            if draft_input.has_finished:
+                draft_input.seq_lens_for_draft_extend = batch.seq_lens[unfinished_index]
+            else:
+                draft_input.seq_lens_for_draft_extend = batch.seq_lens
 
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         return (
