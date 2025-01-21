@@ -1023,7 +1023,7 @@ class Scheduler:
             )
 
         # Check for jump-forward
-        if not self.disable_jump_forward:
+        if not self.disable_jump_forward and batch.has_grammar:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
