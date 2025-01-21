@@ -117,7 +117,7 @@ class TestEAGLEServer(unittest.TestCase):
     def send_request(self):
         time.sleep(random.uniform(0, 2))
         for prompt in prompts:
-            url = (self.base_url,)
+            url = self.base_url + "/generate"
             data = {
                 "text": prompt,
                 "sampling_params": {
@@ -131,8 +131,8 @@ class TestEAGLEServer(unittest.TestCase):
     def send_requests_abort(self):
         for prompt in prompts:
             try:
-                time.sleep(1)
-                url = (self.base_url,)
+                time.sleep(random.uniform(0, 2))
+                url = self.base_url + "/generate"
                 data = {
                     "model": "base",
                     "text": prompt,
