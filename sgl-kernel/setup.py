@@ -39,6 +39,8 @@ def _get_version():
 
 
 cutlass = root / "3rdparty" / "cutlass"
+cutlass_default = root / "3rdparty" / "cutlass"
+cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
 include_dirs = [
     cutlass.resolve() / "include",
