@@ -34,16 +34,17 @@ jobs:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
 
-      - name: Install dependencies
+      - name: Install
         run: |
-          bash scripts/ci_install_dependency.sh
-
+          pip3 install torch==2.5.1
+          pip3 install pytest
+          pip3 uninstall sgl-kernel -y || true
           cd sgl-kernel
-          git submodule update --init --recursive
-          pip3 install -e . --force-reinstall
+          pip3 install .
           pip3 list | grep sgl-kernel
 
       - name: Run test
@@ -57,7 +58,7 @@ jobs:
           pip3 uninstall sgl-kernel -y
 
   finish:
-    needs: [unit-test]
+    needs: [unit-test, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
