@@ -34,7 +34,8 @@ class TestBenchOneBatch(unittest.TestCase):
 
     def test_torch_compile_tp2_bs1(self):
         output_throughput = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST, ["--tp", "2", "--enable-torch-compile"]
+            DEFAULT_MODEL_NAME_FOR_TEST,
+            ["--tp", "2", "--enable-torch-compile", "--cuda-graph-max-bs", "2"],
         )
 
         if is_in_ci():
