@@ -1420,7 +1420,6 @@ if __name__ == "__main__":
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up.",
     )
-    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--multi",
         action="store_true",
@@ -1444,14 +1443,15 @@ if __name__ == "__main__":
         help="Disable streaming mode.",
     )
     parser.add_argument(
-        "--disable-ignore-eos",
-        action="store_true",
-        help="Disable ignoring EOS.",
-    )
-    parser.add_argument(
         "--return-logprob",
         action="store_true",
         help="Return logprob.",
+    )
+    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+    parser.add_argument(
+        "--disable-ignore-eos",
+        action="store_true",
+        help="Disable ignoring EOS.",
     )
     parser.add_argument(
         "--extra-request-body",
