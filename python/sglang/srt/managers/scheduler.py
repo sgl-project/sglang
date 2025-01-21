@@ -115,7 +115,7 @@ from sglang.srt.beam_search import (
 )
 
 xlx_test_beam_width = int(os.getenv("SGLANG_TEST_BEAM_WIDTH", 0))
-
+xlx_test_beam_fixed_max_token = bool(os.getenv("SGLANG_TEST_BEAM_FIXED_MAX_TOKEN", 0))
 
 @dataclass
 class GenerationBatchResult:
@@ -1418,9 +1418,9 @@ class Scheduler:
 
             req.output_ids.append(next_token_id)
             req.check_finished()
-            if isinstance(req.finished_reason, FINISH_MATCHED_TOKEN) or isinstance(
+            if (isinstance(req.finished_reason, FINISH_MATCHED_TOKEN) or isinstance(
                 req.finished_reason, FINISH_MATCHED_STR
-            ):
+            )) and not xlx_test_beam_fixed_max_token:
                 req.finished_reason = None
 
             if req.return_logprob:
@@ -1477,7 +1477,7 @@ class Scheduler:
             if (
                 len(req.beam_list.incompleted) < batch.beam_width
                 or len(req.beam_list.completed) > 10 * batch.beam_width
-            ) and not req.finished():
+            ) and not req.finished() and not xlx_test_beam_fixed_max_token:
                 req.finished_reason = req.beam_list.completed[0].finish
 
             if req.finished():
