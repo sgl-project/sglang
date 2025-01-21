@@ -1,6 +1,6 @@
 import itertools
-
 import math
+
 import torch
 import triton
 import triton.language as tl
@@ -9,6 +9,7 @@ from sgl_kernel import lightning_attention_decode
 
 def next_power_of_2(n):
     return 2 ** (int(math.ceil(math.log(n, 2))))
+
 
 @triton.jit
 def _decode_kernel(
@@ -125,11 +126,12 @@ def triton_lightning_attn_decode(q, k, v, kv, s):
 
     return o, kv_out
 
+
 def lightning_attention_decode_naive(q, k, v, past_kv, slope):
     """Naive implementation of lightning attention decode"""
     original_dtype = q.dtype
     ratio = torch.exp(-slope)  # [h, 1, 1]
-    
+
     kv = past_kv
     b, h, n, d = q.shape
 
@@ -141,16 +143,19 @@ def lightning_attention_decode_naive(q, k, v, past_kv, slope):
             v[:, :, i : i + 1],
         )
         qkv = torch.einsum(
-                "... n e, ... e d -> ... n d", q[:, :, i : i + 1].to(torch.float32), kv.to(torch.float32)
+            "... n e, ... e d -> ... n d",
+            q[:, :, i : i + 1].to(torch.float32),
+            kv.to(torch.float32),
         )
         output.append(qkv)
     output = torch.concat(output, dim=-2)
-    
+
     return output.to(original_dtype), kv
 
 
 def lightning_attention_decode_kernel(q, k, v, past_kv, slope, output, new_kv):
     return lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv)
+
 
 def calculate_diff(batch_size):
     dtype = torch.bfloat16
@@ -159,27 +164,44 @@ def calculate_diff(batch_size):
     head_dim = 96
     seq_len = 1
 
-    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
-    k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
-    v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+    q = torch.randn(
+        batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
+    )
+    k = torch.randn(
+        batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
+    )
+    v = torch.randn(
+        batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
+    )
     past_kv = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device)
     slope = torch.randn(num_heads, 1, 1, device=device)
 
     output_naive, new_kv_naive = lightning_attention_decode_naive(
         q.clone(), k.clone(), v.clone(), past_kv.clone(), slope.clone()
     )
-    
+
     output_kernel = torch.empty_like(output_naive)
     new_kv_kernel = torch.empty_like(new_kv_naive)
     lightning_attention_decode_kernel(
-        q.clone(), k.clone(), v.clone(), past_kv.clone(), slope.clone(),
-        output_kernel, new_kv_kernel
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        past_kv.clone(),
+        slope.clone(),
+        output_kernel,
+        new_kv_kernel,
     )
 
-    output_triton, new_kv_triton = triton_lightning_attn_decode(q.clone(), k.clone(), v.clone(), past_kv.clone(), slope.clone())
+    output_triton, new_kv_triton = triton_lightning_attn_decode(
+        q.clone(), k.clone(), v.clone(), past_kv.clone(), slope.clone()
+    )
 
-
-    if torch.allclose(output_naive, output_kernel, atol=1e-2, rtol=1e-2) and torch.allclose(output_naive, output_triton, atol=1e-2, rtol=1e-2) and torch.allclose(new_kv_naive, new_kv_kernel, atol=1e-2, rtol=1e-2) and torch.allclose(new_kv_naive, new_kv_triton, atol=1e-2, rtol=1e-2):
+    if (
+        torch.allclose(output_naive, output_kernel, atol=1e-2, rtol=1e-2)
+        and torch.allclose(output_naive, output_triton, atol=1e-2, rtol=1e-2)
+        and torch.allclose(new_kv_naive, new_kv_kernel, atol=1e-2, rtol=1e-2)
+        and torch.allclose(new_kv_naive, new_kv_triton, atol=1e-2, rtol=1e-2)
+    ):
         print("✅ All implementations match")
     else:
         print("❌ Implementations differ")
@@ -209,9 +231,15 @@ def benchmark(batch_size, provider):
     head_dim = 96
     seq_len = 1
 
-    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
-    k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
-    v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+    q = torch.randn(
+        batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
+    )
+    k = torch.randn(
+        batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
+    )
+    v = torch.randn(
+        batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
+    )
     past_kv = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device)
     slope = torch.randn(num_heads, 1, 1, device=device)
 
@@ -225,12 +253,19 @@ def benchmark(batch_size, provider):
             quantiles=quantiles,
         )
     elif provider == "kernel":
-        output = torch.empty(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+        output = torch.empty(
+            batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
+        )
         new_kv = torch.empty(batch_size, num_heads, head_dim, head_dim, device=device)
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: lightning_attention_decode_kernel(
-                q.clone(), k.clone(), v.clone(), past_kv.clone(), slope.clone(),
-                output, new_kv
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                past_kv.clone(),
+                slope.clone(),
+                output,
+                new_kv,
             ),
             quantiles=quantiles,
         )
@@ -262,4 +297,3 @@ if __name__ == "__main__":
 
     # Run performance benchmark
     benchmark.run(print_data=True)
-

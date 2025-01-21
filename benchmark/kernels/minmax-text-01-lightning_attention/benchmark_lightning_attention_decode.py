@@ -355,7 +355,7 @@ def test_lightning_attention_implementations(model_params):
     v = v.contiguous()
     past_kv = past_kv.contiguous()
     slope_rate = slope_rate.contiguous()
-    
+
     # Test Triton implementation
     triton_output, triton_new_kv = lightning_attn_decode(q, k, v, past_kv, slope_rate)
     triton_output = triton_output.transpose(1, 2).contiguous()
@@ -496,6 +496,7 @@ def get_benchmark():
                 quantiles=quantiles,
             )
         elif provider == "Triton":
+
             def run_triton():
                 qkv = model_attn.act(model_attn.qkv_proj(hidden_states))
                 new_shape = qkv.size()[:-1] + (model_attn.num_heads, -1)
@@ -517,6 +518,7 @@ def get_benchmark():
                 quantiles=quantiles,
             )
         else:  # SGL
+
             def run_sgl():
                 qkv = model_attn.act(model_attn.qkv_proj(hidden_states))
                 new_shape = qkv.size()[:-1] + (model_attn.num_heads, -1)
@@ -528,8 +530,10 @@ def get_benchmark():
 
                 output = torch.empty_like(v)
                 new_kv = torch.empty_like(past_kv)
-                sgl_lightning_attention_decode(q, k, v, past_kv, slope_rate, output, new_kv)
-                
+                sgl_lightning_attention_decode(
+                    q, k, v, past_kv, slope_rate, output, new_kv
+                )
+
                 output = output.transpose(1, 2).contiguous()
                 output = output.view(batch_size, seq_len, -1)
                 output = model_attn.norm(output)
