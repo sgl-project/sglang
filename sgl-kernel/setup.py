@@ -42,6 +42,7 @@ nvcc_flags = [
     "-gencode=arch=compute_90,code=sm_90",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-DNDEBUG",
 ]
 
 
