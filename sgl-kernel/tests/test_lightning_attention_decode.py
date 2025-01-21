@@ -63,6 +63,8 @@ def test_lightning_attention_decode():
             rtol = 1e-2
             atol = 1e-2
 
+            print('output.sum(): ', output.sum())
+            print('ref_output.sum(): ', ref_output.sum())
             torch.testing.assert_close(
                 output, 
                 ref_output,
@@ -71,7 +73,9 @@ def test_lightning_attention_decode():
                 msg=f"Output mismatch for batch_size={batch_size}, num_heads={num_heads}, "
                     f"dim={dim}, embed_dim={embed_dim}, dtype={dtype}"
             )
-            
+
+            print('new_kv.sum(): ', new_kv.sum())
+            print('ref_new_kv.sum(): ', ref_new_kv.sum())
             torch.testing.assert_close(
                 new_kv,
                 ref_new_kv,

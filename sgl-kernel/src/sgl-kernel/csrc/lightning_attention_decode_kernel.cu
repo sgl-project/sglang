@@ -6,8 +6,7 @@
 
 #include "utils.hpp"
 
-#define WARP_SIZE 32
-#define WARPS_PER_BLOCK 4
+#define THREADS_PER_BLOCK 128
 
 template<typename T>
 __global__ void lightning_attention_decode_kernel(
@@ -23,54 +22,74 @@ __global__ void lightning_attention_decode_kernel(
     const int dim,
     const int embed_dim) {
     
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int lane_id = tx;
+    extern __shared__ char smem[];
+    T* q_shared = reinterpret_cast<T*>(smem);
+    T* k_shared = reinterpret_cast<T*>(smem + dim * sizeof(T));
+    T* v_shared = reinterpret_cast<T*>(smem + 2 * dim * sizeof(T));
+    float* new_kv_shared = reinterpret_cast<float*>(smem + (2 * dim + embed_dim) * sizeof(T));
+    T* output_shared = reinterpret_cast<T*>(smem + (2 * dim + embed_dim) * sizeof(T) + dim * (embed_dim + 1) * sizeof(float));
     
-    const int current_head = blockDim.y * blockIdx.x + ty;
-    const int b = current_head / num_heads;
-    const int h = current_head % num_heads;
+    const int32_t tid = threadIdx.x;
+    const int32_t current_head = blockIdx.x;
+    const int32_t b = current_head / num_heads;
+    const int32_t h = current_head % num_heads;
     
     if (b >= batch_size) return;
     
-    const int64_t qk_offset = b * num_heads * dim + h * dim;
-    const int64_t v_offset = b * num_heads * embed_dim + h * embed_dim;
-    const int64_t kv_offset = b * num_heads * dim * embed_dim + h * dim * embed_dim;
+    const int32_t qk_offset = b * num_heads * dim + h * dim;
+    const int32_t v_offset = b * num_heads * embed_dim + h * embed_dim;
+    const int32_t kv_offset = b * num_heads * dim * embed_dim + h * dim * embed_dim;
     
-    // 声明共享内存数组
-    __shared__ T shared_q[WARPS_PER_BLOCK][96];
-    __shared__ T shared_k[WARPS_PER_BLOCK][96];
-    __shared__ T shared_v[WARPS_PER_BLOCK][96];
+    for (int d = tid; d < dim; d += blockDim.x) {
+        q_shared[d] = q[qk_offset + d];
+        k_shared[d] = k[qk_offset + d];
+    }
+    for (int e = tid; e < embed_dim; e += blockDim.x) {
+        v_shared[e] = v[v_offset + e];
+    }
     
-    // 加载数据到共享内存
-    for (int d = tx; d < dim; d += WARP_SIZE) {
-        shared_k[ty][d] = k[qk_offset + d];
-        shared_q[ty][d] = q[qk_offset + d];
-    }
-    for (int e = tx; e < embed_dim; e += WARP_SIZE) {
-        shared_v[ty][e] = v[v_offset + e];
-    }
     __syncthreads();
     
-    // 1. 计算新的kv: new_kv = ratio * past_kv + k * v^T
     const float ratio = expf(-1.0f * slope[h]);
-    for (int d = lane_id; d < dim; d += WARP_SIZE) {
-        for (int e = 0; e < embed_dim; e++) {
-            float val = ratio * past_kv[kv_offset + d * embed_dim + e];
-            val += shared_k[ty][d] * shared_v[ty][e];
-            new_kv[kv_offset + d * embed_dim + e] = val;
+    
+    for (int d = tid; d < dim; d += blockDim.x) {
+        T k_val = k_shared[d];
+        for (int e = 0; e < embed_dim; ++e) {
+            int past_kv_idx = kv_offset + d * embed_dim + e;
+            T v_val = v_shared[e];
+            float new_val = ratio * past_kv[past_kv_idx] + k_val * v_val;
+            int shared_idx = d * (embed_dim + 1) + e;
+            new_kv_shared[shared_idx] = new_val;
         }
     }
     
     __syncthreads();
     
-    // 2. 计算qkv attention输出: output = q * new_kv
-    for (int e = lane_id; e < embed_dim; e += WARP_SIZE) {
+    for (int idx = tid; idx < dim * embed_dim; idx += blockDim.x) {
+        int d = idx / embed_dim;
+        int e = idx % embed_dim;
+        int shared_idx = d * (embed_dim + 1) + e;
+        int global_idx = kv_offset + idx;
+        new_kv[global_idx] = new_kv_shared[shared_idx];
+    }
+    
+    __syncthreads();
+    
+    for (int e = tid; e < embed_dim; e += blockDim.x) {
         float sum = 0.0f;
-        for (int d = 0; d < dim; d++) {
-            sum += static_cast<float>(shared_q[ty][d]) * new_kv[kv_offset + d * embed_dim + e];
+        for (int d = 0; d < dim; ++d) {
+            int shared_idx = d * (embed_dim + 1) + e;
+            sum += q_shared[d] * new_kv_shared[shared_idx];
         }
-        output[v_offset + e] = static_cast<T>(sum);
+        output_shared[e] = static_cast<T>(sum);
+    }
+    
+    __syncthreads();
+    
+    if (tid == 0) {
+        for (int e = 0; e < embed_dim; ++e) {
+            output[v_offset + e] = output_shared[e];
+        }
     }
 }
 
@@ -93,14 +112,15 @@ void lightning_attention_decode(
     auto dim = q.size(3);
     auto embed_dim = v.size(3);
     
-    dim3 block(WARP_SIZE, WARPS_PER_BLOCK);  // (32, 8)
-    dim3 grid((batch_size * num_heads + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    dim3 block(THREADS_PER_BLOCK);
+    dim3 grid(batch_size * num_heads);
     
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     
     AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, q.scalar_type(), "lightning_attention_decode_kernel", ([&] {
-        lightning_attention_decode_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        size_t smem_size = (2 * dim + 2 * embed_dim) * sizeof(scalar_t) + dim * (embed_dim + 1) * sizeof(float);
+        lightning_attention_decode_kernel<scalar_t><<<grid, block, smem_size, stream>>>(
             q.data_ptr<scalar_t>(),
             k.data_ptr<scalar_t>(),
             v.data_ptr<scalar_t>(),
