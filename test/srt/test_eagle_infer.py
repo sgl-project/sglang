@@ -2,12 +2,14 @@ import random
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
 import requests
 
 import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
+from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -36,15 +38,15 @@ class TestEAGLEEngine(unittest.TestCase):
             speculative_num_steps=5,
             speculative_eagle_topk=8,
             speculative_num_draft_tokens=64,
+            mem_fraction_static=0.7,
         )
 
-        # Test the output of EAGLE engine is the same as normal engine
+        # Case 1: Test the output of EAGLE engine is the same as normal engine
         out1 = engine.generate(prompt, sampling_params)["text"]
-        engine.shutdown()
         print(f"{out1=}, {ref_output=}")
         self.assertEqual(out1, ref_output)
 
-        # Test the output of EAGLE engine does not contain unexpected EOS
+        # Case 2: Test the output of EAGLE engine does not contain unexpected EOS
         prompt = "[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nToday is a sunny day and I like [/INST]"
         sampling_params = {
             "temperature": 0,
@@ -54,8 +56,22 @@ class TestEAGLEEngine(unittest.TestCase):
 
         tokenizer = get_tokenizer(DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST)
         out2 = engine.generate(prompt, sampling_params)["text"]
+        print(f"{out2=}")
         tokens = tokenizer.encode(out2, truncation=False)
         assert tokenizer.eos_token_id not in tokens
+
+        # Case 3: Batched prompts
+        prompts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        sampling_params = {"temperature": 0, "max_new_tokens": 30}
+        outputs = engine.generate(prompts, sampling_params)
+        for prompt, output in zip(prompts, outputs):
+            print("===============================")
+            print(f"Prompt: {prompt}\nGenerated text: {output['text']}")
 
         # Shutdown the engine
         engine.shutdown()
@@ -129,7 +145,7 @@ class TestEAGLEServer(unittest.TestCase):
                 print(e)
                 pass
 
-    def test_eagle_server_request_abort(self):
+    def test_request_abort(self):
         concurrency = 4
         threads = [
             threading.Thread(
@@ -148,6 +164,21 @@ class TestEAGLEServer(unittest.TestCase):
             worker.start()
         for p in threads:
             p.join()
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        self.assertGreater(metrics["accuracy"], 0.81)
 
 
 if __name__ == "__main__":

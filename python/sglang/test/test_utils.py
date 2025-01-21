@@ -541,6 +541,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    disable_ignore_eos=False,
     need_warmup=False,
 ):
     # Launch the server
@@ -575,7 +576,7 @@ def run_bench_serving(
         disable_stream=disable_stream,
         return_logprob=False,
         seed=0,
-        disable_ignore_eos=False,
+        disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
