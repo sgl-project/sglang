@@ -6,6 +6,8 @@ from sgl_kernel.ops import (
     int8_scaled_mm,
     moe_align_block_size,
     register_graph_buffers,
+    rmsnorm,
+    rotary_embedding,
     sampling_scaling_penalties,
 )
 
@@ -18,4 +20,6 @@ __all__ = [
     "sampling_scaling_penalties",
     "get_graph_buffer_ipc_meta",
     "register_graph_buffers",
+    "rotary_embedding",
+    "rmsnorm",
 ]

@@ -1,3 +1,6 @@
+from typing import Optional
+
+import torch
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
 from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import (
@@ -7,6 +10,8 @@ from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
 from sgl_kernel.ops._kernels import int8_scaled_mm as _int8_scaled_mm
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
 from sgl_kernel.ops._kernels import register_graph_buffers as _register_graph_buffers
+from sgl_kernel.ops._kernels import rmsnorm as _rmsnorm
+from sgl_kernel.ops._kernels import rotary_embedding as _rotary_embedding
 from sgl_kernel.ops._kernels import (
     sampling_scaling_penalties as _sampling_scaling_penalties,
 )
@@ -71,3 +76,21 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         out_dtype,
         bias,
     )
+
+
+def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
+    return _rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+
+
+def rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is None:
+        out = torch.empty_like(input)
+    stream = torch.cuda.current_stream().cuda_stream
+    stream_int = int(stream)
+    _rmsnorm(out, input, weight, eps, stream_int)
+    return out
