@@ -308,8 +308,6 @@ def extend_attention_fwd(
     o_extend,
     k_buffer,
     v_buffer,
-    k_scale_zeros_buffer,
-    v_scale_zeros_buffer,
     req_to_tokens,
     b_req_idx,
     b_seq_len,
@@ -318,6 +316,9 @@ def extend_attention_fwd(
     max_len_extend,
     sm_scale=None,
     logit_cap=0.0,
+    k_scale_zeros_buffer=None,
+    v_scale_zeros_buffer=None,
+    kv_cache_dtype=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -326,7 +327,7 @@ def extend_attention_fwd(
     """
 
     # assert kv dtype
-    USE_INT8_KV = k_buffer[0].dtype == torch.uint8
+    USE_INT8_KV = kv_cache_dtype == torch.int8
 
     Lq, Lk, Lv = (
         q_extend.shape[-1],
