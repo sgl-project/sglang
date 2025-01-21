@@ -81,6 +81,7 @@ ext_modules = [
         },
         libraries=libraries,
         extra_link_args=extra_link_args,
+        py_limited_api=True
     ),
 ]
 
@@ -89,9 +90,23 @@ setup(
     version=get_version(),
     packages=find_packages(),
     package_dir={"": "src"},
+    include_package_data=True,
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch"],
+    python_requires=">=3.8",
+    options={
+        "bdist_wheel": {
+            "py_limited_api": "cp38"
+        }
+    },
+    package_data={
+        'sgl_kernel': ['*.py', '*.cpp', '*.cu', '*.h', '*.cuh'],
+        'sgl_kernel.csrc': ['*.py', '*.cpp', '*.cu', '*.h', '*.cuh'],
+        'sgl_kernel.ops': ['*.py', '*.cpp', '*.cu', '*.h', '*.cuh'],
+    },
+    include_package_data=True,
 )
 
 update_wheel_platform_tag()
+
