@@ -199,8 +199,6 @@ class EAGLEDraftInput(SpecInfo):
         self.positions: torch.Tensor = None
         self.accept_length: torch.Tensor = None
         self.accept_length_cpu: List[int] = None
-        self.has_finished: bool = False
-        self.unfinished_index: List[int] = None
 
     def load_server_args(self, server_args: ServerArgs):
         self.topk: int = server_args.speculative_eagle_topk
@@ -449,14 +447,6 @@ class EAGLEDraftInput(SpecInfo):
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def merge_batch(self, spec_info: EAGLEDraftInput):
-        if self.hidden_states is None:
-            self.hidden_states = spec_info.hidden_states
-            self.verified_id = spec_info.verified_id
-            self.sample_output = spec_info.sample_output
-            self.prev_mode = spec_info.prev_mode
-            return
-        if spec_info.hidden_states is None:
-            return
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
@@ -573,6 +563,8 @@ class EagleVerifyInput(SpecInfo):
         finished_extend_len = {}  # {rid:accept_length + 1}
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
+        has_finished = False
+
         # iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
@@ -586,7 +578,7 @@ class EagleVerifyInput(SpecInfo):
                 finished_extend_len[req.rid] = j + 1
                 req.check_finished()
                 if req.finished():
-                    draft_input.has_finished = True
+                    has_finished = True
                     # set all tokens after finished token to -1 and break
                     accept_index[i, j + 1 :] = -1
                     break
@@ -624,8 +616,7 @@ class EagleVerifyInput(SpecInfo):
             draft_input.accept_length_cpu = [
                 accept_length_cpu[i] for i in unfinished_index
             ]
-            draft_input.unfinished_index = unfinished_index
-            if draft_input.has_finished:
+            if has_finished:
                 draft_input.seq_lens_for_draft_extend = batch.seq_lens[unfinished_index]
             else:
                 draft_input.seq_lens_for_draft_extend = batch.seq_lens
