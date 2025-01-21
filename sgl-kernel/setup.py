@@ -2,9 +2,7 @@ from pathlib import Path
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-import os
-import sys
-import multiprocessing
+
 
 root = Path(__file__).parent.resolve()
 

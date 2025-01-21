@@ -2,7 +2,6 @@
 #include <torch/extension.h>
 #include <fstream>
 #include <sstream>
-#include <filesystem>
 
 struct cuda_error : public std::runtime_error {
   /**
