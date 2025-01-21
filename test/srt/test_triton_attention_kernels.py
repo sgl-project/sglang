@@ -259,14 +259,10 @@ class TestTritonAttention(unittest.TestCase):
             dtype=torch.float32,
             device="cuda",
         )
-        k_scales_zeros = None
-        v_scales_zeros = None
         decode_attention_fwd_normal(
             q,
             k_buffer,
             v_buffer,
-            k_scales_zeros,
-            v_scales_zeros,
             o,
             req_to_token,
             b_req_idx,
@@ -286,8 +282,6 @@ class TestTritonAttention(unittest.TestCase):
             q,
             k_buffer,
             v_buffer,
-            k_scales_zeros,
-            v_scales_zeros,
             o_grouped,
             req_to_token,
             b_req_idx,
