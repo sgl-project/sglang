@@ -53,6 +53,9 @@ suites = {
         "test_w8a8_quantization.py",
         "test_session_control.py",
         "test_fp8_kvcache.py",
+        "test_activation.py",
+        "test_block_fp8.py",
+        "test_layernorm.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
