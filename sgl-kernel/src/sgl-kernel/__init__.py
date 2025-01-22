@@ -9,7 +9,7 @@ from sgl_kernel.ops import (
     rotary_embedding,
     sampling_scaling_penalties,
 )
-from sgl_kernel.turbomind import _turbomind_ext as turbomind
+from sgl_kernel.turbomind import turbomind
 
 __all__ = [
     "moe_align_block_size",

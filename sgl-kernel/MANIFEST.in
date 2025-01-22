@@ -1,2 +1,0 @@
-include src/sgl-kernel/turbomind/lib/_turbomind_ext.cpython-312-x86_64-linux-gnu.so
-include src/sgl-kernel/turbomind/__init__.py
