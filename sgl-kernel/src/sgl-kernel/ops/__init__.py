@@ -4,6 +4,8 @@ import torch
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
 from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import fused_add_rmsnorm as _fused_add_rmsnorm
+from sgl_kernel.ops._kernels import gelu_and_mul as _gelu_and_mul
+from sgl_kernel.ops._kernels import gelu_tanh_and_mul as _gelu_tanh_and_mul
 from sgl_kernel.ops._kernels import gemma_fused_add_rmsnorm as _gemma_fused_add_rmsnorm
 from sgl_kernel.ops._kernels import gemma_rmsnorm as _gemma_rmsnorm
 from sgl_kernel.ops._kernels import (
@@ -18,6 +20,7 @@ from sgl_kernel.ops._kernels import rotary_embedding as _rotary_embedding
 from sgl_kernel.ops._kernels import (
     sampling_scaling_penalties as _sampling_scaling_penalties,
 )
+from sgl_kernel.ops._kernels import silu_and_mul as _silu_and_mul
 
 
 def get_cuda_stream(device: torch.device) -> int:
@@ -127,3 +130,61 @@ def gemma_fused_add_rmsnorm(
 ) -> None:
     with input.device as device:
         _gemma_fused_add_rmsnorm(input, residual, weight, eps, get_cuda_stream(device))
+
+
+def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
+    assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
+    assert (
+        input.shape[:-1] == output.shape[:-1]
+    ), f"{input.shape[:-1]} != {output.shape[:-1]}"
+    assert (
+        input.shape[-1] == 2 * output.shape[-1]
+    ), f"{input.shape[-1]} != {2 * output.shape[-1]}"
+
+
+def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    with input.device as device:
+        _silu_and_mul(out, input, get_cuda_stream(device))
+        return out
+
+
+def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    with input.device as device:
+        _gelu_tanh_and_mul(out, input, get_cuda_stream(device))
+        return out
+
+
+def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    with input.device as device:
+        _gelu_and_mul(out, input, get_cuda_stream(device))
+        return out
