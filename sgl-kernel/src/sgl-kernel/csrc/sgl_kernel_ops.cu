@@ -52,6 +52,10 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 // gelu and mul
 void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 
+// bmm fp8
+void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
+             at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -81,4 +85,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Gelu Tanh and Mul (CUDA)");
   // gelu and mul
   m.def("gelu_and_mul", &gelu_and_mul, "Gelu and Mul (CUDA)");
+  // bmm fp8
+  m.def("bmm_fp8", &bmm_fp8, "BMM FP8 (CUDA)");
 }
