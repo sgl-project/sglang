@@ -22,8 +22,7 @@ __global__ void lightning_attention_decode_kernel(
     const int qk_dim,
     const int v_dim) {
 
-    extern __shared__ char smem[]; // 动态共享内存声明
-    // 为所有数组在共享内存中分配空间
+    extern __shared__ char smem[];
     T* q_shared = reinterpret_cast<T*>(smem);
     T* k_shared = reinterpret_cast<T*>(smem + qk_dim * sizeof(T));
     T* v_shared = reinterpret_cast<T*>(smem + 2 * qk_dim * sizeof(T));
