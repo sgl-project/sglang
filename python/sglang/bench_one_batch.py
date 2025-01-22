@@ -57,12 +57,12 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import configure_logger, kill_process_tree, suppress_other_loggers
@@ -99,10 +99,7 @@ class BenchArgs:
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
         parser.add_argument(
-            "--profile",
-            action="store_true",
-            help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            "--profile", action="store_true", help="Use Torch Profiler."
         )
         parser.add_argument(
             "--profile-filename-prefix",
@@ -232,6 +229,7 @@ def extend(reqs, model_runner):
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        enable_custom_logit_processor=False,
     )
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
@@ -380,6 +378,7 @@ def latency_test_run_once(
         parent_dir = os.path.dirname(os.path.abspath(profile_filename))
         os.makedirs(parent_dir, exist_ok=True)
         profiler.export_chrome_trace(profile_filename)
+        rank_print(f"torch profiler chrome trace saved to {profile_filename}")
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -450,7 +449,7 @@ def latency_test(
             il,
             ol,
             server_args.device,
-            bench_args.profile,
+            bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_filename_prefix,
         )
         if ret is not None:

@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from setuptools import setup
+import torch
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
@@ -23,13 +24,33 @@ def update_wheel_platform_tag():
         old_wheel.rename(new_wheel)
 
 
+def get_cuda_version():
+    if torch.version.cuda:
+        return tuple(map(int, torch.version.cuda.split(".")))
+    return (0, 0)
+
+
+def get_device_sm():
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
+
+
+cuda_version = get_cuda_version()
+sm_version = get_device_sm()
+
 cutlass = root / "3rdparty" / "cutlass"
+flashinfer = root / "3rdparty" / "flashinfer"
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
     root / "src" / "sgl-kernel" / "csrc",
+    flashinfer.resolve() / "include",
+    flashinfer.resolve() / "csrc",
 ]
 nvcc_flags = [
+    "-DNDEBUG",
     "-O3",
     "-Xcompiler",
     "-fPIC",
@@ -37,9 +58,25 @@ nvcc_flags = [
     "-gencode=arch=compute_80,code=sm_80",
     "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-std=c++17",
+    "-use_fast_math",
+    "-DFLASHINFER_ENABLE_F16",
+    "-DFLASHINFER_ENABLE_BF16",
 ]
+
+if cuda_version >= (12, 0) and sm_version >= 90:
+    nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+
+for flag in [
+    "-D__CUDA_NO_HALF_OPERATORS__",
+    "-D__CUDA_NO_HALF_CONVERSIONS__",
+    "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-D__CUDA_NO_HALF2_OPERATORS__",
+]:
+    try:
+        torch.utils.cpp_extension.COMMON_NVCC_FLAGS.remove(flag)
+    except ValueError:
+        pass
 cxx_flags = ["-O3"]
 libraries = ["c10", "torch", "torch_python", "cuda"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
@@ -53,6 +90,8 @@ ext_modules = [
             "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
             "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
+            "src/sgl-kernel/csrc/rotary_embedding.cu",
+            "src/sgl-kernel/csrc/norm.cu",
         ],
         include_dirs=include_dirs,
         extra_compile_args={
@@ -67,7 +106,7 @@ ext_modules = [
 setup(
     name="sgl-kernel",
     version=get_version(),
-    packages=["sgl_kernel"],
+    packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

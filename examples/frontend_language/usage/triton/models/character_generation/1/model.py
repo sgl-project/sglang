@@ -3,8 +3,8 @@ import triton_python_backend_utils as pb_utils
 from pydantic import BaseModel
 
 import sglang as sgl
-from sglang import function, set_default_backend
-from sglang.srt.constrained import build_regex_from_object
+from sglang import function
+from sglang.srt.constrained.outlines_backend import build_regex_from_object
 
 sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
 

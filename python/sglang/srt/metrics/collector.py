@@ -25,6 +25,7 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
+    spec_accept_length: float = 0.0
 
 
 class SchedulerMetricsCollector:
@@ -37,42 +38,49 @@ class SchedulerMetricsCollector:
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
-            documentation="The number of running requests",
+            documentation="The number of running requests.",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.num_used_tokens = Gauge(
             name="sglang:num_used_tokens",
-            documentation="The number of used tokens",
+            documentation="The number of used tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.token_usage = Gauge(
             name="sglang:token_usage",
-            documentation="The token usage",
+            documentation="The token usage.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
 
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
-            documentation="The generate throughput (token/s)",
+            documentation="The generation throughput (token/s).",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.num_queue_reqs = Gauge(
             name="sglang:num_queue_reqs",
-            documentation="The number of requests in the waiting queue",
+            documentation="The number of requests in the waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
-            documentation="The cache hit rate",
+            documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.spec_accept_length = Gauge(
+            name="sglang:spec_accept_length",
+            documentation="The average acceptance length of speculative decoding.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -88,6 +96,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
 
 
 class TokenizerMetricsCollector:

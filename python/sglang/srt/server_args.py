@@ -29,8 +29,8 @@ from sglang.srt.utils import (
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
-    is_ipv6,
     is_port_available,
+    is_valid_ipv6_address,
     nullable_str,
 )
 
@@ -158,6 +158,9 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
+
+    # Custom logit processor
+    enable_custom_logit_processor: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -392,7 +395,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda", "xpu", "hpu"],
+            choices=["cuda", "xpu", "hpu", "cpu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -865,6 +868,11 @@ class ServerArgs:
             action="store_true",
             help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
         )
+        parser.add_argument(
+            "--enable-custom-logit-processor",
+            action="store_true",
+            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -875,7 +883,7 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_ipv6(self.host):
+        if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
