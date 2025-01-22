@@ -1,6 +1,6 @@
 #include <vector>
 
-#include "utils.hpp"
+#include "utils.h"
 
 // trt_reduce
 using fptr_t = int64_t;
