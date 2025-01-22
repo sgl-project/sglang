@@ -39,6 +39,7 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
+        self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         super().reset()
 
@@ -223,16 +224,18 @@ class HiRadixCache(RadixCache):
         else:
             ancester_node = node
 
+        # protect the ancestor nodes from eviction
+        delta = self.inc_lock_ref(ancester_node)
+
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         if len(host_indices) < self.load_back_threshold or (
-            len(host_indices) > mem_quota if mem_quota is not None else False
+            len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
-            # skip loading back if the total size is too small
+            # skip loading back if the total size is too small or exceeding the memory quota
+            self.dec_lock_ref(ancester_node)
             return None
 
-        # protect the ancestor nodes from eviction
-        self.inc_lock_ref(ancester_node)
         device_indices = self.cache_controller.load(
             host_indices=host_indices, node_id=last_hit_node.id
         )
