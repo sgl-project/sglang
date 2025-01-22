@@ -28,7 +28,8 @@ runtime_common = [
 srt = [
     "sglang[runtime_common]", "cuda-python",
     "sgl-kernel>=0.0.2.post14", "torch", "vllm==0.6.4.post1",
-    "flashinfer==0.1.6"
+    "flashinfer==0.1.6",
+    "grpcio==1.68.1", "grpcio-tools==1.68.1"
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
