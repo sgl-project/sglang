@@ -30,7 +30,8 @@ class TestOpenAIServerFunctionCalling(unittest.TestCase):
             api_key=cls.api_key,
             other_args=[
                 # If your server needs extra parameters to test function calling, please add them here.
-                # "--enable-tools",
+                "--tool-call-parser",
+                "llama3",
             ],
         )
         cls.base_url += "/v1"
@@ -214,7 +215,7 @@ class TestOpenAIServerFunctionCalling(unittest.TestCase):
             if choice.delta.tool_calls:
                 tool_call = choice.delta.tool_calls[0]
                 # Record the function name on first occurrence
-                function_name = tool_call.function.name.strip() or function_name
+                function_name = tool_call.function.name or function_name
                 # In case of multiple chunks, JSON fragments may need to be concatenated
                 if tool_call.function.arguments:
                     argument_fragments.append(tool_call.function.arguments)
@@ -238,10 +239,10 @@ class TestOpenAIServerFunctionCalling(unittest.TestCase):
         self.assertIn("b", args_obj, "Missing parameter 'b'")
         self.assertEqual(
             args_obj["a"],
-            "5",
-            "Parameter a should be the string '5' (can be converted to int after recognized by the model)",
+            5,
+            "Parameter a should be 5",
         )
-        self.assertEqual(args_obj["b"], "7", "Parameter b should be the string '7'")
+        self.assertEqual(args_obj["b"], 7, "Parameter b should be 7")
 
 
 if __name__ == "__main__":

@@ -470,7 +470,7 @@ class FunctionCallParser:
             else:
                 raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
         else:
-            detectors = [cls() for cls in self.ToolCallParserEnum.values()]
+            raise ValueError("Tool Call Parser Not Given!")
 
         self.multi_format_parser = MultiFormatParser(detectors)
         self.tools = tools
