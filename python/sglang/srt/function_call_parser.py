@@ -78,6 +78,7 @@ class BaseFormatDetector:
             []
         )  # map what has been streamed for each tool so far to a list
         self.bot_token = ""
+        self.eot_token = ""
 
     def parse_base_json(self, action: Dict, tools: List[Function]):
         name, parameters = action["name"], json.dumps(
@@ -109,9 +110,10 @@ class BaseFormatDetector:
         # Append new text to buffer
         self._buffer += new_text
         current_text = self._buffer
-        if not (
-            current_text.startswith(self.bot_token) or current_text.startswith("{")
-        ):
+        if not (self.bot_token in current_text or current_text.startswith("{")):
+            self._buffer = ""
+            if self.eot_token in new_text:
+                new_text = new_text.replace(self.eot_token, "")
             return StreamingParseResult(normal_text=new_text)
 
         # bit mask flags for partial JSON parsing. If the name hasn't been
@@ -237,6 +239,11 @@ class BaseFormatDetector:
                     argument_diff = None
                     if is_complete[self.current_tool_id]:
                         argument_diff = cur_args_json[sent:]
+                        self._buffer = ""
+                        self.prev_tool_call_arr[self.current_tool_id].clear()
+                        self.current_tool_name_sent: bool = False
+                        self.streamed_args_for_tool[self.current_tool_id] = ""
+
                     elif prev_arguments:
                         prev_args_json = json.dumps(prev_arguments)
                         if cur_args_json != prev_args_json:
@@ -254,14 +261,16 @@ class BaseFormatDetector:
                                 )
                             ],
                         )
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        if not is_complete[self.current_tool_id]:
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += argument_diff
 
             self.prev_tool_call_arr = tool_call_arr
             return res
 
-        except Exception:
+        except Exception as e:
+            print(e)
             # Skipping chunk as a result of tool streaming extraction error
             return StreamingParseResult()
 
@@ -279,6 +288,7 @@ class Qwen25Detector(BaseFormatDetector):
         """
         super().__init__()
         self.bot_token = "<tool_call>"
+        self.eot_token = "</tool_call>"
 
     def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
         """
