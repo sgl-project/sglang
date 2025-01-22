@@ -91,7 +91,7 @@ ext_modules = [
             "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
             "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
             "src/sgl-kernel/csrc/rotary_embedding.cu",
-            "src/sgl-kernel/csrc/norm.cu",
+            "3rdparty/flashinfer/csrc/norm.cu",
         ],
         include_dirs=include_dirs,
         extra_compile_args={
