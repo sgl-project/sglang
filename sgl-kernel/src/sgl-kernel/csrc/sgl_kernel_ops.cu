@@ -43,6 +43,15 @@ void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, do
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
                              int64_t cuda_stream);
 
+// silu and mul
+void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+
+// gelu tanh and mul
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+
+// gelu and mul
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -66,4 +75,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemma_rmsnorm", &gemma_rmsnorm, "Gemma RMSNorm (CUDA)");
   // fused gemma rms norm
   m.def("gemma_fused_add_rmsnorm", &gemma_fused_add_rmsnorm, "Gemma Fused Add RMSNorm (CUDA)");
+  // silu and mul
+  m.def("silu_and_mul", &silu_and_mul, "Silu and Mul (CUDA)");
+  // gelu tanh and mul
+  m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Gelu Tanh and Mul (CUDA)");
+  // gelu and mul
+  m.def("gelu_and_mul", &gelu_and_mul, "Gelu and Mul (CUDA)");
 }

@@ -2,6 +2,8 @@ from sgl_kernel.ops import (
     custom_dispose,
     custom_reduce,
     fused_add_rmsnorm,
+    gelu_and_mul,
+    gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     get_graph_buffer_ipc_meta,
@@ -12,12 +14,15 @@ from sgl_kernel.ops import (
     rmsnorm,
     rotary_embedding,
     sampling_scaling_penalties,
+    silu_and_mul,
 )
 
 __all__ = [
     "custom_dispose",
     "custom_reduce",
     "fused_add_rmsnorm",
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "get_graph_buffer_ipc_meta",
@@ -28,4 +33,5 @@ __all__ = [
     "rmsnorm",
     "rotary_embedding",
     "sampling_scaling_penalties",
+    "silu_and_mul",
 ]
