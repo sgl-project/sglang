@@ -1,4 +1,3 @@
-import subprocess
 from pathlib import Path
 
 import torch
@@ -26,12 +25,9 @@ def update_wheel_platform_tag():
 
 
 def get_cuda_version():
-    try:
-        nvcc_output = subprocess.check_output(["nvcc", "--version"]).decode("utf-8")
-        version = nvcc_output.split("release ")[-1].split(",")[0]
-        return tuple(map(int, version.split(".")))
-    except:
-        return (0, 0)
+    if torch.version.cuda:
+        return tuple(map(int, torch.version.cuda.split(".")))
+    return (0, 0)
 
 
 def get_device_sm():
