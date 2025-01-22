@@ -81,12 +81,14 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-I
 
 - View Traces
 
-Traces can be visualized using https://ui.perfetto.dev/.
+Trace files can be loaded and visualized from:
+1. https://ui.perfetto.dev/ (any browser)
+2. chrome://tracing (Chrome browser only)
 
-If Perfetto UI cannot open trace file due to its large size,
+If browser cannot open trace file due to its large size,
 client can generate a small trace file (<100MB) by controlling number of prompts and lengths of prompt outputs.
 For example, when profiling a server,
 ```bash
 python -m sglang.bench_serving --backend sglang --model-path meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
 ```
-sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for perfetto to open smoothly.
+sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
