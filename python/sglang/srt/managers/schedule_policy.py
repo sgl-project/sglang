@@ -136,10 +136,6 @@ class SchedulePolicy:
         """
         self.waiting_queue_radix_tree.reset()
 
-        # We will remove the requests from the waiting queue and put them into this queue
-        # if they have a matching prefix from the existing batch.
-        # In the next round, we will re-add them to the waiting queue.
-        unschedulable_reqs: List[Req] = []
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
 
@@ -165,6 +161,8 @@ class SchedulePolicy:
                     len(in_batch_matching_prefixes)
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
+                    # temporarily mark the request as unschedulable to skip scheduling it for better performance
+                    # we will mark it as schedulable in the next round
                     r.schedulable = False
                 else:
                     # Insert with a dummy key
