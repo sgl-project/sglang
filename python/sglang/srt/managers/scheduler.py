@@ -976,11 +976,12 @@ class Scheduler:
         can_run_list = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+        # mark all the unschedulable requests as schedulable
         for i, req in enumerate(self.waiting_queue):
-            if req in can_run_list:
-                self.waiting_queue.pop(i)
             if not req.schedulable:
                 req.schedulable = True
+        can_run_set = set(can_run_list)
+        self.waiting_queue = [req for req in self.waiting_queue if req in can_run_set]
 
         if adder.new_being_chunked_req is not None:
             assert self.being_chunked_req is None
