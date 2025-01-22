@@ -27,8 +27,8 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
                              const c10::optional<torch::Tensor>& bias);
 
 torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
-                             const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
-                             const c10::optional<torch::Tensor>& bias);
+                            const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
+                            const c10::optional<torch::Tensor>& bias);
 // rotary embedding
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
                       torch::Tensor& cos_sin_cache, bool is_neox);
