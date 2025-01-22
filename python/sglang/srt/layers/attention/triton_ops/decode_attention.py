@@ -738,8 +738,6 @@ def decode_attention_fwd_normal(
     q,
     k_buffer,
     v_buffer,
-    k_scale_zeros_buffer,
-    v_scale_zeros_buffer,
     o,
     req_to_token,
     b_req_idx,
@@ -748,6 +746,8 @@ def decode_attention_fwd_normal(
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    k_scale_zeros_buffer=None,
+    v_scale_zeros_buffer=None,
     kv_cache_dtype=None,
 ):
     _decode_att_m_fwd(
@@ -772,8 +772,6 @@ def decode_attention_fwd_grouped(
     q,
     k_buffer,
     v_buffer,
-    k_scale_zeros_buffer,
-    v_scale_zeros_buffer,
     o,
     req_to_token,
     b_req_idx,
@@ -782,6 +780,8 @@ def decode_attention_fwd_grouped(
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    k_scale_zeros_buffer=None,
+    v_scale_zeros_buffer=None,
     kv_cache_dtype=None,
 ):
     _decode_grouped_att_m_fwd(
@@ -827,8 +827,6 @@ def decode_attention_fwd(
             q,
             k_buffer,
             v_buffer,
-            k_scale_zeros_buffer,
-            v_scale_zeros_buffer,
             o,
             req_to_token,
             b_req_idx,
@@ -837,6 +835,8 @@ def decode_attention_fwd(
             num_kv_splits,
             sm_scale,
             logit_cap,
+            k_scale_zeros_buffer,
+            v_scale_zeros_buffer,
             kv_cache_dtype,
         )
     else:
@@ -845,8 +845,6 @@ def decode_attention_fwd(
             q,
             k_buffer,
             v_buffer,
-            k_scale_zeros_buffer,
-            v_scale_zeros_buffer,
             o,
             req_to_token,
             b_req_idx,
@@ -855,6 +853,8 @@ def decode_attention_fwd(
             num_kv_splits,
             sm_scale,
             logit_cap,
+            k_scale_zeros_buffer,
+            v_scale_zeros_buffer,
             kv_cache_dtype,
         )
 
