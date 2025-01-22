@@ -1018,12 +1018,12 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        try:
-            scaling_type = rope_scaling["rope_type"] 
-        except Exception as e: 
+        if "rope_type" in rope_scaling:
+            scaling_type = rope_scaling["rope_type"]
+        elif "type" in rope_scaling:
             scaling_type = rope_scaling["type"]
-        finally: 
-             raise ValueError(f"Unknown RoPE scaling type")
+        else:
+            raise ValueError("Unknown RoPE scaling type")
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
