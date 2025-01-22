@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field, InitVar
 from typing import List, Optional, Union
+import warnings
 
 from hip.models.hip_attention.gen3.attention_metadata import ScanStage
 
@@ -79,6 +80,10 @@ class HiPAttentionConfig:
         HiPAttentionPerLayerConfig(parsed_json={"second_stage_k": 4096, "sliding_window_size": 1024, "sink_token_size": 256}),
         HiPAttentionPerLayerConfig(),
     ])
+    prefill_layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
+        HiPAttentionPerLayerConfig(parsed_json={"second_stage_k": 4096, "sliding_window_size": 1024, "sink_token_size": 256}),
+        HiPAttentionPerLayerConfig(),
+    ])
     
     # deprecated
     apply_v_dot: bool = False
@@ -129,9 +134,16 @@ class HiPAttentionConfig:
                     HiPAttentionPerLayerConfig(parsed_json=layer)
                     for layer in parsed_json['layers']
                 ]
+                self.prefill_layers = self.layers
                 parsed_json.pop('layers')
+            if 'prefill_layers' in parsed_json:
+                self.prefill_layers = [
+                    HiPAttentionPerLayerConfig(parsed_json=layer)
+                    for layer in parsed_json['prefill_layers']
+                ]
+                parsed_json.pop('prefill_layers')
             if parsed_json:
-                raise ValueError(f'Unknown keys in json: {parsed_json.keys()}')
+                raise Exception(f'Unknown keys in json: {parsed_json.keys()}')
         
         num_stages = len(self.layers[0].stages)
         for layer_config in self.layers:

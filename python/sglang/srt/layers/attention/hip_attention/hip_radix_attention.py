@@ -528,15 +528,21 @@ online_update={online_update}
 
         online_update_cache: bool = False,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
-        is_dense = layer.layer_id in self.hip_config.dense_layers
-        
-        if len(self.hip_config.layers) == 2:
-            layer_config = self.hip_config.layers[0 if is_dense else 1]
-        else:
-            layer_config = self.hip_config.layers[layer.layer_id]
-
         N, num_heads, hidden_dims = query.shape
         dst_seq_len = N // batch_size
+
+        is_decode = dst_seq_len == 1
+        is_dense = layer.layer_id in self.hip_config.dense_layers
+        if not is_decode:
+            if len(self.hip_config.prefill_layers) == 2:
+                layer_config = self.hip_config.prefill_layers[0 if is_dense else 1]
+            else:
+                layer_config = self.hip_config.prefill_layers[layer.layer_id]
+        else:
+            if len(self.hip_config.layers) == 2:
+                layer_config = self.hip_config.layers[0 if is_dense else 1]
+            else:
+                layer_config = self.hip_config.layers[layer.layer_id]
 
         query = query.view(batch_size, dst_seq_len, num_heads, hidden_dims)
 
