@@ -82,6 +82,7 @@ class SchedulePolicy:
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False
+        num_delayed_reqs = 0
         if isinstance(policy, CacheAwarePolicy):
             prefix_computed = True
             num_delayed_reqs = self._compute_prefix_matches(waiting_queue, policy)
