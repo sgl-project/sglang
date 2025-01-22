@@ -24,11 +24,10 @@ import sys
 import threading
 import time
 import uuid
+from concurrent import futures
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
-from concurrent import futures
-from typing import Any, Dict, List, Optional, Union
 
 import fastapi
 import grpc
@@ -39,7 +38,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.grpc_server import CompletionServicer
+from sglang.srt.entrypoints.grpc_server import CompletionServicer
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
@@ -1001,6 +1000,7 @@ class TokenizerManager:
             f"{self.server_args.host}:{self.server_args.grpc_port}"
         )
         return server
+
 
 async def print_exception_wrapper(func):
     """
