@@ -18,7 +18,7 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -78,13 +78,13 @@ class SchedulePolicy:
             req_to_token_pool=None, token_to_kv_pool=None, disable=False
         )
 
-    def calc_priority(self, waiting_queue: List[Req]) -> bool:
+    def calc_priority(self, waiting_queue: List[Req]) -> Tuple[bool, int]:
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False
         if isinstance(policy, CacheAwarePolicy):
             prefix_computed = True
-            self._compute_prefix_matches(waiting_queue, policy)
+            num_delayed_reqs = self._compute_prefix_matches(waiting_queue, policy)
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(waiting_queue)
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
@@ -101,7 +101,7 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        return prefix_computed
+        return prefix_computed, num_delayed_reqs
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if len(waiting_queue) > 128 and self.policy == CacheAwarePolicy.LPM:
@@ -135,6 +135,7 @@ class SchedulePolicy:
             and handles in-batch prefix caching logic.
         """
         self.waiting_queue_radix_tree.reset()
+        num_delayed_reqs = 0
 
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
@@ -164,11 +165,13 @@ class SchedulePolicy:
                     # temporarily mark the request as unschedulable to skip scheduling it for better performance
                     # we will mark it as schedulable in the next round
                     r.schedulable = False
+                    num_delayed_reqs += 1
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool)
                     )
+        return num_delayed_reqs
 
     @staticmethod
     def _sort_by_longest_prefix(waiting_queue: List[Req]) -> None:
