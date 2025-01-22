@@ -40,7 +40,7 @@ from sglang.srt.conversation import (
     generate_chat_conv,
     register_conv_template,
 )
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call_parser import TOOLS_TAG_LIST, FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -1073,15 +1073,7 @@ def v1_chat_generate_response(
             tool_choice = request.tool_choice
             tools = request.tools
 
-        tool_tag_list = [
-            "<|plugin|>",
-            "<function=",
-            "<tool_call>",
-            "<|python_tag|>",
-            "[TOOL_CALLS]",
-        ]
-
-        if tool_choice != "none" and any([i in text for i in tool_tag_list]):
+        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:

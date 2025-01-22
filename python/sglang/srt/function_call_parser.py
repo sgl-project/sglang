@@ -8,6 +8,14 @@ import partial_json_parser
 from partial_json_parser.core.options import Allow
 from pydantic import BaseModel, Field
 
+TOOLS_TAG_LIST = [
+    "<|plugin|>",
+    "<function=",
+    "<tool_call>",
+    "<|python_tag|>",
+    "[TOOL_CALLS]",
+]
+
 
 class Function(BaseModel):
     """Function Tool Template."""
