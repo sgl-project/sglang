@@ -35,6 +35,10 @@ class Sampler(nn.Module):
     ):
         logits = logits_output.next_token_logits
 
+        # Apply the custom logit processors if registered in the sampling info.
+        if sampling_info.has_custom_logit_processor:
+            self._apply_custom_logit_processor(logits, sampling_info)
+
         if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
             logits = torch.where(
@@ -104,8 +108,6 @@ class Sampler(nn.Module):
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
                 )
 
-        batch_next_token_ids = batch_next_token_ids.to(torch.int32)
-
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
             if any(x > 0 for x in top_logprobs_nums):
@@ -119,7 +121,40 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        return batch_next_token_ids
+        return batch_next_token_ids.to(torch.int32)
+
+    def _apply_custom_logit_processor(
+        self, logits: torch.Tensor, sampling_batch_info: SamplingBatchInfo
+    ):
+        """Apply custom logit processors to the logits.
+        This function will modify the logits in-place."""
+
+        assert logits.shape[0] == len(sampling_batch_info), (
+            f"The batch size of logits ({logits.shape[0]}) does not match the batch size of "
+            f"sampling_batch_info ({len(sampling_batch_info)})"
+        )
+
+        for _, (
+            processor,
+            batch_mask,
+        ) in sampling_batch_info.custom_logit_processor.items():
+            # Get the batch indices that need to be processed
+            batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+
+            assert batch_mask.shape[0] == len(sampling_batch_info), (
+                f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
+                f"sampling_batch_info ({len(sampling_batch_info)})"
+            )
+
+            # Apply the processor to the logits
+            logits[batch_mask] = processor(
+                logits[batch_mask],
+                [sampling_batch_info.custom_params[i] for i in batch_indices],
+            )
+
+            logger.debug(
+                f"Custom logit processor {processor.__class__.__name__} is applied."
+            )
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(

@@ -99,7 +99,7 @@ class Session:
 
         if last_req is not None:
             # trim bos token if it is an append
-            if req.input_ids[0] == tokenizer.bos_token_id:
+            if tokenizer is not None and req.input_ids[0] == tokenizer.bos_token_id:
                 req.input_ids = req.input_ids[1:]
 
             input_ids = (
@@ -131,6 +131,7 @@ class Session:
             sampling_params=req.sampling_params,
             lora_path=req.lora_path,
             session_id=self.session_id,
+            custom_logit_processor=req.custom_logit_processor,
         )
         if last_req is not None:
             new_req.image_inputs = last_req.image_inputs

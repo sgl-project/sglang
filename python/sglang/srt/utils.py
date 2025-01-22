@@ -59,6 +59,7 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
+from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +98,8 @@ def is_flashinfer_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
-def is_ipv6(address):
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ipaddress.AddressValueError:
-        return False
+def is_cuda_available():
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def enable_show_time_cost():
@@ -217,6 +214,10 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
+
+    elif device == "cpu":
+        # TODO: rename the variables in the current function to be not GPU specific
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -335,6 +336,8 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
+        except OverflowError:
+            return False
 
 
 def decode_video_base64(video_base64):
@@ -440,6 +443,8 @@ def load_image(image_file: Union[str, bytes]):
     else:
         raise ValueError(f"Invalid image: {image}")
 
+    # if image_size is None:
+    #     image_size = image.size
     return image, image_size
 
 
@@ -505,76 +510,32 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
-def monkey_patch_vllm_p2p_access_check(gpu_id: int):
+def monkey_patch_p2p_access_check():
     """
-    Monkey patch the slow p2p access check in vllm.
+    Monkey patch the slow p2p access check.
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
     # Suppress the warnings from this delete function when using sglang.bench_one_batch
-    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
-vllm_all_gather_backup = None
-
-
-def monkey_patch_vllm_all_gather(reverse: bool = False):
-    """Monkey patch all-gather to remove in-place operations."""
-    from torch.distributed import _functional_collectives as funcol
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    global vllm_all_gather_backup
-    if vllm_all_gather_backup is None:
-        vllm_all_gather_backup = GroupCoordinator.all_gather
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        input_size = input_.size()
-        # Allocate output tensor.
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-
-        output_tensor = funcol.all_gather_tensor(
-            input_, gather_dim=0, group=self.device_group
-        ).view((world_size,) + input_size)
-
-        # Reshape
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
-        return output_tensor
-
-    if reverse:
-        setattr(GroupCoordinator, "all_gather", vllm_all_gather_backup)
-    else:
-        setattr(GroupCoordinator, "all_gather", all_gather)
-
-
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
         GGUFEmbeddingMethod,
         GGUFLinearMethod,
     )
 
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
@@ -782,7 +743,9 @@ def first_rank_print(*args, **kwargs):
         pass
 
 
-def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -795,13 +758,16 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     if socket_type == zmq.PUSH:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-        socket.connect(f"ipc://{endpoint}")
     elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-        socket.bind(f"ipc://{endpoint}")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
 
     return socket
 
@@ -1244,9 +1210,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
-            return f'"{data[:half_length]} ... {data[-half_length:]}"'
+            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
         else:
-            return f'"{data}"'
+            return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -1257,7 +1223,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             "{"
             + ", ".join(
-                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
                 for k, v in data.items()
             )
             + "}"
@@ -1338,6 +1304,25 @@ def parse_tool_response(text, tools, **kwargs):
     return text, call_info_list
 
 
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    b_ = x.shape[0]
+    n_ = x.shape[1]
+    k_ = x.shape[2]
+
+    x_ = x
+    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
+    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
+    else:
+        return x_
+
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
+
 class MultiprocessingSerializer:
     @staticmethod
     def serialize(obj):
@@ -1373,3 +1358,94 @@ def debug_timing(func):
             return func(*args, **kwargs)
 
     return wrapper
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
+
+
+def set_uvicorn_logging_configs():
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    LOGGING_CONFIG["formatters"]["access"][
+        "fmt"
+    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+
+def get_ip() -> str:
+    # SGLANG_HOST_IP env can be ignore
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
+
+    # IP is not set, try to get it from the network interface
+
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    warnings.warn(
+        "Failed to get the IP address, using 0.0.0.0 by default."
+        "The value can be set by the environment variable"
+        " SGLANG_HOST_IP or HOST_IP.",
+        stacklevel=2,
+    )
+    return "0.0.0.0"
+
+
+def get_open_port() -> int:
+
+    port = os.getenv("SGLANG_PORT")
+    if port is not None:
+        while True:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    return port
+            except OSError:
+                port += 1  # Increment port number if already in use
+                logger.info("Port %d is already in use, trying port %d", port - 1, port)
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ValueError:
+        return False
+
+
+def rank0_print(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        print(msg, flush=True)

@@ -18,14 +18,10 @@ impl AppState {
         worker_urls: Vec<String>,
         client: reqwest::Client,
         policy_config: PolicyConfig,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // Create router based on policy
-        let router = match Router::new(worker_urls, policy_config) {
-            Ok(router) => router,
-            Err(error) => panic!("Failed to create router: {}", error),
-        };
-
-        Self { router, client }
+        let router = Router::new(worker_urls, policy_config)?;
+        Ok(Self { router, client })
     }
 }
 
@@ -131,6 +127,7 @@ pub struct ServerConfig {
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
+    // Initialize logger
     Builder::new()
         .format(|buf, record| {
             use chrono::Local;
@@ -152,23 +149,29 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         )
         .init();
 
+    info!("🚧 Initializing router on {}:{}", config.host, config.port);
+    info!("🚧 Initializing workers on {:?}", config.worker_urls);
+    info!("🚧 Policy Config: {:?}", config.policy_config);
+    info!(
+        "🚧 Max payload size: {} MB",
+        config.max_payload_size / (1024 * 1024)
+    );
+
     let client = reqwest::Client::builder()
         .build()
         .expect("Failed to create HTTP client");
 
-    let app_state = web::Data::new(AppState::new(
-        config.worker_urls.clone(),
-        client,
-        config.policy_config.clone(),
-    ));
-
-    info!("✅ Starting router on {}:{}", config.host, config.port);
-    info!("✅ Serving Worker URLs: {:?}", config.worker_urls);
-    info!("✅ Policy Config: {:?}", config.policy_config);
-    info!(
-        "✅ Max payload size: {} MB",
-        config.max_payload_size / (1024 * 1024)
+    let app_state = web::Data::new(
+        AppState::new(
+            config.worker_urls.clone(),
+            client,
+            config.policy_config.clone(),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
     );
+
+    info!("✅ Serving router on {}:{}", config.host, config.port);
+    info!("✅ Serving workers on {:?}", config.worker_urls);
 
     HttpServer::new(move || {
         App::new()

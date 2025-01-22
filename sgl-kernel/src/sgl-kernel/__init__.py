@@ -1,10 +1,15 @@
 from sgl_kernel.ops import (
     custom_dispose,
     custom_reduce,
+    fp8_scaled_mm,
+    get_graph_buffer_ipc_meta,
     init_custom_reduce,
     int8_scaled_mm,
-    fp8_scaled_mm,
     moe_align_block_size,
+    register_graph_buffers,
+    rmsnorm,
+    rotary_embedding,
+    sampling_scaling_penalties,
 )
 
 __all__ = [
@@ -14,4 +19,9 @@ __all__ = [
     "custom_reduce",
     "int8_scaled_mm",
     "fp8_scaled_mm",
+    "sampling_scaling_penalties",
+    "get_graph_buffer_ipc_meta",
+    "register_graph_buffers",
+    "rotary_embedding",
+    "rmsnorm",
 ]
