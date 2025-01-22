@@ -64,11 +64,22 @@ class StreamingParseResult:
         self.calls = calls or []
 
 
-class BaseFormatDetector(ABC):
+class BaseFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    def parse_base_json(self, text: str, tools: List[Function]):
-        action = json.loads(text)
+    def __init__(self):
+        # initialize properties used for state when parsing tool calls in
+        self._buffer = ""
+        # streaming mode
+        self.prev_tool_call_arr: List[Dict] = []
+        self.current_tool_id: int = -1
+        self.current_tool_name_sent: bool = False
+        self.streamed_args_for_tool: List[str] = (
+            []
+        )  # map what has been streamed for each tool so far to a list
+        self.bot_token = ""
+
+    def parse_base_json(self, action: Dict, tools: List[Function]):
         name, parameters = action["name"], json.dumps(
             action.get("parameters", action.get("arguments", {})),
             ensure_ascii=False,
@@ -137,7 +148,7 @@ class BaseFormatDetector(ABC):
                     tool_call_arr.append(obj)
 
             except partial_json_parser.core.exceptions.MalformedJSON:
-                print("not enough tokens to parse into JSON yet")
+                # not enough tokens to parse into JSON yet
                 return StreamingParseResult()
 
             # select as the current tool call the one we're on the state at
@@ -167,7 +178,6 @@ class BaseFormatDetector(ABC):
                         sent = len(self.streamed_args_for_tool[self.current_tool_id])
                         argument_diff = cur_args_json[sent:]
 
-                        print("got arguments diff: %s", argument_diff)
                         res = StreamingParseResult(
                             normal_text=None,
                             calls=[
@@ -252,8 +262,7 @@ class BaseFormatDetector(ABC):
             return res
 
         except Exception:
-            print("Error trying to handle streaming tool call.")
-            print("Skipping chunk as a result of tool streaming extraction " "error")
+            # Skipping chunk as a result of tool streaming extraction error
             return StreamingParseResult()
 
 
@@ -269,19 +278,7 @@ class Qwen25Detector(BaseFormatDetector):
         Initializes the detector with necessary state variables.
         """
         super().__init__()
-        self._buffer = ""
         self.bot_token = "<tool_call>"
-
-        # Indicates the index of the tool call currently being processed; -1 means not started or already finished
-        self.current_tool_id: int = -1
-        # Indicates whether the name of the current tool has already been output (it will only be output once for the same function call)
-        self.current_tool_name_sent: bool = False
-        # Stores the arguments (strings) already sent for each tool, for incremental sending
-        self.streamed_args_for_tool: List[str] = []
-        # Stores the list of all tool calls (JSON objects) parsed in the "previous" iteration
-        self.prev_tool_call_arr: List[Dict] = []
-
-        self.tool_call_regex = re.compile(r"\[{.*?}\]", re.DOTALL)
 
     def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
         """
@@ -297,6 +294,7 @@ class Qwen25Detector(BaseFormatDetector):
         match_result_list = re.findall(pattern, text, re.DOTALL)
         calls = []
         for match_result in match_result_list:
+            match_result = json.loads(match_result)
             calls.extend(self.parse_base_json(match_result, tools))
         return calls
 
@@ -313,15 +311,6 @@ class MistralDetector(BaseFormatDetector):
         Initializes the detector with necessary state variables.
         """
         super().__init__()
-        # initialize properties used for state when parsing tool calls in
-        self._buffer = ""
-        # streaming mode
-        self.prev_tool_call_arr: List[Dict] = []
-        self.current_tool_id: int = -1
-        self.current_tool_name_sent: bool = False
-        self.streamed_args_for_tool: List[str] = (
-            []
-        )  # map what has been streamed for each tool so far to a list
         self.bot_token = "[TOOL_CALLS] ["
         self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
 
@@ -373,19 +362,7 @@ class Llama32Detector(BaseFormatDetector):
         Initializes the detector with necessary state variables.
         """
         super().__init__()
-        self._buffer = ""
         self.bot_token = "<|python_tag|>"
-
-        # Indicates the index of the tool call currently being processed; -1 means not started or already finished
-        self.current_tool_id: int = -1
-        # Indicates whether the name of the current tool has already been output (it will only be output once for the same function call)
-        self.current_tool_name_sent: bool = False
-        # Stores the arguments (strings) already sent for each tool, for incremental sending
-        self.streamed_args_for_tool: List[str] = []
-        # Stores the list of all tool calls (JSON objects) parsed in the "previous" iteration
-        self.prev_tool_call_arr: List[Dict] = []
-
-        self.tool_call_regex = re.compile(r"\[{.*?}\]", re.DOTALL)
 
     def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
         """
@@ -399,6 +376,7 @@ class Llama32Detector(BaseFormatDetector):
         if "<|python_tag|>" not in text:
             return []
         _, action = text.split("<|python_tag|>")
+        action = json.loads(action)
         return self.parse_base_json(action, tools)
 
 
