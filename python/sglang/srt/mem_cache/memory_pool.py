@@ -288,12 +288,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.v_buffer[i][indices] = v_data[i]
 
     def get_key_buffer(self, layer_id: int):
-        if self.kv_cache_dtype == torch.float8_e5m2:
+        if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             return self.k_buffer[layer_id].view(self.kv_cache_dtype)
         return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        if self.kv_cache_dtype == torch.float8_e5m2:
+        if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             return self.v_buffer[layer_id].view(self.kv_cache_dtype)
         return self.v_buffer[layer_id]
 
