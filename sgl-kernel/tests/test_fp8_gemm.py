@@ -1,8 +1,8 @@
 import unittest
 
 import torch
-from vllm._custom_ops import scaled_fp8_quant as vllm_scaled_fp8_quant
 from sgl_kernel import fp8_scaled_mm
+from vllm._custom_ops import scaled_fp8_quant as vllm_scaled_fp8_quant
 
 
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
