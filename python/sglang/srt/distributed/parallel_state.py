@@ -41,8 +41,8 @@ from torch.distributed import Backend, ProcessGroup
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_cuda_alike,
-    supports_custom_op,
     is_hip,
+    supports_custom_op,
 )
 
 
@@ -954,9 +954,7 @@ def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
     if enable and is_hip():
-        logger.warning(
-            "HIP doesn't support custom_all_reduce, so disable it."
-            )
+        logger.warning("HIP doesn't support custom_all_reduce, so disable it.")
         _ENABLE_CUSTOM_ALL_REDUCE = False
 
 
