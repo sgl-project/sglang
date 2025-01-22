@@ -3,6 +3,9 @@ from typing import Optional
 import torch
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
 from sgl_kernel.ops._kernels import dispose as _dispose
+from sgl_kernel.ops._kernels import fused_add_rmsnorm as _fused_add_rmsnorm
+from sgl_kernel.ops._kernels import gemma_fused_add_rmsnorm as _gemma_fused_add_rmsnorm
+from sgl_kernel.ops._kernels import gemma_rmsnorm as _gemma_rmsnorm
 from sgl_kernel.ops._kernels import (
     get_graph_buffer_ipc_meta as _get_graph_buffer_ipc_meta,
 )
@@ -15,6 +18,10 @@ from sgl_kernel.ops._kernels import rotary_embedding as _rotary_embedding
 from sgl_kernel.ops._kernels import (
     sampling_scaling_penalties as _sampling_scaling_penalties,
 )
+
+
+def get_cuda_stream(device: torch.device) -> int:
+    return torch.cuda.current_stream(device).cuda_stream
 
 
 def init_custom_reduce(
@@ -88,9 +95,35 @@ def rmsnorm(
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if out is None:
-        out = torch.empty_like(input)
-    stream = torch.cuda.current_stream().cuda_stream
-    stream_int = int(stream)
-    _rmsnorm(out, input, weight, eps, stream_int)
-    return out
+    with input.device as device:
+        if out is None:
+            out = torch.empty_like(input)
+        _rmsnorm(out, input, weight, eps, get_cuda_stream(device))
+        return out
+
+
+def fused_add_rmsnorm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> None:
+    with input.device as device:
+        _fused_add_rmsnorm(input, residual, weight, eps, get_cuda_stream(device))
+
+
+def gemma_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    with input.device as device:
+        if out is None:
+            out = torch.empty_like(input)
+        _gemma_rmsnorm(out, input, weight, eps, get_cuda_stream(device))
+        return out
+
+
+def gemma_fused_add_rmsnorm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> None:
+    with input.device as device:
+        _gemma_fused_add_rmsnorm(input, residual, weight, eps, get_cuda_stream(device))
