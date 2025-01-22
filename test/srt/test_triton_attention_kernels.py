@@ -259,6 +259,7 @@ class TestTritonAttention(unittest.TestCase):
             dtype=torch.float32,
             device="cuda",
         )
+
         decode_attention_fwd_normal(
             q,
             k_buffer,
