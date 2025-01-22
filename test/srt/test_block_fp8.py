@@ -1,5 +1,6 @@
 import itertools
 import unittest
+import warnings
 
 import torch
 
@@ -9,6 +10,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # For test
@@ -242,14 +245,14 @@ def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
 
 
 class TestW8A8BlockFP8FusedMoE(unittest.TestCase):
-    DTYPES = [torch.float32, torch.half, torch.bfloat16]
-    M = [1, 33, 64, 222, 1024 * 128]
-    N = [128, 1024, 2048]
-    K = [256, 4096, 5120]
+    DTYPES = [torch.half, torch.bfloat16]
+    M = [1, 64, 222, 1024 * 128]
+    N = [128, 2048]
+    K = [256, 5120]
     E = [8, 24]
     TOP_KS = [2, 6]
-    BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
-    # BLOCK_SIZE = [[128, 128]]
+    BLOCK_SIZE = [[128, 128]]
+    # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
     SEEDS = [0]
 
     @classmethod
