@@ -4,7 +4,7 @@
 
 #include <THC/THCAtomics.cuh>
 
-#include "utils.hpp"
+#include "utils.h"
 #include "vectorization.cuh"
 
 template <typename scalar_t>
