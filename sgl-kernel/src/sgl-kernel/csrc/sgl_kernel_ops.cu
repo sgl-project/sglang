@@ -27,8 +27,9 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
                              const c10::optional<torch::Tensor>& bias);
 
 // lightning_attention_decode
-void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor &k, const torch::Tensor &v, const torch::Tensor &past_kv,
-                              const torch::Tensor &slope, torch::Tensor output, torch::Tensor new_kv);
+void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+                                const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
+                                torch::Tensor new_kv);
 
 // rotary embedding
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
