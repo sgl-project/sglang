@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
+from sgl_kernel.ops._kernels import bmm_fp8 as _bmm_fp8
 from sgl_kernel.ops._kernels import dispose as _dispose
 from sgl_kernel.ops._kernels import fused_add_rmsnorm as _fused_add_rmsnorm
 from sgl_kernel.ops._kernels import gelu_and_mul as _gelu_and_mul
@@ -21,10 +22,7 @@ from sgl_kernel.ops._kernels import (
     sampling_scaling_penalties as _sampling_scaling_penalties,
 )
 from sgl_kernel.ops._kernels import silu_and_mul as _silu_and_mul
-
-
-def get_cuda_stream(device: torch.device) -> int:
-    return torch.cuda.current_stream(device).cuda_stream
+from sgl_kernel.ops.utils import _get_cache_buf, _get_cuda_stream
 
 
 def init_custom_reduce(
@@ -101,7 +99,7 @@ def rmsnorm(
     with input.device as device:
         if out is None:
             out = torch.empty_like(input)
-        _rmsnorm(out, input, weight, eps, get_cuda_stream(device))
+        _rmsnorm(out, input, weight, eps, _get_cuda_stream(device))
         return out
 
 
@@ -109,7 +107,7 @@ def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        _fused_add_rmsnorm(input, residual, weight, eps, get_cuda_stream(device))
+        _fused_add_rmsnorm(input, residual, weight, eps, _get_cuda_stream(device))
 
 
 def gemma_rmsnorm(
@@ -121,7 +119,7 @@ def gemma_rmsnorm(
     with input.device as device:
         if out is None:
             out = torch.empty_like(input)
-        _gemma_rmsnorm(out, input, weight, eps, get_cuda_stream(device))
+        _gemma_rmsnorm(out, input, weight, eps, _get_cuda_stream(device))
         return out
 
 
@@ -129,7 +127,7 @@ def gemma_fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        _gemma_fused_add_rmsnorm(input, residual, weight, eps, get_cuda_stream(device))
+        _gemma_fused_add_rmsnorm(input, residual, weight, eps, _get_cuda_stream(device))
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
@@ -154,7 +152,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             dtype=input.dtype,
         )
     with input.device as device:
-        _silu_and_mul(out, input, get_cuda_stream(device))
+        _silu_and_mul(out, input, _get_cuda_stream(device))
         return out
 
 
@@ -170,7 +168,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             dtype=input.dtype,
         )
     with input.device as device:
-        _gelu_tanh_and_mul(out, input, get_cuda_stream(device))
+        _gelu_tanh_and_mul(out, input, _get_cuda_stream(device))
         return out
 
 
@@ -186,5 +184,46 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             dtype=input.dtype,
         )
     with input.device as device:
-        _gelu_and_mul(out, input, get_cuda_stream(device))
+        _gelu_and_mul(out, input, _get_cuda_stream(device))
         return out
+
+
+def _bmm_fp8_internal(
+    workspace_buffer: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+) -> None:
+    with A.device as device:
+        cublas_handle = torch.cuda.current_blas_handle()
+        _bmm_fp8(
+            A,
+            B,
+            D,
+            A_scale,
+            B_scale,
+            workspace_buffer,
+            cublas_handle,
+            _get_cuda_stream(device),
+        )
+
+
+def bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is None:
+        out = torch.empty(
+            (A.shape[0], A.shape[1], B.shape[2]),
+            device=A.device,
+            dtype=dtype,
+        )
+    workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
+    _bmm_fp8_internal(workspace_buffer, A, B, out, A_scale, B_scale)
+    return out

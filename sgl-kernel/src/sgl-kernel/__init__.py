@@ -1,4 +1,5 @@
 from sgl_kernel.ops import (
+    bmm_fp8,
     custom_dispose,
     custom_reduce,
     fused_add_rmsnorm,
@@ -18,6 +19,7 @@ from sgl_kernel.ops import (
 )
 
 __all__ = [
+    "bmm_fp8",
     "custom_dispose",
     "custom_reduce",
     "fused_add_rmsnorm",
