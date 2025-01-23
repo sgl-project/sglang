@@ -4,6 +4,16 @@ import triton.language as tl
 
 
 @triton.jit
+def _quant_int8(val):
+    val_min = tl.min(val, 1)
+    val_max = tl.max(val, 1)
+    scales = 255 / (val_max - val_min)
+    zeros = -val_min / scales
+    q_val = (val * scales[:, None] + zeros[:, None] + 0.5).to(tl.uint8)
+    return q_val, scales, zeros
+
+
+@triton.jit
 def _per_token_quant_int8(
     x_ptr,
     xq_ptr,
