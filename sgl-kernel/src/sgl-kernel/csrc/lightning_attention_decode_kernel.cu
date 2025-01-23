@@ -4,7 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "utils.hpp"
+#include "utils.h"
 
 #define THREADS_PER_BLOCK 128
 
