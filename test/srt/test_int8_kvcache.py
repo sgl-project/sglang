@@ -35,10 +35,9 @@ class TestInt8vcacheBase(unittest.TestCase):
         )
 
 
-class TestFp8KvcacheLlama(TestInt8vcacheBase):
+class TestInt8KvcacheLlama(TestInt8vcacheBase):
     model_config = {
         "model_name": DEFAULT_MODEL_NAME_FOR_TEST,
-        "config_filename": "kv_cache_scales_llama3_8b.json",
     }
 
     @classmethod
@@ -70,7 +69,7 @@ class TestFp8KvcacheLlama(TestInt8vcacheBase):
         self.assertGreaterEqual(metrics["score"], 0.65)
 
 
-class TestInt8KvcacheQwen(TestFp8KvcacheBase):
+class TestInt8KvcacheQwen(TestInt8vcacheBase):
     model_config = {
         "model_name": DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
         "config_filename": "kv_cache_scales_qwen2_1_5b.json",

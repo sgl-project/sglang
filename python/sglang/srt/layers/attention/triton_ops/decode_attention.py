@@ -49,8 +49,8 @@ def _fwd_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
-    K_Scale_Zeros_Buffer,
-    V_Scale_Zeros_Buffer,
+    K_Scales_Zeros_Buffer,
+    V_Scales_Zeros_Buffer,
     sm_scale,
     Req_to_tokens,
     B_req_idx,
@@ -136,14 +136,14 @@ def _fwd_kernel_stage1(
                     kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )
                 k_scales = tl.load(
-                    K_Scale_Zeros_Buffer + offs_scale_k,
+                    K_Scales_Zeros_Buffer + offs_scale_k,
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
                 offs_zeros_k = offs_scale_k + 1
 
                 k_zeros = tl.load(
-                    K_Scale_Zeros_Buffer + offs_zeros_k,
+                    K_Scales_Zeros_Buffer + offs_zeros_k,
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
@@ -179,13 +179,13 @@ def _fwd_kernel_stage1(
                     kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )
                 v_scales = tl.load(
-                    V_Scale_Zeros_Buffer + offs_scale_v,
+                    V_Scales_Zeros_Buffer + offs_scale_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
                 offs_zeros_v = offs_scale_v + 1
                 v_zeros = tl.load(
-                    V_Scale_Zeros_Buffer + offs_zeros_v,
+                    V_Scales_Zeros_Buffer + offs_zeros_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
@@ -317,8 +317,8 @@ def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
-    K_Scale_Zeros_Buffer,
-    V_Scale_Zeros_Buffer,
+    K_Scales_Zeros_Buffer,
+    V_Scales_Zeros_Buffer,
     sm_scale,
     Req_to_tokens,
     B_req_idx,
@@ -424,13 +424,13 @@ def _fwd_grouped_kernel_stage1(
                     kv_loc[None, :] * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 )
                 k_scales = tl.load(
-                    K_Scale_Zeros_Buffer + offs_scale_k,
+                    K_Scales_Zeros_Buffer + offs_scale_k,
                     mask=offs_n[None, :] < split_kv_end,
                     other=1.0,
                 )
                 offs_zeros_k = offs_scale_k + 1
                 k_zeros = tl.load(
-                    K_Scale_Zeros_Buffer + offs_zeros_k,
+                    K_Scales_Zeros_Buffer + offs_zeros_k,
                     mask=offs_n[None, :] < split_kv_end,
                     other=0,
                 )
@@ -487,13 +487,13 @@ def _fwd_grouped_kernel_stage1(
                 )
 
                 v_scales = tl.load(
-                    V_Scale_Zeros_Buffer + offs_scale_v,
+                    V_Scales_Zeros_Buffer + offs_scale_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
                 offs_zeros_v = offs_scale_v + 1
                 v_zeros = tl.load(
-                    V_Scale_Zeros_Buffer + offs_zeros_v,
+                    V_Scales_Zeros_Buffer + offs_zeros_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
