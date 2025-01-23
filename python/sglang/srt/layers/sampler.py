@@ -12,17 +12,28 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import (
     crash_on_warnings,
+    enable_use_sgl_kernel_first,
     get_bool_env_var,
+    is_cuda_available,
     is_flashinfer_available,
 )
 
-if is_flashinfer_available():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_renorm_prob,
-        top_k_top_p_sampling_from_probs,
-        top_p_renorm_prob,
-    )
+if enable_use_sgl_kernel_first:
+    if is_cuda_available():
+        from sgl_kernel import (
+            min_p_sampling_from_probs,
+            top_k_renorm_prob,
+            top_k_top_p_sampling_from_probs,
+            top_p_renorm_prob,
+        )
+else:
+    if is_flashinfer_available():
+        from flashinfer.sampling import (
+            min_p_sampling_from_probs,
+            top_k_renorm_prob,
+            top_k_top_p_sampling_from_probs,
+            top_p_renorm_prob,
+        )
 
 
 logger = logging.getLogger(__name__)

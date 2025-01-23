@@ -66,6 +66,8 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+enable_use_sgl_kernel_first = bool(int(os.getenv("ENABLE_USE_SGL_KERNEL_FIRST", "1")))
+
 
 def is_hip() -> bool:
     """Return whether it is HIP on the AMD ROCm platform."""

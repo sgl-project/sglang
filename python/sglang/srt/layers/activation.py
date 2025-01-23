@@ -20,10 +20,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import (
+    enable_use_sgl_kernel_first,
+    is_cuda_available,
+    is_flashinfer_available,
+)
 
-if is_flashinfer_available():
-    from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+if enable_use_sgl_kernel_first:
+    if is_cuda_available():
+        from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+else:
+    if is_flashinfer_available():
+        from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 from vllm.model_executor.custom_op import CustomOp
 

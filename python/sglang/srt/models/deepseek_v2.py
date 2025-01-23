@@ -60,8 +60,18 @@ from sglang.srt.utils import is_flashinfer_available, is_hip
 
 is_hip_ = is_hip()
 
-if is_flashinfer_available():
-    from flashinfer import bmm_fp8
+from sglang.srt.utils import (
+    enable_use_sgl_kernel_first,
+    is_cuda_available,
+    is_flashinfer_available,
+)
+
+if enable_use_sgl_kernel_first:
+    if is_cuda_available():
+        from sgl_kernel import bmm_fp8
+else:
+    if is_flashinfer_available():
+        from flashinfer import bmm_fp8
 
 
 class DeepseekV2MLP(nn.Module):
