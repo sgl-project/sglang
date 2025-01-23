@@ -21,7 +21,7 @@
 #include <stdint.h>
 #include <torch/all.h>
 
-#include "utils.hpp"
+#include "utils.h"
 
 namespace trt_llm {
 constexpr size_t WARP_SIZE = 32;
