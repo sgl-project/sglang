@@ -238,12 +238,12 @@ impl Router {
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
                 error!(
-                    "Timeout {}s waiting for workers to become healthy",
-                    timeout_secs
+                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    timeout_secs, worker_urls
                 );
                 return Err(format!(
-                    "Timeout {}s waiting for workers to become healthy",
-                    timeout_secs
+                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    timeout_secs, worker_urls
                 ));
             }
 
@@ -644,11 +644,11 @@ impl Router {
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
                 error!(
-                    "Timeout {}s waiting for worker {} to become healthy",
+                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
                     timeout_secs, worker_url
                 );
                 return Err(format!(
-                    "Timeout {}s waiting for worker {} to become healthy",
+                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
                     timeout_secs, worker_url
                 ));
             }
