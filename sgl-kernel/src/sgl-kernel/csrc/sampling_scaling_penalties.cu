@@ -4,7 +4,7 @@
 
 #include <THC/THCAtomics.cuh>
 
-#include "flashinfer/vec_dtypes.cuh"
+#include <flashinfer/vec_dtypes.cuh>
 #include "pytorch_extension_utils.h"
 #include "utils.h"
 
