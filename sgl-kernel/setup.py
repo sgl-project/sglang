@@ -3,15 +3,9 @@ from pathlib import Path
 import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from version import __version__
 
 root = Path(__file__).parent.resolve()
-
-
-def get_version():
-    with open(root / "pyproject.toml") as f:
-        for line in f:
-            if line.startswith("version"):
-                return line.split("=")[1].strip().strip('"')
 
 
 def update_wheel_platform_tag():
@@ -122,7 +116,7 @@ ext_modules = [
 
 setup(
     name="sgl-kernel",
-    version=get_version(),
+    version=__version__,
     packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
