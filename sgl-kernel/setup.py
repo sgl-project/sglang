@@ -128,6 +128,7 @@ ext_modules = [
             "3rdparty/flashinfer/csrc/group_gemm_sm90.cu",
             "3rdparty/flashinfer/csrc/norm.cu",
             "3rdparty/flashinfer/csrc/sampling.cu",
+            "3rdparty/flashinfer/csrc/renorm.cu",
         ],
         include_dirs=include_dirs,
         extra_compile_args={
