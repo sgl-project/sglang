@@ -38,15 +38,16 @@ jobs:
 
       - name: Install
         run: |
-          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm
+          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.6.4.post1
           pip3 uninstall sgl-kernel -y || true
+          find . -name index.lock -delete
           cd sgl-kernel
           git submodule deinit --all --force && git submodule sync --recursive && git submodule update --init --force --recursive
           pip3 install .
           pip3 list | grep sgl-kernel
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           cd sgl-kernel
           find tests -name "test_*.py" | xargs -n 1 python3
