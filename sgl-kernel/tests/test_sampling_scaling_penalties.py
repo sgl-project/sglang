@@ -32,5 +32,5 @@ def test_sampling_scaling_penalties(batch_size, vocab_size, dtype):
 
 
 if __name__ == "__main__":
-    test_sampling_scaling_penalties()
-    print("All tests passed!")
+    pytest.main([__file__])
+
