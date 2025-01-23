@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - sgl-kernel/pyproject.toml
+      - sgl-kernel/version.py
   workflow_dispatch:
 
 concurrency:
