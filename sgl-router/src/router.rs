@@ -359,6 +359,12 @@ impl Router {
 
                         if response.status().is_success() {
                             return response;
+                        } else {
+                            // if the worker is healthy, return the error response
+                            let health_response = self.send_request(client, &worker_url, "/health", req).await;
+                            if health_response.status().is_success() {
+                                return response;
+                            }
                         }
 
                         warn!(
@@ -610,6 +616,12 @@ impl Router {
 
                 if response.status().is_success() {
                     return response;
+                } else {
+                    // if the worker is healthy, return the error response
+                    let health_response = self.send_request(client, &worker_url, "/health", req).await;
+                    if health_response.status().is_success() {
+                        return response;
+                    }
                 }
 
                 warn!(

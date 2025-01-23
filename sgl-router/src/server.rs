@@ -121,6 +121,14 @@ async fn remove_worker(
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
+#[post("/check_auth")]
+async fn check_auth(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    HttpResponse::Unauthorized().body("Unauthorized")
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
