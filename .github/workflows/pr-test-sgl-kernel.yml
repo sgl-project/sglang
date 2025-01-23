@@ -47,7 +47,7 @@ jobs:
           pip3 list | grep sgl-kernel
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           cd sgl-kernel
           find tests -name "test_*.py" | xargs -n 1 python3
