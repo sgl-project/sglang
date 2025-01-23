@@ -185,9 +185,12 @@ class ModelRunner:
         self.load_model()
 
         # Apply torchao quantization
-        apply_torchao_config_to_model(
-            self.model, global_server_args_dict["torchao_config"]
-        )
+        torchao_applied = getattr(self.model, "torchao_applied", False)
+        # In layered loading, torchao may have been applied
+        if not torchao_applied:
+            apply_torchao_config_to_model(
+                self.model, global_server_args_dict["torchao_config"]
+            )
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
