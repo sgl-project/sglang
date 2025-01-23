@@ -4,8 +4,9 @@
 
 #include <THC/THCAtomics.cuh>
 
+#include "flashinfer/vec_dtypes.cuh"
+#include "pytorch_extension_utils.h"
 #include "utils.h"
-#include "vectorization.cuh"
 
 template <typename scalar_t>
 __global__ void sampling_scaling_penalties_kernel(const scalar_t* logits, const scalar_t* scaling_penalties,
@@ -13,31 +14,31 @@ __global__ void sampling_scaling_penalties_kernel(const scalar_t* logits, const 
   const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int32_t stride = blockDim.x * gridDim.x;
 
-  auto const* vectorized_logits = reinterpret_cast<vec4_t<scalar_t> const*>(logits);
-  auto const* vectorized_penalties = reinterpret_cast<vec4_t<scalar_t> const*>(scaling_penalties);
-  auto* vectorized_output = reinterpret_cast<vec4_t<scalar_t>*>(output);
+  constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
+  using vec_t = flashinfer::vec_t<scalar_t, vec_size>;
 
-  const int32_t num_vec_elems = numel >> 2;
+  const int32_t num_vec_elems = numel / vec_size;
 
-#pragma unroll 4
+#pragma unroll 1
   for (int32_t i = tid; i < num_vec_elems; i += stride) {
-    vec4_t<scalar_t> logits_vec = vectorized_logits[i];
-    vec4_t<scalar_t> penalties_vec = vectorized_penalties[i];
-    vec4_t<scalar_t> out_vec;
+    vec_t logits_vec, penalties_vec, out_vec;
+    logits_vec.cast_load(logits + i * vec_size);
+    penalties_vec.cast_load(scaling_penalties + i * vec_size);
 
-    out_vec.x = logits_vec.x > 0 ? logits_vec.x / penalties_vec.x : logits_vec.x * penalties_vec.x;
-    out_vec.y = logits_vec.y > 0 ? logits_vec.y / penalties_vec.y : logits_vec.y * penalties_vec.y;
-    out_vec.z = logits_vec.z > 0 ? logits_vec.z / penalties_vec.z : logits_vec.z * penalties_vec.z;
-    out_vec.w = logits_vec.w > 0 ? logits_vec.w / penalties_vec.w : logits_vec.w * penalties_vec.w;
+#pragma unroll
+    for (uint32_t j = 0; j < vec_size; ++j) {
+      out_vec[j] = logits_vec[j] > scalar_t(0.0f) ? logits_vec[j] / penalties_vec[j] : logits_vec[j] * penalties_vec[j];
+    }
 
-    vectorized_output[i] = out_vec;
+    out_vec.cast_store(output + i * vec_size);
   }
 
-  const int32_t start_idx = num_vec_elems * 4;
+  // process the remaining elements
+  const int32_t start_idx = num_vec_elems * vec_size;
   for (int32_t i = start_idx + tid; i < numel; i += stride) {
     scalar_t logit = logits[i];
     scalar_t penalty = scaling_penalties[i];
-    output[i] = logit > 0 ? logit / penalty : logit * penalty;
+    output[i] = logit > scalar_t(0.0f) ? logit / penalty : logit * penalty;
   }
 }
 
@@ -48,12 +49,14 @@ torch::Tensor sampling_scaling_penalties(const torch::Tensor& logits, const torc
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, logits.scalar_type(), "sampling_scaling_penalties_kernel", ([&] {
-        const int blocks = (numel + threads * 4 - 1) / (threads * 4);
-        sampling_scaling_penalties_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-            logits.data_ptr<scalar_t>(), scaling_penalties.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(), numel);
-      }));
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(logits.scalar_type(), scalar_t, [&] {
+    uint32_t vec_size = 16 / sizeof(scalar_t);
+    const int blocks = (numel + threads * vec_size - 1) / (threads * vec_size);
+    sampling_scaling_penalties_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        static_cast<scalar_t*>(logits.data_ptr()), static_cast<scalar_t*>(scaling_penalties.data_ptr()),
+        static_cast<scalar_t*>(output.data_ptr()), numel);
+    return true;
+  });
 
   return output;
 }
