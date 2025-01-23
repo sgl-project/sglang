@@ -1,11 +1,11 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <pytorch_extension_utils.h>
 
 #include <THC/THCAtomics.cuh>
-
 #include <flashinfer/vec_dtypes.cuh>
-#include <pytorch_extension_utils.h>
+
 #include "utils.h"
 
 template <typename scalar_t>
