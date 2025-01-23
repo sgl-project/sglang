@@ -45,14 +45,14 @@ Please consult the documentation below to learn more about the parameters you ma
 * `tokenizer_mode`: By default `auto`, see [here](https://huggingface.co/docs/transformers/en/main_classes/tokenizer) for different mode.
 * `load_format`: The format the weights are loaded in. Defaults to `*.safetensors`/`*.bin`.
 * `trust_remote_code`:  If `True`, will use locally cached config files, other wise use remote configs in HuggingFace.
-* `dtype`: Dtype used for the model, defaults to `bfloat16`. 
+* `dtype`: Dtype used for the model, defaults to `bfloat16`.
 * `kv_cache_dtype`: Dtype of the kv cache, defaults to the `dtype`.
 * `context_length`: The number of tokens our model can process *including the input*. Not that extending the default might lead to strange behavior.
 * `device`: The device we put the model, defaults to `cuda`.
 * `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.html#Chat-Template).
 * `is_embedding`: Set to true to perform [embedding](https://docs.sglang.ai/backend/openai_api_embeddings.html) / [enocode](https://docs.sglang.ai/backend/native_api.html#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api.html#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
-* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. 
+* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF.
 * `json_model_override_args`: Override model config with the provided JSON.
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
@@ -98,7 +98,7 @@ Please consult the documentation below to learn more about the parameters you ma
 ## Other runtime options
 
 * `stream_interval`: Interval (in tokens) for streaming responses. Smaller values lead to smoother streaming, and larger values lead to better throughput.
-* `random_seed`: Can be used to enforce more deterministic behavior. 
+* `random_seed`: Can be used to enforce more deterministic behavior.
 * `watchdog_timeout`: Adjusts the watchdog thread’s timeout before killing the server if batch generation takes too long.
 * `download_dir`: Use to override the default Hugging Face cache directory for model weights.
 * `base_gpu_id`: Use to adjust first GPU used to distribute the model across available GPUs.
@@ -148,12 +148,12 @@ Please consult the documentation below to learn more about the parameters you ma
 
 * `enable_double_sparsity`: Enables [double sparsity](https://arxiv.org/html/2408.07092v2) which increases throughput.
 * `ds_channel_config_path`: The double sparsity config. For a guide on how to generate the config for your model see [this repo](https://github.com/andy-yang-1/DoubleSparse/tree/main/config).
-* `ds_heavy_channel_num`: Number of channel indices to keep for each layer. 
+* `ds_heavy_channel_num`: Number of channel indices to keep for each layer.
 * `ds_heavy_token_num`: Number of tokens used for attention during decode. Skip sparse decoding if `min_seq_len` in batch < this number.
 * `ds_heavy_channel_type`: The type of heavy channels. Either `q`, `k` or `qk`.
 * `ds_sparse_decode_threshold`: Don't apply sparse decoding if `max_seq_len` in batch < this threshold.
 
-## Debug options 
+## Debug options
 
 *Note: We recommend to stay with the defaults and only use these options for debugging for best possible performance.*
 
