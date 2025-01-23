@@ -52,7 +52,7 @@ jobs:
     runs-on: 1-gpu-runner
     strategy:
       matrix:
-        range: [0-6, 6-16, 16-23, 23-30, 30-38, 38-100]
+        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-100]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -128,7 +128,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_default
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1
 
       - name: Benchmark online latency
         timeout-minutes: 10
@@ -147,6 +147,13 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+
+      - name: Benchmark online latency (EAGLE)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+
 
   performance-test-1-gpu-part-2:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -196,7 +203,13 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_default
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
+      - name: Benchmark single latency + torch.compile (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
 
       - name: Benchmark offline throughput (TP=2)
         timeout-minutes: 10
@@ -209,6 +222,7 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+
 
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

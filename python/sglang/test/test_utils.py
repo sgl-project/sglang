@@ -42,6 +42,9 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-In
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmzheng/sglang-EAGLE-llama2-chat-7B"
+
 
 def is_in_ci():
     """Return whether it is in CI runner."""
@@ -406,7 +409,7 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: tuple = (),
+    other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
 ):
@@ -538,6 +541,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    disable_ignore_eos=False,
     need_warmup=False,
 ):
     # Launch the server
@@ -567,15 +571,16 @@ def run_bench_serving(
         random_range_ratio=0.0,
         request_rate=request_rate,
         multi=None,
-        seed=0,
         output_file=None,
         disable_tqdm=False,
         disable_stream=disable_stream,
-        disable_ignore_eos=False,
         return_logprob=False,
-        lora_name=None,
+        seed=0,
+        disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
+        apply_chat_template=False,
         profile=None,
+        lora_name=None,
     )
 
     try:

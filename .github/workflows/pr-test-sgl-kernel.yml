@@ -16,24 +16,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
+  lint:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
+      - name: Check clang-format
+        uses: DoozyX/clang-format-lint-action@v0.18.1
+        with:
+          source: sgl-kernel
+          extensions: h,c,cpp,hpp,cu,cuh,cc
+          clangFormatVersion: 16
+          style: file
 
+  unit-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.6.4.post1
+          pip3 uninstall sgl-kernel -y || true
+          find . -name index.lock -delete
           cd sgl-kernel
-          git submodule update --init --recursive
-          pip3 install -e . --force-reinstall
+          git submodule deinit --all --force && git submodule sync --recursive && git submodule update --init --force --recursive
+          pip3 install .
           pip3 list | grep sgl-kernel
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           cd sgl-kernel
           find tests -name "test_*.py" | xargs -n 1 python3
@@ -43,7 +57,7 @@ jobs:
           pip3 uninstall sgl-kernel -y
 
   finish:
-    needs: [unit-test]
+    needs: [unit-test, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

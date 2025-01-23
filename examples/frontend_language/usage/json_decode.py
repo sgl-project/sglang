@@ -9,7 +9,7 @@ from enum import Enum
 from pydantic import BaseModel
 
 import sglang as sgl
-from sglang.srt.constrained import build_regex_from_object
+from sglang.srt.constrained.outlines_backend import build_regex_from_object
 
 character_regex = (
     r"""\{\n"""
