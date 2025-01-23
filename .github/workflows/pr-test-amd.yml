@@ -27,6 +27,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python3 -m venv test_venv
+          source test_venv/bin/activate
           pip install --upgrade pip
           pip install -e "python[runtime_common, test]"
           pip install -e "python" --no-deps
@@ -38,6 +40,7 @@ jobs:
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
+          source test_venv/bin/activate
           cd test/srt
           python3 test_eval_accuracy_large.py
 
