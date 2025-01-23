@@ -26,33 +26,37 @@ impl AppState {
 }
 
 #[get("/health")]
-async fn health(data: web::Data<AppState>) -> impl Responder {
-    data.router.route_to_first(&data.client, "/health").await
+async fn health(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
+    data.router
+        .route_to_first(&data.client, "/health", &req)
+        .await
 }
 
 #[get("/health_generate")]
-async fn health_generate(data: web::Data<AppState>) -> impl Responder {
+async fn health_generate(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/health_generate")
+        .route_to_first(&data.client, "/health_generate", &req)
         .await
 }
 
 #[get("/get_server_info")]
-async fn get_server_info(data: web::Data<AppState>) -> impl Responder {
+async fn get_server_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/get_server_info")
+        .route_to_first(&data.client, "/get_server_info", &req)
         .await
 }
 
 #[get("/v1/models")]
-async fn v1_models(data: web::Data<AppState>) -> impl Responder {
-    data.router.route_to_first(&data.client, "/v1/models").await
+async fn v1_models(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
+    data.router
+        .route_to_first(&data.client, "/v1/models", &req)
+        .await
 }
 
 #[get("/get_model_info")]
-async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
+async fn get_model_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/get_model_info")
+        .route_to_first(&data.client, "/get_model_info", &req)
         .await
 }
 

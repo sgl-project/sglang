@@ -12,6 +12,15 @@ use std::thread;
 use std::time::Duration;
 use tokio;
 
+fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
+    req.headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|v| (name.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub enum Router {
     RoundRobin {
@@ -303,8 +312,16 @@ impl Router {
         client: &reqwest::Client,
         worker_url: &str,
         route: &str,
+        req: &HttpRequest,
     ) -> HttpResponse {
-        match client.get(format!("{}{}", worker_url, route)).send().await {
+        let mut request_builder = client.get(format!("{}{}", worker_url, route));
+        
+        // Copy all headers from original request
+        for (name, value) in copy_request_headers(req) {
+            request_builder = request_builder.header(name, value);
+        }
+
+        match request_builder.send().await {
             Ok(res) => {
                 let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -322,7 +339,7 @@ impl Router {
         }
     }
 
-    pub async fn route_to_first(&self, client: &reqwest::Client, route: &str) -> HttpResponse {
+    pub async fn route_to_first(&self, client: &reqwest::Client, route: &str, req: &HttpRequest) -> HttpResponse {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
@@ -338,7 +355,7 @@ impl Router {
                             info!("Retrying request after {} failed attempts", total_retries);
                         }
 
-                        let response = self.send_request(client, &worker_url, route).await;
+                        let response = self.send_request(client, &worker_url, route, req).await;
 
                         if response.status().is_success() {
                             return response;
@@ -496,19 +513,16 @@ impl Router {
             .map(|v| v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false))
             .unwrap_or(false);
 
-        let res = match client
+        let mut request_builder = client
             .post(format!("{}{}", worker_url, route))
-            .header(
-                "Content-Type",
-                req.headers()
-                    .get("Content-Type")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("application/json"),
-            )
-            .body(body.to_vec())
-            .send()
-            .await
-        {
+            .body(body.to_vec());
+
+        // Copy all headers from original request
+        for (name, value) in copy_request_headers(req) {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let res = match request_builder.send().await {
             Ok(res) => res,
             Err(_) => return HttpResponse::InternalServerError().finish(),
         };
