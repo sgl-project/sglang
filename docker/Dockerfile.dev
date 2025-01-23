@@ -218,3 +218,6 @@ setopt HIST_IGNORE_ALL_DUPS
 setopt HIST_FIND_NO_DUPS
 setopt INC_APPEND_HISTORY
 EOF
+
+# Set workspace directory
+WORKDIR /sgl-workspace/sglang
