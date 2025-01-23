@@ -127,7 +127,6 @@ setup(
     package_dir={"": "src"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
-    install_requires=["torch"],
 )
 
 update_wheel_platform_tag()
