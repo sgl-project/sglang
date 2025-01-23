@@ -14,9 +14,7 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Environment :: GPU :: NVIDIA CUDA"
 ]
-dependencies = [
-  "torch",
-]
+dependencies = []
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
