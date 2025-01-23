@@ -38,7 +38,7 @@ jobs:
 
       - name: Install
         run: |
-          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm
+          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.6.4.post1
           pip3 uninstall sgl-kernel -y || true
           find . -name index.lock -delete
           cd sgl-kernel
