@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "torch"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,9 +14,7 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Environment :: GPU :: NVIDIA CUDA"
 ]
-dependencies = [
-  "torch",
-]
+dependencies = []
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
