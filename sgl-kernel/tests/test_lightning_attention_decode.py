@@ -82,3 +82,7 @@ def test_lightning_attention_decode(dtype, batch_size, num_heads, dim, embed_dim
         msg=f"New KV mismatch for batch_size={batch_size}, num_heads={num_heads}, "
         f"dim={dim}, embed_dim={embed_dim}, dtype={dtype}",
     )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
