@@ -127,3 +127,7 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
