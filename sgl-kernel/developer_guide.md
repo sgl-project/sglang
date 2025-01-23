@@ -24,10 +24,11 @@ Third-party libraries:
 
 Steps to add a new kernel:
 
-1. Implement in `sgl-kernel/src/sgl-kernel/csrc`
-2. Expose interface in `sgl-kernel/csrc/sgl_kernel_ops.cu` with pybind11
-3. Create Python wrapper in `sgl-kernel/src/sgl-kernel/ops/__init__.py`
-4. Expose Python interface in `sgl-kernel/src/sgl-kernel/__init__.py`
+1. Implement in [src/sgl-kernel/csrc/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/src/sgl-kernel/csrc)
+2. Expose interface in [csrc/sgl_kernel_ops.cu](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/csrc/sgl_kernel_ops.cu) with pybind11
+3. Create Python wrapper in [src/sgl-kernel/ops/__init__.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/ops/__init__.py)
+4. Expose Python interface in [src/sgl-kernel/__init__.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/__init__.py)
+5. Update [setup.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/setup.py) to include new CUDA source
 
 ### Build & Install
 
@@ -41,6 +42,10 @@ pip3 install dist/*whl --force-reinstall --no-deps
 
 ### Testing & Benchmarking
 
-1. Add pytest tests in `sgl-kernel/tests/`
-2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in `sgl-kernel/benchmark/`
+1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests)
+2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
 3. Run test suite
+
+### Release new version
+
+Update version in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/pyproject.toml)
