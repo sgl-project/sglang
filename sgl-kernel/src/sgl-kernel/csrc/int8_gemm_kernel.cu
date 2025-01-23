@@ -16,7 +16,7 @@
 #include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
 #include "cutlass_extensions/gemm/gemm_universal_base_compat.h"
 #include "cutlass_extensions/gemm/gemm_with_epilogue_visitor.h"
-#include "utils.hpp"
+#include "utils.h"
 
 using namespace cute;
 

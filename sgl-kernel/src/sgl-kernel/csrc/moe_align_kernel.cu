@@ -6,7 +6,7 @@
 
 #include <THC/THCAtomics.cuh>
 
-#include "utils.hpp"
+#include "utils.h"
 
 #ifdef USE_ROCM
 #include <hip/hip_runtime.h>

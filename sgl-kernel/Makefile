@@ -19,7 +19,7 @@ clean:
 	@rm -rf build dist *.egg-info
 
 test:
-	@find tests -name "test_*.py" | xargs -n 1 python3
+	@find tests -name "test_*.py" | xargs -n 1 python3 && pytest tests/test_norm.py && pytest tests/test_activation.py
 
 format:
 	@find src tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i && find src tests -name '*.py' | xargs isort && find src tests -name '*.py' | xargs black
