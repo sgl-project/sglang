@@ -37,8 +37,7 @@ class TestQwen2(unittest.TestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)
-        print(metrics)
-
+        print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.81)
 
 
@@ -69,8 +68,7 @@ class TestQwen2FP8(unittest.TestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)
-        print(metrics)
-
+        print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.79)
 
 
