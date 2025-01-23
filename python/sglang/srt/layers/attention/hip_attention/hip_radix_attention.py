@@ -185,7 +185,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
                         k=k_chunk,
                         v=v_chunk,
-                        online_update_cache=forward_batch.token_to_kv_pool.online_update_cache
+                        online_update_cache=forward_batch.token_to_kv_pool.online_update_cache,
+                        is_decode=False,
                     )
 
                     if require_validation:
@@ -205,6 +206,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
                             layer=layer,
                             is_dense=layer.layer_id in self.hip_config.dense_layers,
+                            is_decode=False,
                         )
                         
                         o_err = ((o_req - o_req_valid) ** 2).sum()
@@ -231,6 +233,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
                         k=k_chunk,
                         v=v_chunk,
+                        is_decode=False,
                     )
                     
                     o[start_len:start_len+seq_len] = o_req
@@ -316,6 +319,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
                     None
                 ),
+                is_decode=True,
             )
         else:
             def sse(a: torch.Tensor, b: torch.Tensor):
@@ -358,6 +362,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
                     None
                 ),
+                is_decode=True,
             )
             
             o_valid, metadata_valid = self.forward_paged_hip(
@@ -383,6 +388,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
                     None
                 ),
+                is_decode=True,
             )
             
             err_thresh = 1e-7
@@ -433,6 +439,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
                         None
                     ),
+                    is_decode=True,
                 )
                 
                 offload_cache.sa_kv_cache.flush()
@@ -461,6 +468,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
                         None
                     ),
+                    is_decode=True,
                 )
                 err_uvm = sse(o, o_uvm)
                 err_retry = sse(o_valid, o_retry)
@@ -527,6 +535,7 @@ online_update={online_update}
         v: Optional[torch.Tensor] = None,
 
         online_update_cache: bool = False,
+        is_decode: bool = False,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
         N, num_heads, hidden_dims = query.shape
         dst_seq_len = N // batch_size
@@ -615,6 +624,7 @@ online_update={online_update}
             sa_extend_backend=layer_config.sa_extend_backend,
             online_update_cache=online_update_cache,
             require_cache_statistics=require_cache_statistics,
+            disable_flashdecode=not is_decode,
         )
         
         context, metadata = dual_stage_quadratic_hip_attention(
