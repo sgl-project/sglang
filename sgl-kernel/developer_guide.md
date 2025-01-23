@@ -30,15 +30,6 @@ Steps to add a new kernel:
 4. Expose Python interface in [src/sgl-kernel/\_\_init\_\_.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/__init__.py)
 5. Update [setup.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/setup.py) to include new CUDA source
 
-### Clang Format
-
-In `sglang/sgl-kernel` directory, run:
-
-```bash
-clang-format -i -style=file src/sgl-kernel/csrc/*.cuh
-clang-format -i -style=file src/sgl-kernel/csrc/*.cu
-```
-
 ### Build & Install
 
 Development build:
