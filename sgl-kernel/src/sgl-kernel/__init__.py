@@ -10,12 +10,12 @@ from sgl_kernel.ops import (
     get_graph_buffer_ipc_meta,
     init_custom_reduce,
     int8_scaled_mm,
+    lightning_attention_decode,
     moe_align_block_size,
     register_graph_buffers,
     rmsnorm,
     rotary_embedding,
     sampling_scaling_penalties,
-    lightning_attention_decode,
     silu_and_mul,
 )
 

@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 from sgl_kernel import lightning_attention_decode
 
 
@@ -49,7 +49,7 @@ dtypes = [torch.float32, torch.float16, torch.bfloat16]
 @pytest.mark.parametrize("batch_size,num_heads,dim,embed_dim", configs)
 def test_lightning_attention_decode(dtype, batch_size, num_heads, dim, embed_dim):
     device = torch.device("cuda")
-    
+
     q = torch.randn(batch_size, num_heads, 1, dim, device=device, dtype=dtype)
     k = torch.randn(batch_size, num_heads, 1, dim, device=device, dtype=dtype)
     v = torch.randn(batch_size, num_heads, 1, embed_dim, device=device, dtype=dtype)
