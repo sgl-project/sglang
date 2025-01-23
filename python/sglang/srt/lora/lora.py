@@ -18,7 +18,7 @@
 # LoRA layers class inheritance adapted from:
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
-
+from dataclasses import dataclass
 import re
 
 import torch
@@ -33,16 +33,31 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
+@dataclass
+class LoraBatchInfo:
+    # Batch size
+    bs: int
+    
+    # Lengths of each sequence in shape (bs,)
+    seg_lens: torch.Tensor
+    
+    # Indice pointers of each sequence in shape (bs + 1, )
+    seg_indptr: torch.Tensor
+    
+    # Maximum sequence length of current batch
+    max_len: int
+    
+    # The index of lora adapter used by each sequence, in shape (bs,)
+    weight_indices: torch.Tensor
 
 class BaseLayerWithLoRA(nn.Module):
-    def __init__(self, base_layer, segment_gemm, lora_rank, scaling, gemm_expand=None):
+    def __init__(self, base_layer, lora_rank, scaling, lora_backend):
         super().__init__()
         self.base_layer = base_layer
-        self.segment_gemm = segment_gemm
         self.lora_rank = lora_rank
         self.scaling = scaling
         self.set_lora = False
-        self.gemm_expand = gemm_expand
+        self.lora_backend = lora_backend
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -55,12 +70,11 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: VocabParallelEmbedding,
-        segment_gemm,
         lora_rank,
         scaling,
-        gemm_expand=None,
+        lora_backend
     ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling, gemm_expand)
+        super().__init__(base_layer, lora_rank, scaling, lora_backend)
         self.weight = base_layer.weight
 
 
@@ -68,12 +82,11 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: ColumnParallelLinear,
-        segment_gemm,
         lora_rank,
         scaling,
-        gemm_expand=None,
+        lora_backend
     ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling, gemm_expand)
+        super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
     def apply_lora(self, output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # TODO
@@ -101,205 +114,90 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
         self,
         base_layer: MergedColumnParallelLinear,
-        segment_gemm,
         lora_rank,
         scaling,
-        gemm_expand=None,
+        lora_backend
     ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling, gemm_expand)
+        super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
     def set_lora_info(
         self,
         A_buffer,
         B_buffer,
-        bs,
-        seg_indptr,
-        weight_indices,
-        seg_lens=None,
-        max_len=None,
+        batch_info,
     ):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
-        self.bs = bs
-        self.seg_indptr = seg_indptr
-        self.seg_lens = seg_lens
-        self.max_len = max_len
-        self.weight_indices = weight_indices
+        self.lora_backend.set_batch_info(batch_info)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.segment_gemm.run(
-            x=x,
-            weights=self.A_buffer,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
+        lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)
+        
+        output_dim = base_output.shape[-1]
+        lora_output = torch.empty_like(base_output)
+        lora_output[:, :output_dim] = self.lora_backend.run_sgemm(
+            x=lora_a_output[:, 0 : self.lora_rank].contiguous(), 
+            weights=self.B_buffer[0])
+        
+        lora_output[:, output_dim : 2 * output_dim] = self.lora_backend.run_sgemm(
+            x=lora_a_output[:, self.lora_rank : 2 * self.lora_rank].contiguous(),
+            weights=self.B_buffer[1]
         )
-        output_dim = lora_output.shape[-1]
-        if self.gemm_expand is not None:
-            for i in range(2):
-                self.gemm_expand(
-                    base_output,
-                    lora_a_output,
-                    self.B_buffer[i],
-                    batch_size=self.bs,
-                    seg_lens=self.seg_lens,
-                    seg_start=self.seg_indptr,
-                    weight_indices=self.weight_indices,
-                    max_len=self.max_len,
-                    input_slice_offset=self.lora_rank * i,
-                    output_slice_offset=output_dim * i,
-                    output_add=True,
-                    scaling=self.scaling,
-                )
-            return base_output
-        else:
-            # FIXME wait for flashinfer segment gemm update
-            lora_output = torch.empty_like(base_output)
-            for i in range(2):
-                left = output_dim * i
-                right = left + output_dim
-                lora_output[:, left:right] = self.segment_gemm.run(
-                    x=lora_a_output[
-                        :, self.lora_rank * i : self.lora_rank * (i + 1)
-                    ].contiguous(),
-                    weights=self.B_buffer[i],
-                    batch_size=self.bs,
-                    weight_column_major=True,
-                    seg_indptr=self.seg_indptr,
-                    weight_indices=self.weight_indices,
-                )
-            return base_output + lora_output * self.scaling
 
-
+        return base_output + lora_output * self.scaling
+        
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def init__(
         self,
         base_layer: QKVParallelLinear,
-        segment_gemm,
         lora_rank,
         scaling,
-        gemm_expand=None,
+        lora_backend
     ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling, gemm_expand)
+        super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
     def set_lora_info(
         self,
         A_buffer_qkv,
         B_buffer_q,
         B_buffer_kv,
-        bs,
-        seg_indptr,
-        weight_indices,
-        seg_lens=None,
-        max_len=None,
+        batch_info
     ):
         self.set_lora = True
         self.A_buffer_qkv = A_buffer_qkv
         self.B_buffer_q = B_buffer_q
         self.B_buffer_kv = B_buffer_kv
-        self.bs = bs
-        self.seg_indptr = seg_indptr
-        self.seg_lens = seg_lens
-        self.max_len = max_len
-        self.weight_indices = weight_indices
+        self.lora_backend.set_batch_info(batch_info)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.segment_gemm.run(
-            x=x,
-            weights=self.A_buffer_qkv,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
+        lora_output = self.lora_backend.run_qkv_lora(
+            x=x, 
+            qkv_lora_a=self.A_buffer_qkv,
+            q_lora_b=self.B_buffer_q,
+            kv_lora_b=self.B_buffer_kv,
         )
-        # FIXME parallelize qkv
-        lora_output = torch.empty_like(base_output)
-        # q
-        output_dim_q = self.B_buffer_q.shape[-2]
-        lora_output[:, :output_dim_q] = self.segment_gemm.run(
-            x=lora_a_output[:, : self.lora_rank].contiguous(),
-            weights=self.B_buffer_q[0],
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
-        # kv
-        output_dim_kv = self.B_buffer_kv.shape[-2]
-        if self.gemm_expand is not None:
-            for i in range(2):
-                self.gemm_expand(
-                    base_output,
-                    lora_a_output,
-                    self.B_buffer_kv[i],
-                    batch_size=self.bs,
-                    seg_lens=self.seg_lens,
-                    seg_start=self.seg_indptr,
-                    weight_indices=self.weight_indices,
-                    max_len=self.max_len,
-                    input_slice_offset=self.lora_rank * (i + 1),
-                    output_slice_offset=output_dim_q + output_dim_kv * i,
-                    output_add=True,
-                    scaling=self.scaling,
-                )
-            return base_output
-        else:
-            for i in range(2):
-                left = output_dim_kv * i
-                right = left + output_dim_kv
-                lora_output[:, output_dim_q + left : output_dim_q + right] = (
-                    self.segment_gemm.run(
-                        x=lora_a_output[
-                            :, self.lora_rank * (i + 1) : self.lora_rank * (i + 2)
-                        ].contiguous(),
-                        weights=self.B_buffer_kv[i],
-                        batch_size=self.bs,
-                        weight_column_major=True,
-                        seg_indptr=self.seg_indptr,
-                        weight_indices=self.weight_indices,
-                    )
-                )
-            return base_output + lora_output * self.scaling
-
+        return base_output + lora_output * self.scaling
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: RowParallelLinear,
-        segment_gemm,
         lora_rank,
         scaling,
-        gemm_expand=None,
+        lora_backend
     ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling, gemm_expand)
+        super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
-    def set_lora_info(self, A_buffer, B_buffer, bs, seg_indptr, weight_indices):
+    def set_lora_info(self, A_buffer, B_buffer, batch_info):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
-        self.bs = bs
-        self.seg_indptr = seg_indptr
-        self.weight_indices = weight_indices
+        self.lora_backend.set_batch_info(batch_info)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_output = self.segment_gemm.run(
-            x=x,
-            weights=self.A_buffer,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
-        lora_output = self.segment_gemm.run(
-            x=lora_output,
-            weights=self.B_buffer[0],
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
+        lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)
+        lora_output = self.lora_backend.run_sgemm(x=lora_a_output, weights=self.B_buffer[0])
         return base_output + lora_output * self.scaling
 
     def forward(self, input_):
@@ -339,10 +237,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 def get_lora_layer(
     layer: nn.Module,
-    segment_gemm,
     lora_rank,
     scaling,
-    gemm_expand,
+    lora_backend
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
@@ -355,7 +252,7 @@ def get_lora_layer(
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
             ret = lora_layer_type(
-                layer, segment_gemm, lora_rank, scaling, gemm_expand=gemm_expand
+                layer, lora_rank, scaling, lora_backend
             )
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")

@@ -20,17 +20,13 @@ import re
 
 import torch
 
-from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
+from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer, LoraBatchInfo
+from sglang.srt.lora.backend import FlashInferLoraBackend, TritonLoraBackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_flashinfer_available, replace_submodule
 
 logger = logging.getLogger(__name__)
-
-if is_flashinfer_available():
-    from flashinfer import SegmentGEMMWrapper
-from sglang.srt.lora.triton_ops.lora_expand import segment_gemm_expand
-
 
 def get_module_name(name):
     # Fallback solution of mapping from config module name to module name in model class.
@@ -78,6 +74,18 @@ def get_stacked_name(name):
     return params_mapping.get(name, (name, name))
 
 
+def get_backend_from_name(name):
+    backend_mapping = {
+        "triton": TritonLoraBackend,
+        "flashinfer": FlashInferLoraBackend,
+    }
+    
+    if name in backend_mapping:
+        return backend_mapping[name]
+
+    raise Exception(f"No supported lora backend called {name}.")
+
+
 def get_layer_id(name):
     match = re.search(r"layers\.(\d+)\.", name)
     if match is None:
@@ -102,13 +110,10 @@ class LoRAManager:
         self.max_loras_per_batch = max_loras_per_batch
         self.load_config = load_config
         self.dtype = dtype
-        self.lora_backend = lora_backend
-
-        workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
-        # waiting for flashinfer's updates on grouped gemm
-        self.segment_gemm = SegmentGEMMWrapper(workspace_buffer)
-
-        self.gemm_expand = segment_gemm_expand if lora_backend == "triton" else None
+        
+        logger.info(f"Using {lora_backend} as backend of Lora kernels.")
+        backend_type = get_backend_from_name(lora_backend)
+        self.lora_backend = backend_type(lora_backend)
 
         self.init_loras()
         self.init_lora_memory_pool()
@@ -130,10 +135,9 @@ class LoRAManager:
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(
             module,
-            self.segment_gemm,
             self.max_lora_dim,
             self.scaling,
-            gemm_expand=self.gemm_expand,
+            self.lora_backend
         )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
@@ -237,34 +241,20 @@ class LoRAManager:
                 _, hidden_dim_B = get_hidden_dim(module_B, self.base_hf_config)
             c = self.loras[-1].get_stacked_multiply(module_B)
             if module_B not in self.B_buffer:
-                if self.lora_backend == "triton":
-                    self.B_buffer[module_B] = [
-                        torch.empty(
-                            (
-                                c,
-                                self.max_loras_per_batch,
-                                hidden_dim_B,
-                                self.max_lora_dim,
-                            ),
-                            dtype=self.dtype,
-                            device="cuda",
-                        )
-                        for i in range(num_layer)
-                    ]
-                else:
-                    self.B_buffer[module_B] = [
-                        torch.empty(
-                            (
-                                c,
-                                self.max_loras_per_batch,
-                                hidden_dim_B,
-                                self.max_lora_dim,
-                            ),
-                            dtype=self.dtype,
-                            device="cuda",
-                        )
-                        for i in range(num_layer)
-                    ]
+                self.B_buffer[module_B] = [
+                    torch.empty(
+                        (
+                            c,
+                            self.max_loras_per_batch,
+                            hidden_dim_B,
+                            self.max_lora_dim,
+                        ),
+                        dtype=self.dtype,
+                        device="cuda",
+                    )
+                    for i in range(num_layer)
+                ]
+
 
     def init_lora_batch(self):
         self.active_uids = set()  # set of active loras
@@ -331,14 +321,13 @@ class LoRAManager:
         if cur_uids == set([None]):
             return
 
-        # setup lora in forward modules
+        # set up batch info shared by all lora moruldes
         bs = forward_batch.batch_size
         seg_lens = (
             forward_batch.extend_seq_lens
             if forward_batch.forward_mode.is_extend()
             else torch.ones(bs, device="cuda")
         )
-        # FIXME: reuse the data rather than recompute
         seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
         max_len = int(torch.max(seg_lens))
@@ -346,6 +335,13 @@ class LoRAManager:
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.buffer_id[lora_path]
 
+        batch_info = LoraBatchInfo(bs=bs,
+                                   seg_lens=seg_lens,
+                                   seg_indptr=seg_indptr,
+                                   max_len=max_len,
+                                   weight_indices=weight_indices)
+
+        # call set_lora_info for each lora modules
         for module_name, module in self.lora_modules:
             layer_id = get_layer_id(module_name)
 
@@ -354,18 +350,12 @@ class LoRAManager:
                 module.set_lora_info(
                     self.A_buffer[weight_name][layer_id],
                     self.B_buffer[weight_name][layer_id],
-                    bs,
-                    seg_indptr,
-                    weight_indices,
+                    batch_info,
                 )
             else:
                 module.set_lora_info(
                     self.A_buffer["qkv_proj"][layer_id],
                     self.B_buffer["q_proj"][layer_id],
                     self.B_buffer["kv_proj"][layer_id],
-                    bs,
-                    seg_indptr,
-                    weight_indices,
-                    seg_lens=seg_lens,
-                    max_len=max_len,
+                    batch_info,
                 )
