@@ -45,13 +45,13 @@ class TestQuantizeKVCache(unittest.TestCase):
 
         return quantized, scale_zeros
 
-    def _native_quantize_cache_kv(self, k_status, v_status, dest_idx):
+    def _native_quantize_cache_kv(self, k, v, dest_idx):
         """Native PyTorch implementation of quantize_cache_kv for reference."""
-        k_status = k_status.to(torch.float32)
-        v_status = v_status.to(torch.float32)
+        k = k.to(torch.float32)
+        v = v.to(torch.float32)
 
-        k_quantized, k_scale_zeros = self._quantize_tensor(k_status)
-        v_quantized, v_scale_zeros = self._quantize_tensor(v_status)
+        k_quantized, k_scale_zeros = self._quantize_tensor(k)
+        v_quantized, v_scale_zeros = self._quantize_tensor(v)
 
         return k_quantized, k_scale_zeros, v_quantized, v_scale_zeros
 
@@ -67,12 +67,8 @@ class TestQuantizeKVCache(unittest.TestCase):
         torch.manual_seed(seed)
 
         # Create input data
-        k_status = torch.randn(
-            batch_size, head_num, head_dim, dtype=dtype, device="cuda"
-        )
-        v_status = torch.randn(
-            batch_size, head_num, head_dim, dtype=dtype, device="cuda"
-        )
+        k = torch.randn(batch_size, head_num, head_dim, dtype=dtype, device="cuda")
+        v = torch.randn(batch_size, head_num, head_dim, dtype=dtype, device="cuda")
         dest_idx = torch.arange(batch_size, device="cuda")
 
         # Create output tensors
@@ -92,8 +88,8 @@ class TestQuantizeKVCache(unittest.TestCase):
         # Run Triton implementation
         with torch.inference_mode():
             quantize_cache_kv(
-                k_status,
-                v_status,
+                k,
+                v,
                 dest_idx,
                 k_quantized,
                 k_scale_zeros,
@@ -103,7 +99,7 @@ class TestQuantizeKVCache(unittest.TestCase):
 
         # Run reference implementation
         ref_k_quantized, ref_k_scale_zeros, ref_v_quantized, ref_v_scale_zeros = (
-            self._native_quantize_cache_kv(k_status, v_status, dest_idx)
+            self._native_quantize_cache_kv(k, v, dest_idx)
         )
 
         # Assert results

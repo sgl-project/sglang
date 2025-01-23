@@ -135,7 +135,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # int8 -> get scale, other -> None
-        k_scale_zeros, v_scale_zeros = (
+        k_scales_zeros, v_scales_zeros = (
             forward_batch.token_to_kv_pool.get_kv_scales_zeros_buffer(layer.layer_id)
         )
 
@@ -155,8 +155,8 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
-            k_scale_zeros,
-            v_scale_zeros,
+            k_scales_zeros,
+            v_scales_zeros,
             self.kv_cache_dtype,
         )
         return o
@@ -172,7 +172,6 @@ class TritonAttnBackend(AttentionBackend):
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
-
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         # TODO: reuse the buffer across layers
@@ -189,7 +188,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # int8 -> get scale, other -> None
-        k_scale_zeros, v_scale_zeros = (
+        k_scales_zeros, v_scales_zeros = (
             forward_batch.token_to_kv_pool.get_kv_scales_zeros_buffer(layer.layer_id)
         )
 
@@ -205,8 +204,8 @@ class TritonAttnBackend(AttentionBackend):
             self.num_kv_splits,
             layer.scaling,
             layer.logit_cap,
-            k_scale_zeros,
-            v_scale_zeros,
+            k_scales_zeros,
+            v_scales_zeros,
             self.kv_cache_dtype,
         )
         return o

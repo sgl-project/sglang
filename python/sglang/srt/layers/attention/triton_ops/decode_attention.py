@@ -989,8 +989,8 @@ def _fwd_kernel_quantize_cache_kv(
 
 
 def quantize_cache_kv(
-    k_status,
-    v_status,
+    k,
+    v,
     dest_idx,
     k_quantized_out,
     k_scales_zeros,
@@ -998,30 +998,30 @@ def quantize_cache_kv(
     v_scales_zeros,
 ):
     bs = dest_idx.shape[0]
-    k_head_num = k_status.shape[1]
-    k_head_dim = k_status.shape[2]
+    k_head_num = k.shape[1]
+    k_head_dim = k.shape[2]
     assert (
-        k_status.shape[1] == k_quantized_out.shape[1]
-        and k_status.shape[2] == k_quantized_out.shape[2]
+        k.shape[1] == k_quantized_out.shape[1]
+        and k.shape[2] == k_quantized_out.shape[2]
     )
     BLOCK_HEAD = triton.next_power_of_2(k_head_num)
     grid = (bs,)
     num_warps = 1
 
     _fwd_kernel_quantize_cache_kv[grid](
-        k_status,
-        v_status,
+        k,
+        v,
         dest_idx,
         k_quantized_out,
         v_quantized_out,
         k_scales_zeros,
         v_scales_zeros,
-        k_status.stride(0),
-        k_status.stride(1),
-        k_status.stride(2),
-        v_status.stride(0),
-        v_status.stride(1),
-        v_status.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
         k_scales_zeros.stride(0),
         k_scales_zeros.stride(1),
         k_scales_zeros.stride(2),
