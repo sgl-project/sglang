@@ -26,6 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.int8_kernel import _quant_int8
 from sglang.srt.utils import is_hip
 
 is_hip_ = is_hip()
@@ -860,16 +861,6 @@ def decode_attention_fwd(
 
 
 @triton.jit
-def _quant_int8(val):
-    val_min = tl.min(val, 1)
-    val_max = tl.max(val, 1)
-    scales = (val_max - val_min) / 255
-    zeros = -val_min / scales
-    q_val = (val / scales[:, None] + zeros[:, None] + 0.5).to(tl.uint8)
-    return q_val, scales, zeros
-
-
-@triton.jit
 def quantize_and_store(
     cur_index,
     data_ptr,
@@ -1006,7 +997,7 @@ def quantize_cache_kv(
     )
     BLOCK_HEAD = triton.next_power_of_2(k_head_num)
     grid = (bs,)
-    num_warps = 1
+    num_warps = min(max(k_head_dim // 256, 1), 8)
 
     _fwd_kernel_quantize_cache_kv[grid](
         k,
