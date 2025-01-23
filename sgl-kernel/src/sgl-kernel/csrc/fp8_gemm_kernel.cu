@@ -33,7 +33,7 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
-#include "utils.hpp"
+#include "utils.h"
 
 using namespace cute;
 
