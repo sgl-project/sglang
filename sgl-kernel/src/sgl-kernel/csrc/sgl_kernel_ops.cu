@@ -26,9 +26,16 @@ torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& ma
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                              const c10::optional<torch::Tensor>& bias);
 
+// fp8_scaled_mm
 torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
                             const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                             const c10::optional<torch::Tensor>& bias);
+
+// lightning_attention_decode
+void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+                                const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
+                                torch::Tensor new_kv);
+
 // rotary embedding
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
                       torch::Tensor& cos_sin_cache, bool is_neox);
@@ -59,6 +66,30 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
              at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
 
+// min p sampling from probs
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               std::optional<at::Tensor> maybe_min_p_arr, double min_p_val, bool deterministic,
+                               int64_t cuda_stream);
+
+// top k renorm probs
+void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr,
+                        unsigned int top_k_val, int64_t cuda_stream);
+
+// top p renorm probs
+void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr,
+                        double top_p_val, int64_t cuda_stream);
+
+// top k top p sampling from probs
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                                     at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
+                                     std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
+                                     int64_t cuda_stream);
+
+// top p sampling from probs
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples, at::Tensor success,
+                               std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
+                               int64_t cuda_stream);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -74,6 +105,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
   // fp8_scaled_mm
   m.def("fp8_scaled_mm", &fp8_scaled_mm, "FP8 scaled matmul (CUDA)");
+  // lightning_attention_decode
+  m.def("lightning_attention_decode", &lightning_attention_decode, "Lightning Attention Ddecode (CUDA)");
   // rotary embedding
   m.def("rotary_embedding", &rotary_embedding, "Rotary Embedding (CUDA)");
   // rms norm
@@ -92,4 +125,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gelu_and_mul", &gelu_and_mul, "Gelu and Mul (CUDA)");
   // bmm fp8
   m.def("bmm_fp8", &bmm_fp8, "BMM FP8 (CUDA)");
+  // min p sampling from probs
+  m.def("min_p_sampling_from_probs", &min_p_sampling_from_probs, "Min P Sampling From Probs (CUDA)");
+  // top k renorm probs
+  m.def("top_k_renorm_probs", &top_k_renorm_probs, "Top K Renorm Probs (CUDA)");
+  // top p renorm probs
+  m.def("top_p_renorm_probs", &top_p_renorm_probs, "Top P Renorm Probs (CUDA)");
+  // top k top p sampling from probs
+  m.def("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs, "Top K Top P Sampling From Probs (CUDA)");
+  // top p sampling from probs
+  m.def("top_p_sampling_from_probs", &top_p_sampling_from_probs, "Top P Sampling From Probs (CUDA)");
 }

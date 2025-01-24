@@ -11,12 +11,17 @@ from sgl_kernel.ops import (
     get_graph_buffer_ipc_meta,
     init_custom_reduce,
     int8_scaled_mm,
+    lightning_attention_decode,
+    min_p_sampling_from_probs,
     moe_align_block_size,
     register_graph_buffers,
     rmsnorm,
     rotary_embedding,
     sampling_scaling_penalties,
     silu_and_mul,
+    top_k_renorm_prob,
+    top_k_top_p_sampling_from_probs,
+    top_p_renorm_prob,
 )
 
 __all__ = [
@@ -34,10 +39,15 @@ __all__ = [
     "get_graph_buffer_ipc_meta",
     "init_custom_reduce",
     "int8_scaled_mm",
+    "lightning_attention_decode",
+    "min_p_sampling_from_probs",
     "moe_align_block_size",
     "register_graph_buffers",
     "rmsnorm",
     "rotary_embedding",
     "sampling_scaling_penalties",
     "silu_and_mul",
+    "top_k_renorm_prob",
+    "top_k_top_p_sampling_from_probs",
+    "top_p_renorm_prob",
 ]

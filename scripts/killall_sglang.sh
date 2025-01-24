@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Check if sudo is available
+if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y lsof
+else
+    apt-get update
+    apt-get install -y lsof
+fi
+
 # Show current GPU status
 nvidia-smi
 

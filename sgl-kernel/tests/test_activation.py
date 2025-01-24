@@ -35,4 +35,5 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
-test_fused_silu_mul(128, 1, 1)
+if __name__ == "__main__":
+    pytest.main([__file__])
