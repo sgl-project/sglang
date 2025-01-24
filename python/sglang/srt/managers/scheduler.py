@@ -24,7 +24,7 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import psutil
 import setproctitle
@@ -314,6 +314,7 @@ class Scheduler:
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        self.staging_reqs: Set[str] = set()
         # The running decoding batch for continuous batching
         self.running_batch: Optional[ScheduleBatch] = None
         # The current forward batch
@@ -949,12 +950,20 @@ class Scheduler:
                         req.last_node, req.prefix_indices, adder.rem_total_tokens
                     )
                     if req.last_node.loading:
+                        # to prevent frequent cache invalidation
+                        assert (
+                            req.rid not in self.staging_reqs
+                        ), "no re-loading should happen"
+                        self.staging_reqs.add(req.rid)
+                        self.tree_cache.inc_lock_ref(req.last_node)
                         continue
                 elif req.last_node.loading:
                     if not self.tree_cache.loading_complete(req.last_node):
                         continue
-                else:
-                    pass
+
+                if req.rid in self.loading_queue:
+                    self.staging_reqs.remove(req.rid)
+                    self.tree_cache.dec_lock_ref(req.last_node)
 
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
