@@ -229,69 +229,64 @@ void sm89_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
                          const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                          const c10::optional<torch::Tensor>& bias) {
   uint32_t const m = a.size(0);
-  // uint32_t const mp2 =
-  //     std::max(static_cast<uint32_t>(32), next_pow_2(m));  // next power of 2
-  uint32_t const mp2 = next_pow_2(m);  // next power of 2
-
   uint32_t const n = out.size(1);
-  uint32_t const np2 = next_pow_2(n);
 
-  if (mp2 == 1) {
-    if (np2 <= 8192) {
+  if (m == 1) {
+    if (n <= 8192) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 7>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 5>(out, a, b, scales_a, scales_b, bias);
     }
-  } else if (mp2 <= 16) {
+  } else if (m <= 16) {
     // M in (1, 16]
-    if (np2 <= 8192) {
+    if (n <= 8192) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 4>(out, a, b, scales_a, scales_b, bias);
-    } else if (np2 <= 16384) {
+    } else if (n <= 16384) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 5>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 7>(out, a, b, scales_a, scales_b, bias);
     }
-  } else if (mp2 <= 64) {
+  } else if (m <= 64) {
     // M in (16, 64]
-    if (np2 <= 16384) {
+    if (n <= 16384) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 7>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 7>(out, a, b, scales_a, scales_b, bias);
     }
-  } else if (mp2 <= 128) {
+  } else if (m <= 128) {
     // M in (64, 128]
-    if (np2 <= 8192) {
+    if (n <= 8192) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 64, 128>, cutlass::gemm::GemmShape<32, 64, 64>,
                                 4>(out, a, b, scales_a, scales_b, bias);
-    } else if (np2 <= 16384) {
+    } else if (n <= 16384) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 64, 128>, cutlass::gemm::GemmShape<32, 64, 64>,
                                 5>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
                                 5>(out, a, b, scales_a, scales_b, bias);
     }
-  } else if (mp2 <= 256) {
+  } else if (m <= 256) {
     // M in (128, 256]
-    if (np2 <= 8192) {
+    if (n <= 8192) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 64, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
                                 5>(out, a, b, scales_a, scales_b, bias);
-    } else if (np2 <= 16384) {
+    } else if (n <= 16384) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
                                 7>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 64, 128>, cutlass::gemm::GemmShape<64, 32, 128>,
                                 4>(out, a, b, scales_a, scales_b, bias);
     }
-  } else if (mp2 <= 512) {
+  } else if (m <= 512) {
     // M in (256, 512)
-    if (np2 <= 16384) {
+    if (n <= 16384) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
                                 2>(out, a, b, scales_a, scales_b, bias);
     } else {
@@ -300,7 +295,7 @@ void sm89_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     }
   } else {
     // M in (512, inf)
-    if (np2 <= 8192) {
+    if (n <= 8192) {
       return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
                                 3>(out, a, b, scales_a, scales_b, bias);
     } else {
@@ -417,7 +412,7 @@ struct DeviceGemmFp8RowwiseSm90 {
       TileShape, ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          MainloopScheduleType>::CollectiveOp;
+      MainloopScheduleType>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,  // Indicates ProblemShape
                                                           CollectiveMainloop, CollectiveEpilogue, TileSchedulerType>;
@@ -451,7 +446,6 @@ typename Gemm::Arguments prepare_sm90_fp8_args(torch::Tensor& out, const torch::
   ElementComputeEpilogue const* ptr_scales_a = reinterpret_cast<ElementComputeEpilogue const*>(scales_a.data_ptr());
   ElementComputeEpilogue const* ptr_scales_b = reinterpret_cast<ElementComputeEpilogue const*>(scales_b.data_ptr());
 
-  // TODO: confirm correctess
   StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
   StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
   StrideC stride_c;
@@ -510,34 +504,27 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType, typename CTAShape, typename ClusterShape, typename MainloopScheduleType, typename TileSchedulerType>
-void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, 
-                       const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                       const c10::optional<torch::Tensor>& bias,
-                       bool fast_accum = true,
-                       bool use_persistent = false) {
-    using ElementInput = cutlass::float_e4m3_t;
-    using ElementOutput = OutType;
-    using AccumElementType = float;
-    using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
-    
-    if (bias) {
-        using Gemm = typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType, 
-            CTAShape, ClusterShape, 
-            MainloopScheduleType,
-            EpilogueScheduleType,
-            TileSchedulerType,
-            true>::Gemm;
-        return launch_sm90_fp8_scaled_mm<Gemm, true>(out, a, b, scales_a, scales_b, bias);
-    } else {
-        using Gemm = typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType,
-            CTAShape, ClusterShape,
-            MainloopScheduleType, 
-            EpilogueScheduleType,
-            TileSchedulerType,
-            false>::Gemm;
-        return launch_sm90_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias);
-    }
+template <typename OutType, typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
+          typename TileSchedulerType>
+void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
+                        const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                        const c10::optional<torch::Tensor>& bias, bool fast_accum = true, bool use_persistent = false) {
+  using ElementInput = cutlass::float_e4m3_t;
+  using ElementOutput = OutType;
+  using AccumElementType = float;
+  using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
+
+  if (bias) {
+    using Gemm =
+        typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType, CTAShape, ClusterShape,
+                                          MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, true>::Gemm;
+    return launch_sm90_fp8_scaled_mm<Gemm, true>(out, a, b, scales_a, scales_b, bias);
+  } else {
+    using Gemm =
+        typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType, CTAShape, ClusterShape,
+                                          MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, false>::Gemm;
+    return launch_sm90_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias);
+  }
 }
 
 template <typename OutType>
@@ -545,25 +532,30 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
                          const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                          const c10::optional<torch::Tensor>& bias) {
   uint32_t const m = a.size(0);
-  uint32_t const mp2 = std::max(static_cast<uint32_t>(64), next_pow_2(m));  // next power of 2
-using FastPingpongScheduler = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
-using FastBasicScheduler = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
-using PersistentTileScheduler = cutlass::gemm::PersistentScheduler;
-using BasicTileScheduler = void;
-  if (mp2 <= 1) {
-    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>, FastBasicScheduler, BasicTileScheduler>(out, a, b, scales_a, scales_b, bias);
-  } if (mp2 <= 64) {
+  using FastPingpongScheduler = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
+  using FastBasicScheduler = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
+  using PersistentTileScheduler = cutlass::gemm::PersistentScheduler;
+  using BasicTileScheduler = void;
+  if (m <= 1) {
+    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>, FastBasicScheduler,
+                              BasicTileScheduler>(out, a, b, scales_a, scales_b, bias);
+  }
+  if (m <= 64) {
     // m in [1, 64]
-    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>, FastPingpongScheduler, PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
-  } else if (mp2 <= 256) {
+    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>, FastPingpongScheduler,
+                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+  } else if (m <= 256) {
     // m in (64, 256]
-    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>, FastPingpongScheduler, PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
-  } else if (mp2 <= 1024) {
+    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>, FastPingpongScheduler,
+                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+  } else if (m <= 1024) {
     // m in (256, 1024]
-    return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>, FastPingpongScheduler, PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+    return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>, FastPingpongScheduler,
+                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
   } else {
     // m in (1024, inf)
-    return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>, FastPingpongScheduler, PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+    return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>, FastPingpongScheduler,
+                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
   }
 }
 #endif
