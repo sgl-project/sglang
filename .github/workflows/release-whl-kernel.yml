@@ -36,7 +36,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
-          path: dist/*
+          path: sgl-kernel/dist/*
 
   release:
     needs: build-wheels
@@ -45,7 +45,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist/
+          path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-*
 
@@ -55,4 +55,4 @@ jobs:
           tag_name: ${{ inputs.tag_name }}
           repository: sgl-project/whl
           files: |
-            dist/*
+            sgl-kernel/dist/*
