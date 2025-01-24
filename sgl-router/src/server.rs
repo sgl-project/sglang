@@ -200,6 +200,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(get_server_info)
             .service(add_worker)
             .service(remove_worker)
+            .service(check_auth)
     })
     .bind((config.host, config.port))?
     .run()

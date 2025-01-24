@@ -353,44 +353,21 @@ class TestLaunchServer(unittest.TestCase):
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/generate", json={"text": "Kanye west is, ", "temperature": 0})
             print(f"status code: {response.status_code}, response: {response.text}")
-        #     self.assertEqual(response.status_code, 401, "Request without api key should fail with 401")
-            session.auth = None
-            session.cookies.clear()
+            self.assertEqual(response.status_code, 401, "Request without api key should fail with 401")
+
         # Test case 2: request with invalid api key should fail
-        # with requests.Session() as session:
+        with requests.Session() as session:
             response = requests.post(f"{self.base_url}/generate", json={"text": "Kanye west is, ", "temperature": 0}, headers={"Authorization": "Bearer 123"})
             print(f"status code: {response.status_code}, response: {response.text}")
-        #     # self.assertEqual(response.status_code, 401, "Request with invalid api key should fail with 401")
-            session.auth = None
-            session.cookies.clear()
+            self.assertEqual(response.status_code, 401, "Request with invalid api key should fail with 401")
+
         # Test case 3: request with correct api key should succeed
-        # with requests.Session() as session:
+        with requests.Session() as session:
             response = session.post(f"{self.base_url}/generate", json={"text": "Kanye west is ", "temperature": 0}, headers={"Authorization": "Bearer correct_api_key"})
             print(f"status code: {response.status_code}, response: {response.text}")
-        #     self.assertEqual(response.status_code, 200, "Request with correct api key should succeed")
+            self.assertEqual(response.status_code, 200, "Request with correct api key should succeed")
 
 
 
 if __name__ == "__main__":
     unittest.main()
-
-"""
-curl -X POST http://127.0.0.1:30000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Kanye west is, ",
-    "sampling_params": {
-      "temperature": 0
-    }
-  }'
-
-curl -X POST http://127.0.0.1:30000/generate \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer correct_api_key" \
-  -d '{
-    "text": "Kanye west is, ",
-    "sampling_params": {
-      "temperature": 0
-    }
-  }'
-"""

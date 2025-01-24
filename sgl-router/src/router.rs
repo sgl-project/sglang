@@ -316,9 +316,11 @@ impl Router {
     ) -> HttpResponse {
         let mut request_builder = client.get(format!("{}{}", worker_url, route));
         
-        // Copy all headers from original request
-        for (name, value) in copy_request_headers(req) {
-            request_builder = request_builder.header(name, value);
+        // Copy all headers from original request except for /health
+        if route != "/health" {
+            for (name, value) in copy_request_headers(req) {
+                request_builder = request_builder.header(name, value);
+            }
         }
 
         match request_builder.send().await {
