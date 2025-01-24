@@ -4,7 +4,7 @@ PYTHON_VERSION=$1
 CUDA_VERSION=$2
 PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
 
-if (( $(echo "$CUDA_VERSION < 12.0" | bc -l) )); then
+if (( ${CUDA_VERSION%.*} < 12 )); then
     ENABLE_SM90A=0
 else
     ENABLE_SM90A=1
