@@ -63,6 +63,8 @@ jobs:
         env:
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
 
+      - uses: actions/checkout@v4
+
       - name: Update wheel index
         run: python3 scripts/update_kernel_whl_index.py
 
