@@ -121,14 +121,6 @@ async fn remove_worker(
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
-#[post("/check_auth")]
-async fn check_auth(
-    req: HttpRequest,
-    data: web::Data<AppState>,
-) -> impl Responder {
-    HttpResponse::Unauthorized().body("Unauthorized")
-}
-
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -200,7 +192,6 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(get_server_info)
             .service(add_worker)
             .service(remove_worker)
-            .service(check_auth)
     })
     .bind((config.host, config.port))?
     .run()

@@ -91,6 +91,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
@@ -474,28 +475,6 @@ def launch_server(
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
-
-    # Add middleware to log all requests
-    @app.middleware("http")
-    async def log_requests(request: Request, call_next):
-        """Log all incoming requests and their details"""
-        # Log request details
-        body = await request.body()
-        body_str = body.decode() if body else ""
-        logger.info(f"🌐 Request: {request.method} {request.url}")
-        logger.info(f"🌐 Headers: {dict(request.headers)}")
-        logger.info(f"🌐 Body: {body_str}")
-        
-        # Process the request and get response
-        try:
-            response = await call_next(request)
-            # Log response status
-            logger.info(f"🌐 Response status: {response.status_code}")
-            return response
-        except Exception as e:
-            # Log any errors
-            logger.error(f"🌐 Request failed: {str(e)}")
-            raise
 
     # Add prometheus middleware
     if server_args.enable_metrics:

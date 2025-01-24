@@ -16,7 +16,10 @@ fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
         .iter()
         .filter_map(|(name, value)| {
-            value.to_str().ok().map(|v| (name.to_string(), v.to_string()))
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.to_string(), v.to_string()))
         })
         .collect()
 }
@@ -315,8 +318,8 @@ impl Router {
         req: &HttpRequest,
     ) -> HttpResponse {
         let mut request_builder = client.get(format!("{}{}", worker_url, route));
-        
-        // Copy all headers from original request except for /health
+
+        // Copy all headers from original request except for /health because it does not need authorization
         if route != "/health" {
             for (name, value) in copy_request_headers(req) {
                 request_builder = request_builder.header(name, value);
@@ -341,7 +344,12 @@ impl Router {
         }
     }
 
-    pub async fn route_to_first(&self, client: &reqwest::Client, route: &str, req: &HttpRequest) -> HttpResponse {
+    pub async fn route_to_first(
+        &self,
+        client: &reqwest::Client,
+        route: &str,
+        req: &HttpRequest,
+    ) -> HttpResponse {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
@@ -362,8 +370,9 @@ impl Router {
                         if response.status().is_success() {
                             return response;
                         } else {
-                            // if the worker is healthy, return the error response
-                            let health_response = self.send_request(client, &worker_url, "/health", req).await;
+                            // if the worker is healthy, it means the request is bad, so return the error response
+                            let health_response =
+                                self.send_request(client, &worker_url, "/health", req).await;
                             if health_response.status().is_success() {
                                 return response;
                             }
@@ -619,8 +628,9 @@ impl Router {
                 if response.status().is_success() {
                     return response;
                 } else {
-                    // if the worker is healthy, return the error response
-                    let health_response = self.send_request(client, &worker_url, "/health", req).await;
+                    // if the worker is healthy, it means the request is bad, so return the error response
+                    let health_response =
+                        self.send_request(client, &worker_url, "/health", req).await;
                     if health_response.status().is_success() {
                         return response;
                     }

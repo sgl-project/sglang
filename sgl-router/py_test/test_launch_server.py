@@ -52,7 +52,7 @@ def popen_launch_router(
         "--dp",
         str(dp_size),
         "--router-eviction-interval",
-        "300",
+        "5",
         "--router-policy",
         policy,
         "--api-key",
@@ -155,191 +155,191 @@ class TestLaunchServer(unittest.TestCase):
             terminate_and_wait(process)
         print("tearDown done")
 
-    # def test_1_mmlu(self):
-    #     print("Running test_1_mmlu...")
-    #     # DP size = 2
-    #     self.process = popen_launch_router(
-    #         self.model,
-    #         self.base_url,
-    #         dp_size=2,
-    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    #         policy="cache_aware",
-    #     )
+    def test_1_mmlu(self):
+        print("Running test_1_mmlu...")
+        # DP size = 2
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=2,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="cache_aware",
+        )
 
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=64,
-    #         num_threads=32,
-    #         temperature=0.1,
-    #     )
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+            temperature=0.1,
+        )
 
-    #     metrics = run_eval(args)
-    #     score = metrics["score"]
-    #     THRESHOLD = 0.65
-    #     passed = score >= THRESHOLD
-    #     msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
-    #     self.assertGreaterEqual(score, THRESHOLD, msg)
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    # def test_2_add_and_remove_worker(self):
-    #     print("Running test_2_add_and_remove_worker...")
-    #     # DP size = 1
-    #     self.process = popen_launch_router(
-    #         self.model,
-    #         self.base_url,
-    #         dp_size=1,
-    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    #         policy="round_robin",  # use round robin to make sure every worker processes requests
-    #     )
-    #     # 1. start a worker
-    #     port = find_available_port()
-    #     worker_url = f"http://127.0.0.1:{port}"
-    #     worker_process = popen_launch_server(
-    #         self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-    #     )
-    #     self.other_process.append(worker_process)
+    def test_2_add_and_remove_worker(self):
+        print("Running test_2_add_and_remove_worker...")
+        # DP size = 1
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",  # use round robin to make sure every worker processes requests
+        )
+        # 1. start a worker
+        port = find_available_port()
+        worker_url = f"http://127.0.0.1:{port}"
+        worker_process = popen_launch_server(
+            self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        )
+        self.other_process.append(worker_process)
 
-    #     # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
-    #     with requests.Session() as session:
-    #         response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
-    #         print(f"status code: {response.status_code}, response: {response.text}")
-    #         self.assertEqual(response.status_code, 200)
+        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
+        with requests.Session() as session:
+            response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
+            self.assertEqual(response.status_code, 200)
 
-    #     # 3. run mmlu
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=64,
-    #         num_threads=32,
-    #         temperature=0.1,
-    #     )
-    #     metrics = run_eval(args)
-    #     score = metrics["score"]
-    #     THRESHOLD = 0.65
-    #     passed = score >= THRESHOLD
-    #     msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
-    #     self.assertGreaterEqual(score, THRESHOLD, msg)
+        # 3. run mmlu
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+            temperature=0.1,
+        )
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    #     # 4. use /remove_worker api to remove it from the router
-    #     with requests.Session() as session:
-    #         response = session.post(f"{self.base_url}/remove_worker?url={worker_url}")
-    #         print(f"status code: {response.status_code}, response: {response.text}")
-    #         self.assertEqual(response.status_code, 200)
+        # 4. use /remove_worker api to remove it from the router
+        with requests.Session() as session:
+            response = session.post(f"{self.base_url}/remove_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
+            self.assertEqual(response.status_code, 200)
 
-    #     # 5. run mmlu again
-    #     metrics = run_eval(args)
-    #     score = metrics["score"]
-    #     THRESHOLD = 0.65
-    #     passed = score >= THRESHOLD
-    #     msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
-    #     self.assertGreaterEqual(score, THRESHOLD, msg)
+        # 5. run mmlu again
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    # def test_3_lazy_fault_tolerance(self):
-    #     print("Running test_3_lazy_fault_tolerance...")
-    #     # DP size = 1
-    #     self.process = popen_launch_router(
-    #         self.model,
-    #         self.base_url,
-    #         dp_size=1,
-    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    #         policy="round_robin",
-    #     )
+    def test_3_lazy_fault_tolerance(self):
+        print("Running test_3_lazy_fault_tolerance...")
+        # DP size = 1
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",
+        )
 
-    #     # 1. start a worker
-    #     port = find_available_port()
-    #     worker_url = f"http://127.0.0.1:{port}"
-    #     worker_process = popen_launch_server(
-    #         self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-    #     )
-    #     self.other_process.append(worker_process)
+        # 1. start a worker
+        port = find_available_port()
+        worker_url = f"http://127.0.0.1:{port}"
+        worker_process = popen_launch_server(
+            self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        )
+        self.other_process.append(worker_process)
 
-    #     # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
-    #     with requests.Session() as session:
-    #         response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
-    #         print(f"status code: {response.status_code}, response: {response.text}")
-    #         self.assertEqual(response.status_code, 200)
+        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
+        with requests.Session() as session:
+            response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
+            self.assertEqual(response.status_code, 200)
 
-    #     # Start a thread to kill the worker after 10 seconds to mimic abrupt worker failure
-    #     def kill_worker():
-    #         time.sleep(10)
-    #         kill_process_tree(worker_process.pid)
-    #         print("Worker process killed")
+        # Start a thread to kill the worker after 10 seconds to mimic abrupt worker failure
+        def kill_worker():
+            time.sleep(10)
+            kill_process_tree(worker_process.pid)
+            print("Worker process killed")
 
-    #     import threading
+        import threading
 
-    #     kill_thread = threading.Thread(target=kill_worker)
-    #     kill_thread.daemon = True
-    #     kill_thread.start()
+        kill_thread = threading.Thread(target=kill_worker)
+        kill_thread.daemon = True
+        kill_thread.start()
 
-    #     # 3. run mmlu
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=256,
-    #         num_threads=32,
-    #         temperature=0.1,
-    #     )
-    #     metrics = run_eval(args)
-    #     score = metrics["score"]
-    #     THRESHOLD = 0.65
-    #     passed = score >= THRESHOLD
-    #     msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
-    #     self.assertGreaterEqual(score, THRESHOLD, msg)
+        # 3. run mmlu
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=256,
+            num_threads=32,
+            temperature=0.1,
+        )
+        metrics = run_eval(args)
+        score = metrics["score"]
+        THRESHOLD = 0.65
+        passed = score >= THRESHOLD
+        msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
+        self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    # def test_4_payload_size(self):
-    #     print("Running test_4_payload_size...")
-    #     # Start router with 3MB limit
-    #     self.process = popen_launch_router(
-    #         self.model,
-    #         self.base_url,
-    #         dp_size=1,
-    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    #         policy="round_robin",
-    #         max_payload_size=1 * 1024 * 1024,  # 1MB limit
-    #     )
+    def test_4_payload_size(self):
+        print("Running test_4_payload_size...")
+        # Start router with 3MB limit
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",
+            max_payload_size=1 * 1024 * 1024,  # 1MB limit
+        )
 
-    #     # Test case 1: Payload just under 1MB should succeed
-    #     payload_0_5_mb = {
-    #         "text": "x" * int(0.5 * 1024 * 1024),  # 0.5MB of text
-    #         "temperature": 0.0,
-    #     }
+        # Test case 1: Payload just under 1MB should succeed
+        payload_0_5_mb = {
+            "text": "x" * int(0.5 * 1024 * 1024),  # 0.5MB of text
+            "temperature": 0.0,
+        }
 
-    #     with requests.Session() as session:
-    #         response = session.post(
-    #             f"{self.base_url}/generate",
-    #             json=payload_0_5_mb,
-    #             headers={"Content-Type": "application/json"},
-    #         )
-    #         self.assertEqual(
-    #             response.status_code,
-    #             200,
-    #             f"0.5MB payload should succeed but got status {response.status_code}",
-    #         )
+        with requests.Session() as session:
+            response = session.post(
+                f"{self.base_url}/generate",
+                json=payload_0_5_mb,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"0.5MB payload should succeed but got status {response.status_code}",
+            )
 
-    #     # Test case 2: Payload over 1MB should fail
-    #     payload_1_plus_mb = {
-    #         "text": "x" * int((1.2 * 1024 * 1024)),  # 1.2MB of text
-    #         "temperature": 0.0,
-    #     }
+        # Test case 2: Payload over 1MB should fail
+        payload_1_plus_mb = {
+            "text": "x" * int((1.2 * 1024 * 1024)),  # 1.2MB of text
+            "temperature": 0.0,
+        }
 
-    #     with requests.Session() as session:
-    #         response = session.post(
-    #             f"{self.base_url}/generate",
-    #             json=payload_1_plus_mb,
-    #             headers={"Content-Type": "application/json"},
-    #         )
-    #         self.assertEqual(
-    #             response.status_code,
-    #             413,  # Payload Too Large
-    #             f"1.2MB payload should fail with 413 but got status {response.status_code}",
-    #         )
+        with requests.Session() as session:
+            response = session.post(
+                f"{self.base_url}/generate",
+                json=payload_1_plus_mb,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(
+                response.status_code,
+                413,  # Payload Too Large
+                f"1.2MB payload should fail with 413 but got status {response.status_code}",
+            )
 
     def test_5_api_key(self):
         print("Running test_5_api_key...")
-        # Start router with 3MB limit
+
         self.process = popen_launch_router(
             self.model,
             self.base_url,
@@ -351,22 +351,42 @@ class TestLaunchServer(unittest.TestCase):
 
         # # Test case 1: request without api key should fail
         with requests.Session() as session:
-            response = session.post(f"{self.base_url}/generate", json={"text": "Kanye west is, ", "temperature": 0})
+            response = session.post(
+                f"{self.base_url}/generate",
+                json={"text": "Kanye west is, ", "temperature": 0},
+            )
             print(f"status code: {response.status_code}, response: {response.text}")
-            self.assertEqual(response.status_code, 401, "Request without api key should fail with 401")
+            self.assertEqual(
+                response.status_code,
+                401,
+                "Request without api key should fail with 401",
+            )
 
         # Test case 2: request with invalid api key should fail
         with requests.Session() as session:
-            response = requests.post(f"{self.base_url}/generate", json={"text": "Kanye west is, ", "temperature": 0}, headers={"Authorization": "Bearer 123"})
+            response = requests.post(
+                f"{self.base_url}/generate",
+                json={"text": "Kanye west is, ", "temperature": 0},
+                headers={"Authorization": "Bearer 123"},
+            )
             print(f"status code: {response.status_code}, response: {response.text}")
-            self.assertEqual(response.status_code, 401, "Request with invalid api key should fail with 401")
+            self.assertEqual(
+                response.status_code,
+                401,
+                "Request with invalid api key should fail with 401",
+            )
 
         # Test case 3: request with correct api key should succeed
         with requests.Session() as session:
-            response = session.post(f"{self.base_url}/generate", json={"text": "Kanye west is ", "temperature": 0}, headers={"Authorization": "Bearer correct_api_key"})
+            response = session.post(
+                f"{self.base_url}/generate",
+                json={"text": "Kanye west is ", "temperature": 0},
+                headers={"Authorization": "Bearer correct_api_key"},
+            )
             print(f"status code: {response.status_code}, response: {response.text}")
-            self.assertEqual(response.status_code, 200, "Request with correct api key should succeed")
-
+            self.assertEqual(
+                response.status_code, 200, "Request with correct api key should succeed"
+            )
 
 
 if __name__ == "__main__":
