@@ -55,9 +55,10 @@ def popen_launch_router(
         "5",
         "--router-policy",
         policy,
-        "--api-key",
-        api_key,
     ]
+
+    if api_key is not None:
+        command.extend(["--api-key", api_key])
 
     if max_payload_size is not None:
         command.extend(["--router-max-payload-size", str(max_payload_size)])
