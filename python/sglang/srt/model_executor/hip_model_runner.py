@@ -7,12 +7,12 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.hip_attention import HiPRadixAttentionBackend
 from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,7 @@ class HiPModelRunner(ModelRunner):
         if server_args.enable_hip_attention:
             logger.info("HIP attention is turned on.")
             server_args.attention_backend = "hip_attention"
-            self.init_hip_attention_config(
-                server_args.hip_attention_config
-            )
+            self.init_hip_attention_config(server_args.hip_attention_config)
 
         super().__init__(
             model_config=model_config,
@@ -72,10 +70,11 @@ class HiPModelRunner(ModelRunner):
         max_total_tokens: Optional[int] = None,
     ):
         super().init_memory_pool(total_gpu_memory, max_num_reqs, max_total_tokens)
-        
+
         if self.server_args.enable_hip_attention:
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
-                query_head_num=self.model_config.num_attention_heads // self.server_args.tp_size,
+                query_head_num=self.model_config.num_attention_heads
+                // self.server_args.tp_size,
                 layer_num=self.model_config.num_hidden_layers,
                 context_length=self.model_config.context_len,
                 device=self.device,

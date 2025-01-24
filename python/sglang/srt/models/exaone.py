@@ -154,7 +154,9 @@ class ExaoneAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            orig_context_len=getattr(config, "orig_context_len", max_position_embeddings),
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
             rope=self.rotary_emb,
         )
 

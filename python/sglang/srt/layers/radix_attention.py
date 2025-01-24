@@ -14,13 +14,14 @@
 """Radix attention."""
 from __future__ import annotations
 
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
 
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.rotary_embedding import get_rope, RotaryEmbedding
+
 
 class RadixAttention(nn.Module):
     """
@@ -64,7 +65,7 @@ class RadixAttention(nn.Module):
                 _, self.rope_cos, self.rope_sin = rope
             else:
                 assert isinstance(rope, RotaryEmbedding)
-                if hasattr(rope, 'repeated_cos_sin_cache'):
+                if hasattr(rope, "repeated_cos_sin_cache"):
                     self.rope_cos, self.rope_sin = rope.repeated_cos_sin_cache
                 else:
                     cos_sin = rope.cos_sin_cache

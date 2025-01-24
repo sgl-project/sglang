@@ -276,9 +276,9 @@ class TokenizerManager:
 
             # HACK: Remove duplicate bos tokens
             while (
-                (len(input_ids) > 1) and
-                (input_ids[0] == self.tokenizer.bos_token_id) and
-                (input_ids[1] == self.tokenizer.bos_token_id)
+                (len(input_ids) > 1)
+                and (input_ids[0] == self.tokenizer.bos_token_id)
+                and (input_ids[1] == self.tokenizer.bos_token_id)
             ):
                 input_ids.pop(0)
         elif obj.input_ids is not None:

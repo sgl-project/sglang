@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import bisect
-from contextlib import contextmanager
 import os
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable
 
 import torch

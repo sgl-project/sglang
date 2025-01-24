@@ -33,8 +33,8 @@ import numpy as np
 import psutil
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import debug_timing, get_compiler_backend
 
 logger = logging.getLogger(__name__)
@@ -204,6 +204,7 @@ class BaseTokenToKVPool:
 
     def on_layer_end(self, forward_batch: ForwardBatch, layer_id: int):
         pass
+
 
 class MHATokenToKVPool(BaseTokenToKVPool):
 

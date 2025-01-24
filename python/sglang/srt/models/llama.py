@@ -38,7 +38,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope, RotaryEmbedding
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -170,7 +170,9 @@ class LlamaAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            orig_context_len=getattr(config, "orig_context_len", max_position_embeddings),
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
             rope=self.rotary_emb,
         )
 
@@ -184,9 +186,8 @@ class LlamaAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # FIXME(geon): find better way to detect if HIP is enabled
-        if (
-            (forward_batch.hip_metadata_cache_pool is None) or\
-            (not forward_batch.hip_metadata_cache_pool.hip_config.using_extend)
+        if (forward_batch.hip_metadata_cache_pool is None) or (
+            not forward_batch.hip_metadata_cache_pool.hip_config.using_extend
         ):
             q, k = self.rotary_emb(positions, q, k)
 
@@ -234,7 +235,9 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             bias=attention_bias,
-            previous_layer=previous_layer.self_attn if previous_layer is not None else None,
+            previous_layer=(
+                previous_layer.self_attn if previous_layer is not None else None
+            ),
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -291,9 +294,9 @@ class LlamaModel(nn.Module):
         self.layers = make_layers_with_previous_layer(
             config.num_hidden_layers,
             lambda idx, prefix, previous_layer: LlamaDecoderLayer(
-                config=config, 
-                quant_config=quant_config, 
-                layer_id=idx, 
+                config=config,
+                quant_config=quant_config,
+                layer_id=idx,
                 prefix=prefix,
                 previous_layer=previous_layer,
             ),
@@ -327,9 +330,9 @@ class LlamaModel(nn.Module):
             )
             forward_batch.on_layer_end(i)
         forward_batch.on_model_end()
-        
+
         hidden_states, _ = self.norm(hidden_states, residual)
-        
+
         return hidden_states
 
     # If this function is called, it should always initialize KV cache scale

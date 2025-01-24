@@ -43,11 +43,11 @@ from sglang.srt.utils import maybe_torch_compile
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
+    from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
-    from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
 
 
 class ForwardMode(IntEnum):
@@ -348,7 +348,7 @@ class ForwardBatch:
         ret.attn_backend = model_runner.attn_backend
 
         # Init HiP attention information
-        if hasattr(model_runner, 'hip_metadata_cache_pool'):
+        if hasattr(model_runner, "hip_metadata_cache_pool"):
             ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
             ret.hip_use_cached_mask = batch.hip_use_cached_mask
             ret.hip_metadata_cached_stage = batch.hip_metadata_cached_stages
@@ -370,6 +370,7 @@ class ForwardBatch:
 
     def on_layer_end(self, layer_id: int):
         self.token_to_kv_pool.on_layer_end(self, layer_id)
+
 
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
