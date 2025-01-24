@@ -41,7 +41,7 @@ import numpy as np
 import psutil
 import torch
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import quantize_cache_kv
+from sglang.srt.layers.quantization.int8_kernel import quantize_cache_kv
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
 

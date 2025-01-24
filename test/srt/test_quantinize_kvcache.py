@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import quantize_cache_kv
+from sglang.srt.layers.quantization.int8_kernel import quantize_cache_kv
 
 
 class TestQuantizeKVCache(unittest.TestCase):

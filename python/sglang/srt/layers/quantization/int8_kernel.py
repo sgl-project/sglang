@@ -62,3 +62,168 @@ def per_token_quant_int8(x):
     )
 
     return x_q, scales
+
+
+@triton.jit
+def quantize_and_store(
+    cur_index,
+    data_ptr,
+    cache_ptr,
+    scale_zeros_ptr,
+    stride_bs,
+    stride_h,
+    stride_d,
+    stride_c_bs,
+    stride_c_h,
+    stride_c_d,
+    dest_index,
+    offs_h,
+    offs_d,
+    head_num,
+    szd_off,
+):
+    data = tl.load(
+        data_ptr
+        + cur_index * stride_bs
+        + offs_h[:, None] * stride_h
+        + offs_d[None, :] * stride_d,
+        mask=offs_h[:, None] < head_num,
+        other=0.0,
+    )
+
+    quant, scales, zeros = _quant_int8(data)
+    o_ptrs = (
+        cache_ptr
+        + dest_index * stride_bs
+        + offs_h[:, None] * stride_h
+        + offs_d[None, :] * stride_d
+    )
+    sz_ptrs_k = (
+        scale_zeros_ptr
+        + dest_index * stride_c_bs
+        + stride_c_h * offs_h[:, None] * stride_c_d
+    )
+    tl.store(o_ptrs, quant, mask=offs_h[:, None] < head_num)
+    tl.store(
+        sz_ptrs_k + szd_off[None, :] * 1,
+        scales[:, None],
+        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] < 1),
+    )
+    tl.store(
+        sz_ptrs_k + szd_off[None, :] * 1,
+        zeros[:, None],
+        mask=(offs_h[:, None] < head_num) & (szd_off[None, :] == 1),
+    )
+
+
+@triton.jit
+def _fwd_kernel_quantize_cache_kv(
+    K,
+    V,
+    Dest_Idx,
+    K_Cache,
+    V_Cache,
+    K_Scale_Zeros,
+    V_Scale_Zeros,
+    stride_k_bs,
+    stride_k_h,
+    stride_k_d,
+    stride_v_bs,
+    stride_v_h,
+    stride_v_d,
+    stride_kv_sz_bs,
+    stride_kv_sz_h,
+    stride_kv_sz_d,
+    head_num,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+):
+    cur_index = tl.program_id(0)
+    offs_h = tl.arange(0, BLOCK_HEAD)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    dest_index = tl.load(Dest_Idx + cur_index)
+    szd_off = tl.arange(0, 2)
+
+    # Process K
+    quantize_and_store(
+        cur_index,
+        K,
+        K_Cache,
+        K_Scale_Zeros,
+        stride_k_bs,
+        stride_k_h,
+        stride_k_d,
+        stride_kv_sz_bs,
+        stride_kv_sz_h,
+        stride_kv_sz_d,
+        dest_index,
+        offs_h,
+        offs_d,
+        head_num,
+        szd_off,
+    )
+
+    # Process V
+    quantize_and_store(
+        cur_index,
+        V,
+        V_Cache,
+        V_Scale_Zeros,
+        stride_v_bs,
+        stride_v_h,
+        stride_v_d,
+        stride_kv_sz_bs,
+        stride_kv_sz_h,
+        stride_kv_sz_d,
+        dest_index,
+        offs_h,
+        offs_d,
+        head_num,
+        szd_off,
+    )
+
+
+def quantize_cache_kv(
+    k,
+    v,
+    dest_idx,
+    k_quantized_out,
+    k_scales_zeros,
+    v_quantized_out,
+    v_scales_zeros,
+):
+    bs = dest_idx.shape[0]
+    k_head_num = k.shape[1]
+    k_head_dim = k.shape[2]
+    assert (
+        k.shape[1] == k_quantized_out.shape[1]
+        and k.shape[2] == k_quantized_out.shape[2]
+    )
+    BLOCK_HEAD = triton.next_power_of_2(k_head_num)
+    grid = (bs,)
+    num_warps = min(max(k_head_dim // 256, 1), 8)
+
+    _fwd_kernel_quantize_cache_kv[grid](
+        k,
+        v,
+        dest_idx,
+        k_quantized_out,
+        v_quantized_out,
+        k_scales_zeros,
+        v_scales_zeros,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        k_scales_zeros.stride(0),
+        k_scales_zeros.stride(1),
+        k_scales_zeros.stride(2),
+        k_head_num,
+        BLOCK_DMODEL=k_head_dim,
+        BLOCK_HEAD=BLOCK_HEAD,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return
