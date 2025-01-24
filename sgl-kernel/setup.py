@@ -38,7 +38,6 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
-cutlass = root / "3rdparty" / "cutlass"
 cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
