@@ -20,6 +20,10 @@ classifiers = [
 [tool.setuptools.packages]
 find = { where = ["py_src"] }
 
+# workaround for https://github.com/pypa/twine/issues/1216
+[tool.setuptools]
+license-files = []
+
 [[tool.setuptools-rust.ext-modules]]
 target = "sglang_router_rs"
 path = "Cargo.toml"
