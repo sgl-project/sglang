@@ -97,6 +97,7 @@ CONTEXT_LENGTH_KEYS = [
     "max_position_embeddings",
 ]
 
+
 def get_context_length(config):
     """Get the context length of a model from a huggingface model configs."""
     text_config = config

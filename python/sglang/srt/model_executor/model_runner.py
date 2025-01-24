@@ -33,12 +33,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.hf_transformers_utils import update_context_length, get_context_length
-
+from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -53,13 +48,13 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import ServerArgs
@@ -307,10 +302,14 @@ class ModelRunner:
             orig_context_length = get_context_length(self.model_config.hf_config)
             if self.server_args.context_length is None:
                 self.server_args.context_length = orig_context_length
-            update_context_length(self.model_config.hf_config, self.server_args.context_length)
+            update_context_length(
+                self.model_config.hf_config, self.server_args.context_length
+            )
             self.model_config.hf_config.orig_context_len = orig_context_length
-            logger.info(f"Update model config for HiP context extension "
-                        f"{orig_context_length} -> {self.server_args.context_length}.")
+            logger.info(
+                f"Update model config for HiP context extension "
+                f"{orig_context_length} -> {self.server_args.context_length}."
+            )
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
@@ -662,7 +661,10 @@ class ModelRunner:
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
-        elif self.server_args.enable_hip_attention and self.server_args.enable_hip_offload:
+        elif (
+            self.server_args.enable_hip_attention
+            and self.server_args.enable_hip_offload
+        ):
             self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
                 max_token_size=self.max_total_num_tokens,
                 max_mask_cache_token_size=self.server_args.hip_max_mask_cache_token_size,
@@ -742,8 +744,8 @@ class ModelRunner:
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
         from sglang.srt.layers.attention.hip_attention import HiPCudaGraphRunner
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
         self.cuda_graph_runner = None
 
@@ -824,34 +826,38 @@ class ModelRunner:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        require_decode_profiling = os.getenv('SRT_MODEL_RUNNER_PROFILING', '0') == '1'
+        require_decode_profiling = os.getenv("SRT_MODEL_RUNNER_PROFILING", "0") == "1"
         if require_decode_profiling:
             start_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
-        
+
         result = self._forward(forward_batch)
 
         if require_decode_profiling:
             end_event = torch.cuda.Event(enable_timing=True)
             end_event.record()
-            
+
             end_event.synchronize()
             elapsed = start_event.elapsed_time(end_event)
-        
-        if require_decode_profiling and (forward_batch.hip_metadata_cache_pool is not None) and forward_batch.forward_mode.is_decode():
+
+        if (
+            require_decode_profiling
+            and (forward_batch.hip_metadata_cache_pool is not None)
+            and forward_batch.forward_mode.is_decode()
+        ):
             cache = forward_batch.hip_metadata_cache_pool
             statistics = cache.compute_cache_statistics(forward_batch.batch_size)
             statistics = dict(map(lambda x: (x[0], x[1].item()), statistics.items()))
             logger.info(
-                f'took {elapsed:.3f} ms, '
+                f"took {elapsed:.3f} ms, "
                 f'SA hit = {statistics["sa_hit_ratio"]*100:.2f}% (miss = {statistics["sa_miss"] / 1024 / 1024:.2f}M / {statistics["sa_access"] / 1024 / 1024:.2f}M), '
                 f'Mask hit = {statistics["mask_hit_ratio"] * 100:.2f}% (miss = {statistics["mask_miss"] / 1024 / 1024:.2f}M / {statistics["mask_access"] / 1024 / 1024:.2f}M)'
             )
         elif require_decode_profiling:
-            logger.info(f'took {elapsed:.3f} ms')
+            logger.info(f"took {elapsed:.3f} ms")
 
         return result
-    
+
     def sample(
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> torch.Tensor:

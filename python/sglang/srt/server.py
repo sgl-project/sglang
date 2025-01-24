@@ -712,13 +712,21 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
         json_data["input_ids"] = [10, 11, 12]
     else:
         # json_data["text"] = "The capital city of France is"
-        target_length = int(os.getenv('SRT_WARMUP_PASSKEY_LENGTH', '35000'))
-        json_data["text"] = "You need to find the passkey. Read carefully following text, and remember the passkey\n\n"
+        target_length = int(os.getenv("SRT_WARMUP_PASSKEY_LENGTH", "35000"))
+        json_data["text"] = (
+            "You need to find the passkey. Read carefully following text, and remember the passkey\n\n"
+        )
         filler = "Sky is blue, grass is green, sun is red. And here we go again"
         json_data["text"] += filler * (target_length // 35)
-        json_data["text"] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
-        json_data["text"] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
-        json_data["text"] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
+        json_data[
+            "text"
+        ] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
+        json_data[
+            "text"
+        ] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
+        json_data[
+            "text"
+        ] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
         json_data["text"] += filler * (target_length // 35)
         json_data["text"] += "What was the passkey? The passkey is"
 

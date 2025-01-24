@@ -1049,21 +1049,21 @@ class Scheduler:
                     model_worker_batch = batch.get_model_worker_batch()
                     logits_output, next_token_ids = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
-#                 model_worker_batch = batch.get_model_worker_batch()
-#                 if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-#                     # FIXME(geon): handle hip refresh_interval here
-#                     logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-#                         model_worker_batch
-#                     )
-#                 elif batch.forward_mode.is_idle():
-#                     model_worker_batch = batch.get_model_worker_batch()
-#                     self.tp_worker.forward_batch_idle(model_worker_batch)
-#                     return
-#                 else:
-#                     logits_output = None
-#                     if self.skip_tokenizer_init:
-#                         next_token_ids = torch.full(
-#                             (batch.batch_size(),), self.tokenizer.eos_token_id
+                        #                 model_worker_batch = batch.get_model_worker_batch()
+                        #                 if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
+                        #                     # FIXME(geon): handle hip refresh_interval here
+                        #                     logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                        #                         model_worker_batch
+                        #                     )
+                        #                 elif batch.forward_mode.is_idle():
+                        #                     model_worker_batch = batch.get_model_worker_batch()
+                        #                     self.tp_worker.forward_batch_idle(model_worker_batch)
+                        #                     return
+                        #                 else:
+                        #                     logits_output = None
+                        #                     if self.skip_tokenizer_init:
+                        #                         next_token_ids = torch.full(
+                        #                             (batch.batch_size(),), self.tokenizer.eos_token_id
                     )
                 else:
                     (

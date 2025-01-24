@@ -8,19 +8,18 @@ import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
-
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
     LogitsProcessorOutput,
 )
+from sglang.srt.layers.torchao_utils import save_gemlite_cache
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner, patch_model
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner, patch_model
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.hip_model_runner import HiPModelRunner
@@ -41,13 +40,18 @@ class HiPCudaGraphRunner(CudaGraphRunner):
                 forward_batch.global_num_tokens
             )
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                (min_num_tokens == max_num_tokens and (max_num_tokens, use_cached_mask, num_stage_cached) in self.graphs)
+                (
+                    min_num_tokens == max_num_tokens
+                    and (max_num_tokens, use_cached_mask, num_stage_cached)
+                    in self.graphs
+                )
                 if self.disable_padding
                 else max_num_tokens <= self.max_bs
             )
         else:
             is_bs_supported = (
-                (forward_batch.batch_size, use_cached_mask, num_stage_cached) in self.graphs
+                (forward_batch.batch_size, use_cached_mask, num_stage_cached)
+                in self.graphs
                 if self.disable_padding
                 else forward_batch.batch_size <= self.max_bs
             )
@@ -70,7 +74,7 @@ class HiPCudaGraphRunner(CudaGraphRunner):
             cache_configs = [(True, None)]
             for i_stage in range(num_stages):
                 cache_configs.append((False, i_stage))
-            
+
             self.stream = graph_capture_context.stream
             capture_bs = (
                 tqdm.tqdm(self.capture_bs)
@@ -89,8 +93,7 @@ class HiPCudaGraphRunner(CudaGraphRunner):
                             graph,
                             output_buffers,
                         ) = self.capture_one_batch_size(
-                            bs, forward, 
-                            use_cached_mask, num_cached_stages
+                            bs, forward, use_cached_mask, num_cached_stages
                         )
                         graph_handle = (bs, use_cached_mask, num_cached_stages)
                         self.graphs[graph_handle] = graph
@@ -99,16 +102,16 @@ class HiPCudaGraphRunner(CudaGraphRunner):
                     save_gemlite_cache()
 
     def capture_one_batch_size(
-        self, 
-        bs: int, 
-        forward: Callable, 
+        self,
+        bs: int,
+        forward: Callable,
         hip_use_cached_mask: bool = False,
         hip_num_cached_stages: int = 0,
     ):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
-        
+
         # Common inputs
         input_ids = self.input_ids[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
@@ -218,7 +221,7 @@ class HiPCudaGraphRunner(CudaGraphRunner):
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        
+
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
@@ -226,7 +229,7 @@ class HiPCudaGraphRunner(CudaGraphRunner):
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
-        
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
@@ -239,7 +242,11 @@ class HiPCudaGraphRunner(CudaGraphRunner):
         )
 
         # Replay
-        key = (bs, forward_batch.hip_use_cached_mask, forward_batch.hip_metadata_cached_stage)
+        key = (
+            bs,
+            forward_batch.hip_use_cached_mask,
+            forward_batch.hip_metadata_cached_stage,
+        )
         self.graphs[key].replay()
         next_token_logits, hidden_states = self.output_buffers[key]
 

@@ -24,7 +24,7 @@ export CHUNK_PREFILL=16384;
 # Any RoPE based attention models are supported in theoritically.
 # However currently we are supports `llama.py` models. (Llama Family)
 export MODEL="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4";
-# You can set upper limit of maximum extended context window. 
+# You can set upper limit of maximum extended context window.
 # Training-free and unlimited.
 export EXTENDED_CONTEXT_LEN=196608;
 # You can change this flag into 1, if you want test online cache update. (exprimental)
@@ -42,13 +42,13 @@ python -m sglang.launch_server \
     --context-length $EXTENDED_CONTEXT_LEN \
     --max-total-tokens $EXTENDED_CONTEXT_LEN \
     --enable-hip-attention \
-    # You can turn off this flag to disable offloading. 
+    # You can turn off this flag to disable offloading.
     # Offloading may have difference in decoding result.
     --enable-hip-offload \
-    # For on-gpu offloading cache in masking kernel, 
+    # For on-gpu offloading cache in masking kernel,
     # allocate size of cache in num of tokens. This is shared by whole batch.
     --hip-max-mask-cache-token-size 32000 \
-    # For on-gpu offloading cache in block sparse attention kernel, 
+    # For on-gpu offloading cache in block sparse attention kernel,
     # allocate size of cache in num of tokens. This is shared by whole batch.
     --hip-max-sa-cache-token-size 10000;
 ```
