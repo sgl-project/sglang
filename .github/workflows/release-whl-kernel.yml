@@ -57,3 +57,20 @@ jobs:
           token: ${{ secrets.WHL_TOKEN }}
           files: |
             sgl-kernel/dist/*
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_kernel_whl_index.py
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl index"
+          git push
