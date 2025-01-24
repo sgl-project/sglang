@@ -1,91 +1,104 @@
-#include <torch/script.h>
-#include "sgl_kernels_ops.h"
+#pragma once
+#include <vector>
 
-TORCH_LIBRARY(sgl_kernels, m) {
-    // trt_reduce
-    m.def("init_custom_ar(int64_t rank_id, int64_t world_size, Tensor rank_data, int64_t[] buffers, int64_t[] tmp_result_buffers, int64_t[] barrier_in, int64_t[] barrier_out) -> int64_t");
-    m.def("dispose(int64_t fa) -> ()");
-    m.def("all_reduce(int64_t fa, Tensor inp, Tensor out) -> ()");
-    m.def("get_graph_buffer_ipc_meta(int64_t fa) -> (int64_t[], int64_t[])");
-    m.def("register_graph_buffers(int64_t fa, int64_t[][] handles, int64_t[][] offsets) -> ()");
+#include <torch/extension.h>
+#include "utils.h"
 
-    // moe_align_block_size
-    m.def("moe_align_block_size(Tensor topk_ids, int64_t num_experts, int64_t block_size, Tensor sorted_token_ids, Tensor experts_ids, Tensor num_tokens_post_pad, Tensor token_cnts_buffer, Tensor cumsum_buffer) -> ()");
+// trt_reduce
+using fptr_t = int64_t;
+fptr_t init_custom_ar(int64_t rank_id, int64_t world_size, torch::Tensor& rank_data, const std::vector<fptr_t>& buffers,
+                      const std::vector<fptr_t>& tmp_result_buffers, const std::vector<fptr_t>& barrier_in,
+                      const std::vector<fptr_t>& barrier_out);
+void dispose(fptr_t _fa);
+void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
+void register_graph_buffers(fptr_t _fa, const std::vector<std::vector<int64_t>>& handles,
+                            const std::vector<std::vector<int64_t>>& offsets);
 
-    // sampling_scaling_penalties
-    m.def("sampling_scaling_penalties(Tensor logits, Tensor scaling_penalties) -> Tensor");
+// moe_align_block_size
+void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
+                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
+                          torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer);
 
-    // int8_scaled_mm
-    m.def("int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? bias) -> Tensor");
+// sampling_scaling_penalties
+torch::Tensor sampling_scaling_penalties(const torch::Tensor& logits, const torch::Tensor& scaling_penalties);
 
-    // lightning_attention_decode
-    m.def("lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor output, Tensor new_kv) -> ()");
+// int8_scaled_mm
+torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
+                             const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
+                             const c10::optional<torch::Tensor>& bias);
 
-    // rotary embedding
-    m.def("rotary_embedding(Tensor positions, Tensor query, Tensor key, int64_t head_size, Tensor cos_sin_cache, bool is_neox) -> ()");
+// lightning_attention_decode
+void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+                                const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
+                                torch::Tensor new_kv);
 
-    // rms norm
-    m.def("rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, int64_t cuda_stream) -> ()");
+// rotary embedding
+void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
+                      torch::Tensor& cos_sin_cache, bool is_neox);
 
-    // fused rms norm
-    m.def("fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps, int64_t cuda_stream) -> ()");
+// rms norm
+void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
 
-    // gemma rms norm
-    m.def("gemma_rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, int64_t cuda_stream) -> ()");
+// fused rms norm
+void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
 
-    // fused gemma rms norm
-    m.def("gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps, int64_t cuda_stream) -> ()");
+// gemma rms norm
+void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
 
-    // silu and mul
-    m.def("silu_and_mul(Tensor out, Tensor input, int64_t cuda_stream) -> ()");
+// fused gemma rms norm
+void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
+                             int64_t cuda_stream);
 
-    // gelu tanh and mul
-    m.def("gelu_tanh_and_mul(Tensor out, Tensor input, int64_t cuda_stream) -> ()");
+// silu and mul
+void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 
-    // gelu and mul
-    m.def("gelu_and_mul(Tensor out, Tensor input, int64_t cuda_stream) -> ()");
+// gelu tanh and mul
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 
-    // bmm fp8
-    m.def("bmm_fp8(Tensor A, Tensor B, Tensor D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream) -> ()");
+// gelu and mul
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 
-    // min p sampling from probs
-    m.def("min_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor samples, Tensor? maybe_min_p_arr, double min_p_val, bool deterministic, int64_t cuda_stream) -> ()");
+// bmm fp8
+void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
+             at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
 
-    // top k renorm probs
-    m.def("top_k_renorm_probs(Tensor probs, Tensor renorm_probs, Tensor? maybe_top_k_arr, int64_t top_k_val, int64_t cuda_stream) -> ()");
+// min p sampling from probs
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               std::optional<at::Tensor> maybe_min_p_arr, double min_p_val, bool deterministic,
+                               int64_t cuda_stream);
 
-    // top p renorm probs
-    m.def("top_p_renorm_probs(Tensor probs, Tensor renorm_probs, Tensor? maybe_top_p_arr, double top_p_val, int64_t cuda_stream) -> ()");
+// top k renorm probs
+// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
+void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
+                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                        int64_t cuda_stream); 
 
-    // top k top p sampling from probs
-    m.def("top_k_top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor samples, Tensor success, Tensor? maybe_top_k_arr, double top_k_val, Tensor? maybe_top_p_arr, double top_p_val, bool deterministic, int64_t cuda_stream) -> ()");
-
-    // top p sampling from probs
-    m.def("top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor samples, Tensor success, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, int64_t cuda_stream) -> ()");
+// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
+// wrapper for binding
+inline void top_k_renorm_probs_wrapper(at::Tensor probs, 
+                               at::Tensor renorm_probs,
+                               std::optional<at::Tensor> maybe_top_k_arr, 
+                               int64_t top_k_val,
+                               int64_t cuda_stream) {
+    top_k_renorm_probs(probs, 
+                       renorm_probs, 
+                       maybe_top_k_arr,
+                       static_cast<unsigned int>(top_k_val),
+                       cuda_stream);
 }
 
-TORCH_LIBRARY_IMPL(sgl_kernels, CUDA, m) {
-    m.impl("init_custom_ar", &init_custom_ar);
-    m.impl("dispose", &dispose);
-    m.impl("all_reduce", &all_reduce);
-    m.impl("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
-    m.impl("register_graph_buffers", &register_graph_buffers);
-    m.impl("moe_align_block_size", &moe_align_block_size);
-    m.impl("sampling_scaling_penalties", &sampling_scaling_penalties);
-    m.impl("int8_scaled_mm", &int8_scaled_mm);
-    m.impl("lightning_attention_decode", &lightning_attention_decode);
-    m.impl("rotary_embedding", &rotary_embedding);
-    m.impl("rmsnorm", &rmsnorm);
-    m.impl("fused_add_rmsnorm", &fused_add_rmsnorm);
-    m.impl("gemma_rmsnorm", &gemma_rmsnorm);
-    m.impl("gemma_fused_add_rmsnorm", &gemma_fused_add_rmsnorm);
-    m.impl("silu_and_mul", &silu_and_mul);
-    m.impl("gelu_tanh_and_mul", &gelu_tanh_and_mul);
-    m.impl("gelu_and_mul", &gelu_and_mul);
-    m.impl("bmm_fp8", &bmm_fp8);
-    m.impl("min_p_sampling_from_probs", &min_p_sampling_from_probs);
-    m.impl("top_k_renorm_probs", &top_k_renorm_probs);
-    m.impl("top_p_renorm_probs", &top_p_renorm_probs);
-    m.impl("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs);
-    m.impl("top_p_sampling_from_probs", &top_p_sampling_from_probs);
-}
+// top p renorm probs
+void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr,
+                        double top_p_val, int64_t cuda_stream);
+
+// top k top p sampling from probs
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                                     at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
+                                     std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
+                                     int64_t cuda_stream);
+
+// top p sampling from probs
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples, at::Tensor success,
+                               std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
+                               int64_t cuda_stream);
