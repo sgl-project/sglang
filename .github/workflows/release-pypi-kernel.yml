@@ -54,5 +54,6 @@ jobs:
         with:
           tag_name: ${{ inputs.tag_name }}
           repository: sgl-project/whl
+          token: ${{ secrets.WHL_TOKEN }}
           files: |
             sgl-kernel/dist/*
