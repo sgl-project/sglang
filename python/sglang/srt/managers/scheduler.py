@@ -961,7 +961,7 @@ class Scheduler:
                     if not self.tree_cache.loading_complete(req.last_node):
                         continue
 
-                if req.rid in self.loading_queue:
+                if req.rid in self.staging_reqs:
                     self.staging_reqs.remove(req.rid)
                     self.tree_cache.dec_lock_ref(req.last_node)
 

@@ -50,30 +50,35 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-    def inc_hit_count(self, node: TreeNode):
-        if self.cache_controller.write_policy != "write_through_selective":
-            return
-        node.hit_count += 1
-        if node.host_value is None and node.hit_count > self.write_through_threshold:
+    def write_backup(self, node: TreeNode):
+        host_indices = self.cache_controller.write(
+            device_indices=node.value,
+            priority=-self.get_height(node),
+            node_id=node.id,
+        )
+        if host_indices is None:
+            self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 priority=-self.get_height(node),
                 node_id=node.id,
             )
-            if host_indices is None:
-                self.evict_host(len(node.value))
-                host_indices = self.cache_controller.write(
-                    device_indices=node.value,
-                    priority=-self.get_height(node),
-                    node_id=node.id,
-                )
-            if host_indices is not None:
-                node.host_value = host_indices
-                self.ongoing_write_through[node.id] = node
-                self.inc_lock_ref(node)
-            else:
-                # todo, check broken chains
-                pass
+        if host_indices is not None:
+            node.host_value = host_indices
+            self.ongoing_write_through[node.id] = node
+            self.inc_lock_ref(node)
+        else:
+            return None
+
+        return len(host_indices)
+
+    def inc_hit_count(self, node: TreeNode):
+        if self.cache_controller.write_policy != "write_through_selective":
+            return
+        node.hit_count += 1
+        if node.host_value is None and node.hit_count > self.write_through_threshold:
+            self.write_backup(node)
+            node.hit_count = 0
 
     def writing_check(self):
         while not self.cache_controller.ack_write_queue.empty():
@@ -119,9 +124,7 @@ class HiRadixCache(RadixCache):
 
             if x.host_value is None:
                 if self.cache_controller.write_policy == "write_back":
-                    num_evicted += self._evict_write_back(x)
-                    if x.host_value is not None:
-                        pending_nodes.append(x)
+                    num_evicted += self.write_backup(x)
                 elif self.cache_controller.write_policy == "write_through_selective":
                     num_evicted += self._evict_write_through_selective(x)
                 else:
@@ -130,10 +133,6 @@ class HiRadixCache(RadixCache):
                     ), "write_through should be inclusive"
                     raise NotImplementedError
             else:
-                # assert self.token_to_kv_pool_host.is_synced(x.host_value), (
-                #     x.host_value,
-                #     self.token_to_kv_pool_host.get_state(x.host_value),
-                # )
                 num_evicted += self._evict_write_through(x)
 
             for child in x.parent.children.values():
@@ -145,30 +144,11 @@ class HiRadixCache(RadixCache):
                 # all children are evicted or no children
                 heapq.heappush(leaves, x.parent)
 
-        # blocking for write back completion
-        while len(pending_nodes) > 0:
-            for x in pending_nodes:
-                if self.token_to_kv_pool_host.is_synced(x.host_value):
-                    num_evicted = self.cache_controller.evict_device(
-                        x.value, x.host_value
-                    )
-                    self.evictable_size_ -= num_evicted
-                    x.value = None
-                    pending_nodes.remove(x)
-                    break
-            else:
+        if self.cache_controller.write_policy == "write_back":
+            # blocking till all write back complete
+            while len(self.ongoing_write_through) > 0:
+                self.writing_check()
                 time.sleep(0.1)
-
-    def _evict_write_back(self, node: TreeNode):
-        host_indices = self.cache_controller.write(node.value)
-        if host_indices is None:
-            self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write(node.value)
-        if host_indices is None:
-            raise RuntimeError("No sufficient host memory available")
-        else:
-            node.host_value = host_indices
-            return len(node.host_value)
 
     def _evict_write_through(self, node: TreeNode):
         # evict a node already written to host
@@ -281,6 +261,9 @@ class HiRadixCache(RadixCache):
                     if len(prefix_indices) == 0
                     else torch.cat([prefix_indices, loading_values])
                 )
+                logger.info(
+                    f"load back {len(loading_values)} tokens for {last_node.id}"
+                )
 
             while last_node.evicted:
                 last_node = last_node.parent
@@ -381,29 +364,8 @@ class HiRadixCache(RadixCache):
             node.children[key[0]] = new_node
             self.evictable_size_ += len(value)
 
-            # todo: deduplication
             if self.cache_controller.write_policy == "write_through":
-                new_node.host_value = self.cache_controller.write(
-                    device_indices=value,
-                    priority=-self.get_height(new_node),
-                    node_id=new_node.id,
-                )
-                if new_node.host_value is None:
-                    self.evict_host(len(value))
-                    new_node.host_value = self.cache_controller.write(
-                        device_indices=value,
-                        priority=-self.get_height(new_node),
-                        node_id=new_node.id,
-                    )
-                if new_node.host_value is None:
-                    # todo, change raising error to a longer waiting
-                    raise RuntimeError(
-                        "No sufficient host memory available for write through"
-                    )
-                else:
-                    # protect the nodes pending for write through
-                    self.id_to_node[new_node.id] = new_node
-                    self.inc_lock_ref(new_node)
+                self.write_backup(new_node)
         return 0
 
     def _collect_leaves_device(self):
