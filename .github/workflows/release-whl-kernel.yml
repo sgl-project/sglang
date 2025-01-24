@@ -42,6 +42,8 @@ jobs:
     needs: build-wheels
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -62,8 +64,6 @@ jobs:
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
         env:
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
-
-      - uses: actions/checkout@v4
 
       - name: Update wheel index
         run: python3 scripts/update_kernel_whl_index.py
