@@ -75,8 +75,12 @@ class HiPAttentionConfig:
     )
     using_extend: bool = True
     layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
-        HiPAttentionPerLayerConfig(parsed_json={"second_stage_k": 4096, "sliding_window_size": 1024, "sink_token_size": 256}),
-        HiPAttentionPerLayerConfig(),
+        HiPAttentionPerLayerConfig(parsed_json={
+            "second_stage_k": 4096, 
+            "sliding_window_size": 32768, 
+            "sink_token_size": 256,
+        }),
+        HiPAttentionPerLayerConfig(parsed_json={"second_stage_k": 1024, "sliding_window_size": 1024, "sink_token_size": 256}),
     ])
     prefill_layers: list[HiPAttentionPerLayerConfig] = field(default_factory=lambda: [
         HiPAttentionPerLayerConfig(parsed_json={"second_stage_k": 4096, "sliding_window_size": 1024, "sink_token_size": 256}),
