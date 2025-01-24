@@ -3,10 +3,11 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.few_shot_gsm8k import run_eval as gsm8k_run_eval
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -35,7 +36,7 @@ class TestInt8vcacheBase(unittest.TestCase):
         )
 
 
-class TestInt8KvcacheLlama(TestInt8vcacheBase):
+class TestInt8KvcacheLlamaGQA(TestInt8vcacheBase):
     model_config = {
         "model_name": DEFAULT_MODEL_NAME_FOR_TEST,
     }
@@ -44,18 +45,6 @@ class TestInt8KvcacheLlama(TestInt8vcacheBase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.80)
-
     def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -66,44 +55,44 @@ class TestInt8KvcacheLlama(TestInt8vcacheBase):
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.70)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = gsm8k_run_eval(args)
+        self.assertGreater(metrics["accuracy"], 0.74)
 
 
-class TestInt8KvcacheQwen(TestInt8vcacheBase):
+class TestInt8KvcacheLlamaMHA(TestInt8vcacheBase):
     model_config = {
-        "model_name": DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-        "config_filename": "kv_cache_scales_qwen2_1_5b.json",
+        "model_name": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     }
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_en(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
-
-        metrics = run_eval(args)
-        print("int8 mgsm_en: ", metrics["score"])
-        self.assertGreater(metrics["score"], 0.01)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print("int8 mmlu: ", metrics["score"])
-        self.assertGreaterEqual(metrics["score"], 0.3)
+        metrics = gsm8k_run_eval(args)
+        # base 0.25
+        self.assertGreater(metrics["accuracy"], 0.24)
 
 
 if __name__ == "__main__":

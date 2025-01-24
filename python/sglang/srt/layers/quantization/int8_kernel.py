@@ -7,9 +7,9 @@ import triton.language as tl
 def _quant_int8(val):
     val_min = tl.min(val, 1)
     val_max = tl.max(val, 1)
-    scales = 255 / (val_max - val_min)
+    scales = (val_max - val_min) / 255
     zeros = -val_min / scales
-    q_val = (val * scales[:, None] + zeros[:, None] + 0.5).to(tl.uint8)
+    q_val = (val / scales[:, None] + zeros[:, None] + 0.5).to(tl.uint8)
     return q_val, scales, zeros
 
 
