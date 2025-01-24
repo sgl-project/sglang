@@ -61,6 +61,30 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
              at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
 
+// min p sampling from probs
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               std::optional<at::Tensor> maybe_min_p_arr, double min_p_val, bool deterministic,
+                               int64_t cuda_stream);
+
+// top k renorm probs
+void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr,
+                        unsigned int top_k_val, int64_t cuda_stream);
+
+// top p renorm probs
+void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr,
+                        double top_p_val, int64_t cuda_stream);
+
+// top k top p sampling from probs
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                                     at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
+                                     std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
+                                     int64_t cuda_stream);
+
+// top p sampling from probs
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples, at::Tensor success,
+                               std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
+                               int64_t cuda_stream);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -94,4 +118,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gelu_and_mul", &gelu_and_mul, "Gelu and Mul (CUDA)");
   // bmm fp8
   m.def("bmm_fp8", &bmm_fp8, "BMM FP8 (CUDA)");
+  // min p sampling from probs
+  m.def("min_p_sampling_from_probs", &min_p_sampling_from_probs, "Min P Sampling From Probs (CUDA)");
+  // top k renorm probs
+  m.def("top_k_renorm_probs", &top_k_renorm_probs, "Top K Renorm Probs (CUDA)");
+  // top p renorm probs
+  m.def("top_p_renorm_probs", &top_p_renorm_probs, "Top P Renorm Probs (CUDA)");
+  // top k top p sampling from probs
+  m.def("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs, "Top K Top P Sampling From Probs (CUDA)");
+  // top p sampling from probs
+  m.def("top_p_sampling_from_probs", &top_p_sampling_from_probs, "Top P Sampling From Probs (CUDA)");
 }
