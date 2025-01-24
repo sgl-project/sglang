@@ -71,8 +71,22 @@ void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 // top k renorm probs
 // patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
                         int64_t cuda_stream); 
+
+// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
+// wrapper for binding
+inline void top_k_renorm_probs_wrapper(at::Tensor probs, 
+                               at::Tensor renorm_probs,
+                               std::optional<at::Tensor> maybe_top_k_arr, 
+                               int64_t top_k_val,
+                               int64_t cuda_stream) {
+    top_k_renorm_probs(probs, 
+                       renorm_probs, 
+                       maybe_top_k_arr,
+                       static_cast<unsigned int>(top_k_val),
+                       cuda_stream);
+}
 
 // top p renorm probs
 void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr,
