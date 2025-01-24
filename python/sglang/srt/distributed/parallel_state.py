@@ -903,14 +903,20 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 
+_EP: Optional[GroupCoordinator] = None
 
 def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
+def get_ep_group() -> GroupCoordinator:
+    assert _EP is not None, "expert parallel group is not initialized"
+    return _EP
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
+
+get_expert_parallel_group = get_ep_group
 
 _PP: Optional[GroupCoordinator] = None
 

@@ -39,7 +39,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+from sglang.srt.layers.moe.ep_moe.layer import EPMoE, All2AllEPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -141,8 +141,18 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self.gate = MoEGate(config=config)
+        
+        def select_moe_type():
+            if global_server_args_dict["enable_ep_moe"]:
+                if global_server_args_dict["enable_all2all_ep"]:
+                    return All2AllEPMoE
+                else:
+                    return EPMoE
+            else:
+                return FusedMoE
 
-        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        MoEImpl = select_moe_type()
+        
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -765,11 +775,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         if self.enable_dp_attention:
-            hidden_states, start_idx, end_idx = all_gather(
-                hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
-            )
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = hidden_states[start_idx:end_idx]
+            if not self.enable_all2all_ep:
+                hidden_states, start_idx, end_idx = all_gather(
+                    hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+                )
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = hidden_states[start_idx:end_idx]
+            else:
+                hidden_states = self.mlp(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
 
