@@ -89,6 +89,7 @@ class TestInt8KvcacheQwen(TestInt8vcacheBase):
         )
 
         metrics = run_eval(args)
+        print("int8 mgsm_en: ", metrics["score"])
         self.assertGreater(metrics["score"], 0.01)
 
     def test_mmlu(self):
@@ -101,6 +102,7 @@ class TestInt8KvcacheQwen(TestInt8vcacheBase):
         )
 
         metrics = run_eval(args)
+        print("int8 mmlu: ", metrics["score"])
         self.assertGreaterEqual(metrics["score"], 0.3)
 
 
