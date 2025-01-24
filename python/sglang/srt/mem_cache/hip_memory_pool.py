@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Literal, Tuple, Union, Optional, Dict
 import logging
 import math
 from dataclasses import dataclass
@@ -72,10 +75,11 @@ class HiPMetadataCachePool:
                 layer_config = hip_config.layers[layer_idx]
             self.layer_configs[layer_idx] = layer_config
 
-            n_chunks = triton.cdiv(
-                layer_config.second_stage_k, layer_config.stages[-1].stage_chunk_size
-            )
-
+            if os.getenv('HIP_DEBUG_SNAP_KV', '0') == '1':
+                n_chunks = triton.cdiv(layer_config.second_stage_k + 2048, layer_config.stages[-1].stage_chunk_size)
+            else:
+                n_chunks = triton.cdiv(layer_config.second_stage_k, layer_config.stages[-1].stage_chunk_size)
+            
             num_q_blocks = 1
             self.init_buffer(
                 layer_idx,
