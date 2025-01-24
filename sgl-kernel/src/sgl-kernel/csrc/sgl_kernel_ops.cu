@@ -1,6 +1,6 @@
 #include <vector>
 
-#include "utils.hpp"
+#include "utils.h"
 
 // trt_reduce
 using fptr_t = int64_t;
@@ -36,6 +36,29 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Ten
 // rms norm
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
 
+// fused rms norm
+void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
+
+// gemma rms norm
+void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
+
+// fused gemma rms norm
+void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
+                             int64_t cuda_stream);
+
+// silu and mul
+void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+
+// gelu tanh and mul
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+
+// gelu and mul
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+
+// bmm fp8
+void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
+             at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // trt_reduce
   m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
@@ -55,4 +78,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rotary_embedding", &rotary_embedding, "Rotary Embedding (CUDA)");
   // rms norm
   m.def("rmsnorm", &rmsnorm, "RMSNorm (CUDA)");
+  // fused rms norm
+  m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused Add RMSNorm (CUDA)");
+  // gemma rms norm
+  m.def("gemma_rmsnorm", &gemma_rmsnorm, "Gemma RMSNorm (CUDA)");
+  // fused gemma rms norm
+  m.def("gemma_fused_add_rmsnorm", &gemma_fused_add_rmsnorm, "Gemma Fused Add RMSNorm (CUDA)");
+  // silu and mul
+  m.def("silu_and_mul", &silu_and_mul, "Silu and Mul (CUDA)");
+  // gelu tanh and mul
+  m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Gelu Tanh and Mul (CUDA)");
+  // gelu and mul
+  m.def("gelu_and_mul", &gelu_and_mul, "Gelu and Mul (CUDA)");
+  // bmm fp8
+  m.def("bmm_fp8", &bmm_fp8, "BMM FP8 (CUDA)");
 }

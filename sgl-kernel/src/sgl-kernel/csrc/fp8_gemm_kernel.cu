@@ -3,29 +3,37 @@
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm89.h
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h
 
-#pragma once
-
 #include <ATen/cuda/CUDAContext.h>
 #include <cudaTypedefs.h>
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/memory.h>
+#include <cutlass/arch/mma.h>
+#include <cutlass/array.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/activation.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/threadblock/default_thread_map_tensor_op.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/kernel/default_gemm_universal_with_visitor.h>
+#include <cutlass/gemm/thread/mma.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/matrix_coord.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/tensor_ref.h>
 #include <torch/all.h>
 
-#include "cute/tensor.hpp"
-#include "cutlass/conv/convolution.h"
-// Order matters here, packed_stride.hpp is missing cute and convolution includes
-#include "cutlass/cutlass.h"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/epilogue/thread/activation.h"
-#include "cutlass/epilogue/thread/linear_combination.h"
-#include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/gemm/device/gemm.h"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
-#include "cutlass/gemm/kernel/gemm_universal.hpp"
-#include "cutlass/util/packed_stride.hpp"
-#include "utils.hpp"
+#include <cute/tensor.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/epilogue/collective/default_epilogue.hpp>
+#include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/util/packed_stride.hpp>
+
+#include "utils.h"
 
 using namespace cute;
 
