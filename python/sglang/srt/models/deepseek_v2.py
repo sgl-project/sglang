@@ -775,7 +775,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         if self.enable_dp_attention:
-            if not self.enable_all2all_ep:
+            if not global_server_args_dict["enable_all2all_ep"]:
                 hidden_states, start_idx, end_idx = all_gather(
                     hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
                 )
