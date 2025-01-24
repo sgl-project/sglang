@@ -4,6 +4,12 @@ PYTHON_VERSION=$1
 CUDA_VERSION=$2
 PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
 
+if (( ${CUDA_VERSION%.*} < 12 )); then
+    ENABLE_SM90A=0
+else
+    ENABLE_SM90A=1
+fi
+
 docker run --rm \
     -v "$(pwd)":/sgl-kernel \
     pytorch/manylinux-builder:cuda${CUDA_VERSION} \
@@ -13,7 +19,7 @@ docker run --rm \
     export CUDA_VERSION=${CUDA_VERSION} && \
     export SGL_KERNEL_ENABLE_BF16=1 && \
     export SGL_KERNEL_ENABLE_FP8=1 && \
-    export SGL_KERNEL_ENABLE_SM90A=1 && \
+    export SGL_KERNEL_ENABLE_SM90A=${ENABLE_SM90A} && \
     mkdir -p /usr/lib/x86_64-linux-gnu/ && \
     ln -s /usr/local/cuda-${CUDA_VERSION}/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so && \
     cd /sgl-kernel && \
