@@ -1,6 +1,6 @@
+import warnings
 from dataclasses import InitVar, dataclass, field
 from typing import List, Optional, Union
-import warnings
 
 from hip.models.hip_attention.gen3.attention_metadata import ScanStage
 
@@ -141,13 +141,13 @@ class HiPAttentionConfig:
                     for layer in parsed_json["layers"]
                 ]
                 self.prefill_layers = self.layers
-                parsed_json.pop('layers')
-            if 'prefill_layers' in parsed_json:
+                parsed_json.pop("layers")
+            if "prefill_layers" in parsed_json:
                 self.prefill_layers = [
                     HiPAttentionPerLayerConfig(parsed_json=layer)
-                    for layer in parsed_json['prefill_layers']
+                    for layer in parsed_json["prefill_layers"]
                 ]
-                parsed_json.pop('prefill_layers')
+                parsed_json.pop("prefill_layers")
             if parsed_json:
                 raise ValueError(f"Unknown keys in json: {parsed_json.keys()}")
 

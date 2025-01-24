@@ -739,8 +739,8 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
                 timeout=3600,
             )
             assert res.status_code == 200, f"{res}"
-            logger.info(f'Warmup response: {res.json()}')
-            if os.getenv('SRT_EXIT_AFTER_WARMUP', '0') == '1':
+            logger.info(f"Warmup response: {res.json()}")
+            if os.getenv("SRT_EXIT_AFTER_WARMUP", "0") == "1":
                 logger.error(f"Initialization canceled. SRT_EXIT_AFTER_WARMUP")
                 kill_process_tree(os.getpid())
     except Exception:
