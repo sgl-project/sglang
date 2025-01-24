@@ -1,6 +1,8 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import sgl_kernel.ops._kernels
+
 from torch.ops.sgl_kernels import (
     all_reduce as _all_reduce,
     bmm_fp8 as _bmm_fp8,
@@ -21,7 +23,7 @@ from torch.ops.sgl_kernels import (
     rotary_embedding as _rotary_embedding,
     sampling_scaling_penalties as _sampling_scaling_penalties,
     silu_and_mul as _silu_and_mul,
-    top_k_renorm_probs as _top_k_renorm_probs,
+    top_k_renorm_probs_wrapper as _top_k_renorm_probs,
     top_k_top_p_sampling_from_probs as _top_k_top_p_sampling_from_probs,
     top_p_renorm_probs as _top_p_renorm_probs,
     top_p_sampling_from_probs as _top_p_sampling_from_probs,
