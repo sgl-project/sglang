@@ -127,7 +127,7 @@ class GenerationConverter:
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            tokenized_obj = TokenizedGenerateReqInput(
+            return TokenizedGenerateReqInput(
                 obj.rid,
                 input_text,
                 input_ids,
@@ -143,14 +143,14 @@ class GenerationConverter:
                 custom_logit_processor=obj.custom_logit_processor,
             )
         elif isinstance(obj, EmbeddingReqInput):
-            tokenized_obj = TokenizedEmbeddingReqInput(
+            return TokenizedEmbeddingReqInput(
                 obj.rid,
                 input_text,
                 input_ids,
                 sampling_params,
             )
-
-        return tokenized_obj
+        else:
+            raise NotImplementedError
 
 
 class _MetricManager:
