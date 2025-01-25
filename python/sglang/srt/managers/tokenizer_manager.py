@@ -347,9 +347,9 @@ class TokenizerManager:
         if obj.log_requests_level is not None:
             self.log_requests_level = obj.log_requests_level
         if obj.dump_requests_folder is not None:
-            self.dump_requests_folder = obj.dump_requests_folder
+            self._generation_manager.request_dumper.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
-            self.dump_requests_threshold = obj.dump_requests_threshold
+            self._generation_manager.request_dumper.dump_requests_threshold = obj.dump_requests_threshold
         logging.info(f"Config logging: {obj=}")
 
     def create_abort_task(self, obj: GenerateReqInput):

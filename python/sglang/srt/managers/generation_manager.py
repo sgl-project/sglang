@@ -45,6 +45,8 @@ class GenerationManager:
         else:
             self._metric_manager = None
 
+        self.request_dumper = _RequestDumper()
+
     async def generate(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
