@@ -70,7 +70,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             outputs = fragment.generate(
                 prompt=prompt,
                 sampling_params=[dict(max_new_tokens=16, temperature=0.0)]
-                                * len(prompt),
+                * len(prompt),
             )
             print(
                 f"subprocess[{tp_rank=}] End generation {prompt=} {outputs=}",
