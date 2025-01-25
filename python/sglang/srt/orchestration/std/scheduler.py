@@ -32,15 +32,13 @@ class SchedulerCommunicator:
         core: Scheduler,
         server_args: ServerArgs,
         port_args: PortArgs,
-        tp_rank: int,
     ):
         self.core = core
         self.server_args = server_args
-        self.tp_rank = tp_rank
 
         # Init inter-process communication
         context = zmq.Context(2)
-        if self.attn_tp_rank == 0:
+        if self.core.attn_tp_rank == 0:
             self._recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -99,7 +97,7 @@ class SchedulerCommunicator:
 
     def _recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        if self.attn_tp_rank == 0:
+        if self.core.attn_tp_rank == 0:
             recv_reqs = []
 
             while True:
@@ -112,7 +110,7 @@ class SchedulerCommunicator:
             recv_reqs = None
 
         if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0:
+            if self.core.attn_tp_rank == 0:
                 work_reqs = [
                     req
                     for req in recv_reqs
@@ -131,21 +129,21 @@ class SchedulerCommunicator:
                 work_reqs = None
                 control_reqs = None
 
-            if self.attn_tp_size != 1:
-                attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
+            if self.core.attn_tp_size != 1:
+                attn_tp_rank_0 = self.core.dp_rank * self.core.attn_tp_size
                 work_reqs = broadcast_pyobj(
                     work_reqs,
-                    self.attn_tp_rank,
-                    self.attn_tp_cpu_group,
+                    self.core.attn_tp_rank,
+                    self.core.attn_tp_cpu_group,
                     src=attn_tp_rank_0,
                 )
-            if self.tp_size != 1:
+            if self.core.tp_size != 1:
                 control_reqs = broadcast_pyobj(
-                    control_reqs, self.tp_rank, self.tp_cpu_group
+                    control_reqs, self.core.tp_rank, self.core.tp_cpu_group
                 )
             recv_reqs = work_reqs + control_reqs
-        elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+        elif self.core.tp_size != 1:
+            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.core.tp_cpu_group)
         return recv_reqs
 
     def _process_input_requests(self, recv_reqs: List):
@@ -193,7 +191,6 @@ def run_scheduler_process(
             core=scheduler,
             server_args=server_args,
             port_args=port_args,
-            tp_rank=tp_rank,
         )
 
         pipe_writer.send(
