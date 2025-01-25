@@ -21,6 +21,8 @@ jobs:
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: linux-mi300-gpu-1
+    container:
+      image: lmsysorg/sglang:v0.4.1.post7-rocm620
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
