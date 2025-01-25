@@ -45,7 +45,7 @@ class GenerationManager:
         else:
             self._metric_manager = None
 
-        self.request_logger = _RequestLogger()
+        self.request_logger = _RequestLogger(server_args)
         self.request_dumper = _RequestDumper()
 
     async def generate(
