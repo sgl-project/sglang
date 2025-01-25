@@ -11,7 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
 import logging
@@ -27,7 +26,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
@@ -66,8 +64,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
-class TokenizerManager:
-    """TokenizerManager is a process that tokenizes the text."""
+class StdOrchestrator:
+    """StdOrchestrator is the primary entrypoint of orchestration.std package"""
 
     def __init__(
         self,
@@ -450,7 +448,7 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        logger.error(f"StdOrchestrator hit an exception: {traceback}")
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
