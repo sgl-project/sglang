@@ -62,7 +62,7 @@ class GenerationManager:
 
         obj.normalize_batch_and_arguments()
 
-        if self.log_requests:
+        if self.server_args.log_requests:
             max_length = 2048 if self.log_requests_level == 0 else 1 << 30
             logger.info(
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length)}"
@@ -112,7 +112,7 @@ class GenerationManager:
 
             state.out_list = []
             if state.finished:
-                if self.log_requests:
+                if self.server_args.log_requests:
                     max_length = 2048 if self.log_requests_level == 0 else 1 << 30
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length)}, out={dataclass_to_string_truncated(out, max_length)}"
                     logger.info(msg)
