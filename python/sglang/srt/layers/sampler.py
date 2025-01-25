@@ -1,14 +1,20 @@
 import logging
-from typing import Dict, List
+from typing import List
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.distributed import get_tensor_model_parallel_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import crash_on_warnings, is_flashinfer_available
+from sglang.srt.utils import (
+    crash_on_warnings,
+    get_bool_env_var,
+    is_flashinfer_available,
+)
 
 if is_flashinfer_available():
     from flashinfer.sampling import (
@@ -21,11 +27,17 @@ if is_flashinfer_available():
 
 logger = logging.getLogger(__name__)
 
+SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+
 
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
+        self.tp_sync_group = get_tensor_model_parallel_group().device_group
+
+        if global_server_args_dict["enable_dp_attention"]:
+            self.tp_sync_group = get_attention_tp_group().device_group
 
     def forward(
         self,
@@ -109,8 +121,6 @@ class Sampler(nn.Module):
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
                 )
 
-        batch_next_token_ids = batch_next_token_ids.to(torch.int32)
-
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
             if any(x > 0 for x in top_logprobs_nums):
@@ -124,7 +134,21 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        return batch_next_token_ids
+        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
+            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
+            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
+            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
+            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
+            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+
+            torch.distributed.all_reduce(
+                batch_next_token_ids,
+                op=dist.ReduceOp.MIN,
+                group=self.tp_sync_group,
+            )
+
+        return batch_next_token_ids.to(torch.int32)
 
     def _apply_custom_logit_processor(
         self, logits: torch.Tensor, sampling_batch_info: SamplingBatchInfo

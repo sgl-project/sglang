@@ -10,3 +10,6 @@
 [submodule "sgl-kernel/3rdparty/flashinfer"]
 	path = sgl-kernel/3rdparty/flashinfer
 	url = https://github.com/flashinfer-ai/flashinfer.git
+[submodule "sgl-kernel/3rdparty/turbomind"]
+	path = sgl-kernel/3rdparty/turbomind
+	url = https://github.com/InternLM/turbomind

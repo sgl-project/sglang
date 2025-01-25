@@ -20,6 +20,7 @@ class LoadFormat(str, enum.Enum):
     GGUF = "gguf"
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
+    LAYERED = "layered"
 
 
 @dataclass

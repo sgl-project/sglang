@@ -12,6 +12,18 @@ use std::thread;
 use std::time::Duration;
 use tokio;
 
+fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
+    req.headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub enum Router {
     RoundRobin {
@@ -238,12 +250,12 @@ impl Router {
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
                 error!(
-                    "Timeout {}s waiting for workers to become healthy",
-                    timeout_secs
+                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    timeout_secs, worker_urls
                 );
                 return Err(format!(
-                    "Timeout {}s waiting for workers to become healthy",
-                    timeout_secs
+                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    timeout_secs, worker_urls
                 ));
             }
 
@@ -303,8 +315,18 @@ impl Router {
         client: &reqwest::Client,
         worker_url: &str,
         route: &str,
+        req: &HttpRequest,
     ) -> HttpResponse {
-        match client.get(format!("{}{}", worker_url, route)).send().await {
+        let mut request_builder = client.get(format!("{}{}", worker_url, route));
+
+        // Copy all headers from original request except for /health because it does not need authorization
+        if route != "/health" {
+            for (name, value) in copy_request_headers(req) {
+                request_builder = request_builder.header(name, value);
+            }
+        }
+
+        match request_builder.send().await {
             Ok(res) => {
                 let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -322,7 +344,12 @@ impl Router {
         }
     }
 
-    pub async fn route_to_first(&self, client: &reqwest::Client, route: &str) -> HttpResponse {
+    pub async fn route_to_first(
+        &self,
+        client: &reqwest::Client,
+        route: &str,
+        req: &HttpRequest,
+    ) -> HttpResponse {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
@@ -338,10 +365,17 @@ impl Router {
                             info!("Retrying request after {} failed attempts", total_retries);
                         }
 
-                        let response = self.send_request(client, &worker_url, route).await;
+                        let response = self.send_request(client, &worker_url, route, req).await;
 
                         if response.status().is_success() {
                             return response;
+                        } else {
+                            // if the worker is healthy, it means the request is bad, so return the error response
+                            let health_response =
+                                self.send_request(client, &worker_url, "/health", req).await;
+                            if health_response.status().is_success() {
+                                return response;
+                            }
                         }
 
                         warn!(
@@ -496,19 +530,16 @@ impl Router {
             .map(|v| v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false))
             .unwrap_or(false);
 
-        let res = match client
+        let mut request_builder = client
             .post(format!("{}{}", worker_url, route))
-            .header(
-                "Content-Type",
-                req.headers()
-                    .get("Content-Type")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("application/json"),
-            )
-            .body(body.to_vec())
-            .send()
-            .await
-        {
+            .body(body.to_vec());
+
+        // Copy all headers from original request
+        for (name, value) in copy_request_headers(req) {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let res = match request_builder.send().await {
             Ok(res) => res,
             Err(_) => return HttpResponse::InternalServerError().finish(),
         };
@@ -596,6 +627,13 @@ impl Router {
 
                 if response.status().is_success() {
                     return response;
+                } else {
+                    // if the worker is healthy, it means the request is bad, so return the error response
+                    let health_response =
+                        self.send_request(client, &worker_url, "/health", req).await;
+                    if health_response.status().is_success() {
+                        return response;
+                    }
                 }
 
                 warn!(
@@ -644,11 +682,11 @@ impl Router {
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
                 error!(
-                    "Timeout {}s waiting for worker {} to become healthy",
+                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
                     timeout_secs, worker_url
                 );
                 return Err(format!(
-                    "Timeout {}s waiting for worker {} to become healthy",
+                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
                     timeout_secs, worker_url
                 ));
             }
