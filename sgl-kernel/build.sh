@@ -25,6 +25,6 @@ docker run --rm \
     cd /sgl-kernel/3rdparty/turbomind && \
     mkdir build && cd build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_CUDA_FLAGS="-lineinfo" -DUSE_NVTX=ON && make -j$(nproc) && \
-    cd .. && \
+    cd ../../../ && \
     ${PYTHON_ROOT_PATH}/bin/python setup.py bdist_wheel
     "
