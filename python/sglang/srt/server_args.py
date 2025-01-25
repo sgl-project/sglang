@@ -884,7 +884,7 @@ class ServerArgs:
             type=str,
             choices=["qwen25", "mistral", "llama3"],
             default=ServerArgs.tool_call_parser,
-            help="Delete the model checkpoint after loading the model.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
         )
 
     @classmethod
