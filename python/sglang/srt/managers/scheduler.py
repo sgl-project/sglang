@@ -285,6 +285,7 @@ class Scheduler:
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
+        self.overlap_result_queue = deque()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
 
@@ -391,65 +392,59 @@ class Scheduler:
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
+    def process_batch(self):
+        if self.enable_overlap:
+            return self._process_batch_overlap()
+        else:
+            return self._process_batch_normal()
+
     @torch.no_grad()
-    def event_loop_normal(self):
-        """A normal scheduler loop."""
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+    def _process_batch_normal(self):
+        batch = self.get_next_batch_to_run()
+        self.cur_batch = batch
 
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
+        if batch:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+        else:
+            # When the server is idle, so self-check and re-init some states
+            self.check_memory()
+            self.new_token_ratio = self.init_new_token_ratio
 
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-            else:
-                # When the server is idle, so self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-
-            self.last_batch = batch
+        self.last_batch = batch
 
     @torch.no_grad()
     def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        result_queue = deque()
+        batch = self.get_next_batch_to_run()
+        self.cur_batch = batch
 
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+        if batch:
+            result = self.run_batch(batch)
+            self.overlap_result_queue.append((batch.copy(), result))
 
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-
-            if batch:
-                result = self.run_batch(batch)
-                result_queue.append((batch.copy(), result))
-
-                if self.last_batch is None:
-                    # Create a dummy first batch to start the pipeline for overlap schedule.
-                    # It is now used for triggering the sampling_info_done event.
-                    tmp_batch = ScheduleBatch(
-                        reqs=None,
-                        forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                    )
-                    self.process_batch_result(tmp_batch, None)
-
-            if self.last_batch:
-                # Process the results of the last batch
-                tmp_batch, tmp_result = result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+            if self.last_batch is None:
+                # Create a dummy first batch to start the pipeline for overlap schedule.
+                # It is now used for triggering the sampling_info_done event.
+                tmp_batch = ScheduleBatch(
+                    reqs=None,
+                    forward_mode=ForwardMode.DUMMY_FIRST,
+                    next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                 )
-                self.process_batch_result(tmp_batch, tmp_result)
-            elif batch is None:
-                # When the server is idle, so self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
+                self.process_batch_result(tmp_batch, None)
 
-            self.last_batch = batch
+        if self.last_batch:
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.overlap_result_queue.popleft()
+            tmp_batch.next_batch_sampling_info = (
+                self.tp_worker.cur_sampling_info if batch else None
+            )
+            self.process_batch_result(tmp_batch, tmp_result)
+        elif batch is None:
+            # When the server is idle, so self-check and re-init some states
+            self.check_memory()
+            self.new_token_ratio = self.init_new_token_ratio
+
+        self.last_batch = batch
 
     def handle_generate_request(
         self,
