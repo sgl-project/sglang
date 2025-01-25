@@ -54,7 +54,7 @@ class GenerationManager:
     ):
         created_time = time.time()
 
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+        if isinstance(obj, EmbeddingReqInput) and self.model_config.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
                 "Please add `--is-embedding` when launching the server or try another model."
@@ -323,7 +323,7 @@ class GenerationConverter:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        if self.is_generation:
+        if self.model_config.is_generation:
             # TODO: also support getting embeddings for multimodal models
             image_inputs: Dict = await self.image_processor.process_images_async(
                 obj.image_data, input_text or input_ids, obj, self.max_req_input_len
