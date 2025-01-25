@@ -445,5 +445,5 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
-    orchestrator.max_req_input_len = scheduler_info["max_req_input_len"]
+    orchestrator.configure_max_req_input_len(scheduler_info["max_req_input_len"])
     return orchestrator, scheduler_info
