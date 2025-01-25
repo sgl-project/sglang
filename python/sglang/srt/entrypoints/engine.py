@@ -44,10 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    MultiprocessingSerializer,
-    kill_process_tree,
-)
+from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)

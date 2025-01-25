@@ -8,8 +8,6 @@ import signal
 import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
-from sglang.srt.orchestration.std.detokenizer import run_detokenizer_process
-
 import torch
 import uvloop
 
@@ -27,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.orchestration.std.detokenizer import run_detokenizer_process
 from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.orchestration.std.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -45,6 +44,7 @@ from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
 
 def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
     """
@@ -76,7 +76,7 @@ def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
         tp_rank_range = range(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
-            )
+        )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
@@ -157,6 +157,7 @@ def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
     orchestrator.configure_max_req_input_len(scheduler_info["max_req_input_len"])
     return orchestrator, scheduler_info
 
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -200,5 +201,3 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-
-

@@ -3,24 +3,39 @@ import logging
 import os
 import signal
 from types import SimpleNamespace
-from typing import Optional, List
+from typing import List, Optional
 
 import psutil
 import setproctitle
 import zmq
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, FlushCacheReq, \
-    AbortReq, UpdateWeightFromDiskReqInput, InitWeightsUpdateGroupReqInput, UpdateWeightsFromDistributedReqInput, \
-    UpdateWeightsFromTensorReqInput, GetWeightsByNameReqInput, ProfileReq, OpenSessionReqInput, CloseSessionReqInput, \
-    ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput
+
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    CloseSessionReqInput,
+    FlushCacheReq,
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    OpenSessionReqInput,
+    ProfileReq,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    broadcast_pyobj,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
     set_gpu_proc_affinity,
-    suppress_other_loggers, broadcast_pyobj, )
+    suppress_other_loggers,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -143,7 +158,9 @@ class SchedulerCommunicator:
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.core.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.core.tp_rank, self.core.tp_cpu_group)
+            recv_reqs = broadcast_pyobj(
+                recv_reqs, self.core.tp_rank, self.core.tp_cpu_group
+            )
         return recv_reqs
 
     def _process_input_requests(self, recv_reqs: List):
@@ -186,7 +203,9 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args.nccl_port, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args, port_args.nccl_port, gpu_id, tp_rank, dp_rank
+        )
         communicator = SchedulerCommunicator(
             core=scheduler,
             server_args=server_args,
