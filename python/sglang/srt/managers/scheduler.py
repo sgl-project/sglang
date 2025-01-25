@@ -161,31 +161,6 @@ class Scheduler:
             )
         )
 
-        # Init inter-process communication
-        context = zmq.Context(2)
-        if self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
-            self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-
-            if server_args.skip_tokenizer_init:
-                # Directly send to the StdOrchestrator
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-                )
-            else:
-                # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
-        else:
-            self.recv_from_tokenizer = None
-            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-
         # Init tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -407,35 +382,6 @@ class Scheduler:
                     # TODO: Add lora name/path in the future,
                 },
             )
-
-        # Init request dispatcher
-        self._request_dispatcher = TypeBasedDispatcher(
-            [
-                (TokenizedGenerateReqInput, self.handle_generate_request),
-                (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
-                (AbortReq, self.abort_request),
-                (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
-                (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
-                (
-                    UpdateWeightsFromDistributedReqInput,
-                    self.update_weights_from_distributed,
-                ),
-                (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
-                (GetWeightsByNameReqInput, self.get_weights_by_name),
-                (ProfileReq, self.profile),
-                (OpenSessionReqInput, self.open_session),
-                (CloseSessionReqInput, self.close_session),
-                (
-                    ReleaseMemoryOccupationReqInput,
-                    lambda _: self.release_memory_occupation(),
-                ),
-                (
-                    ResumeMemoryOccupationReqInput,
-                    lambda _: self.resume_memory_occupation(),
-                ),
-            ]
-        )
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one batch takes too long."""
