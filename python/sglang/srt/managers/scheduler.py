@@ -409,6 +409,7 @@ class Scheduler:
             self.new_token_ratio = self.init_new_token_ratio
 
         self.last_batch = batch
+        return batch is not None
 
     @torch.no_grad()
     def _process_batch_overlap(self):
@@ -442,6 +443,7 @@ class Scheduler:
             self.new_token_ratio = self.init_new_token_ratio
 
         self.last_batch = batch
+        return batch is not None
 
     def handle_generate_request(
         self,
