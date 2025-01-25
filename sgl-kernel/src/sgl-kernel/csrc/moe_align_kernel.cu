@@ -26,7 +26,7 @@
   hipFuncSetAttribute(FUNC, hipFuncAttributeMaxDynamicSharedMemorySize, VAL)
 #endif
 
-#define CEILDIV(x, y) (((x) + (y)-1) / (y))
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
   AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \

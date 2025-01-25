@@ -1,9 +1,10 @@
 #pragma once
+#include <Python.h>
+#include <torch/extension.h>
+
 #include <vector>
 
-#include <torch/extension.h>
 #include "utils.h"
-#include <Python.h>
 
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
@@ -13,13 +14,11 @@
 
 #define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
 
-#define REGISTER_EXTENSION(NAME)                                               \
-  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                     \
-    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT,                 \
-                                        STRINGIFY(NAME), nullptr, 0, nullptr}; \
-    return PyModule_Create(&module);                                           \
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
   }
-
 
 // trt_reduce
 using fptr_t = int64_t;
@@ -87,22 +86,15 @@ void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 
 // top k renorm probs
 // patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
-void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
-                        int64_t cuda_stream);
+void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr,
+                        unsigned int top_k_val, int64_t cuda_stream);
 
 // patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
 // wrapper for binding
-inline void top_k_renorm_probs_wrapper(at::Tensor probs,
-                               at::Tensor renorm_probs,
-                               std::optional<at::Tensor> maybe_top_k_arr,
-                               int64_t top_k_val,
-                               int64_t cuda_stream) {
-    top_k_renorm_probs(probs,
-                       renorm_probs,
-                       maybe_top_k_arr,
-                       static_cast<unsigned int>(top_k_val),
-                       cuda_stream);
+inline void top_k_renorm_probs_wrapper(at::Tensor probs, at::Tensor renorm_probs,
+                                       std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                                       int64_t cuda_stream) {
+  top_k_renorm_probs(probs, renorm_probs, maybe_top_k_arr, static_cast<unsigned int>(top_k_val), cuda_stream);
 }
 
 // top p renorm probs
