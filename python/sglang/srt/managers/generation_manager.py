@@ -8,6 +8,7 @@ from http import HTTPStatus
 from typing import Optional, List, Any, Union, Dict, Callable
 
 import fastapi
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import get_dummy_image_processor, get_image_processor
 from sglang.srt.managers.io_struct import GenerateReqInput, EmbeddingReqInput, SessionParams, TokenizedGenerateReqInput, \
@@ -509,6 +510,19 @@ class GenerationConverter:
             else:
                 ret.append(None)
         return ret
+
+
+def _compute_model_config(server_args: ServerArgs):
+    return ModelConfig(
+        server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        context_length=server_args.context_length,
+        model_override_args=server_args.json_model_override_args,
+        is_embedding=server_args.is_embedding,
+        dtype=server_args.dtype,
+        quantization=server_args.quantization,
+    )
 
 
 class _MetricManager:
