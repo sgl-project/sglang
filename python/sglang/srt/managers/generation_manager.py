@@ -7,14 +7,27 @@ import pickle
 import time
 from datetime import datetime
 from http import HTTPStatus
-from typing import Optional, List, Any, Union, Dict, Callable, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.image_processor import get_dummy_image_processor, get_image_processor
-from sglang.srt.managers.io_struct import GenerateReqInput, EmbeddingReqInput, SessionParams, TokenizedGenerateReqInput, \
-    TokenizedEmbeddingReqInput, BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, AbortReq
+from sglang.srt.managers.image_processor import (
+    get_dummy_image_processor,
+    get_image_processor,
+)
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchEmbeddingOut,
+    BatchStrOut,
+    BatchTokenIDOut,
+    EmbeddingReqInput,
+    GenerateReqInput,
+    SessionParams,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -84,7 +97,9 @@ class GenerationManager:
         created_time: Optional[float] = None,
     ):
         event = asyncio.Event()
-        state = _ReqState([], False, event, obj, metric=_MetricReqState(created_time=created_time))
+        state = _ReqState(
+            [], False, event, obj, metric=_MetricReqState(created_time=created_time)
+        )
         self.rid_to_state[obj.rid] = state
         self.on_request(tokenized_obj)
 
@@ -147,7 +162,9 @@ class GenerationManager:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
-                tokenized_obj = await self._generation_converter.tokenize_request(tmp_obj)
+                tokenized_obj = await self._generation_converter.tokenize_request(
+                    tmp_obj
+                )
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
@@ -602,11 +619,11 @@ class _RequestDumper:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
 
-    def maybe_dump_requests(self, state: '_ReqState', out_dict: dict):
+    def maybe_dump_requests(self, state: "_ReqState", out_dict: dict):
         if self.dump_requests_folder and state.finished and state.obj.log_metrics:
             self._dump_requests(state, out_dict)
 
-    def _dump_requests(self, state: '_ReqState', out_dict: dict):
+    def _dump_requests(self, state: "_ReqState", out_dict: dict):
         self.dump_request_list.append(
             (state.obj, out_dict, state.metric.created_time, time.time())
         )
