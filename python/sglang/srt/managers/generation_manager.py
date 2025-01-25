@@ -196,7 +196,7 @@ class GenerationConverter:
         }
 
         if getattr(state.obj, "return_logprob", False):
-            self.convert_logprob_style(
+            self._convert_logprob_style(
                 meta_info,
                 state.obj.top_logprobs_num,
                 state.obj.return_text_in_logprobs,
@@ -214,7 +214,7 @@ class GenerationConverter:
 
         return meta_info
 
-    def convert_logprob_style(
+    def _convert_logprob_style(
         self,
         meta_info: dict,
         top_logprobs_num: int,
@@ -222,30 +222,30 @@ class GenerationConverter:
         recv_obj: BatchStrOut,
         recv_obj_index: int,
     ):
-        meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
+        meta_info["input_token_logprobs"] = self._detokenize_logprob_tokens(
             recv_obj.input_token_logprobs_val[recv_obj_index],
             recv_obj.input_token_logprobs_idx[recv_obj_index],
             return_text_in_logprobs,
         )
-        meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
+        meta_info["output_token_logprobs"] = self._detokenize_logprob_tokens(
             recv_obj.output_token_logprobs_val[recv_obj_index],
             recv_obj.output_token_logprobs_idx[recv_obj_index],
             return_text_in_logprobs,
         )
 
         if top_logprobs_num > 0:
-            meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+            meta_info["input_top_logprobs"] = self._detokenize_top_logprobs_tokens(
                 recv_obj.input_top_logprobs_val[recv_obj_index],
                 recv_obj.input_top_logprobs_idx[recv_obj_index],
                 return_text_in_logprobs,
             )
-            meta_info["output_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+            meta_info["output_top_logprobs"] = self._detokenize_top_logprobs_tokens(
                 recv_obj.output_top_logprobs_val[recv_obj_index],
                 recv_obj.output_top_logprobs_idx[recv_obj_index],
                 return_text_in_logprobs,
             )
 
-    def detokenize_logprob_tokens(
+    def _detokenize_logprob_tokens(
         self,
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
@@ -261,7 +261,7 @@ class GenerationConverter:
             token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
-    def detokenize_top_logprobs_tokens(
+    def _detokenize_top_logprobs_tokens(
         self,
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
@@ -273,7 +273,7 @@ class GenerationConverter:
         for i in range(len(token_logprobs_val)):
             if token_logprobs_val[i]:
                 ret.append(
-                    self.detokenize_logprob_tokens(
+                    self._detokenize_logprob_tokens(
                         token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
                     )
                 )
