@@ -4,7 +4,7 @@ When contributing to SGLang, the [PR template](https://github.com/sgl-project/sg
 
 ## Example: Evaluate on GSM8K
 
-The [GSM8K mathematical reasoning dataset](https://huggingface.co/datasets/openai/gsm8k) is commonly used for LLM evaluation. SGLang provides a benchmark script for this task.
+The [GSM8K mathematical reasoning dataset](https://huggingface.co/datasets/openai/gsm8k) is commonly used for LLM evaluation. SGLang provides a [benchmark script](https://github.com/sgl-project/sglang/tree/main/benchmark/gsm8k) for this task.
 
 **Key Implementation Details**:
 
@@ -47,6 +47,50 @@ This evaluates the first 200 questions from the dataset. Key arguments:
 
 * `--data-path`: Custom dataset path in the format of the [default](https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl) which is used when no path is provided.
 
+* `--num-shots`: Number of few shots to include into each prompt.
+
 ### Step 3: Read off accuracy
 
-After running the benchmark a `JSONL` file containing the accuracy is created. Read it off from here.
+After running the benchmark a `result.jsonl` file containing the accuracy is created. Read it off from here.
+
+## Example: Evaluate on MMLU
+
+[MMLU](https://arxiv.org/pdf/2009.03300) is a common dataset to benchmark model abilities in a multiple choice setting. SGLang provides a [benchmark script](https://github.com/sgl-project/sglang/tree/main/benchmark/mmlu) for this task.
+The implementation is similar to above. Contrary to GSM8K in MMLU we evaluate the models ability to reply with the letter corresponding to the correct answer.
+
+### Step 1: Download Dataset
+
+Execute the following code to download the dataset.
+
+```bash
+bash download_data.sh
+```
+
+### Step 2: Launch Server
+
+Same as above.
+
+```python
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-Math-1.5B-Instruct \
+  --port 30000 \
+  --mem-fraction-static 0.8
+```
+
+### Step 3: Run Benchmark
+
+Similar to above.
+
+```bash
+python3 bench_sglang.py --nsub 10
+```
+
+This evaluates the model on 10 different subjects from the dataset. Key arguments:
+
+* `--ntrain`: Number of few shot examples
+* `--nsub`: Number of subjects to evaluate the model on
+
+### Step 4: Read off accuracy
+
+During script execution we get a breakdown on subject wise accuracy.
+After running the benchmark a `result.jsonl` file containing the accuracy is created. Read it off from here.
