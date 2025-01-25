@@ -43,6 +43,9 @@ from sglang.srt.utils import (
 )
 from sglang.version import __version__
 
+logger = logging.getLogger(__name__)
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
 def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
     """
     Launch the StdOrchestrator in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
