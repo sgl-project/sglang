@@ -97,14 +97,6 @@ class DetokenizerManager:
             return output[:-1]
         return output
 
-    def event_loop(self):
-        """The event loop that handles requests"""
-
-        while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
-            output = self._request_dispatcher(recv_obj)
-            self.send_to_tokenizer.send_pyobj(output)
-
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
         # If it is embedding model, no detokenization is needed.
         return recv_obj

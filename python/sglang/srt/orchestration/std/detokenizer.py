@@ -16,10 +16,10 @@ class DetokenizerManagerCommunicator:
 
         # Init inter-process communication
         context = zmq.Context(2)
-        self.recv_from_scheduler = get_zmq_socket(
+        self._recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        self.send_to_tokenizer = get_zmq_socket(
+        self._send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
@@ -29,3 +29,8 @@ class DetokenizerManagerCommunicator:
                 (BatchTokenIDOut, self.core.handle_batch_token_id_out),
             ]
         )
+
+    def recv_and_process_input_requests(self):
+        recv_obj = self._recv_from_scheduler.recv_pyobj()
+        output_obj = self._request_dispatcher(recv_obj)
+        self._send_to_tokenizer.send_pyobj(output_obj)
