@@ -70,7 +70,7 @@ class GenerationManager:
 
         is_single = obj.is_single
         if is_single:
-            tokenized_obj = await self._tokenize_one_request(obj)
+            tokenized_obj = await self._generation_converter.tokenize_request(obj)
             self._send_one_request(obj, tokenized_obj, created_time)
             async for response in self._wait_one_response(obj, request):
                 yield response
@@ -153,7 +153,7 @@ class GenerationManager:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
-                tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                tokenized_obj = await self._generation_converter.tokenize_request(tmp_obj)
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
@@ -169,7 +169,7 @@ class GenerationManager:
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
+                *(self._generation_converter.tokenize_request(obj) for obj in objs)
             )
 
             # Cache the common prefix for parallel sampling
@@ -595,7 +595,7 @@ class _RequestDumper:
 
     def _dump_requests(self, state: '_ReqState', out_dict: dict):
         self.dump_request_list.append(
-            (state.obj, out_dict, state.created_time, time.time())
+            (state.obj, out_dict, state.metric.created_time, time.time())
         )
 
         if len(self.dump_request_list) >= self.dump_requests_threshold:
