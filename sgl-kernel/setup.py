@@ -144,7 +144,7 @@ ext_modules = [
         },
         libraries=libraries,
         extra_link_args=extra_link_args,
-        py_limited_api=True
+        py_limited_api=True,
     ),
 ]
 
@@ -155,11 +155,7 @@ setup(
     package_dir={"": "src"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
-    options={
-        "bdist_wheel": {
-            "py_limited_api": "cp39"
-        }
-    },
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
 
 _update_wheel_platform_tag()

@@ -27,7 +27,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
     m.def("sampling_scaling_penalties(Tensor logits, Tensor scaling_penalties) -> Tensor");
     m.impl("sampling_scaling_penalties", torch::kCUDA, &sampling_scaling_penalties);
 
-    // int8_scaled_mm 
+    // int8_scaled_mm
     m.def("int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? bias) -> Tensor");
     m.impl("int8_scaled_mm", torch::kCUDA, &int8_scaled_mm);
 

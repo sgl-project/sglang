@@ -1,14 +1,8 @@
+import os
 from typing import Optional, Tuple, Union
 
-import torch
-import os
 import sgl_kernel.ops._kernels
-
-from sgl_kernel.ops.utils import (
-    _get_cache_buf,
-    _get_cuda_stream,
-    _to_tensor_scalar_tuple,
-)
+import torch
 from sgl_kernel.ops.utils import (
     _get_cache_buf,
     _get_cuda_stream,
@@ -78,11 +72,15 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 
 
 def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
-    torch.ops.sgl_kernels.lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv)
+    torch.ops.sgl_kernels.lightning_attention_decode(
+        q, k, v, past_kv, slope, output, new_kv
+    )
 
 
 def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
-    return torch.ops.sgl_kernels.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+    return torch.ops.sgl_kernels.rotary_embedding(
+        positions, query, key, head_size, cos_sin_cache, is_neox
+    )
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -104,7 +102,9 @@ def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        torch.ops.sgl_kernels.fused_add_rmsnorm(input, residual, weight, eps, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.fused_add_rmsnorm(
+            input, residual, weight, eps, _get_cuda_stream(device)
+        )
 
 
 def gemma_rmsnorm(
@@ -116,7 +116,9 @@ def gemma_rmsnorm(
     with input.device as device:
         if out is None:
             out = torch.empty_like(input)
-        torch.ops.sgl_kernels.gemma_rmsnorm(out, input, weight, eps, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.gemma_rmsnorm(
+            out, input, weight, eps, _get_cuda_stream(device)
+        )
         return out
 
 
@@ -124,7 +126,9 @@ def gemma_fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        torch.ops.sgl_kernels.gemma_fused_add_rmsnorm(input, residual, weight, eps, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.gemma_fused_add_rmsnorm(
+            input, residual, weight, eps, _get_cuda_stream(device)
+        )
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
