@@ -60,7 +60,6 @@ class DetokenizerManager:
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
     ):
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
