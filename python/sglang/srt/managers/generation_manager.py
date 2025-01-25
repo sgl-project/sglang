@@ -168,6 +168,27 @@ class GenerationConverter:
         index: int,
         req_obj: Union[GenerateReqInput, EmbeddingReqInput],
     ) -> Dict[str, Any]:
+        meta_info = self._compute_meta_info(index, recv_obj, req_obj)
+
+        if isinstance(recv_obj, BatchStrOut):
+            return {
+                "text": recv_obj.output_strs[i],
+                "meta_info": meta_info,
+            }
+        elif isinstance(recv_obj, BatchTokenIDOut):
+            return {
+                "token_ids": recv_obj.output_ids[i],
+                "meta_info": meta_info,
+            }
+        elif isinstance(recv_obj, BatchEmbeddingOut):
+            return {
+                "embedding": recv_obj.embeddings[i],
+                "meta_info": meta_info,
+            }
+        else:
+            raise NotImplementedError
+
+    def _compute_meta_info(self, index, recv_obj, req_obj):
         meta_info = {
             "id": rid,
             "finish_reason": recv_obj.finished_reasons[i],
@@ -191,23 +212,7 @@ class GenerationConverter:
                 }
             )
 
-        if isinstance(recv_obj, BatchStrOut):
-            return {
-                "text": recv_obj.output_strs[i],
-                "meta_info": meta_info,
-            }
-        elif isinstance(recv_obj, BatchTokenIDOut):
-            return {
-                "token_ids": recv_obj.output_ids[i],
-                "meta_info": meta_info,
-            }
-        elif isinstance(recv_obj, BatchEmbeddingOut):
-            return {
-                "embedding": recv_obj.embeddings[i],
-                "meta_info": meta_info,
-            }
-        else:
-            raise NotImplementedError
+        return meta_info
 
 
 class _MetricManager:
