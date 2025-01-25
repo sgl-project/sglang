@@ -411,17 +411,17 @@ class GenerationConverter:
 
         if isinstance(recv_obj, BatchStrOut):
             return {
-                "text": recv_obj.output_strs[i],
+                "text": recv_obj.output_strs[index],
                 "meta_info": meta_info,
             }
         elif isinstance(recv_obj, BatchTokenIDOut):
             return {
-                "token_ids": recv_obj.output_ids[i],
+                "token_ids": recv_obj.output_ids[index],
                 "meta_info": meta_info,
             }
         elif isinstance(recv_obj, BatchEmbeddingOut):
             return {
-                "embedding": recv_obj.embeddings[i],
+                "embedding": recv_obj.embeddings[index],
                 "meta_info": meta_info,
             }
         else:
@@ -429,25 +429,25 @@ class GenerationConverter:
 
     def _compute_meta_info(self, index, recv_obj, req_obj):
         meta_info = {
-            "id": rid,
-            "finish_reason": recv_obj.finished_reasons[i],
-            "prompt_tokens": recv_obj.prompt_tokens[i],
+            "id": recv_obj.rids[index],
+            "finish_reason": recv_obj.finished_reasons[index],
+            "prompt_tokens": recv_obj.prompt_tokens[index],
         }
 
-        if getattr(state.obj, "return_logprob", False):
+        if getattr(req_obj, "return_logprob", False):
             self._convert_logprob_style(
                 meta_info,
-                state.obj.top_logprobs_num,
-                state.obj.return_text_in_logprobs,
+                req_obj.top_logprobs_num,
+                req_obj.return_text_in_logprobs,
                 recv_obj,
-                i,
+                index,
             )
 
         if not isinstance(recv_obj, BatchEmbeddingOut):
             meta_info.update(
                 {
-                    "completion_tokens": recv_obj.completion_tokens[i],
-                    "cached_tokens": recv_obj.cached_tokens[i],
+                    "completion_tokens": recv_obj.completion_tokens[index],
+                    "cached_tokens": recv_obj.cached_tokens[index],
                 }
             )
 
