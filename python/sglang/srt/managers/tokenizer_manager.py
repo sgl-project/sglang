@@ -80,8 +80,6 @@ class TokenizerManager:
 
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
-        self.log_requests = server_args.log_requests
-        self.log_requests_level = 0
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -339,9 +337,9 @@ class TokenizerManager:
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         if obj.log_requests is not None:
-            self.log_requests = obj.log_requests
+            self._generation_manager.request_logger.log_requests = obj.log_requests
         if obj.log_requests_level is not None:
-            self.log_requests_level = obj.log_requests_level
+            self._generation_manager.request_logger.log_requests_level = obj.log_requests_level
         if obj.dump_requests_folder is not None:
             self._generation_manager.request_dumper.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:

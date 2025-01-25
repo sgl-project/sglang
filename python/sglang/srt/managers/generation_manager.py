@@ -45,6 +45,7 @@ class GenerationManager:
         else:
             self._metric_manager = None
 
+        self.request_logger = _RequestLogger()
         self.request_dumper = _RequestDumper()
 
     async def generate(
@@ -581,6 +582,12 @@ class _MetricManager:
                 self.metrics_collector.observe_time_per_output_token(
                     (time.time() - state.created_time) / completion_tokens
                 )
+
+
+class _RequestLogger:
+    def __init__(self, server_args: ServerArgs):
+        self.log_requests = server_args.log_requests
+        self.log_requests_level = 0
 
 
 class _RequestDumper:
