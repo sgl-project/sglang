@@ -750,7 +750,7 @@ online_update={online_update}
                 (
                     "relative"
                     if self.hip_config.apply_v_dot
-                    else ("relative" if is_dense else "relative")
+                    else ("streaming" if is_dense else "relative")
                 )
                 if layer_config.scan_extend_backend is None
                 else layer_config.scan_extend_backend
