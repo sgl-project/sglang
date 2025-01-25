@@ -131,9 +131,7 @@ def load_chat_template_for_openai_api(orchestrator, chat_template_arg):
         if chat_template_arg.endswith(".jinja"):
             with open(chat_template_arg, "r") as f:
                 chat_template = "".join(f.readlines()).strip("\n")
-            orchestrator.tokenizer.chat_template = chat_template.replace(
-                "\\n", "\n"
-            )
+            orchestrator.tokenizer.chat_template = chat_template.replace("\\n", "\n")
             chat_template_name = None
         else:
             assert chat_template_arg.endswith(
@@ -582,9 +580,7 @@ def v1_generate_response(request, ret, orchestrator, to_file=False):
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], int):
             # for the case of single token ids prompt
             prompts = [
-                orchestrator.tokenizer.decode(
-                    request.prompt, skip_special_tokens=True
-                )
+                orchestrator.tokenizer.decode(request.prompt, skip_special_tokens=True)
             ]
         else:
             # for the case of single str prompt

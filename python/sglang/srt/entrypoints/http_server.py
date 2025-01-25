@@ -52,7 +52,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
-from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.openai_api.adapter import (
     v1_batches,
@@ -67,6 +66,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
+from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
@@ -291,10 +291,8 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.orchestrator.update_weights_from_distributed(
-            obj, request
-        )
+    success, message = await _global_state.orchestrator.update_weights_from_distributed(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:

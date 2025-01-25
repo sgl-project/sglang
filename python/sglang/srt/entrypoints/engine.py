@@ -48,8 +48,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -101,9 +101,7 @@ class Engine:
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        orchestrator, scheduler_info = _launch_subprocesses(
-            server_args=server_args
-        )
+        orchestrator, scheduler_info = _launch_subprocesses(server_args=server_args)
         self.orchestrator = orchestrator
         self.scheduler_info = scheduler_info
 
@@ -271,9 +269,7 @@ class Engine:
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.orchestrator.get_weights_by_name(obj, None)
-        )
+        return loop.run_until_complete(self.orchestrator.get_weights_by_name(obj, None))
 
     def release_memory_occupation(self):
         """Release GPU occupation temporarily."""
