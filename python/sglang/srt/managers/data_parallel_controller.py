@@ -22,13 +22,12 @@ from enum import Enum, auto
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.orchestration.std.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
@@ -143,11 +142,11 @@ class DataParallelController:
         return dp_port_args
 
     def launch_tensor_parallel_group(
-        self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
-        base_gpu_id: int,
-        dp_rank: int,
+            self,
+            server_args: ServerArgs,
+            port_args: PortArgs,
+            base_gpu_id: int,
+            dp_rank: int,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -210,11 +209,11 @@ class DataParallelController:
                     break
 
                 if isinstance(
-                    recv_req,
-                    (
-                        TokenizedGenerateReqInput,
-                        TokenizedEmbeddingReqInput,
-                    ),
+                        recv_req,
+                        (
+                                TokenizedGenerateReqInput,
+                                TokenizedEmbeddingReqInput,
+                        ),
                 ):
                     self.dispatching(recv_req)
                 else:
@@ -224,9 +223,9 @@ class DataParallelController:
 
 
 def run_data_parallel_controller_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    pipe_writer,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        pipe_writer,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
     configure_logger(server_args)
