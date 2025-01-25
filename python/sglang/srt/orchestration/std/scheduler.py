@@ -186,7 +186,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args.nccl_port, gpu_id, tp_rank, dp_rank)
         communicator = SchedulerCommunicator(
             core=scheduler,
             server_args=server_args,
