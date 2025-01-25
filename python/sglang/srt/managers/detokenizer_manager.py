@@ -32,7 +32,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, get_zmq_socket
-from sglang.utils import find_printable_text, get_exception_traceback, TypeBasedDispatcher
+from sglang.utils import (
+    TypeBasedDispatcher,
+    find_printable_text,
+    get_exception_traceback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +201,7 @@ class DetokenizerManager:
                     s.decoded_text + new_text,
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
-                    )
+                )
             )
 
         return BatchStrOut(
@@ -216,7 +220,6 @@ class DetokenizerManager:
             output_top_logprobs_val=recv_obj.output_top_logprobs_val,
             output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
         )
-
 
 
 class LimitedCapacityDict(OrderedDict):
