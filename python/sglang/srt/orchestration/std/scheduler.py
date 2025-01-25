@@ -2,21 +2,17 @@ import faulthandler
 import logging
 import os
 import signal
-import time
 from types import SimpleNamespace
 from typing import Optional
 
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, FlushCacheReq, \
     AbortReq, UpdateWeightFromDiskReqInput, InitWeightsUpdateGroupReqInput, UpdateWeightsFromDistributedReqInput, \
     UpdateWeightsFromTensorReqInput, GetWeightsByNameReqInput, ProfileReq, OpenSessionReqInput, CloseSessionReqInput, \
     ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -70,28 +66,28 @@ class SchedulerCommunicator:
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (TokenizedGenerateReqInput, self.handle_generate_request),
-                (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
-                (AbortReq, self.abort_request),
-                (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
-                (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
+                (TokenizedGenerateReqInput, self.core.handle_generate_request),
+                (TokenizedEmbeddingReqInput, self.core.handle_embedding_request),
+                (FlushCacheReq, self.core.flush_cache_wrapped),
+                (AbortReq, self.core.abort_request),
+                (UpdateWeightFromDiskReqInput, self.core.update_weights_from_disk),
+                (InitWeightsUpdateGroupReqInput, self.core.init_weights_update_group),
                 (
                     UpdateWeightsFromDistributedReqInput,
-                    self.update_weights_from_distributed,
+                    self.core.update_weights_from_distributed,
                 ),
-                (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
-                (GetWeightsByNameReqInput, self.get_weights_by_name),
-                (ProfileReq, self.profile),
-                (OpenSessionReqInput, self.open_session),
-                (CloseSessionReqInput, self.close_session),
+                (UpdateWeightsFromTensorReqInput, self.core.update_weights_from_tensor),
+                (GetWeightsByNameReqInput, self.core.get_weights_by_name),
+                (ProfileReq, self.core.profile),
+                (OpenSessionReqInput, self.core.open_session),
+                (CloseSessionReqInput, self.core.close_session),
                 (
                     ReleaseMemoryOccupationReqInput,
-                    lambda _: self.release_memory_occupation(),
+                    lambda _: self.core.release_memory_occupation(),
                 ),
                 (
                     ResumeMemoryOccupationReqInput,
-                    lambda _: self.resume_memory_occupation(),
+                    lambda _: self.core.resume_memory_occupation(),
                 ),
             ]
         )
