@@ -35,12 +35,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.image_processor import (
-    get_dummy_image_processor,
-    get_image_processor,
-)
+from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -62,9 +57,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
-    SessionParams,
     TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -73,7 +66,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
@@ -134,6 +126,11 @@ class TokenizerManager:
 
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
+
+        self._generation_manager = GenerationManager(
+            server_args=server_args,
+            on_request=self.send_to_scheduler.send_pyobj,
+        )
 
         # Others
         self.gracefully_exit = False
