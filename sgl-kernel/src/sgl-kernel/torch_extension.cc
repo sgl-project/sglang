@@ -11,7 +11,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
 
   m.def("dispose(int fa) -> ()");
-  m.impl("dispose", torch::kCUDA, &dispose);
+  m.impl("dispose", c10::DispatchKey::CUDA, C10_ALWAYS_INLINE TORCH_FN(dispose));
 
   m.def("all_reduce(int fa, Tensor inp, Tensor! out) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
