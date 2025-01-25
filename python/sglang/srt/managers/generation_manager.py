@@ -1,8 +1,11 @@
 import asyncio
 import dataclasses
+import os
 import time
 from typing import Optional, List, Any
 
+from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.managers.image_processor import get_dummy_image_processor, get_image_processor
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 
@@ -12,7 +15,43 @@ class GenerationManager:
 
 
 class GenerationConverter:
-    pass
+    """Preprocessors and postprocessors for generation"""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+    ):
+        self.server_args = server_args
+        self.model_config = _compute_model_config(server_args)
+
+        # Create image processor placeholder
+        self.image_processor = get_dummy_image_processor()
+
+        # Create tokenizer
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        else:
+            if self.model_config.is_multimodal:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+                self.tokenizer = self.processor.tokenizer
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+                # We want to parallelize the image pre-processing so we create an executor for it
+                self.image_processor = get_image_processor(
+                    self.model_config.hf_config, server_args, self.processor
+                )
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
 
 
 class _MetricManager:
