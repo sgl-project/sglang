@@ -208,4 +208,3 @@ class LimitedCapacityDict(OrderedDict):
             self.popitem(last=False)
         # Set the new item
         super().__setitem__(key, value)
-
