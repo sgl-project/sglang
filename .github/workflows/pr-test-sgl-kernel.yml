@@ -31,7 +31,7 @@ jobs:
           style: file
 
   build-wheels:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:

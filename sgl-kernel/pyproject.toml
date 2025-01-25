@@ -17,7 +17,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-"Homepage" = "https://github.com/sgl-project/sglang"
+"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [tool.setuptools]
