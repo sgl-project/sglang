@@ -17,4 +17,5 @@ nbstripout
 sphinxcontrib-mermaid
 urllib3<2.0.0
 gguf>=0.10.0
+cutex
 sphinx-autobuild

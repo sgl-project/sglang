@@ -68,7 +68,7 @@ class TestMatchedStop(unittest.TestCase):
     def run_chat_completions_generation(
         self,
         prompt=MANY_NEW_TOKENS_PROMPT,
-        max_tokens=1,
+        max_completion_tokens=1,
         stop=None,
         finish_reason=None,
         matched_stop=None,
@@ -81,7 +81,7 @@ class TestMatchedStop(unittest.TestCase):
             ],
             "temperature": 0,
             "top_p": 1,
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max_completion_tokens,
         }
 
         if stop is not None:
@@ -102,7 +102,10 @@ class TestMatchedStop(unittest.TestCase):
             max_tokens=1000, stop="\n", finish_reason="stop", matched_stop="\n"
         )
         self.run_chat_completions_generation(
-            max_tokens=1000, stop="\n", finish_reason="stop", matched_stop="\n"
+            max_completion_tokens=1000,
+            stop="\n",
+            finish_reason="stop",
+            matched_stop="\n",
         )
 
     def test_finish_stop_eos(self):
@@ -121,7 +124,7 @@ class TestMatchedStop(unittest.TestCase):
         )
         self.run_chat_completions_generation(
             prompt="What is 2 + 2?",
-            max_tokens=1000,
+            max_completion_tokens=1000,
             finish_reason="stop",
             matched_stop=eos_token_id,
         )
@@ -131,7 +134,7 @@ class TestMatchedStop(unittest.TestCase):
             max_tokens=5, finish_reason="length", matched_stop=None
         )
         self.run_chat_completions_generation(
-            max_tokens=5, finish_reason="length", matched_stop=None
+            max_completion_tokens=5, finish_reason="length", matched_stop=None
         )
 
 

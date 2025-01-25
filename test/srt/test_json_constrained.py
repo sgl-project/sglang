@@ -106,7 +106,7 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
                 {"role": "user", "content": "Introduce the capital of France."},
             ],
             temperature=0,
-            max_tokens=128,
+            max_completion_tokens=128,
             response_format={
                 "type": "json_schema",
                 "json_schema": {"name": "foo", "schema": json.loads(self.json_schema)},

@@ -975,7 +975,7 @@ def v1_chat_generate_request(
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.get_max_output_tokens(),
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
