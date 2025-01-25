@@ -143,7 +143,7 @@ class SchedulerCommunicator:
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.core.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.core.tp_cpu_group)
+            recv_reqs = broadcast_pyobj(recv_reqs, self.core.tp_rank, self.core.tp_cpu_group)
         return recv_reqs
 
     def _process_input_requests(self, recv_reqs: List):
