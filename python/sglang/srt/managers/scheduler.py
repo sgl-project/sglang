@@ -414,7 +414,7 @@ class Scheduler:
         self.last_batch = batch
 
     @torch.no_grad()
-    def event_loop_overlap(self):
+    def _process_batch_overlap(self):
         batch = self.get_next_batch_to_run()
         self.cur_batch = batch
 
