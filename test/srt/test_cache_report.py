@@ -74,7 +74,7 @@ class TestCacheReport(unittest.TestCase):
                 {"role": "user", "content": message},
             ],
             temperature=0,
-            max_tokens=100,
+            max_completion_tokens=100,
         )
         return response
 
@@ -85,7 +85,7 @@ class TestCacheReport(unittest.TestCase):
                 {"role": "user", "content": message},
             ],
             temperature=0,
-            max_tokens=100,
+            max_completion_tokens=100,
         )
         return response
 

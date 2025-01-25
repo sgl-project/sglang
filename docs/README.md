@@ -46,14 +46,14 @@ If you need to run and shut down a SGLang server or engine, following these exam
 #Launch Sever
 
 from sglang.utils import (
-    execute_shell_command,
-    wait_for_server,
-    terminate_process,
-    print_highlight,
+  execute_shell_command,
+  wait_for_server,
+  terminate_process,
+  print_highlight,
 )
 
 server_process = execute_shell_command(
-    "python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000 --host 0.0.0.0"
+  "python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000 --host 0.0.0.0"
 )
 
 wait_for_server("http://localhost:30000")

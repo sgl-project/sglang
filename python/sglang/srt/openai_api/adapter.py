@@ -92,7 +92,6 @@ file_id_response: Dict[str, FileResponse] = {}
 # map file id to file path in SGLang backend
 file_id_storage: Dict[str, str] = {}
 
-
 # backend storage directory
 storage_dir = None
 
@@ -957,7 +956,7 @@ def v1_chat_generate_request(
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.get_max_output_tokens(),
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
