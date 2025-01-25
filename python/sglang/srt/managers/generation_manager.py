@@ -7,7 +7,7 @@ from typing import Optional, List, Any, Union, Dict
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import get_dummy_image_processor, get_image_processor
 from sglang.srt.managers.io_struct import GenerateReqInput, EmbeddingReqInput, SessionParams, TokenizedGenerateReqInput, \
-    TokenizedEmbeddingReqInput
+    TokenizedEmbeddingReqInput, BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -161,6 +161,52 @@ class GenerationConverter:
         return loop.run_until_complete(
             asyncio.gather(*(self.tokenize_request(obj) for obj in objs))
         )
+
+    def postprocess_response(
+        self,
+        recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
+        index: int,
+        req_obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> Dict[str, Any]:
+        meta_info = {
+            "id": rid,
+            "finish_reason": recv_obj.finished_reasons[i],
+            "prompt_tokens": recv_obj.prompt_tokens[i],
+        }
+
+        if getattr(state.obj, "return_logprob", False):
+            self.convert_logprob_style(
+                meta_info,
+                state.obj.top_logprobs_num,
+                state.obj.return_text_in_logprobs,
+                recv_obj,
+                i,
+            )
+
+        if not isinstance(recv_obj, BatchEmbeddingOut):
+            meta_info.update(
+                {
+                    "completion_tokens": recv_obj.completion_tokens[i],
+                    "cached_tokens": recv_obj.cached_tokens[i],
+                }
+            )
+
+        if isinstance(recv_obj, BatchStrOut):
+            out_dict = {
+                "text": recv_obj.output_strs[i],
+                "meta_info": meta_info,
+            }
+        elif isinstance(recv_obj, BatchTokenIDOut):
+            out_dict = {
+                "token_ids": recv_obj.output_ids[i],
+                "meta_info": meta_info,
+            }
+        else:
+            assert isinstance(recv_obj, BatchEmbeddingOut)
+            out_dict = {
+                "embedding": recv_obj.embeddings[i],
+                "meta_info": meta_info,
+            }
 
 
 class _MetricManager:
