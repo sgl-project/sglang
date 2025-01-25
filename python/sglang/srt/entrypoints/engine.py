@@ -23,8 +23,9 @@ import dataclasses
 import logging
 import os
 import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.entrypoints.engine_base import EngineBase
 from sglang.srt.orchestration.std.launcher import launch
 
 # Fix a bug of Python threading
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-class Engine:
+class Engine(EngineBase):
     """
     The entry point to the inference engine.
 
@@ -88,40 +89,15 @@ class Engine:
         self.orchestrator = orchestrator
         self.scheduler_info = scheduler_info
 
-    def generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
-        stream: bool = False,
-    ) -> Union[Dict, Iterator[Dict]]:
+    def _generate_impl(self, obj: GenerateReqInput):
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        obj = GenerateReqInput(
-            text=prompt,
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            lora_path=lora_path,
-            custom_logit_processor=custom_logit_processor,
-            stream=stream,
-        )
         loop = asyncio.get_event_loop()
         generator = self.orchestrator.generate_request(obj, None)
 
-        if stream:
-
+        if obj.stream:
             def generator_wrapper():
                 while True:
                     try:
