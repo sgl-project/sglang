@@ -439,7 +439,10 @@ class TokenizerManager:
         return self._generation_manager.model_config.image_token_id
 
     def configure_max_req_input_len(self, max_req_input_len):
-        self._generation_manager.generation_converter.max_req_input_len = max_req_input_len
+        self._generation_manager.generation_converter.max_req_input_len = (
+            max_req_input_len
+        )
+
 
 async def print_exception_wrapper(func):
     """
