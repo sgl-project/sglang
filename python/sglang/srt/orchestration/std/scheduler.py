@@ -19,8 +19,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_zmq_socket,
     set_gpu_proc_affinity,
-    suppress_other_loggers,
-)
+    suppress_other_loggers, )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -41,27 +40,27 @@ class SchedulerCommunicator:
         # Init inter-process communication
         context = zmq.Context(2)
         if self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
+            self._recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
-            self.send_to_tokenizer = get_zmq_socket(
+            self._send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the StdOrchestrator
-                self.send_to_detokenizer = get_zmq_socket(
+                self._send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
             else:
                 # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+                self._send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
         else:
-            self.recv_from_tokenizer = None
-            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self._recv_from_tokenizer = None
+            self._send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self._send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
