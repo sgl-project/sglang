@@ -242,8 +242,7 @@ class GenerationManager:
                     stream=state.obj.stream if hasattr(state.obj, "stream") else None,
                 )
 
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
-                self.dump_requests(state, out_dict)
+            self.request_dumper.maybe_dump_requests(state=state, out_dict=out_dict)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
@@ -590,7 +589,11 @@ class _RequestDumper:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
 
-    def dump_requests(self, state: '_ReqState', out_dict: dict):
+    def maybe_dump_requests(self, state: '_ReqState', out_dict: dict):
+        if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+            self._dump_requests(state, out_dict)
+
+    def _dump_requests(self, state: '_ReqState', out_dict: dict):
         self.dump_request_list.append(
             (state.obj, out_dict, state.created_time, time.time())
         )
