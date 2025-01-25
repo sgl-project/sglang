@@ -68,8 +68,11 @@ class HiPRadixAttentionBackend(AttentionBackend):
             )
             for _ in range(model_runner.model_config.num_hidden_layers)
         ]
+        self.q_buffers = None
 
     def push_q_buffer(self, q: torch.Tensor, layer_id: int, batch_size: int):
+        if self.q_buffers is None:
+            return
         assert batch_size == 1
         q = q.unsqueeze(0)
         layer_q_buffer = self.q_buffers[layer_id]
@@ -747,7 +750,7 @@ online_update={online_update}
                 (
                     "relative"
                     if self.hip_config.apply_v_dot
-                    else ("streaming" if is_dense else "relative")
+                    else ("relative" if is_dense else "relative")
                 )
                 if layer_config.scan_extend_backend is None
                 else layer_config.scan_extend_backend
