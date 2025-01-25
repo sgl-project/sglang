@@ -27,7 +27,6 @@ from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import psutil
 import torch
-import zmq
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -83,7 +82,6 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
-    broadcast_pyobj,
     crash_on_warnings,
     get_bool_env_var,
     set_random_seed,
@@ -452,57 +450,6 @@ class Scheduler:
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
-
-    def recv_requests(self) -> List[Req]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        if self.attn_tp_rank == 0:
-            recv_reqs = []
-
-            while True:
-                try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                recv_reqs.append(recv_req)
-        else:
-            recv_reqs = None
-
-        if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0:
-                work_reqs = [
-                    req
-                    for req in recv_reqs
-                    if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-                control_reqs = [
-                    req
-                    for req in recv_reqs
-                    if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-            else:
-                work_reqs = None
-                control_reqs = None
-
-            if self.attn_tp_size != 1:
-                attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_rank,
-                    self.attn_tp_cpu_group,
-                    src=attn_tp_rank_0,
-                )
-            if self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs, self.tp_rank, self.tp_cpu_group
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
-        return recv_reqs
 
     def handle_generate_request(
         self,

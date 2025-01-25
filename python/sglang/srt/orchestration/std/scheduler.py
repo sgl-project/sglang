@@ -12,6 +12,7 @@ from sglang.srt.managers.io_struct import TokenizedGenerateReqInput, TokenizedEm
     AbortReq, UpdateWeightFromDiskReqInput, InitWeightsUpdateGroupReqInput, UpdateWeightsFromDistributedReqInput, \
     UpdateWeightsFromTensorReqInput, GetWeightsByNameReqInput, ProfileReq, OpenSessionReqInput, CloseSessionReqInput, \
     ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -19,7 +20,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_zmq_socket,
     set_gpu_proc_affinity,
-    suppress_other_loggers, )
+    suppress_other_loggers, broadcast_pyobj, )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,60 @@ class SchedulerCommunicator:
         )
 
         core.on_generation_output = self._handle_generation_output
+
+    def recv_and_process_input_requests(self):
+        self._process_input_requests(self._recv_requests())
+
+    def _recv_requests(self) -> List[Req]:
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        if self.attn_tp_rank == 0:
+            recv_reqs = []
+
+            while True:
+                try:
+                    recv_req = self._recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                recv_reqs.append(recv_req)
+        else:
+            recv_reqs = None
+
+        if self.server_args.enable_dp_attention:
+            if self.attn_tp_rank == 0:
+                work_reqs = [
+                    req
+                    for req in recv_reqs
+                    if isinstance(
+                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                    )
+                ]
+                control_reqs = [
+                    req
+                    for req in recv_reqs
+                    if not isinstance(
+                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                    )
+                ]
+            else:
+                work_reqs = None
+                control_reqs = None
+
+            if self.attn_tp_size != 1:
+                attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_tp_rank,
+                    self.attn_tp_cpu_group,
+                    src=attn_tp_rank_0,
+                )
+            if self.tp_size != 1:
+                control_reqs = broadcast_pyobj(
+                    control_reqs, self.tp_rank, self.tp_cpu_group
+                )
+            recv_reqs = work_reqs + control_reqs
+        elif self.tp_size != 1:
+            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+        return recv_reqs
 
     def _process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
