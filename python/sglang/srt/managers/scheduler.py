@@ -28,7 +28,6 @@ from typing import Dict, List, Optional, Tuple, Union, Callable
 import psutil
 import torch
 import zmq
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -49,7 +48,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqOutput,
-    ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -505,12 +503,6 @@ class Scheduler:
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
-
-    def process_input_requests(self, recv_reqs: List):
-        for recv_req in recv_reqs:
-            output = self._request_dispatcher(recv_req)
-            if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,

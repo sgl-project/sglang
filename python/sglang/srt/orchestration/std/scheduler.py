@@ -3,7 +3,7 @@ import logging
 import os
 import signal
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, List
 
 import psutil
 import setproctitle
@@ -92,6 +92,12 @@ class SchedulerCommunicator:
         )
 
         core.on_generation_output = self._handle_generation_output
+
+    def _process_input_requests(self, recv_reqs: List):
+        for recv_req in recv_reqs:
+            output = self._request_dispatcher(recv_req)
+            if output is not None:
+                self._send_to_tokenizer.send_pyobj(output)
 
 
 def run_scheduler_process(
