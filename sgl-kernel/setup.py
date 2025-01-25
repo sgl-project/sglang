@@ -134,7 +134,6 @@ extra_link_args = [
     f"{str(root)}/3rdparty/turbomind/build/lib/libgemm2.a",
     f"{str(root)}/3rdparty/turbomind/build/lib/libparser.a",
 ]
-print("extra_link_args: ", extra_link_args)
 
 ext_modules = [
     CUDAExtension(
