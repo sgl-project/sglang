@@ -84,6 +84,7 @@ jobs:
       - name: Build SDist
         run: |
           pip install build
+          python -m pip install -U packaging
           python -m build --sdist
 
       - uses: actions/upload-artifact@v4
