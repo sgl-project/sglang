@@ -192,21 +192,22 @@ class GenerationConverter:
             )
 
         if isinstance(recv_obj, BatchStrOut):
-            out_dict = {
+            return {
                 "text": recv_obj.output_strs[i],
                 "meta_info": meta_info,
             }
         elif isinstance(recv_obj, BatchTokenIDOut):
-            out_dict = {
+            return {
                 "token_ids": recv_obj.output_ids[i],
                 "meta_info": meta_info,
             }
-        else:
-            assert isinstance(recv_obj, BatchEmbeddingOut)
-            out_dict = {
+        elif isinstance(recv_obj, BatchEmbeddingOut):
+            return {
                 "embedding": recv_obj.embeddings[i],
                 "meta_info": meta_info,
             }
+        else:
+            raise NotImplementedError
 
 
 class _MetricManager:
