@@ -397,7 +397,7 @@ class TokenizerManager:
 
         # Drain requests
         while True:
-            remain_num_req = len(self.rid_to_state)
+            remain_num_req = len(self._generation_manager.rid_to_state)
             logger.info(
                 f"Gracefully exiting... remaining number of requests {remain_num_req}"
             )
