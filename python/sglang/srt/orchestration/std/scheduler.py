@@ -23,47 +23,13 @@ from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
-    CloseSessionReqInput,
-    FlushCacheReq,
-    GetWeightsByNameReqInput,
-    GetWeightsByNameReqOutput,
-    InitWeightsUpdateGroupReqInput,
-    InitWeightsUpdateGroupReqOutput,
-    OpenSessionReqInput,
-    OpenSessionReqOutput,
-    ProfileReq,
-    ReleaseMemoryOccupationReqInput,
-    ReleaseMemoryOccupationReqOutput,
-    ResumeMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqOutput,
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
-)
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
-    ImageInputs,
-    Req,
-    ScheduleBatch,
-    global_server_args_dict,
-)
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -76,7 +42,6 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
-    crash_on_warnings,
     get_bool_env_var,
     get_zmq_socket,
     set_gpu_proc_affinity,
@@ -86,6 +51,20 @@ from sglang.srt.utils import (
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class SchedulerCommunicator:
+    def __init__(
+        self,
+        core: Scheduler,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        tp_rank: int,
+    ):
+        self.core = core
+        self.server_args = server_args
+        self.tp_rank = tp_rank
+
 
 def run_scheduler_process(
     server_args: ServerArgs,
