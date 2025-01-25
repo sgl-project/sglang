@@ -74,13 +74,6 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
 
-        self._request_dispatcher = TypeBasedDispatcher(
-            [
-                (BatchEmbeddingOut, self.handle_batch_embedding_out),
-                (BatchTokenIDOut, self.handle_batch_token_id_out),
-            ]
-        )
-
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
