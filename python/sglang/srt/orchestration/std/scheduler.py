@@ -99,6 +99,9 @@ class SchedulerCommunicator:
             if output is not None:
                 self._send_to_tokenizer.send_pyobj(output)
 
+    def _handle_generation_output(self, obj):
+        self._send_to_detokenizer.send_pyobj(obj)
+
 
 def run_scheduler_process(
     server_args: ServerArgs,
