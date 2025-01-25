@@ -38,8 +38,6 @@ Development build:
 
 ```bash
 make build
-pip3 install dist/*whl --force-reinstall --no-deps
-# Or use: make install (runs pip install -e .)
 ```
 
 ### Testing & Benchmarking
