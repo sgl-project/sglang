@@ -10,7 +10,6 @@ from http import HTTPStatus
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -46,7 +45,7 @@ class GenerationManager:
         self.on_request = on_request
 
         self.model_config = _compute_model_config(server_args)
-        self._generation_converter = GenerationConverter(server_args=server_args)
+        self.generation_converter = GenerationConverter(server_args=server_args)
 
         self.rid_to_state: Dict[str, _ReqState] = {}
 
@@ -80,7 +79,7 @@ class GenerationManager:
 
         is_single = obj.is_single
         if is_single:
-            tokenized_obj = await self._generation_converter.tokenize_request(obj)
+            tokenized_obj = await self.generation_converter.tokenize_request(obj)
             self._send_one_request(obj, tokenized_obj, created_time)
             async for response in self._wait_one_response(obj, request):
                 yield response
@@ -162,7 +161,7 @@ class GenerationManager:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
-                tokenized_obj = await self._generation_converter.tokenize_request(
+                tokenized_obj = await self.generation_converter.tokenize_request(
                     tmp_obj
                 )
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
@@ -180,7 +179,7 @@ class GenerationManager:
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
-                *(self._generation_converter.tokenize_request(obj) for obj in objs)
+                *(self.generation_converter.tokenize_request(obj) for obj in objs)
             )
 
             # Cache the common prefix for parallel sampling
@@ -236,7 +235,7 @@ class GenerationManager:
             if state is None:
                 continue
 
-            out_dict = self._generation_converter.postprocess_response(
+            out_dict = self.generation_converter.postprocess_response(
                 recv_obj, index, state.obj
             )
 
@@ -264,7 +263,7 @@ class GenerationManager:
 
     @property
     def tokenizer(self):
-        return self._generation_converter.tokenizer
+        return self.generation_converter.tokenizer
 
 
 class GenerationConverter:
@@ -279,6 +278,9 @@ class GenerationConverter:
 
         # Create image processor placeholder
         self.image_processor = get_dummy_image_processor()
+
+        # Set after scheduler is initialized
+        self.max_req_input_len = None
 
         # Create tokenizer
         if server_args.skip_tokenizer_init:

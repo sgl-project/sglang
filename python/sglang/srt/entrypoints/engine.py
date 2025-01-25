@@ -445,5 +445,5 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.configure_max_req_input_len(scheduler_info["max_req_input_len"])
     return tokenizer_manager, scheduler_info

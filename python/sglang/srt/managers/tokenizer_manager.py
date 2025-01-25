@@ -130,8 +130,6 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        # Set after scheduler is initialized
-        self.max_req_input_len = None
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -440,6 +438,8 @@ class TokenizerManager:
     def image_token_id(self):
         return self._generation_manager.model_config.image_token_id
 
+    def configure_max_req_input_len(self, max_req_input_len):
+        self._generation_manager.generation_converter.max_req_input_len = max_req_input_len
 
 async def print_exception_wrapper(func):
     """
