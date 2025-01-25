@@ -211,7 +211,7 @@ class TokenizerManager:
         self.send_to_scheduler.send_pyobj(req)
 
     def abort_request(self, rid: str):
-        TODO_moved
+        self._generation_manager.abort_request(rid)
 
     def start_profile(self):
         req = ProfileReq.START_PROFILE
