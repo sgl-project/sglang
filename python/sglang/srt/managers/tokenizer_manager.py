@@ -96,10 +96,6 @@ class TokenizerManager:
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
 
-        self.is_generation = self.model_config.is_generation
-        self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
-
         # Store states
         self.no_create_loop = False
 
@@ -429,6 +425,18 @@ class TokenizerManager:
             # set future if the all results are recevied
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    @property
+    def is_generation(self):
+        return self._generation_manager.model_config.is_generation
+
+    @property
+    def tokenizer(self):
+        return self._generation_manager.tokenizer
+
+    @property
+    def image_token_id(self):
+        return self._generation_manager.model_config.image_token_id
 
 
 async def print_exception_wrapper(func):
