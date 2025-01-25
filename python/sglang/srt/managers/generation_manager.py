@@ -224,7 +224,9 @@ class GenerationManager:
             if state is None:
                 continue
 
-            TODO_moved_postprocesse_response
+            out_dict = self._generation_converter.postprocess_response(
+                recv_obj, index, state.obj
+            )
 
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[i] is not None
