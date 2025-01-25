@@ -189,6 +189,13 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        communicator = SchedulerCommunicator(
+            core=scheduler,
+            server_args=server_args,
+            port_args=port_args,
+            tp_rank=tp_rank,
+        )
+
         pipe_writer.send(
             {
                 "status": "ready",
@@ -196,10 +203,10 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        if scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
+
+        while True:
+            communicator.recv_and_process_input_requests()
+            scheduler.process_batch()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
