@@ -22,6 +22,7 @@ from typing import Optional
 
 import psutil
 import torch
+
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -143,7 +144,7 @@ class TpModelWorkerClient:
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
             self.future_token_ids_map[
-            future_token_ids_ct + 1: future_token_ids_ct + bs + 1
+                future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
             ] = next_token_ids
 
             # Copy results to the CPU
@@ -203,8 +204,8 @@ class TpModelWorkerClient:
             device=self.device,
         )
         self.future_token_ids_ct = (
-                                       self.future_token_ids_ct + bs
-                                   ) % self.future_token_ids_limit
+            self.future_token_ids_ct + bs
+        ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

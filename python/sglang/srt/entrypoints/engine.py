@@ -98,6 +98,7 @@ class Engine(EngineBase):
         generator = self.orchestrator.generate_request(obj, None)
 
         if obj.stream:
+
             def generator_wrapper():
                 while True:
                     try:
