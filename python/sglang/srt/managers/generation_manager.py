@@ -1,6 +1,7 @@
+import asyncio
 import dataclasses
 import time
-from typing import Optional
+from typing import Optional, List, Any
 
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.server_args import ServerArgs
@@ -61,6 +62,19 @@ class _MetricManager:
                 self.metrics_collector.observe_time_per_output_token(
                     (time.time() - state.created_time) / completion_tokens
                 )
+
+
+@dataclasses.dataclass
+class _ReqState:
+    """Store the state a request."""
+
+    out_list: List
+    finished: bool
+    event: asyncio.Event
+    obj: Any
+
+    # For streaming output
+    last_output_offset: int = 0
 
 
 @dataclasses.dataclass

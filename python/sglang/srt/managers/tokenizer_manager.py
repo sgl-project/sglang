@@ -87,19 +87,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
-@dataclasses.dataclass
-class ReqState:
-    """Store the state a request."""
-
-    out_list: List
-    finished: bool
-    event: asyncio.Event
-    obj: Any
-
-    # For streaming output
-    last_output_offset: int = 0
-
-
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
 
