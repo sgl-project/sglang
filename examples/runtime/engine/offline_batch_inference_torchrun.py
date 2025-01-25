@@ -2,7 +2,7 @@ import datetime
 import os
 import sys
 
-from sglang.srt.server.engine_fragment import EngineFragment
+from sglang.srt.entrypoints.engine_fragment import EngineFragment
 
 
 def run():

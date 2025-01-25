@@ -4,7 +4,7 @@ import traceback
 import unittest
 from multiprocessing import Process
 
-from sglang.srt.server.engine_fragment import EngineFragment
+from sglang.srt.entrypoints.engine_fragment import EngineFragment
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 _TP_SIZE = 2
@@ -70,7 +70,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             outputs = fragment.generate(
                 prompt=prompt,
                 sampling_params=[dict(max_new_tokens=16, temperature=0.0)]
-                * len(prompt),
+                                * len(prompt),
             )
             print(
                 f"subprocess[{tp_rank=}] End generation {prompt=} {outputs=}",
