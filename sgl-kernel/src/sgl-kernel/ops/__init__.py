@@ -1,41 +1,8 @@
+import os
 from typing import Optional, Tuple, Union
 
+import sgl_kernel.ops._kernels
 import torch
-from sgl_kernel.ops._kernels import all_reduce as _all_reduce
-from sgl_kernel.ops._kernels import bmm_fp8 as _bmm_fp8
-from sgl_kernel.ops._kernels import dispose as _dispose
-from sgl_kernel.ops._kernels import fused_add_rmsnorm as _fused_add_rmsnorm
-from sgl_kernel.ops._kernels import gelu_and_mul as _gelu_and_mul
-from sgl_kernel.ops._kernels import gelu_tanh_and_mul as _gelu_tanh_and_mul
-from sgl_kernel.ops._kernels import gemma_fused_add_rmsnorm as _gemma_fused_add_rmsnorm
-from sgl_kernel.ops._kernels import gemma_rmsnorm as _gemma_rmsnorm
-from sgl_kernel.ops._kernels import (
-    get_graph_buffer_ipc_meta as _get_graph_buffer_ipc_meta,
-)
-from sgl_kernel.ops._kernels import init_custom_ar as _init_custom_ar
-from sgl_kernel.ops._kernels import int8_scaled_mm as _int8_scaled_mm
-from sgl_kernel.ops._kernels import (
-    lightning_attention_decode as _lightning_attention_decode,
-)
-from sgl_kernel.ops._kernels import (
-    min_p_sampling_from_probs as _min_p_sampling_from_probs,
-)
-from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
-from sgl_kernel.ops._kernels import register_graph_buffers as _register_graph_buffers
-from sgl_kernel.ops._kernels import rmsnorm as _rmsnorm
-from sgl_kernel.ops._kernels import rotary_embedding as _rotary_embedding
-from sgl_kernel.ops._kernels import (
-    sampling_scaling_penalties as _sampling_scaling_penalties,
-)
-from sgl_kernel.ops._kernels import silu_and_mul as _silu_and_mul
-from sgl_kernel.ops._kernels import top_k_renorm_probs as _top_k_renorm_probs
-from sgl_kernel.ops._kernels import (
-    top_k_top_p_sampling_from_probs as _top_k_top_p_sampling_from_probs,
-)
-from sgl_kernel.ops._kernels import top_p_renorm_probs as _top_p_renorm_probs
-from sgl_kernel.ops._kernels import (
-    top_p_sampling_from_probs as _top_p_sampling_from_probs,
-)
 from sgl_kernel.ops.utils import (
     _get_cache_buf,
     _get_cuda_stream,
@@ -46,25 +13,25 @@ from sgl_kernel.ops.utils import (
 def init_custom_reduce(
     rank_id, num_devices, rank_data, buffers, tmp_buffers, barrier_in, barrier_out
 ):
-    return _init_custom_ar(
+    return torch.ops.sgl_kernels.init_custom_ar(
         rank_id, num_devices, rank_data, buffers, tmp_buffers, barrier_in, barrier_out
     )
 
 
 def custom_dispose(fa):
-    _dispose(fa)
+    torch.ops.sgl_kernels.dispose(fa)
 
 
 def custom_reduce(fa, inp, out):
-    _all_reduce(fa, inp, out)
+    torch.ops.sgl_kernels.all_reduce(fa, inp, out)
 
 
 def get_graph_buffer_ipc_meta(fa):
-    return _get_graph_buffer_ipc_meta(fa)
+    return torch.ops.sgl_kernels.get_graph_buffer_ipc_meta(fa)
 
 
 def register_graph_buffers(fa, handles, offsets):
-    _register_graph_buffers(fa, handles, offsets)
+    torch.ops.sgl_kernels.register_graph_buffers(fa, handles, offsets)
 
 
 def moe_align_block_size(
@@ -77,7 +44,7 @@ def moe_align_block_size(
     token_cnts_buffer,
     cumsum_buffer,
 ):
-    _moe_align_block_size(
+    torch.ops.sgl_kernels.moe_align_block_size(
         topk_ids,
         num_experts,
         block_size,
@@ -90,11 +57,11 @@ def moe_align_block_size(
 
 
 def sampling_scaling_penalties(logits, scaling_penalties):
-    return _sampling_scaling_penalties(logits, scaling_penalties)
+    return torch.ops.sgl_kernels.sampling_scaling_penalties(logits, scaling_penalties)
 
 
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-    return _int8_scaled_mm(
+    return torch.ops.sgl_kernels.int8_scaled_mm(
         mat_a,
         mat_b,
         scales_a,
@@ -105,11 +72,15 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 
 
 def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
-    _lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv)
+    torch.ops.sgl_kernels.lightning_attention_decode(
+        q, k, v, past_kv, slope, output, new_kv
+    )
 
 
 def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
-    return _rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+    return torch.ops.sgl_kernels.rotary_embedding(
+        positions, query, key, head_size, cos_sin_cache, is_neox
+    )
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -123,7 +94,7 @@ def rmsnorm(
     with input.device as device:
         if out is None:
             out = torch.empty_like(input)
-        _rmsnorm(out, input, weight, eps, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.rmsnorm(out, input, weight, eps, _get_cuda_stream(device))
         return out
 
 
@@ -131,7 +102,9 @@ def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        _fused_add_rmsnorm(input, residual, weight, eps, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.fused_add_rmsnorm(
+            input, residual, weight, eps, _get_cuda_stream(device)
+        )
 
 
 def gemma_rmsnorm(
@@ -143,7 +116,9 @@ def gemma_rmsnorm(
     with input.device as device:
         if out is None:
             out = torch.empty_like(input)
-        _gemma_rmsnorm(out, input, weight, eps, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.gemma_rmsnorm(
+            out, input, weight, eps, _get_cuda_stream(device)
+        )
         return out
 
 
@@ -151,7 +126,9 @@ def gemma_fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        _gemma_fused_add_rmsnorm(input, residual, weight, eps, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.gemma_fused_add_rmsnorm(
+            input, residual, weight, eps, _get_cuda_stream(device)
+        )
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
@@ -176,7 +153,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             dtype=input.dtype,
         )
     with input.device as device:
-        _silu_and_mul(out, input, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.silu_and_mul(out, input, _get_cuda_stream(device))
         return out
 
 
@@ -192,7 +169,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             dtype=input.dtype,
         )
     with input.device as device:
-        _gelu_tanh_and_mul(out, input, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.gelu_tanh_and_mul(out, input, _get_cuda_stream(device))
         return out
 
 
@@ -208,7 +185,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             dtype=input.dtype,
         )
     with input.device as device:
-        _gelu_and_mul(out, input, _get_cuda_stream(device))
+        torch.ops.sgl_kernels.gelu_and_mul(out, input, _get_cuda_stream(device))
         return out
 
 
@@ -222,7 +199,7 @@ def _bmm_fp8_internal(
 ) -> None:
     with A.device as device:
         cublas_handle = torch.cuda.current_blas_handle()
-        _bmm_fp8(
+        torch.ops.sgl_kernels.bmm_fp8(
             A,
             B,
             D,
@@ -262,7 +239,7 @@ def _top_k_renorm_probs_internal(
         probs = probs.float()
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         renorm_probs = torch.empty_like(probs)
-        _top_k_renorm_probs(
+        torch.ops.sgl_kernels.top_k_renorm_probs_wrapper(
             probs,
             renorm_probs,
             maybe_top_k_arr,
@@ -293,7 +270,7 @@ def _top_p_renorm_probs_internal(
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         renorm_probs = torch.empty_like(probs)
-        _top_p_renorm_probs(
+        torch.ops.sgl_kernels.top_p_renorm_probs(
             probs,
             renorm_probs,
             maybe_top_p_arr,
@@ -328,7 +305,7 @@ def _top_p_sampling_from_probs_internal(
         )
         samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
         success = torch.empty(probs.size(0), dtype=torch.bool, device=device)
-        _top_p_sampling_from_probs(
+        torch.ops.sgl_kernels.top_p_sampling_from_probs(
             probs,
             uniform_samples,
             samples,
@@ -374,7 +351,7 @@ def _top_k_top_p_sampling_from_probs_internal(
         )
         samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
         success = torch.empty(probs.size(0), dtype=torch.bool, device=device)
-        _top_k_top_p_sampling_from_probs(
+        torch.ops.sgl_kernels.top_k_top_p_sampling_from_probs(
             probs,
             uniform_samples,
             samples,
@@ -432,7 +409,7 @@ def _min_p_sampling_from_probs_internal(
             maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
         )
         samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-        _min_p_sampling_from_probs(
+        torch.ops.sgl_kernels.min_p_sampling_from_probs(
             probs,
             uniform_samples,
             samples,
