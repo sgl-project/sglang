@@ -1,6 +1,6 @@
 #pragma once
-#include <torch/extension.h>
 #include <pytorch_extension_utils.h>
+#include <torch/extension.h>
 
 #include <sstream>
 
@@ -46,15 +46,15 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, ...)                 \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, ...)           \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
-      case at::ScalarType::Float: {                                                     \
-        using c_type = float;                                                           \
-        return __VA_ARGS__();                                                           \
-      }                                                                                 \
-      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                           \
-      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      case at::ScalarType::Float: {                                                      \
+        using c_type = float;                                                            \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+        _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                          \
+        _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                         \
       default:                                                                           \
         std::ostringstream oss;                                                          \
         oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
