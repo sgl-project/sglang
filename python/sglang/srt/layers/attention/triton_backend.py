@@ -27,7 +27,6 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
