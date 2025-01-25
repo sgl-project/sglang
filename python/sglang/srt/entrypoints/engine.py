@@ -101,10 +101,10 @@ class Engine:
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        tokenizer_manager, scheduler_info = _launch_subprocesses(
+        orchestrator, scheduler_info = _launch_subprocesses(
             server_args=server_args
         )
-        self.tokenizer_manager = tokenizer_manager
+        self.orchestrator = orchestrator
         self.scheduler_info = scheduler_info
 
     def generate(
@@ -137,7 +137,7 @@ class Engine:
             stream=stream,
         )
         loop = asyncio.get_event_loop()
-        generator = self.tokenizer_manager.generate_request(obj, None)
+        generator = self.orchestrator.generate_request(obj, None)
 
         if stream:
 
@@ -183,7 +183,7 @@ class Engine:
             stream=stream,
             custom_logit_processor=custom_logit_processor,
         )
-        generator = self.tokenizer_manager.generate_request(obj, None)
+        generator = self.orchestrator.generate_request(obj, None)
 
         if stream is True:
             return generator
@@ -201,7 +201,7 @@ class Engine:
 
         obj = EmbeddingReqInput(text=prompt)
         loop = asyncio.get_event_loop()
-        generator = self.tokenizer_manager.generate_request(obj, None)
+        generator = self.orchestrator.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
         return ret
 
@@ -210,14 +210,14 @@ class Engine:
         kill_process_tree(os.getpid(), include_parent=False)
 
     def start_profile(self):
-        self.tokenizer_manager.start_profile()
+        self.orchestrator.start_profile()
 
     def stop_profile(self):
-        self.tokenizer_manager.stop_profile()
+        self.orchestrator.stop_profile()
 
     def get_server_info(self):
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),  # server args
+            **dataclasses.asdict(self.orchestrator.server_args),  # server args
             **self.scheduler_info,
             "version": __version__,
         }
@@ -242,7 +242,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.init_weights_update_group(obj, None)
+            self.orchestrator.init_weights_update_group(obj, None)
         )
 
     def update_weights_from_distributed(self, name: str, dtype, shape):
@@ -254,7 +254,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_distributed(obj, None)
+            self.orchestrator.update_weights_from_distributed(obj, None)
         )
 
     def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
@@ -264,7 +264,7 @@ class Engine:
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_tensor(obj, None)
+            self.orchestrator.update_weights_from_tensor(obj, None)
         )
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
@@ -272,7 +272,7 @@ class Engine:
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.get_weights_by_name(obj, None)
+            self.orchestrator.get_weights_by_name(obj, None)
         )
 
     def release_memory_occupation(self):
@@ -280,7 +280,7 @@ class Engine:
         obj = ReleaseMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.release_memory_occupation(obj, None)
+            self.orchestrator.release_memory_occupation(obj, None)
         )
 
     def resume_memory_occupation(self):
@@ -288,7 +288,7 @@ class Engine:
         obj = ResumeMemoryOccupationReqInput()
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.resume_memory_occupation(obj, None)
+            self.orchestrator.resume_memory_occupation(obj, None)
         )
 
 
@@ -420,9 +420,9 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict
     detoken_proc.start()
 
     # Launch tokenizer process
-    tokenizer_manager = StdOrchestrator(server_args, port_args)
+    orchestrator = StdOrchestrator(server_args, port_args)
     if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+        load_chat_template_for_openai_api(orchestrator, server_args.chat_template)
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -445,5 +445,5 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-    return tokenizer_manager, scheduler_info
+    orchestrator.max_req_input_len = scheduler_info["max_req_input_len"]
+    return orchestrator, scheduler_info

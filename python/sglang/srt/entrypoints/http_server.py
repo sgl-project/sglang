@@ -95,7 +95,7 @@ app.add_middleware(
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: StdOrchestrator
+    orchestrator: StdOrchestrator
     scheduler_info: Dict
 
 
@@ -122,7 +122,7 @@ async def health_generate(request: Request) -> Response:
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.7}
 
-    if _global_state.tokenizer_manager.is_generation:
+    if _global_state.orchestrator.is_generation:
         gri = GenerateReqInput(
             input_ids=[0], sampling_params=sampling_params, log_metrics=False
         )
@@ -132,7 +132,7 @@ async def health_generate(request: Request) -> Response:
         )
 
     try:
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+        async for _ in _global_state.orchestrator.generate_request(gri, request):
             break
         return Response(status_code=200)
     except Exception as e:
@@ -144,9 +144,9 @@ async def health_generate(request: Request) -> Response:
 async def get_model_info():
     """Get the model information."""
     result = {
-        "model_path": _global_state.tokenizer_manager.model_path,
-        "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
-        "is_generation": _global_state.tokenizer_manager.is_generation,
+        "model_path": _global_state.orchestrator.model_path,
+        "tokenizer_path": _global_state.orchestrator.server_args.tokenizer_path,
+        "is_generation": _global_state.orchestrator.is_generation,
     }
     return result
 
@@ -154,7 +154,7 @@ async def get_model_info():
 @app.get("/get_server_info")
 async def get_server_info():
     return {
-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
+        **dataclasses.asdict(_global_state.orchestrator.server_args),
         **_global_state.scheduler_info,
         "version": __version__,
     }
@@ -168,7 +168,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
+                async for out in _global_state.orchestrator.generate_request(
                     obj, request
                 ):
                     yield b"data: " + orjson.dumps(
@@ -184,11 +184,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
-            background=_global_state.tokenizer_manager.create_abort_task(obj),
+            background=_global_state.orchestrator.create_abort_task(obj),
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
+            ret = await _global_state.orchestrator.generate_request(
                 obj, request
             ).__anext__()
             return ret
@@ -201,7 +201,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
+        ret = await _global_state.orchestrator.generate_request(
             obj, request
         ).__anext__()
         return ret
@@ -213,7 +213,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
+        ret = await _global_state.orchestrator.generate_request(
             obj, request
         ).__anext__()
         return ret
@@ -224,7 +224,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @app.post("/flush_cache")
 async def flush_cache():
     """Flush the radix cache."""
-    _global_state.tokenizer_manager.flush_cache()
+    _global_state.orchestrator.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
@@ -235,7 +235,7 @@ async def flush_cache():
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async():
     """Start profiling."""
-    _global_state.tokenizer_manager.start_profile()
+    _global_state.orchestrator.start_profile()
     return Response(
         content="Start profiling.\n",
         status_code=200,
@@ -245,7 +245,7 @@ async def start_profile_async():
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    _global_state.orchestrator.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
@@ -255,7 +255,7 @@ async def stop_profile_async():
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk in-place without re-launching the server."""
-    success, message = await _global_state.tokenizer_manager.update_weights_from_disk(
+    success, message = await _global_state.orchestrator.update_weights_from_disk(
         obj, request
     )
     content = {"success": success, "message": message}
@@ -276,7 +276,7 @@ async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    success, message = await _global_state.tokenizer_manager.init_weights_update_group(
+    success, message = await _global_state.orchestrator.init_weights_update_group(
         obj, request
     )
     content = {"success": success, "message": message}
@@ -292,7 +292,7 @@ async def update_weights_from_distributed(
 ):
     """Update model parameter from distributed online."""
     success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
+        await _global_state.orchestrator.update_weights_from_distributed(
             obj, request
         )
     )
@@ -307,7 +307,7 @@ async def update_weights_from_distributed(
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
+        ret = await _global_state.orchestrator.get_weights_by_name(obj, request)
         if ret is None:
             return _create_error_response("Get parameter by name failed")
         else:
@@ -322,7 +322,7 @@ async def release_memory_occupation(
 ):
     """Release GPU occupation temporarily"""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        await _global_state.orchestrator.release_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -333,7 +333,7 @@ async def resume_memory_occupation(
 ):
     """Resume GPU occupation"""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        await _global_state.orchestrator.resume_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -342,7 +342,7 @@ async def resume_memory_occupation(
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await _global_state.tokenizer_manager.open_session(obj, request)
+        session_id = await _global_state.orchestrator.open_session(obj, request)
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
@@ -356,7 +356,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 async def close_session(obj: CloseSessionReqInput, request: Request):
     """Close the session"""
     try:
-        await _global_state.tokenizer_manager.close_session(obj, request)
+        await _global_state.orchestrator.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -365,7 +365,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Close the session"""
-    _global_state.tokenizer_manager.configure_logging(obj)
+    _global_state.orchestrator.configure_logging(obj)
     return Response(status_code=200)
 
 
@@ -374,24 +374,24 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 @app.post("/v1/completions")
 async def openai_v1_completions(raw_request: Request):
-    return await v1_completions(_global_state.tokenizer_manager, raw_request)
+    return await v1_completions(_global_state.orchestrator, raw_request)
 
 
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+    return await v1_chat_completions(_global_state.orchestrator, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
 async def openai_v1_embeddings(raw_request: Request):
-    response = await v1_embeddings(_global_state.tokenizer_manager, raw_request)
+    response = await v1_embeddings(_global_state.orchestrator, raw_request)
     return response
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
 def available_models():
     """Show available models."""
-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+    served_model_names = [_global_state.orchestrator.served_model_name]
     model_cards = []
     for served_model_name in served_model_names:
         model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
@@ -401,7 +401,7 @@ def available_models():
 @app.post("/v1/files")
 async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
     return await v1_files_create(
-        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_pth
+        file, purpose, _global_state.orchestrator.server_args.file_storage_pth
     )
 
 
@@ -413,13 +413,13 @@ async def delete_file(file_id: str):
 
 @app.post("/v1/batches")
 async def openai_v1_batches(raw_request: Request):
-    return await v1_batches(_global_state.tokenizer_manager, raw_request)
+    return await v1_batches(_global_state.orchestrator, raw_request)
 
 
 @app.post("/v1/batches/{batch_id}/cancel")
 async def cancel_batches(batch_id: str):
     # https://platform.openai.com/docs/api-reference/batch/cancel
-    return await v1_cancel_batch(_global_state.tokenizer_manager, batch_id)
+    return await v1_cancel_batch(_global_state.orchestrator, batch_id)
 
 
 @app.get("/v1/batches/{batch_id}")
@@ -464,10 +464,10 @@ def launch_server(
     1. The HTTP server, Engine, and StdOrchestrator both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+    orchestrator, scheduler_info = _launch_subprocesses(server_args=server_args)
     set_global_state(
         _GlobalState(
-            tokenizer_manager=tokenizer_manager,
+            orchestrator=orchestrator,
             scheduler_info=scheduler_info,
         )
     )
@@ -487,7 +487,7 @@ def launch_server(
         args=(
             server_args,
             pipe_finish_writer,
-            _global_state.tokenizer_manager.image_token_id,
+            _global_state.orchestrator.image_token_id,
         ),
     )
     t.start()
