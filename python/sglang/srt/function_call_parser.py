@@ -105,7 +105,8 @@ class BaseFormatDetector:
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
         """
-        return self.parse_base_json(text, tools)
+        action = json.loads(text)
+        return self.parse_base_json(action, tools)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Function]
@@ -458,7 +459,6 @@ class FunctionCallParser:
         "llama3": Llama32Detector,
         "qwen25": Qwen25Detector,
         "mistral": MistralDetector,
-        "json": BaseFormatDetector,
     }
 
     def __init__(self, tools: List[Function], tool_call_parser: str = None):

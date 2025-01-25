@@ -915,7 +915,10 @@ def v1_chat_generate_request(
                         tools=tools,
                     )
                 except:
-                    tools = [{"function": tools[0]}]
+                    #  This except branch will be triggered when the chosen model
+                    #  has a different tools input format that is not compatiable
+                    #  with openAI's apply_chat_template tool_call format, like Mistral.
+                    tools = [t if "function" in t else {"function": t} for t in tools]
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
