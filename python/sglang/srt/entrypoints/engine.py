@@ -27,6 +27,8 @@ import signal
 import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
+from sglang.srt.orchestration.std.detokenizer import run_detokenizer_process
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -36,7 +38,6 @@ import uvloop
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
