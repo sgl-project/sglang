@@ -27,6 +27,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
@@ -57,10 +58,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    get_zmq_socket,
-    kill_process_tree,
-)
+from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -339,11 +337,17 @@ class TokenizerManager:
         if obj.log_requests is not None:
             self._generation_manager.request_logger.log_requests = obj.log_requests
         if obj.log_requests_level is not None:
-            self._generation_manager.request_logger.log_requests_level = obj.log_requests_level
+            self._generation_manager.request_logger.log_requests_level = (
+                obj.log_requests_level
+            )
         if obj.dump_requests_folder is not None:
-            self._generation_manager.request_dumper.dump_requests_folder = obj.dump_requests_folder
+            self._generation_manager.request_dumper.dump_requests_folder = (
+                obj.dump_requests_folder
+            )
         if obj.dump_requests_threshold is not None:
-            self._generation_manager.request_dumper.dump_requests_threshold = obj.dump_requests_threshold
+            self._generation_manager.request_dumper.dump_requests_threshold = (
+                obj.dump_requests_threshold
+            )
         logging.info(f"Config logging: {obj=}")
 
     def create_abort_task(self, obj: GenerateReqInput):
