@@ -33,3 +33,6 @@ def test_sampling_scaling_penalties(batch_size, vocab_size, dtype):
         atol=atol,
         msg=f"Failed for batch_size={batch_size}, vocab_size={vocab_size}, dtype={dtype}",
     )
+
+if __name__ == "__main__":
+    pytest.main([__file__])
