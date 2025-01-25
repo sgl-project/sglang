@@ -6,7 +6,7 @@
 
 #include <THC/THCAtomics.cuh>
 
-#include "utils.hpp"
+#include "utils.h"
 
 #ifdef USE_ROCM
 #include <hip/hip_runtime.h>
@@ -51,7 +51,6 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
   __shared__ int32_t local_offsets[256];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
-  const int lane_id = threadIdx.x % WARP_SIZE;
   const int experts_per_warp = 8;
   const int my_expert_start = warp_id * experts_per_warp;
 

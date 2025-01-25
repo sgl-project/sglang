@@ -21,10 +21,10 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
-from vllm.distributed import get_tensor_model_parallel_rank
-from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -33,7 +33,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -64,7 +63,7 @@ def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
     batch_size: int,
-    tp_group: "GroupCoordinator",
+    tp_group: GroupCoordinator,
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
@@ -72,7 +71,6 @@ def patch_model(
     try:
         if enable_compile:
             _to_torch(model, reverse=False, batch_size=batch_size)
-            monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -88,7 +86,6 @@ def patch_model(
     finally:
         if enable_compile:
             _to_torch(model, reverse=True, batch_size=batch_size)
-            monkey_patch_vllm_all_gather(reverse=True)
             tp_group.ca_comm = backup_ca_comm
 
 
@@ -122,12 +119,15 @@ class CudaGraphRunner:
         self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
         self.tp_size = self.model_runner.tp_size
+        self.dp_size = self.model_runner.server_args.dp_size
 
         # Batch sizes to capture
-        if model_runner.server_args.disable_cuda_graph_padding:
-            self.capture_bs = list(range(1, 33)) + [64, 128]
-        else:
-            self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+        self.capture_bs = self.model_runner.server_args.cuda_graph_bs
+        if self.capture_bs is None:
+            if model_runner.server_args.disable_cuda_graph_padding:
+                self.capture_bs = list(range(1, 33)) + [64, 128]
+            else:
+                self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
 
         if max(self.capture_bs) > model_runner.req_to_token_pool.size:
             # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -149,9 +149,18 @@ class CudaGraphRunner:
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
 
+        self.compile_bs = (
+            [
+                bs
+                for bs in self.capture_bs
+                if bs <= self.model_runner.server_args.torch_compile_max_bs
+            ]
+            if self.use_torch_compile
+            else []
+        )
+
         self.capture_forward_mode = ForwardMode.DECODE
         self.num_tokens_per_bs = 1
-
         if model_runner.spec_algorithm.is_eagle():
             if self.model_runner.is_draft_worker:
                 self.num_tokens_per_bs = (
@@ -163,16 +172,6 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
 
-        self.compile_bs = (
-            [
-                bs
-                for bs in self.capture_bs
-                if bs <= self.model_runner.server_args.torch_compile_max_bs
-            ]
-            if self.use_torch_compile
-            else []
-        )
-
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
@@ -180,7 +179,6 @@ class CudaGraphRunner:
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
 
@@ -189,14 +187,14 @@ class CudaGraphRunner:
 
         # Common inputs
         with torch.device("cuda"):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int32)
+            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
+            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
+            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
 
             # Speculative_inference
             if model_runner.spec_algorithm.is_eagle():
@@ -216,7 +214,7 @@ class CudaGraphRunner:
             if self.enable_dp_attention:
                 self.gathered_buffer = torch.zeros(
                     (
-                        self.max_bs * self.tp_size,
+                        self.max_bs * self.dp_size,
                         self.model_runner.model_config.hidden_size,
                     ),
                     dtype=self.model_runner.dtype,
@@ -322,6 +320,8 @@ class CudaGraphRunner:
             global_num_tokens = None
             gathered_buffer = None
 
+        spec_info = self.get_spec_info(num_tokens, positions)
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -338,10 +338,13 @@ class CudaGraphRunner:
             top_logprobs_nums=[0] * bs,
             positions=positions,
             global_num_tokens=global_num_tokens,
-            mrope_positions=mrope_positions,
             gathered_buffer=gathered_buffer,
+            mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=self.get_spec_info(num_tokens, positions),
+            spec_info=spec_info,
+            capture_hidden_mode=(
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            ),
         )
 
         # Attention backend
@@ -446,10 +449,10 @@ class CudaGraphRunner:
 
             if self.model_runner.is_draft_worker:
                 spec_info = EAGLEDraftInput()
+                spec_info.load_server_args(self.model_runner.server_args)
                 spec_info.hidden_states = self.hidden_states[:num_tokens]
                 spec_info.positions = positions
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
-                spec_info.init(self.model_runner.server_args)
             else:
                 spec_info = EagleVerifyInput(
                     None,

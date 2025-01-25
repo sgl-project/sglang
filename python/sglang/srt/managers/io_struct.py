@@ -19,9 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
-
-import torch
+from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -61,6 +59,9 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
+
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # LoRA related
@@ -68,6 +69,10 @@ class GenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -182,6 +187,13 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
+            if self.custom_logit_processor is None:
+                self.custom_logit_processor = [None] * num
+            elif not isinstance(self.custom_logit_processor, list):
+                self.custom_logit_processor = [self.custom_logit_processor] * num
+            else:
+                assert self.parallel_sample_num == 1
+
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
@@ -198,8 +210,14 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
+            log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            custom_logit_processor=(
+                self.custom_logit_processor[i]
+                if self.custom_logit_processor is not None
+                else None
+            ),
         )
 
 
@@ -232,6 +250,11 @@ class TokenizedGenerateReqInput:
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[str] = None
+
 
 @dataclass
 class EmbeddingReqInput:
@@ -245,6 +268,8 @@ class EmbeddingReqInput:
     sampling_params: Union[List[Dict], Dict] = None
     # Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -323,9 +348,7 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when --return-token-ids` is set
-    origin_input_ids: Optional[List[int]]
-    # Only used when `--skip-tokenizer-init` or `--return-token-ids` is set
+    # Only used when `--skip-tokenizer-init` is on
     output_ids: Optional[List[int]]
     # Detokenization configs
     skip_special_tokens: List[bool]
@@ -344,7 +367,6 @@ class BatchTokenIDOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    normalized_prompt_logprob: List[float]
 
 
 @dataclass
@@ -356,14 +378,7 @@ class BatchStrOut:
     # The output decoded strings
     output_strs: List[str]
 
-    # The token ids
-    origin_input_ids: Optional[List[int]]
-    output_ids: Optional[List[int]]
-
     # Token counts
-    # real input and output tokens can be get from
-    # origin_input_ids and output_ids by enabling --return_token_ids
-    # TODO (Shuai): Rename this to clarify the meaning.
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
@@ -377,7 +392,6 @@ class BatchStrOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    normalized_prompt_logprob: List[float]
 
 
 @dataclass
@@ -469,6 +483,26 @@ class GetWeightsByNameReqOutput:
 
 
 @dataclass
+class ReleaseMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ReleaseMemoryOccupationReqOutput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqOutput:
+    pass
+
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str
@@ -477,6 +511,14 @@ class AbortReq:
 class ProfileReq(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+
+
+@dataclass
+class ConfigureLoggingReq:
+    log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
 
 
 @dataclass

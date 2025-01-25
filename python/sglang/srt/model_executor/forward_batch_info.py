@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import maybe_torch_compile
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
@@ -105,6 +105,24 @@ class ForwardMode(IntEnum):
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
+
+    def is_decode_or_idle(self):
+        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+
+
+class CaptureHiddenMode(IntEnum):
+    NULL = auto()
+    FULL = auto()
+    LAST = auto()
+
+    def need_capture(self):
+        return self != CaptureHiddenMode.NULL
+
+    def is_full(self):
+        return self == CaptureHiddenMode.FULL
+
+    def is_last(self):
+        return self == CaptureHiddenMode.LAST
 
 
 @dataclass
@@ -174,6 +192,7 @@ class ForwardBatch:
     # Speculative decoding
     spec_info: SpecInfo = None
     spec_algorithm: SpeculativeAlgorithm = None
+    capture_hidden_mode: CaptureHiddenMode = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -263,8 +282,12 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            attn_backend=model_runner.attn_backend,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
+            capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
         )
 
@@ -315,11 +338,6 @@ class ForwardBatch:
 
         if model_runner.model_is_mrope:
             ret.compute_mrope_positions(model_runner, batch)
-
-        # Init attention information
-        ret.req_to_token_pool = model_runner.req_to_token_pool
-        ret.token_to_kv_pool = model_runner.token_to_kv_pool
-        ret.attn_backend = model_runner.attn_backend
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
@@ -397,21 +415,6 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@maybe_torch_compile(dynamic=True)
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
-
-
-class CaptureHiddenMode(IntEnum):
-    NULL = auto()
-    FULL = auto()
-    LAST = auto()
-
-    def need_capture(self):
-        return self != CaptureHiddenMode.NULL
-
-    def is_full(self):
-        return self == CaptureHiddenMode.FULL
-
-    def is_last(self):
-        return self == CaptureHiddenMode.LAST

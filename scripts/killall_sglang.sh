@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Check if sudo is available
+if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y lsof
+else
+    apt-get update
+    apt-get install -y lsof
+fi
+
 # Show current GPU status
 nvidia-smi
 
@@ -7,6 +16,7 @@ nvidia-smi
 kill -9 $(ps aux | grep 'sglang::' | grep -v 'grep' | awk '{print $2}') 2>/dev/null
 kill -9 $(ps aux | grep 'sglang.launch_server' | grep -v 'grep' | awk '{print $2}') 2>/dev/null
 kill -9 $(ps aux | grep 'sglang.bench' | grep -v 'grep' | awk '{print $2}') 2>/dev/null
+kill -9 $(ps aux | grep 'sglang.data_parallel' | grep -v 'grep' | awk '{print $2}') 2>/dev/null
 
 # Clean all GPU processes if any argument is provided
 if [ $# -gt 0 ]; then

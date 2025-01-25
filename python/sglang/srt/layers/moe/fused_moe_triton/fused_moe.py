@@ -15,15 +15,18 @@ from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
+from sglang.srt.utils import (
+    direct_register_custom_op,
+    get_device_name,
+    is_cuda_available,
+    is_hip,
+)
 
-is_hip_flag = False
-if not is_hip():
+is_cuda = is_cuda_available()
+is_hip_flag = is_hip()
+if is_cuda:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
-    is_hip_flag = False
-else:
-    is_hip_flag = True
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
@@ -1011,11 +1014,22 @@ def fused_experts_impl(
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
-            torch.sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                dim=1,
-                out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
+            if topk_ids.shape[1] == 1:
+                out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(
+                    intermediate_cache3[:, 0]
+                )
+            elif topk_ids.shape[1] == 2:
+                torch.add(
+                    intermediate_cache3[:, 0],
+                    intermediate_cache3[:, 1],
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                ).squeeze(dim=1)
+            elif topk_ids.shape[1] > 2:
+                torch.sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    dim=1,
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
 
     return out_hidden_states
 

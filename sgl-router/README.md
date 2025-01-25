@@ -4,7 +4,7 @@ SGLang router is a standalone module implemented in Rust to achieve data paralle
 
 ## User docs
 
-Please check https://sgl-project.github.io/router/router.html
+Please check https://docs.sglang.ai/router/router.html
 
 ## Developer docs
 
@@ -66,6 +66,16 @@ $ pip install -e .
 ```
 
 **Note:** When modifying Rust code, you must rebuild the wheel for changes to take effect.
+
+### Troubleshooting
+
+1. If rust analyzer is not working in VSCode, set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml` in your repo. For example:
+
+```json
+{
+  "rust-analyzer.linkedProjects":  ["/workspaces/sglang/sgl-router/Cargo.toml"]
+}
+```
 
 ### CI/CD Setup
 

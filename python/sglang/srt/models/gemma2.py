@@ -15,13 +15,13 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
@@ -32,6 +32,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -42,23 +43,6 @@ from sglang.srt.utils import make_layers
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
-
-
-# FIXME: temporary solution, remove after next vllm release
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
-
-
-class GemmaRotaryEmbedding(RotaryEmbedding):
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
-        # https://github.com/huggingface/transformers/blob/v4.41.2/src/transformers/models/gemma/modeling_gemma.py#L107
-        inv_freq = 1.0 / (
-            base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.int64).float()
-                / self.rotary_dim
-            )
-        )
-        return inv_freq
 
 
 class Gemma2MLP(nn.Module):
@@ -143,14 +127,12 @@ class Gemma2Attention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
         )
-        # from vLLM: TODO(woosuk): Use the `get_rope` interface.
-        self.rotary_emb = GemmaRotaryEmbedding(
+        self.rotary_emb = get_rope(
             self.head_dim,
-            self.head_dim,
-            max_position_embeddings,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
             base=self.rope_theta,
             is_neox_style=True,
-            dtype=torch.get_default_dtype(),
         )
 
         use_sliding_window = layer_id % 2 == 0 and hasattr(config, "sliding_window")
