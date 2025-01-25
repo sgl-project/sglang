@@ -38,6 +38,8 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
+operator_namespace = "sgl_kernels"
+
 cutlass = root / "3rdparty" / "cutlass" 
 flashinfer = root / "3rdparty" / "flashinfer"
 include_dirs = [
@@ -53,6 +55,7 @@ include_dirs = [
 ]
 nvcc_flags = [
     "-DNDEBUG",
+    f"-DOPERATOR_NAMESPACE={operator_namespace}",
     "-O3",
     "-Xcompiler",
     "-fPIC",
@@ -130,12 +133,12 @@ for flag in [
         pass
 
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda"]
+libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
     CUDAExtension(
-        name="sgl_kernel.ops._kernels",
+        name="sgl_kernel.ops._kernel",
         sources=sources,
         include_dirs=include_dirs,
         extra_compile_args={
