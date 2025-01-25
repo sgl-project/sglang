@@ -14,8 +14,6 @@
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
-import copy
-import dataclasses
 import logging
 import os
 import pickle
@@ -25,19 +23,16 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
+from typing import Awaitable, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.managers.generation_manager import GenerationManager
 from sglang.srt.managers.io_struct import (
-    AbortReq,
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
@@ -57,7 +52,6 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
-    TokenizedEmbeddingReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -65,10 +59,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    dataclass_to_string_truncated,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -429,9 +421,6 @@ class TokenizerManager:
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
-
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
-        TODO_moved
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         self.dump_request_list.append(
