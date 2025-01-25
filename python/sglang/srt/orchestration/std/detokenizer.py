@@ -1,10 +1,12 @@
 import logging
 
+import psutil
+import setproctitle
 import zmq
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.io_struct import BatchTokenIDOut, BatchEmbeddingOut
-from sglang.srt.server_args import PortArgs
-from sglang.srt.utils import get_zmq_socket
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import get_zmq_socket, configure_logger
 from sglang.utils import TypeBasedDispatcher
 
 logger = logging.getLogger(__name__)
@@ -34,3 +36,20 @@ class DetokenizerManagerCommunicator:
         recv_obj = self._recv_from_scheduler.recv_pyobj()
         output_obj = self._request_dispatcher(recv_obj)
         self._send_to_tokenizer.send_pyobj(output_obj)
+
+
+def run_detokenizer_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+):
+    setproctitle.setproctitle("sglang::detokenizer")
+    configure_logger(server_args)
+    parent_process = psutil.Process().parent()
+
+    try:
+        manager = DetokenizerManager(server_args, port_args)
+        manager.event_loop()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)
