@@ -87,6 +87,8 @@ sources = [
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
+    "3rdparty/turbomind/src/turbomind/api/python/bind.cpp",
+    "3rdparty/turbomind/src/turbomind/api/python/linear.cc",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
@@ -126,7 +128,13 @@ for flag in [
 
 cxx_flags = ["-O3"]
 libraries = ["c10", "torch", "torch_python", "cuda"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
+extra_link_args = [
+    "-Wl,-rpath,$ORIGIN/../../torch/lib",
+    "-L/usr/lib/x86_64-linux-gnu",
+    f"{str(root)}/3rdparty/turbomind/build/lib/libgemm2.a",
+    f"{str(root)}/3rdparty/turbomind/build/lib/libparser.a",
+]
+print("extra_link_args: ", extra_link_args)
 
 ext_modules = [
     CUDAExtension(
@@ -147,7 +155,6 @@ setup(
     version=_get_version(),
     packages=find_packages(),
     package_dir={"": "src"},
-    include_package_data=True,
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )
