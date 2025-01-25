@@ -63,11 +63,7 @@ class GenerationManager:
 
         obj.normalize_batch_and_arguments()
 
-        if self.server_args.log_requests:
-            max_length = 2048 if self.log_requests_level == 0 else 1 << 30
-            logger.info(
-                f"Receive: obj={dataclass_to_string_truncated(obj, max_length)}"
-            )
+        self.request_logger.log_generate(obj)
 
         is_single = obj.is_single
         if is_single:
@@ -113,10 +109,7 @@ class GenerationManager:
 
             state.out_list = []
             if state.finished:
-                if self.server_args.log_requests:
-                    max_length = 2048 if self.log_requests_level == 0 else 1 << 30
-                    msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length)}, out={dataclass_to_string_truncated(out, max_length)}"
-                    logger.info(msg)
+                self.request_logger.log_response(obj, out)
                 del self.rid_to_state[obj.rid]
 
                 # Check if this was an abort/error created by scheduler
@@ -588,6 +581,19 @@ class _RequestLogger:
     def __init__(self, server_args: ServerArgs):
         self.log_requests = server_args.log_requests
         self.log_requests_level = 0
+
+    def log_generate(self, obj):
+        if self.log_requests:
+            max_length = 2048 if self.log_requests_level == 0 else 1 << 30
+            logger.info(
+                f"Receive: obj={dataclass_to_string_truncated(obj, max_length)}"
+            )
+
+    def log_response(self, obj, out):
+        if self.log_requests:
+            max_length = 2048 if self.log_requests_level == 0 else 1 << 30
+            msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length)}, out={dataclass_to_string_truncated(out, max_length)}"
+            logger.info(msg)
 
 
 class _RequestDumper:
