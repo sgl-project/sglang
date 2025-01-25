@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, Union
 
+import sgl_kernel.turbomind._turbomind_ext as turbomind
 import torch
 from sgl_kernel.ops._kernels import all_reduce as _all_reduce
 from sgl_kernel.ops._kernels import bmm_fp8 as _bmm_fp8

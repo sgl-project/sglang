@@ -21,8 +21,8 @@ from sgl_kernel.ops import (
     top_k_renorm_prob,
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
+    turbomind,
 )
-from sgl_kernel.turbomind import turbomind
 
 __all__ = [
     "bmm_fp8",
