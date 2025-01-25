@@ -86,7 +86,7 @@ class GenerationManager:
         created_time: Optional[float] = None,
     ):
         event = asyncio.Event()
-        state = _ReqState([], False, event, obj, created_time=created_time)
+        state = _ReqState([], False, event, obj, metric=_MetricReqState(created_time=created_time))
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
@@ -219,7 +219,7 @@ class GenerationManager:
     def _handle_batch_output(
         self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
     ):
-        for i, rid in enumerate(recv_obj.rids):
+        for index, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 continue
@@ -229,11 +229,18 @@ class GenerationManager:
             )
 
             state.out_list.append(out_dict)
-            state.finished = recv_obj.finished_reasons[i] is not None
+            state.finished = recv_obj.finished_reasons[index] is not None
             state.event.set()
 
-            if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i)
+            if self._metric_manager:
+                self._metric_manager.handle_batch_output_metrics(
+                    recv_obj,
+                    index,
+                    state.metric,
+                    finished=state.finished,
+                    stream=state.obj.stream if hasattr(state.obj, "stream") else None,
+                )
+
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
 
@@ -584,6 +591,8 @@ class _ReqState:
     finished: bool
     event: asyncio.Event
     obj: Any
+
+    metric: "_MetricReqState"
 
     # For streaming output
     last_output_offset: int = 0
