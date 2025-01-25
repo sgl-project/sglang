@@ -49,7 +49,7 @@ class _MetricManager:
                     (time.time() - state.first_token_time) / (completion_tokens - 1)
                 )
 
-        if state.finished:
+        if finished:
             self.metrics_collector.observe_one_finished_request(
                 recv_obj.prompt_tokens[i], completion_tokens
             )
@@ -57,11 +57,7 @@ class _MetricManager:
                 time.time() - state.created_time
             )
             # Compute time_per_output_token for the non-streaming case
-            if (
-                hasattr(state.obj, "stream")
-                and not state.obj.stream
-                and completion_tokens >= 1
-            ):
+            if stream is not None and not stream and completion_tokens >= 1:
                 self.metrics_collector.observe_time_per_output_token(
                     (time.time() - state.created_time) / completion_tokens
                 )
