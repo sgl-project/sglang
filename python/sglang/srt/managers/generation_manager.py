@@ -50,8 +50,6 @@ class GenerationManager:
     ):
         created_time = time.time()
 
-        self.auto_create_handle_loop()
-
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
@@ -66,18 +64,17 @@ class GenerationManager:
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length)}"
             )
 
-        async with self.model_update_lock.reader_lock:
-            is_single = obj.is_single
-            if is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
-                self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, request):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(
-                    obj, request, created_time
-                ):
-                    yield response
+        is_single = obj.is_single
+        if is_single:
+            tokenized_obj = await self._tokenize_one_request(obj)
+            self._send_one_request(obj, tokenized_obj, created_time)
+            async for response in self._wait_one_response(obj, request):
+                yield response
+        else:
+            async for response in self._handle_batch_request(
+                obj, request, created_time
+            ):
+                yield response
 
     def _send_one_request(
         self,

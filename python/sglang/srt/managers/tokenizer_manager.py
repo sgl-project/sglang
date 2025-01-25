@@ -201,7 +201,10 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        TODO_moved_to_generate
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.reader_lock:
+            async for value in self._generation_manager.generate(obj, request):
+                yield value
 
     def flush_cache(self):
         req = FlushCacheReq()
