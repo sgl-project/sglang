@@ -43,7 +43,7 @@ from sglang.srt.utils import (
 )
 from sglang.version import __version__
 
-def _launch_subprocesses(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
+def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
     """
     Launch the StdOrchestrator in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """

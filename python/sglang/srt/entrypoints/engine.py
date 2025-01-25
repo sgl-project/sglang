@@ -25,6 +25,8 @@ import os
 import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
+from sglang.srt.orchestration.std.launcher import launch
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -85,7 +87,7 @@ class Engine:
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        orchestrator, scheduler_info = _launch_subprocesses(server_args=server_args)
+        orchestrator, scheduler_info = launch(server_args=server_args)
         self.orchestrator = orchestrator
         self.scheduler_info = scheduler_info
 

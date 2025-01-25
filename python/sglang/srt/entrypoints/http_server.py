@@ -27,6 +27,8 @@ import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, Optional
 
+from sglang.srt.orchestration.std.launcher import launch
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -38,7 +40,6 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -227,7 +228,7 @@ async def flush_cache():
     _global_state.orchestrator.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -462,7 +463,7 @@ def launch_server(
     1. The HTTP server, Engine, and StdOrchestrator both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-    orchestrator, scheduler_info = _launch_subprocesses(server_args=server_args)
+    orchestrator, scheduler_info = launch(server_args=server_args)
     set_global_state(
         _GlobalState(
             orchestrator=orchestrator,
