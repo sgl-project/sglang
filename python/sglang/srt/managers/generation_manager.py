@@ -1,16 +1,23 @@
 import asyncio
+import copy
 import dataclasses
+import logging
 import os
 import time
+from http import HTTPStatus
 from typing import Optional, List, Any, Union, Dict, Callable
 
+import fastapi
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import get_dummy_image_processor, get_image_processor
 from sglang.srt.managers.io_struct import GenerateReqInput, EmbeddingReqInput, SessionParams, TokenizedGenerateReqInput, \
-    TokenizedEmbeddingReqInput, BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut
+    TokenizedEmbeddingReqInput, BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, AbortReq
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import dataclass_to_string_truncated
+
+logger = logging.getLogger(__name__)
 
 
 class GenerationManager:
@@ -78,7 +85,7 @@ class GenerationManager:
         created_time: Optional[float] = None,
     ):
         event = asyncio.Event()
-        state = ReqState([], False, event, obj, created_time=created_time)
+        state = _ReqState([], False, event, obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
