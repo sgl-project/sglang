@@ -3,9 +3,11 @@ import copy
 import dataclasses
 import logging
 import os
+import pickle
 import time
+from datetime import datetime
 from http import HTTPStatus
-from typing import Optional, List, Any, Union, Dict, Callable
+from typing import Optional, List, Any, Union, Dict, Callable, Tuple
 
 import fastapi
 from sglang.srt.configs.model_config import ModelConfig
@@ -578,6 +580,36 @@ class _MetricManager:
                 self.metrics_collector.observe_time_per_output_token(
                     (time.time() - state.created_time) / completion_tokens
                 )
+
+
+class _RequestDumper:
+    def __init__(self):
+        self.dump_requests_folder = ""  # By default do not dump
+        self.dump_requests_threshold = 1000
+        self.dump_request_list: List[Tuple] = []
+
+    def dump_requests(self, state: '_ReqState', out_dict: dict):
+        self.dump_request_list.append(
+            (state.obj, out_dict, state.created_time, time.time())
+        )
+
+        if len(self.dump_request_list) >= self.dump_requests_threshold:
+            filename = os.path.join(
+                self.dump_requests_folder,
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
+            )
+            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
+
+            to_dump = self.dump_request_list
+            self.dump_request_list = []
+
+            def background_task():
+                os.makedirs(self.dump_requests_folder, exist_ok=True)
+                with open(filename, "wb") as f:
+                    pickle.dump(to_dump, f)
+
+            # Schedule the task to run in the background without awaiting it
+            asyncio.create_task(asyncio.to_thread(background_task))
 
 
 @dataclasses.dataclass

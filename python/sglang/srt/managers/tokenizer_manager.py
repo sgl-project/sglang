@@ -16,13 +16,10 @@
 import asyncio
 import logging
 import os
-import pickle
 import signal
 import sys
 import threading
-import time
 import uuid
-from datetime import datetime
 from typing import Awaitable, Generic, List, Optional, Tuple, TypeVar, Union
 
 import fastapi
@@ -105,9 +102,6 @@ class TokenizerManager:
 
         # Store states
         self.no_create_loop = False
-        self.dump_requests_folder = ""  # By default do not dump
-        self.dump_requests_threshold = 1000
-        self.dump_request_list: List[Tuple] = []
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
@@ -421,29 +415,6 @@ class TokenizerManager:
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
-
-    def dump_requests(self, state: ReqState, out_dict: dict):
-        self.dump_request_list.append(
-            (state.obj, out_dict, state.created_time, time.time())
-        )
-
-        if len(self.dump_request_list) >= self.dump_requests_threshold:
-            filename = os.path.join(
-                self.dump_requests_folder,
-                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
-            )
-            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
-
-            to_dump = self.dump_request_list
-            self.dump_request_list = []
-
-            def background_task():
-                os.makedirs(self.dump_requests_folder, exist_ok=True)
-                with open(filename, "wb") as f:
-                    pickle.dump(to_dump, f)
-
-            # Schedule the task to run in the background without awaiting it
-            asyncio.create_task(asyncio.to_thread(background_task))
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
