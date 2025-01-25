@@ -131,7 +131,6 @@ class TokenizerManager:
 
         # Store states
         self.no_create_loop = False
-        self.rid_to_state: Dict[str, ReqState] = {}
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
@@ -168,10 +167,6 @@ class TokenizerManager:
         )
         # Set after scheduler is initialized
         self.max_req_input_len = None
-
-        # Metrics
-        if self.enable_metrics:
-            TODO_moved
 
         self._result_dispatcher = TypeBasedDispatcher(
             [

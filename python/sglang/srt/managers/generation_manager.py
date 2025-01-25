@@ -2,7 +2,7 @@ import asyncio
 import dataclasses
 import os
 import time
-from typing import Optional, List, Any, Union, Dict
+from typing import Optional, List, Any, Union, Dict, Callable
 
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import get_dummy_image_processor, get_image_processor
@@ -14,7 +14,26 @@ from sglang.srt.server_args import ServerArgs
 
 
 class GenerationManager:
-    pass
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        on_request: Callable,
+    ):
+        self.server_args = server_args
+        self.on_request = on_request
+
+        self.model_config = _compute_model_config(server_args)
+        self._generation_converter = GenerationConverter(server_args=server_args)
+
+        self.rid_to_state: Dict[str, _ReqState] = {}
+
+        # Metrics
+        if server_args.enable_metrics:
+            self._metric_manager = _MetricManager(
+                server_args=server_args,
+            )
+        else:
+            self._metric_manager = None
 
 
 class GenerationConverter:
