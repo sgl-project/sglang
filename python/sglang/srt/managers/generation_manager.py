@@ -217,7 +217,7 @@ class GenerationManager:
                     except StopAsyncIteration:
                         pass
 
-    def _handle_batch_output(
+    def handle_batch_output(
         self, recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut]
     ):
         for index, rid in enumerate(recv_obj.rids):

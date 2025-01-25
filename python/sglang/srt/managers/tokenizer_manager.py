@@ -145,7 +145,7 @@ class TokenizerManager:
             [
                 (
                     (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut),
-                    self._handle_batch_output,
+                    self._generation_manager.handle_batch_output,
                 ),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
