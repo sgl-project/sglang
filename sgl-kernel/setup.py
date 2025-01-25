@@ -39,9 +39,10 @@ def _get_version():
 
 
 operator_namespace = "sgl_kernels"
-
-cutlass = root / "3rdparty" / "cutlass" 
+cutlass_default = root / "3rdparty" / "cutlass"
+cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
+turbomind = root / "3rdparty" / "turbomind"
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
@@ -52,6 +53,8 @@ include_dirs = [
     flashinfer.resolve() / "csrc",
     "cublas",
     "cublasLt",
+    turbomind.resolve(),
+    turbomind.resolve() / "src",
 ]
 nvcc_flags = [
     "-DNDEBUG",
@@ -67,6 +70,11 @@ nvcc_flags = [
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
 ]
+nvcc_flags_fp8 = [
+    "-DFLASHINFER_ENABLE_FP8",
+    "-DFLASHINFER_ENABLE_FP8_E4M3",
+    "-DFLASHINFER_ENABLE_FP8_E5M2",
+]
 
 sources = [
     "src/sgl-kernel/torch_extension.cc",
@@ -76,7 +84,8 @@ sources = [
     "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
-    "src/sgl-kernel/csrc/rotary_embedding.cu",
+    "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
+    "src/sgl-kernel/csrc/fused_add_rms_norm.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/group_gemm.cu",
@@ -96,13 +105,7 @@ if torch.cuda.is_available():
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
         sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
     if sm_version >= 90:
-        nvcc_flags.extend(
-            [
-                "-DFLASHINFER_ENABLE_FP8",
-                "-DFLASHINFER_ENABLE_FP8_E4M3",
-                "-DFLASHINFER_ENABLE_FP8_E5M2",
-            ]
-        )
+        nvcc_flags.extend(nvcc_flags_fp8)
     if sm_version >= 80:
         nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
 else:
@@ -111,13 +114,7 @@ else:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
         sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
     if enable_fp8:
-        nvcc_flags.extend(
-            [
-                "-DFLASHINFER_ENABLE_FP8",
-                "-DFLASHINFER_ENABLE_FP8_E4M3",
-                "-DFLASHINFER_ENABLE_FP8_E5M2",
-            ]
-        )
+        nvcc_flags.extend(nvcc_flags_fp8)
     if enable_bf16:
         nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
 
@@ -138,7 +135,7 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linu
 
 ext_modules = [
     CUDAExtension(
-        name="sgl_kernel.ops._kernel",
+        name="sgl_kernel.ops._kernels",
         sources=sources,
         include_dirs=include_dirs,
         extra_compile_args={

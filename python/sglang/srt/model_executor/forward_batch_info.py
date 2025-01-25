@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import maybe_torch_compile
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
@@ -415,6 +415,6 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@maybe_torch_compile(dynamic=True)
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)

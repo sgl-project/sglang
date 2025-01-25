@@ -92,4 +92,4 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
     m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
 }
 
-REGISTER_EXTENSION(_kernel)
+REGISTER_EXTENSION(_kernels)

@@ -2,8 +2,13 @@ from typing import Optional, Tuple, Union
 
 import torch
 import os
-import sgl_kernel.ops._kernel
+import sgl_kernel.ops._kernels
 
+from sgl_kernel.ops.utils import (
+    _get_cache_buf,
+    _get_cuda_stream,
+    _to_tensor_scalar_tuple,
+)
 from sgl_kernel.ops.utils import (
     _get_cache_buf,
     _get_cuda_stream,
