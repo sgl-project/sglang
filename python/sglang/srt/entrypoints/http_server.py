@@ -95,7 +95,7 @@ app.add_middleware(
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: TokenizerManager
+    tokenizer_manager: StdOrchestrator
     scheduler_info: Dict
 
 
@@ -456,12 +456,12 @@ def launch_server(
 
     - HTTP server: A FastAPI server that routes requests to the engine.
     - The engine consists of three components:
-        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        1. StdOrchestrator: Tokenizes the requests and sends them to the scheduler.
         2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
+    1. The HTTP server, Engine, and StdOrchestrator both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)

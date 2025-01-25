@@ -73,12 +73,12 @@ class Engine:
     The entry point to the inference engine.
 
     - The engine consists of three components:
-        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        1. StdOrchestrator: Tokenizes the requests and sends them to the scheduler.
         2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
+    1. The HTTP server, Engine, and StdOrchestrator both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
 
@@ -337,9 +337,9 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dict]:
+def _launch_subprocesses(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
     """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    Launch the StdOrchestrator in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
     # Configure global environment
     configure_logger(server_args)
@@ -420,7 +420,7 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
     detoken_proc.start()
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    tokenizer_manager = StdOrchestrator(server_args, port_args)
     if server_args.chat_template:
         load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
