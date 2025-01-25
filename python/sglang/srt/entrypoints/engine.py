@@ -48,7 +48,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter

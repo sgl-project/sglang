@@ -52,7 +52,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.openai_api.adapter import (
     v1_batches,
