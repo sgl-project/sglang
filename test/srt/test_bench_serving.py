@@ -49,7 +49,7 @@ class TestBenchServing(unittest.TestCase):
             )
             # There is a regression with torch 2.5
             # This number was 950 for torch 2.4
-            self.assertGreater(res["output_throughput"], 850)
+            self.assertGreater(res["output_throughput"], 1000)
 
     def test_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -114,7 +114,7 @@ class TestBenchServing(unittest.TestCase):
                 f"### test_offline_throughput_default_fp8\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3850)
+            self.assertGreater(res["output_throughput"], 3900)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
@@ -129,7 +129,7 @@ class TestBenchServing(unittest.TestCase):
                 f"### test_online_latency_default\n"
                 f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
-            self.assertLess(res["median_e2e_latency_ms"], 12000)
+            self.assertLess(res["median_e2e_latency_ms"], 11000)
             self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
@@ -161,7 +161,7 @@ class TestBenchServing(unittest.TestCase):
                 f"### test_online_latency_eagle\n"
                 f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
-            self.assertLess(res["median_e2e_latency_ms"], 10000)
+            self.assertLess(res["median_e2e_latency_ms"], 450)
 
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(
@@ -176,7 +176,7 @@ class TestBenchServing(unittest.TestCase):
                 f"### test_moe_offline_throughput_default\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 2150)
+            self.assertGreater(res["output_throughput"], 2200)
 
     def test_moe_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -191,7 +191,7 @@ class TestBenchServing(unittest.TestCase):
                 f"### test_moe_offline_throughput_without_radix_cache\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 2150)
+            self.assertGreater(res["output_throughput"], 2200)
 
 
 if __name__ == "__main__":
