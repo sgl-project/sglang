@@ -660,23 +660,22 @@ class Scheduler:
                 self.waiting_queue.append(req)
                 return
 
-        # Copy more attributes
-        req.logprob_start_len = recv_req.logprob_start_len
-
-        if req.logprob_start_len == -1:
-            # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-
         # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
         )
-
         if error_msg:
             self.waiting_queue.append(req)
             return
+
+        # Copy more attributes
+        if recv_req.logprob_start_len == -1:
+            # By default, only return the logprobs for output tokens
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+        else:
+            req.logprob_start_len = recv_req.logprob_start_len
 
         req.sampling_params.max_new_tokens = min(
             (
@@ -725,12 +724,17 @@ class Scheduler:
         req.tokenizer = self.tokenizer
 
         # Validate prompts length
-        validate_input_length(
+        error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
         )
+        if error_msg:
+            self.waiting_queue.append(req)
+            return
 
+        # Copy more attributes
+        req.logprob_start_len = len(req.origin_input_ids) - 1
         self.waiting_queue.append(req)
 
     def log_prefill_stats(self, adder, can_run_list, running_bs, has_being_chunked):
@@ -1044,26 +1048,23 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            if batch.forward_mode.is_decode_or_idle() or batch.extend_num_tokens != 0:
-                if self.spec_algorithm.is_none():
-                    model_worker_batch = batch.get_model_worker_batch()
-                    logits_output, next_token_ids = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                else:
-                    (
-                        logits_output,
-                        next_token_ids,
-                        model_worker_batch,
-                        num_accepted_tokens,
-                    ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                    self.spec_num_total_accepted_tokens += (
-                        num_accepted_tokens + batch.batch_size()
-                    )
-                    self.spec_num_total_forward_ct += batch.batch_size()
-                    self.num_generated_tokens += num_accepted_tokens
+            if self.spec_algorithm.is_none():
+                model_worker_batch = batch.get_model_worker_batch()
+                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                    model_worker_batch
+                )
             else:
-                assert False, "batch.extend_num_tokens == 0, this is unexpected!"
+                (
+                    logits_output,
+                    next_token_ids,
+                    model_worker_batch,
+                    num_accepted_tokens,
+                ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                self.spec_num_total_accepted_tokens += (
+                    num_accepted_tokens + batch.batch_size()
+                )
+                self.spec_num_total_forward_ct += batch.batch_size()
+                self.num_generated_tokens += num_accepted_tokens
             batch.output_ids = next_token_ids
 
             ret = GenerationBatchResult(
@@ -1072,7 +1073,6 @@ class Scheduler:
                 bid=model_worker_batch.bid,
             )
         else:  # embedding or reward model
-            assert batch.extend_num_tokens != 0
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(
