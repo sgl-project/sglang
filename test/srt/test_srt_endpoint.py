@@ -5,6 +5,7 @@ python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_logprob_with_chunked_
 
 import json
 import random
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -317,18 +318,39 @@ class TestSRTEndpoint(unittest.TestCase):
         """Test custom logit processor with a single request."""
         self.run_custom_logit_processor(target_token_id=5)
 
-    def test_custom_logit_processor_batch(self):
-        """Test custom logit processor with a batch of requests."""
-        target_token_ids = list(range(32))
-        with ThreadPoolExecutor(len(target_token_ids)) as executor:
-            list(executor.map(self.run_custom_logit_processor, target_token_ids))
-
     def test_custom_logit_processor_batch_mixed(self):
         """Test a batch of requests mixed of requests with and without custom logit processor."""
         target_token_ids = list(range(32)) + [None] * 16
         random.shuffle(target_token_ids)
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
+
+    def test_cache_tokens(self):
+        for _ in range(5):
+            response = requests.post(self.base_url + "/flush_cache")
+            if response.status_code == 200:
+                break
+            time.sleep(1)
+        assert response.status_code == 200
+
+        def send_and_check_cached_tokens(input_ids):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": list(input_ids),
+                    "sampling_params": {
+                        "max_new_tokens": 1,
+                    },
+                },
+            )
+            response_json = response.json()
+            return response_json["meta_info"]["cached_tokens"]
+
+        self.assertEqual(send_and_check_cached_tokens(range(0, 100)), 0)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 100)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 9999)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 1000)), 999)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 11000)), 10000)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")
