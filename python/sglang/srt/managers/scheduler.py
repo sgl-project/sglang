@@ -1046,7 +1046,6 @@ class Scheduler:
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
-        assert batch.extend_num_tokens != 0
 
         if self.is_generation:
             if self.spec_algorithm.is_none():
