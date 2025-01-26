@@ -43,8 +43,6 @@ jobs:
 
       - name: Run test
         timeout-minutes: 10
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           cd test/lang
           python3 run_suite.py --suite per-commit
