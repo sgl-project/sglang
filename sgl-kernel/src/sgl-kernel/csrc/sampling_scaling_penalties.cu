@@ -1,7 +1,6 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <pytorch_extension_utils.h>
 
 #include <THC/THCAtomics.cuh>
 #include <flashinfer/vec_dtypes.cuh>
@@ -49,7 +48,7 @@ torch::Tensor sampling_scaling_penalties(const torch::Tensor& logits, const torc
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(logits.scalar_type(), scalar_t, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(logits.scalar_type(), scalar_t, [&] {
     uint32_t vec_size = 16 / sizeof(scalar_t);
     const int blocks = (numel + threads * vec_size - 1) / (threads * vec_size);
     sampling_scaling_penalties_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
