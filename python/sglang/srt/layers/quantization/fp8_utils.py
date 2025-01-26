@@ -2,19 +2,21 @@ from typing import List, Optional, Tuple
 
 import torch
 from packaging.version import Version
-from sgl_kernel import fp8_scaled_mm
 
-from sglang.srt.layers.parameter import RowvLLMParameter, _ColumnvLLMParameter
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    static_quant_fp8,
-    w8a8_block_fp8_matmul,
-)
 from sglang.srt.utils import (
     get_device_capability,
     get_nvcc_cuda_version,
     is_cuda,
     is_hip,
+)
+
+if is_cuda():
+    from sgl_kernel import fp8_scaled_mm
+
+from sglang.srt.layers.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    static_quant_fp8,
+    w8a8_block_fp8_matmul,
 )
 
 is_hip_ = is_hip()
