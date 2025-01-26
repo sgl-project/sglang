@@ -1,11 +1,10 @@
 #pragma once
+
 #include <cuda_runtime.h>
 #include <pytorch_extension_utils.h>
 #include <torch/extension.h>
 
 #include <sstream>
-
-#include "sgl_kernels_ops.h"
 
 struct cuda_error : public std::runtime_error {
   /**

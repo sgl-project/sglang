@@ -5,6 +5,7 @@
 #include <cassert>
 
 #include "trt_reduce_internal.cuh"
+#include "utils.h"
 
 using namespace trt_llm;
 

@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import base64
+import ctypes
 import dataclasses
 import io
 import ipaddress
@@ -29,6 +30,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import warnings
@@ -59,7 +61,6 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
-from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -1304,7 +1305,33 @@ def nullable_str(val: str):
     return val
 
 
+def pyspy_dump_schedulers():
+    """py-spy dump on all scheduler in a local node."""
+    try:
+        pid = psutil.Process().pid
+        # Command to run py-spy with the PID
+        cmd = f"py-spy dump --pid {pid}"
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, check=True
+        )
+        logger.info(f"Profile for PID {pid}:\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logger.info(f"Failed to profile PID {pid}. Error: {e.stderr}")
+
+
+def kill_itself_when_parent_died():
+    if sys.platform == "linux":
+        # sigkill this process when parent worker manager dies
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    else:
+        logger.warninig("kill_itself_when_parent_died is only supported in linux.")
+
+
 def set_uvicorn_logging_configs():
+    from uvicorn.config import LOGGING_CONFIG
+
     LOGGING_CONFIG["formatters"]["default"][
         "fmt"
     ] = "[%(asctime)s] %(levelprefix)s %(message)s"
@@ -1387,3 +1414,28 @@ def rank0_print(msg: str):
 
     if get_tensor_model_parallel_rank() == 0:
         print(msg, flush=True)
+
+
+def launch_dummy_health_check_server(host, port):
+    import uvicorn
+    from fastapi import FastAPI, Response
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    @app.get("/health_generate")
+    async def health_generate():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        timeout_keep_alive=5,
+        loop="uvloop",
+    )
