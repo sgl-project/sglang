@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 # type of content fields, can be only prompts or with images/videos
 MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
 
-
 def get_exception_traceback():
     etype, value, tb = sys.exc_info()
     err_str = "".join(traceback.format_exception(etype, value, tb))

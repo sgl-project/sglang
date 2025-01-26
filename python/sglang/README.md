@@ -13,4 +13,3 @@
 - `launch_server.py`: The entry point for launching the local server.
 - `llama3_eval.py`: Evaluation of Llama 3 using the Meta Llama dataset.
 - `utils.py`: Common utilities.
-- `download.sh`: Script to download the datasets
