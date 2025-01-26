@@ -124,12 +124,10 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self,
         A_buffer,
         B_buffer,
-        batch_info,
     ):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
-        self.lora_backend.set_batch_info(batch_info)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)
@@ -162,13 +160,11 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         A_buffer_qkv,
         B_buffer_q,
         B_buffer_kv,
-        batch_info
     ):
         self.set_lora = True
         self.A_buffer_qkv = A_buffer_qkv
         self.B_buffer_q = B_buffer_q
         self.B_buffer_kv = B_buffer_kv
-        self.lora_backend.set_batch_info(batch_info)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_output = self.lora_backend.run_qkv_lora(
@@ -177,6 +173,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             q_lora_b=self.B_buffer_q,
             kv_lora_b=self.B_buffer_kv,
         )
+        # print(lora_output[0][:10])
         return base_output + lora_output * self.scaling
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
@@ -189,11 +186,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
-    def set_lora_info(self, A_buffer, B_buffer, batch_info):
+    def set_lora_info(self, A_buffer, B_buffer):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
-        self.lora_backend.set_batch_info(batch_info)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)

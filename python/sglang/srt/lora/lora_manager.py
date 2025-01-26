@@ -340,6 +340,7 @@ class LoRAManager:
                                    seg_indptr=seg_indptr,
                                    max_len=max_len,
                                    weight_indices=weight_indices)
+        self.lora_backend.set_batch_info(batch_info)
 
         # call set_lora_info for each lora modules
         for module_name, module in self.lora_modules:
@@ -350,12 +351,10 @@ class LoRAManager:
                 module.set_lora_info(
                     self.A_buffer[weight_name][layer_id],
                     self.B_buffer[weight_name][layer_id],
-                    batch_info,
                 )
             else:
                 module.set_lora_info(
                     self.A_buffer["qkv_proj"][layer_id],
                     self.B_buffer["q_proj"][layer_id],
                     self.B_buffer["kv_proj"][layer_id],
-                    batch_info,
                 )

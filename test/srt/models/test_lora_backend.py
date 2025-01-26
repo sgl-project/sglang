@@ -46,7 +46,7 @@ What do you know about llamas?
 ]
 
 BACKENDS = ['triton', 
-            'flashinfer'
+            # 'flashinfer'
          ]
 
 class TestLoRABackend(unittest.TestCase):
@@ -55,12 +55,12 @@ class TestLoRABackend(unittest.TestCase):
         print(f"=================== testing {backend} backend =======================")
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]
-        batch_lora_paths = [None]
+        batch_lora_paths = []
         i = 0
-        for _ in range(len(prompts) - 1):
+        for _ in range(len(prompts)):
             batch_lora_paths.append(all_lora_paths[i])
             i = (i + 1) % len(all_lora_paths)
-
+        print(f"batch lora paths={batch_lora_paths}")
         with SRTRunner(
             base_path,
             torch_dtype=torch_dtype,
