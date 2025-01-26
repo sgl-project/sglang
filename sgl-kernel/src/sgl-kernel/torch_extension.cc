@@ -7,6 +7,13 @@
 #include "sgl_kernels_ops.h"
 #include "linear.h"
 
+// std::shared_ptr<turbomind::Tensor> TorchTensorToTurbomindTensor(py::object obj)
+// {
+//     py::capsule      cap  = obj.attr("__dlpack__")();
+//     DLManagedTensor* dlmt = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(cap.ptr(), kDlTensorCapsuleName));
+//     return DLManagedTensorToTurbomindTensor(dlmt);
+// }
+
 TORCH_LIBRARY(sgl_kernels, m) {
   // trt_reduce
   m.def(
@@ -118,10 +125,28 @@ TORCH_LIBRARY(sgl_kernels, m) {
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
 
-  m.class_<turbomind::Linear>("Linear")
-    .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
-    // .def("post_init", &turbomind::Linear::post_init);
-    .def("forward", &turbomind::Linear::forward);
+//   m.class_<turbomind::Linear>("Linear")
+//     .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
+//     // .def("post_init", &turbomind::Linear::post_init);
+//     .def("forward", &turbomind::Linear::forward);
+
+    m.class_<turbomind::Linear>("Linear")
+        .def(torch::init<int64_t, int64_t, int64_t, int64_t>());
+        // .def("post_init",
+        //      [](turbomind::Linear* self, torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros, bool simt) {
+        //          auto _qweight = TorchTensorToTurbomindTensor(qweight);
+        //          auto _scales  = TorchTensorToTurbomindTensor(scales);
+        //          auto _qzeros  = TorchTensorToTurbomindTensor(qzeros);
+        //          self->post_init(_qweight, *_scales, *_qzeros, simt);
+        //      })
+        // .def("forward", [](turbomind::Linear* self, torch::Tensor in, torch::Tensor out, c10::optional<int64_t> stream_id = c10::nullopt) {
+        //     auto _in    = TorchTensorToTurbomindTensor(in);
+        //     auto _out   = TorchTensorToTurbomindTensor(out);
+        //     auto stream = stream_id.has_value() ?
+        //         at::cuda::getCurrentCUDAStream(stream_id.value()).stream() :
+        //         at::cuda::getCurrentCUDAStream().stream();
+        //     return self->forward(*_in, *_out, stream);
+        // });
 }
 
 REGISTER_EXTENSION(_kernels)

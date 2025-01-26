@@ -8,7 +8,19 @@ from sgl_kernel.ops.utils import (
     _get_cuda_stream,
     _to_tensor_scalar_tuple,
 )
-from torch.ops.sgl_kernels import Linear
+
+
+class turbomindLinear:
+    def __init__(self, in_feature, out_features, w_bit, group_size) -> None:
+        self.linear = torch.classes.sgl_kernels.Linear(
+            in_feature, out_features, w_bit, group_size
+        )
+
+    def post_init(self):
+        pass
+
+    def forward(self):
+        pass
 
 
 def init_custom_reduce(

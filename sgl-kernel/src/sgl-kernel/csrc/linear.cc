@@ -193,7 +193,7 @@ struct Linear::Impl {
                               const Tensor& qzeros,
                               int64_t        input_dims,
                               int64_t        output_dims,
-                              int           group_size,
+                              int64_t           group_size,
                               bool          use_simt)
     {
         if constexpr (0) {
@@ -279,8 +279,8 @@ private:
 
     int64_t input_dims_;
     int64_t output_dims_;
-    int    w_bit_;
-    int    group_size_;
+    int64_t    w_bit_;
+    int64_t    group_size_;
 
     std::shared_ptr<Tensor> weight_;
     half*                   scales_zeros_;
