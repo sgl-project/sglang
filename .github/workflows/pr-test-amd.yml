@@ -35,6 +35,10 @@ jobs:
           pip install --upgrade pip
           pip install -e "python[dev_hip]"
 
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
