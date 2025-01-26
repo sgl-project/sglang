@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 from pathlib import Path
 
@@ -70,6 +71,8 @@ nvcc_flags = [
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
+    "-Xcompiler",
+    "-w",
 ]
 nvcc_flags_fp8 = [
     "-DFLASHINFER_ENABLE_FP8",
@@ -151,7 +154,11 @@ setup(
     packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={
+        "build_ext": BuildExtension.with_options(
+            use_ninja=True, max_jobs=multiprocessing.cpu_count()
+        )
+    },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
 
