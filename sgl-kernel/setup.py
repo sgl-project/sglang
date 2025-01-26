@@ -56,6 +56,7 @@ include_dirs = [
     turbomind.resolve(),
     turbomind.resolve() / "src",
 ]
+
 nvcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
@@ -82,6 +83,7 @@ sources = [
     "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
+    "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
     "src/sgl-kernel/csrc/rotary_embedding.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
