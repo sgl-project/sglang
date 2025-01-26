@@ -23,21 +23,19 @@ jobs:
     runs-on: linux-mi300-gpu-1
     container:
       image: lmsysorg/sglang:v0.4.1.post7-rocm620
+      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --group-add $(getent group render | cut -d':' -f 3) --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Install dependencies
         run: |
-          python3 -m venv test_venv
-          source test_venv/bin/activate
           pip install --upgrade pip
           pip install -e "python[all_hip]"
 
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
-          source test_venv/bin/activate
           cd test/srt
           python3 test_eval_accuracy_large.py
 
