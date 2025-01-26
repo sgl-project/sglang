@@ -1,7 +1,11 @@
 #pragma once
+#include <cuda_runtime.h>
+#include <pytorch_extension_utils.h>
 #include <torch/extension.h>
 
 #include <sstream>
+
+#include "sgl_kernels_ops.h"
 
 struct cuda_error : public std::runtime_error {
   /**
@@ -44,3 +48,20 @@ inline int getSMVersion() {
   CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
   return sm_major * 10 + sm_minor;
 }
+
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, ...)           \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      case at::ScalarType::Float: {                                                      \
+        using c_type = float;                                                            \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+        _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                          \
+        _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                         \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
+  }()

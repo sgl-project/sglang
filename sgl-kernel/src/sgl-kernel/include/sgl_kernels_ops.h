@@ -1,6 +1,24 @@
+#pragma once
+#include <Python.h>
+#include <torch/extension.h>
+
 #include <vector>
 
 #include "utils.h"
+
+#define _CONCAT(A, B) A##B
+#define CONCAT(A, B) _CONCAT(A, B)
+
+#define _STRINGIFY(A) #A
+#define STRINGIFY(A) _STRINGIFY(A)
+
+#define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
+
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
+  }
 
 // trt_reduce
 using fptr_t = int64_t;
@@ -67,8 +85,17 @@ void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
                                int64_t cuda_stream);
 
 // top k renorm probs
+// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr,
                         unsigned int top_k_val, int64_t cuda_stream);
+
+// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
+// wrapper for binding
+inline void top_k_renorm_probs_wrapper(at::Tensor probs, at::Tensor renorm_probs,
+                                       std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                                       int64_t cuda_stream) {
+  top_k_renorm_probs(probs, renorm_probs, maybe_top_k_arr, static_cast<unsigned int>(top_k_val), cuda_stream);
+}
 
 // top p renorm probs
 void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr,
@@ -84,48 +111,3 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_sample
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples, at::Tensor success,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
                                int64_t cuda_stream);
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  // trt_reduce
-  m.def("init_custom_ar", &init_custom_ar, "init custom allreduce meta (CUDA)");
-  m.def("dispose", &dispose, "dispose custom allreduce meta");
-  m.def("all_reduce", &all_reduce, "custom all reduce (CUDA)");
-  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta, "custom all reduce get graph ipc meta");
-  m.def("register_graph_buffers", &register_graph_buffers, "custom all reduce register graph buffers");
-  // moe_align_block_size
-  m.def("moe_align_block_size", &moe_align_block_size, "MOE Align Block Size (CUDA)");
-  // sampling_scaling_penalties
-  m.def("sampling_scaling_penalties", &sampling_scaling_penalties, "Sampling scaling penalties (CUDA)");
-  // int8_scaled_mm
-  m.def("int8_scaled_mm", &int8_scaled_mm, "INT8 scaled matmul (CUDA)");
-  // lightning_attention_decode
-  m.def("lightning_attention_decode", &lightning_attention_decode, "Lightning Attention Ddecode (CUDA)");
-  // rotary embedding
-  m.def("rotary_embedding", &rotary_embedding, "Rotary Embedding (CUDA)");
-  // rms norm
-  m.def("rmsnorm", &rmsnorm, "RMSNorm (CUDA)");
-  // fused rms norm
-  m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused Add RMSNorm (CUDA)");
-  // gemma rms norm
-  m.def("gemma_rmsnorm", &gemma_rmsnorm, "Gemma RMSNorm (CUDA)");
-  // fused gemma rms norm
-  m.def("gemma_fused_add_rmsnorm", &gemma_fused_add_rmsnorm, "Gemma Fused Add RMSNorm (CUDA)");
-  // silu and mul
-  m.def("silu_and_mul", &silu_and_mul, "Silu and Mul (CUDA)");
-  // gelu tanh and mul
-  m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Gelu Tanh and Mul (CUDA)");
-  // gelu and mul
-  m.def("gelu_and_mul", &gelu_and_mul, "Gelu and Mul (CUDA)");
-  // bmm fp8
-  m.def("bmm_fp8", &bmm_fp8, "BMM FP8 (CUDA)");
-  // min p sampling from probs
-  m.def("min_p_sampling_from_probs", &min_p_sampling_from_probs, "Min P Sampling From Probs (CUDA)");
-  // top k renorm probs
-  m.def("top_k_renorm_probs", &top_k_renorm_probs, "Top K Renorm Probs (CUDA)");
-  // top p renorm probs
-  m.def("top_p_renorm_probs", &top_p_renorm_probs, "Top P Renorm Probs (CUDA)");
-  // top k top p sampling from probs
-  m.def("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs, "Top K Top P Sampling From Probs (CUDA)");
-  // top p sampling from probs
-  m.def("top_p_sampling_from_probs", &top_p_sampling_from_probs, "Top P Sampling From Probs (CUDA)");
-}
