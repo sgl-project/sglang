@@ -1,6 +1,5 @@
 import argparse
 import itertools
-import time
 
 import torch
 import triton
