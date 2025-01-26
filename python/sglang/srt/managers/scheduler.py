@@ -734,12 +734,7 @@ class Scheduler:
             return
 
         # Copy more attributes
-        if recv_req.logprob_start_len == -1:
-            # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-        else:
-            req.logprob_start_len = recv_req.logprob_start_len
-
+        req.logprob_start_len = len(req.origin_input_ids) - 1
         self.waiting_queue.append(req)
 
     def log_prefill_stats(self, adder, can_run_list, running_bs, has_being_chunked):
