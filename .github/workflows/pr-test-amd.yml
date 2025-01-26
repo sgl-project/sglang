@@ -23,7 +23,7 @@ jobs:
     runs-on: linux-mi300-gpu-1
     container:
       image: lmsysorg/sglang:v0.4.1.post7-rocm620
-      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --group-add $(getent group render | cut -d':' -f 3) --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
