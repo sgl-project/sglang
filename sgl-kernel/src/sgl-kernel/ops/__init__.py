@@ -84,6 +84,17 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
+def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+    return torch.ops.sgl_kernels.fp8_scaled_mm(
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        out_dtype,
+        bias,
+    )
+
+
 def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
     torch.ops.sgl_kernels.lightning_attention_decode(
         q, k, v, past_kv, slope, output, new_kv

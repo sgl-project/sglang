@@ -32,13 +32,17 @@ jobs:
 
   build-wheels:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: sgl-kernel-build-node
     strategy:
       matrix:
-        python-version: ['3.10']
+        python-version: ['3.9']
         cuda-version: ['12.4']
 
     steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
       - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
