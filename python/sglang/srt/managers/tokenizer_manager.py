@@ -785,6 +785,9 @@ class TokenizerManager:
                     i,
                 )
 
+            if self.server_args.speculative_algorithm:
+                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+
             if not isinstance(recv_obj, BatchEmbeddingOut):
                 meta_info.update(
                     {
@@ -809,6 +812,7 @@ class TokenizerManager:
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
+
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[i] is not None
             state.event.set()
