@@ -326,12 +326,10 @@ class TestSRTEndpoint(unittest.TestCase):
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
     def test_cache_tokens(self):
-        for _ in range(5):
-            response = requests.post(self.base_url + "/flush_cache")
-            if response.status_code == 200:
-                break
+        for _ in range(2):
             time.sleep(1)
-        assert response.status_code == 200
+            response = requests.post(self.base_url + "/flush_cache")
+            assert response.status_code == 200
 
         def send_and_check_cached_tokens(input_ids):
             response = requests.post(
