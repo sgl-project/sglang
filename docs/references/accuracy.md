@@ -94,3 +94,34 @@ This evaluates the model on 10 different subjects from the dataset. Key argument
 
 During script execution we get a breakdown on subject wise accuracy.
 After running the benchmark a `result.jsonl` file containing the accuracy is created. Read it off from here.
+
+## Replicating results and customize benchmark scripts
+
+[Qwen2.5-Math-1.5B](https://github.com/QwenLM/Qwen2.5-Math) is claimed to reach GSM8K accuracy of `76.8` when using 8 shot on GSM8K.
+
+Running `python3 bench_sglang.py --num-questions 8000 --num-shots 8` gives an accuracy of `76.1`.
+To recover the GSM8K accuracy reported in the paper you need to make two adjustments:
+
+```python
+    for i in range(len(lines[num_shots:num_questions])):
+        questions.append(get_one_example(lines, i, False))
+        labels.append(get_answer_value(lines[i]["answer"]))
+```
+Here the adjustment made from the original script is that the few shot examples get *exluded* from evaluation.
+
+```python
+    @sgl.function
+    def few_shot_gsm8k(s, question):
+        s += sgl.system("Please reason step by step, and put your final answer within \\boxed{}.")
+        s += few_shot_examples + question
+        s += sgl.gen(
+            "answer", max_tokens=2048, stop=["Question", "Assistant:", "</s>", "<|im_end|>", "<|endoftext|>"]
+        )
+```
+Here the adjustment made from the original script is that the system prompt for the model is included and the stop words are adjusted. Also `max_tokens` was increased from 512 to 2048. This gives us the reported accuracy of `76.8`.
+
+Please keep in mind to make similar adjustments to benchmark scripts in case you want to archieve maximum performance/replicate paper results.
+
+## Other ways of evaluating model accuracy
+
+Instead of the [SGLang benchmark scripts](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark) you may use other alternatives tailored especially to the task of evaluating LLMs. Two alternatives are [OpenCompass](https://github.com/open-compass/opencompass) and [Language Model Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness/tree/main). Please consult their documentation on how to use them.
