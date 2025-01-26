@@ -26,8 +26,14 @@ def parse_args():
     parser.add_argument(
         "--num-clients",
         type=int,
-        default=100,
+        default=256,
         help="Number of concurrent clients",
+    )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=128,
+        help="Maximum number of parallel requests",
     )
     parser.add_argument(
         "--request-length",
@@ -44,7 +50,7 @@ def parse_args():
     parser.add_argument(
         "--num-rounds",
         type=int,
-        default=8,
+        default=5,
         help="Number of rounds per client",
     )
     parser.add_argument(
@@ -163,7 +169,7 @@ class ReadyQueue:
     Thread-safe queue that can pop requests in different orders based on given policy.
     """
 
-    def __init__(self, init_requests=None, policy="fifo"):
+    def __init__(self, init_requests=None, policy="random"):
         self.lock = threading.Lock()
         self.requests = init_requests or []
         self.policy = policy
@@ -182,6 +188,7 @@ class ReadyQueue:
             elif self.policy == "fifo":
                 return self.requests.pop(0)
             else:
+                # todo, varying thinking time of clients
                 raise ValueError(f"{self.policy} not implemented")
 
 
@@ -195,6 +202,9 @@ class WorkloadGenerator:
         self.request_rate = args.request_rate
         self.start_time = None
         self.finished_time = None
+
+        self.sent_requests = 0
+        self.completed_requests = 0
 
         self.candidate_inputs = sample_random_requests(
             input_len=args.request_length,
@@ -234,6 +244,18 @@ class WorkloadGenerator:
     def request_sender(self):
         async def request_loop():
             while True:
+                if self.sent_requests - self.completed_requests < args.max_parallel:
+                    new_request = self.ready_queue.pop()
+                    if new_request:
+                        asyncio.create_task(self.handle_request(new_request))
+                        self.sent_requests += 1
+                else:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                if self.pbar.n == self.pbar.total:
+                    break
+
                 # Calculate Poisson-distributed wait time
                 if self.distribution == "poisson":
                     sleep_time = random.expovariate(self.request_rate)
@@ -245,14 +267,6 @@ class WorkloadGenerator:
                 else:
                     raise ValueError("Invalid distribution type")
                 await asyncio.sleep(sleep_time)  # Wait before sending the next request
-
-                new_request = self.ready_queue.pop()
-                # Submit async request
-                if new_request:
-                    asyncio.create_task(self.handle_request(new_request))
-                else:
-                    if self.pbar.n == self.pbar.total:
-                        break
 
         # Create and run the event loop for asynchronous requests
         loop = asyncio.new_event_loop()
@@ -272,6 +286,7 @@ class WorkloadGenerator:
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
                 self.performance_metrics["latency"].append(response.latency)
+                self.completed_requests += 1
 
                 if self.client_records[client_id]["round"] < args.num_rounds:
                     self.client_records[client_id][
@@ -311,10 +326,16 @@ class WorkloadGenerator:
             f"  Average TTFT: {sum(self.performance_metrics['ttft']) / len(self.performance_metrics['ttft']):.2f}"
         )
         print(
+            f"  P90 TTFT: {sorted(self.performance_metrics['ttft'])[int(0.9 * len(self.performance_metrics['ttft']))]:.2f}"
+        )
+        print(
             f"  Median TTFT: {sorted(self.performance_metrics['ttft'])[len(self.performance_metrics['ttft']) // 2]:.2f}"
         )
         print(
             f"  Average latency: {sum(self.performance_metrics['latency']) / len(self.performance_metrics['latency']):.2f}"
+        )
+        print(
+            f"  P90 latency: {sorted(self.performance_metrics['latency'])[int(0.9 * len(self.performance_metrics['latency']))]:.2f}"
         )
         print(
             f"  Median latency: {sorted(self.performance_metrics['latency'])[len(self.performance_metrics['latency']) // 2]:.2f}"
@@ -327,7 +348,9 @@ if __name__ == "__main__":
     args = parse_args()
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    for request_rate in range(1, 41, 2):
+    for request_rate in [16, 14, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]:
         args.request_rate = request_rate
         requests.post(flush_cache_url)
+        time.sleep(1)
         WorkloadGenerator(args).run()
+        time.sleep(10)
