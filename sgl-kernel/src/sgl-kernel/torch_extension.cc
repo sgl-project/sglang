@@ -34,6 +34,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "bias) -> Tensor");
   m.impl("int8_scaled_mm", torch::kCUDA, &int8_scaled_mm);
 
+  // fp8_scaled_mm
+  m.def(
+      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+      "bias) -> Tensor");
+  m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
+
   // lightning_attention_decode
   m.def(
       "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
