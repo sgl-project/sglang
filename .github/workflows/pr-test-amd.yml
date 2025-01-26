@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "python[all_hip]"
+          pip install -e "python[dev_hip]"
 
       - name: Evaluate Accuracy
         timeout-minutes: 20
