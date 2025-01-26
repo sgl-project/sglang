@@ -7,7 +7,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
-from vllm.distributed import (
+
+from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -15,10 +16,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-
-# Workaround: many QuantizationConfig still depends on this, so we have to use vLLM's LinearBase now.
-from vllm.model_executor.layers.linear import LinearBase
-
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     PackedColumnParameter,
@@ -172,6 +169,45 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         return F.linear(x, layer.weight, bias)
+
+
+class LinearBase(torch.nn.Module):
+    """Base linear layer.
+
+    Args:
+        input_size: input dimension of the linear layer.
+        output_size: output dimension of the linear layer.
+        bias: If true, add bias.
+        skip_bias_add: If true, skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        quant_config: Quantization configure.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+
+        # Keep input parameters
+        self.input_size = input_size
+        self.output_size = output_size
+        self.skip_bias_add = skip_bias_add
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+        self.params_dtype = params_dtype
+        if quant_config is None:
+            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
+        else:
+            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
 
 
 class ReplicatedLinear(LinearBase):

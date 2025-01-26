@@ -21,14 +21,14 @@ from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
 from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
@@ -374,6 +374,78 @@ class DefaultModelLoader(BaseModelLoader):
         return model.eval()
 
 
+class LayeredModelLoader(DefaultModelLoader):
+    """Model loader that loads weights layer by layer so that one can quantize a
+    layer before loading another to make the peak memory envelope smaller."""
+
+    def __init__(self, load_config: LoadConfig):
+        # Back to the default load format
+        load_config.load_format = LoadFormat.AUTO
+        super().__init__(load_config)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+        torchao_config = global_server_args_dict.get("torchao_config")
+        target_device = torch.device(device_config.device)
+
+        with set_default_torch_dtype(model_config.dtype):
+            # Create model on meta device
+            with torch.device("meta"):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                )
+
+            # Check model's layered load support
+            if not hasattr(model, "load_weights_to_module"):
+                raise ValueError(
+                    "LayeredModelLoader requires the model to have a "
+                    "`load_weights_to_module` method. "
+                    f"{model_config.model_path} does not support it."
+                )
+
+            # Get all weights from disk
+            weights = self._get_all_weights(model_config, model)
+
+            # Helper function to recursively fill the weights of a module
+            def fill_module(module, fqn: List[str], weights):
+                """
+                fqn: list of strings representing the fully qualified name of `module`.
+                """
+                # Layer by layer
+                for name, submod in module.named_children():
+                    fill_module(submod, fqn + [name], weights)
+
+                # First materialize on target device
+                module.to_empty(device=target_device, recurse=False)
+                fqn_path = ".".join(fqn)
+                # Fill weights
+                model.load_weights_to_module(
+                    fqn_path,
+                    weights,
+                )
+                # Quantize weights if applicable
+                if torchao_config and "proj" in fqn_path:
+                    # Note: `None` here is needed to indicate no filter, see
+                    # `apply_torchao_config_to_model` for details.
+                    apply_torchao_config_to_model(module, torchao_config, None)
+
+            # Start calling on root module
+            fill_module(model, [], weights)
+
+        if torchao_config:
+            model.torchao_applied = True
+
+        return model.eval()
+
+
 class DummyModelLoader(BaseModelLoader):
     """Model loader that will set model weights to random values."""
 
@@ -496,7 +568,8 @@ class ShardedStateLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from safetensors.torch import safe_open
-        from vllm.distributed import get_tensor_model_parallel_rank
+
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
@@ -556,7 +629,8 @@ class ShardedStateLoader(BaseModelLoader):
         max_size: Optional[int] = None,
     ) -> None:
         from safetensors.torch import save_file
-        from vllm.distributed import get_tensor_model_parallel_rank
+
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
@@ -1146,5 +1220,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.GGUF:
         return GGUFModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.LAYERED:
+        return LayeredModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

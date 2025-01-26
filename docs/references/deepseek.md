@@ -34,6 +34,10 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 **Usage**: This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). Data Parallelism Attention optimization can be enabeld by `--enable-dp-attention` for DeepSeek Series Models.
 
+<p align="center">
+  <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison">
+</p>
+
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 
 ## Multi Node Tensor Parallelism

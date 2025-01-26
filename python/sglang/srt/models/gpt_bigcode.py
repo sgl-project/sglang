@@ -21,8 +21,8 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import GPTBigCodeConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,

@@ -103,6 +103,7 @@ def tree_search(s, question, num_branches):
 
 def main(args):
     lines = read_jsonl(args.data_path)
+    lines = list(lines)
 
     # Construct prompts
     num_branches = 2
