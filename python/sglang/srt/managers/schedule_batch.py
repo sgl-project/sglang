@@ -331,6 +331,7 @@ class Req:
 
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
+        self.already_computed = 0
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
@@ -750,13 +751,6 @@ class ScheduleBatch:
 
         pt = 0
         for i, req in enumerate(reqs):
-            already_computed = (
-                req.extend_logprob_start_len + 1 + req.cached_tokens
-                if req.extend_logprob_start_len > 0
-                else 0
-            )
-            req.cached_tokens += len(req.prefix_indices) - already_computed
-
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
@@ -772,15 +766,20 @@ class ScheduleBatch:
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
-            # Compute the relative logprob_start_len in an extend batch
-            if req.logprob_start_len >= pre_len:
-                extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len, req.extend_input_len - 1
-                )
-            else:
-                extend_logprob_start_len = req.extend_input_len - 1
+            if req.return_logprob:
+                # Compute the relative logprob_start_len in an extend batch
+                if req.logprob_start_len >= pre_len:
+                    extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len, req.extend_input_len - 1
+                    )
+                else:
+                    raise RuntimeError(
+                        f"This should never happen. {req.logprob_start_len=}, {pre_len=}"
+                    )
+                req.extend_logprob_start_len = extend_logprob_start_len
 
-            req.extend_logprob_start_len = extend_logprob_start_len
+            req.cached_tokens += pre_len - req.already_computed
+            req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
 
