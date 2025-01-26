@@ -22,9 +22,6 @@ docker run --rm \
     export SGL_KERNEL_ENABLE_SM90A=${ENABLE_SM90A} && \
     mkdir -p /usr/lib/x86_64-linux-gnu/ && \
     ln -s /usr/local/cuda-${CUDA_VERSION}/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so && \
-    cd /sgl-kernel/3rdparty/turbomind && \
-    mkdir build && cd build && \
-    cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_CUDA_FLAGS="-lineinfo" -DUSE_NVTX=ON && make -j$(nproc) && \
-    cd ../../../ && \
+    cd /sgl-kernel && \
     ${PYTHON_ROOT_PATH}/bin/python setup.py bdist_wheel
     "

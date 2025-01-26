@@ -86,14 +86,33 @@ sources = [
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
     "src/sgl-kernel/csrc/rotary_embedding.cu",
     "src/sgl-kernel/csrc/fused_add_rms_norm.cu",
+    "src/sgl-kernel/csrc/linear.cc",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/group_gemm.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
-    "3rdparty/turbomind/src/turbomind/api/python/bind.cpp",
-    "3rdparty/turbomind/src/turbomind/api/python/linear.cc",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/gemm.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/kernel.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/registry.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/dispatch_cache.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/gpu_metric.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/convert_v2.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/cast.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/unpack.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/tuner/cache_utils.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/tuner/measurer.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/tuner/sampler.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/tuner/stopping_criterion.cc",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/tuner/params.cc",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/kernel/f16_u4g128_f16_tnt_sm90_s16816.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/kernel/f16_u4g128_f16_tnt_sm80_s16816.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/kernel/f16_u4g128_f16_tnt_sm75_s16816.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/kernel/f16_u4g128_f16_tnt_sm70_s884.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/kernel/f16_u4g128_f16_tnt_sm75_simt.cu",
+    "3rdparty/turbomind/src/turbomind/kernels/gemm/kernel/u4g128_f16_f16_nnn_sm80_s16816.cu",
+    "3rdparty/turbomind/src/turbomind/utils/parser.cc",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
@@ -133,12 +152,7 @@ for flag in [
 
 cxx_flags = ["-O3"]
 libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
-extra_link_args = [
-    "-Wl,-rpath,$ORIGIN/../../torch/lib",
-    "-L/usr/lib/x86_64-linux-gnu",
-    f"{str(root)}/3rdparty/turbomind/build/lib/libgemm2.a",
-    f"{str(root)}/3rdparty/turbomind/build/lib/libparser.a",
-]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
     CUDAExtension(

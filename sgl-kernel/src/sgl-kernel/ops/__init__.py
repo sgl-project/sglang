@@ -2,13 +2,13 @@ import os
 from typing import Optional, Tuple, Union
 
 import sgl_kernel.ops._kernels
-import sgl_kernel.turbomind._turbomind_ext as turbomind
 import torch
 from sgl_kernel.ops.utils import (
     _get_cache_buf,
     _get_cuda_stream,
     _to_tensor_scalar_tuple,
 )
+from torch.ops.sgl_kernels import Linear
 
 
 def init_custom_reduce(

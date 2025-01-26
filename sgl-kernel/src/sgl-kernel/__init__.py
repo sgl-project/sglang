@@ -1,4 +1,5 @@
 from sgl_kernel.ops import (
+    Linear,
     bmm_fp8,
     custom_dispose,
     custom_reduce,
@@ -21,7 +22,6 @@ from sgl_kernel.ops import (
     top_k_renorm_prob,
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
-    turbomind,
 )
 
 __all__ = [
@@ -47,5 +47,5 @@ __all__ = [
     "top_k_renorm_prob",
     "top_k_top_p_sampling_from_probs",
     "top_p_renorm_prob",
-    "turbomind",
+    "Linear",
 ]

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "utils.h"
+#include "linear.h"
 
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
@@ -111,3 +112,10 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_sample
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples, at::Tensor success,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
                                int64_t cuda_stream);
+
+class Linear : public torch::CustomClassHolder {
+public:
+    Linear(int64_t input_dims, int64_t output_dims, int64_t w_bit, int64_t group_size);
+    void forward(const at::Tensor& in, at::Tensor& out, cudaStream_t stream = nullptr);
+    ~Linear() {}
+};

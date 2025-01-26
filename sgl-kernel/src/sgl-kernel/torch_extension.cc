@@ -1,10 +1,13 @@
 
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/library.h>
+#include <torch/script.h>
+#include <torch/custom_class.h>
 
 #include "sgl_kernels_ops.h"
+#include "linear.h"
 
-TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
+TORCH_LIBRARY(sgl_kernels, m) {
   // trt_reduce
   m.def(
       "init_custom_ar(int rank_id, int world_size, Tensor rank_data, int[] buffers, int[] tmp_result_buffers, int[] "
@@ -114,6 +117,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor! success, Tensor? "
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
+
+  m.class_<turbomind::Linear>("Linear")
+    .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
+    // .def("post_init", &turbomind::Linear::post_init);
+    .def("forward", &turbomind::Linear::forward);
 }
 
 REGISTER_EXTENSION(_kernels)
