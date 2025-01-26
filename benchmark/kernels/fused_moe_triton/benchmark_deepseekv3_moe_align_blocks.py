@@ -116,6 +116,7 @@ def moe_align_block_size_triton(
         numel,
         tokens_per_thread,
     )
+    print("[stage1] tokens_cnts : ", tokens_cnts)
     moe_align_block_size_stage2[grid](
         tokens_cnts,
         num_experts,
@@ -127,6 +128,7 @@ def moe_align_block_size_triton(
         num_experts,
         block_size,
     )
+    print("[stage3] cumsum : ", cumsum)
     moe_align_block_size_stage4[grid](
         topk_ids,
         sorted_token_ids,
@@ -141,9 +143,9 @@ def moe_align_block_size_triton(
 
 
 def calculate_diff(batch_size, seq_len):
-    num_experts = 256
-    block_size = 128
-    topk = 8
+    num_experts = 8  # 256
+    block_size = 3  # 128
+    topk = 4  # 8
 
     topk_ids = torch.stack(
         [
@@ -151,6 +153,8 @@ def calculate_diff(batch_size, seq_len):
             for _ in range(batch_size * seq_len)
         ]
     )
+
+    print("topk_ids : ", topk_ids)
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids_cuda = torch.empty(
@@ -202,6 +206,9 @@ def calculate_diff(batch_size, seq_len):
         print("✅ CUDA and Triton implementations match")
     else:
         print("❌ CUDA and Triton implementations do not match")
+        print("CUDA cumsum : ", cumsum_buffer)
+        print("CUDA sorted ids:", sorted_ids_cuda)
+        print("Triton sorted ids:", sorted_ids_triton)
         print("CUDA expert_ids:", expert_ids_cuda)
         print("Triton expert_ids:", expert_ids_triton)
         print("CUDA num_tokens_post_pad:", num_tokens_post_pad_cuda)
@@ -209,7 +216,7 @@ def calculate_diff(batch_size, seq_len):
 
 
 batch_size_range = [2**i for i in range(0, 8)]
-seq_length_range = [2**i for i in range(0, 16)]
+seq_length_range = [2**i for i in range(14, 16)]
 configs = list(itertools.product(batch_size_range, seq_length_range))
 
 
@@ -300,6 +307,11 @@ def benchmark(batch_size, seq_len, provider):
 
 
 if __name__ == "__main__":
+    import numpy as np
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--save_path",
@@ -309,6 +321,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # calculate_diff(batch_size=5, seq_len=1)
     calculate_diff(batch_size=4, seq_len=1024)
+    # calculate_diff(batch_size=1, seq_len=16384)
 
-    benchmark.run(print_data=True, save_path=args.save_path)
+    # benchmark.run(print_data=True, save_path=args.save_path)
