@@ -20,6 +20,8 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 )
 from sglang.srt.utils import is_hip
 
+_is_hip_ = is_hip()
+
 
 class BenchmarkConfig(TypedDict):
     BLOCK_SIZE_M: int
@@ -103,8 +105,8 @@ def benchmark_config(
                 (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.float32
             )
 
-        w1 = w1.to(torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn)
-        w2 = w2.to(torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn)
+        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
+        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
@@ -167,9 +169,6 @@ def benchmark_config(
 
 
 def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
-    # Reduced search space for faster tuning.
-    # TODO(woosuk): Increase the search space and use a performance model to
-    # prune the search space.
     configs: List[BenchmarkConfig] = []
     waves_per_eu_range = 0
     for num_stages in [2]:
@@ -197,7 +196,7 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
     # TODO(woosuk): Increase the search space and use a performance model to
     # prune the search space.
     configs: List[BenchmarkConfig] = []
-    if is_hip():
+    if _is_hip_:
         configs = get_rocm_configs_compute_bound()
     else:
         for num_stages in [2, 3, 4, 5]:
