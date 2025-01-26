@@ -73,7 +73,7 @@ def is_hip() -> bool:
 
 
 def is_cuda():
-    return hasattr(torch, "cuda") and torch.cuda.is_available()
+    return hasattr(torch, "cuda") and torch.version.cuda is not None
 
 
 def is_cuda_alike():
