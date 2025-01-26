@@ -46,7 +46,7 @@ What do you know about llamas?
 ]
 
 BACKENDS = ['triton', 
-            # 'flashinfer'
+            'flashinfer'
          ]
 
 class TestLoRABackend(unittest.TestCase):

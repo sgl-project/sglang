@@ -8,6 +8,7 @@ suites = {
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
+        "models/test_lora_backend.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
         "sampling/penaltylib",
