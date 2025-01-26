@@ -207,9 +207,9 @@ void launch_sm89_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
 }
 
 template <typename OutType, typename CtaShape, typename WarpShape, int Stages>
-void sm89_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                        const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                        const c10::optional<torch::Tensor>& bias) {
+void sm89_fp8_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
+                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                            const c10::optional<torch::Tensor>& bias) {
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
   using AccumElementType = float;
@@ -225,82 +225,82 @@ void sm89_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch:
 }
 
 template <typename OutType>
-void sm89_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                         const c10::optional<torch::Tensor>& bias) {
+void sm89_fp8_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
+                             const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                             const c10::optional<torch::Tensor>& bias) {
   uint32_t const m = a.size(0);
   uint32_t const n = out.size(1);
 
   if (m == 1) {
     if (n <= 8192) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                7>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     } else {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                5>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 5>(out, a, b, scales_a, scales_b, bias);
     }
   } else if (m <= 16) {
     // M in (1, 16]
     if (n <= 8192) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                4>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 4>(out, a, b, scales_a, scales_b, bias);
     } else if (n <= 16384) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                5>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 5>(out, a, b, scales_a, scales_b, bias);
     } else {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                7>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     }
   } else if (m <= 64) {
     // M in (16, 64]
     if (n <= 16384) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                7>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     } else {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                7>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     }
   } else if (m <= 128) {
     // M in (64, 128]
     if (n <= 8192) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 64, 128>, cutlass::gemm::GemmShape<32, 64, 64>,
-                                4>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 64, 128>,
+                                    cutlass::gemm::GemmShape<32, 64, 64>, 4>(out, a, b, scales_a, scales_b, bias);
     } else if (n <= 16384) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 64, 128>, cutlass::gemm::GemmShape<32, 64, 64>,
-                                5>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 64, 128>,
+                                    cutlass::gemm::GemmShape<32, 64, 64>, 5>(out, a, b, scales_a, scales_b, bias);
     } else {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>,
-                                5>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<32, 64, 128>,
+                                    cutlass::gemm::GemmShape<16, 64, 64>, 5>(out, a, b, scales_a, scales_b, bias);
     }
   } else if (m <= 256) {
     // M in (128, 256]
     if (n <= 8192) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 64, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
-                                5>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 64, 64>,
+                                    cutlass::gemm::GemmShape<64, 32, 64>, 5>(out, a, b, scales_a, scales_b, bias);
     } else if (n <= 16384) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
-                                7>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<64, 128, 64>,
+                                    cutlass::gemm::GemmShape<64, 32, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     } else {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 64, 128>, cutlass::gemm::GemmShape<64, 32, 128>,
-                                4>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 64, 128>,
+                                    cutlass::gemm::GemmShape<64, 32, 128>, 4>(out, a, b, scales_a, scales_b, bias);
     }
   } else if (m <= 512) {
     // M in (256, 512)
     if (n <= 16384) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
-                                2>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>,
+                                    cutlass::gemm::GemmShape<64, 32, 64>, 2>(out, a, b, scales_a, scales_b, bias);
     } else {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
-                                4>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>,
+                                    cutlass::gemm::GemmShape<64, 32, 64>, 4>(out, a, b, scales_a, scales_b, bias);
     }
   } else {
     // M in (512, inf)
     if (n <= 8192) {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
-                                3>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>,
+                                    cutlass::gemm::GemmShape<64, 32, 64>, 3>(out, a, b, scales_a, scales_b, bias);
     } else {
-      return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 32, 64>,
-                                2>(out, a, b, scales_a, scales_b, bias);
+      return sm89_fp8_dispatch_bias<OutType, cutlass::gemm::GemmShape<128, 128, 64>,
+                                    cutlass::gemm::GemmShape<64, 32, 64>, 2>(out, a, b, scales_a, scales_b, bias);
     }
   }
 }
@@ -506,9 +506,10 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
 
 template <typename OutType, typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
           typename TileSchedulerType>
-void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                        const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                        const c10::optional<torch::Tensor>& bias, bool fast_accum = true, bool use_persistent = false) {
+void sm90_fp8_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
+                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                            const c10::optional<torch::Tensor>& bias, bool fast_accum = true,
+                            bool use_persistent = false) {
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
   using AccumElementType = float;
@@ -528,34 +529,34 @@ void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch:
 }
 
 template <typename OutType>
-void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                         const c10::optional<torch::Tensor>& bias) {
+void sm90_fp8_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
+                             const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                             const c10::optional<torch::Tensor>& bias) {
   uint32_t const m = a.size(0);
   using FastPingpongScheduler = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
   using FastBasicScheduler = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
   using PersistentTileScheduler = cutlass::gemm::PersistentScheduler;
   using BasicTileScheduler = void;
   if (m <= 1) {
-    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>, FastBasicScheduler,
-                              BasicTileScheduler>(out, a, b, scales_a, scales_b, bias);
+    return sm90_fp8_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>, FastBasicScheduler,
+                                  BasicTileScheduler>(out, a, b, scales_a, scales_b, bias);
   }
   if (m <= 64) {
     // m in [1, 64]
-    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>, FastPingpongScheduler,
-                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+    return sm90_fp8_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>, FastPingpongScheduler,
+                                  PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
   } else if (m <= 256) {
     // m in (64, 256]
-    return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>, FastPingpongScheduler,
-                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+    return sm90_fp8_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>, FastPingpongScheduler,
+                                  PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
   } else if (m <= 1024) {
     // m in (256, 1024]
-    return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>, FastPingpongScheduler,
-                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+    return sm90_fp8_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>, FastPingpongScheduler,
+                                  PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
   } else {
     // m in (1024, inf)
-    return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>, FastPingpongScheduler,
-                              PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+    return sm90_fp8_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>, FastPingpongScheduler,
+                                  PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
   }
 }
 #endif
@@ -600,9 +601,9 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000
   if (sm_version >= 90) {
     if (out_dtype == torch::kBFloat16) {
-      sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm90_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      sm90_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm90_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
   }
@@ -611,9 +612,9 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
 #if defined CUDA_VERSION && CUDA_VERSION >= 12040
   if (sm_version == 89) {
     if (out_dtype == torch::kBFloat16) {
-      sm89_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm89_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      sm89_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm89_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
   }
