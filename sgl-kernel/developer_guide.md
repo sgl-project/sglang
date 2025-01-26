@@ -40,6 +40,10 @@ Development build:
 make build
 ```
 
+Note:
+
+The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
+
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests)
