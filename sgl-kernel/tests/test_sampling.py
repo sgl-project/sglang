@@ -15,7 +15,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     elif p == 0.5:
         k = int(vocab_size * 0.1)
     else:
-        raise ValueError("p not recognized")
+        raise ValueError("pp not recognized")
     max_top_k_trails = 32
     eps = 1e-4
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
