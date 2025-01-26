@@ -281,6 +281,7 @@ class Scheduler:
         # Print debug info
         logger.info(
             f"max_total_num_tokens={self.max_total_num_tokens}, "
+            f"chunked_prefill_size={server_args.chunked_prefill_size}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"max_running_requests={self.max_running_requests}, "
             f"context_len={self.model_config.context_len}"
@@ -407,6 +408,11 @@ class Scheduler:
                     # TODO: Add lora name/path in the future,
                 },
             )
+
+        # The largest prefill length of a single request
+        self._largest_prefill_len: int = 0
+        # The largest context length (prefill + generation) of a single request
+        self._largest_prefill_decode_len: int = 0
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -1371,6 +1377,7 @@ class Scheduler:
             prompt_tokens = []
             completion_tokens = []
             cached_tokens = []
+            spec_verify_ct = []
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1424,6 +1431,9 @@ class Scheduler:
                     completion_tokens.append(len(req.output_ids))
                     cached_tokens.append(req.cached_tokens)
 
+                    if not self.spec_algorithm.is_none():
+                        spec_verify_ct.append(req.spec_verify_ct)
+
                     if return_logprob:
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
@@ -1451,6 +1461,7 @@ class Scheduler:
                         prompt_tokens,
                         completion_tokens,
                         cached_tokens,
+                        spec_verify_ct,
                         input_token_logprobs_val,
                         input_token_logprobs_idx,
                         output_token_logprobs_val,
