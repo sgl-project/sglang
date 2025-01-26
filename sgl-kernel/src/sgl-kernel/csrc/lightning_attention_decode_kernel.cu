@@ -3,8 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
-#include "utils.h"
+#include <torch/extension.h>
 
 #define THREADS_PER_BLOCK 128
 
