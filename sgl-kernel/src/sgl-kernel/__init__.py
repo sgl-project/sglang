@@ -1,4 +1,5 @@
 from sgl_kernel.ops import (
+    apply_rope_with_cos_sin_cache_inplace,
     bmm_fp8,
     custom_dispose,
     custom_reduce,
@@ -25,6 +26,7 @@ from sgl_kernel.ops import (
 )
 
 __all__ = [
+    "apply_rope_with_cos_sin_cache_inplace",
     "bmm_fp8",
     "custom_dispose",
     "custom_reduce",
