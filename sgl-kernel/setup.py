@@ -88,7 +88,6 @@ sources = [
     "src/sgl-kernel/csrc/rotary_embedding.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
-    "3rdparty/flashinfer/csrc/group_gemm.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
@@ -103,7 +102,6 @@ sm_version = _get_device_sm()
 if torch.cuda.is_available():
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
-        sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
     if sm_version >= 90:
         nvcc_flags.extend(nvcc_flags_fp8)
     if sm_version >= 80:
@@ -112,7 +110,6 @@ else:
     # compilation environment without GPU
     if enable_sm90a:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
-        sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
     if enable_bf16:
