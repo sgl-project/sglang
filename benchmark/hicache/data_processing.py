@@ -3,17 +3,20 @@ import os
 import pickle
 import random
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import requests
+from nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.bench.nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
-from sglang.utils import MsgContent
-
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+
+from sglang.srt.openai_api.protocol import ChatCompletionMessageContentPart
+
+# type of content fields, can be only prompts or with images/videos
+MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
 
 # A list of all the conversations. Each conversation is a list of
 # tuples. If multiturn is not enabled, the length of list is 1,
