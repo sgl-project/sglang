@@ -21,12 +21,7 @@ import requests
 from IPython.display import HTML, display
 from tqdm import tqdm
 
-from sglang.srt.openai_api.protocol import ChatCompletionMessageContentPart
-
 logger = logging.getLogger(__name__)
-
-# type of content fields, can be only prompts or with images/videos
-MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
 
 
 def get_exception_traceback():
