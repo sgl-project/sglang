@@ -354,10 +354,13 @@ class BatchTokenIDOut:
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     no_stop_trim: List[bool]
+
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    spec_verify_ct: List[int]
+
     # Logprobs
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -382,6 +385,7 @@ class BatchStrOut:
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    spec_verify_ct: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
