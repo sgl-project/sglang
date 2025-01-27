@@ -161,9 +161,7 @@ def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        torch.ops.sgl_kernels.fused_add_rmsnorm(
-            input, residual, weight, eps, _get_cuda_stream(device)
-        )
+        torch.ops.sgl_kernels.fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
