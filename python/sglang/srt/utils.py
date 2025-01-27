@@ -774,7 +774,7 @@ def get_zmq_socket(
 
 
 def dump_to_file(dirpath, name, value):
-    from vllm.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() != 0:
         return
