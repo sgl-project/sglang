@@ -718,7 +718,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-lookahead-path",
             type=str,
-            help="The path of the lookahead ",
+            help="The path of the lookahead. If provided, the lookahead will be inited from this path. You can `lookahead_cache.save_mem('lookahrad.pkl')` to save the lookahead for later use.",
             required=False,
         )
         parser.add_argument(
