@@ -44,13 +44,48 @@ class WrapperDispatch(Enum):
 
 
 class HiPRadixAttentionBackend(AttentionBackend):
-
     def __init__(self, model_runner: HiPModelRunner):
         super().__init__()
+
+        # NOTE: this backend instance is only one time creation.
 
         self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config
 
         self.max_context_len = model_runner.model_config.context_len
+
+        # NOTE: this is quite temporary one.
+        self.q_buffers = [
+            torch.zeros(
+                (
+                    1,
+                    self.hip_config.block_sparse_block_size_q,
+                    model_runner.model_config.num_attention_heads
+                    // model_runner.tp_size,
+                    model_runner.model_config.head_dim,
+                ),
+                device=torch.device(model_runner.device),
+                dtype=model_runner.dtype,
+            )
+            for _ in range(model_runner.model_config.num_hidden_layers)
+        ]
+        # NOTE: disable q caching
+        self.q_buffers = None
+
+    def push_q_buffer(self, q: torch.Tensor, layer_id: int, batch_size: int):
+        if self.q_buffers is None:
+            return
+        assert batch_size == 1
+        q = q.unsqueeze(0)
+        layer_q_buffer = self.q_buffers[layer_id]
+        q_buffer = torch.cat([layer_q_buffer, q[:, -layer_q_buffer.shape[1] :]], dim=1)
+        layer_q_buffer.copy_(q_buffer[:, -layer_q_buffer.shape[1] :])
+
+    def get_q_buffer(self, layer_id: int, batch_size: int) -> torch.Tensor:
+        if self.q_buffers is not None:
+            assert batch_size == 1
+            return self.q_buffers[layer_id].flatten(0, 1)
+        else:
+            return None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         pass
@@ -130,6 +165,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
             offload_cache = None
 
         q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        self.push_q_buffer(
+            q_reshaped, layer_id=layer.layer_id, batch_size=forward_batch.batch_size
+        )
 
         # Output tensor
         o = torch.empty_like(q_reshaped)
@@ -349,9 +387,17 @@ class HiPRadixAttentionBackend(AttentionBackend):
             )
             offload_cache = None
 
+        self.push_q_buffer(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            layer_id=layer.layer_id,
+            batch_size=forward_batch.batch_size,
+        )
+        q_for_masking = self.get_q_buffer(layer.layer_id, forward_batch.batch_size)
+
         if not require_validation:
             o, metadata = self.forward_paged_hip(
                 query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                query_for_mask=q_for_masking,
                 sm_scale=layer.scaling,
                 batch_size=forward_batch.batch_size,
                 k_cache=k_cache,
@@ -384,6 +430,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
             o, metadata_new = self.forward_paged_hip(
                 query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                query_for_mask=q_for_masking,
                 sm_scale=layer.scaling,
                 batch_size=forward_batch.batch_size,
                 k_cache=None,
@@ -416,6 +463,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
             o_valid, metadata_valid = self.forward_paged_hip(
                 query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                query_for_mask=q_for_masking,
                 sm_scale=layer.scaling,
                 batch_size=forward_batch.batch_size,
                 k_cache=k_cache,
@@ -491,6 +539,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
                 o_uvm, metadata_uvm = self.forward_paged_hip(
                     query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    query_for_mask=q_for_masking,
                     sm_scale=layer.scaling,
                     batch_size=forward_batch.batch_size,
                     k_cache=offload_cache.k_uvm.bank_gpu,
@@ -518,6 +567,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
                 o_retry, metadata_retry = self.forward_paged_hip(
                     query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    query_for_mask=q_for_masking,
                     sm_scale=layer.scaling,
                     batch_size=forward_batch.batch_size,
                     k_cache=None,
@@ -599,6 +649,7 @@ online_update={online_update}
         is_dense: bool = False,
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
+        query_for_mask: Optional[torch.Tensor] = None,
         online_update_cache: bool = False,
         is_decode: bool = False,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
@@ -619,6 +670,8 @@ online_update={online_update}
                 layer_config = self.hip_config.layers[layer.layer_id]
 
         query = query.view(batch_size, dst_seq_len, num_heads, hidden_dims)
+        if query_for_mask is not None:
+            query_for_mask = query_for_mask.view(batch_size, -1, num_heads, hidden_dims)
 
         if k_cache is not None:
             N_PAGE, num_heads_kv, hidden_dims_kv = k_cache.shape
@@ -654,6 +707,16 @@ online_update={online_update}
         elif os.getenv("HIP_DISABLE_COMPUTE_STATISTICS", "1") == "0":
             require_cache_statistics = True
 
+        if query_for_mask is not None:
+            query_position_ids = positions.view(batch_size, dst_seq_len)
+            position_ids = (
+                torch.arange(0, query_for_mask.shape[1], device=query.device)[None, :]
+                - (query_for_mask.shape[1] - 1)
+                + query_position_ids
+            )
+        else:
+            position_ids = positions.view(batch_size, dst_seq_len)
+
         args = HiPAttentionArgs(
             k_cache=(
                 k_cache.view(torch.uint8)
@@ -670,7 +733,7 @@ online_update={online_update}
             offload_cache=offload_cache,
             block_table=block_table,
             cache_seq_lens=seq_lens,
-            position_ids=positions.view(batch_size, dst_seq_len),
+            position_ids=position_ids,
             block_size_k=32 if is_gemma else 64,  # BLOCK_CHUNK
             sliding_window_size=layer_config.sliding_window_size,
             sink_token_size=layer_config.sink_token_size,
@@ -697,6 +760,11 @@ online_update={online_update}
             online_update_cache=online_update_cache,
             require_cache_statistics=require_cache_statistics,
             disable_flashdecode=not is_decode,
+            q_mask=(
+                (query_for_mask * sm_scale).to(query.dtype)
+                if query_for_mask is not None
+                else None
+            ),
         )
 
         context, metadata = dual_stage_quadratic_hip_attention(
@@ -707,5 +775,6 @@ online_update={online_update}
             cached_metadata=cached_metadata,
         )
         context = context.to(query.dtype)
+        context = context[:, -query.shape[1] :, :, :].contiguous()
 
         return context.view(N, num_heads, hidden_dims), metadata

@@ -86,6 +86,18 @@ class HiPAttentionConfig:
             HiPAttentionPerLayerConfig(),
         ]
     )
+    prefill_layers: list[HiPAttentionPerLayerConfig] = field(
+        default_factory=lambda: [
+            HiPAttentionPerLayerConfig(
+                parsed_json={
+                    "second_stage_k": 4096,
+                    "sliding_window_size": 1024,
+                    "sink_token_size": 256,
+                }
+            ),
+            HiPAttentionPerLayerConfig(),
+        ]
+    )
 
     # deprecated
     apply_v_dot: bool = False
