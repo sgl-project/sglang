@@ -34,7 +34,7 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
@@ -136,7 +136,32 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
 
 
 def call_generate_gserver(prompt, temperature, max_tokens, stop=None, url=None):
-    raise NotImplementedError()
+    import grpc
+    from xlm.proto import sampler_pb2, sampler_pb2_grpc
+
+    sampler_channel = grpc.insecure_channel(url.replace("http://", ""))
+    sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)
+
+    if stop is None:
+        stop_strings = None
+    elif isinstance(stop, str):
+        stop_strings = [stop]
+    else:
+        stop_strings = stop
+
+    sample_request = sampler_pb2.SampleTextRequest(
+        prompt=prompt,
+        settings=sampler_pb2.SampleSettings(
+            max_len=max_tokens,
+            rng_seed=0,
+            temperature=max(temperature, 1e-10),
+            nucleus_p=1,
+            stop_strings=stop_strings,
+        ),
+    )
+    stream = sampler.SampleText(sample_request)
+    response = "".join([x.text for x in stream])
+    return response
 
 
 def call_generate_guidance(
@@ -530,31 +555,19 @@ def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
 
-def run_bench_serving(
-    model,
-    num_prompts,
-    request_rate,
-    other_server_args,
-    dataset_name="random",
+def get_benchmark_args(
+    base_url="",
+    dataset_name="",
     dataset_path="",
-    tokenizer=None,
+    tokenizer="",
+    num_prompts=500,
     random_input_len=4096,
     random_output_len=2048,
+    request_rate=float("inf"),
     disable_stream=False,
     disable_ignore_eos=False,
-    need_warmup=False,
 ):
-    # Launch the server
-    base_url = DEFAULT_URL_FOR_TEST
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_server_args,
-    )
-
-    # Run benchmark
-    args = SimpleNamespace(
+    return SimpleNamespace(
         backend="sglang",
         base_url=base_url,
         host=None,
@@ -583,6 +596,42 @@ def run_bench_serving(
         lora_name=None,
     )
 
+
+def run_bench_serving(
+    model,
+    num_prompts,
+    request_rate,
+    other_server_args,
+    dataset_name="random",
+    dataset_path="",
+    tokenizer=None,
+    random_input_len=4096,
+    random_output_len=2048,
+    disable_stream=False,
+    need_warmup=False,
+):
+    # Launch the server
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    # Run benchmark
+    args = get_benchmark_args(
+        base_url=base_url,
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        tokenizer=tokenizer,
+        num_prompts=num_prompts,
+        random_input_len=random_input_len,
+        random_output_len=random_output_len,
+        request_rate=request_rate,
+        disable_stream=disable_stream,
+    )
+
     try:
         if need_warmup:
             warmup_args = copy.deepcopy(args)
@@ -594,6 +643,38 @@ def run_bench_serving(
 
     assert res["completed"] == num_prompts
     return res
+
+
+def run_bench_serving_multi(
+    model,
+    base_url,
+    other_server_args,
+    benchmark_args,
+    need_warmup=False,
+):
+    # Launch the server
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    # run benchmark for all
+    res_l = []
+    try:
+        for args in benchmark_args:
+            if need_warmup:
+                warmup_args = copy.deepcopy(args)
+                warmup_args.num_prompts = 16
+                run_benchmark(warmup_args)
+
+            res = run_benchmark(args)
+            res_l.append((args, res))
+    finally:
+        kill_process_tree(process.pid)
+
+    return res_l
 
 
 def run_bench_one_batch(model, other_args):
