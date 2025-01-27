@@ -133,6 +133,7 @@ class Grok1MoE(nn.Module):
             renormalize=False,
             quant_config=quant_config,
             tp_size=tp_size,
+            activation="gelu",
             use_presharded_weights=use_presharded_weights,
         )
 

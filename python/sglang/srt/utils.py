@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import base64
+import ctypes
 import dataclasses
 import io
 import ipaddress
@@ -29,6 +30,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import warnings
@@ -59,7 +61,6 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
-from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def is_hip() -> bool:
 
 
 def is_cuda():
-    return hasattr(torch, "cuda") and torch.cuda.is_available()
+    return hasattr(torch, "cuda") and torch.version.cuda is not None
 
 
 def is_cuda_alike():
@@ -797,7 +798,7 @@ def get_zmq_socket(
 
 
 def dump_to_file(dirpath, name, value):
-    from vllm.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() != 0:
         return
@@ -1266,68 +1267,6 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return str(data)
 
 
-TOOLS_TAG_LIST = ["<|plugin|>", "<function=", "<tool_call>", "<|python_tag|>"]
-
-
-def parse_tool_response(text, tools, **kwargs):
-    """Parse model response containing tool information.
-
-    Args:
-        text(str): model response in string format
-        tools(List): tools from user request
-    """
-    if "<|plugin|>" in text:  # internlm2
-        text, action = text.split("<|action_start|><|plugin|>")
-        action = action.split("<|action_end|>".strip())[0]
-        action = action[action.find("{") :]
-        action = json.loads(action)
-        name, parameters = action["name"], json.dumps(
-            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
-        )
-        call_info_list = [(name, parameters)]
-    elif "<function=" in text:  # llama3.1
-        action, _ = text.split("</function>")
-        parameters = action[action.find("{") :]
-        name = action.split("<function=")[1].split(">{")[0]
-        call_info_list = [(name, parameters)]
-    elif "<tool_call>" in text and "</tool_call>" in text:  # qwen2.5
-        # get tool_call in text
-        pattern = r"<tool_call>(.*?)</tool_call>"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
-        call_info_list = []
-        for match_result in match_result_list:
-            action = json.loads(match_result)
-            call_info_list.append(
-                (action["name"], json.dumps(action["arguments"], ensure_ascii=False))
-            )
-        # get text outside of tags
-        if not text.startswith("<tool_call>"):
-            text = text[: text.find("<tool_call>")]
-        elif not text.endswith("</tool_call>"):
-            text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
-        else:
-            text = ""
-    elif "<|python_tag|>" in text:  # llama3.2
-        _, action = text.split("<|python_tag|>")
-        action = json.loads(action)
-        name, parameters = action["name"], json.dumps(
-            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
-        )
-        call_info_list = [(name, parameters)]
-    else:
-        raise RuntimeError(f"Unexpected model response: {text}")
-
-    call_info_list = [
-        (
-            [tool.function.name for tool in tools].index(call_info[0]),
-            call_info[0],
-            call_info[1],
-        )
-        for call_info in call_info_list
-    ]
-    return text, call_info_list
-
-
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
     b_ = x.shape[0]
     n_ = x.shape[1]
@@ -1390,7 +1329,33 @@ def nullable_str(val: str):
     return val
 
 
+def pyspy_dump_schedulers():
+    """py-spy dump on all scheduler in a local node."""
+    try:
+        pid = psutil.Process().pid
+        # Command to run py-spy with the PID
+        cmd = f"py-spy dump --pid {pid}"
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, check=True
+        )
+        logger.info(f"Profile for PID {pid}:\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logger.info(f"Failed to profile PID {pid}. Error: {e.stderr}")
+
+
+def kill_itself_when_parent_died():
+    if sys.platform == "linux":
+        # sigkill this process when parent worker manager dies
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    else:
+        logger.warninig("kill_itself_when_parent_died is only supported in linux.")
+
+
 def set_uvicorn_logging_configs():
+    from uvicorn.config import LOGGING_CONFIG
+
     LOGGING_CONFIG["formatters"]["default"][
         "fmt"
     ] = "[%(asctime)s] %(levelprefix)s %(message)s"
@@ -1473,3 +1438,28 @@ def rank0_print(msg: str):
 
     if get_tensor_model_parallel_rank() == 0:
         print(msg, flush=True)
+
+
+def launch_dummy_health_check_server(host, port):
+    import uvicorn
+    from fastapi import FastAPI, Response
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    @app.get("/health_generate")
+    async def health_generate():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        timeout_keep_alive=5,
+        loop="uvloop",
+    )

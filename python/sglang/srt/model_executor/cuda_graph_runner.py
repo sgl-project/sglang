@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
+def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             if reverse:
@@ -47,7 +47,7 @@ def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
             else:
                 # NOTE: Temporarily workaround MoE
                 if "FusedMoE" in sub.__class__.__name__:
-                    if batch_size == 1:
+                    if num_tokens == 1:
                         # The performance of torch.compile on this layer is not always good when bs > 1,
                         # so we decide to only use torch.compile when bs =1
                         sub._forward_method = fused_moe_forward_native
@@ -55,14 +55,14 @@ def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
                     sub._forward_method = sub.forward_native
                 setattr(sub, "is_torch_compile", True)
         if isinstance(sub, torch.nn.Module):
-            _to_torch(sub, reverse, batch_size)
+            _to_torch(sub, reverse, num_tokens)
 
 
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
-    batch_size: int,
+    num_tokens: int,
     tp_group: GroupCoordinator,
 ):
     """Patch the model to make it compatible with with torch.compile"""
@@ -70,7 +70,7 @@ def patch_model(
 
     try:
         if enable_compile:
-            _to_torch(model, reverse=False, batch_size=batch_size)
+            _to_torch(model, reverse=False, num_tokens=num_tokens)
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -85,7 +85,7 @@ def patch_model(
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True, batch_size=batch_size)
+            _to_torch(model, reverse=True, num_tokens=num_tokens)
             tp_group.ca_comm = backup_ca_comm
 
 
@@ -291,8 +291,8 @@ class CudaGraphRunner:
                     with patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
-                        bs,
-                        self.model_runner.tp_group,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
                     ) as forward:
                         (
                             graph,
