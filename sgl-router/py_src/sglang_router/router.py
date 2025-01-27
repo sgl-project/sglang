@@ -17,6 +17,8 @@ class Router:
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
+        worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
+        worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
             if the match rate exceeds threshold, otherwise routes to the worker with the smallest
             tree. Default: 0.5
@@ -37,6 +39,8 @@ class Router:
         policy: PolicyType = PolicyType.RoundRobin,
         host: str = "127.0.0.1",
         port: int = 3001,
+        worker_startup_timeout_secs: int = 300,
+        worker_startup_check_interval: int = 10,
         cache_threshold: float = 0.50,
         balance_abs_threshold: int = 32,
         balance_rel_threshold: float = 1.0001,
@@ -50,6 +54,8 @@ class Router:
             policy=policy,
             host=host,
             port=port,
+            worker_startup_timeout_secs=worker_startup_timeout_secs,
+            worker_startup_check_interval=worker_startup_check_interval,
             cache_threshold=cache_threshold,
             balance_abs_threshold=balance_abs_threshold,
             balance_rel_threshold=balance_rel_threshold,

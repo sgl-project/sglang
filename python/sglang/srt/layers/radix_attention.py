@@ -54,8 +54,8 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
-        self.k_scale = 1.0
-        self.v_scale = 1.0
+        self.k_scale = None
+        self.v_scale = None
 
         self.orig_context_len = orig_context_len
 

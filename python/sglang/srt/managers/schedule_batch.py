@@ -158,7 +158,6 @@ class ImageInputs:
     im_end_id: Optional[torch.Tensor] = None
     slice_start_id: Optional[torch.Tensor] = None
     slice_end_id: Optional[torch.Tensor] = None
-
     tgt_sizes: Optional[list] = None
 
     @staticmethod
@@ -233,6 +232,7 @@ class Req:
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
+        custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
@@ -253,6 +253,7 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
         self.req_pool_idx = None
@@ -549,13 +550,13 @@ class ScheduleBatch:
     next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: torch.Tensor = None
-    input_embeds: torch.Tensor = None
-    req_pool_indices: torch.Tensor = None
-    seq_lens: torch.Tensor = None
+    input_ids: torch.Tensor = None  # shape: [b], int32
+    input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    req_pool_indices: torch.Tensor = None  # shape: [b], int32
+    seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
-    out_cache_loc: torch.Tensor = None
-    output_ids: torch.Tensor = None
+    out_cache_loc: torch.Tensor = None  # shape: [b], int32
+    output_ids: torch.Tensor = None  # shape: [b], int32
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
@@ -594,6 +595,9 @@ class ScheduleBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
 
+    # Enable custom logit processor
+    enable_custom_logit_processor: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -604,6 +608,7 @@ class ScheduleBatch:
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
+        enable_custom_logit_processor: bool,
     ):
         return cls(
             reqs=reqs,
@@ -617,6 +622,7 @@ class ScheduleBatch:
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
+            enable_custom_logit_processor=enable_custom_logit_processor,
         )
 
     def batch_size(self):
@@ -1020,7 +1026,7 @@ class ScheduleBatch:
         self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1106,6 +1112,8 @@ class ScheduleBatch:
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
+        if self.spec_info:
+            self.spec_info.filter_batch(new_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1200,6 +1208,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            enable_custom_logit_processor=self.enable_custom_logit_processor,
         )
 
     def __str__(self):
