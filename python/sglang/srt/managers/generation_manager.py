@@ -655,7 +655,7 @@ class _RequestDumper:
 
 @dataclasses.dataclass
 class _ReqState:
-    """Store the state of a request."""
+    """Store the state a request."""
 
     out_list: List
     finished: bool
