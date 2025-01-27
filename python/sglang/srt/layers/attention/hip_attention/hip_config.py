@@ -86,6 +86,7 @@ class HiPAttentionConfig:
             HiPAttentionPerLayerConfig(),
         ]
     )
+    prefill_layers: Optional[list[HiPAttentionPerLayerConfig]] = None
 
     # deprecated
     apply_v_dot: bool = False
@@ -140,8 +141,9 @@ class HiPAttentionConfig:
                     HiPAttentionPerLayerConfig(parsed_json=layer)
                     for layer in parsed_json["layers"]
                 ]
-                self.prefill_layers = self.layers
                 parsed_json.pop("layers")
+            if self.prefill_layers is None:
+                self.prefill_layers = self.layers
             if "prefill_layers" in parsed_json:
                 self.prefill_layers = [
                     HiPAttentionPerLayerConfig(parsed_json=layer)
