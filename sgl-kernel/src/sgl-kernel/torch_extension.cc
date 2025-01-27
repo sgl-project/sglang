@@ -28,15 +28,17 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
-  // sampling_scaling_penalties
-  m.def("sampling_scaling_penalties(Tensor logits, Tensor scaling_penalties) -> Tensor");
-  m.impl("sampling_scaling_penalties", torch::kCUDA, &sampling_scaling_penalties);
-
   // int8_scaled_mm
   m.def(
       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");
   m.impl("int8_scaled_mm", torch::kCUDA, &int8_scaled_mm);
+
+  // fp8_scaled_mm
+  m.def(
+      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+      "bias) -> Tensor");
+  m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
 
   // lightning_attention_decode
   m.def(
