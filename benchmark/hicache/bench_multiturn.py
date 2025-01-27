@@ -6,6 +6,7 @@ import random
 import threading
 import time
 from typing import Optional
+from datetime import datetime
 
 import aiohttp
 import requests
@@ -79,7 +80,7 @@ def parse_args():
         help="Server port (default: 30000)",
     )
     parser.add_argument(
-        "--model",
+        "--model-path",
         type=str,
         default="meta-llama/Llama-3.1-8B-Instruct",
         help="model path compatible with Hugging Face Transformers",
@@ -164,6 +165,18 @@ def gen_payload(prompt, output_len):
     return payload
 
 
+def log_to_jsonl_file(data, file_path="performance_metrics.jsonl"):
+    """Append the data with a timestamp to the specified JSONL file."""
+    timestamped_data = {"timestamp": datetime.now().isoformat(), **data}
+    try:
+        with open(file_path, "a") as file:
+            file.write(
+                json.dumps(timestamped_data) + "\n"
+            )  # Write as a single line in JSONL format
+    except IOError as e:
+        print(f"Error writing to JSONL file: {e}")
+
+
 class ReadyQueue:
     """
     Thread-safe queue that can pop requests in different orders based on given policy.
@@ -197,7 +210,7 @@ class WorkloadGenerator:
         # Construct the base URL for requests
         self.url = f"http://{args.host}:{args.port}/generate"
 
-        self.tokenizer = get_tokenizer(args.model)
+        self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
         self.request_rate = args.request_rate
         self.start_time = None
@@ -315,33 +328,48 @@ class WorkloadGenerator:
 
         request_thread.join()
         response_thread.join()
-
         self.pbar.close()
-        print("All requests completed.")
+
+        performance_data = {
+            "summary": {
+                "total_requests": len(self.performance_metrics["ttft"]),
+                "request_rate": self.request_rate,
+                "average_ttft": sum(self.performance_metrics["ttft"])
+                / len(self.performance_metrics["ttft"]),
+                "p90_ttft": sorted(self.performance_metrics["ttft"])[
+                    int(0.9 * len(self.performance_metrics["ttft"]))
+                ],
+                "median_ttft": sorted(self.performance_metrics["ttft"])[
+                    len(self.performance_metrics["ttft"]) // 2
+                ],
+                "average_latency": sum(self.performance_metrics["latency"])
+                / len(self.performance_metrics["latency"]),
+                "p90_latency": sorted(self.performance_metrics["latency"])[
+                    int(0.9 * len(self.performance_metrics["latency"]))
+                ],
+                "median_latency": sorted(self.performance_metrics["latency"])[
+                    len(self.performance_metrics["latency"]) // 2
+                ],
+                "throughput": self.pbar.total / (self.finished_time - self.start_time),
+            },
+        }
+        print("All requests completed")
         print("Performance metrics summary:")
         print(
-            f"  Total requests: {len(self.performance_metrics['ttft'])} at {self.request_rate} requests per second"
+            f"  Total requests: {performance_data['summary']['total_requests']} at {performance_data['summary']['request_rate']} requests per second"
         )
+        print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
+        print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
+        print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
         print(
-            f"  Average TTFT: {sum(self.performance_metrics['ttft']) / len(self.performance_metrics['ttft']):.2f}"
+            f"  Average latency: {performance_data['summary']['average_latency']:.2f}"
         )
+        print(f"  P90 latency: {performance_data['summary']['p90_latency']:.2f}")
+        print(f"  Median latency: {performance_data['summary']['median_latency']:.2f}")
         print(
-            f"  P90 TTFT: {sorted(self.performance_metrics['ttft'])[int(0.9 * len(self.performance_metrics['ttft']))]:.2f}"
+            f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
-        print(
-            f"  Median TTFT: {sorted(self.performance_metrics['ttft'])[len(self.performance_metrics['ttft']) // 2]:.2f}"
-        )
-        print(
-            f"  Average latency: {sum(self.performance_metrics['latency']) / len(self.performance_metrics['latency']):.2f}"
-        )
-        print(
-            f"  P90 latency: {sorted(self.performance_metrics['latency'])[int(0.9 * len(self.performance_metrics['latency']))]:.2f}"
-        )
-        print(
-            f"  Median latency: {sorted(self.performance_metrics['latency'])[len(self.performance_metrics['latency']) // 2]:.2f}"
-        )
-        throughput = self.pbar.total / (self.finished_time - self.start_time)
-        print(f"Throughput: {throughput:.2f} requests per second")
+        log_to_jsonl_file(performance_data)
 
 
 if __name__ == "__main__":

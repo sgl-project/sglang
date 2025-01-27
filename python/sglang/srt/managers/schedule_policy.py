@@ -194,9 +194,6 @@ class SchedulePolicy:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
-            # todo: make load back compatible with this policy
-            while req.last_node.evicted:
-                req.last_node = req.last_node.parent
             last_node_to_reqs[req.last_node].append(req)
 
         node_to_weight = defaultdict(int)
