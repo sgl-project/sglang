@@ -71,8 +71,8 @@ nvcc_flags = [
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
-    "-Xcompiler",
-    "-w",
+    "-Xcompiler=-Wconversion",
+    "-Xcompiler=-fno-strict-aliasing",
 ]
 nvcc_flags_fp8 = [
     "-DFLASHINFER_ENABLE_FP8",
@@ -88,12 +88,13 @@ sources = [
     "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
-    "src/sgl-kernel/csrc/rotary_embedding.cu",
+    "src/sgl-kernel/csrc/fused_add_rms_norm_kernel.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
+    "3rdparty/flashinfer/csrc/rope.cu",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
