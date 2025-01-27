@@ -18,7 +18,6 @@ suites = {
         "test_eagle_infer.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
-        "test_get_weights_by_name.py",
         "test_gguf.py",
         "test_input_embeddings.py",
         "test_json_constrained.py",
@@ -42,8 +41,7 @@ suites = {
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torch_compile_moe.py",
-        # Temporarily disable this because it requires PyTorch >= 2.5
-        # "test_torch_native_attention_backend.py",
+        "test_torch_native_attention_backend.py",
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",

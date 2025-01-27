@@ -28,6 +28,7 @@
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4
+- Phi-3 / Phi-4
 - Phi-3-Small
 - IBM Granite 3
 
@@ -91,7 +92,7 @@ Here is how you can do it:
 
 ```python
 from sglang.srt.models.registry import ModelRegistry
-from sglang.srt.server import launch_server
+from sglang.srt.entrypoints.http_server import launch_server
 
 # for a single model, you can add it to the registry
 ModelRegistry.models[model_name] = model_class

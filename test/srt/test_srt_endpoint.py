@@ -4,8 +4,11 @@ python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_logprob_with_chunked_
 """
 
 import json
+import random
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import numpy as np
 import requests
@@ -253,8 +256,11 @@ class TestSRTEndpoint(unittest.TestCase):
 
         self.assertTrue(all(x is not None for x in logprobs))
 
-    def run_custom_logit_processor(self, target_token_id: int):
-        """Test custom logit processor with custom params."""
+    def run_custom_logit_processor(self, target_token_id: Optional[int] = None):
+        """Test custom logit processor with custom params.
+
+        If target_token_id is None, the custom logit processor won't be passed in.
+        """
 
         custom_params = {"token_id": target_token_id}
 
@@ -285,8 +291,12 @@ class TestSRTEndpoint(unittest.TestCase):
 
         # Custom json data with custom logit processor and params.
         custom_json = base_json.copy()
-        custom_json["custom_logit_processor"] = DeterministicLogitProcessor().to_str()
-        custom_json["sampling_params"]["custom_params"] = custom_params
+        # Only set the custom logit processor if target_token_id is not None.
+        if target_token_id is not None:
+            custom_json["custom_logit_processor"] = (
+                DeterministicLogitProcessor().to_str()
+            )
+            custom_json["sampling_params"]["custom_params"] = custom_params
 
         custom_response = requests.post(
             self.base_url + "/generate",
@@ -297,17 +307,48 @@ class TestSRTEndpoint(unittest.TestCase):
         sampled_tokens = [x[1] for x in output_token_logprobs]
 
         # The logit processor should always sample the given token as the logits is deterministic.
-        self.assertTrue(all(x == custom_params["token_id"] for x in sampled_tokens))
+        if target_token_id is not None:
+            self.assertTrue(
+                all(x == custom_params["token_id"] for x in sampled_tokens),
+                # Print the detailed test case info if the test fails.
+                f"{target_token_id=}\n{sampled_tokens=}\n{custom_response=}",
+            )
 
     def test_custom_logit_processor(self):
         """Test custom logit processor with a single request."""
         self.run_custom_logit_processor(target_token_id=5)
 
-    def test_custom_logit_processor_batch(self):
-        """Test custom logit processor with a batch of requests."""
-        target_token_ids = list(range(32))
+    def test_custom_logit_processor_batch_mixed(self):
+        """Test a batch of requests mixed of requests with and without custom logit processor."""
+        target_token_ids = list(range(32)) + [None] * 16
+        random.shuffle(target_token_ids)
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
+
+    def test_cache_tokens(self):
+        for _ in range(2):
+            time.sleep(1)
+            response = requests.post(self.base_url + "/flush_cache")
+            assert response.status_code == 200
+
+        def send_and_check_cached_tokens(input_ids):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": list(input_ids),
+                    "sampling_params": {
+                        "max_new_tokens": 1,
+                    },
+                },
+            )
+            response_json = response.json()
+            return response_json["meta_info"]["cached_tokens"]
+
+        self.assertEqual(send_and_check_cached_tokens(range(0, 100)), 0)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 100)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 9999)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 1000)), 999)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 11000)), 10000)
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/get_server_info")

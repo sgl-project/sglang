@@ -176,7 +176,7 @@ class TokenizerManager:
                 )
 
         # Store states
-        self.to_create_loop = True
+        self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
@@ -226,9 +226,10 @@ class TokenizerManager:
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
-                (BatchStrOut, self._handle_batch_output),
-                (BatchEmbeddingOut, self._handle_batch_output),
-                (BatchTokenIDOut, self._handle_batch_output),
+                (
+                    (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut),
+                    self._handle_batch_output,
+                ),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -684,7 +685,6 @@ class TokenizerManager:
     async def close_session(
         self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
-        assert not self.to_create_loop, "close session should not be the first request"
         await self.send_to_scheduler.send_pyobj(obj)
 
     def configure_logging(self, obj: ConfigureLoggingReq):
@@ -713,10 +713,10 @@ class TokenizerManager:
         return background_tasks
 
     def auto_create_handle_loop(self):
-        if not self.to_create_loop:
+        if self.no_create_loop:
             return
 
-        self.to_create_loop = False
+        self.no_create_loop = True
         loop = asyncio.get_event_loop()
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
@@ -785,6 +785,9 @@ class TokenizerManager:
                     i,
                 )
 
+            if self.server_args.speculative_algorithm:
+                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+
             if not isinstance(recv_obj, BatchEmbeddingOut):
                 meta_info.update(
                     {
@@ -809,6 +812,7 @@ class TokenizerManager:
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
+
             state.out_list.append(out_dict)
             state.finished = recv_obj.finished_reasons[i] is not None
             state.event.set()

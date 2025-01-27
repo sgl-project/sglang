@@ -24,7 +24,7 @@ import tqdm
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -33,13 +33,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
+def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             if reverse:
@@ -48,7 +47,7 @@ def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
             else:
                 # NOTE: Temporarily workaround MoE
                 if "FusedMoE" in sub.__class__.__name__:
-                    if batch_size == 1:
+                    if num_tokens == 1:
                         # The performance of torch.compile on this layer is not always good when bs > 1,
                         # so we decide to only use torch.compile when bs =1
                         sub._forward_method = fused_moe_forward_native
@@ -56,23 +55,22 @@ def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
                     sub._forward_method = sub.forward_native
                 setattr(sub, "is_torch_compile", True)
         if isinstance(sub, torch.nn.Module):
-            _to_torch(sub, reverse, batch_size)
+            _to_torch(sub, reverse, num_tokens)
 
 
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
-    batch_size: int,
-    tp_group: "GroupCoordinator",
+    num_tokens: int,
+    tp_group: GroupCoordinator,
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
 
     try:
         if enable_compile:
-            _to_torch(model, reverse=False, batch_size=batch_size)
-            monkey_patch_vllm_all_gather()
+            _to_torch(model, reverse=False, num_tokens=num_tokens)
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -87,8 +85,7 @@ def patch_model(
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True, batch_size=batch_size)
-            monkey_patch_vllm_all_gather(reverse=True)
+            _to_torch(model, reverse=True, num_tokens=num_tokens)
             tp_group.ca_comm = backup_ca_comm
 
 
@@ -152,9 +149,18 @@ class CudaGraphRunner:
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
 
+        self.compile_bs = (
+            [
+                bs
+                for bs in self.capture_bs
+                if bs <= self.model_runner.server_args.torch_compile_max_bs
+            ]
+            if self.use_torch_compile
+            else []
+        )
+
         self.capture_forward_mode = ForwardMode.DECODE
         self.num_tokens_per_bs = 1
-
         if model_runner.spec_algorithm.is_eagle():
             if self.model_runner.is_draft_worker:
                 self.num_tokens_per_bs = (
@@ -166,16 +172,6 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
 
-        self.compile_bs = (
-            [
-                bs
-                for bs in self.capture_bs
-                if bs <= self.model_runner.server_args.torch_compile_max_bs
-            ]
-            if self.use_torch_compile
-            else []
-        )
-
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
@@ -183,7 +179,6 @@ class CudaGraphRunner:
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
 
@@ -192,14 +187,14 @@ class CudaGraphRunner:
 
         # Common inputs
         with torch.device("cuda"):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int32)
+            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
+            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
+            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
 
             # Speculative_inference
             if model_runner.spec_algorithm.is_eagle():
@@ -288,8 +283,8 @@ class CudaGraphRunner:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
-                    bs,
-                    self.model_runner.tp_group,
+                    num_tokens=bs * self.num_tokens_per_bs,
+                    tp_group=self.model_runner.tp_group,
                 ) as forward:
                     (
                         graph,

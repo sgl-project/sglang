@@ -3,28 +3,14 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
 
 #include <THC/THCAtomics.cuh>
 
-#include "utils.hpp"
-
-#ifdef USE_ROCM
-#include <hip/hip_runtime.h>
-#endif
-
-#ifndef USE_ROCM
 #define WARP_SIZE 32
-#else
-#define WARP_SIZE warpSize
-#endif
 
-#ifndef USE_ROCM
 #define DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
   cudaFuncSetAttribute(FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize, VAL)
-#else
-#define DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
-  hipFuncSetAttribute(FUNC, hipFuncAttributeMaxDynamicSharedMemorySize, VAL)
-#endif
 
 #define CEILDIV(x, y) (((x) + (y)-1) / (y))
 
@@ -39,7 +25,6 @@
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
 __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t col) {
-  // don't worry about overflow because num_experts is relatively small
   return row * total_col + col;
 }
 

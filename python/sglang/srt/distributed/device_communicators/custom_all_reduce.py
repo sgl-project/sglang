@@ -1,4 +1,5 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/device_communicators/custom_all_reduce.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce.py
+
 import ctypes
 import logging
 import os
@@ -6,7 +7,6 @@ from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, List, Optional, TypeVar, Union
 
-import pynvml
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -19,6 +19,14 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import cuda_device_count_stateless, is_cuda
+
+logger = logging.getLogger(__name__)
+
+if is_cuda():
+    try:
+        import pynvml
+    except ImportError as e:
+        logger.warning("Failed to import pynvml with %r", e)
 
 try:
     if ops.use_vllm_custom_allreduce:
@@ -177,9 +185,12 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        assert is_cuda()
+        if is_cuda():
+            assert is_cuda()
 
-        full_nvlink = is_full_nvlink(physical_device_ids)
+            full_nvlink = is_full_nvlink(physical_device_ids)
+        else:
+            full_nvlink = False
         if world_size > 2 and not full_nvlink:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"

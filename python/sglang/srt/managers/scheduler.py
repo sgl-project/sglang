@@ -281,6 +281,7 @@ class Scheduler:
         # Print debug info
         logger.info(
             f"max_total_num_tokens={self.max_total_num_tokens}, "
+            f"chunked_prefill_size={server_args.chunked_prefill_size}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"max_running_requests={self.max_running_requests}, "
             f"context_len={self.model_config.context_len}"
@@ -407,6 +408,11 @@ class Scheduler:
                     # TODO: Add lora name/path in the future,
                 },
             )
+
+        # The largest prefill length of a single request
+        self._largest_prefill_len: int = 0
+        # The largest context length (prefill + generation) of a single request
+        self._largest_prefill_decode_len: int = 0
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -660,23 +666,22 @@ class Scheduler:
                 self.waiting_queue.append(req)
                 return
 
-        # Copy more attributes
-        req.logprob_start_len = recv_req.logprob_start_len
-
-        if req.logprob_start_len == -1:
-            # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-
         # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
         )
-
         if error_msg:
             self.waiting_queue.append(req)
             return
+
+        # Copy more attributes
+        if recv_req.logprob_start_len == -1:
+            # By default, only return the logprobs for output tokens
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+        else:
+            req.logprob_start_len = recv_req.logprob_start_len
 
         req.sampling_params.max_new_tokens = min(
             (
@@ -725,12 +730,17 @@ class Scheduler:
         req.tokenizer = self.tokenizer
 
         # Validate prompts length
-        validate_input_length(
+        error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
         )
+        if error_msg:
+            self.waiting_queue.append(req)
+            return
 
+        # Copy more attributes
+        req.logprob_start_len = len(req.origin_input_ids) - 1
         self.waiting_queue.append(req)
 
     def log_prefill_stats(self, adder, can_run_list, running_bs, has_being_chunked):
@@ -785,8 +795,9 @@ class Scheduler:
                 f"gen throughput (token/s): {gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}"
             )
+            spec_accept_length = 0
         else:
-            accept_length = (
+            spec_accept_length = (
                 self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
             )
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
@@ -795,7 +806,7 @@ class Scheduler:
                 f"#running-req: {num_running_reqs}, "
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"accept len: {accept_length:.2f}, "
+                f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}"
             )
@@ -807,6 +818,7 @@ class Scheduler:
             self.stats.token_usage = num_used / self.max_total_num_tokens
             self.stats.gen_throughput = gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
 
     def check_memory(self):
@@ -964,6 +976,7 @@ class Scheduler:
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
         )
         new_batch.prepare_for_extend()
 
@@ -1020,7 +1033,7 @@ class Scheduler:
             )
 
         # Check for jump-forward
-        if not self.disable_jump_forward:
+        if not self.disable_jump_forward and batch.has_grammar:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
@@ -1041,26 +1054,23 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            if batch.forward_mode.is_decode_or_idle() or batch.extend_num_tokens != 0:
-                if self.spec_algorithm.is_none():
-                    model_worker_batch = batch.get_model_worker_batch()
-                    logits_output, next_token_ids = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                else:
-                    (
-                        logits_output,
-                        next_token_ids,
-                        model_worker_batch,
-                        num_accepted_tokens,
-                    ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                    self.spec_num_total_accepted_tokens += (
-                        num_accepted_tokens + batch.batch_size()
-                    )
-                    self.spec_num_total_forward_ct += batch.batch_size()
-                    self.num_generated_tokens += num_accepted_tokens
+            if self.spec_algorithm.is_none():
+                model_worker_batch = batch.get_model_worker_batch()
+                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                    model_worker_batch
+                )
             else:
-                assert False, "batch.extend_num_tokens == 0, this is unexpected!"
+                (
+                    logits_output,
+                    next_token_ids,
+                    model_worker_batch,
+                    num_accepted_tokens,
+                ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                self.spec_num_total_accepted_tokens += (
+                    num_accepted_tokens + batch.batch_size()
+                )
+                self.spec_num_total_forward_ct += batch.batch_size()
+                self.num_generated_tokens += num_accepted_tokens
             batch.output_ids = next_token_ids
 
             ret = GenerationBatchResult(
@@ -1069,7 +1079,6 @@ class Scheduler:
                 bid=model_worker_batch.bid,
             )
         else:  # embedding or reward model
-            assert batch.extend_num_tokens != 0
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(
@@ -1368,6 +1377,7 @@ class Scheduler:
             prompt_tokens = []
             completion_tokens = []
             cached_tokens = []
+            spec_verify_ct = []
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1421,6 +1431,9 @@ class Scheduler:
                     completion_tokens.append(len(req.output_ids))
                     cached_tokens.append(req.cached_tokens)
 
+                    if not self.spec_algorithm.is_none():
+                        spec_verify_ct.append(req.spec_verify_ct)
+
                     if return_logprob:
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
@@ -1448,6 +1461,7 @@ class Scheduler:
                         prompt_tokens,
                         completion_tokens,
                         cached_tokens,
+                        spec_verify_ct,
                         input_token_logprobs_val,
                         input_token_logprobs_idx,
                         output_token_logprobs_val,
@@ -1518,6 +1532,7 @@ class Scheduler:
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -1560,6 +1575,15 @@ class Scheduler:
                 self.grammar_backend.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
+
+            if not self.spec_algorithm.is_none():
+                self.draft_worker.model_runner.req_to_token_pool.clear()
+                self.draft_worker.model_runner.token_to_kv_pool.clear()
+
+            self.num_generated_tokens = 0
+            self.forward_ct_decode = 0
+            self.spec_num_total_accepted_tokens = 0
+            self.spec_num_total_forward_ct = 0
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             if_success = True

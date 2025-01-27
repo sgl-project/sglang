@@ -12,7 +12,7 @@ import torch.library
 from sglang.srt.utils import is_hpu
 
 logger = logging.getLogger(__name__)
-use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=False)
+use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=True)
 
 if not is_hpu():
     if use_vllm_custom_allreduce:

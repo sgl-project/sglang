@@ -29,8 +29,8 @@ from sglang.srt.utils import (
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
-    is_ipv6,
     is_port_available,
+    is_valid_ipv6_address,
     nullable_str,
 )
 
@@ -161,6 +161,7 @@ class ServerArgs:
 
     # Custom logit processor
     enable_custom_logit_processor: bool = False
+    tool_call_parser: str = None
 
     def __post_init__(self):
         # Set missing default values
@@ -317,6 +318,7 @@ class ServerArgs:
                 "dummy",
                 "gguf",
                 "bitsandbytes",
+                "layered",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -330,7 +332,10 @@ class ServerArgs:
             "which is mainly for profiling."
             '"gguf" will load the weights in the gguf format. '
             '"bitsandbytes" will load the weights using bitsandbytes '
-            "quantization.",
+            "quantization."
+            '"layered" loads weights layer by layer so that one can quantize a '
+            "layer before loading another to make the peak memory envelope "
+            "smaller.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -874,6 +879,14 @@ class ServerArgs:
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
+        # Function Calling
+        parser.add_argument(
+            "--tool-call-parser",
+            type=str,
+            choices=["qwen25", "mistral", "llama3"],
+            default=ServerArgs.tool_call_parser,
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -884,7 +897,7 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_ipv6(self.host):
+        if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"

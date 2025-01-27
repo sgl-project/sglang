@@ -22,7 +22,7 @@ from typing import Tuple
 import numpy as np
 import requests
 
-from sglang.srt.server import launch_server
+from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 

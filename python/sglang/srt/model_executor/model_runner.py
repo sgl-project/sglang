@@ -63,8 +63,8 @@ from sglang.srt.utils import (
     init_custom_process_group,
     is_cuda,
     is_hip,
+    monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
-    monkey_patch_vllm_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
 
@@ -185,9 +185,12 @@ class ModelRunner:
         self.load_model()
 
         # Apply torchao quantization
-        apply_torchao_config_to_model(
-            self.model, global_server_args_dict["torchao_config"]
-        )
+        torchao_applied = getattr(self.model, "torchao_applied", False)
+        # In layered loading, torchao may have been applied
+        if not torchao_applied:
+            apply_torchao_config_to_model(
+                self.model, global_server_args_dict["torchao_config"]
+            )
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
@@ -229,7 +232,8 @@ class ModelRunner:
             backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
-            monkey_patch_vllm_p2p_access_check(self.gpu_id)
+            monkey_patch_p2p_access_check()
+
         if self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:

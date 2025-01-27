@@ -17,12 +17,11 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -70,8 +69,10 @@ class GenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
-    # Custom logit processor (serialized function)
-    custom_logit_processor: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -249,8 +250,9 @@ class TokenizedGenerateReqInput:
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
-    # Custom logit processor (serialized function)
-    # TODO (hpguo): Add an example and update doc string here
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[str] = None
 
 
@@ -352,10 +354,13 @@ class BatchTokenIDOut:
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     no_stop_trim: List[bool]
+
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    spec_verify_ct: List[int]
+
     # Logprobs
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -380,6 +385,7 @@ class BatchStrOut:
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    spec_verify_ct: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -534,3 +540,27 @@ class CloseSessionReqInput:
 class OpenSessionReqOutput:
     session_id: Optional[str]
     success: bool
+
+
+@dataclass
+class Function:
+    description: Optional[str] = None
+    name: Optional[str] = None
+    parameters: Optional[object] = None
+
+
+@dataclass
+class Tool:
+    function: Function
+    type: Optional[str] = "function"
+
+
+@dataclass
+class FunctionCallReqInput:
+    text: str  # The text to parse.
+    tools: List[Tool] = field(
+        default_factory=list
+    )  # A list of available function tools (name, parameters, etc.).
+    tool_call_parser: Optional[str] = (
+        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+    )
