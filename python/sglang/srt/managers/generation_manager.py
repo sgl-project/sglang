@@ -457,6 +457,9 @@ class GenerationConverter:
                 index,
             )
 
+        if self.server_args.speculative_algorithm:
+            meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[index]
+
         if not isinstance(recv_obj, BatchEmbeddingOut):
             meta_info.update(
                 {

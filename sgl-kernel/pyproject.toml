@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgl-kernel"
-version = "0.0.2.post16"
+version = "0.0.2.post18"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,7 +17,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-"Homepage" = "https://github.com/sgl-project/sglang"
+"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [tool.setuptools]

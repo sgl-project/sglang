@@ -40,10 +40,13 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    FunctionCallReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -366,6 +369,28 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Close the session"""
     _global_state.orchestrator.configure_logging(obj)
     return Response(status_code=200)
+
+
+@app.post("/function_call")
+async def function_call_request(obj: FunctionCallReqInput, request: Request):
+    """
+    A native API endpoint to parse function calls from a text.
+    """
+    # 1) Initialize the parser based on the request body
+    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+
+    # 2) Call the non-stream parsing method (non-stream)
+    normal_text, calls = parser.parse_non_stream(obj.text)
+
+    # 3) Organize the response content
+    response_data = {
+        "normal_text": normal_text,
+        "calls": [
+            call.model_dump() for call in calls
+        ],  # Convert pydantic objects to dictionaries
+    }
+
+    return ORJSONResponse(content=response_data, status_code=200)
 
 
 ##### OpenAI-compatible API endpoints #####
