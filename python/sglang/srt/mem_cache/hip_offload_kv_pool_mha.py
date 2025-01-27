@@ -2,18 +2,15 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Optional, Set, Tuple, Union
+from typing import Dict, Set, Tuple
 
 import torch
 from hip.models.hip_attention.gen3.uvm_gpu_cache import (
-    GPUCache,
     HiPOffloadCache,
-    UVMCache,
     format_size_bytes,
 )
 from torch import Tensor
 
-from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -33,7 +30,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         head_dim: int,
         layer_num: int,
         device: torch.device,
-        hip_config: HiPAttentionConfig,
+        hip_config: "HiPAttentionConfig",
     ):
         assert isinstance(device, torch.device)
         assert device.index is not None
@@ -140,9 +137,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
     def get_kv_buffer(self, layer_id: int) -> HiPOffloadCache:
         # Use this function for decode, pass this to `k`
         if self.require_validation:
-            return self.layer_buffer[layer_id], *self.validation_cache.get_kv_buffer(
-                layer_id
-            )
+            return self.layer_buffer[layer_id], *self.validation_cache.get_kv_buffer(layer_id)
         return self.layer_buffer[layer_id]
 
     def prefetch_prefix_kv_buffer(

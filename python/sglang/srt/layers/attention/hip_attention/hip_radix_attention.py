@@ -21,18 +21,8 @@ from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVP
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInfo
-
-from hip.models.hip_attention.gen3.attention_extend import (
-    dual_stage_quadratic_hip_attention,
-)
-from hip.models.hip_attention.gen3.attention_metadata import (
-    HiPAttentionArgs,
-    HiPAttentionOutputMetadata,
-)
-from hip.models.hip_attention.gen3.uvm_gpu_cache import HiPOffloadCache
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +37,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
-        self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config
+        self.hip_config: "HiPAttentionConfig" = model_runner.hip_attention_config
 
         self.max_context_len = model_runner.model_config.context_len
 
@@ -98,8 +88,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-
-        # logger.info(f'HiP attention is used in prompting (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(
             forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool
@@ -292,8 +280,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-
-        # logger.info(f'HiP attention is used in decoding (layer {layer.layer_id})!', stacklevel=0)
 
         is_offload_cache = isinstance(
             forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool
@@ -588,13 +574,13 @@ online_update={online_update}
         batch_size: int,
         k_cache: Optional[torch.Tensor],
         v_cache: Optional[torch.Tensor],
-        offload_cache: Optional[HiPOffloadCache],
+        offload_cache: Optional["HiPOffloadCache"],
         positions: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_tokens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         layer: RadixAttention,
-        cached_metadata: Optional[HiPAttentionOutputMetadata] = None,
+        cached_metadata: Optional["HiPAttentionOutputMetadata"] = None,
         is_dense: bool = False,
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
@@ -652,6 +638,11 @@ online_update={online_update}
             require_cache_statistics = True
         elif os.getenv("HIP_DISABLE_COMPUTE_STATISTICS", "1") == "0":
             require_cache_statistics = True
+
+        from hip.models.hip_attention.gen3.attention_extend import (
+            dual_stage_quadratic_hip_attention,
+        )
+        from hip.models.hip_attention.gen3.attention_metadata import HiPAttentionArgs
 
         args = HiPAttentionArgs(
             k_cache=(

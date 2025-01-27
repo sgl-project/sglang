@@ -37,7 +37,6 @@ from sglang.srt.hf_transformers_utils import get_context_length, update_context_
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.hip_attention import HiPRadixAttentionBackend
-from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -50,7 +49,6 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
 from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -699,6 +697,7 @@ class ModelRunner:
 
         self.hip_metadata_cache_pool = None
         if self.server_args.enable_hip_attention:
+            from hip.models.hip_attention.gen3.hip_memory_pool import HiPMetadataCachePool
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
                 query_head_num=self.model_config.num_attention_heads // self.server_args.tp_size,
                 layer_num=self.model_config.num_hidden_layers,
@@ -765,6 +764,7 @@ class ModelRunner:
             )
 
     def init_hip_attention_config(self, hip_attention_config):
+        from hip.models.hip_attention.gen3.hip_config import HiPAttentionConfig
         if hip_attention_config is None:
             hip_attention_config = {}
         elif hip_attention_config.startswith("{"):
@@ -790,10 +790,7 @@ class ModelRunner:
         tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
-        logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s, "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")

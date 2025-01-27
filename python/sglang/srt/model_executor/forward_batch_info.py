@@ -43,7 +43,6 @@ from sglang.srt.utils import get_compiler_backend
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
-    from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -186,7 +185,7 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For HiP attention
-    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
+    hip_metadata_cache_pool: Optional["HiPMetadataCachePool"] = None
     hip_use_cached_mask: Optional[bool] = None
     hip_metadata_cached_stage: Optional[int] = None
 
