@@ -1,127 +1,117 @@
-# How to Measure Accuracy in SGLang
+# Measuring Model Accuracy in SGLang
 
-When contributing to SGLang, the [PR template](https://github.com/sgl-project/sglang/blob/main/.github/pull_request_template.md) requests contributors to report accuracy metrics when relevant. This guide demonstrates how to measure model accuracy using built-in benchmarks.
+This guide shows how to evaluate model accuracy using SGLang's built-in benchmarks.
 
-## Example: Evaluate on GSM8K
+## Evalutating model accuracy with SGLang
 
-The [GSM8K mathematical reasoning dataset](https://huggingface.co/datasets/openai/gsm8k) is commonly used for LLM evaluation. SGLang provides a [benchmark script](https://github.com/sgl-project/sglang/tree/main/benchmark/gsm8k) for this task.
+SGLang provides many [benchmark scripts](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark) which can be used to evaluate a models accuracy.
 
-**Key Implementation Details**:
+Below we describe the workflow of evaluation with [MMLU benchmark](https://github.com/sgl-project/sglang/tree/main/benchmark/mmlu) as an example but it is very similar for every benchmark script.
 
-* Few-shot Prompting: Prepends N example Q/A pairs (configurable via `--num-shots`)
+### Step 1
 
-* Prompt Structure: Combines few-shot examples with current question using `Question: {text}\nAnswer:` format
-
-* Answer Extraction:
-
-    * Uses regex to find last numeric value in model response
-
-    * Handles invalid outputs with fallback value (-9999999)
-
-* Batch Processing: Leverages SGLang's `run_batch` for [continous batching](https://docs.sglang.ai/frontend/frontend.html#batching)
-
-* Metric Tracking: Calculates accuracy, invalid response rate, and token throughput
-
-The implementation remains model-agnostic - simply modify the `--model-path` server argument to test different models.
-
-### Step 1: Launch Server
-
-Launch server with desired [server arguments](https://docs.sglang.ai/backend/server_arguments.html)
-
-```python
-python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen2.5-Math-1.5B-Instruct \
-  --port 30000 \
-  --mem-fraction-static 0.8
-```
-
-### Step 2: Run benchmark
-
-```python
-python3 bench_sglang.py --num-questions 200
-```
-
-This evaluates the first 200 questions from the dataset. Key arguments:
-
-* `--num-questions`: Number of questions to evaluate
-
-* `--data-path`: Custom dataset path in the format of the [default](https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl) which is used when no path is provided.
-
-* `--num-shots`: Number of few shots to include into each prompt.
-
-### Step 3: Read off accuracy
-
-After running the benchmark a `result.jsonl` file containing the accuracy is created. Read it off from here.
-
-## Example: Evaluate on MMLU
-
-[MMLU](https://arxiv.org/pdf/2009.03300) is a common dataset to benchmark model abilities in a multiple choice setting. SGLang provides a [benchmark script](https://github.com/sgl-project/sglang/tree/main/benchmark/mmlu) for this task.
-The implementation is similar to above. Contrary to GSM8K in MMLU we evaluate the models ability to reply with the letter corresponding to the correct answer.
-
-### Step 1: Download Dataset
-
-Execute the following code to download the dataset.
+Download the data
 
 ```bash
 bash download_data.sh
 ```
 
-### Step 2: Launch Server
+### Step 2
 
-Same as above.
+Launch the server
 
-```python
+```bash
 python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen2.5-Math-1.5B-Instruct \
-  --port 30000 \
-  --mem-fraction-static 0.8
+  --model-path Qwen/Qwen2.5-Math-1.5B-Instruct \ # Define model
+  --port 30000 \ # Define port
+  --mem-fraction-static 0.8 # Avoid memory error
 ```
 
-### Step 3: Run Benchmark
+### Step 3
 
-Similar to above.
+Run the benchmark script
 
 ```bash
 python3 bench_sglang.py --nsub 10
 ```
 
-This evaluates the model on 10 different subjects from the dataset. Key arguments:
+This will produce a `result.jsonl` file with the key metrics.
 
-* `--ntrain`: Number of few shot examples
-* `--nsub`: Number of subjects to evaluate the model on
+### Step 4
 
-### Step 4: Read off accuracy
+Use `cat result.jsonl | grep -oP '"accuracy": \K\d+\.\d+` to extract the accuracy.
 
-During script execution we get a breakdown on subject wise accuracy.
-After running the benchmark a `result.jsonl` file containing the accuracy is created. Read it off from here.
+## Key implementation notes
 
-## Replicating results and customize benchmark scripts
-
-[Qwen2.5-Math-1.5B](https://github.com/QwenLM/Qwen2.5-Math) is claimed to reach GSM8K accuracy of `76.8` when using 8 shot on GSM8K.
-
-Running `python3 bench_sglang.py --num-questions 8000 --num-shots 8` gives an accuracy of `76.1`.
-To recover the GSM8K accuracy reported in the paper you need to make two adjustments:
+Find a comparison of key parts of the implementation of [GSM8K](https://github.com/sgl-project/sglang/tree/main/benchmark/gsm8k) and [MMLU](https://github.com/sgl-project/sglang/tree/main/benchmark/mmlu) as example benchmarks below.
 
 ```python
-    for i in range(len(lines[num_shots:num_questions])):
-        questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
+# GSM8K Evaluation Script
+# Prompt construction with few-shot examples
+def build_prompt(question):
+    # Format: [Few-shot Q/A pairs] + Current Question
+    return few_shot_examples + f"Question: {question}\nAnswer:"
+
+# Answer extraction logic
+def parse_answer(response):
+    # Extract last numeric value from response
+    numbers = re.findall(r"\d+", response)
+    return int(numbers[-1]) if numbers else -9999999  # Error flag
+
+# Batch processing core
+responses = sgl.run_batch(prompts)  # Efficient continuous batching
 ```
-Here the adjustment made from the original script is that the few shot examples get *exluded* from evaluation.
 
 ```python
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += sgl.system("Please reason step by step, and put your final answer within \\boxed{}.")
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=2048, stop=["Question", "Assistant:", "</s>", "<|im_end|>", "<|endoftext|>"]
-        )
+# MMLU Evaluation Script
+# Multiple-choice prompt template
+def build_mmlu_prompt(question, choices):
+    # Format: [Examples] + Current Question + Options
+    return f"{examples}{question}\nOptions: {choices}\nAnswer:"
+
+# Choice extraction
+def parse_choice(response):
+    # Get last alphabetical character
+    return response.strip()[-1]  # A/B/C/D detection
+
+# Batch processing core
+states = few_shot_mmlu.run_batch(
+        ...
+        max_new_tokens=1, # Only one letter response
+        ...
+      )
 ```
-Here the adjustment made from the original script is that the system prompt for the model is included and the stop words are adjusted. Also `max_tokens` was increased from 512 to 2048. This gives us the reported accuracy of `76.8`.
 
-Please keep in mind to make similar adjustments to benchmark scripts in case you want to archieve maximum performance/replicate paper results.
+We see that the core implementation is very similar. It only differs in how we define the prompt and extract the response. Other benchmarks can be analyzed similary.
 
-## Other ways of evaluating model accuracy
+## Customizing Benchmark Scripts
 
-Instead of the [SGLang benchmark scripts](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark) you may use other alternatives tailored especially to the task of evaluating LLMs. Two alternatives are [OpenCompass](https://github.com/open-compass/opencompass) and [Language Model Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness/tree/main). Please consult their documentation on how to use them.
+To match [Qwen2.5-Math](https://github.com/QwenLM/Qwen2.5-Math)'s reported 76.8% GSM8K accuracy, customization is needed.
+
+```python
+for i in range(len(lines[num_shots:num_questions])): # Exclude the few shot examples for evaluation
+    questions.append(get_one_example(lines, i, False))
+    labels.append(get_answer_value(lines[i]["answer"]))
+```
+
+```python
+@sgl.function
+def few_shot_gsm8k(s, question):
+    s += sgl.system("Please reason step by step, and put your final answer within \\boxed{}.") # Include system prompt
+    s += few_shot_examples + question
+    s += sgl.gen(
+        "answer", max_tokens=2048, stop=["Question", "Assistant:", "</s>", "<|im_end|>", "<|endoftext|>"] # Adjust stopwords
+    )
+```
+
+These adjustments give us the us the reported accuracy.
+
+## Extending Evaluation Capabilities
+
+1. **Contribute New Benchmarks**
+   * Follow our [contribution guidelines](https://docs.sglang.ai/references/contribution_guide.html) to add new test scripts
+2. **Request Implementations**
+   * Feel free to open an issue describing your evaluation needs
+3. **Use Alternative Tools**
+   * [OpenCompass](https://opencompass.org.cn)
+   * [LM Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness)
