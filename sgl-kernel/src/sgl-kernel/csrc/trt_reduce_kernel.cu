@@ -3,11 +3,9 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <cassert>
-#include <iostream>
-#include <sstream>
-#include <unordered_map>
 
 #include "trt_reduce_internal.cuh"
+#include "utils.h"
 
 using namespace trt_llm;
 

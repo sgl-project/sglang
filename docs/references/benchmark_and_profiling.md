@@ -64,16 +64,31 @@ with nvtx.annotate("description", color="color"):
 ```bash
 # set trace path
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+
 # start server
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
-python -m sglang.bench_serving --backend sglang --model-path meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile
+# send profiling request from client
+python -m sglang.bench_serving --backend sglang --model-path meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
-
-Traces can be visualized using https://ui.perfetto.dev/.
+Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
 
 - To profile offline
 ```bash
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
 ```
+
+- View Traces
+
+Trace files can be loaded and visualized from:
+1. https://ui.perfetto.dev/ (any browser)
+2. chrome://tracing (Chrome browser only)
+
+If browser cannot open trace file due to its large size,
+client can generate a small trace file (<100MB) by controlling number of prompts and lengths of prompt outputs.
+For example, when profiling a server,
+```bash
+python -m sglang.bench_serving --backend sglang --model-path meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
+```
+sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.

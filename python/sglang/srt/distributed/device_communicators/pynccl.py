@@ -1,8 +1,10 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/device_communicators/pynccl.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
+
 import logging
 from contextlib import contextmanager
 from typing import Optional, Union
 
+# ===================== import region =====================
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
@@ -143,6 +145,57 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def all_gather(
+        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, stream=None
+    ):
+        if self.disabled:
+            return
+        # nccl communicator created on a specific device
+        # will only work on tensors on the same device
+        # otherwise it will cause "illegal memory access"
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        if stream is None:
+            stream = self.stream
+        self.nccl.ncclAllGather(
+            buffer_type(input_tensor.data_ptr()),
+            buffer_type(output_tensor.data_ptr()),
+            input_tensor.numel(),
+            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
+    def reduce_scatter(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+        stream=None,
+    ):
+        if self.disabled:
+            return
+        # nccl communicator created on a specific device
+        # will only work on tensors on the same device
+        # otherwise it will cause "illegal memory access"
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        if stream is None:
+            stream = self.stream
+        self.nccl.ncclReduceScatter(
+            buffer_type(input_tensor.data_ptr()),
+            buffer_type(output_tensor.data_ptr()),
+            output_tensor.numel(),
+            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+            ncclRedOpTypeEnum.from_torch(op),
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
             return
@@ -172,6 +225,32 @@ class PyNcclCommunicator:
             stream = self.stream
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
+            tensor.numel(),
+            ncclDataTypeEnum.from_torch(tensor.dtype),
+            src,
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
+    def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
+        if self.disabled:
+            return
+        assert tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {tensor.device}"
+        )
+        if stream is None:
+            stream = self.stream
+        if src == self.rank:
+            sendbuff = buffer_type(tensor.data_ptr())
+            # NCCL requires the sender also to have a receive buffer
+            recvbuff = buffer_type(tensor.data_ptr())
+        else:
+            sendbuff = buffer_type()
+            recvbuff = buffer_type(tensor.data_ptr())
+        self.nccl.ncclBroadcast(
+            sendbuff,
+            recvbuff,
             tensor.numel(),
             ncclDataTypeEnum.from_torch(tensor.dtype),
             src,

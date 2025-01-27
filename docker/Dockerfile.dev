@@ -18,6 +18,9 @@ RUN apt-get update && apt-get install -y \
     silversearcher-ag \
     cloc \
     unzip \
+    pkg-config \
+    libssl-dev \
+    bear \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -39,7 +42,8 @@ RUN python3 -m pip install --no-cache-dir \
     pytest \
     black \
     isort \
-    icdiff
+    icdiff \
+    pre-commit
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \

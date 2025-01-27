@@ -24,10 +24,11 @@
 - InternLM 2
 - Exaone 3
 - BaiChuan2
-- MiniCPM / MiniCPM 3
+- MiniCPM / MiniCPM 3 / MiniCPMV
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4
+- Phi-3 / Phi-4
 - Phi-3-Small
 - IBM Granite 3
 
@@ -81,6 +82,7 @@ To port a model from vLLM to SGLang, you can compare these two files [SGLang Lla
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.
   - Add `EntryClass` at the end.
+  - Please ensure the new implementation uses **only SGLang components and does not rely on any vLLM components**.
 
 ### Registering an external model implementation
 
@@ -90,7 +92,7 @@ Here is how you can do it:
 
 ```python
 from sglang.srt.models.registry import ModelRegistry
-from sglang.srt.server import launch_server
+from sglang.srt.entrypoints.http_server import launch_server
 
 # for a single model, you can add it to the registry
 ModelRegistry.models[model_name] = model_class
