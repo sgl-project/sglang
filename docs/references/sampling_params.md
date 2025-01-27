@@ -59,7 +59,7 @@ class GenerateReqInput:
 
 ```
 
-The `sampling_params` follows this format
+The `sampling_params` configure the generation process, including sampling strategies and output constraints. Below is a detailed breakdown of each parameter:
 
 ```python
 # The maximum number of output tokens
