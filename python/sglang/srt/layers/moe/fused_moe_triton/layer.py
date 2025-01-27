@@ -286,6 +286,7 @@ class FusedMoE(torch.nn.Module):
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
+        self.activation = activation
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
