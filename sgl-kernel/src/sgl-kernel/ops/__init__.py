@@ -11,16 +11,18 @@ from sgl_kernel.ops.utils import (
 
 
 class turbomindLinear:
-    def __init__(self, in_feature, out_features, w_bit, group_size) -> None:
+    def __init__(self, in_features, out_features, w_bit, group_size) -> None:
         self.linear = torch.classes.sgl_kernels.Linear(
-            in_feature, out_features, w_bit, group_size
+            in_features, out_features, w_bit, group_size
         )
 
-    def post_init(self):
-        pass
+    def post_init(self, qweight, scales, qzeros, simt):
 
-    def forward(self):
-        pass
+        self.linear.post_init(qweight, scales, qzeros, simt)
+
+    def forward(self, input, output, stream):
+        with input.device as device:
+            self.linear.forward(input, output, _get_cuda_stream(device))
 
 
 def init_custom_reduce(

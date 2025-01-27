@@ -3,7 +3,7 @@ import unittest
 
 import torch
 import torch.nn as nn
-from sgl_kernel import turbomind
+from sgl_kernel import turbomindLinear
 
 from sglang.srt.layers.quantization.turbomind_utils import pack_u4_row, unpack_awq_gemm
 
@@ -128,7 +128,7 @@ class TestInt8Gemm(unittest.TestCase):
                     ref_res = ref_linear(x)
                     print(f"nn.linear.res: {ref_res}")
 
-                self.model = turbomind.Linear(
+                self.model = turbomindLinear(
                     in_features,
                     out_features,
                     w_bit,
