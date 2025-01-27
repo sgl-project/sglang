@@ -1,106 +1,102 @@
 
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <ATen/dlpack.h>
 #include <ATen/DLConvertor.h>
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/dlpack.h>
+#include <cuda_runtime.h>
+#include <torch/custom_class.h>
 #include <torch/library.h>
 #include <torch/script.h>
-#include <torch/custom_class.h>
-#include <cuda_runtime.h>
 
-#include "sgl_kernels_ops.h"
 #include "linear.h"
+#include "sgl_kernels_ops.h"
 #include "src/turbomind/api/python/dlpack.h"
 
 static const char kDlTensorCapsuleName[] = "dltensor";
 
-turbomind::DataType getDataType(DLDataType data_type)
-{
-    switch (data_type.code) {
-        case DLDataTypeCode::kDLUInt:
-            switch (data_type.bits) {
-                case 8:
-                    return turbomind::TYPE_UINT8;
-                case 16:
-                    return turbomind::TYPE_UINT16;
-                case 32:
-                    return turbomind::TYPE_UINT32;
-                case 64:
-                    return turbomind::TYPE_UINT64;
-                default:
-                    return turbomind::TYPE_INVALID;
-            }
-            break;
-        case DLDataTypeCode::kDLInt:
-            switch (data_type.bits) {
-                case 8:
-                    return turbomind::TYPE_INT8;
-                case 16:
-                    return turbomind::TYPE_INT16;
-                case 32:
-                    return turbomind::TYPE_INT32;
-                case 64:
-                    return turbomind::TYPE_INT64;
-                default:
-                    return turbomind::TYPE_INVALID;
-            }
-            break;
-        case DLDataTypeCode::kDLFloat:
-            switch (data_type.bits) {
-                case 16:
-                    return turbomind::TYPE_FP16;
-                case 32:
-                    return turbomind::TYPE_FP32;
-                case 64:
-                    return turbomind::TYPE_FP64;
-                default:
-                    return turbomind::TYPE_INVALID;
-            }
-            break;
-        case DLDataTypeCode::kDLBfloat:
-            switch (data_type.bits) {
-                case 16:
-                    return turbomind::TYPE_BF16;
-                default:
-                    return turbomind::TYPE_INVALID;
-            }
-            break;
-        case DLDataTypeCode::kDLBool:
-            return turbomind::TYPE_BOOL;
+turbomind::DataType getDataType(DLDataType data_type) {
+  switch (data_type.code) {
+    case DLDataTypeCode::kDLUInt:
+      switch (data_type.bits) {
+        case 8:
+          return turbomind::TYPE_UINT8;
+        case 16:
+          return turbomind::TYPE_UINT16;
+        case 32:
+          return turbomind::TYPE_UINT32;
+        case 64:
+          return turbomind::TYPE_UINT64;
         default:
-            return turbomind::TYPE_INVALID;
-    }
-}
-
-turbomind::MemoryType getMemoryType(DLDevice device)
-{
-    switch (device.device_type) {
-        case DLDeviceType::kDLCUDAHost:
-            return turbomind::MemoryType::MEMORY_CPU_PINNED;
-        case DLDeviceType::kDLCUDA:
-            return turbomind::MemoryType::MEMORY_GPU;
-        case DLDeviceType::kDLCPU:
+          return turbomind::TYPE_INVALID;
+      }
+      break;
+    case DLDataTypeCode::kDLInt:
+      switch (data_type.bits) {
+        case 8:
+          return turbomind::TYPE_INT8;
+        case 16:
+          return turbomind::TYPE_INT16;
+        case 32:
+          return turbomind::TYPE_INT32;
+        case 64:
+          return turbomind::TYPE_INT64;
         default:
-            return turbomind::MemoryType::MEMORY_CPU;
-    }
+          return turbomind::TYPE_INVALID;
+      }
+      break;
+    case DLDataTypeCode::kDLFloat:
+      switch (data_type.bits) {
+        case 16:
+          return turbomind::TYPE_FP16;
+        case 32:
+          return turbomind::TYPE_FP32;
+        case 64:
+          return turbomind::TYPE_FP64;
+        default:
+          return turbomind::TYPE_INVALID;
+      }
+      break;
+    case DLDataTypeCode::kDLBfloat:
+      switch (data_type.bits) {
+        case 16:
+          return turbomind::TYPE_BF16;
+        default:
+          return turbomind::TYPE_INVALID;
+      }
+      break;
+    case DLDataTypeCode::kDLBool:
+      return turbomind::TYPE_BOOL;
+    default:
+      return turbomind::TYPE_INVALID;
+  }
 }
 
-std::shared_ptr<turbomind::Tensor> DLManagedTensorToTurbomindTensor(DLManagedTensor* tensor)
-{
-    auto& dl_tensor = tensor->dl_tensor;
-    auto  where     = getMemoryType(dl_tensor.device);
-    auto  dtype     = getDataType(dl_tensor.dtype);
-    assert(dl_tensor.ndim > 0);
-    std::vector<size_t> shape(dl_tensor.shape, dl_tensor.shape + dl_tensor.ndim);
-    auto                data = dl_tensor.data;
-
-    return std::make_shared<turbomind::Tensor>(where, dtype, shape, data);
+turbomind::MemoryType getMemoryType(DLDevice device) {
+  switch (device.device_type) {
+    case DLDeviceType::kDLCUDAHost:
+      return turbomind::MemoryType::MEMORY_CPU_PINNED;
+    case DLDeviceType::kDLCUDA:
+      return turbomind::MemoryType::MEMORY_GPU;
+    case DLDeviceType::kDLCPU:
+    default:
+      return turbomind::MemoryType::MEMORY_CPU;
+  }
 }
 
-std::shared_ptr<turbomind::Tensor> TorchTensorToTurbomindTensor(at::Tensor obj)
-{
-    DLManagedTensor* dlmt = torch::toDLPack(obj);
-    return DLManagedTensorToTurbomindTensor(dlmt);
+std::shared_ptr<turbomind::Tensor> DLManagedTensorToTurbomindTensor(DLManagedTensor* tensor) {
+  auto& dl_tensor = tensor->dl_tensor;
+  auto where = getMemoryType(dl_tensor.device);
+  auto dtype = getDataType(dl_tensor.dtype);
+  assert(dl_tensor.ndim > 0);
+  std::vector<size_t> shape(dl_tensor.shape, dl_tensor.shape + dl_tensor.ndim);
+  auto data = dl_tensor.data;
+
+  return std::make_shared<turbomind::Tensor>(where, dtype, shape, data);
+}
+
+std::shared_ptr<turbomind::Tensor> TorchTensorToTurbomindTensor(at::Tensor obj) {
+  DLManagedTensor* dlmt = torch::toDLPack(obj);
+  return DLManagedTensorToTurbomindTensor(dlmt);
 }
 
 TORCH_LIBRARY(sgl_kernels, m) {
@@ -218,22 +214,23 @@ TORCH_LIBRARY(sgl_kernels, m) {
 
   // turbomind linear
   m.class_<turbomind::Linear>("Linear")
-    .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
-    .def("post_init",
-            [](c10::intrusive_ptr<turbomind::Linear> self, at::Tensor qweight, at::Tensor scales, at::Tensor qzeros, bool simt) {
-                auto _qweight = TorchTensorToTurbomindTensor(qweight);
-                auto _scales  = TorchTensorToTurbomindTensor(scales);
-                auto _qzeros  = TorchTensorToTurbomindTensor(qzeros);
-                self->post_init(_qweight, *_scales, *_qzeros, simt);
-            })
-    .def("forward", [](c10::intrusive_ptr<turbomind::Linear> self, torch::Tensor in, torch::Tensor out, c10::optional<int64_t> stream_id = c10::nullopt) {
-        auto _in    = TorchTensorToTurbomindTensor(in);
-        auto _out   = TorchTensorToTurbomindTensor(out);
-        auto stream = stream_id.has_value() ?
-            at::cuda::getCurrentCUDAStream(stream_id.value()).stream() :
-            at::cuda::getCurrentCUDAStream().stream();
+      .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
+      .def("post_init",
+           [](c10::intrusive_ptr<turbomind::Linear> self, at::Tensor qweight, at::Tensor scales, at::Tensor qzeros,
+              bool simt) {
+             auto _qweight = TorchTensorToTurbomindTensor(qweight);
+             auto _scales = TorchTensorToTurbomindTensor(scales);
+             auto _qzeros = TorchTensorToTurbomindTensor(qzeros);
+             self->post_init(_qweight, *_scales, *_qzeros, simt);
+           })
+      .def("forward", [](c10::intrusive_ptr<turbomind::Linear> self, torch::Tensor in, torch::Tensor out,
+                         c10::optional<int64_t> stream_id = c10::nullopt) {
+        auto _in = TorchTensorToTurbomindTensor(in);
+        auto _out = TorchTensorToTurbomindTensor(out);
+        auto stream = stream_id.has_value() ? at::cuda::getCurrentCUDAStream(stream_id.value()).stream()
+                                            : at::cuda::getCurrentCUDAStream().stream();
         return self->forward(*_in, *_out, stream);
-    });
+      });
 }
 
 REGISTER_EXTENSION(_kernels)

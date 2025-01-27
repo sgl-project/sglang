@@ -5,8 +5,8 @@
 
 #include <vector>
 
-#include "utils.h"
 #include "linear.h"
+#include "utils.h"
 
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
