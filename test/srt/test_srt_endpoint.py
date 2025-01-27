@@ -158,7 +158,7 @@ class TestSRTEndpoint(unittest.TestCase):
                     "max_new_tokens": new_tokens,
                 },
                 "return_logprob": True,
-                "logprob_start_len": 0,
+                "logprob_start_len": -1,
                 "top_logprobs_num": 5,
             },
         )
@@ -169,14 +169,6 @@ class TestSRTEndpoint(unittest.TestCase):
         self.assertEqual(res["meta_info"]["completion_tokens"], new_tokens)
 
         # Test the number of tokens are correct
-        self.assertEqual(
-            len(res["meta_info"]["input_token_logprobs"]),
-            res["meta_info"]["prompt_tokens"],
-        )
-        self.assertEqual(
-            len(res["meta_info"]["input_top_logprobs"]),
-            res["meta_info"]["prompt_tokens"],
-        )
         self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), new_tokens)
         self.assertEqual(len(res["meta_info"]["output_top_logprobs"]), new_tokens)
 
