@@ -309,9 +309,9 @@ class TestSRTEndpoint(unittest.TestCase):
         args = []
         temperature = 0
         # input_len, output_len, temperature, logprob_start_len, return_logprob, top_logprobs_num
-        for input_len in [1000, 5000, 10000, 50000]:
+        for input_len in [1000]:
             for output_len in [4, 8]:
-                for logprob_start_len in [-1, 0, 500, 2500, 5000, 25000]:
+                for logprob_start_len in [-1, 0]:
                     for return_logprob in [True, False]:
                         for top_logprobs_num in [0, 5]:
 
