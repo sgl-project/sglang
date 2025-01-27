@@ -6,14 +6,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 from vllm import _custom_ops as ops
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.utils import is_cuda_available
 
-IS_CUDA_AVAILABLE = is_cuda_available()
+_is_cuda_available = is_cuda_available()
+if _is_cuda_available:
+    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -81,7 +82,8 @@ class RotaryEmbedding(CustomOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        # cache = cache.to(dtype)
+        if not _is_cuda_available:
+            cache = cache.to(dtype)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -147,7 +149,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if IS_CUDA_AVAILABLE:
+        if _is_cuda_available:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
