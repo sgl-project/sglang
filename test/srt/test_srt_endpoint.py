@@ -186,6 +186,7 @@ class TestSRTEndpoint(unittest.TestCase):
                 res["meta_info"]["output_token_logprobs"][i],
                 res["meta_info"]["output_top_logprobs"][i][0],
             )
+            self.assertEqual(len(res["meta_info"]["output_top_logprobs"][i]), 5)
 
     def test_logprob_match(self):
         """Test the output logprobs are close to the input logprobs if we run a prefill again."""
