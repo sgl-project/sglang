@@ -141,16 +141,15 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from vllm import _custom_ops as ops
+        from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
-        self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-        ops.rotary_embedding(
-            positions,
-            query,
-            key,
-            self.head_size,
-            self.cos_sin_cache,
-            self.is_neox_style,
+        apply_rope_with_cos_sin_cache_inplace(
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            cos_sin_cache=self.cos_sin_cache,
+            is_neox=self.is_neox_style,
         )
         return query, key
 
