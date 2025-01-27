@@ -333,6 +333,11 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
 
+        # The previous logprobs should've been already updated. Move the start len
+        # so that the next input token logprobs are computed.
+        if req.logprob_start_len < len(req.prefix_indices):
+            req.logprob_start_len = len(req.prefix_indices)
+
         self._prefill_one_req(
             0,
             req.extend_input_len,
@@ -443,14 +448,7 @@ class PrefillAdder:
             if total_tokens > self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if (
-                self.rem_chunk_tokens is None
-                or input_tokens <= self.rem_chunk_tokens
-                or (
-                    req.return_logprob
-                    and req.logprob_start_len != len(req.origin_input_ids) - 1
-                )
-            ):
+            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)

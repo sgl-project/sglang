@@ -296,6 +296,9 @@ class Req:
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
+        # Start index to compute logprob from.
+        # logprob_start_len is like a pointer and being updated if it is chunked.
+        self.original_logprob_start_len: int = 0
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
 

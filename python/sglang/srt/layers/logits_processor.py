@@ -272,10 +272,10 @@ class LogitsProcessor(nn.Module):
                 continue
 
             input_top_logprobs_val.append(
-                [values[pt + j][:k] for j in range(pruned_len - 1)]
+                [values[pt + j][:k] for j in range(pruned_len)]
             )
             input_top_logprobs_idx.append(
-                [indices[pt + j][:k] for j in range(pruned_len - 1)]
+                [indices[pt + j][:k] for j in range(pruned_len)]
             )
             pt += pruned_len
 

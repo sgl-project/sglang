@@ -110,6 +110,8 @@ test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
 class GenerationBatchResult:
     logits_output: LogitsProcessorOutput
     next_token_ids: List[int]
+    fill_ids_per_req: List[List[int]]
+    logprob_start_len_per_req: List[int]
     bid: int
 
 
@@ -677,6 +679,7 @@ class Scheduler:
             return
 
         # Copy more attributes
+        req.original_logprob_start_len = recv_req.logprob_start_len
         if recv_req.logprob_start_len == -1:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(req.origin_input_ids) - 1
@@ -1071,11 +1074,25 @@ class Scheduler:
                 )
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
+
             batch.output_ids = next_token_ids
+
+            # These 2 values are needed for processing the output, but the values can be
+            # modified by overlap schedule. So we have to copy them here so that
+            # we can use the correct values in output processing.
+            if batch.return_logprob:
+                fill_ids_per_req = [req.fill_ids[:] for req in batch.reqs]
+                logprob_start_len_per_req = [
+                    req.logprob_start_len for req in batch.reqs
+                ]
+            else:
+                fill_ids_per_req = logprob_start_len_per_req = None
 
             ret = GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
+                fill_ids_per_req=fill_ids_per_req,
+                logprob_start_len_per_req=logprob_start_len_per_req,
                 bid=model_worker_batch.bid,
             )
         else:  # embedding or reward model
@@ -1116,10 +1133,14 @@ class Scheduler:
             (
                 logits_output,
                 next_token_ids,
+                fill_ids_per_req,
+                logprob_start_len_per_req,
                 bid,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
+                result.fill_ids_per_req,
+                result.logprob_start_len_per_req,
                 result.bid,
             )
 
@@ -1159,7 +1180,13 @@ class Scheduler:
 
                     if req.return_logprob:
                         logprob_pt += self.add_logprob_return_values(
-                            i, req, logprob_pt, next_token_ids, logits_output
+                            i,
+                            req,
+                            fill_ids_per_req[i],
+                            logprob_pt,
+                            next_token_ids,
+                            logits_output,
+                            finalize=True,
                         )
 
                     if req.grammar is not None:
@@ -1172,6 +1199,22 @@ class Scheduler:
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
+
+                    # Incrementally update input logprobs.
+                    if req.return_logprob:
+                        assert logprob_start_len_per_req is not None
+                        assert fill_ids_per_req is not None
+                        logprob_start_len = logprob_start_len_per_req[i]
+                        fill_ids = fill_ids_per_req[i]
+                        if logprob_start_len < len(fill_ids):
+                            logprob_pt += self.add_input_logprob_return_values(
+                                i,
+                                req,
+                                fill_ids,
+                                logprob_pt,
+                                logits_output,
+                                include_sample_tokens=False,
+                            )
 
             if batch.next_batch_sampling_info:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
@@ -1275,10 +1318,72 @@ class Scheduler:
         ):
             self.log_decode_stats()
 
+    def add_input_logprob_return_values(
+        self,
+        i: int,
+        req: Req,
+        fill_ids: List[int],
+        pt: int,
+        output: LogitsProcessorOutput,
+        include_sample_tokens: bool,
+    ):
+        assert output.input_token_logprobs is not None
+        num_input_logprobs = len(output.input_token_logprobs)
+
+        # Jump-forward decoding will be deprecated anyway.
+        assert req.last_update_decode_tokens == 0
+
+        input_token_logprobs_val = output.input_token_logprobs[
+            pt : pt + num_input_logprobs - int(include_sample_tokens)
+        ]
+        input_token_logprobs_idx = fill_ids[
+            len(fill_ids) - num_input_logprobs + 1 : len(fill_ids)
+        ]
+        # Clip the padded hash values from image tokens.
+        # Otherwise, it will lead to detokenization errors.
+        input_token_logprobs_idx = [
+            x if x < self.model_config.vocab_size - 1 else 0
+            for x in input_token_logprobs_idx
+        ]
+
+        # The first token does not have logprob, pad it.
+        if req.input_token_logprobs_val is None:
+            req.input_token_logprobs_val = []
+            req.input_token_logprobs_idx = []
+            if req.original_logprob_start_len == 0:
+                req.input_token_logprobs_val.append(None)
+                input_token_logprobs_idx.extend([fill_ids[0]])
+
+        req.input_token_logprobs_val.extend(input_token_logprobs_val)
+        req.input_token_logprobs_idx.extend(input_token_logprobs_idx)
+
+        if req.top_logprobs_num > 0:
+            if req.input_top_logprobs_val is None:
+                req.input_top_logprobs_val = []
+                req.input_top_logprobs_idx = []
+                if req.original_logprob_start_len == 0:
+                    req.input_top_logprobs_val.append(None)
+                    req.input_top_logprobs_idx.append(None)
+
+            input_top_logprobs_val = output.input_top_logprobs_val[i]
+            input_top_logprobs_idx = output.input_top_logprobs_idx[i]
+
+            if include_sample_tokens:
+                # Last token is a sample token.
+                input_top_logprobs_val.pop()
+                input_top_logprobs_idx.pop()
+
+            req.input_top_logprobs_val.extend(input_top_logprobs_val)
+            req.input_top_logprobs_idx.extend(input_top_logprobs_idx)
+
+        num_input_logprobs = len(input_token_logprobs_val)
+        return num_input_logprobs
+
     def add_logprob_return_values(
         self,
         i: int,
         req: Req,
+        fill_ids: List[int],
         pt: int,
         next_token_ids: List[int],
         output: LogitsProcessorOutput,
@@ -1287,36 +1392,9 @@ class Scheduler:
         req.output_token_logprobs_val.append(output.next_token_logprobs[i])
         req.output_token_logprobs_idx.append(next_token_ids[i])
 
-        # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-        num_input_logprobs = req.extend_input_len - req.extend_logprob_start_len
-
-        if req.input_token_logprobs_val is None:
-            input_token_logprobs_val = output.input_token_logprobs[
-                pt : pt + num_input_logprobs - 1 - req.last_update_decode_tokens
-            ]
-
-            input_token_logprobs_idx = req.fill_ids[
-                len(req.fill_ids)
-                - num_input_logprobs
-                + 1 : len(req.fill_ids)
-                - req.last_update_decode_tokens
-            ]
-            # Clip the padded hash values from image tokens.
-            # Otherwise, it will lead to detokenization errors.
-            input_token_logprobs_idx = [
-                x if x < self.model_config.vocab_size - 1 else 0
-                for x in input_token_logprobs_idx
-            ]
-
-            if (
-                req.logprob_start_len == 0
-            ):  # The first token does not have logprob, pad it.
-                input_token_logprobs_val = [None] + input_token_logprobs_val
-                input_token_logprobs_idx = [req.fill_ids[0]] + input_token_logprobs_idx
-
-            req.input_token_logprobs_val = input_token_logprobs_val
-            req.input_token_logprobs_idx = input_token_logprobs_idx
-
+        num_input_logprobs = self.add_input_logprob_return_values(
+            i, req, fill_ids, pt, output, include_sample_tokens=True
+        )
         if req.last_update_decode_tokens != 0:
             # Some decode tokens are re-computed in an extend batch
             req.output_token_logprobs_val.extend(
@@ -1337,13 +1415,6 @@ class Scheduler:
             )
 
         if req.top_logprobs_num > 0:
-            if req.input_top_logprobs_val is None:
-                req.input_top_logprobs_val = output.input_top_logprobs_val[i]
-                req.input_top_logprobs_idx = output.input_top_logprobs_idx[i]
-                if req.logprob_start_len == 0:
-                    req.input_top_logprobs_val = [None] + req.input_top_logprobs_val
-                    req.input_top_logprobs_idx = [None] + req.input_top_logprobs_idx
-
             if req.last_update_decode_tokens != 0:
                 req.output_top_logprobs_val.extend(
                     output.input_top_logprobs_val[i][-req.last_update_decode_tokens :]
