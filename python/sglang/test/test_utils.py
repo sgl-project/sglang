@@ -579,6 +579,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    disable_ignore_eos=False,
     need_warmup=False,
 ):
     # Launch the server
@@ -601,6 +602,7 @@ def run_bench_serving(
         random_output_len=random_output_len,
         request_rate=request_rate,
         disable_stream=disable_stream,
+        disable_ignore_eos=disable_ignore_eos,
     )
 
     try:
