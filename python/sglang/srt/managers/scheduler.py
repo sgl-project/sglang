@@ -767,14 +767,14 @@ class Scheduler:
             f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue) + has_being_chunked}"
+            f"#queue-req: {len(self.waiting_queue)}"
         )
 
         if self.enable_metrics:
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
-            self.stats.num_queue_reqs = len(self.waiting_queue) + has_being_chunked
+            self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = tree_cache_hit_rate
             self.metrics_collector.log_stats(self.stats)
 
