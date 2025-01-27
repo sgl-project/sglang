@@ -196,3 +196,7 @@ def test_correctness(
         query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
