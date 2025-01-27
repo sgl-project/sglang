@@ -163,11 +163,12 @@ class TestSRTEndpoint(unittest.TestCase):
             },
         )
         response_json = response.json()
-        print(json.dumps(response_json, indent=2))
+        # print(json.dumps(response_json, indent=2))
 
         res = response_json
         self.assertEqual(res["meta_info"]["completion_tokens"], new_tokens)
 
+        # Test the number of tokens are correct
         self.assertEqual(
             len(res["meta_info"]["input_token_logprobs"]),
             res["meta_info"]["prompt_tokens"],
@@ -178,6 +179,13 @@ class TestSRTEndpoint(unittest.TestCase):
         )
         self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), new_tokens)
         self.assertEqual(len(res["meta_info"]["output_top_logprobs"]), new_tokens)
+
+        # Test the top-1 tokens are the same as output tokens (because temp = 0.0)
+        for i in range(new_tokens):
+            self.assertListEqual(
+                res["meta_info"]["output_token_logprobs"][i],
+                res["meta_info"]["output_top_logprobs"][i][0],
+            )
 
     def test_logprob_match(self):
         """Test the output logprobs are close to the input logprobs if we run a prefill again."""
