@@ -223,6 +223,11 @@ compile_commands.json
 
 *.iml
 
-.vscode/
+# VSCode
+.vscode
+
+1
+
+# Profiling data
 *.nsys-rep
 *.ncu-rep

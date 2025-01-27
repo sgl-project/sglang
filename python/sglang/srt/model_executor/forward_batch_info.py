@@ -345,11 +345,6 @@ class ForwardBatch:
         if model_runner.model_is_mrope:
             ret.compute_mrope_positions(model_runner, batch)
 
-        # Init attention information
-        ret.req_to_token_pool = model_runner.req_to_token_pool
-        ret.token_to_kv_pool = model_runner.token_to_kv_pool
-        ret.attn_backend = model_runner.attn_backend
-
         # Init HiP attention information
         if hasattr(model_runner, "hip_metadata_cache_pool"):
             ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool

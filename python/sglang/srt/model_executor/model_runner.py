@@ -624,10 +624,9 @@ class ModelRunner:
                 logging.warning(
                     f"max_total_tokens={max_total_tokens} is larger than the profiled value "
                     f"{self.max_total_num_tokens}. "
-                    # f"Use the given value instead."
+                    f"Use the profiled value instead."
                 )
-            # self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
-            self.max_total_num_tokens = max_total_tokens
+            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -689,7 +688,6 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
-
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

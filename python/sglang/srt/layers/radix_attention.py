@@ -16,11 +16,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-import torch
 from torch import nn
 
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+if TYPE_CHECKING:
+    from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class RadixAttention(nn.Module):

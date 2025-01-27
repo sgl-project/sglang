@@ -124,6 +124,7 @@ class TpModelWorkerClient:
         batch_pt = 0
         batch_lists = [None] * 2
 
+        # For keeping track of HiP attention mask refresh
         decode_index = 0
 
         while True:
@@ -134,28 +135,6 @@ class TpModelWorkerClient:
             model_worker_batch: ModelWorkerBatch
             if model_worker_batch.forward_mode.is_decode():
                 if self.hip_mask_refresh_interval is not None:
-                    # NOTE: for debug
-                    # if decode_index % self.hip_mask_refresh_interval == 0:
-                    #     model_worker_batch.hip_use_cached_mask = False
-                    #     # logger.info(f"Refreshing attention mask for decode index {decode_index}.")
-                    # else:
-                    #     model_worker_batch.hip_use_cached_mask = True
-                    #     # logger.info(f"Using cached attention mask for decode index {decode_index}.")
-
-                    # NOTE: for debug
-                    # if decode_index % 8 == 0: # first stage refresh interval
-                    #     model_worker_batch.hip_use_cached_mask = False
-                    #     model_worker_batch.hip_metadata_cached_stages = 0       # NOTE: no cached stages
-                    # elif decode_index % 4 == 0: # second stage refresh interval
-                    #     model_worker_batch.hip_use_cached_mask = False
-                    #     model_worker_batch.hip_metadata_cached_stages = 1
-                    # elif decode_index % 2 == 0: # third stage refresh interval
-                    #     model_worker_batch.hip_use_cached_mask = False
-                    #     model_worker_batch.hip_metadata_cached_stages = 2
-                    # else:
-                    #     model_worker_batch.hip_use_cached_mask = True
-                    #     model_worker_batch.hip_metadata_cached_stages = None    # NOTE: use cache every stage
-
                     require_refresh = False
                     for i_stage, refresh_inteval in enumerate(
                         self.hip_mask_refresh_interval
@@ -172,6 +151,7 @@ class TpModelWorkerClient:
                             None  # NOTE: use cache every stage
                         )
                 decode_index += 1
+
             elif model_worker_batch.forward_mode.is_extend():
                 decode_index = 0
 
