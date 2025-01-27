@@ -126,6 +126,10 @@ class ModelRunner:
                 self.server_args.ds_heavy_channel_type
             )
 
+        if self.server_args.kv_cache_dtype == "int8":
+            logger.info("int8 kv cache quantization is turned on. Use triton backend.")
+            self.server_args.attention_backend = "triton"
+
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
             logger.info(
@@ -575,6 +579,8 @@ class ModelRunner:
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
             if is_cuda():
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "int8":
+            self.kv_cache_dtype = torch.int8
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -629,7 +635,7 @@ class ModelRunner:
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
@@ -639,7 +645,7 @@ class ModelRunner:
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
@@ -650,7 +656,7 @@ class ModelRunner:
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,

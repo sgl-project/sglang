@@ -21,6 +21,14 @@ Memory pool.
 SGLang has two levels of memory pool.
 ReqToTokenPool maps a a request to its token locations.
 BaseTokenToKVPool maps a token location to its KV cache data.
+
+KV Cache Quant
+
+| quant type  | store type | load type |
+|-------------|------------|-----------|
+| int8        | uint8      | uint8     |
+| fp8 e5m2    | uint8      | fp8 e5m2  |
+| fp8 e4m3    | uint8      | fp8 e4m3  |
 """
 
 import logging
@@ -33,6 +41,7 @@ import numpy as np
 import psutil
 import torch
 
+from sglang.srt.layers.quantization.int8_kernel import quantize_cache_kv
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
 
@@ -95,16 +104,16 @@ class BaseTokenToKVPool:
     def __init__(
         self,
         size: int,
-        dtype: torch.dtype,
+        kv_cache_dtype: torch.dtype,
         device: str,
     ):
         self.size = size
-        self.dtype = dtype
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+        self.kv_cache_dtype = kv_cache_dtype
+        if kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.int8):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
-            self.store_dtype = dtype
+            self.store_dtype = kv_cache_dtype
         self.device = device
 
         self.free_slots = None
@@ -121,7 +130,6 @@ class BaseTokenToKVPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-
         return select_index.to(self.device, non_blocking=True)
 
     def free(self, free_index: torch.Tensor):
@@ -166,20 +174,31 @@ class BaseTokenToKVPool:
     ) -> None:
         raise NotImplementedError()
 
+    def get_key_scales_zeros_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def get_value_scales_zeros_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def get_kv_scales_zeros_buffer(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError()
+
 
 class MHATokenToKVPool(BaseTokenToKVPool):
 
     def __init__(
         self,
         size: int,
-        dtype: torch.dtype,
+        kv_cache_dtype: torch.dtype,
         head_num: int,
         head_dim: int,
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
     ):
-        super().__init__(size, dtype, device)
+        super().__init__(size, kv_cache_dtype, device)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -188,6 +207,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
+        self.kv_cache_dtype = kv_cache_dtype
         self._create_buffers()
 
         k_size, v_size = self.get_kv_size_bytes()
@@ -211,6 +231,22 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 torch.empty(
                     (self.size + 1, self.head_num, self.head_dim),
                     dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.k_scales_zeros = [
+                torch.empty(
+                    (self.size + 1, self.head_num, 2),
+                    dtype=torch.float16,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_scales_zeros = [
+                torch.empty(
+                    (self.size + 1, self.head_num, 2),
+                    dtype=torch.float16,
                     device=self.device,
                 )
                 for _ in range(self.layer_num)
@@ -252,17 +288,37 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.v_buffer[i][indices] = v_data[i]
 
     def get_key_buffer(self, layer_id: int):
-        if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id].view(self.dtype)
+        if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            return self.k_buffer[layer_id].view(self.kv_cache_dtype)
         return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id].view(self.dtype)
+        if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            return self.v_buffer[layer_id].view(self.kv_cache_dtype)
         return self.v_buffer[layer_id]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_key_scales_zeros_buffer(self, layer_id: int):
+        if self.kv_cache_dtype == torch.int8:
+            return self.k_scales_zeros[layer_id]
+        else:
+            return None
+
+    def get_value_scales_zeros_buffer(self, layer_id: int):
+        if self.kv_cache_dtype == torch.int8:
+            return self.v_scales_zeros[layer_id]
+        else:
+            return None
+
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
+        if self.kv_cache_dtype == torch.int8:
+            return self.get_key_scales_zeros_buffer(
+                layer_id
+            ), self.get_value_scales_zeros_buffer(layer_id)
+        else:
+            return None, None
 
     def set_kv_buffer(
         self,
@@ -274,16 +330,26 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         v_scale: Optional[float] = None,
     ):
         layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-        if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+        if cache_k.dtype != self.kv_cache_dtype:
+            if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.kv_cache_dtype)
+                cache_v = cache_v.to(self.kv_cache_dtype)
+                self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
+                self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+            elif self.kv_cache_dtype == torch.int8:
+                quantize_cache_kv(
+                    cache_k.contiguous(),
+                    cache_v.contiguous(),
+                    loc,
+                    self.k_buffer[layer_id],
+                    self.k_scales_zeros[layer_id],
+                    self.v_buffer[layer_id],
+                    self.v_scales_zeros[layer_id],
+                )
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
@@ -301,14 +367,14 @@ class MLATokenToKVPool(BaseTokenToKVPool):
     def __init__(
         self,
         size: int,
-        dtype: torch.dtype,
+        kv_cache_dtype: torch.dtype,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
     ):
-        super().__init__(size, dtype, device)
+        super().__init__(size, kv_cache_dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
 
@@ -328,17 +394,22 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             ]
 
     def get_key_buffer(self, layer_id: int):
-        if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id].view(self.dtype)
+        if self.store_dtype != self.kv_cache_dtype:
+            return self.kv_buffer[layer_id].view(self.kv_cache_dtype)
         return self.kv_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(self.dtype)
+        if self.store_dtype != self.kv_cache_dtype:
+            return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(
+                self.kv_cache_dtype
+            )
         return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
+        return None, None
 
     def set_kv_buffer(
         self,
@@ -348,9 +419,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
-        if self.store_dtype != self.dtype:
+        if cache_k.dtype != self.kv_cache_dtype:
+            cache_k = cache_k.to(self.kv_cache_dtype)
+        if self.store_dtype != self.kv_cache_dtype:
             self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
         else:
             self.kv_buffer[layer_id][loc] = cache_k
@@ -360,7 +431,7 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
     def __init__(
         self,
         size: int,
-        dtype: torch.dtype,
+        kv_cache_dtype: torch.dtype,
         head_num: int,
         head_dim: int,
         layer_num: int,
@@ -368,7 +439,7 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         heavy_channel_num: int,
         enable_memory_saver: bool,
     ):
-        super().__init__(size, dtype, device)
+        super().__init__(size, kv_cache_dtype, device)
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -377,18 +448,24 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         with memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
-                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                torch.empty(
+                    (size + 1, head_num, head_dim), dtype=kv_cache_dtype, device=device
+                )
                 for _ in range(layer_num)
             ]
             self.v_buffer = [
-                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                torch.empty(
+                    (size + 1, head_num, head_dim), dtype=kv_cache_dtype, device=device
+                )
                 for _ in range(layer_num)
             ]
 
             # [size, head_num, heavy_channel_num] for each layer
             self.label_buffer = [
                 torch.empty(
-                    (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
+                    (size + 1, head_num, heavy_channel_num),
+                    dtype=kv_cache_dtype,
+                    device=device,
                 )
                 for _ in range(layer_num)
             ]
@@ -404,6 +481,9 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_buffer(self, layer_id: int):
         return self.k_buffer[layer_id], self.v_buffer[layer_id]
+
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
+        return None, None
 
     def set_kv_buffer(
         self,
@@ -457,12 +537,16 @@ class MLATokenToKVPoolHost:
         self.device = device
 
         self.size = int(device_pool.size * host_to_device_ratio)
-        self.dtype = device_pool.store_dtype
+        self.kv_cache_dtype = device_pool.store_dtype
         self.head_num = device_pool.head_num
         self.head_dim = device_pool.head_dim
         self.layer_num = device_pool.layer_num
         self.size_per_token = (
-            self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+            self.head_dim
+            * self.head_num
+            * self.layer_num
+            * self.kv_cache_dtype.itemsize
+            * 2
         )
 
         # Verify there is enough available host memory.
@@ -484,7 +568,7 @@ class MLATokenToKVPoolHost:
 
         self.kv_buffer = torch.empty(
             (2, self.layer_num, self.size, self.head_num, self.head_dim),
-            dtype=self.dtype,
+            dtype=self.kv_cache_dtype,
             device=self.device,
             pin_memory=self.pin_memory,
         )

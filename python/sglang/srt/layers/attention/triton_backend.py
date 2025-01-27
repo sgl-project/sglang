@@ -26,6 +26,7 @@ class TritonAttnBackend(AttentionBackend):
 
         super().__init__()
 
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
@@ -132,6 +133,11 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        # int8 -> get scale, other -> None
+        k_scales_zeros, v_scales_zeros = (
+            forward_batch.token_to_kv_pool.get_kv_scales_zeros_buffer(layer.layer_id)
+        )
+
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -148,6 +154,9 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
+            k_scales_zeros,
+            v_scales_zeros,
+            self.kv_cache_dtype,
         )
         return o
 
@@ -177,6 +186,11 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        # int8 -> get scale, other -> None
+        k_scales_zeros, v_scales_zeros = (
+            forward_batch.token_to_kv_pool.get_kv_scales_zeros_buffer(layer.layer_id)
+        )
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -189,5 +203,8 @@ class TritonAttnBackend(AttentionBackend):
             self.num_kv_splits,
             layer.scaling,
             layer.logit_cap,
+            k_scales_zeros,
+            v_scales_zeros,
+            self.kv_cache_dtype,
         )
         return o

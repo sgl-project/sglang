@@ -93,6 +93,7 @@ class TestTritonAttention(unittest.TestCase):
         b_start_loc_extend = torch.zeros_like(b_seq_len)
         b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
         max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
+
         extend_attention_fwd(
             q_extend,
             k_extend,
@@ -203,7 +204,6 @@ class TestTritonAttention(unittest.TestCase):
             dtype=torch.float32,
             device="cuda",
         )
-
         decode_attention_fwd(
             q,
             k_buffer,
