@@ -29,6 +29,8 @@ The core features include:
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
    backend/structured_outputs.ipynb
+   backend/speculative_decoding.ipynb
+   backend/function_calling.ipynb
    backend/server_arguments.md
 
 
