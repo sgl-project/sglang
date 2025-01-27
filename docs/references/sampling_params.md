@@ -8,42 +8,58 @@ The `/generate` endpoint accepts the following arguments in the JSON format.
 ```python
 @dataclass
 class GenerateReqInput:
+    """
+    Data structure for the input to the `/generate` endpoint.
+    """
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
+
+    # The token IDs for text; one can specify either `text` or `input_ids`.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
+
+    # The embeddings for input_ids; one can specify either `text` or `input_ids` or `input_embeds`.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # The image input. It can be a file name, a url, or base64 encoded string.
-    # See also python/sglang/srt/utils.py:load_image.
+
+    # The image input. It can be a file name, a URL, or a base64 encoded string.
+    # See also: `python/sglang/srt/utils.py:load_image`.
     image_data: Optional[Union[List[str], str]] = None
-    # The sampling_params. See descriptions below.
+
+    # Sampling parameters. A dictionary or a list of dictionaries. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # The request id.
+
+    # An optional request ID for tracking requests.
     rid: Optional[Union[List[str], str]] = None
-    # Whether to return logprobs.
+
+    # Whether to return log probabilities for generated tokens.
     return_logprob: Optional[Union[List[bool], bool]] = None
-    # If return logprobs, the start location in the prompt for returning logprobs.
-    # By default, this value is "-1", which means it will only return logprobs for output tokens.
+
+    # If `return_logprob` is True, this specifies the starting position for log probabilities.
+    # Default is `-1`, meaning log probabilities will only be calculated for generated tokens.
     logprob_start_len: Optional[Union[List[int], int]] = None
-    # If return logprobs, the number of top logprobs to return at each position.
+
+    # If `return_logprob` is True, specifies the number of top log probabilities to return for each token.
     top_logprobs_num: Optional[Union[List[int], int]] = None
-    # Whether to detokenize tokens in text in the returned logprobs.
+
+    # Whether to include detokenized text in the log probabilities.
     return_text_in_logprobs: bool = False
-    # Whether to stream output.
+
+    # Whether to enable streaming of the output.
     stream: bool = False
-    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+
+    # Whether to log metrics for this request. Useful for health checks.
     log_metrics: bool = True
 
-    # The modalities of the image data [image, multi-images, video]
+    # The modalities of the input image. Possible values: [image, multi-images, video].
     modalities: Optional[List[str]] = None
-    # LoRA related
+
+    # Path to LoRA (Low-Rank Adaptation) configuration or checkpoint files.
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Session info for continual prompting
+    # Session information for continual prompting (stateful conversations).
     session_params: Optional[Union[List[Dict], Dict]] = None
-    # Custom logit processor for advanced sampling control. Must be a serialized instance
-    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+
+    # Custom logit processor for advanced sampling control.
+    # Must be a serialized instance of `CustomLogitProcessor` in `python/sglang/srt/sampling/custom_logit_processor.py`.
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 ```
