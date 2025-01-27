@@ -5,9 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+from sgl_kernel import turbomindLinear
 from torch.nn import Parameter
-
-from sgl_kernel import turbomind
 from vllm.model_executor.layers.linear import LinearBase
 
 from sglang.srt.layers.linear import LinearMethodBase, UnquantizedLinearMethod
@@ -246,7 +245,7 @@ class AWQTurbomindLinearMethod(LinearMethodBase):
         scales_turbomind = scales_turbomind.contiguous()
         qzeros_turbomind = qzeros_turbomind.contiguous()
 
-        self.linear = turbomind.Linear(
+        self.linear = turbomindLinear(
             layer.input_size_per_partition,
             layer.output_size_per_partition,
             self.quant_config.weight_bits,
