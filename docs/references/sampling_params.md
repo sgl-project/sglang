@@ -8,60 +8,55 @@ The `/generate` endpoint accepts the following arguments in the JSON format.
 ```python
 @dataclass
 class GenerateReqInput:
-    """
-    Data structure for the input to the `/generate` endpoint.
-    """
-    # The input prompt. It can be a single prompt or a batch of prompts.
+    """Defines the input parameters for the /generate endpoint in SGLang."""
+    # The input prompt, can be a single string or a batch of strings.
     text: Optional[Union[List[str], str]] = None
-
-    # The token IDs for text; one can specify either `text` or `input_ids`.
+    # The token IDs for the input prompt; can specify either `text` or `input_ids`.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-
-    # The embeddings for input_ids; one can specify either `text` or `input_ids` or `input_embeds`.
+    # The embeddings for the input IDs; can specify either `text`, `input_ids`, or `input_embeds`.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-
-    # The image input. It can be a file name, a URL, or a base64 encoded string.
-    # See also: `python/sglang/srt/utils.py:load_image`.
+    # Image input, can be a file name, a URL, or a base64-encoded string.
+    # Refer to python/sglang/srt/utils.py:load_image for details.
     image_data: Optional[Union[List[str], str]] = None
 
-    # Sampling parameters. A dictionary or a list of dictionaries. See descriptions below.
+    # Sampling-related parameters
+    # Parameters that define the sampling behavior, described in detail below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
 
-    # An optional request ID for tracking requests.
+    ## Metadata
+    # Request ID to track the request (can be a single ID or a batch of IDs).
     rid: Optional[Union[List[str], str]] = None
-
     # Whether to return log probabilities for generated tokens.
     return_logprob: Optional[Union[List[bool], bool]] = None
-
-    # If `return_logprob` is True, this specifies the starting position for log probabilities.
-    # Default is `-1`, meaning log probabilities will only be calculated for generated tokens.
+    # The starting position in the prompt for returning log probabilities.
+    # Defaults to "-1", which means it only returns log probabilities for output tokens.
     logprob_start_len: Optional[Union[List[int], int]] = None
-
-    # If `return_logprob` is True, specifies the number of top log probabilities to return for each token.
+    # The number of top log probabilities to return for each token position.
     top_logprobs_num: Optional[Union[List[int], int]] = None
-
-    # Whether to include detokenized text in the log probabilities.
+    # Whether to include detokenized text in the returned log probabilities.
     return_text_in_logprobs: bool = False
 
-    # Whether to enable streaming of the output.
+    ## Output streaming and logging
+    # Whether to stream the output in real-time.
     stream: bool = False
-
-    # Whether to log metrics for this request. Useful for health checks.
+    # Whether to log metrics for this request (e.g., for health checks, metrics logging is disabled).
     log_metrics: bool = True
 
-    # The modalities of the input image. Possible values: [image, multi-images, video].
+    ## Multi-modal and session-related parameters
+    # Defines the modalities for image input (e.g., `image`, `multi-images`, or `video`).
     modalities: Optional[List[str]] = None
-
-    # Path to LoRA (Low-Rank Adaptation) configuration or checkpoint files.
+    # LoRA-related parameters for low-rank adaptation models.
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Session information for continual prompting (stateful conversations).
+    ## Session and custom logit processor
+    # Session parameters for continual prompting across multiple requests.
     session_params: Optional[Union[List[Dict], Dict]] = None
-
     # Custom logit processor for advanced sampling control.
-    # Must be a serialized instance of `CustomLogitProcessor` in `python/sglang/srt/sampling/custom_logit_processor.py`.
-    # Use the processor's `to_str()` method to generate the serialized string.
+    # Must be a serialized instance of `CustomLogitProcessor` from
+    # python/sglang/srt/sampling/custom_logit_processor.py.
+    # Use the processor's `to_str()` method for serialization.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+
 ```
 
 The `sampling_params` follows this format
