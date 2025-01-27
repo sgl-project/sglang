@@ -1186,7 +1186,6 @@ class Scheduler:
                             logprob_pt,
                             next_token_ids,
                             logits_output,
-                            finalize=True,
                         )
 
                     if req.grammar is not None:
@@ -1337,7 +1336,9 @@ class Scheduler:
             pt : pt + num_input_logprobs - int(include_sample_tokens)
         ]
         input_token_logprobs_idx = fill_ids[
-            len(fill_ids) - num_input_logprobs + 1 : len(fill_ids)
+            len(fill_ids)
+            - num_input_logprobs
+            + int(include_sample_tokens) : len(fill_ids)
         ]
         # Clip the padded hash values from image tokens.
         # Otherwise, it will lead to detokenization errors.
@@ -1345,6 +1346,7 @@ class Scheduler:
             x if x < self.model_config.vocab_size - 1 else 0
             for x in input_token_logprobs_idx
         ]
+        assert len(input_token_logprobs_idx) == len(input_token_logprobs_val)
 
         # The first token does not have logprob, pad it.
         if req.input_token_logprobs_val is None:

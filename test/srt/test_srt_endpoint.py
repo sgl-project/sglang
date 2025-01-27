@@ -32,7 +32,11 @@ class TestSRTEndpoint(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=("--enable-custom-logit-processor",),
+            other_args=(
+                "--enable-custom-logit-processor",
+                "--mem-fraction-static",
+                "0.8",
+            ),
         )
 
     @classmethod
@@ -154,7 +158,8 @@ class TestSRTEndpoint(unittest.TestCase):
                     "max_new_tokens": new_tokens,
                 },
                 "return_logprob": True,
-                "logprob_start_len": -1,
+                "logprob_start_len": 0,
+                "top_logprobs_num": 5,
             },
         )
         response_json = response.json()
@@ -162,7 +167,17 @@ class TestSRTEndpoint(unittest.TestCase):
 
         res = response_json
         self.assertEqual(res["meta_info"]["completion_tokens"], new_tokens)
+
+        self.assertEqual(
+            len(res["meta_info"]["input_token_logprobs"]),
+            res["meta_info"]["prompt_tokens"],
+        )
+        self.assertEqual(
+            len(res["meta_info"]["input_top_logprobs"]),
+            res["meta_info"]["prompt_tokens"],
+        )
         self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), new_tokens)
+        self.assertEqual(len(res["meta_info"]["output_top_logprobs"]), new_tokens)
 
     def test_logprob_match(self):
         """Test the output logprobs are close to the input logprobs if we run a prefill again."""
