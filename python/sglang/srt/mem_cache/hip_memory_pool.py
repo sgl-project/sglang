@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Literal, Tuple, Union, Optional, Dict
 import logging
 import math
+import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
+
 import torch
 import triton
 from hip.models.hip_attention.gen3.attention_metadata import (
