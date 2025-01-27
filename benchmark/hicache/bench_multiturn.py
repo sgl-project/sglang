@@ -353,4 +353,3 @@ if __name__ == "__main__":
         requests.post(flush_cache_url)
         time.sleep(1)
         WorkloadGenerator(args).run()
-        time.sleep(10)
