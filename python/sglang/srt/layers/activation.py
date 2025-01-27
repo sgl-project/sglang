@@ -20,10 +20,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_cuda_available
 
-if is_flashinfer_available():
-    from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+if is_cuda_available():
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 from vllm.model_executor.custom_op import CustomOp
 
@@ -149,8 +149,8 @@ def get_act_fn(
     return act_fn
 
 
-if not is_flashinfer_available():
+if not is_cuda_available():
     logger.info(
-        "FlashInfer is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
