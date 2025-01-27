@@ -17,11 +17,10 @@ import torch
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.hip_model_runner import HiPModelRunner
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInfo
@@ -45,7 +44,7 @@ class WrapperDispatch(Enum):
 
 class HiPRadixAttentionBackend(AttentionBackend):
 
-    def __init__(self, model_runner: HiPModelRunner):
+    def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
         self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config

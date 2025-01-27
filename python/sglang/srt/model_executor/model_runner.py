@@ -36,6 +36,8 @@ from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_sta
 from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.hip_attention import HiPRadixAttentionBackend
+from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -48,6 +50,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
 from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -128,6 +131,11 @@ class ModelRunner:
             self.init_double_sparsity_channel_config(
                 self.server_args.ds_heavy_channel_type
             )
+
+        elif server_args.enable_hip_attention:
+            logger.info("HIP attention is turned on.")
+            server_args.attention_backend = "hip_attention"
+            self.init_hip_attention_config(server_args.hip_attention_config)
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
@@ -688,6 +696,17 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+
+        self.hip_metadata_cache_pool = None
+        if self.server_args.enable_hip_attention:
+            self.hip_metadata_cache_pool = HiPMetadataCachePool(
+                query_head_num=self.model_config.num_attention_heads // self.server_args.tp_size,
+                layer_num=self.model_config.num_hidden_layers,
+                context_length=self.model_config.context_len,
+                device=self.device,
+                hip_config=self.hip_attention_config,
+            )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -704,7 +723,9 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if self.server_args.attention_backend == "flashinfer":
+        if self.server_args.enable_hip_attention:
+            self.attn_backend = HiPRadixAttentionBackend(self)
+        elif self.server_args.attention_backend == "flashinfer":
             self.attn_backend = FlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
@@ -742,6 +763,16 @@ class ModelRunner:
                 .contiguous()
                 .cuda()
             )
+
+    def init_hip_attention_config(self, hip_attention_config):
+        if hip_attention_config is None:
+            hip_attention_config = {}
+        elif hip_attention_config.startswith("{"):
+            hip_attention_config = json.loads(hip_attention_config)
+        else:
+            with open(hip_attention_config, "r") as f:
+                hip_attention_config = json.load(f)
+        self.hip_attention_config = HiPAttentionConfig(parsed_json=hip_attention_config)
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
