@@ -122,33 +122,24 @@ class TpModelWorkerClient:
         batch_pt = 0
         batch_lists = [None] * 2
 
-        # For keeping track of HiP attention mask refresh
-        decode_index = 0
+        hip_mask_refresh_state = None
+        if self.hip_attention_config is not None:
+            from hip.models.hip_attention.gen3.mask_refresh_interval import HiPMaskRefreshState
+
+            # For keeping track of HiP attention mask refresh cycles
+            hip_mask_refresh_state = HiPMaskRefreshState()
 
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
 
-            if model_worker_batch.forward_mode.is_decode():
-                if self.hip_attention_config.mask_refresh_interval is not None:
-                    require_refresh = False
-                    for i_stage, refresh_inteval in enumerate(
-                        self.hip_attention_config.mask_refresh_interval
-                    ):
-                        if (decode_index % refresh_inteval == 0) and (
-                            not require_refresh
-                        ):
-                            model_worker_batch.hip_metadata_cached_stages = i_stage
-                            require_refresh = True
-                    if not require_refresh:
-                        model_worker_batch.hip_metadata_cached_stages = (
-                            None  # NOTE: use cache every stage
-                        )
-                decode_index += 1
-
-            elif model_worker_batch.forward_mode.is_extend():
-                decode_index = 0
+            if hip_mask_refresh_state is not None:
+                model_worker_batch.hip_metadata_cached_stages = hip_mask_refresh_state.update(
+                    model_worker_batch.forward_mode.is_decode(),
+                    model_worker_batch.forward_mode.is_extend(),
+                    self.hip_attention_config,
+                )
 
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released
