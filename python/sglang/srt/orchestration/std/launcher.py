@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     kill_process_tree,
+    launch_dummy_health_check_server,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
@@ -109,14 +110,16 @@ def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return
+            return None, None
+
+        launch_dummy_health_check_server(server_args.host, server_args.port)
 
         for proc in scheduler_procs:
             proc.join()
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return
+        return None, None
 
     # Launch detokenizer process
     detoken_proc = mp.Process(

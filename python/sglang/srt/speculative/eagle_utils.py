@@ -603,6 +603,7 @@ class EagleVerifyInput(SpecInfo):
             if not req.finished():
                 new_accept_index.extend(new_accept_index_)
                 unfinished_index.append(i)
+            req.spec_verify_ct += 1
         accept_length = (accept_index != -1).sum(dim=1) - 1
 
         accept_index = accept_index[accept_index != -1]
