@@ -286,11 +286,11 @@ class SamplingBatchInfo:
                 shape, dtype = lhs.shape[1:], lhs.dtype
             else:
                 shape, dtype = rhs.shape[1:], rhs.dtype
-            with torch.dtype(dtype):
-                if lhs is None:
-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
-                if rhs is None:
-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
+
+            if lhs is None:
+                lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+            if rhs is None:
+                rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
             return torch.cat([lhs, rhs])
 
         return None
