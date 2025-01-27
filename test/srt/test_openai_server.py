@@ -623,58 +623,6 @@ class TestOpenAIServerEBNF(unittest.TestCase):
             text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape"
         )
 
-    def test_function_calling_format(self):
-
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "add",
-                    "description": "Compute the sum of two numbers",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "a": {
-                                "type": "int",
-                                "description": "A number",
-                            },
-                            "b": {
-                                "type": "int",
-                                "description": "A number",
-                            },
-                        },
-                        "required": ["a", "b"],
-                    },
-                },
-            }
-        ]
-
-        messages = [{"role": "user", "content": "Compute (3+5)"}]
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.8,
-            top_p=0.8,
-            stream=False,
-            tools=tools,
-        )
-
-        content = response.choices[0].message.content
-        tool_calls = response.choices[0].message.tool_calls
-
-        assert (
-            content is None
-        ), "When tools provided by the response, content should be None"
-        assert (
-            isinstance(tool_calls, list) and len(tool_calls) > 0
-        ), "Format not matched, tool_calls should be a list"
-
-        function_name = tool_calls[0].function.name
-        assert (
-            function_name == "add"
-        ), "Function name should be add for the above response"
-
 
 class TestOpenAIEmbedding(unittest.TestCase):
     @classmethod

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgl-kernel"
-version = "0.0.2.post17"
+version = "0.0.2.post18"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.9"
