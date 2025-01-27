@@ -915,7 +915,7 @@ def v1_chat_generate_request(
                     #  has a different tools input format that is not compatiable
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    prompt_ids = orchestrator.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
                         add_generation_prompt=True,
@@ -1282,7 +1282,7 @@ async def v1_chat_completions(orchestrator, raw_request: Request):
                         if index not in parser_dict:
                             parser_dict[index] = FunctionCallParser(
                                 tools=request.tools,
-                                tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                                tool_call_parser=orchestrator.server_args.tool_call_parser,
                             )
                         parser = parser_dict[index]
 
