@@ -135,35 +135,6 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     return pred
 
 
-def call_generate_gserver(prompt, temperature, max_tokens, stop=None, url=None):
-    import grpc
-    from xlm.proto import sampler_pb2, sampler_pb2_grpc
-
-    sampler_channel = grpc.insecure_channel(url.replace("http://", ""))
-    sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)
-
-    if stop is None:
-        stop_strings = None
-    elif isinstance(stop, str):
-        stop_strings = [stop]
-    else:
-        stop_strings = stop
-
-    sample_request = sampler_pb2.SampleTextRequest(
-        prompt=prompt,
-        settings=sampler_pb2.SampleSettings(
-            max_len=max_tokens,
-            rng_seed=0,
-            temperature=max(temperature, 1e-10),
-            nucleus_p=1,
-            stop_strings=stop_strings,
-        ),
-    )
-    stream = sampler.SampleText(sample_request)
-    response = "".join([x.text for x in stream])
-    return response
-
-
 def call_generate_guidance(
     prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
 ):
