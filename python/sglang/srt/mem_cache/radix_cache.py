@@ -50,8 +50,6 @@ class TreeNode:
         self.last_access_time = time.time()
 
         self.hit_count = 0
-        # indicating the node is written to host
-        # self.writing = False
         # indicating the node is loading KV cache from host
         self.loading = False
         # store the host indices of KV cache
@@ -254,6 +252,7 @@ class RadixCache(BasePrefixCache):
         return self.evictable_size_
 
     def protected_size(self):
+        # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
     ##### Internal Helper Functions #####
@@ -335,7 +334,7 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self, node: TreeNode):
-        if node.value is None:
+        if node.evicted:
             return 0
         x = len(node.value)
         for child in node.children.values():

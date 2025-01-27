@@ -43,7 +43,7 @@ class BasePrefixCache(ABC):
 
     @abstractmethod
     def protected_size(self):
-        pass
+        raise NotImplementedError()
 
     def total_size(self):
         raise NotImplementedError()

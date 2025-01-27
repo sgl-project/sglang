@@ -836,8 +836,12 @@ class Scheduler:
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
         protected_size = self.tree_cache.protected_size()
-        # protected memory for hierarchical cache is not leaked
-        if available_size != self.max_total_num_tokens - protected_size:
+        memory_leak = available_size != (
+            self.max_total_num_tokens
+            if not self.enable_hierarchical_cache
+            else self.max_total_num_tokens - protected_size
+        )
+        if memory_leak:
             msg = (
                 "KV cache pool leak detected!"
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
@@ -977,14 +981,14 @@ class Scheduler:
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    # do not set batch_is_full when no request can be served due to protected memory
-                    if len(adder.can_run_list) > 0 or (
-                        self.running_batch is not None
-                        and not self.running_batch.is_empty()
-                    ):
-                        # todo, should set it back to false when more memory is released
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.batch_is_full = len(adder.can_run_list) > 0 or (
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
+                    else:
                         self.batch_is_full = True
-                    pass
                 break
             if self.server_args.prefill_only_one_req:
                 break
