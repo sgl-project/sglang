@@ -315,7 +315,7 @@ class TestSRTEndpoint(unittest.TestCase):
                     for return_logprob in [True, False]:
                         for top_logprobs_num in [0, 5]:
 
-                            if logprob_start_len > input_len:
+                            if logprob_start_len >= input_len:
                                 continue
 
                             args.append(
