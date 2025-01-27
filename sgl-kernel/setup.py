@@ -71,8 +71,8 @@ nvcc_flags = [
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
-    "-Xcompiler",
-    "-w",
+    "-Xcompiler=-Wconversion",
+    "-Xcompiler=-fno-strict-aliasing",
 ]
 nvcc_flags_fp8 = [
     "-DFLASHINFER_ENABLE_FP8",

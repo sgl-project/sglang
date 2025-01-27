@@ -247,6 +247,7 @@ class Req:
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
+        self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
 
