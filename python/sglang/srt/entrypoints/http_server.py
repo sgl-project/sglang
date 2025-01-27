@@ -40,7 +40,6 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -70,6 +69,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
+from sglang.srt.orchestration.std.launcher import launch
 from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
