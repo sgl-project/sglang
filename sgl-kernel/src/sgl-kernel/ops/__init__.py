@@ -51,7 +51,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         raise ValueError("cos_sin_cache should be float32")
 
     with query.device as device:
-        pos_ids = pos_ids.int()
+        positions = positions.int()
         torch.ops.sgl_kernels.apply_rope_pos_ids_cos_sin_cache(
             q=query.view(query.shape[0], -1, head_size),
             k=key.view(key.shape[0], -1, head_size),

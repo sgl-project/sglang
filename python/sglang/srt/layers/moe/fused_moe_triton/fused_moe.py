@@ -711,6 +711,7 @@ def inplace_fused_experts(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -726,6 +727,7 @@ def inplace_fused_experts(
         topk_weights,
         topk_ids,
         True,
+        activation,
         use_fp8_w8a8,
         use_int8_w8a16,
         w1_scale,
@@ -742,6 +744,7 @@ def inplace_fused_experts_fake(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -767,6 +770,7 @@ def outplace_fused_experts(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -782,6 +786,7 @@ def outplace_fused_experts(
         topk_weights,
         topk_ids,
         False,
+        activation,
         use_fp8_w8a8,
         use_int8_w8a16,
         w1_scale,
@@ -798,6 +803,7 @@ def outplace_fused_experts_fake(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -824,6 +830,7 @@ def fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     inplace: bool = False,
+    activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -839,6 +846,7 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
+            activation,
             use_fp8_w8a8,
             use_int8_w8a16,
             w1_scale,
@@ -855,6 +863,7 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
+            activation,
             use_fp8_w8a8,
             use_int8_w8a16,
             w1_scale,
@@ -872,6 +881,7 @@ def fused_experts_impl(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     inplace: bool = False,
+    activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -986,7 +996,12 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
 
-        ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        if activation == "silu":
+            ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        elif activation == "gelu":
+            ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        else:
+            raise ValueError(f"Unsupported activation: {activation=}")
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
@@ -1042,6 +1057,7 @@ def fused_moe(
     topk: int,
     renormalize: bool,
     inplace: bool = False,
+    activation: str = "silu",
     use_grouped_topk: bool = False,
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
@@ -1111,6 +1127,7 @@ def fused_moe(
         topk_weights,
         topk_ids,
         inplace=inplace,
+        activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         w1_scale=w1_scale,
