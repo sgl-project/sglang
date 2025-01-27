@@ -216,28 +216,24 @@ TORCH_LIBRARY(sgl_kernels, m) {
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
 
-//   m.class_<turbomind::Linear>("Linear")
-//     .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
-//     .def("post_init", &turbomind::Linear::post_init);
-//     .def("forward", &turbomind::Linear::forward);
-
-    m.class_<turbomind::Linear>("Linear")
-        .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
-        .def("post_init",
-             [](c10::intrusive_ptr<turbomind::Linear> self, at::Tensor qweight, at::Tensor scales, at::Tensor qzeros, bool simt) {
-                 auto _qweight = TorchTensorToTurbomindTensor(qweight);
-                 auto _scales  = TorchTensorToTurbomindTensor(scales);
-                 auto _qzeros  = TorchTensorToTurbomindTensor(qzeros);
-                 self->post_init(_qweight, *_scales, *_qzeros, simt);
-             })
-        .def("forward", [](c10::intrusive_ptr<turbomind::Linear> self, torch::Tensor in, torch::Tensor out, c10::optional<int64_t> stream_id = c10::nullopt) {
-            auto _in    = TorchTensorToTurbomindTensor(in);
-            auto _out   = TorchTensorToTurbomindTensor(out);
-            auto stream = stream_id.has_value() ?
-                at::cuda::getCurrentCUDAStream(stream_id.value()).stream() :
-                at::cuda::getCurrentCUDAStream().stream();
-            return self->forward(*_in, *_out, stream);
-        });
+  // turbomind linear
+  m.class_<turbomind::Linear>("Linear")
+    .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
+    .def("post_init",
+            [](c10::intrusive_ptr<turbomind::Linear> self, at::Tensor qweight, at::Tensor scales, at::Tensor qzeros, bool simt) {
+                auto _qweight = TorchTensorToTurbomindTensor(qweight);
+                auto _scales  = TorchTensorToTurbomindTensor(scales);
+                auto _qzeros  = TorchTensorToTurbomindTensor(qzeros);
+                self->post_init(_qweight, *_scales, *_qzeros, simt);
+            })
+    .def("forward", [](c10::intrusive_ptr<turbomind::Linear> self, torch::Tensor in, torch::Tensor out, c10::optional<int64_t> stream_id = c10::nullopt) {
+        auto _in    = TorchTensorToTurbomindTensor(in);
+        auto _out   = TorchTensorToTurbomindTensor(out);
+        auto stream = stream_id.has_value() ?
+            at::cuda::getCurrentCUDAStream(stream_id.value()).stream() :
+            at::cuda::getCurrentCUDAStream().stream();
+        return self->forward(*_in, *_out, stream);
+    });
 }
 
 REGISTER_EXTENSION(_kernels)
