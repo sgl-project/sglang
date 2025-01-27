@@ -56,8 +56,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
 
   // fused rms norm
-  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, int cuda_stream) -> ()");
-  m.impl("fused_add_rmsnorm", torch::kCUDA, &fused_add_rmsnorm);
+  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
+  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
 
   // gemma rms norm
   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
