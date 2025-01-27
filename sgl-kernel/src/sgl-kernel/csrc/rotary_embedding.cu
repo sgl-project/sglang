@@ -98,7 +98,7 @@ void rotary_embedding(torch::Tensor& positions,  // [batch_size, seq_len] or [nu
   int64_t query_stride = query.stride(-2);
   int64_t key_stride = key.stride(-2);
 
-  dim3 grid(num_tokens);
+  dim3 grid(num_tokens);  // each block is responsible for one token
   dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

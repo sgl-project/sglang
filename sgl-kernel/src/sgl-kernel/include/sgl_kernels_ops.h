@@ -112,3 +112,7 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_sample
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples, at::Tensor success,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
                                int64_t cuda_stream);
+
+void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                                      at::Tensor cos_sin_cache, at::Tensor pos_ids, bool interleave,
+                                      int64_t cuda_stream);
