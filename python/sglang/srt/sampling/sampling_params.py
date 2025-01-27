@@ -75,7 +75,7 @@ class SamplingParams:
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
         self.logit_bias = logit_bias
-        
+
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
             self.temperature = 1.0
