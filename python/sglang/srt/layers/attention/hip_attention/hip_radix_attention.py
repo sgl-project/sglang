@@ -286,9 +286,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         metadata = None
-        if forward_batch.hip_use_cached_mask or (
-            forward_batch.hip_metadata_cached_stage is not None
-        ):
+        if forward_batch.hip_metadata_cached_stage is not None:
             metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
                 layer.layer_id,
                 q.shape[0],

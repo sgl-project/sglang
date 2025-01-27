@@ -1274,7 +1274,6 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     # Use cached mask for HiP Attention
-    hip_use_cached_mask: Optional[bool] = None
     hip_metadata_cached_stages: Optional[int] = None
 
 

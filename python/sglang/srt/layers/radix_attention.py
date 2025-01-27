@@ -12,16 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from torch import nn
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class RadixAttention(nn.Module):

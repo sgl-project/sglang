@@ -186,7 +186,6 @@ class ForwardBatch:
 
     # For HiP attention
     hip_metadata_cache_pool: Optional["HiPMetadataCachePool"] = None
-    hip_use_cached_mask: Optional[bool] = None
     hip_metadata_cached_stage: Optional[int] = None
 
     # For DP attention
@@ -347,7 +346,6 @@ class ForwardBatch:
         # Init HiP attention information
         if hasattr(model_runner, "hip_metadata_cache_pool"):
             ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
-            ret.hip_use_cached_mask = batch.hip_use_cached_mask
             ret.hip_metadata_cached_stage = batch.hip_metadata_cached_stages
 
         # Init lora information

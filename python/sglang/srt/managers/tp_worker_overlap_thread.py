@@ -72,12 +72,10 @@ class TpModelWorkerClient:
             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
         )
 
-        # Init hip mask refresh interval
-        self.hip_mask_refresh_interval = None
+        # Init hip attention config
+        self.hip_attention_config = None
         if server_args.enable_hip_attention:
-            self.hip_mask_refresh_interval = (
-                self.worker.model_runner.hip_attention_config.mask_refresh_interval
-            )
+            self.hip_attention_config = self.worker.model_runner.hip_attention_config
 
         # Launch threads
         self.input_queue = Queue()
@@ -132,21 +130,18 @@ class TpModelWorkerClient:
             if not model_worker_batch:
                 break
 
-            model_worker_batch: ModelWorkerBatch
             if model_worker_batch.forward_mode.is_decode():
-                if self.hip_mask_refresh_interval is not None:
+                if self.hip_attention_config.mask_refresh_interval is not None:
                     require_refresh = False
                     for i_stage, refresh_inteval in enumerate(
-                        self.hip_mask_refresh_interval
+                        self.hip_attention_config.mask_refresh_interval
                     ):
                         if (decode_index % refresh_inteval == 0) and (
                             not require_refresh
                         ):
-                            model_worker_batch.hip_use_cached_mask = False
                             model_worker_batch.hip_metadata_cached_stages = i_stage
                             require_refresh = True
                     if not require_refresh:
-                        model_worker_batch.hip_use_cached_mask = True
                         model_worker_batch.hip_metadata_cached_stages = (
                             None  # NOTE: use cache every stage
                         )

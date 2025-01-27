@@ -308,9 +308,9 @@ class CudaGraphRunner:
     def capture_configs(self):
         if self.enable_hip_attention:
             num_stages = len(self.hip_config.layers[0].stages)
-            cache_configs = [(True, None)]  # (use_cached_mask, num_stage_cached)
+            cache_configs = [(None,)]  # (num_stage_cached,)
             for i_stage in range(num_stages):
-                cache_configs.append((False, i_stage))
+                cache_configs.append((i_stage,))
             return cache_configs
         else:
             return [()]
@@ -341,9 +341,9 @@ class CudaGraphRunner:
 
         spec_info = self.get_spec_info(num_tokens, positions)
 
-        hip_use_cached_mask = hip_num_cached_stages = None
+        hip_num_cached_stages = None
         if self.enable_hip_attention:
-            hip_use_cached_mask, hip_num_cached_stages = capture_config
+            hip_num_cached_stages, = capture_config
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -355,7 +355,6 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
-            hip_use_cached_mask=hip_use_cached_mask,
             hip_metadata_cached_stage=hip_num_cached_stages,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum(),
@@ -456,7 +455,7 @@ class CudaGraphRunner:
         # Replay
         graph_handle = (bs,)
         if self.enable_hip_attention:
-            graph_handle = (bs, forward_batch.hip_use_cached_mask, forward_batch.hip_metadata_cached_stage)
+            graph_handle = (bs, forward_batch.hip_metadata_cached_stage)
         self.graphs[graph_handle].replay()
         next_token_logits, hidden_states = self.output_buffers[graph_handle]
 
