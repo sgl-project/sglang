@@ -5,8 +5,8 @@ import queue
 import random
 import threading
 import time
-from typing import Optional
 from datetime import datetime
+from typing import Optional
 
 import aiohttp
 import requests
