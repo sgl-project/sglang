@@ -20,13 +20,14 @@ import re
 
 import torch
 
-from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer, LoraBatchInfo
 from sglang.srt.lora.backend import FlashInferLoraBackend, TritonLoraBackend
+from sglang.srt.lora.lora import LoRAAdapter, LoraBatchInfo, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_flashinfer_available, replace_submodule
 
 logger = logging.getLogger(__name__)
+
 
 def get_module_name(name):
     # Fallback solution of mapping from config module name to module name in model class.
@@ -79,7 +80,7 @@ def get_backend_from_name(name):
         "triton": TritonLoraBackend,
         "flashinfer": FlashInferLoraBackend,
     }
-    
+
     if name in backend_mapping:
         return backend_mapping[name]
 
@@ -110,7 +111,7 @@ class LoRAManager:
         self.max_loras_per_batch = max_loras_per_batch
         self.load_config = load_config
         self.dtype = dtype
-        
+
         logger.info(f"Using {lora_backend} as backend of Lora kernels.")
         backend_type = get_backend_from_name(lora_backend)
         self.lora_backend = backend_type(lora_backend)
@@ -134,10 +135,7 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(
-            module,
-            self.max_lora_dim,
-            self.scaling,
-            self.lora_backend
+            module, self.max_lora_dim, self.scaling, self.lora_backend
         )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
@@ -255,7 +253,6 @@ class LoRAManager:
                     for i in range(num_layer)
                 ]
 
-
     def init_lora_batch(self):
         self.active_uids = set()  # set of active loras
         self.buffer_id = {}  # lora uid -> idx in memory pool
@@ -335,11 +332,13 @@ class LoRAManager:
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.buffer_id[lora_path]
 
-        batch_info = LoraBatchInfo(bs=bs,
-                                   seg_lens=seg_lens,
-                                   seg_indptr=seg_indptr,
-                                   max_len=max_len,
-                                   weight_indices=weight_indices)
+        batch_info = LoraBatchInfo(
+            bs=bs,
+            seg_lens=seg_lens,
+            seg_indptr=seg_indptr,
+            max_len=max_len,
+            weight_indices=weight_indices,
+        )
         self.lora_backend.set_batch_info(batch_info)
 
         # call set_lora_info for each lora modules

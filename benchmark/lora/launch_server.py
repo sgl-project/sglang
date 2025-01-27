@@ -1,7 +1,7 @@
 import argparse
 import os
 
-NUM_LORAS = 8
+NUM_LORAS = 4
 LORA_PATH = {
     "base": "meta-llama/Llama-2-7b-hf",
     "lora": "winddude/wizardLM-LlaMA-LoRA-7B",

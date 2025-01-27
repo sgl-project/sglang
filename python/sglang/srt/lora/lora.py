@@ -18,8 +18,8 @@
 # LoRA layers class inheritance adapted from:
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -33,22 +33,24 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
+
 @dataclass
 class LoraBatchInfo:
     # Batch size
     bs: int
-    
+
     # Lengths of each sequence in shape (bs,)
     seg_lens: torch.Tensor
-    
+
     # Indice pointers of each sequence in shape (bs + 1, )
     seg_indptr: torch.Tensor
-    
+
     # Maximum sequence length of current batch
     max_len: int
-    
+
     # The index of lora adapter used by each sequence, in shape (bs,)
     weight_indices: torch.Tensor
+
 
 class BaseLayerWithLoRA(nn.Module):
     def __init__(self, base_layer, lora_rank, scaling, lora_backend):
@@ -68,11 +70,7 @@ class BaseLayerWithLoRA(nn.Module):
 
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def __init__(
-        self,
-        base_layer: VocabParallelEmbedding,
-        lora_rank,
-        scaling,
-        lora_backend
+        self, base_layer: VocabParallelEmbedding, lora_rank, scaling, lora_backend
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
         self.weight = base_layer.weight
@@ -80,11 +78,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
-        self,
-        base_layer: ColumnParallelLinear,
-        lora_rank,
-        scaling,
-        lora_backend
+        self, base_layer: ColumnParallelLinear, lora_rank, scaling, lora_backend
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -112,11 +106,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
-        self,
-        base_layer: MergedColumnParallelLinear,
-        lora_rank,
-        scaling,
-        lora_backend
+        self, base_layer: MergedColumnParallelLinear, lora_rank, scaling, lora_backend
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -131,27 +121,25 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)
-        
+
         output_dim = base_output.shape[-1]
         lora_output = torch.empty_like(base_output)
         lora_output[:, :output_dim] = self.lora_backend.run_sgemm(
-            x=lora_a_output[:, 0 : self.lora_rank].contiguous(), 
-            weights=self.B_buffer[0])
-        
+            x=lora_a_output[:, 0 : self.lora_rank].contiguous(),
+            weights=self.B_buffer[0],
+        )
+
         lora_output[:, output_dim : 2 * output_dim] = self.lora_backend.run_sgemm(
             x=lora_a_output[:, self.lora_rank : 2 * self.lora_rank].contiguous(),
-            weights=self.B_buffer[1]
+            weights=self.B_buffer[1],
         )
 
         return base_output + lora_output * self.scaling
-        
+
+
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def init__(
-        self,
-        base_layer: QKVParallelLinear,
-        lora_rank,
-        scaling,
-        lora_backend
+        self, base_layer: QKVParallelLinear, lora_rank, scaling, lora_backend
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -168,21 +156,17 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_output = self.lora_backend.run_qkv_lora(
-            x=x, 
+            x=x,
             qkv_lora_a=self.A_buffer_qkv,
             q_lora_b=self.B_buffer_q,
             kv_lora_b=self.B_buffer_kv,
         )
-        # print(lora_output[0][:10])
         return base_output + lora_output * self.scaling
+
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
-        self,
-        base_layer: RowParallelLinear,
-        lora_rank,
-        scaling,
-        lora_backend
+        self, base_layer: RowParallelLinear, lora_rank, scaling, lora_backend
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -193,7 +177,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)
-        lora_output = self.lora_backend.run_sgemm(x=lora_a_output, weights=self.B_buffer[0])
+        lora_output = self.lora_backend.run_sgemm(
+            x=lora_a_output, weights=self.B_buffer[0]
+        )
         return base_output + lora_output * self.scaling
 
     def forward(self, input_):
@@ -232,10 +218,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module,
-    lora_rank,
-    scaling,
-    lora_backend
+    layer: nn.Module, lora_rank, scaling, lora_backend
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
@@ -247,9 +230,7 @@ def get_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-            ret = lora_layer_type(
-                layer, lora_rank, scaling, lora_backend
-            )
+            ret = lora_layer_type(layer, lora_rank, scaling, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
 

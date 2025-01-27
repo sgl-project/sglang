@@ -45,13 +45,14 @@ What do you know about llamas?
 """,
 ]
 
-BACKENDS = ['triton', 
-            'flashinfer'
-         ]
+BACKENDS = ["triton", "flashinfer"]
+
 
 class TestLoRABackend(unittest.TestCase):
-    
-    def run_backend(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens, backend):
+
+    def run_backend(
+        self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens, backend
+    ):
         print(f"=================== testing {backend} backend =======================")
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]
@@ -104,7 +105,7 @@ class TestLoRABackend(unittest.TestCase):
 
         for i in range(len(prompts)):
             print(f"Prompt {i} with lora path {batch_lora_paths[i]}:")
-            
+
             # compare input logprobs
             hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
             srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
@@ -154,7 +155,10 @@ class TestLoRABackend(unittest.TestCase):
                 tp_size = 1
                 max_new_tokens = 32
                 for backend in BACKENDS:
-                    self.run_backend(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens, backend)
+                    self.run_backend(
+                        PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens, backend
+                    )
+
 
 if __name__ == "__main__":
     try:
