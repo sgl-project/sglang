@@ -49,6 +49,7 @@ class SamplingParams:
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
         custom_params: Optional[Dict[str, Any]] = None,
+        logit_bias: Optional[Dict[int, float]] = None,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -73,7 +74,8 @@ class SamplingParams:
         self.ebnf = ebnf
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
-
+        self.logit_bias = logit_bias
+        
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
             self.temperature = 1.0
