@@ -45,12 +45,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "new_kv) -> ()");
   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 
-  // rotary embedding
-  m.def(
-      "rotary_embedding(Tensor positions, Tensor! query, Tensor! key, int head_size, Tensor cos_sin_cache, bool "
-      "is_neox) -> ()");
-  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
-
   // rms norm
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);

@@ -50,10 +50,6 @@ void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, 
                                 const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
                                 torch::Tensor new_kv);
 
-// rotary embedding
-void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
-                      torch::Tensor& cos_sin_cache, bool is_neox);
-
 // rms norm
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
 
