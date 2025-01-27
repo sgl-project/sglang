@@ -745,7 +745,6 @@ class ModelRunner:
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        from sglang.srt.layers.attention.hip_attention import HiPCudaGraphRunner
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
         self.cuda_graph_runner = None
@@ -758,11 +757,8 @@ class ModelRunner:
             return
 
         tic = time.time()
-        CudaGraphRunnerClass = CudaGraphRunner
-        if self.server_args.enable_hip_attention:
-            CudaGraphRunnerClass = HiPCudaGraphRunner
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
-        self.cuda_graph_runner = CudaGraphRunnerClass(self)
+        self.cuda_graph_runner = CudaGraphRunner(self)
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s, "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

@@ -118,6 +118,9 @@ class CudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
+        self.enable_hip_attention = self.model_runner.server_args.enable_hip_attention
+        if self.enable_hip_attention:
+            self.hip_config = self.model_runner.hip_attention_config
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.server_args.dp_size
 
@@ -250,16 +253,20 @@ class CudaGraphRunner:
                 forward_batch.global_num_tokens
             )
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                (min_num_tokens == max_num_tokens and max_num_tokens in self.graphs)
+                (min_num_tokens == max_num_tokens and (max_num_tokens,) in self.graphs)
                 if self.disable_padding
                 else max_num_tokens <= self.max_bs
             )
         else:
-            is_bs_supported = (
-                forward_batch.batch_size in self.graphs
-                if self.disable_padding
-                else forward_batch.batch_size <= self.max_bs
-            )
+            if self.disable_padding:
+                index = bisect.bisect_left(self.capture_bs, forward_batch.batch_size)
+                if index < len(self.capture_bs):
+                    found_bs = self.capture_bs[index]
+                    is_bs_supported = found_bs == forward_batch.batch_size
+                else:
+                    is_bs_supported = False
+            else:
+                is_bs_supported = forward_batch.batch_size <= self.max_bs
 
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
@@ -280,23 +287,35 @@ class CudaGraphRunner:
                 else self.capture_bs
             )
             for bs in capture_range:
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    bs,
-                    self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward)
-                    self.graphs[bs] = graph
-                    self.output_buffers[bs] = output_buffers
+                for capture_config in self.capture_configs():
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        bs,
+                        self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, capture_config)
+                        graph_handle = (bs, *capture_config)
+                        self.graphs[graph_handle] = graph
+                        self.output_buffers[graph_handle] = output_buffers
 
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
+                    # Save gemlite cache after each capture
+                    save_gemlite_cache()
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_configs(self):
+        if self.enable_hip_attention:
+            num_stages = len(self.hip_config.layers[0].stages)
+            cache_configs = [(True, None)]  # (use_cached_mask, num_stage_cached)
+            for i_stage in range(num_stages):
+                cache_configs.append((False, i_stage))
+            return cache_configs
+        else:
+            return [()]
+
+    def capture_one_batch_size(self, bs: int, forward: Callable, capture_config: tuple):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -322,6 +341,10 @@ class CudaGraphRunner:
 
         spec_info = self.get_spec_info(num_tokens, positions)
 
+        hip_use_cached_mask = hip_num_cached_stages = None
+        if self.enable_hip_attention:
+            hip_use_cached_mask, hip_num_cached_stages = capture_config
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -331,6 +354,9 @@ class CudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
+            hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
+            hip_use_cached_mask=hip_use_cached_mask,
+            hip_metadata_cached_stage=hip_num_cached_stages,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum(),
             encoder_lens=encoder_lens,
@@ -428,8 +454,11 @@ class CudaGraphRunner:
         )
 
         # Replay
-        self.graphs[bs].replay()
-        next_token_logits, hidden_states = self.output_buffers[bs]
+        graph_handle = (bs,)
+        if self.enable_hip_attention:
+            graph_handle = (bs, forward_batch.hip_use_cached_mask, forward_batch.hip_metadata_cached_stage)
+        self.graphs[graph_handle].replay()
+        next_token_logits, hidden_states = self.output_buffers[graph_handle]
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=next_token_logits[:raw_num_token],
