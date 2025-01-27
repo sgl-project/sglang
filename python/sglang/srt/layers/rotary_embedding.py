@@ -6,10 +6,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+from vllm import _custom_ops as ops
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.utils import is_cuda_available
+
+IS_CUDA_AVAILABLE = is_cuda_available()
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -143,9 +147,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if is_cuda_available():
-            from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
-
+        if IS_CUDA_AVAILABLE:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -155,8 +157,6 @@ class RotaryEmbedding(CustomOp):
                 is_neox=self.is_neox_style,
             )
         else:
-            from vllm import _custom_ops as ops
-
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             ops.rotary_embedding(
                 positions,
