@@ -68,6 +68,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             )
             for _ in range(model_runner.model_config.num_hidden_layers)
         ]
+        # NOTE: disable q caching
         self.q_buffers = None
 
     def push_q_buffer(self, q: torch.Tensor, layer_id: int, batch_size: int):
