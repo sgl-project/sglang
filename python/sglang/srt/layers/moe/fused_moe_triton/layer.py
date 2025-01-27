@@ -126,6 +126,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -138,6 +139,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            activation=activation,
         )
 
     def forward_cuda(
@@ -152,6 +154,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -169,6 +172,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             import ater
             from ater.fused_moe import fused_experts_ck
 
+            assert activation == "silu", f"{activation=} is not supported."
+
             return fused_experts_ck(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -184,6 +189,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 inplace=True,
+                activation=activation,
             )
 
     def forward_cpu(
@@ -256,6 +262,7 @@ class FusedMoE(torch.nn.Module):
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
         use_presharded_weights: bool = False,
     ):
         super().__init__()
@@ -589,6 +596,7 @@ class FusedMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
+            activation=self.activation,
         )
 
         if self.reduce_results and self.tp_size > 1:
