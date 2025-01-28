@@ -96,7 +96,9 @@ std::shared_ptr<turbomind::Tensor> DLManagedTensorToTurbomindTensor(DLManagedTen
 
 std::shared_ptr<turbomind::Tensor> TorchTensorToTurbomindTensor(at::Tensor obj) {
   DLManagedTensor* dlmt = torch::toDLPack(obj);
-  return DLManagedTensorToTurbomindTensor(dlmt);
+  auto result = DLManagedTensorToTurbomindTensor(dlmt);
+  dlmt->deleter(dlmt);
+  return result;
 }
 
 TORCH_LIBRARY(sgl_kernels, m) {
