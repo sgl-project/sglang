@@ -5,6 +5,7 @@ You can install SGLang using any of the methods below.
 ## Method 1: With pip
 ```
 pip install --upgrade pip
+pip install sgl-kernel --force-reinstall --no-deps
 pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
 
@@ -17,10 +18,11 @@ git clone -b v0.4.2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
+pip install sgl-kernel --force-reinstall --no-deps
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
 
-Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
+Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions. If you meet with issue like **ImportError: cannot import name `_grouped_size_compiled_for_decode_kernels`**, installing FlashInfer with Version 0.1.6 instead of the latest version could solve it.
 
 Note: To AMD ROCm system with Instinct/MI GPUs, do following instead:
 
@@ -30,6 +32,7 @@ git clone -b v0.4.2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
+pip install sgl-kernel --force-reinstall --no-deps
 pip install -e "python[all_hip]"
 ```
 
