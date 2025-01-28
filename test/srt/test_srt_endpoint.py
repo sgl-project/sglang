@@ -476,6 +476,36 @@ class TestSRTEndpoint(unittest.TestCase):
         version = response_json["version"]
         self.assertIsInstance(version, str)
 
+    def test_logit_bias(self):
+        """Test that a very high logit bias forces sampling of a specific token."""
+        # Choose a token ID to bias (using 5 as an example)
+        target_token_id = 5
+        logit_bias = {str(target_token_id): 100.0}  # Very high positive bias
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,  # Use high temperature to encourage exploration
+                    "max_new_tokens": 4,
+                    "logit_bias": logit_bias,
+                },
+                "return_logprob": True,
+            },
+        )
+        response_json = response.json()
+
+        # Extract the sampled token IDs from the output
+        output_token_logprobs = response_json["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+
+        # Verify that all sampled tokens are the target token
+        self.assertTrue(
+            all(x == target_token_id for x in sampled_tokens),
+            f"Expected all tokens to be {target_token_id}, but got {sampled_tokens}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

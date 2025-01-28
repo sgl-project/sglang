@@ -61,8 +61,6 @@ class SamplingBatchInfo:
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
 
-    logit_bias: torch.Tensor
-
     @classmethod
     def from_schedule_batch(
         cls, batch: ScheduleBatch, vocab_size: int, enable_overlap_schedule: bool
@@ -87,11 +85,13 @@ class SamplingBatchInfo:
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
 
-        logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
-        for i, r in enumerate(reqs):
-            if r.sampling_params.logit_bias is not None:
-                for key, value in r.sampling_params.logit_bias.items():
-                    logit_bias[i, int(key)] = value
+        logit_bias = None
+        if any(r.sampling_params.logit_bias is not None for r in reqs):
+            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            for i, r in enumerate(reqs):
+                if r.sampling_params.logit_bias is not None:
+                    for key, value in r.sampling_params.logit_bias.items():
+                        logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
@@ -288,9 +288,13 @@ class SamplingBatchInfo:
                 shape, dtype = rhs.shape[1:], rhs.dtype
 
             if lhs is None:
-                lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+                lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(
+                    default
+                )
             if rhs is None:
-                rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
+                rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(
+                    default
+                )
             return torch.cat([lhs, rhs])
 
         return None
