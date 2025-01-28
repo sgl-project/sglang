@@ -34,6 +34,14 @@
 
 </details>
 
+
+## topk states
+to return the hidden states you need to pass `return_hidden_states`. Change `top_hidden_states_nums` if you want to only retrieve topk of the hidden states. Pass -1 is you want to the full state
+```python
+llm = sgl.Engine(model_path=config.name_model, top_hidden_states_nums=8)
+llm.generate(batch_inputs, sampling_params, return_hidden_states=True)
+```
+
 ## About
 SGLang is a fast serving framework for large language models and vision language models.
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
