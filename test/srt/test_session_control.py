@@ -216,7 +216,7 @@ class TestSessionControl(unittest.TestCase):
         print(outputs_from_session)
         print("outputs from normal queries:")
         print(outputs_normal)
-        assert outputs_from_session == outputs_normal
+        assert outputs_from_session == outputs_normal, f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
 
     async def async_generate(self, payload):
         url = self.base_url + "/generate"
@@ -345,7 +345,7 @@ class TestSessionControl(unittest.TestCase):
             output_no_session = response["text"]
             print("second request output without session:")
             print(output_no_session)
-            assert second_output == output_no_session
+            assert second_output == output_no_session, f"second_output: {second_output}, output_no_session: {output_no_session}"
 
     def test_session_control_backtrack_with_abort(self):
         asyncio.run(self.run_session_control_backtrack_with_abort(replace=True))
@@ -463,7 +463,7 @@ class TestSessionControl(unittest.TestCase):
         print(outputs_from_session)
         print("====== outputs from normal queries: =======")
         print(outputs_normal)
-        assert outputs_from_session == outputs_normal
+        assert outputs_from_session == outputs_normal, f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
 
     def test_session_control_with_branching(self):
         root_prompt = "First, let me explain in one sentence about AI"
@@ -696,7 +696,7 @@ class TestSessionControlVision(unittest.TestCase):
         print(outputs_from_session)
         print("outputs from normal queries:")
         print(outputs_normal)
-        assert outputs_from_session == outputs_normal
+        assert outputs_from_session == outputs_normal, f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
 
 
 if __name__ == "__main__":
