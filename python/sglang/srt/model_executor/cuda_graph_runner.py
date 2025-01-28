@@ -343,7 +343,7 @@ class CudaGraphRunner:
 
         hip_num_cached_stages = None
         if self.enable_hip_attention:
-            hip_num_cached_stages, = capture_config
+            (hip_num_cached_stages,) = capture_config
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,

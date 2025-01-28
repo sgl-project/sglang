@@ -1,6 +1,7 @@
 from __future__ import annotations
+
 import logging
-from typing import Tuple, Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Tuple
 
 import torch
 from torch import Tensor
@@ -10,8 +11,7 @@ from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
-    from hip.models.hip_attention.gen3 import HiPOffloadCache
-    from hip.models.hip_attention.gen3 import HiPAttentionConfig
+    from hip.models.hip_attention.gen3 import HiPAttentionConfig, HiPOffloadCache
 
 logger = logging.getLogger(__name__)
 

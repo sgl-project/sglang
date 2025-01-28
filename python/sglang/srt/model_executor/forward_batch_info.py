@@ -41,14 +41,14 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
+    from hip.models.hip_attention.gen3 import HiPMetadataCachePool
+
     from sglang.srt.layers.attention import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
-
-    from hip.models.hip_attention.gen3 import HiPMetadataCachePool
 
 
 class ForwardMode(IntEnum):

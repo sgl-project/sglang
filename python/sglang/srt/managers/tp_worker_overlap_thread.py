@@ -135,10 +135,12 @@ class TpModelWorkerClient:
                 break
 
             if hip_mask_refresh_state is not None:
-                model_worker_batch.hip_metadata_cached_stages = hip_mask_refresh_state.update(
-                    model_worker_batch.forward_mode.is_decode(),
-                    model_worker_batch.forward_mode.is_extend(),
-                    self.hip_attention_config,
+                model_worker_batch.hip_metadata_cached_stages = (
+                    hip_mask_refresh_state.update(
+                        model_worker_batch.forward_mode.is_decode(),
+                        model_worker_batch.forward_mode.is_extend(),
+                        self.hip_attention_config,
+                    )
                 )
 
             # Keep a reference of model_worker_batch by storing it into a list.
