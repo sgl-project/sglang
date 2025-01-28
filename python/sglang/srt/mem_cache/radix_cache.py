@@ -32,10 +32,6 @@ from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-# import logging
-
-# logger = logging.getLogger(__name__)
-
 
 class TreeNode:
 
