@@ -112,3 +112,6 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                       at::Tensor cos_sin_cache, at::Tensor pos_ids, bool interleave,
                                       int64_t cuda_stream);
+
+
+std::vector<at::Tensor> deepseekv3_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t n_rows);

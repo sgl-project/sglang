@@ -495,3 +495,7 @@ def min_p_sampling_from_probs(
     return _min_p_sampling_from_probs_internal(
         probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
     )
+
+
+def deepseekv3_fused_gate(input_tensor, bias, num_rows):
+    return torch.ops.sgl_kernels.deepseekv3_fused_gate(input_tensor, bias, num_rows)

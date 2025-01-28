@@ -115,6 +115,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+
+  // deepseek v3 fused gate module
+  m.def("deepseekv3_fused_gate(Tensor input, Tensor bias, int num_rows) -> (Tensor[])");
+  m.impl("deepseekv3_fused_gate", torch::kCUDA, &deepseekv3_fused_gate);
+
 }
 
 REGISTER_EXTENSION(_kernels)

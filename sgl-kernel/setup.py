@@ -89,6 +89,7 @@ sources = [
     "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
     "src/sgl-kernel/csrc/fused_add_rms_norm_kernel.cu",
+    "src/sgl-kernel/csrc/deepseek_fused_gate.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
