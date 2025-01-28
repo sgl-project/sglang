@@ -229,7 +229,7 @@ async def flush_cache():
     _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -573,7 +573,24 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [10, 11, 12]
     else:
-        json_data["text"] = "The capital city of France is"
+        # json_data["text"] = "The capital city of France is"
+        target_length = int(os.getenv("SRT_WARMUP_PASSKEY_LENGTH", "35000"))
+        json_data["text"] = (
+            "You need to find the passkey. Read carefully following text, and remember the passkey\n\n"
+        )
+        filler = "Sky is blue, grass is green, sun is red. And here we go again"
+        json_data["text"] += filler * (target_length // 35)
+        json_data[
+            "text"
+        ] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
+        json_data[
+            "text"
+        ] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
+        json_data[
+            "text"
+        ] += "\n\nThe passkey is $000310$. Remember, the passkey is $000310$.\n\n"
+        json_data["text"] += filler * (target_length // 35)
+        json_data["text"] += "What was the passkey? The passkey is"
 
     try:
         for _ in range(server_args.dp_size):
@@ -581,9 +598,13 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=3600,
             )
             assert res.status_code == 200, f"{res}"
+            logger.info(f"Warmup response: {res.json()}")
+            if os.getenv("SRT_EXIT_AFTER_WARMUP", "0") == "1":
+                logger.error(f"Initialization canceled. SRT_EXIT_AFTER_WARMUP")
+                kill_process_tree(os.getpid())
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
