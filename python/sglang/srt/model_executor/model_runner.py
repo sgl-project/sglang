@@ -36,7 +36,7 @@ from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_sta
 from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.layers.attention.hip_attention import HiPRadixAttentionBackend
+from sglang.srt.layers.attention.hip_radix_attention import HiPRadixAttentionBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
