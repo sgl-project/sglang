@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
