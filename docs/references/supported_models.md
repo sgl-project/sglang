@@ -28,6 +28,7 @@
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4
+- Phi-3 / Phi-4
 - Phi-3-Small
 - IBM Granite 3
 
@@ -77,10 +78,12 @@ Another valuable resource is the [vLLM Models Directory](https://github.com/vllm
 To port a model from vLLM to SGLang, you can compare these two files [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama.py) and [vLLM Llama Implementation](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py). This comparison will help you understand how to convert a model implementation from vLLM to SGLang. The major difference is the replacement of Attention with RadixAttention. The other parts are almost identical. Specifically,
   - Replace vllm's `Attention` with `RadixAttention`. Note that you need to pass `layer_id` all the way to `RadixAttention`.
   - Replace vllm's `LogitsProcessor` with SGLang's `LogitsProcessor`.
+  - Replace Multi-headed `Attention` of ViT with SGLang's `VisionAttention`.
   - Replace other vLLM layers with SGLang layers (e.g., `RMSNorm`, `SiluAndMul`).
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.
   - Add `EntryClass` at the end.
+  - Please ensure the new implementation uses **only SGLang components and does not rely on any vLLM components**.
 
 ### Registering an external model implementation
 
@@ -90,7 +93,7 @@ Here is how you can do it:
 
 ```python
 from sglang.srt.models.registry import ModelRegistry
-from sglang.srt.server import launch_server
+from sglang.srt.entrypoints.http_server import launch_server
 
 # for a single model, you can add it to the registry
 ModelRegistry.models[model_name] = model_class

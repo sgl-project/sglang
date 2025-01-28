@@ -222,6 +222,11 @@ work_dirs/
 compile_commands.json
 
 *.iml
-.vscode/
+
+# VSCode
+.vscode
+
+1
+
 *.nsys-rep
 *.ncu-rep

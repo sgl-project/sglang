@@ -29,8 +29,8 @@ from sglang.srt.utils import (
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
-    is_ipv6,
     is_port_available,
+    is_valid_ipv6_address,
     nullable_str,
 )
 
@@ -75,6 +75,7 @@ class ServerArgs:
     # Other runtime options
     tp_size: int = 1
     stream_interval: int = 1
+    stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
@@ -167,6 +168,11 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
+
+    # Custom logit processor
+    enable_custom_logit_processor: bool = False
+    tool_call_parser: str = None
+    enable_hierarchical_cache: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -323,6 +329,7 @@ class ServerArgs:
                 "dummy",
                 "gguf",
                 "bitsandbytes",
+                "layered",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -336,7 +343,10 @@ class ServerArgs:
             "which is mainly for profiling."
             '"gguf" will load the weights in the gguf format. '
             '"bitsandbytes" will load the weights using bitsandbytes '
-            "quantization.",
+            "quantization."
+            '"layered" loads weights layer by layer so that one can quantize a '
+            "layer before loading another to make the peak memory envelope "
+            "smaller.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -500,6 +510,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.stream_interval,
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+        )
+        parser.add_argument(
+            "--stream-output",
+            action="store_true",
+            help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
             "--random-seed",
@@ -912,6 +927,24 @@ class ServerArgs:
             action="store_true",
             help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
         )
+        parser.add_argument(
+            "--enable-custom-logit-processor",
+            action="store_true",
+            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        # Function Calling
+        parser.add_argument(
+            "--tool-call-parser",
+            type=str,
+            choices=["qwen25", "mistral", "llama3"],
+            default=ServerArgs.tool_call_parser,
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+        )
+        parser.add_argument(
+            "--enable-hierarchical-cache",
+            action="store_true",
+            help="Enable hierarchical cache",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -922,7 +955,7 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_ipv6(self.host):
+        if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"

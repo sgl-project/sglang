@@ -158,7 +158,6 @@ class ImageInputs:
     im_end_id: Optional[torch.Tensor] = None
     slice_start_id: Optional[torch.Tensor] = None
     slice_end_id: Optional[torch.Tensor] = None
-
     tgt_sizes: Optional[list] = None
 
     @staticmethod
@@ -233,6 +232,7 @@ class Req:
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
+        custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
@@ -247,12 +247,13 @@ class Req:
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
+        self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
 
         # Sampling info
         self.sampling_params = sampling_params
-        self.lora_path = lora_path
+        self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
         self.req_pool_idx = None
@@ -299,7 +300,7 @@ class Req:
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
 
-        # Logprobs (return value)
+        # Logprobs (return values)
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
         self.input_top_logprobs_val: Optional[List[float]] = None
@@ -328,8 +329,14 @@ class Req:
         # Constrained decoding
         self.grammar: Optional[BaseGrammarObject] = None
 
-        # The number of cached tokens, that were already cached in the KV cache
+        # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
+        self.already_computed = 0
+
+        # The number of verification forward passes in the speculative decoding.
+        # This is used to compute the average acceptance length per request.
+        self.spec_verify_ct = 0
+        self.lora_path = lora_path
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
@@ -549,13 +556,13 @@ class ScheduleBatch:
     next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: torch.Tensor = None
-    input_embeds: torch.Tensor = None
-    req_pool_indices: torch.Tensor = None
-    seq_lens: torch.Tensor = None
+    input_ids: torch.Tensor = None  # shape: [b], int32
+    input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    req_pool_indices: torch.Tensor = None  # shape: [b], int32
+    seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
-    out_cache_loc: torch.Tensor = None
-    output_ids: torch.Tensor = None
+    out_cache_loc: torch.Tensor = None  # shape: [b], int32
+    output_ids: torch.Tensor = None  # shape: [b], int32
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
@@ -594,6 +601,9 @@ class ScheduleBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
 
+    # Enable custom logit processor
+    enable_custom_logit_processor: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -604,6 +614,7 @@ class ScheduleBatch:
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
+        enable_custom_logit_processor: bool,
     ):
         return cls(
             reqs=reqs,
@@ -617,6 +628,7 @@ class ScheduleBatch:
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
+            enable_custom_logit_processor=enable_custom_logit_processor,
         )
 
     def batch_size(self):
@@ -744,13 +756,6 @@ class ScheduleBatch:
 
         pt = 0
         for i, req in enumerate(reqs):
-            already_computed = (
-                req.extend_logprob_start_len + 1 + req.cached_tokens
-                if req.extend_logprob_start_len > 0
-                else 0
-            )
-            req.cached_tokens += len(req.prefix_indices) - already_computed
-
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
@@ -766,15 +771,20 @@ class ScheduleBatch:
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
-            # Compute the relative logprob_start_len in an extend batch
-            if req.logprob_start_len >= pre_len:
-                extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len, req.extend_input_len - 1
-                )
-            else:
-                extend_logprob_start_len = req.extend_input_len - 1
+            if req.return_logprob:
+                # Compute the relative logprob_start_len in an extend batch
+                if req.logprob_start_len >= pre_len:
+                    extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len, req.extend_input_len - 1
+                    )
+                else:
+                    raise RuntimeError(
+                        f"This should never happen. {req.logprob_start_len=}, {pre_len=}"
+                    )
+                req.extend_logprob_start_len = extend_logprob_start_len
 
-            req.extend_logprob_start_len = extend_logprob_start_len
+            req.cached_tokens += pre_len - req.already_computed
+            req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
 
@@ -1020,7 +1030,7 @@ class ScheduleBatch:
         self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1106,6 +1116,8 @@ class ScheduleBatch:
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
+        if self.spec_info:
+            self.spec_info.filter_batch(new_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1200,6 +1212,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            enable_custom_logit_processor=self.enable_custom_logit_processor,
         )
 
     def __str__(self):

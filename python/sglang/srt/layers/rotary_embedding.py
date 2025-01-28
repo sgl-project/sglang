@@ -6,7 +6,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from vllm import _custom_ops as ops
 from vllm.model_executor.custom_op import CustomOp
+
+from sglang.srt.layers.custom_op_util import register_custom_op
+from sglang.srt.utils import is_cuda_available
+
+_is_cuda_available = is_cuda_available()
+if _is_cuda_available:
+    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -51,7 +59,7 @@ def _apply_rotary_emb(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-@CustomOp.register("rotary_embedding")
+@register_custom_op("sglang_rotary_embedding")
 class RotaryEmbedding(CustomOp):
     """Original rotary positional embedding."""
 
@@ -73,7 +81,9 @@ class RotaryEmbedding(CustomOp):
         self.dtype = dtype
 
         cache = self._compute_cos_sin_cache()
-        cache = cache.to(dtype)
+        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
+        if not _is_cuda_available:
+            cache = cache.to(dtype)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -139,23 +149,17 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from vllm import _custom_ops as ops
-
-        self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-        # ops.rotary_embedding()/batched_rotary_embedding()
-        # are in-place operations that update the query and key tensors.
-        if offsets is not None:
-            ops.batched_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-                self.rotary_dim,
-                offsets,
+        if _is_cuda_available:
+            apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self.cos_sin_cache,
+                is_neox=self.is_neox_style,
             )
         else:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             ops.rotary_embedding(
                 positions,
                 query,
@@ -176,28 +180,14 @@ class RotaryEmbedding(CustomOp):
         from vllm._ipex_ops import ipex_ops as ops
 
         self.cos_sin_cache = self.cos_sin_cache.to(positions.device, dtype=query.dtype)
-        # ops.rotary_embedding()/batched_rotary_embedding()
-        # are in-place operations that update the query and key tensors.
-        if offsets is not None:
-            ops.batched_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-                self.rotary_dim,
-                offsets,
-            )
-        else:
-            ops.rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+        ops.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
         return query, key
 
     def forward_hpu(
@@ -664,6 +654,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
+        device: Optional[str] = "cuda",
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -676,13 +667,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
+        self.device = device
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device="cuda")
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device)
             / self.rotary_dim
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
@@ -710,7 +702,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(
             self.max_position_embeddings * self.scaling_factor,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -1042,7 +1034,12 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        scaling_type = rope_scaling["rope_type"]
+        if "rope_type" in rope_scaling:
+            scaling_type = rope_scaling["rope_type"]
+        elif "type" in rope_scaling:
+            scaling_type = rope_scaling["type"]
+        else:
+            raise ValueError("Unknown RoPE scaling type")
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
@@ -1174,3 +1171,111 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
+
+def get_rope_cpu(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[torch.dtype] = None,
+    partial_rotary_factor: float = 1.0,
+    device: Optional[str] = None,
+) -> RotaryEmbedding:
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if rope_scaling is not None:
+        # Transforms every value that is a list into a tuple for caching calls
+        rope_scaling_tuple = {
+            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
+        }
+        rope_scaling_args = tuple(rope_scaling_tuple.items())
+    else:
+        rope_scaling_args = None
+    if partial_rotary_factor < 1.0:
+        rotary_dim = int(rotary_dim * partial_rotary_factor)
+    key = (
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style,
+        rope_scaling_args,
+        dtype,
+    )
+    if key in _ROPE_DICT:
+        return _ROPE_DICT[key]
+
+    assert rope_scaling is not None
+    scaling_type = rope_scaling["rope_type"]
+    assert (
+        scaling_type == "deepseek_yarn"
+    ), "Only deepseek_yarn is supported for CPU for now"
+
+    scaling_factor = rope_scaling["factor"]
+    original_max_position = rope_scaling["original_max_position_embeddings"]
+    extra_kwargs = {
+        k: v
+        for k, v in rope_scaling.items()
+        if k
+        in (
+            "extrapolation_factor",
+            "attn_factor",
+            "beta_fast",
+            "beta_slow",
+            "mscale",
+            "mscale_all_dim",
+        )
+    }
+    extra_kwargs["device"] = device
+    rotary_emb = DeepseekScalingRotaryEmbedding(
+        head_size,
+        rotary_dim,
+        original_max_position,
+        base,
+        is_neox_style,
+        scaling_factor,
+        dtype,
+        **extra_kwargs,
+    )
+
+    _ROPE_DICT[key] = rotary_emb
+    return rotary_emb
+
+
+def get_rope_wrapper(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[torch.dtype] = None,
+    partial_rotary_factor: float = 1.0,
+    device: Optional[str] = None,
+):
+    if device != "cpu":
+        return get_rope(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            rope_scaling,
+            dtype,
+            partial_rotary_factor,
+        )
+
+    return get_rope_cpu(
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style,
+        rope_scaling,
+        dtype,
+        partial_rotary_factor,
+        device,
+    )

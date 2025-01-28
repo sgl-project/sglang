@@ -18,7 +18,6 @@ suites = {
         "test_eagle_infer.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
-        "test_get_weights_by_name.py",
         "test_gguf.py",
         "test_input_embeddings.py",
         "test_json_constrained.py",
@@ -31,6 +30,7 @@ suites = {
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
+        "test_regex_constrained.py",
         "test_release_memory_occupation.py",
         "test_request_length_validation.py",
         "test_retract_decode.py",
@@ -41,18 +41,18 @@ suites = {
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torch_compile_moe.py",
-        # Temporarily disable this because it requires PyTorch >= 2.5
-        # "test_torch_native_attention_backend.py",
+        "test_torch_native_attention_backend.py",
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",
         "test_update_weights_from_disk.py",
         "test_update_weights_from_tensor.py",
         "test_vision_chunked_prefill.py",
+        "test_vision_llm.py",
         "test_vision_openai_server.py",
         "test_w8a8_quantization.py",
-        "test_session_control.py",
         "test_fp8_kvcache.py",
+        "test_fp8_kernel.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
@@ -72,7 +72,6 @@ for target_suite_name, target_tests in suites.items():
         if target_suite_name in tests:
             tests.remove(target_suite_name)
             tests.extend(target_tests)
-
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
