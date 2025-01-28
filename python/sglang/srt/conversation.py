@@ -631,3 +631,18 @@ register_conv_template(
         image_token="(<image>./</image>)",
     )
 )
+
+# Reference: https://github.com/deepseek-ai/Janus?tab=readme-ov-file#janus-pro
+register_conv_template(
+    Conversation(
+        name="janus-pro",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language",
+        system_template="{system_message}.",
+        roles=("User", "Assistant"),
+        sep="\n\n",
+        sep2="<｜end▁of▁sentence｜>",
+        sep_style=SeparatorStyle.ADD_COLON_TWO,
+        stop_str=["<|User|>", "<｜end▁of▁sentence｜>"],
+        image_token="<image_placeholder>",
+    )
+)
