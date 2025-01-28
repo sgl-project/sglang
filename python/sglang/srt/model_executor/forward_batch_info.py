@@ -41,9 +41,10 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
+    from hip.models.hip_attention.gen3 import HiPMetadataCachePool
+
     from sglang.srt.layers.attention import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
-    from sglang.srt.mem_cache.hip_memory_pool import HiPMetadataCachePool
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -187,7 +188,6 @@ class ForwardBatch:
 
     # For HiP attention
     hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
-    hip_use_cached_mask: Optional[bool] = None
     hip_metadata_cached_stage: Optional[int] = None
 
     # For DP attention
@@ -346,9 +346,8 @@ class ForwardBatch:
             ret.compute_mrope_positions(model_runner, batch)
 
         # Init HiP attention information
-        if hasattr(model_runner, "hip_metadata_cache_pool"):
+        if model_runner.hip_metadata_cache_pool is not None:
             ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
-            ret.hip_use_cached_mask = batch.hip_use_cached_mask
             ret.hip_metadata_cached_stage = batch.hip_metadata_cached_stages
 
         # Init lora information

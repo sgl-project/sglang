@@ -197,6 +197,7 @@ class Scheduler:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            is_context_extended=server_args.enable_hip_attention,
         )
         self.is_generation = self.model_config.is_generation
 

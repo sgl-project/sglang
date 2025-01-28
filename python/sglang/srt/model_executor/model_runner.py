@@ -36,6 +36,7 @@ from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_sta
 from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.hip_radix_attention import HiPRadixAttentionBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -128,6 +129,11 @@ class ModelRunner:
             self.init_double_sparsity_channel_config(
                 self.server_args.ds_heavy_channel_type
             )
+
+        elif server_args.enable_hip_attention:
+            logger.info("HIP attention is turned on.")
+            server_args.attention_backend = "hip_attention"
+            self.init_hip_attention_config(server_args.hip_attention_config)
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
@@ -624,10 +630,9 @@ class ModelRunner:
                 logging.warning(
                     f"max_total_tokens={max_total_tokens} is larger than the profiled value "
                     f"{self.max_total_num_tokens}. "
-                    # f"Use the given value instead."
+                    f"Use the profiled value instead."
                 )
-            # self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
-            self.max_total_num_tokens = max_total_tokens
+            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -690,6 +695,19 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
 
+        self.hip_metadata_cache_pool = None
+        if self.server_args.enable_hip_attention:
+            from hip.models.hip_attention.gen3 import HiPMetadataCachePool
+
+            self.hip_metadata_cache_pool = HiPMetadataCachePool(
+                query_head_num=self.model_config.num_attention_heads
+                // self.server_args.tp_size,
+                layer_num=self.model_config.num_hidden_layers,
+                context_length=self.model_config.context_len,
+                device=self.device,
+                hip_config=self.hip_attention_config,
+            )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -706,7 +724,9 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if self.server_args.attention_backend == "flashinfer":
+        if self.server_args.enable_hip_attention:
+            self.attn_backend = HiPRadixAttentionBackend(self)
+        elif self.server_args.attention_backend == "flashinfer":
             self.attn_backend = FlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
@@ -745,9 +765,20 @@ class ModelRunner:
                 .cuda()
             )
 
+    def init_hip_attention_config(self, hip_attention_config):
+        from hip.models.hip_attention.gen3 import HiPAttentionConfig
+
+        if hip_attention_config is None:
+            hip_attention_config = {}
+        elif hip_attention_config.startswith("{"):
+            hip_attention_config = json.loads(hip_attention_config)
+        else:
+            with open(hip_attention_config, "r") as f:
+                hip_attention_config = json.load(f)
+        self.hip_attention_config = HiPAttentionConfig(parsed_json=hip_attention_config)
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        from sglang.srt.layers.attention.hip_attention import HiPCudaGraphRunner
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
         self.cuda_graph_runner = None
@@ -760,15 +791,9 @@ class ModelRunner:
             return
 
         tic = time.time()
-        CudaGraphRunnerClass = CudaGraphRunner
-        if self.server_args.enable_hip_attention:
-            CudaGraphRunnerClass = HiPCudaGraphRunner
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
-        self.cuda_graph_runner = CudaGraphRunnerClass(self)
-        logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s, "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        self.cuda_graph_runner = CudaGraphRunner(self)
+        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
