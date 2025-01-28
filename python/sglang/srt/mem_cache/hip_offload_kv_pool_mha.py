@@ -2,7 +2,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Set, Tuple
+from typing import Dict, Set, Tuple, Any
 
 import torch
 from hip.models.hip_attention.gen3.uvm_gpu_cache import (
@@ -135,11 +135,11 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
     def get_value_buffer(self, layer_id: int):
         raise NotImplementedError()
 
-    def get_kv_buffer(self, layer_id: int) -> HiPOffloadCache:
+    def get_kv_buffer(self, layer_id: int) -> Tuple[HiPOffloadCache, Any]:
         # Use this function for decode, pass this to `k`
         if self.require_validation:
-            return self.layer_buffer[layer_id], *self.validation_cache.get_kv_buffer(layer_id)
-        return self.layer_buffer[layer_id]
+            return self.layer_buffer[layer_id], self.validation_cache.get_kv_buffer(layer_id)
+        return self.layer_buffer[layer_id], None
 
     def prefetch_prefix_kv_buffer(
         self, layer_id: int, batch_id: int, table: Tensor, prefix_seq_len: int
@@ -147,10 +147,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         # you must call before get fetched prefix
         assert table.ndim == 1
 
-        if self.require_validation:
-            hip_offload_cache, _, _ = self.get_kv_buffer(layer_id)
-        else:
-            hip_offload_cache = self.get_kv_buffer(layer_id)
+        hip_offload_cache, _ = self.get_kv_buffer(layer_id)
 
         handle_id = (layer_id, batch_id)
         assert handle_id not in self.prefetch_threads, handle_id
@@ -205,7 +202,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
         # you need to pass KV for extend
         cache_k: Tensor,
         cache_v: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Any]:
         # return cache_k, cache_v
 
         # Use this function for prefill
@@ -279,9 +276,9 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
             assert k_err < 1e-5, k_err
             assert v_err < 1e-5, v_err
 
-            return k, v, k_valid, v_valid
+            return k, v, (k_valid, v_valid)
         else:
-            return k, v
+            return k, v, None
 
     def set_kv_buffer(
         self,
