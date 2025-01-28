@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
+    from hip.models.hip_attention.gen3 import HiPMetadataCachePool
+
 
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
@@ -185,7 +187,7 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For HiP attention
-    hip_metadata_cache_pool: Optional["HiPMetadataCachePool"] = None
+    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
     hip_metadata_cached_stage: Optional[int] = None
 
     # For DP attention

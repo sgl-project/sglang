@@ -124,7 +124,7 @@ class TpModelWorkerClient:
 
         hip_mask_refresh_state = None
         if self.hip_attention_config is not None:
-            from hip.models.hip_attention.gen3.mask_refresh_interval import HiPMaskRefreshState
+            from hip.models.hip_attention.gen3 import HiPMaskRefreshState
 
             # For keeping track of HiP attention mask refresh cycles
             hip_mask_refresh_state = HiPMaskRefreshState()

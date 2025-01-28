@@ -697,7 +697,7 @@ class ModelRunner:
 
         self.hip_metadata_cache_pool = None
         if self.server_args.enable_hip_attention:
-            from hip.models.hip_attention.gen3.hip_memory_pool import HiPMetadataCachePool
+            from hip.models.hip_attention.gen3 import HiPMetadataCachePool
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
                 query_head_num=self.model_config.num_attention_heads // self.server_args.tp_size,
                 layer_num=self.model_config.num_hidden_layers,
@@ -764,7 +764,7 @@ class ModelRunner:
             )
 
     def init_hip_attention_config(self, hip_attention_config):
-        from hip.models.hip_attention.gen3.hip_config import HiPAttentionConfig
+        from hip.models.hip_attention.gen3 import HiPAttentionConfig
         if hip_attention_config is None:
             hip_attention_config = {}
         elif hip_attention_config.startswith("{"):

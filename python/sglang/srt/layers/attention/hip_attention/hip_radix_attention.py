@@ -8,7 +8,6 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
-from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -21,6 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInfo
+    from hip.models.hip_attention.gen3 import HiPAttentionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +30,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
-        from hip.models.hip_attention.gen3 import forward_paged_hip, HiPAttentionConfig
-
+        from hip.models.hip_attention.gen3 import forward_paged_hip
         self.forward_paged_hip = forward_paged_hip
 
         self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config
@@ -157,7 +156,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     k=k_chunk,
                     v=v_chunk,
                     online_update_cache=(
-                        forward_batch.token_to_kv_pool.online_update_cache
+                        forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
                         if self.is_offload_enabled else None
                     ),
                     offloading_metadata=offloading_metadata,
@@ -205,7 +204,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
         else:  # Offloading enabled
             assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
-
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
@@ -237,7 +235,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             hip_config=self.hip_config,
             cached_metadata=metadata,
             online_update_cache=(
-                forward_batch.token_to_kv_pool.online_update_cache
+                forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
                 if self.is_offload_enabled else None
             ),
         )
