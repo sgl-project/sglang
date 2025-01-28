@@ -149,6 +149,7 @@ class Scheduler:
             if not self.spec_algorithm.is_none()
             else 1
         )
+        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -486,7 +487,7 @@ class Scheduler:
     @torch.no_grad()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        result_queue = deque()
+        self.result_queue = deque()
 
         while True:
             recv_reqs = self.recv_requests()
@@ -497,7 +498,7 @@ class Scheduler:
 
             if batch:
                 result = self.run_batch(batch)
-                result_queue.append((batch.copy(), result))
+                self.result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
@@ -511,7 +512,7 @@ class Scheduler:
 
             if self.last_batch:
                 # Process the results of the last batch
-                tmp_batch, tmp_result = result_queue.popleft()
+                tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
@@ -642,7 +643,7 @@ class Scheduler:
                 self.waiting_queue.append(req)
                 return
 
-        # Handle image inputs
+        # Handle multimodal inputs
         if recv_req.image_inputs is not None:
             image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
@@ -743,7 +744,13 @@ class Scheduler:
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self.waiting_queue.append(req)
 
-    def log_prefill_stats(self, adder, can_run_list, running_bs, has_being_chunked):
+    def log_prefill_stats(
+        self,
+        adder: PrefillAdder,
+        can_run_list: List[Req],
+        running_bs: ScheduleBatch,
+        has_being_chunked: bool,
+    ):
         self.tree_cache_metrics["total"] += (
             adder.log_input_tokens + adder.log_hit_tokens
         ) / 10**9
@@ -825,10 +832,16 @@ class Scheduler:
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        if available_size != self.max_total_num_tokens:
+        protected_size = self.tree_cache.protected_size()
+        memory_leak = available_size != (
+            self.max_total_num_tokens
+            if not self.enable_hierarchical_cache
+            else self.max_total_num_tokens - protected_size
+        )
+        if memory_leak:
             msg = (
                 "KV cache pool leak detected!"
-                f"{available_size=}, {self.max_total_num_tokens=}\n"
+                f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
             )
             warnings.warn(msg)
             if crash_on_warnings():
@@ -943,7 +956,14 @@ class Scheduler:
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    self.batch_is_full = True
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.batch_is_full = len(adder.can_run_list) > 0 or (
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
+                    else:
+                        self.batch_is_full = True
                 break
             if self.server_args.prefill_only_one_req:
                 break

@@ -141,19 +141,13 @@ TORCH_LIBRARY(sgl_kernels, m) {
       "new_kv) -> ()");
   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 
-  // rotary embedding
-  m.def(
-      "rotary_embedding(Tensor positions, Tensor! query, Tensor! key, int head_size, Tensor cos_sin_cache, bool "
-      "is_neox) -> ()");
-  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
-
   // rms norm
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
 
   // fused rms norm
-  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, int cuda_stream) -> ()");
-  m.impl("fused_add_rmsnorm", torch::kCUDA, &fused_add_rmsnorm);
+  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
+  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
 
   // gemma rms norm
   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
@@ -212,6 +206,7 @@ TORCH_LIBRARY(sgl_kernels, m) {
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
 
+<<<<<<< HEAD
   // turbomind linear
   m.class_<turbomind::Linear>("Linear")
       .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
@@ -231,6 +226,13 @@ TORCH_LIBRARY(sgl_kernels, m) {
                                             : at::cuda::getCurrentCUDAStream().stream();
         return self->forward(*_in, *_out, stream);
       });
+=======
+  // apply rope with cos sin cache
+  m.def(
+      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
+      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+>>>>>>> awq
 }
 
 REGISTER_EXTENSION(_kernels)
