@@ -468,8 +468,6 @@ def load_image(image_file: Union[str, bytes]):
     else:
         raise ValueError(f"Invalid image: {image}")
 
-    # if image_size is None:
-    #     image_size = image.size
     return image, image_size
 
 

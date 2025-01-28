@@ -250,7 +250,10 @@ class Qwen2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        if hasattr(self.config, "scale_emb"):
+            return self.embed_tokens(input_ids) * self.config.scale_emb
+        else:
+            return self.embed_tokens(input_ids)
 
     def forward(
         self,

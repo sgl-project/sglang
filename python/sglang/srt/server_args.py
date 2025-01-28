@@ -172,6 +172,7 @@ class ServerArgs:
     # Custom logit processor
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
+    enable_hierarchical_cache: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -938,6 +939,11 @@ class ServerArgs:
             choices=["qwen25", "mistral", "llama3"],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+        )
+        parser.add_argument(
+            "--enable-hierarchical-cache",
+            action="store_true",
+            help="Enable hierarchical cache",
         )
 
     @classmethod
