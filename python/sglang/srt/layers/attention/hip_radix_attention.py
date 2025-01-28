@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 """
-Support different attention backends.
-Now there are two backends: FlashInfer and Triton.
-FlashInfer is faster and Triton is easier to customize.
-Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
+HiP Attention Backend for SGLang
+https://arxiv.org/pdf/2406.09827
 """
 
 import logging
