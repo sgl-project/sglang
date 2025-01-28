@@ -75,6 +75,7 @@ class ServerArgs:
     # Other runtime options
     tp_size: int = 1
     stream_interval: int = 1
+    stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
@@ -500,6 +501,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.stream_interval,
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+        )
+        parser.add_argument(
+            "--stream-output",
+            action="store_true",
+            help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
             "--random-seed",

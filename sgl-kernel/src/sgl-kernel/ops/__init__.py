@@ -142,12 +142,6 @@ def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
     )
 
 
-def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
-    return torch.ops.sgl_kernels.rotary_embedding(
-        positions, query, key, head_size, cos_sin_cache, is_neox
-    )
-
-
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
 # Kudos to @yzh119
 def rmsnorm(
@@ -167,9 +161,7 @@ def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        torch.ops.sgl_kernels.fused_add_rmsnorm(
-            input, residual, weight, eps, _get_cuda_stream(device)
-        )
+        torch.ops.sgl_kernels.fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
