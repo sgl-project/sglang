@@ -373,3 +373,45 @@ class TypeBasedDispatcher:
             if isinstance(obj, ty):
                 return fn(obj)
         raise ValueError(f"Invalid object: {obj}")
+
+
+def trim_overlap(existing_text, new_chunk):
+    """
+    Finds the largest suffix of 'existing_text' that is a prefix of 'new_chunk'
+    and removes that overlap from the start of 'new_chunk'.
+    """
+    max_overlap = 0
+    max_possible = min(len(existing_text), len(new_chunk))
+    for i in range(max_possible, 0, -1):
+        if existing_text.endswith(new_chunk[:i]):
+            max_overlap = i
+            break
+    return new_chunk[max_overlap:]
+
+
+def stream_and_merge(llm, prompt, sampling_params):
+    """
+    1) Streams the text,
+    2) Removes chunk overlaps,
+    3) Returns the merged text.
+    """
+    final_text = ""
+    for chunk in llm.generate(prompt, sampling_params, stream=True):
+        chunk_text = chunk["text"]
+        cleaned_chunk = trim_overlap(final_text, chunk_text)
+        final_text += cleaned_chunk
+    return final_text
+
+
+async def async_stream_and_merge(llm, prompt, sampling_params):
+    """
+    Streams tokens asynchronously, removes chunk overlaps,
+    and yields the cleaned chunk in real time for printing.
+    """
+    final_text = ""
+    generator = await llm.async_generate(prompt, sampling_params, stream=True)
+    async for chunk in generator:
+        chunk_text = chunk["text"]
+        cleaned_chunk = trim_overlap(final_text, chunk_text)
+        final_text += cleaned_chunk
+        yield cleaned_chunk  # yield the non-overlapping portion

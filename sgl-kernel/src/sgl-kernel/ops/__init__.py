@@ -10,6 +10,60 @@ from sgl_kernel.ops.utils import (
 )
 
 
+def apply_rope_with_cos_sin_cache_inplace(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    r"""
+    Apply rotary embedding to keys and queries with precomputed cos/sin values.
+    This is designed to be compatible with the SGL/vLLM implementation.
+    The result is inplace applied to the input tensors.
+
+    Parameters
+    ----------
+    positions : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    query : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
+    key : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    cos_sin_cache : torch.Tensor
+        Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
+        Cosine is the first half and Sine is the second half on rotary_dim.
+    is_neox : bool
+        Whether to use Neox style RoPE, default: ``True``.
+
+        * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+        * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+    Note
+    ----
+    The rotary dimension is determined by the cosine cache and sine cache.
+    """
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+
+    with query.device as device:
+        positions = positions.int()
+        torch.ops.sgl_kernels.apply_rope_pos_ids_cos_sin_cache(
+            q=query.view(query.shape[0], -1, head_size),
+            k=key.view(key.shape[0], -1, head_size),
+            q_rope=query.view(query.shape[0], -1, head_size),
+            k_rope=key.view(key.shape[0], -1, head_size),
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=positions,
+            interleave=(not is_neox),
+            cuda_stream=_get_cuda_stream(device),
+        )
+
+
 def init_custom_reduce(
     rank_id, num_devices, rank_data, buffers, tmp_buffers, barrier_in, barrier_out
 ):
@@ -88,12 +142,6 @@ def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
     )
 
 
-def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
-    return torch.ops.sgl_kernels.rotary_embedding(
-        positions, query, key, head_size, cos_sin_cache, is_neox
-    )
-
-
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
 # Kudos to @yzh119
 def rmsnorm(
@@ -113,9 +161,7 @@ def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        torch.ops.sgl_kernels.fused_add_rmsnorm(
-            input, residual, weight, eps, _get_cuda_stream(device)
-        )
+        torch.ops.sgl_kernels.fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
