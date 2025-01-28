@@ -1,0 +1,131 @@
+from abc import abstractmethod
+from typing import Callable, List, Optional, Tuple
+
+from sglang.srt.managers.schedule_batch import ImageInputs
+
+
+class MediaPaddingPattern:
+    """
+    Media tokens (like image tokens) often need special handling during padding
+    to maintain model compatibility. This class provides the interface for
+    implementing different padding strategies for media tokens
+    """
+
+    @abstractmethod
+    def pad_input_tokens(
+        self, input_ids: List[int], image_inputs: ImageInputs
+    ) -> List[int]:
+        """
+        Pad the input ids sequence containing media tokens, and replace them with pad_values
+        """
+        pass
+
+
+class MediaPaddingPatternTokenPairs(MediaPaddingPattern):
+    """In this pattern, media tokens should be enclosed by special token pairs (e.g. <image>...</image>, media_token_pairs)
+
+    This strategy should be applied when media content is marked by start/end token pairs in the input sequence.
+    """
+
+    def __init__(self, media_token_pairs: Optional[List[Tuple[int, int]]]) -> None:
+        self.media_token_pairs = media_token_pairs
+
+    def pad_input_tokens(
+        self, input_ids: List[int], image_inputs: ImageInputs
+    ) -> List[int]:
+        """
+        This function will replace the media-tokens inbetween with pad_values accordingly
+        """
+        pad_values = image_inputs.pad_values
+        media_token_pairs = self.media_token_pairs
+        if media_token_pairs is None:
+            media_token_pairs = [image_inputs.im_start_id, image_inputs.im_end_id]
+        if media_token_pairs is None:
+            logger.warning(
+                "No media_token_pairs provided, RadixAttention might be influenced."
+            )
+            return input_ids
+        start_tokens = [s for s, _e in media_token_pairs]
+        end_tokens = [e for _s, e in media_token_pairs]
+        # First start token marks new media
+        media_start_token = start_tokens[0]
+
+        padded_ids = []
+        last_idx = 0
+        media_idx = -1
+
+        start_indices = [i for i, x in enumerate(input_ids) if x in start_tokens]
+        end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens]
+
+        if len(start_indices) != len(end_indices):
+            return input_ids
+
+        for start_idx, end_idx in zip(start_indices, end_indices):
+            padded_ids.extend(input_ids[last_idx : start_idx + 1])
+
+            if input_ids[start_idx] == media_start_token:
+                media_idx += 1
+
+            num_tokens = end_idx - start_idx - 1
+            pad_value = pad_values[media_idx]
+            padded_ids.extend([pad_value] * num_tokens)
+
+            last_idx = end_idx
+
+        padded_ids.extend(input_ids[last_idx:])
+
+        assert len(input_ids) == len(padded_ids)
+        return padded_ids
+
+
+class MediaPaddingPatternSingleToken(MediaPaddingPattern):
+    """In this pattern, media is represented with a special token_id ( image_inputs.im_token_id ), which needs to be expanded to multiple tokens.
+
+    This strategy should be used when a single media token represents content that should
+    be expanded to multiple tokens during processing.
+    """
+
+    def __init__(
+        self, num_media_token_calc_func: Callable[[Tuple[int, int, int]], int]
+    ) -> None:
+        self.num_media_token_calc_func = num_media_token_calc_func
+
+    def pad_input_tokens(
+        self, input_ids: List[int], image_inputs: ImageInputs
+    ) -> List[int]:
+        """
+        This function will follow the procedure of:
+            1. the media token will be expanded, of which the final number will be calculated by `num_media_token_calc_func`
+            2. the padded media tokens will be replaced with their pad_values
+        """
+        image_grid_thws = image_inputs.image_grid_thws
+        pad_values = image_inputs.pad_values
+
+        image_indices = [
+            idx
+            for idx, token in enumerate(input_ids)
+            if token == image_inputs.im_token_id
+        ]
+
+        image_inputs.image_offsets = []
+
+        input_ids_with_image = []
+        for image_cnt, _ in enumerate(image_grid_thws):
+            num_image_tokens = self.num_media_token_calc_func(
+                image_grid_thws[image_cnt]
+            )
+            if image_cnt == 0:
+                non_image_tokens = input_ids[: image_indices[image_cnt]]
+            else:
+                non_image_tokens = input_ids[
+                    image_indices[image_cnt - 1] + 1 : image_indices[image_cnt]
+                ]
+            input_ids_with_image.extend(non_image_tokens)
+            image_inputs.image_offsets.append(len(input_ids_with_image))
+            pad_ids = pad_values * (
+                (num_image_tokens + len(pad_values)) // len(pad_values)
+            )
+            input_ids_with_image.extend(pad_ids[:num_image_tokens])
+        input_ids_with_image.extend(input_ids[image_indices[-1] + 1 :])
+
+        return input_ids_with_image
