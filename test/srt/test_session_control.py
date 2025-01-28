@@ -54,6 +54,7 @@ class TestSessionControl(unittest.TestCase):
                 chunks_ids[i] = chunks_ids[i][1:]
 
         # 1. using session control
+        requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
             json={"capacity_of_str_len": 1000},
@@ -250,6 +251,7 @@ class TestSessionControl(unittest.TestCase):
                 chunks_ids[i] = chunks_ids[i][1:]
 
         # 1. using session control
+        requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
             json={"capacity_of_str_len": 1000},
@@ -320,6 +322,7 @@ class TestSessionControl(unittest.TestCase):
             assert response["meta_info"]["finish_reason"]["type"] == "abort"
         else:
             # 2. not using session control
+            requests.post(self.base_url + "/flush_cache")
             output_ids = tokenizer.encode(gen_so_far)
             if output_ids[0] == tokenizer.bos_token_id:
                 output_ids = output_ids[1:]
@@ -355,6 +358,7 @@ class TestSessionControl(unittest.TestCase):
             assert len(x) == len(chunks_per_step[0])
 
         # 1. using session control
+        requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
             json={"capacity_of_str_len": 1000},
@@ -525,6 +529,7 @@ class TestSessionControlVision(unittest.TestCase):
         gen_len = 32
 
         # 1. using session control
+        requests.post(self.base_url + "/flush_cache")
         session_id = requests.post(
             self.base_url + "/open_session",
             json={"capacity_of_str_len": 1000},
