@@ -93,7 +93,6 @@ def eval_mmmu(args):
             pred_ans = response
         out_samples[sample["id"]] = pred_ans
 
-        torch.cuda.empty_cache()
         # set ground truth answer
         answer_dict[sample["id"]] = {
             "question_type": sample["question_type"],
