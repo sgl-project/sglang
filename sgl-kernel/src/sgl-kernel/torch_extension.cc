@@ -227,8 +227,6 @@ TORCH_LIBRARY(sgl_kernels, m) {
                          c10::optional<int64_t> stream_id = c10::nullopt) {
         auto _in = TorchTensorToTurbomindTensor(in);
         auto _out = TorchTensorToTurbomindTensor(out);
-        // auto stream = stream_id.has_value() ? at::cuda::getCurrentCUDAStream(stream_id.value()).stream()
-        //                                     : at::cuda::getCurrentCUDAStream().stream();
         return self->forward(*_in, *_out, reinterpret_cast<cudaStream_t>(stream_id.value()));
       });
 }
