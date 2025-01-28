@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 chat_template_name = None
 
-xlx_test_beam_kth_as_output = int(os.getenv("SGLANG_TEST_BEAM_KTH_AS_OUTPUT", -1))
+test_beam_kth_as_output = int(os.getenv("SGLANG_TEST_BEAM_KTH_AS_OUTPUT", -1)) # for beam search unit test
 
 class FileMetadata:
     def __init__(self, filename: str, purpose: str):
@@ -1103,10 +1103,10 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
             }
         else:
             if tool_calls is None:
-                if xlx_test_beam_kth_as_output == -1:
+                if ret_item["meta_info"]["beam_search_outputs"] is None or test_beam_kth_as_output == -1:
                     content = ret_item["text"]
                 else:
-                    content = ret_item["meta_info"]["beam_search_outputs"].sequences[xlx_test_beam_kth_as_output].text
+                    content = ret_item["meta_info"]["beam_search_outputs"].sequences[test_beam_kth_as_output].text
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(

@@ -162,6 +162,9 @@ class ServerArgs:
     # Custom logit processor
     enable_custom_logit_processor: bool = False
 
+    # Beam Search
+    beam_width: int = 0
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -872,6 +875,14 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+
+        # beam search
+        parser.add_argument(
+            "--beam-width",
+            type=int,
+            default=0,
+            help="The number of kept sequences in beam search",
         )
 
     @classmethod

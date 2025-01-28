@@ -31,7 +31,6 @@ import copy
 import os
 import time
 import random
-import requests
 import pandas
 from typing import List
 
@@ -70,8 +69,8 @@ class TestBeamSearch(unittest.TestCase):
         new_chat_prompts[1]['content'] = new_content
         return new_chat_prompts
 
-    def _run_one_test(self, cur_prompt, tokenizer, max_tokens=5, caching=True, top_logprobs_num=-1):
-        if(top_logprobs_num!=-1):
+    def _run_one_test(self, cur_prompt, tokenizer, beam_width, max_tokens=5, caching=True, top_logprobs_num=-1):
+        if(top_logprobs_num!=-1 or beam_width>0):
             is_logprob = True
         else:
             is_logprob = False
@@ -79,7 +78,8 @@ class TestBeamSearch(unittest.TestCase):
         llm = sgl.Engine(model_path=MODEL_PATH,
                         disable_radix_cache=not caching,
                         disable_jump_forward=True,
-                        disable_overlap_schedule=True)
+                        disable_overlap_schedule=True,
+                        beam_width=beam_width)
 
         sampling_params = {"temperature": 0.0, "max_new_tokens": max_tokens}
         t1 = time.time()
@@ -91,15 +91,16 @@ class TestBeamSearch(unittest.TestCase):
         return [(beam.tokens, tokenizer.decode(beam.tokens)) 
                 for output in outputs for beam in output["meta_info"]["beam_search_outputs"].sequences]
     
-    def _run_one_bench(self, cur_prompt, tokenizer, max_tokens=[5], caching=True, top_logprobs_num=-1):
-        if(top_logprobs_num!=-1):
+    def _run_one_bench(self, cur_prompt, tokenizer, beam_width, max_tokens=[5], caching=True, top_logprobs_num=-1):
+        if(top_logprobs_num!=-1 or beam_width>0):
             is_logprob = True
         else:
             is_logprob = False
 
         llm = sgl.Engine(model_path=MODEL_PATH,
                         disable_jump_forward=True,
-                        disable_overlap_schedule=True)
+                        disable_overlap_schedule=True,
+                        beam_width=beam_width)
         
         # warmup
         sampling_params = {"temperature": 0.0, "max_new_tokens": 5}
@@ -259,7 +260,6 @@ class TestBeamSearch(unittest.TestCase):
         return time_consume
 
     def test_beam_search_accuracy_by_offline_mmlu(self):
-        os.environ["SGLANG_TEST_BEAM_WIDTH"] = "5"
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
         df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
@@ -278,7 +278,7 @@ class TestBeamSearch(unittest.TestCase):
         params = {"max_tokens": 5, "caching": True, "top_logprobs_num": beam_width*2}
 
         # our beam search
-        output_text = self._run_one_test(cur_prompt, tokenizer, **params)
+        output_text = self._run_one_test(cur_prompt, tokenizer, beam_width, **params)
 
         # transformers beam search
         transformer_text = self._run_transformer(cur_prompt, tokenizer, **params)
@@ -317,21 +317,24 @@ class TestBeamSearch(unittest.TestCase):
 
         beam_width = 5
         
-        os.environ["SGLANG_TEST_BEAM_WIDTH"] = "5"
         os.environ["SGLANG_TEST_BEAM_FIXED_MAX_TOKEN"] = "1"
-        time_consume = self._run_one_bench(cur_prompt, tokenizer, 
+        time_consume = self._run_one_bench(cur_prompt, tokenizer, beam_width,
                                           max_tokens=[8, 16, 32, 64, 128, 512, 1024],
                                           caching=False,
                                           top_logprobs_num=beam_width*2)
 
-        time_consume = self._bench_transformer(cur_prompt, tokenizer, 
-                                          max_tokens=[8, 16, 32, 64, 128, 512, 1024],
-                                          caching=False,
-                                          top_logprobs_num=beam_width*2)
+        try:
+            # likely to OOM
+            time_consume = self._bench_transformer(cur_prompt, tokenizer, 
+                                            max_tokens=[8, 16, 32, 64, 128, 512, 1024],
+                                            caching=False,
+                                            top_logprobs_num=beam_width*2)
+        except Exception:
+            import torch
+            torch.cuda.empty_cache()
 
-        os.environ["SGLANG_TEST_BEAM_WIDTH"] = "0"
-        time_consume = self._bench_vllm_fork(cur_prompt, tokenizer, 
-                                          max_tokens=[8, 16, 32, 64, 128, 512, 1024],
+        time_consume = self._bench_vllm_fork(cur_prompt, tokenizer, 0,
+                                          max_tokens=[8, 16, 32, 64, 128, 512], # 1024 wouble super slow
                                           caching=False,
                                           top_logprobs_num=beam_width*2)
 
@@ -358,6 +361,7 @@ class TestBeamSearch(unittest.TestCase):
             "--trust-remote-code",
             "--disable-overlap-schedule",
             "--disable-jump-forward",
+            "--beam-width", "5",
         ]
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -368,7 +372,6 @@ class TestBeamSearch(unittest.TestCase):
         stdout = open(STDOUT_FILENAME, "w")
         stderr = open(STDERR_FILENAME, "w")
         env = os.environ.copy()
-        env["SGLANG_TEST_BEAM_WIDTH"] = "5"
         env["SGLANG_TEST_BEAM_KTH_AS_OUTPUT"] = "0"
         process = popen_launch_server(
             model,

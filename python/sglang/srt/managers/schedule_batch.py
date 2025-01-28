@@ -55,8 +55,6 @@ if TYPE_CHECKING:
 
 from sglang.srt.beam_search import BeamSearchList
 
-xlx_test_beam_width = int(os.getenv("SGLANG_TEST_BEAM_WIDTH", 0))
-
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 # Put some global args for easy access
@@ -311,7 +309,7 @@ class Req:
         self.input_top_logprobs_val: Optional[List[float]] = None
         self.input_top_logprobs_idx: Optional[List[int]] = None
 
-        if return_logprob or xlx_test_beam_width > 0:
+        if return_logprob:
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
             self.output_top_logprobs_val = []

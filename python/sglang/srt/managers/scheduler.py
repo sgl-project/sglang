@@ -114,8 +114,7 @@ from sglang.srt.beam_search import (
     sort_by_beam_search_score,
 )
 
-xlx_test_beam_width = int(os.getenv("SGLANG_TEST_BEAM_WIDTH", 0))
-xlx_test_beam_fixed_max_token = bool(os.getenv("SGLANG_TEST_BEAM_FIXED_MAX_TOKEN", 0))
+test_beam_fixed_max_token = bool(os.getenv("SGLANG_TEST_BEAM_FIXED_MAX_TOKEN", 0)) # for beam search unit test
 
 @dataclass
 class GenerationBatchResult:
@@ -448,6 +447,9 @@ class Scheduler:
             ]
         )
 
+        # beam search
+        self.beam_width = server_args.beam_width
+
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one batch takes too long."""
         self.watchdog_last_forward_ct = 0
@@ -620,8 +622,8 @@ class Scheduler:
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
+                return_logprob=recv_req.return_logprob or self.beam_width>0,
+                top_logprobs_num=max(recv_req.top_logprobs_num, self.beam_width*2),
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
@@ -673,10 +675,6 @@ class Scheduler:
 
         # Copy more attributes
         req.logprob_start_len = recv_req.logprob_start_len
-
-        if xlx_test_beam_width > 0:
-            req.return_logprob = True
-            req.top_logprobs_num = xlx_test_beam_width * 2
 
         if req.logprob_start_len == -1:
             # By default, only return the logprobs for output tokens
@@ -1116,7 +1114,7 @@ class Scheduler:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
-            if xlx_test_beam_width > 0:
+            if self.beam_width > 0:
                 self.process_batch_result_beam_search(batch, result)
             else:
                 self.process_batch_result_decode(batch, result)
@@ -1189,9 +1187,9 @@ class Scheduler:
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
 
-                        if xlx_test_beam_width > 0:
-                            req.beam_list.beam_width = xlx_test_beam_width
-                            batch.beam_width = xlx_test_beam_width
+                        if self.beam_width > 0:
+                            req.beam_list.beam_width = self.beam_width
+                            batch.beam_width = self.beam_width
                             incompleted = [
                                 BeamSearchSequence(
                                     last_token=top_token,
@@ -1420,7 +1418,7 @@ class Scheduler:
             req.check_finished()
             if (isinstance(req.finished_reason, FINISH_MATCHED_TOKEN) or isinstance(
                 req.finished_reason, FINISH_MATCHED_STR
-            )) and not xlx_test_beam_fixed_max_token:
+            )) and not test_beam_fixed_max_token:
                 req.finished_reason = None
 
             if req.return_logprob:
@@ -1477,7 +1475,7 @@ class Scheduler:
             if (
                 len(req.beam_list.incompleted) < batch.beam_width
                 or len(req.beam_list.completed) > 10 * batch.beam_width
-            ) and not req.finished() and not xlx_test_beam_fixed_max_token:
+            ) and not req.finished() and not test_beam_fixed_max_token:
                 req.finished_reason = req.beam_list.completed[0].finish
 
             if req.finished():
