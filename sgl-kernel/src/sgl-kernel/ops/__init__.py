@@ -24,6 +24,7 @@ class turbomindLinear:
         with input.device as device:
             self.linear.forward(input, output, _get_cuda_stream(device))
 
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,

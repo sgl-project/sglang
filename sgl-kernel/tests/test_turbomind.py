@@ -137,7 +137,7 @@ class TestInt8Gemm(unittest.TestCase):
 
                 self._post_init()
 
-                stream = torch.cuda.Stream()
+                stream = torch.cuda.current_stream()
                 res = torch.empty(
                     (x.shape[0], out_features),
                     dtype=torch.float16,
