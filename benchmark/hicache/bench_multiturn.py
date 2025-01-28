@@ -85,6 +85,12 @@ def parse_args():
         default="meta-llama/Llama-3.1-8B-Instruct",
         help="model path compatible with Hugging Face Transformers",
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default="performance_metrics.jsonl",
+        help="File to log performance metrics",
+    )
     return parser.parse_args()
 
 
@@ -369,7 +375,7 @@ class WorkloadGenerator:
         print(
             f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
-        log_to_jsonl_file(performance_data)
+        log_to_jsonl_file(performance_data, args.log_file)
 
 
 if __name__ == "__main__":
