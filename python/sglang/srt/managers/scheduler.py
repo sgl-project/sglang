@@ -149,6 +149,7 @@ class Scheduler:
             if not self.spec_algorithm.is_none()
             else 1
         )
+        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -831,10 +832,16 @@ class Scheduler:
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        if available_size != self.max_total_num_tokens:
+        protected_size = self.tree_cache.protected_size()
+        memory_leak = available_size != (
+            self.max_total_num_tokens
+            if not self.enable_hierarchical_cache
+            else self.max_total_num_tokens - protected_size
+        )
+        if memory_leak:
             msg = (
                 "KV cache pool leak detected!"
-                f"{available_size=}, {self.max_total_num_tokens=}\n"
+                f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
             )
             warnings.warn(msg)
             if crash_on_warnings():
@@ -949,7 +956,14 @@ class Scheduler:
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    self.batch_is_full = True
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.batch_is_full = len(adder.can_run_list) > 0 or (
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
+                    else:
+                        self.batch_is_full = True
                 break
             if self.server_args.prefill_only_one_req:
                 break
