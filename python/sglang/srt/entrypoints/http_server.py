@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inferenc engine via fastapi.
 
 import asyncio
 import dataclasses
+import json
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -26,7 +27,6 @@ import threading
 import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, Optional
-import json
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -198,7 +198,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"Error: {e}")
             return _create_error_response(e)
-        
+
 
 @app.api_route("/generate_from_file", methods=["POST"])
 async def generate_from_file_request(file: UploadFile, request: Request):
@@ -208,13 +208,13 @@ async def generate_from_file_request(file: UploadFile, request: Request):
 
     obj = GenerateReqInput(
         input_embeds=input_embeds,
-        sampling_params= {
+        sampling_params={
             "repetition_penalty": 1.2,
             "temperature": 0.2,
             "max_new_tokens": 512,
-        }
+        },
     )
-    
+
     try:
         ret = await _global_state.generate_request(obj, request).__anext__()
         return ret
