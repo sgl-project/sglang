@@ -206,7 +206,12 @@ TORCH_LIBRARY(sgl_kernels, m) {
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
 
-<<<<<<< HEAD
+  // apply rope with cos sin cache
+  m.def(
+      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
+      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+
   // turbomind linear
   m.class_<turbomind::Linear>("Linear")
       .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
@@ -226,13 +231,6 @@ TORCH_LIBRARY(sgl_kernels, m) {
                                             : at::cuda::getCurrentCUDAStream().stream();
         return self->forward(*_in, *_out, stream);
       });
-=======
-  // apply rope with cos sin cache
-  m.def(
-      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
-      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
-  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
->>>>>>> awq
 }
 
 REGISTER_EXTENSION(_kernels)
