@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 from pathlib import Path
 
@@ -38,6 +39,7 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
+operator_namespace = "sgl_kernels"
 cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
@@ -45,15 +47,20 @@ turbomind = root / "3rdparty" / "turbomind"
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
+    root / "src" / "sgl-kernel" / "include",
     root / "src" / "sgl-kernel" / "csrc",
     flashinfer.resolve() / "include",
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
+    "cublas",
+    "cublasLt",
     turbomind.resolve(),
     turbomind.resolve() / "src",
 ]
+
 nvcc_flags = [
     "-DNDEBUG",
+    f"-DOPERATOR_NAMESPACE={operator_namespace}",
     "-O3",
     "-Xcompiler",
     "-fPIC",
@@ -64,6 +71,8 @@ nvcc_flags = [
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
+    "-Xcompiler=-Wconversion",
+    "-Xcompiler=-fno-strict-aliasing",
 ]
 nvcc_flags_fp8 = [
     "-DFLASHINFER_ENABLE_FP8",
@@ -72,21 +81,20 @@ nvcc_flags_fp8 = [
 ]
 
 sources = [
+    "src/sgl-kernel/torch_extension.cc",
     "src/sgl-kernel/csrc/trt_reduce_internal.cu",
     "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
-    "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
+    "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
-    "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
-    "src/sgl-kernel/csrc/rotary_embedding.cu",
-    "src/sgl-kernel/csrc/fused_add_rms_norm.cu",
+    "src/sgl-kernel/csrc/fused_add_rms_norm_kernel.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
-    "3rdparty/flashinfer/csrc/group_gemm.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
+    "3rdparty/flashinfer/csrc/rope.cu",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
@@ -98,7 +106,6 @@ sm_version = _get_device_sm()
 if torch.cuda.is_available():
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
-        sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
     if sm_version >= 90:
         nvcc_flags.extend(nvcc_flags_fp8)
     if sm_version >= 80:
@@ -107,7 +114,6 @@ else:
     # compilation environment without GPU
     if enable_sm90a:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
-        sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
     if enable_bf16:
@@ -125,7 +131,7 @@ for flag in [
         pass
 
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda"]
+libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
@@ -139,6 +145,7 @@ ext_modules = [
         },
         libraries=libraries,
         extra_link_args=extra_link_args,
+        py_limited_api=True,
     ),
 ]
 
@@ -148,7 +155,12 @@ setup(
     packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={
+        "build_ext": BuildExtension.with_options(
+            use_ninja=True, max_jobs=multiprocessing.cpu_count()
+        )
+    },
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
 
 _update_wheel_platform_tag()

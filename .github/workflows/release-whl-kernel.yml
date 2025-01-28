@@ -4,8 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        required: true
         type: string
+  push:
+    branches:
+      - main
+    paths:
+      - sgl-kernel/version.py
 
 jobs:
   build-wheels:
@@ -13,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12']
+        python-version: ['3.9']
         cuda-version: ['11.8']
 
     steps:
@@ -51,10 +55,20 @@ jobs:
           merge-multiple: true
           pattern: wheel-*
 
+      - name: Set tag name
+        id: set_tag_name
+        run: |
+          if [ -z "${{ inputs.tag_name }}" ]; then
+            TAG_NAME="v$(cat sgl-kernel/version.py | cut -d'"' -f2)"
+            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag_name }}
+          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
           repository: sgl-project/whl
           token: ${{ secrets.WHL_TOKEN }}
           files: |

@@ -8,7 +8,7 @@ from typing import Callable, Optional
 import torch
 from torch.nn import functional as F
 
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.moe.topk import select_experts
 
 
@@ -23,6 +23,7 @@ def fused_moe_forward_native(
     num_expert_group: Optional[int] = None,
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
@@ -41,7 +42,12 @@ def fused_moe_forward_native(
     w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     w2_weights = layer.w2_weight[topk_ids]
     x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
-    x1 = F.silu(x1)
+    if activation == "silu":
+        x1 = F.silu(x1)
+    elif activation == "gelu":
+        x1 = F.gelu(x1)
+    else:
+        raise ValueError(f"Unsupported activation: {activation=}")
     x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
     return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
@@ -58,6 +64,7 @@ def moe_forward_native(
     num_expert_group: Optional[int] = None,
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
 
     topk_weights, topk_ids = select_experts(
@@ -84,6 +91,13 @@ def moe_forward_native(
     sorted_tokens = x[idxs // topk_ids.shape[1]]
     tokens_per_expert = tokens_per_expert.cpu().numpy()
 
+    if activation == "silu":
+        act = SiluAndMul()
+    elif activation == "gelu":
+        act = GeluAndMul()
+    else:
+        raise ValueError(f"Unsupported activation: {activation=}")
+
     outputs = []
     start_idx = 0
     for i, num_tokens in enumerate(tokens_per_expert):
@@ -96,7 +110,7 @@ def moe_forward_native(
         layer_w2_weight = layer.w2_weight[i]
 
         gate_up = F.linear(tokens_for_this_expert, layer_w13_weight)
-        gate_up = SiluAndMul()(gate_up)
+        gate_up = act(gate_up)
         expert_out = F.linear(gate_up, layer_w2_weight)
         outputs.append(expert_out)
         start_idx = end_idx

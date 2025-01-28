@@ -1,7 +1,9 @@
 from sgl_kernel.ops import (
+    apply_rope_with_cos_sin_cache_inplace,
     bmm_fp8,
     custom_dispose,
     custom_reduce,
+    fp8_scaled_mm,
     fused_add_rmsnorm,
     gelu_and_mul,
     gelu_tanh_and_mul,
@@ -15,7 +17,6 @@ from sgl_kernel.ops import (
     moe_align_block_size,
     register_graph_buffers,
     rmsnorm,
-    rotary_embedding,
     sampling_scaling_penalties,
     silu_and_mul,
     top_k_renorm_prob,
@@ -24,9 +25,11 @@ from sgl_kernel.ops import (
 )
 
 __all__ = [
+    "apply_rope_with_cos_sin_cache_inplace",
     "bmm_fp8",
     "custom_dispose",
     "custom_reduce",
+    "fp8_scaled_mm",
     "fused_add_rmsnorm",
     "gelu_and_mul",
     "gelu_tanh_and_mul",
@@ -40,7 +43,6 @@ __all__ = [
     "moe_align_block_size",
     "register_graph_buffers",
     "rmsnorm",
-    "rotary_embedding",
     "sampling_scaling_penalties",
     "silu_and_mul",
     "top_k_renorm_prob",

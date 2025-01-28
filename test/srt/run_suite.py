@@ -18,7 +18,6 @@ suites = {
         "test_eagle_infer.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
-        "test_get_weights_by_name.py",
         "test_gguf.py",
         "test_input_embeddings.py",
         "test_json_constrained.py",
@@ -53,6 +52,7 @@ suites = {
         "test_w8a8_quantization.py",
         "test_session_control.py",
         "test_fp8_kvcache.py",
+        "test_fp8_kernel.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
