@@ -115,6 +115,7 @@ class MHATokenToHiPOffloadKVPool(BaseTokenToKVPool):
                 head_dim=head_dim,
                 layer_num=layer_num,
                 device=self.device,
+                enable_memory_saver=False,
             )
         else:
             self.validation_cache = None

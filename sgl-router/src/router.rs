@@ -3,7 +3,7 @@ use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicUsize;
@@ -12,14 +12,30 @@ use std::thread;
 use std::time::Duration;
 use tokio;
 
+fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
+    req.headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub enum Router {
     RoundRobin {
         worker_urls: Arc<RwLock<Vec<String>>>,
         current_index: AtomicUsize,
+        timeout_secs: u64,
+        interval_secs: u64,
     },
     Random {
         worker_urls: Arc<RwLock<Vec<String>>>,
+        timeout_secs: u64,
+        interval_secs: u64,
     },
     CacheAware {
         /*
@@ -89,36 +105,73 @@ pub enum Router {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
+        timeout_secs: u64,
+        interval_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
     },
 }
 
 #[derive(Debug, Clone)]
 pub enum PolicyConfig {
-    RandomConfig,
-    RoundRobinConfig,
+    RandomConfig {
+        timeout_secs: u64,
+        interval_secs: u64,
+    },
+    RoundRobinConfig {
+        timeout_secs: u64,
+        interval_secs: u64,
+    },
     CacheAwareConfig {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        timeout_secs: u64,
+        interval_secs: u64,
     },
 }
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
+        // Get timeout and interval from policy config
+        let (timeout_secs, interval_secs) = match &policy_config {
+            PolicyConfig::RandomConfig {
+                timeout_secs,
+                interval_secs,
+            } => (*timeout_secs, *interval_secs),
+            PolicyConfig::RoundRobinConfig {
+                timeout_secs,
+                interval_secs,
+            } => (*timeout_secs, *interval_secs),
+            PolicyConfig::CacheAwareConfig {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
+        };
+
         // Wait until all workers are healthy
-        Self::wait_for_healthy_workers(&worker_urls, 300, 10)?;
+        Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
 
         // Create router based on policy...
         Ok(match policy_config {
-            PolicyConfig::RandomConfig => Router::Random {
+            PolicyConfig::RandomConfig {
+                timeout_secs,
+                interval_secs,
+            } => Router::Random {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
+                timeout_secs,
+                interval_secs,
             },
-            PolicyConfig::RoundRobinConfig => Router::RoundRobin {
+            PolicyConfig::RoundRobinConfig {
+                timeout_secs,
+                interval_secs,
+            } => Router::RoundRobin {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 current_index: std::sync::atomic::AtomicUsize::new(0),
+                timeout_secs,
+                interval_secs,
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
@@ -126,6 +179,8 @@ impl Router {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                timeout_secs,
+                interval_secs,
             } => {
                 let mut running_queue = HashMap::new();
                 for url in &worker_urls {
@@ -176,6 +231,8 @@ impl Router {
                     cache_threshold,
                     balance_abs_threshold,
                     balance_rel_threshold,
+                    timeout_secs,
+                    interval_secs,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -192,9 +249,13 @@ impl Router {
 
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
+                error!(
+                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    timeout_secs, worker_urls
+                );
                 return Err(format!(
-                    "Timeout {}s waiting for workers to become healthy",
-                    timeout_secs
+                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    timeout_secs, worker_urls
                 ));
             }
 
@@ -238,7 +299,7 @@ impl Router {
     fn select_first_worker(&self) -> Result<String, String> {
         match self {
             Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls }
+            | Router::Random { worker_urls, .. }
             | Router::CacheAware { worker_urls, .. } => {
                 if worker_urls.read().unwrap().is_empty() {
                     Err("No workers are available".to_string())
@@ -254,8 +315,18 @@ impl Router {
         client: &reqwest::Client,
         worker_url: &str,
         route: &str,
+        req: &HttpRequest,
     ) -> HttpResponse {
-        match client.get(format!("{}{}", worker_url, route)).send().await {
+        let mut request_builder = client.get(format!("{}{}", worker_url, route));
+
+        // Copy all headers from original request except for /health because it does not need authorization
+        if route != "/health" {
+            for (name, value) in copy_request_headers(req) {
+                request_builder = request_builder.header(name, value);
+            }
+        }
+
+        match request_builder.send().await {
             Ok(res) => {
                 let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -273,7 +344,12 @@ impl Router {
         }
     }
 
-    pub async fn route_to_first(&self, client: &reqwest::Client, route: &str) -> HttpResponse {
+    pub async fn route_to_first(
+        &self,
+        client: &reqwest::Client,
+        route: &str,
+        req: &HttpRequest,
+    ) -> HttpResponse {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
@@ -289,10 +365,17 @@ impl Router {
                             info!("Retrying request after {} failed attempts", total_retries);
                         }
 
-                        let response = self.send_request(client, &worker_url, route).await;
+                        let response = self.send_request(client, &worker_url, route, req).await;
 
                         if response.status().is_success() {
                             return response;
+                        } else {
+                            // if the worker is healthy, it means the request is bad, so return the error response
+                            let health_response =
+                                self.send_request(client, &worker_url, "/health", req).await;
+                            if health_response.status().is_success() {
+                                return response;
+                            }
                         }
 
                         warn!(
@@ -349,6 +432,7 @@ impl Router {
             Router::RoundRobin {
                 worker_urls,
                 current_index,
+                ..
             } => {
                 let idx = current_index
                     .fetch_update(
@@ -360,7 +444,7 @@ impl Router {
                 worker_urls.read().unwrap()[idx].clone()
             }
 
-            Router::Random { worker_urls } => worker_urls.read().unwrap()
+            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
                 [rand::random::<usize>() % worker_urls.read().unwrap().len()]
             .clone(),
 
@@ -446,19 +530,16 @@ impl Router {
             .map(|v| v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false))
             .unwrap_or(false);
 
-        let res = match client
+        let mut request_builder = client
             .post(format!("{}{}", worker_url, route))
-            .header(
-                "Content-Type",
-                req.headers()
-                    .get("Content-Type")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("application/json"),
-            )
-            .body(body.to_vec())
-            .send()
-            .await
-        {
+            .body(body.to_vec());
+
+        // Copy all headers from original request
+        for (name, value) in copy_request_headers(req) {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let res = match request_builder.send().await {
             Ok(res) => res,
             Err(_) => return HttpResponse::InternalServerError().finish(),
         };
@@ -546,6 +627,13 @@ impl Router {
 
                 if response.status().is_success() {
                     return response;
+                } else {
+                    // if the worker is healthy, it means the request is bad, so return the error response
+                    let health_response =
+                        self.send_request(client, &worker_url, "/health", req).await;
+                    if health_response.status().is_success() {
+                        return response;
+                    }
                 }
 
                 warn!(
@@ -570,16 +658,35 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        let interval_secs = 10; // check every 10 seconds
-        let timeout_secs = 300; // 5 minutes
+        let (timeout_secs, interval_secs) = match self {
+            Router::Random {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
+            Router::RoundRobin {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
+            Router::CacheAware {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
+        };
 
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::new();
 
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
+                error!(
+                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
+                    timeout_secs, worker_url
+                );
                 return Err(format!(
-                    "Timeout {}s waiting for worker {} to become healthy",
+                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
                     timeout_secs, worker_url
                 ));
             }
@@ -589,7 +696,7 @@ impl Router {
                     if res.status().is_success() {
                         match self {
                             Router::RoundRobin { worker_urls, .. }
-                            | Router::Random { worker_urls }
+                            | Router::Random { worker_urls, .. }
                             | Router::CacheAware { worker_urls, .. } => {
                                 info!("Worker {} health check passed", worker_url);
                                 let mut urls = worker_urls.write().unwrap();
@@ -663,7 +770,7 @@ impl Router {
     pub fn remove_worker(&self, worker_url: &str) {
         match self {
             Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls }
+            | Router::Random { worker_urls, .. }
             | Router::CacheAware { worker_urls, .. } => {
                 let mut urls = worker_urls.write().unwrap();
                 if let Some(index) = urls.iter().position(|url| url == &worker_url) {

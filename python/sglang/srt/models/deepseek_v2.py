@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -56,12 +56,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_flashinfer_available, is_hip
+from sglang.srt.utils import is_cuda_available, is_hip
 
 is_hip_ = is_hip()
 
-if is_flashinfer_available():
-    from flashinfer import bmm_fp8
+if is_cuda_available():
+    from sgl_kernel import bmm_fp8
 
 
 class DeepseekV2MLP(nn.Module):
@@ -271,7 +271,7 @@ class DeepseekV2Attention(nn.Module):
             quant_config=quant_config,
         )
         rope_scaling["rope_type"] = "deepseek_yarn"
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
