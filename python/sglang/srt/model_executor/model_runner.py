@@ -776,7 +776,7 @@ class ModelRunner:
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
-        ):
+        ):  
             return self.cuda_graph_runner.replay(forward_batch)
 
         if forward_batch.forward_mode.is_decode():

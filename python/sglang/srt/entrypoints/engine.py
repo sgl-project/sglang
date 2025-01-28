@@ -120,6 +120,8 @@ class Engine:
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
+        return_hidden_states: Optional[Union[List[bool], bool]] = False,
+        top_hidden_states_num: Optional[Union[List[int], int]] = 0,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -135,6 +137,8 @@ class Engine:
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
             stream=stream,
+            return_hidden_states=return_hidden_states,
+            top_hidden_states_num=top_hidden_states_num,
         )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)

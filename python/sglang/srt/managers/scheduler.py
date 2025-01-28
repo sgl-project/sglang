@@ -611,6 +611,8 @@ class Scheduler:
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
+                return_hidden_states=recv_req.return_hidden_states,
+                top_hidden_states_num=recv_req.top_hidden_states_num,
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
@@ -1219,6 +1221,8 @@ class Scheduler:
 
         self.token_to_kv_pool.free_group_begin()
 
+        # print(f"process_batch_result_decode {type(logits_output.hidden_states_topk_idx)=}, {type(logits_output.hidden_states_topk_val)=}")
+        
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
@@ -1248,6 +1252,9 @@ class Scheduler:
                     req.output_top_logprobs_idx.append(
                         logits_output.next_token_top_logprobs_idx[i]
                     )
+            if req.return_hidden_states:
+                req.output_token_hidden_states_val.append(logits_output.hidden_states_topk_val[i].tolist())
+                req.output_token_hidden_states_idx.append(logits_output.hidden_states_topk_idx[i].tolist())
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
@@ -1371,6 +1378,9 @@ class Scheduler:
             prompt_tokens = []
             completion_tokens = []
             cached_tokens = []
+            
+            output_top_hidden_states_val = []
+            output_top_hidden_states_idx = []
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1433,9 +1443,13 @@ class Scheduler:
                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
+                    
+                    output_top_hidden_states_val.append(req.output_token_hidden_states_val)
+                    output_top_hidden_states_idx.append(req.output_token_hidden_states_idx)
 
             # Send to detokenizer
             if rids:
+                # print(f"{len(output_top_hidden_states_val)=}, {len(output_top_hidden_states_idx)=}, {len(reqs)=}")
                 self.send_to_detokenizer.send_pyobj(
                     BatchTokenIDOut(
                         rids,
@@ -1459,6 +1473,8 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
+                        output_top_hidden_states_val,
+                        output_top_hidden_states_idx,
                     )
                 )
         else:  # embedding or reward model

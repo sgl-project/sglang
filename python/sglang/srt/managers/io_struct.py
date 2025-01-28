@@ -48,6 +48,7 @@ class GenerateReqInput:
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -55,6 +56,12 @@ class GenerateReqInput:
     logprob_start_len: Optional[Union[List[int], int]] = None
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: Optional[Union[List[int], int]] = None
+    
+    # Whether to return hidden states. work the same as return_logprob.
+    return_hidden_states: Optional[Union[List[bool], bool]] = None
+    # If return hidden states, the number of top hidden states to return at each position.
+    top_hidden_states_num: Optional[Union[List[int], int]] = None
+
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
@@ -142,6 +149,10 @@ class GenerateReqInput:
                 self.logprob_start_len = -1
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = 0
+            if self.return_hidden_states is None:
+                self.return_hidden_states = False
+            if self.top_hidden_states_num is None:
+                self.top_hidden_states_num = 0
         else:
             if self.parallel_sample_num == 1:
                 num = self.batch_size
@@ -172,7 +183,7 @@ class GenerateReqInput:
                 self.return_logprob = [self.return_logprob] * num
             else:
                 assert self.parallel_sample_num == 1
-
+            
             if self.logprob_start_len is None:
                 self.logprob_start_len = [-1] * num
             elif not isinstance(self.logprob_start_len, list):
@@ -184,6 +195,20 @@ class GenerateReqInput:
                 self.top_logprobs_num = [0] * num
             elif not isinstance(self.top_logprobs_num, list):
                 self.top_logprobs_num = [self.top_logprobs_num] * num
+            else:
+                assert self.parallel_sample_num == 1
+
+            if self.return_hidden_states is None:
+                self.return_hidden_states = [False] * num
+            elif not isinstance(self.return_hidden_states, list):
+                self.return_hidden_states = [self.return_hidden_states] * num
+            else:
+                assert self.parallel_sample_num == 1
+
+            if self.top_hidden_states_num is None:
+                self.top_hidden_states_num = [0] * num
+            elif not isinstance(self.top_hidden_states_num, list):
+                self.top_hidden_states_num = [self.top_hidden_states_num] * num
             else:
                 assert self.parallel_sample_num == 1
 
@@ -208,6 +233,8 @@ class GenerateReqInput:
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
+            return_hidden_states=self.return_hidden_states[i],
+            top_hidden_states_num=self.top_hidden_states_num[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
@@ -239,8 +266,14 @@ class TokenizedGenerateReqInput:
     logprob_start_len: int
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: int
+    
     # Whether to stream output
     stream: bool
+
+    # Whether to return hidden states
+    return_hidden_states: bool
+    # If return hidden states, the number of top hidden states to return at each position.
+    top_hidden_states_num: int
 
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model
@@ -367,6 +400,9 @@ class BatchTokenIDOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
+    
+    output_top_hidden_states_val: List[List]
+    output_top_hidden_states_idx: List[List]
 
 
 @dataclass
@@ -392,7 +428,9 @@ class BatchStrOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-
+    
+    output_top_hidden_states_val: List[List]
+    output_top_hidden_states_idx: List[List]
 
 @dataclass
 class BatchEmbeddingOut:

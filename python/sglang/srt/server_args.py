@@ -161,6 +161,8 @@ class ServerArgs:
 
     # Custom logit processor
     enable_custom_logit_processor: bool = False
+    
+    top_hidden_states_nums: Optional[int] = None
 
     def __post_init__(self):
         # Set missing default values

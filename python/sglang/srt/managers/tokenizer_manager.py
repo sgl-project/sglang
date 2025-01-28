@@ -383,6 +383,8 @@ class TokenizerManager:
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
+                return_hidden_states=obj.return_hidden_states,
+                top_hidden_states_num=obj.top_hidden_states_num,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -794,11 +796,16 @@ class TokenizerManager:
                 )
 
             if isinstance(recv_obj, BatchStrOut):
+                if recv_obj.output_top_hidden_states_val is not None:
+                    meta_info["output_top_hidden_states_val"] = recv_obj.output_top_hidden_states_val[i]
+                    meta_info["output_top_hidden_states_idx"] = recv_obj.output_top_hidden_states_idx[i]
+                    
                 out_dict = {
                     "text": recv_obj.output_strs[i],
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOut):
+
                 out_dict = {
                     "token_ids": recv_obj.output_ids[i],
                     "meta_info": meta_info,

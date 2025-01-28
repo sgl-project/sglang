@@ -336,6 +336,7 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             top_logprobs_nums=[0] * bs,
+            return_hidden_states=True,
             positions=positions,
             global_num_tokens=global_num_tokens,
             gathered_buffer=gathered_buffer,
@@ -345,6 +346,7 @@ class CudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
+            top_hidden_states_nums=self.model_runner.server_args.top_hidden_states_nums,
         )
 
         # Attention backend
@@ -361,7 +363,7 @@ class CudaGraphRunner:
         # Run and capture
         def run_once():
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
-            return logits_output.next_token_logits, logits_output.hidden_states
+            return logits_output.next_token_logits, logits_output.hidden_states, logits_output.hidden_states_topk_idx, logits_output.hidden_states_topk_val
 
         for _ in range(2):
             torch.cuda.synchronize()
@@ -429,13 +431,15 @@ class CudaGraphRunner:
 
         # Replay
         self.graphs[bs].replay()
-        next_token_logits, hidden_states = self.output_buffers[bs]
+        next_token_logits, hidden_states, hidden_states_topk_idx, hidden_states_topk_val = self.output_buffers[bs]
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=next_token_logits[:raw_num_token],
             hidden_states=(
                 hidden_states[:raw_num_token] if hidden_states is not None else None
             ),
+            hidden_states_topk_idx=hidden_states_topk_idx[:raw_num_token],
+            hidden_states_topk_val=hidden_states_topk_val[:raw_num_token],
         )
         return logits_output
 
