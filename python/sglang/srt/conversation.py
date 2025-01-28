@@ -181,7 +181,7 @@ class Conversation:
 
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
-                    ret += f"[Round {i//2 + round_add_n}]{self.sep}"
+                    ret += f"[Round {i // 2 + round_add_n}]{self.sep}"
 
                 if message:
                     ret += f"{role}：{message}{self.sep}"
@@ -566,5 +566,20 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=("<|im_end|>", "<|endoftext|>"),
         image_token="(<image>./</image>)",
+    )
+)
+
+# Reference: https://github.com/deepseek-ai/Janus?tab=readme-ov-file#janus-pro
+register_conv_template(
+    Conversation(
+        name="janus-pro",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language",
+        system_template="{system_message}.",
+        roles=("User", "Assistant"),
+        sep="\n\n",
+        sep2="<｜end▁of▁sentence｜>",
+        sep_style=SeparatorStyle.ADD_COLON_TWO,
+        stop_str=["<|User|>", "<｜end▁of▁sentence｜>"],
+        image_token="<image_placeholder>",
     )
 )
