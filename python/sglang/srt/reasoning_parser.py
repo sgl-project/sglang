@@ -171,11 +171,11 @@ class ReasoningParser:
     def __init__(self, model_type: str = None, accumulate_reasoning: bool = False):
         if not model_type:
             raise ValueError("Model type must be specified")
-        
-        detector_class = self.DetectorMap.get(model_type)
+
+        detector_class = self.DetectorMap.get(model_type.lower())
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
-        
+
         self.detector = detector_class(accumulate_reasoning=accumulate_reasoning)
 
     def parse_non_stream(self, full_text: str) -> StreamingParseResult:
