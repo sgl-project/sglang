@@ -42,7 +42,7 @@ class TestWaveAttention(unittest.TestCase):
 
         # o will have the same shape as q
         o_triton = torch.zeros(B, H_Q, D_V, dtype=dtype, device="cuda")
-        o = torch.zeros(B, H_Q, D_V, dtype=torch.float32, device="cuda")
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device="cuda")
 
         req_to_token = torch.arange(
             total_tokens, device="cuda", dtype=torch.int32
@@ -102,7 +102,7 @@ class TestWaveAttention(unittest.TestCase):
         )
         print(cos_sim.item())
         self.assertTrue(cos_sim.item() > 0.99)
-        self.assertTrue(torch.allclose(o, o_triton.to(torch.float32), atol=3e-2))
+        self.assertTrue(torch.allclose(o, o_triton, atol=3e-2))
 
     def test_grouped_decode_attention(self):
         # seq_lens = [5, 100, 128, 500]
