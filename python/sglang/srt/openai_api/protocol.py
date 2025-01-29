@@ -324,6 +324,8 @@ class ChatCompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    separate_reasoning: bool = False
+    stream_reasoning: bool = True
 
 
 class FunctionResponse(BaseModel):
@@ -345,6 +347,7 @@ class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -368,6 +371,7 @@ class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):

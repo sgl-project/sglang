@@ -22,10 +22,13 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 RUN pip3 install datamodel_code_generator
 
 WORKDIR /sgl-workspace
+ARG SGL_REPO="https://github.com/sgl-project/sglang"
+ENV SGL_DEFAULT="main"
+ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ARG CUDA_VERSION
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
-    && git clone --depth=1 https://github.com/sgl-project/sglang.git \
+    && git clone ${SGL_REPO} \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
@@ -39,6 +42,12 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
          echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
        fi \
     && cd sglang \
+    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+         echo "Using ${SGL_DEFAULT}, default branch."; \
+       else \
+         echo "Using ${SGL_BRANCH} branch."; \
+         git checkout ${SGL_BRANCH}; \
+       fi \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          if [ "$CUDA_VERSION" = "12.1.1" ]; then \
            python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu121/torch2.5/flashinfer/; \
