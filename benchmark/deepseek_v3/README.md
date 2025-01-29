@@ -8,6 +8,7 @@ For optimizations made on the DeepSeek series models regarding SGLang, please re
 
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
+- Or 8 x AMD Instinct MI300X OAM GPUs
 
 If you do not have GPUs with large enough memory, please try multi-node tensor parallelism. There is an example serving with [2 H20 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) below.
 
@@ -16,6 +17,8 @@ If you do not have GPUs with large enough memory, please try multi-node tensor p
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded.
 
 ### Using Docker (Recommended)
+
+#### For NVIDIA GPUs:
 ```bash
 # Pull latest image
 # https://hub.docker.com/r/lmsysorg/sglang/tags
@@ -24,6 +27,33 @@ docker pull lmsysorg/sglang:latest
 # Launch
 docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
+```
+
+#### For AMD ROCm Systems:
+```bash
+# Clone the sglang repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang/docker
+
+# Build the ROCm Docker image
+docker build --build-arg SGL_BRANCH=v0.4.2 -t sglang-rocm620 -f Dockerfile.rocm .
+
+# Create Docker run alias (Add to ~/.bashrc or run directly)
+alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/dri --ipc=host \
+    --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v $HOME/dockerx:/dockerx -v /data:/data'
+
+# Launch the server
+drun -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=your_huggingface_token" \
+    sglang-rocm620 \
+    python3 -m sglang.launch_server \
+    --model deepseek-ai/DeepSeek-V3 \
+    --tp 8 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 30000
 ```
 
 For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
