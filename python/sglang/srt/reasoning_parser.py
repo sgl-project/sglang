@@ -17,11 +17,11 @@ class StreamingParseResult:
 
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
-    def __init__(self, accumulate_reasoning: bool = False):
+    def __init__(self, stream_reasoning: bool = False):
         self._buffer = ""
         self._in_reasoning = False
         self._current_reasoning = ""
-        self.accumulate_reasoning = accumulate_reasoning
+        self.stream_reasoning = stream_reasoning
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """Parses the text in one go."""
@@ -40,11 +40,11 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
     and the rest of the text as `normal_text`.
 
     Args:
-        accumulate_reasoning (bool): If True, accumulates reasoning content until the end tag.
-            If False, streams reasoning content as it arrives.
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
     """
-    def __init__(self, accumulate_reasoning: bool = False):
-        super().__init__(accumulate_reasoning=accumulate_reasoning)
+    def __init__(self, stream_reasoning: bool = False):
+        super().__init__(stream_reasoning=stream_reasoning)
         self.think_start_token = "<think>"
         self.think_end_token = "</think>"
         self.reasoning_regex = re.compile(
@@ -78,7 +78,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             
             return StreamingParseResult(
                 normal_text=normal_text if normal_text else "",
-                reasoning_text=reasoning_text
+                reasoning_text=reasoning_text.strip()
             )
 
         return StreamingParseResult(normal_text=text)
@@ -88,9 +88,9 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         Streaming incremental parsing for reasoning content.
         Handles partial reasoning tags and content.
         
-        If accumulate_reasoning is True:
+        If stream_reasoning is False:
             Accumulates reasoning content until the end tag is found
-        If accumulate_reasoning is False:
+        If stream_reasoning is True:
             Streams reasoning content as it arrives
         """
         self._buffer += new_text
@@ -112,24 +112,24 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             reasoning_start = start_idx + len(self.think_start_token)
             reasoning_text = current_text[reasoning_start:]
             
-            if self.accumulate_reasoning:
+            if self.stream_reasoning: 
+                self._buffer = ""  # Clear buffer since we're streaming
+            else:
                 self._current_reasoning = reasoning_text
                 reasoning_text = ""
-            else:
-                self._buffer = ""  # Clear buffer since we're streaming
             
-            return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
+            return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text.lstrip())
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:
             end_idx = current_text.find(self.think_end_token)
             
-            if self.accumulate_reasoning:
-                # Return accumulated reasoning plus final chunk
-                reasoning_text = self._current_reasoning + current_text[:end_idx]
-            else:
+            if self.stream_reasoning:
                 # Just return the final chunk before the end tag
                 reasoning_text = current_text[:end_idx]
+            else:
+                # Return accumulated reasoning plus final chunk
+                reasoning_text = self._current_reasoning + current_text[:end_idx]
             
             self._in_reasoning = False
             self._current_reasoning = ""
@@ -138,19 +138,19 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             
             return StreamingParseResult(
                 normal_text=normal_text,
-                reasoning_text=reasoning_text
+                reasoning_text=reasoning_text.rstrip()
             )
 
         # Continue with reasoning content
         if self._in_reasoning:
-            if self.accumulate_reasoning:
-                # Accumulate content but don't return it yet
-                self._current_reasoning += new_text
-                return StreamingParseResult()
-            else:
+            if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
                 return StreamingParseResult(reasoning_text=new_text)
+            else:
+                # Accumulate content but don't return it yet
+                self._current_reasoning += new_text
+                return StreamingParseResult()
 
         return StreamingParseResult()
 
@@ -161,14 +161,14 @@ class ReasoningParser:
 
     Args:
         model_type (str): Type of model to parse reasoning from
-        accumulate_reasoning (bool): If True, accumulates reasoning content until complete.
-            If False, streams reasoning content as it arrives.
+        stream_reasoning (bool): If Flase, accumulates reasoning content until complete.
+            If True, streams reasoning content as it arrives.
     """
     DetectorMap: Dict[str, BaseReasoningFormatDetector] = {
         "deepseek-r1": DeepSeekR1Detector
     }
 
-    def __init__(self, model_type: str = None, accumulate_reasoning: bool = False):
+    def __init__(self, model_type: str = None, stream_reasoning: bool = True):
         if not model_type:
             raise ValueError("Model type must be specified")
 
@@ -176,7 +176,7 @@ class ReasoningParser:
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
-        self.detector = detector_class(accumulate_reasoning=accumulate_reasoning)
+        self.detector = detector_class(stream_reasoning=stream_reasoning)
 
     def parse_non_stream(self, full_text: str) -> StreamingParseResult:
         """Non-streaming call: one-time parsing"""
