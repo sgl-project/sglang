@@ -128,6 +128,7 @@ if torch.cuda.is_available():
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
         nvcc_flags.append("-DCOMPILE_HOPPER_TMA_GEMMS")
         nvcc_flags.append("-DCUTLASS_ARCH_MMA_SM90_SUPPORTED")
+        nvcc_flags.append("-DCUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED")
         sources.extend(sources_cutlass_moe_gemm)
     if sm_version >= 90:
         nvcc_flags.extend(nvcc_flags_fp8)
@@ -142,6 +143,7 @@ else:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
         nvcc_flags.append("-DCOMPILE_HOPPER_TMA_GEMMS")
         nvcc_flags.append("-DCUTLASS_ARCH_MMA_SM90_SUPPORTED")
+        nvcc_flags.append("-DCUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED")
         sources.extend(sources_cutlass_moe_gemm)
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
