@@ -257,6 +257,9 @@ async def benchmark(
             "Output token throughput (tok/s):", metrics.output_throughput
         )
     )
+    print(
+        "{:<40} {:<10.2f}".format("Total throughput (tok/s):", metrics.total_throughput)
+    )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)

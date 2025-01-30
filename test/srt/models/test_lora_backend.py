@@ -18,6 +18,7 @@ import unittest
 import torch
 
 from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import calculate_rouge_l
 
 LORA_SETS = [
     {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
@@ -26,26 +27,23 @@ LORA_SETS = [
 TORCH_DTYPES = [torch.float16]
 
 PROMPTS = [
+    "AI is a field of computer science focused on",
     """
-### Instruction:
-Write a poem about the transformers Python library.
-Mention the word "large language models" in that poem.
-### Response:
-The Transformers are large language models,
-They're used to make predictions on text.
-""",
-    """
-### Instruction:
-Tell me about llamas and alpacas
-### Response:
-Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
-### Question 2:
-What do you know about llamas?
-### Answer:
-""",
+    ### Instruction:
+    Tell me about llamas and alpacas
+    ### Response:
+    Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
+    ### Question 2:
+    What do you know about llamas?
+    ### Answer:
+    """,
 ]
 
 BACKENDS = ["triton", "flashinfer"]
+
+prefill_tolerance: float = 5e-2
+decode_tolerance: float = 5e-2
+rouge_l_tolerance: float = 1
 
 
 class TestLoRABackend(unittest.TestCase):
@@ -129,6 +127,13 @@ class TestLoRABackend(unittest.TestCase):
                 "max input diff between hf_lora and hf_base",
                 torch.max(abs(hf_logprobs - hf_no_lora_logprobs)),
             )
+            if hf_logprobs.shape[0] <= 100:
+                assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
+                    f"prefill logprobs are not all close with model_path={base_path},"
+                    f"lora_path={batch_lora_paths[i]}, backend={backend}, prompt={prompts[i]}"
+                    f"prefill_tolerance={prefill_tolerance}."
+                    f"{hf_logprobs=}, {srt_logprobs=}"
+                )
 
             # compare output logprobs
             hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
@@ -138,15 +143,24 @@ class TestLoRABackend(unittest.TestCase):
                 torch.max(abs(hf_logprobs - srt_logprobs)),
                 "\n",
             )
+            if hf_logprobs.shape[0] <= 100:
+                assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
+                    f"decode logprobs are not all close with model_path={base_path},"
+                    f"lora_path={batch_lora_paths[i]}, backend={backend}, prompt={prompts[i]}"
+                    f"decode_tolerance={decode_tolerance}."
+                    f"{hf_logprobs=}, {srt_logprobs=}"
+                )
 
             # compare output strings
-            srt_output_str = srt_outputs.output_strs[i]
+            srt_output_str = srt_outputs.output_strs[i].strip(" ")
             hf_output_str = hf_outputs.output_strs[i]
             print(f"srt_output_str={srt_output_str}")
             print(f"hf_output_str={hf_output_str}")
-            print(f"srt_no_lora_output_str={srt_no_lora_outputs.output_strs[i]}")
-            print(f"hf_no_lora_output_str={hf_no_lora_outputs.output_strs[i]}")
-            assert srt_output_str == hf_output_str
+            rouge_l_scores = calculate_rouge_l([srt_output_str], [hf_output_str])
+            print(f"{rouge_l_scores=}")
+            assert (
+                rouge_l_scores[0] >= rouge_l_tolerance
+            ), f"ROUGE-L scores of prompt {i} outputs are greater than rouge_l_tolerance={rouge_l_tolerance}"
 
     def test_all(self):
         for lora_set in LORA_SETS:
