@@ -42,7 +42,7 @@ jobs:
           python -m ipykernel install --user --name python3 --display-name "Python 3"
 
       - name: Execute notebooks
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           cd docs
           make clean

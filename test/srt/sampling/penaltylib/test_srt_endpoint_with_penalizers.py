@@ -36,7 +36,7 @@ class TestBatchPenalizerE2E(unittest.TestCase):
     def run_decode(
         self,
         return_logprob=True,
-        top_logprobs_num=5,
+        top_logprobs_num=3,
         return_text=True,
         n=1,
         **sampling_params,

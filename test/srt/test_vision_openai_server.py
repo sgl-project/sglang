@@ -180,7 +180,9 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.usage.total_tokens > 0
 
     def prepare_video_messages(self, video_path):
-        max_frames_num = 32
+        # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
+        # the size of the video embeds differs from the `modality` argument when preprocessed
+        max_frames_num = 12
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
