@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
@@ -70,7 +71,13 @@ class ModelOptFp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        return ModelOptFp8LinearMethod(self) if isinstance(layer, LinearBase) else None
+        from vllm.attention.layer import Attention
+
+        if isinstance(layer, LinearBase):
+            return ModelOptFp8LinearMethod(self)
+        elif isinstance(layer, Attention):
+            return ModelOptFp8KVCacheMethod(self)
+        return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
@@ -171,3 +178,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
+
+
+class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
+    """
+    Supports loading kv-cache scaling factors from FP8 checkpoints.
+    """
+
+    def __init__(self, quant_config: ModelOptFp8Config):
+        super().__init__(quant_config)
