@@ -94,6 +94,13 @@ sources = [
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
     "3rdparty/flashinfer/csrc/rope.cu",
+    "3rdparty/tensorrt_llm/common/assert.cpp",
+    "3rdparty/tensorrt_llm/common/cublasMMWrapper.cpp",
+    "3rdparty/tensorrt_llm/common/cudaDriverWrapper.cpp",
+    "3rdparty/tensorrt_llm/common/logger.cpp",
+    "3rdparty/tensorrt_llm/common/stringUtils.cpp",
+    "3rdparty/tensorrt_llm/common/tllmException.cpp",
+    "3rdparty/tensorrt_llm/common/cudaFp8Utils.cu",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
