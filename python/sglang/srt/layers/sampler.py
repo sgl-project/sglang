@@ -74,7 +74,7 @@ class Sampler(nn.Module):
                     # so we use the torch implementation.
                     logprobs = torch.log(
                         top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    )
+                    ).clamp(min=torch.finfo(probs.dtype).min)
 
                 max_top_k_round, batch_size = 32, probs.shape[0]
                 uniform_samples = torch.rand(
@@ -111,7 +111,7 @@ class Sampler(nn.Module):
                 if return_logprob:
                     logprobs = torch.log(
                         top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    )
+                    ).clamp(min=torch.finfo(probs.dtype).min)
             else:
                 raise ValueError(
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
@@ -216,10 +216,10 @@ def top_p_normalize_probs_torch(
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
-    # Add small epsilon to prevent division by zero
-    # Use a small value that's appropriate for the dtype
-    eps = torch.finfo(probs.dtype).eps
-    probs_sort.add_(eps)
+    # # Add small epsilon to prevent division by zero
+    # # Use a small value that's appropriate for the dtype
+    # eps = torch.finfo(probs.dtype).eps
+    # probs_sort.add_(eps)
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
