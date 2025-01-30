@@ -77,111 +77,6 @@ class RequestFuncOutput:
     error: str = ""
 
 
-# trt llm not support ignore_eos
-# https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
-async def async_request_trt_llm(
-    request_func_input: RequestFuncInput,
-    queue: asyncio.Queue,
-    tokenizer: PreTrainedTokenizerBase,
-    pbar: Optional[tqdm] = None,
-) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-    assert api_url.endswith("generate_stream")
-
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        payload = {
-            "accumulate_tokens": True,
-            "temperature": 0.000001,
-            "top_p": 1.0,
-            "stream": True,
-            "end_id": 1048576,
-            **request_func_input.extra_request_body,
-        }
-
-        prompt_idx = request_func_input.finished_prompts
-        messages = request_func_input.prev_messages
-        prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
-        prompt_len = sum(
-            prompt[1] + prompt[2]  # input_len + output_len
-            for prompt in request_func_input.prompts[:prompt_idx]
-        )
-        prompt_len += input_len
-
-        # TODO: Check out whether trt-llm supports native multiturn chat
-        messages.append(prompt)
-        payload["text_input"] = " ".join(messages)
-        payload["max_tokens"] = max_tokens
-        payload["min_length"] = max_tokens
-
-        if args.disable_ignore_eos:
-            del payload["min_length"]
-            del payload["end_id"]
-
-        output = RequestFuncOutput()
-
-        generated_text = ""
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(url=api_url, json=payload) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
-
-                        data = json.loads(chunk)
-                        generated_text += data["text_output"]
-                        timestamp = time.perf_counter()
-                        # First token
-                        if ttft == 0.0:
-                            ttft = time.perf_counter() - st
-                            output.ttft.append(ttft)
-
-                        # Decoding phase
-                        else:
-                            output.itl.append(timestamp - most_recent_timestamp)
-
-                        most_recent_timestamp = timestamp
-
-                    output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
-                    output.output_len.append(output_len)
-                    output.generated_text.append(generated_text)
-                    output.latency.append(most_recent_timestamp - st)
-                    output.success = True
-
-                    # Prepare for the new request
-                    request_func_input.prompts[prompt_idx] = (
-                        prompt,
-                        input_len,
-                        output_len,  # changes from max_tokens to output_len
-                    )
-                    prompt_idx += 1
-                    messages.append(generated_text)
-
-                    # Move the new request to the end of the queue
-                    if prompt_idx < len(request_func_input.prompts):
-                        request_func_input.finished_prompts = prompt_idx
-                        request_func_input.prev_messages = messages
-                        await queue.put(request_func_input)
-
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-        if pbar:
-            pbar.update(1)
-        return output
-
-
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -291,113 +186,6 @@ async def async_request_openai_completions(
                             "content": generated_text,
                         }
                     )
-
-                    # Move the new request to the end of the queue
-                    if prompt_idx < len(request_func_input.prompts):
-                        request_func_input.finished_prompts = prompt_idx
-                        request_func_input.prev_messages = messages
-                        await queue.put(request_func_input)
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-    if pbar:
-        pbar.update(1)
-    return output
-
-
-async def async_request_truss(
-    request_func_input: RequestFuncInput,
-    queue: asyncio.Queue,
-    tokenizer: PreTrainedTokenizerBase,
-    pbar: Optional[tqdm] = None,
-) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        payload = {
-            "model": request_func_input.model,
-            "temperature": 0.0,
-            "best_of": 1,
-            "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
-        }
-        headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
-
-        output = RequestFuncOutput()
-
-        prompt_idx = request_func_input.finished_prompts
-        messages = request_func_input.prev_messages
-        prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
-        prompt_len = sum(
-            prompt[1] + prompt[2]  # input_len + output_len
-            for prompt in request_func_input.prompts[:prompt_idx]
-        )
-        prompt_len += input_len
-
-        # TODO: Checkout truss to see whether there is a another field
-        messages.append(prompt)
-        payload["prompt"] = " ".join(messages)
-        payload["max_tokens"] = max_tokens
-
-        generated_text = ""
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["delta"]["content"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft.append(ttft)
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["delta"]["content"]
-
-                    output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
-                    output.output_len.append(output_len)
-                    output.generated_text.append(generated_text)
-                    output.success = True
-                    output.latency.append(latency)
-
-                    # Prepare for the new request
-                    request_func_input.prompts[prompt_idx] = (
-                        prompt,
-                        input_len,
-                        output_len,  # changes from max_tokens to output_len
-                    )
-                    prompt_idx += 1
-                    messages.append(generated_text)
 
                     # Move the new request to the end of the queue
                     if prompt_idx < len(request_func_input.prompts):
@@ -531,15 +319,6 @@ async def async_request_sglang_generate(
     return output
 
 
-async def async_request_gserver(
-    request_func_input: RequestFuncInput,
-    queue: asyncio.Queue,
-    tokenizer: PreTrainedTokenizerBase,
-    pbar: Optional[tqdm] = None,
-) -> RequestFuncOutput:
-    raise NotImplementedError()
-
-
 async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
@@ -564,9 +343,6 @@ ASYNC_REQUEST_FUNCS = {
     "sglang-oai": async_request_openai_completions,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
-    "trt": async_request_trt_llm,
-    "gserver": async_request_gserver,
-    "truss": async_request_truss,
 }
 
 
@@ -1051,9 +827,6 @@ def run_benchmark(args_: argparse.Namespace):
             "sglang-oai": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
-            "trt": 8000,
-            "gserver": 9988,
-            "truss": 8080,
         }.get(args.backend, 30000)
 
     model_url = (
@@ -1073,24 +846,6 @@ def run_benchmark(args_: argparse.Namespace):
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/chat/completions"
-        )
-    elif args.backend == "trt":
-        api_url = (
-            f"{args.base_url}/v2/models/ensemble/generate_stream"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v2/models/ensemble/generate_stream"
-        )
-        if args.model is None:
-            print("Please provide a model using `--model` when using `trt` backend.")
-            sys.exit(1)
-    elif args.backend == "gserver":
-        api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
-        args.model = args.model or "default"
-    elif args.backend == "truss":
-        api_url = (
-            f"{args.base_url}/v1/models/model:predict"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v1/models/model:predict"
         )
     base_url = (
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
