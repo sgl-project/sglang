@@ -101,6 +101,9 @@ sources = [
     "3rdparty/tensorrt_llm/common/stringUtils.cpp",
     "3rdparty/tensorrt_llm/common/tllmException.cpp",
     "3rdparty/tensorrt_llm/common/cudaFp8Utils.cu",
+]
+
+sources_cutlass_moe_gemm = [
     "3rdparty/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
     "3rdparty/tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.cpp",
     "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
@@ -123,18 +126,30 @@ sm_version = _get_device_sm()
 if torch.cuda.is_available():
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+        nvcc_flags.append("-DCOMPILE_HOPPER_TMA_GEMMS")
+        nvcc_flags.append("-DCUTLASS_ARCH_MMA_SM90_SUPPORTED")
+        sources.extend(sources_cutlass_moe_gemm)
     if sm_version >= 90:
         nvcc_flags.extend(nvcc_flags_fp8)
+        nvcc_flags.append("-DENABLE_FP8")
     if sm_version >= 80:
         nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
+        nvcc_flags.append("-DCUTLASS_ARCH_MMA_SM80_SUPPORTED")
+        nvcc_flags.append("-DENABLE_BF16")
 else:
     # compilation environment without GPU
     if enable_sm90a:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+        nvcc_flags.append("-DCOMPILE_HOPPER_TMA_GEMMS")
+        nvcc_flags.append("-DCUTLASS_ARCH_MMA_SM90_SUPPORTED")
+        sources.extend(sources_cutlass_moe_gemm)
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
+        nvcc_flags.append("-DENABLE_FP8")
     if enable_bf16:
         nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
+        nvcc_flags.append("-DCUTLASS_ARCH_MMA_SM80_SUPPORTED")
+        nvcc_flags.append("-DENABLE_BF16")
 
 for flag in [
     "-D__CUDA_NO_HALF_OPERATORS__",
