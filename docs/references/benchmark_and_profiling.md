@@ -51,7 +51,7 @@ python -m sglang.bench_serving --backend sglang --model-path meta-llama/Llama-3.
 sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
 
 ## Profile with Nsight
-Nsight systems is an advanced tool to see more profiling details, such as register and shared memory usage, annotated code regions and low-level CUDA kernels and events.
+Nsight systems is an advanced tool that exposes more profiling details, such as register and shared memory usage, annotated code regions and low-level CUDA APIs and events.
 
 0. Prerequisite: install using apt, or run inside a [NVIDIA Docker container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags) or [SGLang Docker container](https://github.com/sgl-project/sglang/tree/main/docker).
 
