@@ -13,6 +13,11 @@ from transformers import PreTrainedTokenizerBase
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
+from sglang.bench_serving import (
+    download_and_cache_file,
+    gen_prompt,
+    get_gen_prefix_cache_path,
+)
 from sglang.srt.openai_api.protocol import ChatCompletionMessageContentPart
 
 # type of content fields, can be only prompts or with images/videos
@@ -81,40 +86,6 @@ def common_filter_chat(
     print(f"#Input tokens: {input_tokens}")
     print(f"#Output tokens: {output_tokens}")
     return filtered_dataset
-
-
-def download_and_cache_file(url: str, filename: Optional[str] = None):
-    """Read and cache a file from a url."""
-    if filename is None:
-        filename = os.path.join("/tmp", url.split("/")[-1])
-
-    # Check if the cache file already exists
-    if os.path.exists(filename):
-        return filename
-
-    print(f"Downloading from {url} to {filename}")
-
-    # Stream the response to show the progress bar
-    response = requests.get(url, stream=True)
-    response.raise_for_status()  # Check for request errors
-
-    # Total size of the file in bytes
-    total_size = int(response.headers.get("content-length", 0))
-    chunk_size = 1024  # Download in chunks of 1KB
-
-    # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            f.write(chunk)
-            bar.update(len(chunk))
-
-    return filename
 
 
 def sample_sharegpt_requests(

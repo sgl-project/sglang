@@ -38,6 +38,14 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sglang.bench_serving import (
+    check_chat_template,
+    get_tokenizer,
+    parse_request_rate_range,
+    remove_prefix,
+    set_ulimit,
+)
+
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
 global args
@@ -67,10 +75,6 @@ class RequestFuncOutput:
 
     success: bool = False
     error: str = ""
-
-
-def remove_prefix(text: str, prefix: str) -> str:
-    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 # trt llm not support ignore_eos
@@ -554,40 +558,6 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     return output
 
 
-def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
-        import huggingface_hub.constants
-        from modelscope import snapshot_download
-
-        model_path = snapshot_download(
-            model_id=pretrained_model_name_or_path,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-            ignore_file_pattern=[".*.pt", ".*.safetensors", ".*.bin"],
-        )
-
-        return model_path
-    return pretrained_model_name_or_path
-
-
-def get_tokenizer(
-    pretrained_model_name_or_path: str,
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.hf_transformers_utils import get_tokenizer
-
-        return get_tokenizer(pretrained_model_name_or_path)
-
-    if pretrained_model_name_or_path is not None and not os.path.exists(
-        pretrained_model_name_or_path
-    ):
-        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
-    )
-
-
 ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
@@ -1056,23 +1026,6 @@ async def benchmark(
     return result
 
 
-def parse_request_rate_range(request_rate_range):
-    if len(request_rate_range.split(",")) == 3:
-        start, stop, step = map(int, request_rate_range.split(","))
-        return list(range(start, stop, step))
-    else:
-        return list(map(int, request_rate_range.split(",")))
-
-
-def check_chat_template(model_path):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        return "chat_template" in tokenizer.init_kwargs
-    except Exception as e:
-        print(f"Fail to load tokenizer config with error={e}")
-        return False
-
-
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
@@ -1236,17 +1189,6 @@ def run_benchmark(args_: argparse.Namespace):
                     enable_shared_prefix=args.enable_shared_prefix,
                 )
             )
-
-
-def set_ulimit(target_soft_limit=65535):
-    resource_type = resource.RLIMIT_NOFILE
-    current_soft, current_hard = resource.getrlimit(resource_type)
-
-    if current_soft < target_soft_limit:
-        try:
-            resource.setrlimit(resource_type, (target_soft_limit, current_hard))
-        except ValueError as e:
-            print(f"Fail to set RLIMIT_NOFILE: {e}")
 
 
 if __name__ == "__main__":
