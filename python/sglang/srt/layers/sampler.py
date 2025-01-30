@@ -215,6 +215,11 @@ def top_p_normalize_probs_torch(
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+
+    # Add small epsilon to prevent division by zero
+    # Use a small value that's appropriate for the dtype
+    eps = torch.finfo(probs.dtype).eps
+    probs_sort.add_(eps)
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
