@@ -101,6 +101,17 @@ sources = [
     "3rdparty/tensorrt_llm/common/stringUtils.cpp",
     "3rdparty/tensorrt_llm/common/tllmException.cpp",
     "3rdparty/tensorrt_llm/common/cudaFp8Utils.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.cpp",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
+    "3rdparty/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_hopper_input.cu",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
