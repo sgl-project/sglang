@@ -181,7 +181,7 @@ python -m sglang.launch_server \
 ```
 Output
 ```bash
-[2025-01-26 23:31:24 TP0] Decode batch. #running-req: 1, #token: 101, token usage: 0.00, gen throughput (token/s): 11.34, #queue-req: 
+[2025-01-26 23:31:24 TP0] Decode batch. #running-req: 1, #token: 101, token usage: 0.00, gen throughput (token/s): 11.34, #queue-req:
 ```
 
 * * * * *
@@ -196,12 +196,12 @@ python -m sglang.launch_server \
     --attention-backend flashinfer \
     --mem-fraction-static 0.8 \
     --context-length 8192 \
-    --torchao-config int4wo-128 
+    --torchao-config int4wo-128
 ```
-This enables TorchAO's int4 weight-only quantization with 128-group size. 
+This enables TorchAO's int4 weight-only quantization with 128-group size.
 
 ```bash
-[2025-01-27 00:06:47 TP0] Decode batch. #running-req: 1, #token: 115, token usage: 0.00, gen throughput (token/s): 30.84, #queue-req: 
+[2025-01-27 00:06:47 TP0] Decode batch. #running-req: 1, #token: 115, token usage: 0.00, gen throughput (token/s): 30.84, #queue-req:
 ```
 
 * * * * *
@@ -209,7 +209,7 @@ Structured output with XGrammar
 -------------------------------
 
 Install XGrammar:
-```bash 
+```bash
 git clone --recursive https://github.com/mlc-ai/xgrammar.git && cd xgrammar
 pre-commit install
 mkdir build && cd build
@@ -219,7 +219,7 @@ cd ../python
 python3 -m pip install .
 ```
 Launch the server with XGrammar:
-```bash 
+```bash
 python -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --device cuda \
@@ -231,7 +231,7 @@ python -m sglang.launch_server \
     --grammar-backend xgrammar
 ```
 Run a structured output script:
-```bash 
+```bash
 import openai
 
 client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
@@ -252,7 +252,7 @@ for chunk in response:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 Output
-```bash 
+```bash
 {
     "name": "Knowledge Assistant",
     "description": "A helpful AI assistant",
