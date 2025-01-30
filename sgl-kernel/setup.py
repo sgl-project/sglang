@@ -44,6 +44,8 @@ cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
 turbomind = root / "3rdparty" / "turbomind"
+tensorrt_llm = root / "3rdparty" / "TensorRT-LLM"
+
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
@@ -56,6 +58,14 @@ include_dirs = [
     "cublasLt",
     turbomind.resolve(),
     turbomind.resolve() / "src",
+    tensorrt_llm.resolve(),
+    tensorrt_llm.resolve() / "cpp",
+    tensorrt_llm.resolve() / "cpp" / "include",
+    tensorrt_llm.resolve() / "cpp" / "tensorrt_llm",
+    tensorrt_llm.resolve() / "cpp" / "tensorrt_llm" / "kernels",
+    tensorrt_llm.resolve() / "cpp" / "tensorrt_llm" / "kernels" / "mixtureOfExperts",
+    tensorrt_llm.resolve() / "cpp" / "tensorrt_llm" / "cutlass_extensions" / "include",
+    tensorrt_llm.resolve() / "cpp" / "tensorrt_llm" / "cutlass_extensions" / "include" / "cutlass_extensions",
 ]
 
 nvcc_flags = [
@@ -95,6 +105,8 @@ sources = [
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
     "3rdparty/flashinfer/csrc/rope.cu",
+    "3rdparty/TensorRT-LLM/cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.cu",
+    "src/sgl-kernel/csrc/trt_fused_moe.cu",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"

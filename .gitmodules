@@ -10,3 +10,6 @@
 [submodule "sgl-kernel/3rdparty/turbomind"]
 	path = sgl-kernel/3rdparty/turbomind
 	url = https://github.com/InternLM/turbomind
+[submodule "sgl-kernel/3rdparty/TensorRT-LLM"]
+	path = sgl-kernel/3rdparty/TensorRT-LLM
+	url = https://github.com/NVIDIA/TensorRT-LLM.git

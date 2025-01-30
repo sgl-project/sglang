@@ -115,6 +115,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+
+  // trt fused moe
+  m.def("trt_fused_moe(Tensor input_activations, Tensor gating_output, Tensor fc1_expert_weights, Tensor fc1_activation_type_str, Tensor fc2_expert_weights, Tensor w1_scale, Tensor w2_scale, int top_k) -> Tensor");
+  m.impl("trt_fused_moe", torch::kCUDA, &trt_fused_moe);
 }
 
 REGISTER_EXTENSION(_kernels)

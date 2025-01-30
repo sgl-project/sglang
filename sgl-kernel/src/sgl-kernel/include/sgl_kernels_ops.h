@@ -112,3 +112,9 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                       at::Tensor cos_sin_cache, at::Tensor pos_ids, bool interleave,
                                       int64_t cuda_stream);
+
+// trt fused moe
+torch::Tensor trt_fused_moe(torch::Tensor input_activations, torch::Tensor gating_output, torch::Tensor fc1_expert_weights,
+                             std::string fc1_activation_type_str, torch::Tensor fc2_expert_weights,
+                             const c10::optional<torch::Tensor> w1_scale, const c10::optional<torch::Tensor> w2_scale,
+                             int64_t top_k);

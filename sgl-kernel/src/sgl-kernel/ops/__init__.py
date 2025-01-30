@@ -495,3 +495,7 @@ def min_p_sampling_from_probs(
     return _min_p_sampling_from_probs_internal(
         probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
     )
+
+def trt_fused_moe(input_activations, gating_output, fc1_expert_weights, fc1_activation_type_str, fc2_expert_weights, w1_scale: Optional[torch.Tensor], w2_scale: Optional[torch.Tensor], top_k: int):
+    return torch.ops.sgl_kernels.trt_fused_moe(input_activations, gating_output, fc1_expert_weights, fc1_activation_type_str, fc2_expert_weights, w1_scale, w2_scale, top_k)
+

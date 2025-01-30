@@ -3,8 +3,12 @@
 #include <cuda_runtime.h>
 #include <pytorch_extension_utils.h>
 #include <torch/extension.h>
-
-#include <sstream>
+#include <ATen/cuda/CUDAContext.h>
+#include <cstdio>
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <sstream> 
 
 struct cuda_error : public std::runtime_error {
   /**
