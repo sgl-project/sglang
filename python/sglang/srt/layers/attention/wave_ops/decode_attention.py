@@ -43,6 +43,8 @@ from sglang.srt.utils import is_hip
 is_hip_ = is_hip()
 
 logger = logging.getLogger(__name__)
+import os
+dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
 
 # TODO: Remove this when triton>=3.2.0. This issue will not affect performance and accuracy.
 logger.warning(
@@ -709,6 +711,11 @@ def decode_attention_wave(
             attn_logits,
             attn_logits_max,
         )
+        if dump_generated_mlir:
+            filename = f"wave_decode_attention_phase0_{'x'.join(map(str, shape))}.mlir"
+            with open(filename, "w") as f:
+                f.write(mb_qk.module_op.get_asm())
+
 
     with tk.gen.TestLaunchContext(
         hyperparams_1,
@@ -720,6 +727,11 @@ def decode_attention_wave(
         use_scheduling_barriers=False,
     ):
         mb_sv = phase_1(attn_logits, attn_logits_max, o)
+        if dump_generated_mlir:
+            filename = f"wave_decode_attention_phase1_{'x'.join(map(str, shape))}.mlir"
+            with open(filename, "w") as f:
+                f.write(mb_sv.module_op.get_asm())
+
 
 
 def decode_attention_fwd(
