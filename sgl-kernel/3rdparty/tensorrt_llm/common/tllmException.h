@@ -14,12 +14,35 @@
  * limitations under the License.
  */
 
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <stdexcept>
 #include <string>
+
+#define NEW_TLLM_EXCEPTION(...)                                                                                        \
+    tensorrt_llm::common::TllmException(__FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__))
 
 namespace tensorrt_llm::common
 {
 
-/// @brief Get the current timestamp in the format "MM-DD-YYYY HH:MM:SS:uuuuuu"
-std::string getCurrentTimestamp();
+class TllmException : public std::runtime_error
+{
+public:
+    static auto constexpr MAX_FRAMES = 128;
+
+    explicit TllmException(char const* file, std::size_t line, std::string const& msg);
+
+    ~TllmException() noexcept override;
+
+    [[nodiscard]] std::string getTrace() const;
+
+    static std::string demangle(char const* name);
+
+private:
+    std::array<void*, MAX_FRAMES> mCallstack{};
+    int mNbFrames;
+};
 
 } // namespace tensorrt_llm::common
