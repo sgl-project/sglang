@@ -31,7 +31,7 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu124; \
        elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-         python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu125; \
+         python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu124; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu118; \
          python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
