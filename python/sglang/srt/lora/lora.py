@@ -120,18 +120,20 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(x=x, weights=self.A_buffer)
 
         output_dim = base_output.shape[-1]
         lora_output = torch.empty_like(base_output)
-        lora_output[:, :output_dim] = self.lora_backend.run_sgemm(
+        lora_output[:, :output_dim] = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output[:, 0 : self.lora_rank].contiguous(),
             weights=self.B_buffer[0],
         )
 
-        lora_output[:, output_dim : 2 * output_dim] = self.lora_backend.run_sgemm(
-            x=lora_a_output[:, self.lora_rank : 2 * self.lora_rank].contiguous(),
-            weights=self.B_buffer[1],
+        lora_output[:, output_dim : 2 * output_dim] = (
+            self.lora_backend.run_lora_b_sgemm(
+                x=lora_a_output[:, self.lora_rank : 2 * self.lora_rank].contiguous(),
+                weights=self.B_buffer[1],
+            )
         )
 
         return base_output + lora_output * self.scaling
@@ -176,8 +178,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.lora_backend.run_sgemm(x=x, weights=self.A_buffer)
-        lora_output = self.lora_backend.run_sgemm(
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(x=x, weights=self.A_buffer)
+        lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output, weights=self.B_buffer[0]
         )
         return base_output + lora_output * self.scaling

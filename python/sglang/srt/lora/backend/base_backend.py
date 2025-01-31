@@ -16,13 +16,27 @@ class BaseLoraBackend:
         self.name = name
         self.batch_info = batch_info
 
-    def run_sgemm(self, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """Run segment Gemm with current backend.
+    def run_lora_a_sgemm(self, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Run segment Gemm of lora a modules with current backend.
         The definition of segment Gemm can be referred to https://docs.flashinfer.ai/api/gemm.html.
 
         Args:
              x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
-             weights: a set of lora weights with shape (num_lora, output_dim, input_dim)
+             weights: a set of lora weights with shape (num_lora, r, input_dim), here r is lora rank
+             Usually input_dim is much larger than r
+        Returns:
+             result with shape (s, r)
+        """
+        pass
+
+    def run_lora_b_sgemm(self, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Run segment Gemm of lora b modules with current backend.
+        The definition of segment Gemm can be referred to https://docs.flashinfer.ai/api/gemm.html.
+
+        Args:
+             x: input matrix with shape (s, r), here s is the sum of all sequence lengths, r is lora rank
+             weights: a set of lora weights with shape (num_lora, output_dim, r)
+             Usually output_dim is much larger than r
         Returns:
              result with shape (s, output_dim)
         """
