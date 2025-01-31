@@ -517,7 +517,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             if is_hip_:
                 if os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") is not None:
-                    return self.forward_absorb_fused_mla(positions, hiddent_states, forward_batch)
+                    return self.forward_absorb_fused_mla(positions, hidden_states, forward_batch)
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
             return self.forward_absorb(positions, hidden_states, forward_batch)
@@ -692,7 +692,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                         b_req_idx,
                         b_seq_len,
                         attn_logits,
-                        num_kv_split)
+                        num_kv_split,
+                        sm_scale)
         return attn_out
         
 def all_gather(
