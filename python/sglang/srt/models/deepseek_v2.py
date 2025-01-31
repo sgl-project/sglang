@@ -681,7 +681,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         b_req_idx = forward_batch.req_pool_indices
         b_seq_len = forward_batch.seq_lens
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        
+        w = self.kv_b_proj.weight
+        w_kc, w_vc = w.unflatten(
+                    0, (-1, self.qk_nope_head_dim + self.v_head_dim)
+                ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         
 
         #v_input = latent_cache[..., : self.kv_lora_rank]
