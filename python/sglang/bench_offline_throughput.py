@@ -27,7 +27,8 @@ from sglang.bench_serving import (
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Engine, Runtime
+from sglang.lang.backend.runtime_endpoint import Runtime
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
 
 
@@ -39,20 +40,22 @@ class BenchArgs:
     dataset_path: str = ""
     num_prompts: int = 1000
     sharegpt_output_len: Optional[int] = None
+    sharegpt_context_len: Optional[int] = None
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
-    gen_num_groups: int = 64
-    gen_prompts_per_group: int = 16
-    gen_system_prompt_len: int = 2048
-    gen_question_len: int = 128
-    gen_output_len: int = 256
+    gsp_num_groups: int = 64
+    gsp_prompts_per_group: int = 16
+    gsp_system_prompt_len: int = 2048
+    gsp_question_len: int = 128
+    gsp_output_len: int = 256
+    seed: int = 1
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
-    seed: int = 1
+    apply_chat_template: bool = False
+    profile: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
-    profile: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -83,6 +86,12 @@ class BenchArgs:
             help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
         )
         parser.add_argument(
+            "--sharegpt-context-len",
+            type=int,
+            default=BenchArgs.sharegpt_context_len,
+            help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
+        )
+        parser.add_argument(
             "--random-input-len",
             type=int,
             default=BenchArgs.random_input_len,
@@ -102,51 +111,62 @@ class BenchArgs:
             "used only for random dataset.",
         )
         parser.add_argument(
-            "--gen-num-groups",
+            "--gsp-num-groups",
             type=int,
-            default=BenchArgs.gen_num_groups,
+            default=BenchArgs.gsp_num_groups,
             help="Number of groups with shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-prompts-per-group",
+            "--gsp-prompts-per-group",
             type=int,
-            default=BenchArgs.gen_prompts_per_group,
+            default=BenchArgs.gsp_prompts_per_group,
             help="Number of prompts per group of shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-system-prompt-len",
+            "--gsp-system-prompt-len",
             type=int,
-            default=BenchArgs.gen_system_prompt_len,
+            default=BenchArgs.gsp_system_prompt_len,
             help="System prompt length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-question-len",
+            "--gsp-question-len",
             type=int,
-            default=BenchArgs.gen_question_len,
+            default=BenchArgs.gsp_question_len,
             help="Question length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-output-len",
+            "--gsp-output-len",
             type=int,
-            default=BenchArgs.gen_output_len,
+            default=BenchArgs.gsp_output_len,
             help="Target length in tokens for outputs in generated-shared-prefix dataset",
         )
+        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
         parser.add_argument(
             "--disable-ignore-eos",
-            type=bool,
-            default=BenchArgs.disable_ignore_eos,
+            action="store_true",
             help="Disable ignore EOS token",
         )
         parser.add_argument(
             "--extra-request-body",
             metavar='{"key1": "value1", "key2": "value2"}',
             type=str,
+            default=BenchArgs.extra_request_body,
             help="Append given JSON object to the request payload. You can use this to specify"
             "additional generate params like sampling params.",
         )
-        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument(
+            "--apply-chat-template",
+            action="store_true",
+            help="Apply chat template",
+        )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
         parser.add_argument(
             "--skip-warmup",
             action="store_true",
@@ -156,12 +176,6 @@ class BenchArgs:
             "--do-not-exit",
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
-        )
-        parser.add_argument(
-            "--profile",
-            action="store_true",
-            help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
 
     @classmethod
@@ -201,17 +215,16 @@ def throughput_test_once(
         for r in reqs
     ]
 
-    st = time.perf_counter()
     if profile:
         backend.start_profile()
 
+    st = time.perf_counter()
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+    latency = time.perf_counter() - st
 
     if profile:
         backend.stop_profile()
         monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
-
-    latency = time.perf_counter() - st
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
@@ -285,7 +298,7 @@ def throughput_test(
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
 
-    tokenizer_id = server_args.model_path
+    tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environmnets
@@ -304,8 +317,8 @@ def throughput_test(
     warmup_requests = sample_random_requests(
         input_len=256,
         output_len=16,
-        num_prompts=16,
-        range_ratio=0.8,
+        num_prompts=min(bench_args.num_prompts, 16),
+        range_ratio=1.0,
         tokenizer=tokenizer,
         dataset_path=bench_args.dataset_path,
     )
@@ -321,6 +334,7 @@ def throughput_test(
             extra_request_body=extra_request_body,
             profile=False,
         )
+        time.sleep(0.5)
 
     logging.info("\nBenchmark...")
     result = throughput_test_once(
@@ -331,6 +345,7 @@ def throughput_test(
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
     )
+    backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:

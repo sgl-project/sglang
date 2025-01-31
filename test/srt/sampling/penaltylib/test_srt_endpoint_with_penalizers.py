@@ -6,7 +6,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -17,7 +17,7 @@ class TestBatchPenalizerE2E(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -58,8 +58,7 @@ class TestBatchPenalizerE2E(unittest.TestCase):
                 "logprob_start_len": 0,
             },
         )
-        print(json.dumps(response.json()))
-        print("=" * 100)
+        assert response.status_code == 200, "Request failed: " + response.text
 
     def test_default_values(self):
         self.run_decode()
@@ -112,4 +111,4 @@ class TestBatchPenalizerE2E(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=3)

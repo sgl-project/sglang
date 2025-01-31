@@ -32,7 +32,6 @@ class Gemma2ForSequenceClassification(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.torchao_config = None
         self.quant_config = quant_config
         self.num_labels = config.num_labels
         self.model = Gemma2Model(config, quant_config=quant_config)

@@ -4,23 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgl-kernel"
-version = "0.0.2"
+version = "0.0.3.post1"
 description = "Kernel Library for SGLang"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { file = "LICENSE" }
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
-  "Programming Language :: C++",
-  "Programming Language :: CUDA",
+  "Environment :: GPU :: NVIDIA CUDA"
 ]
-dependencies = [
-  "torch",
-]
+dependencies = []
 
 [project.urls]
-"Homepage" = "https://github.com/sgl-project/sglang"
+"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [tool.setuptools]

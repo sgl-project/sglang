@@ -14,6 +14,9 @@
 """Common utilities."""
 
 import base64
+import ctypes
+import dataclasses
+import io
 import ipaddress
 import itertools
 import json
@@ -27,12 +30,14 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
@@ -59,7 +64,6 @@ from triton.runtime.cache import (
 
 logger = logging.getLogger(__name__)
 
-
 show_time_cost = False
 time_infos = {}
 
@@ -70,7 +74,7 @@ def is_hip() -> bool:
 
 
 def is_cuda():
-    return hasattr(torch, "cuda") and torch.cuda.is_available()
+    return hasattr(torch, "cuda") and torch.version.cuda is not None
 
 
 def is_cuda_alike():
@@ -92,15 +96,11 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and not is_hip()
+    return torch.cuda.is_available() and torch.version.cuda
 
 
-def is_ipv6(address):
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ipaddress.AddressValueError:
-        return False
+def is_cuda_available():
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def enable_show_time_cost():
@@ -169,7 +169,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False):
+def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -184,7 +184,8 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 "which may cause useless memory allocation for torch CUDA context.",
             )
 
-        torch.cuda.empty_cache()
+        if empty_cache:
+            torch.cuda.empty_cache()
         free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
@@ -196,7 +197,9 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
                 f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
                 "which may cause useless memory allocation for torch XPU context.",
             )
-        torch.xpu.empty_cache()
+
+        if empty_cache:
+            torch.xpu.empty_cache()
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
@@ -212,6 +215,10 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
+
+    elif device == "cpu":
+        # TODO: rename the variables in the current function to be not GPU specific
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -329,6 +336,8 @@ def is_port_available(port):
             s.listen(1)
             return True
         except socket.error:
+            return False
+        except OverflowError:
             return False
 
 
@@ -500,76 +509,32 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
-def monkey_patch_vllm_p2p_access_check(gpu_id: int):
+def monkey_patch_p2p_access_check():
     """
-    Monkey patch the slow p2p access check in vllm.
+    Monkey patch the slow p2p access check.
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
     # Suppress the warnings from this delete function when using sglang.bench_one_batch
-    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
-vllm_all_gather_backup = None
-
-
-def monkey_patch_vllm_all_gather(reverse: bool = False):
-    """Monkey patch all-gather to remove in-place operations."""
-    from torch.distributed import _functional_collectives as funcol
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    global vllm_all_gather_backup
-    if vllm_all_gather_backup is None:
-        vllm_all_gather_backup = GroupCoordinator.all_gather
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        input_size = input_.size()
-        # Allocate output tensor.
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-
-        output_tensor = funcol.all_gather_tensor(
-            input_, gather_dim=0, group=self.device_group
-        ).view((world_size,) + input_size)
-
-        # Reshape
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
-        return output_tensor
-
-    if reverse:
-        setattr(GroupCoordinator, "all_gather", vllm_all_gather_backup)
-    else:
-        setattr(GroupCoordinator, "all_gather", all_gather)
-
-
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
         GGUFEmbeddingMethod,
         GGUFLinearMethod,
     )
 
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
@@ -704,13 +669,14 @@ def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -719,19 +685,19 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -776,7 +742,9 @@ def first_rank_print(*args, **kwargs):
         pass
 
 
-def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -789,19 +757,22 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     if socket_type == zmq.PUSH:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-        socket.connect(f"ipc://{endpoint}")
     elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-        socket.bind(f"ipc://{endpoint}")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
 
     return socket
 
 
 def dump_to_file(dirpath, name, value):
-    from vllm.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() != 0:
         return
@@ -1068,9 +1039,6 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
 
-    if hasattr(torch, "hip") and torch.hip.is_available():
-        return torch.hip.get_device_name(device_id)
-
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_name(device_id)
 
@@ -1081,9 +1049,6 @@ def get_device_name(device_id: int = 0) -> str:
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability(device_id)
-
-    if hasattr(torch, "hip") and torch.hip.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -1208,7 +1173,6 @@ def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> 
     # https://github.com/pytorch/pytorch/blob/
     # c1cd946818442aca8c7f812b16d187ce1586c3bc/
     # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.cuda
     import torch.version
 
     if not torch.cuda._is_compiled():
@@ -1241,49 +1205,235 @@ def cuda_device_count_stateless() -> int:
     return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
 
 
-def should_use_tensor_core(
-    kv_cache_dtype: torch.dtype,
-    num_attention_heads: int,
-    num_kv_heads: int,
-) -> bool:
-    """
-    Determine whether to use tensor cores for attention computation.
-
-    Args:
-        kv_cache_dtype: Data type of the KV cache
-        num_attention_heads: Number of attention heads
-        num_kv_heads: Number of key/value heads
-
-    Returns:
-        bool: Whether to use tensor cores
-    """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
-
-    # Try to use _grouped_size_compiled_for_decode_kernels if available
-    # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
-    try:
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
-        if not _grouped_size_compiled_for_decode_kernels(
-            num_attention_heads,
-            num_kv_heads,
-        ):
-            return True
+def dataclass_to_string_truncated(data, max_length=2048):
+    if isinstance(data, str):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
         else:
-            return False
-    except (ImportError, AttributeError):
+            return f"{repr(data)}"
+    elif isinstance(data, (list, tuple)):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+        else:
+            return str(data)
+    elif isinstance(data, dict):
+        return (
+            "{"
+            + ", ".join(
+                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+                for k, v in data.items()
+            )
+            + "}"
+        )
+    elif dataclasses.is_dataclass(data):
+        fields = dataclasses.fields(data)
+        return (
+            f"{data.__class__.__name__}("
+            + ", ".join(
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                for f in fields
+            )
+            + ")"
+        )
+    else:
+        return str(data)
+
+
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    b_ = x.shape[0]
+    n_ = x.shape[1]
+    k_ = x.shape[2]
+
+    x_ = x
+    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
+    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
+    else:
+        return x_
+
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
+
+class MultiprocessingSerializer:
+    @staticmethod
+    def serialize(obj):
+        buf = io.BytesIO()
+        ForkingPickler(buf).dump(obj)
+        buf.seek(0)
+        return buf.read()
+
+    @staticmethod
+    def deserialize(data):
+        return ForkingPickler.loads(data)
+
+
+def debug_timing(func):
+    # todo: replace with a more organized instrumentation
+    def wrapper(*args, **kwargs):
+        if logger.isEnabledFor(logging.DEBUG):
+            tic = torch.cuda.Event(enable_timing=True)
+            toc = torch.cuda.Event(enable_timing=True)
+            tic.record()
+            result = func(*args, **kwargs)
+            toc.record()
+            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
+            elapsed = tic.elapsed_time(toc)
+            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
+            num_tokens = len(indices) if indices is not None else 0
+            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
+            logger.debug(
+                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
+            )
+            return result
+        else:
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
+
+
+def pyspy_dump_schedulers():
+    """py-spy dump on all scheduler in a local node."""
+    try:
+        pid = psutil.Process().pid
+        # Command to run py-spy with the PID
+        cmd = f"py-spy dump --pid {pid}"
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, check=True
+        )
+        logger.info(f"Profile for PID {pid}:\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logger.info(f"Failed to profile PID {pid}. Error: {e.stderr}")
+
+
+def kill_itself_when_parent_died():
+    if sys.platform == "linux":
+        # sigkill this process when parent worker manager dies
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    else:
+        logger.warninig("kill_itself_when_parent_died is only supported in linux.")
+
+
+def set_uvicorn_logging_configs():
+    from uvicorn.config import LOGGING_CONFIG
+
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    LOGGING_CONFIG["formatters"]["access"][
+        "fmt"
+    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+
+def get_ip() -> str:
+    # SGLANG_HOST_IP env can be ignore
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
+
+    # IP is not set, try to get it from the network interface
+
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
         pass
 
-    # Calculate GQA group size
-    gqa_group_size = num_attention_heads // num_kv_heads
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
 
-    # Determine based on dtype and GQA group size
-    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    warnings.warn(
+        "Failed to get the IP address, using 0.0.0.0 by default."
+        "The value can be set by the environment variable"
+        " SGLANG_HOST_IP or HOST_IP.",
+        stacklevel=2,
+    )
+    return "0.0.0.0"
+
+
+def get_open_port() -> int:
+
+    port = os.getenv("SGLANG_PORT")
+    if port is not None:
+        while True:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    return port
+            except OSError:
+                port += 1  # Increment port number if already in use
+                logger.info("Port %d is already in use, trying port %d", port - 1, port)
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
         return True
-    elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
-    else:
+    except ValueError:
         return False
+
+
+def rank0_print(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        print(msg, flush=True)
+
+
+def launch_dummy_health_check_server(host, port):
+    import uvicorn
+    from fastapi import FastAPI, Response
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    @app.get("/health_generate")
+    async def health_generate():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        timeout_keep_alive=5,
+        loop="uvloop",
+    )

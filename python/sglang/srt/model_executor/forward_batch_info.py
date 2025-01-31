@@ -38,6 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 
 class ForwardMode(IntEnum):
@@ -59,6 +61,11 @@ class ForwardMode(IntEnum):
     # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
 
+    # Used in speculative decoding: verify a batch in the target model.
+    TARGET_VERIFY = auto()
+    # Used in speculative decoding: extend a batch in the draft model.
+    DRAFT_EXTEND = auto()
+
     # A dummy first batch to start the pipeline for overlap scheduler.
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
     DUMMY_FIRST = auto()
@@ -67,7 +74,12 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):
-        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
+            or self == ForwardMode.DRAFT_EXTEND
+            or self == self.TARGET_VERIFY
+        )
 
     def is_decode(self):
         return self == ForwardMode.DECODE
@@ -78,8 +90,39 @@ class ForwardMode(IntEnum):
     def is_idle(self):
         return self == ForwardMode.IDLE
 
+    def is_target_verify(self):
+        return self == ForwardMode.TARGET_VERIFY
+
+    def is_draft_extend(self):
+        return self == ForwardMode.DRAFT_EXTEND
+
+    def is_cuda_graph(self):
+        return (
+            self == ForwardMode.DECODE
+            or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.IDLE
+        )
+
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
+
+    def is_decode_or_idle(self):
+        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+
+
+class CaptureHiddenMode(IntEnum):
+    NULL = auto()
+    FULL = auto()
+    LAST = auto()
+
+    def need_capture(self):
+        return self != CaptureHiddenMode.NULL
+
+    def is_full(self):
+        return self == CaptureHiddenMode.FULL
+
+    def is_last(self):
+        return self == CaptureHiddenMode.LAST
 
 
 @dataclass
@@ -141,13 +184,18 @@ class ForwardBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
 
-    # For Qwen2-VL
-    mrope_positions: torch.Tensor = None
-
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+
+    # Speculative decoding
+    spec_info: SpecInfo = None
+    spec_algorithm: SpeculativeAlgorithm = None
+    capture_hidden_mode: CaptureHiddenMode = None
+
+    # For Qwen2-VL
+    mrope_positions: torch.Tensor = None
 
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -234,6 +282,12 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            attn_backend=model_runner.attn_backend,
+            spec_algorithm=batch.spec_algorithm,
+            spec_info=batch.spec_info,
+            capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
         )
 
@@ -246,10 +300,21 @@ class ForwardBatch:
             )
 
         if ret.forward_mode.is_idle():
+            ret.positions = torch.empty((0,), device=device)
             return ret
 
+        # Override the positions with spec_info
+        if (
+            ret.spec_info is not None
+            and getattr(ret.spec_info, "positions", None) is not None
+        ):
+            ret.positions = ret.spec_info.positions
+
         # Init position information
-        if not ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode():
+            if ret.positions is None:
+                ret.positions = clamp_position(batch.seq_lens)
+        else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -258,24 +323,21 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
             if model_runner.server_args.attention_backend != "torch_native":
                 ret.extend_num_tokens = batch.extend_num_tokens
-                ret.positions, ret.extend_start_loc = compute_position_triton(
+                positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
                 )
             else:
-                ret.positions, ret.extend_start_loc = compute_position_torch(
+                positions, ret.extend_start_loc = compute_position_torch(
                     ret.extend_prefix_lens, ret.extend_seq_lens
                 )
+            if ret.positions is None:
+                ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
             ret.compute_mrope_positions(model_runner, batch)
-
-        # Init attention information
-        ret.req_to_token_pool = model_runner.req_to_token_pool
-        ret.token_to_kv_pool = model_runner.token_to_kv_pool
-        ret.attn_backend = model_runner.attn_backend
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
@@ -351,3 +413,8 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def clamp_position(seq_lens):
+    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)

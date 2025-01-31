@@ -166,17 +166,21 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
+    top_k: int = -1
+    min_p: float = 0.0
+    min_tokens: int = 0
     json_schema: Optional[str] = None
     regex: Optional[str] = None
-    min_tokens: int = 0
+    ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_params: Optional[Dict] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -254,6 +258,34 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
+class Function(BaseModel):
+    """Function descriptions."""
+
+    description: Optional[str] = Field(default=None, examples=[None])
+    name: Optional[str] = None
+    parameters: Optional[object] = None
+
+
+class Tool(BaseModel):
+    """Function wrapper."""
+
+    type: str = Field(default="function", examples=["function"])
+    function: Function
+
+
+class ToolChoiceFuncName(BaseModel):
+    """The name of tool choice function."""
+
+    name: Optional[str] = None
+
+
+class ToolChoice(BaseModel):
+    """The tool choice definition."""
+
+    function: ToolChoiceFuncName
+    type: Literal["function"] = Field(default="function", examples=["function"])
+
+
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -274,20 +306,45 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     top_p: float = 1.0
     user: Optional[str] = None
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
+        default="auto", examples=["none"]
+    )  # noqa
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    regex: Optional[str] = None
+    top_k: int = -1
+    min_p: float = 0.0
     min_tokens: int = 0
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_params: Optional[Dict] = None
+
+
+class FunctionResponse(BaseModel):
+    """Function response."""
+
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+class ToolCall(BaseModel):
+    """Tool call response."""
+
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionResponse
 
 
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -310,6 +367,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):

@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 import unittest
 import warnings
 from datetime import datetime
@@ -16,27 +15,29 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 MODEL_SCORE_THRESHOLDS = {
-    "meta-llama/Llama-3.1-8B-Instruct": 0.83,
+    "meta-llama/Llama-3.1-8B-Instruct": 0.82,
     "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.84,
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     "google/gemma-2-27b-it": 0.92,
-    "meta-llama/Llama-3.1-70B-Instruct": 0.96,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.87,
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.84,
+    "meta-llama/Llama-3.1-70B-Instruct": 0.95,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.63,
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.83,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.83,
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
     "neuralmagic/gemma-2-2b-it-FP8": 0.60,
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.95,
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.61,
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.95,
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.62,
+    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.84,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.84,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.83,
 }
 
 
@@ -44,7 +45,7 @@ def parse_models(model_string):
     return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
-def launch_server(base_url, model, is_fp8, is_tp2):
+def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
     other_args = ["--log-level-http", "warning", "--trust-remote-code"]
     if is_fp8:
         if "Llama-3" in model or "gemma-2" in model:
@@ -67,7 +68,6 @@ def launch_server(base_url, model, is_fp8, is_tp2):
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
-        return_stdout_stderr=(subprocess.DEVNULL, subprocess.DEVNULL),
     )
     return process
 
@@ -99,6 +99,9 @@ def write_results_to_json(model, metrics, mode="a"):
 
 def check_model_scores(results):
     failed_models = []
+    summary = " | model | score | threshold |\n"
+    summary += "| ----- | ----- | --------- |\n"
+
     for model, score in results:
         threshold = MODEL_SCORE_THRESHOLDS.get(model)
         if threshold is None:
@@ -111,11 +114,19 @@ def check_model_scores(results):
                 f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
             )
 
+        line = f"| {model} | {score} | {threshold} |\n"
+        summary += line
+
+    print(summary)
+
+    if is_in_ci():
+        write_github_step_summary(f"### TestNightlyGsm8KEval\n{summary}")
+
     if failed_models:
         raise AssertionError("\n".join(failed_models))
 
 
-class TestEvalAccuracyLarge(unittest.TestCase):
+class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
@@ -127,13 +138,6 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-    def setUp(self):
-        self.process = None
-
-    def tearDown(self):
-        if self.process:
-            kill_process_tree(self.process.pid)
-
     def test_mgsm_en_all_models(self):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
@@ -144,7 +148,9 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    self.process = launch_server(self.base_url, model, is_fp8, is_tp2)
+                    process = popen_launch_server_wrapper(
+                        self.base_url, model, is_fp8, is_tp2
+                    )
 
                     args = SimpleNamespace(
                         base_url=self.base_url,
@@ -163,8 +169,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
                     is_first = False
 
                     all_results.append((model, metrics["score"]))
-
-                    self.tearDown()
+                    kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:

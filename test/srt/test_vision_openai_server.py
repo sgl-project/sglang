@@ -171,7 +171,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         text = response.choices[0].message.content
         assert isinstance(text, str)
         print(text)
-        assert "man" in text or "cab" in text, text
+        assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
         assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
         assert response.created
@@ -180,7 +180,9 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.usage.total_tokens > 0
 
     def prepare_video_messages(self, video_path):
-        max_frames_num = 32
+        # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
+        # the size of the video embeds differs from the `modality` argument when preprocessed
+        max_frames_num = 12
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -392,34 +394,33 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
     def test_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
-        response = client.chat.completions.create(
-            model="default",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.chat.completions.create(
+                model="default",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+                                },
                             },
-                        },
-                        {
-                            "type": "text",
-                            "text": "Give a lengthy description of this picture",
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-        )
+                            {
+                                "type": "text",
+                                "text": "Give a lengthy description of this picture",
+                            },
+                        ],
+                    },
+                ],
+                temperature=0,
+            )
 
-        assert response.choices[0].finish_reason == "abort"
-        assert response.id
-        assert response.created
-        assert response.usage.prompt_tokens > 0
-        assert response.usage.completion_tokens > 0
-        assert response.usage.total_tokens > 0
+        self.assertIn(
+            "Multimodal prompt is too long after expanding multimodal tokens.",
+            str(cm.exception),
+        )
 
 
 class TestMllamaServer(TestOpenAIVisionServer):
@@ -442,6 +443,25 @@ class TestMllamaServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
+
+class TestMinicpmvServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-V-2_6"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "minicpmv",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ def multi_turn_question(s, question_1, question_2):
     s += sgl.user(question_2)
     s += sgl.assistant(sgl.gen("answer_2", max_tokens=256))
 
+
 @sgl.function
 def tip_suggestion(s):
     s += (
@@ -39,6 +40,7 @@ def tip_suggestion(s):
     s += "Tip 2:" + forks[1]["detailed_tip"] + "\n"
     s += "In summary" + sgl.gen("summary")
 
+
 def single():
     state = multi_turn_question.run(
         question_1="What is the capital of the United States?",
@@ -49,6 +51,8 @@ def single():
         print(m["role"], ":", m["content"])
 
     print("\n-- answer_1 --\n", state["answer_1"])
+    print("\n-- answer_2 --\n", state["answer_2"])
+
 
 def stream():
     state = multi_turn_question.run(
@@ -61,9 +65,11 @@ def stream():
         print(out, end="", flush=True)
     print()
 
+
 def fork():
     state = tip_suggestion.run()
     print(state.text())
+
 
 def batch():
     states = multi_turn_question.run_batch(
@@ -85,6 +91,7 @@ def batch():
 
         print()
     print()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

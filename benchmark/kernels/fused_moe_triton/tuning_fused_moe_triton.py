@@ -11,13 +11,16 @@ import triton
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
-from sglang.srt.layers.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_dtype_str,
     get_config_file_name,
     get_default_config,
     get_moe_configs,
 )
+from sglang.srt.utils import is_hip
+
+_is_hip_ = is_hip()
 
 
 class BenchmarkConfig(TypedDict):
@@ -39,6 +42,7 @@ def benchmark_config(
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
@@ -83,13 +87,26 @@ def benchmark_config(
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
     if use_fp8_w8a8:
-        w1_scale = torch.randn(num_experts, dtype=torch.float32)
-        w2_scale = torch.randn(num_experts, dtype=torch.float32)
-        a1_scale = torch.randn(1, dtype=torch.float32)
-        a2_scale = torch.randn(1, dtype=torch.float32)
+        if block_shape is None:
+            w1_scale = torch.randn(num_experts, dtype=torch.float32)
+            w2_scale = torch.randn(num_experts, dtype=torch.float32)
+            a1_scale = torch.randn(1, dtype=torch.float32)
+            a2_scale = torch.randn(1, dtype=torch.float32)
+        else:
+            block_n, block_k = block_shape[0], block_shape[1]
+            n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
+            n_tiles_w2 = (hidden_size + block_n - 1) // block_n
+            k_tiles_w1 = (hidden_size + block_k - 1) // block_k
+            k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+            w1_scale = torch.rand(
+                (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.float32
+            )
+            w2_scale = torch.rand(
+                (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.float32
+            )
 
-        w1 = w1.to(torch.float8_e4m3fn)
-        w2 = w2.to(torch.float8_e4m3fn)
+        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
+        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
@@ -97,7 +114,7 @@ def benchmark_config(
         input_gating.copy_(gating_output[i])
 
     def run():
-        from sglang.srt.layers.fused_moe_triton import override_config
+        from sglang.srt.layers.moe.fused_moe_triton import override_config
 
         with override_config(config):
             fused_moe(
@@ -114,6 +131,7 @@ def benchmark_config(
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
+                block_shape=block_shape,
             )
 
     # JIT compilation & warmup
@@ -150,17 +168,15 @@ def benchmark_config(
     return avg
 
 
-def get_configs_compute_bound() -> List[Dict[str, int]]:
-    # Reduced search space for faster tuning.
-    # TODO(woosuk): Increase the search space and use a performance model to
-    # prune the search space.
+def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
     configs: List[BenchmarkConfig] = []
-    for num_stages in [2, 3, 4, 5]:
-        for block_m in [16, 32, 64, 128, 256]:
-            for block_k in [64, 128, 256]:
-                for block_n in [32, 64, 128, 256]:
+    waves_per_eu_range = 0
+    for num_stages in [2]:
+        for block_m in [32, 64, 128, 256]:
+            for block_k in [32, 64, 128, 256]:
+                for block_n in [16, 32, 64, 128, 256]:
                     for num_warps in [4, 8]:
-                        for group_size in [1, 16, 32, 64]:
+                        for group_size in [1, 4, 8, 16, 32]:
                             configs.append(
                                 {
                                     "BLOCK_SIZE_M": block_m,
@@ -169,8 +185,36 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
                                     "GROUP_SIZE_M": group_size,
                                     "num_warps": num_warps,
                                     "num_stages": num_stages,
+                                    "waves_per_eu": waves_per_eu_range,
                                 }
                             )
+    return configs
+
+
+def get_configs_compute_bound() -> List[Dict[str, int]]:
+    # Reduced search space for faster tuning.
+    # TODO(woosuk): Increase the search space and use a performance model to
+    # prune the search space.
+    configs: List[BenchmarkConfig] = []
+    if _is_hip_:
+        configs = get_rocm_configs_compute_bound()
+    else:
+        for num_stages in [2, 3, 4, 5]:
+            for block_m in [16, 32, 64, 128, 256]:
+                for block_k in [64, 128, 256]:
+                    for block_n in [32, 64, 128, 256]:
+                        for num_warps in [4, 8]:
+                            for group_size in [1, 16, 32, 64]:
+                                configs.append(
+                                    {
+                                        "BLOCK_SIZE_M": block_m,
+                                        "BLOCK_SIZE_N": block_n,
+                                        "BLOCK_SIZE_K": block_k,
+                                        "GROUP_SIZE_M": group_size,
+                                        "num_warps": num_warps,
+                                        "num_stages": num_stages,
+                                    }
+                                )
     return configs
 
 
@@ -192,6 +236,7 @@ class BenchmarkWorker:
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
+        block_shape: List[int],
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
         dtype_str = get_config_dtype_str(
@@ -199,8 +244,10 @@ class BenchmarkWorker:
         )
         # NOTE(woosuk): The current naming convention uses w2.shape[2], which
         # is the intermediate size after silu_and_mul.
+        block_n = block_shape[0] if block_shape else 0
+        block_k = block_shape[1] if block_shape else 0
         op_config = get_moe_configs(
-            num_experts, shard_intermediate_size // 2, dtype_str
+            num_experts, shard_intermediate_size // 2, dtype_str, block_n, block_k
         )
         if op_config is None:
             config = get_default_config(
@@ -210,6 +257,7 @@ class BenchmarkWorker:
                 hidden_size,
                 topk,
                 dtype_str,
+                False,
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
@@ -223,6 +271,7 @@ class BenchmarkWorker:
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
+            block_shape,
         )
         return config, kernel_time
 
@@ -236,6 +285,7 @@ class BenchmarkWorker:
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
+        block_shape: List[int],
         search_space: List[Dict[str, int]],
     ) -> Dict[str, int]:
         best_config = None
@@ -252,6 +302,7 @@ class BenchmarkWorker:
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    block_shape,
                     num_iters=10,
                 )
             except triton.runtime.autotuner.OutOfResources:
@@ -275,6 +326,9 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
         "GROUP_SIZE_M": config["GROUP_SIZE_M"],
         "num_warps": config["num_warps"],
         "num_stages": config["num_stages"],
+        **(
+            {"waves_per_eu": config["waves_per_eu"]} if "waves_per_eu" in config else {}
+        ),
     }
 
 
@@ -287,6 +341,7 @@ def save_configs(
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    block_shape: List[int],
 ) -> None:
     dtype_str = get_config_dtype_str(
         dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
@@ -295,7 +350,10 @@ def save_configs(
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
     filename = get_config_file_name(
-        num_experts, shard_intermediate_size // 2, dtype_str
+        num_experts,
+        shard_intermediate_size // 2,
+        dtype_str,
+        block_shape,
     )
 
     print(f"Writing best config to {filename}...")
@@ -307,7 +365,7 @@ def save_configs(
 def main(args: argparse.Namespace):
     print(args)
 
-    config = AutoConfig.from_pretrained(args.model)
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k
@@ -323,6 +381,11 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
+        E = config.n_routed_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
     else:
         # Default: Mixtral
         E = config.num_local_experts
@@ -334,6 +397,13 @@ def main(args: argparse.Namespace):
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
+    block_shape = None
+    if (
+        hasattr(config, "quantization_config")
+        and "weight_block_size" in config.quantization_config
+    ):
+        block_shape = config.quantization_config["weight_block_size"]
+        assert len(block_shape) == 2
 
     if args.batch_size is None:
         batch_sizes = [
@@ -376,6 +446,13 @@ def main(args: argparse.Namespace):
 
     if args.tune:
         search_space = get_configs_compute_bound()
+        if block_shape is not None:
+            block_n, block_k = block_shape[0], block_shape[1]
+            search_space = [
+                config
+                for config in search_space
+                if block_k % config["BLOCK_SIZE_K"] == 0
+            ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
         start = time.time()
@@ -391,6 +468,7 @@ def main(args: argparse.Namespace):
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    block_shape,
                     search_space,
                 )
                 for batch_size in batch_sizes
@@ -408,6 +486,7 @@ def main(args: argparse.Namespace):
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
+            block_shape,
         )
         end = time.time()
         print(f"Tuning took {end - start:.2f} seconds")
@@ -424,6 +503,7 @@ def main(args: argparse.Namespace):
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    block_shape,
                 )
                 for batch_size in batch_sizes
             ],

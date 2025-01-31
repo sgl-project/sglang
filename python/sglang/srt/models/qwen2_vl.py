@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
+import logging
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
@@ -29,17 +30,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
-from vllm.distributed import parallel_state
-from vllm.distributed import utils as dist_utils
-from vllm.logger import init_logger
+from einops import rearrange
 from vllm.model_executor.layers.activation import QuickGELU
 
 from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
-    context_attention_fwd,
-)
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -50,7 +46,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
+
 
 # === Vision Inputs === #
 
@@ -110,118 +107,6 @@ class Qwen2VisionMLP(nn.Module):
         return x
 
 
-def rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
-    if not interleaved:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return rearrange(
-            torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2
-        )
-
-
-def apply_rotary_emb_torch(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
-) -> torch.Tensor:
-    """
-    x: (batch_size, seqlen, nheads, headdim)
-    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
-    """
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    cos = repeat(
-        cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
-    )
-    sin = repeat(
-        sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
-    )
-    return torch.cat(
-        [
-            x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
-            x[..., ro_dim:],
-        ],
-        dim=-1,
-    )
-
-
-def apply_rotary_pos_emb_vision(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    t_ = t.float()
-    cos = freqs.cos()
-    sin = freqs.sin()
-    output = apply_rotary_emb_torch(t_, cos, sin).type_as(t)
-    return output
-
-
-class Qwen2VisionAttention(nn.Module):
-
-    def __init__(
-        self,
-        embed_dim: Optional[int] = None,
-        num_heads: Optional[int] = None,
-        projection_size: Optional[int] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
-        # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_attention_head = dist_utils.divide(
-            projection_size, num_heads
-        )
-        self.num_attention_heads_per_partition = dist_utils.divide(
-            num_heads, world_size
-        )
-
-        self.qkv = ColumnParallelLinear(
-            input_size=embed_dim,
-            output_size=3 * projection_size,
-            quant_config=quant_config,
-        )
-        self.proj = RowParallelLinear(
-            input_size=projection_size, output_size=embed_dim, quant_config=quant_config
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor = None,
-    ) -> torch.Tensor:
-        # [s, b, c] --> [s, b, head * 3 * head_dim]
-        x, _ = self.qkv(x)
-
-        # [s, b, head * 3 * head_dim] --> [s, b, head, 3 * head_dim]
-        new_x_shape = x.size()[:-1] + (
-            self.num_attention_heads_per_partition,
-            3 * self.hidden_size_per_attention_head,
-        )
-        x = x.view(*new_x_shape)
-
-        # [s, b, head, 3 * head_dim] --> 3 [s, b, head, head_dim]
-        q, k, v = dist_utils.split_tensor_along_last_dim(x, 3)
-        batch_size = q.shape[1]
-
-        q, k, v = [rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)]
-        if rotary_pos_emb is not None:
-            q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
-            k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = (seq_lens).max().item()
-        q, k, v = [rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v]]
-
-        output = torch.empty_like(q)
-        context_attention_fwd(
-            q, k, v, output, cu_seqlens, seq_lens, max_seqlen, is_causal=False
-        )
-
-        context_layer = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
-        context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
-
-        output, _ = self.proj(context_layer)
-        return output
-
-
 class Qwen2VisionBlock(nn.Module):
 
     def __init__(
@@ -231,6 +116,7 @@ class Qwen2VisionBlock(nn.Module):
         mlp_ratio: float,
         act_layer: Type[nn.Module] = QuickGELU,
         norm_layer: Type[nn.Module] = None,
+        attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -239,11 +125,24 @@ class Qwen2VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
+        if attn_implementation == "sdpa":
+            use_context_forward = False
+            use_full_precision_softmax = False
+        elif attn_implementation == "flash_attention_2":
+            use_full_precision_softmax = False
+            use_context_forward = True
+        elif attn_implementation == "eager":
+            use_full_precision_softmax = True
+            use_context_forward = False
 
-        self.attn = Qwen2VisionAttention(
+        self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
+            use_qkv_parallel=False,
+            use_context_forward=use_context_forward,
+            use_full_precision_softmax=use_full_precision_softmax,
+            flatten_batch=True,
             quant_config=quant_config,
         )
         self.mlp = Qwen2VisionMLP(
@@ -253,9 +152,13 @@ class Qwen2VisionBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, cu_seqlens: torch.Tensor, rotary_pos_emb: torch.Tensor
     ) -> torch.Tensor:
-        x = x + self.attn(
-            self.norm1(x), cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+        hidden_states = self.norm1(x)
+        hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+        attn = self.attn(
+            hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
         )
+        attn = rearrange(attn, "b s ... -> s b ...")
+        x = x + attn
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -394,7 +297,6 @@ class Qwen2VisionTransformer(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = embed_dim // num_heads
         self.rotary_pos_emb = Qwen2VisionRotaryEmbedding(head_dim // 2)
-
         self.blocks = nn.ModuleList(
             [
                 Qwen2VisionBlock(
@@ -402,6 +304,7 @@ class Qwen2VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     norm_layer=norm_layer,
+                    attn_implementation="sdpa",
                     quant_config=quant_config,
                 )
                 for _ in range(depth)
@@ -590,10 +493,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 opensource models), the shape will be `(3, seq_len)`,
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
-            pixel_values: Pixel values to be fed to a model.
-                `None` if no images are passed.
-            image_grid_thw: Tensor `(n_images, 3)` of image 3D grid in LLM.
-                `None` if no images are passed.
         """
         if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
             positions = forward_batch.mrope_positions
@@ -648,15 +547,18 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     num_image_tokens = self.calculate_num_image_tokens(
                         image_grid_thws[idx]
                     )
+
                     left_idx = start_idx + (image_offset - prefix_len)
                     right_idx = (
                         start_idx + (image_offset - prefix_len) + num_image_tokens
                     )
+
                     inputs_embeds[left_idx:right_idx] = image_embeds[
                         image_embeds_offset : image_embeds_offset + num_image_tokens
                     ]
                     image_embeds_offset += num_image_tokens
 
+        input_ids = None
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -684,10 +586,12 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -696,6 +600,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+
                 if "visual" in name and "qkv.weight" in name:
                     visual_num_heads = self.config.vision_config.num_heads
                     visual_embed_dim = self.config.vision_config.embed_dim
@@ -712,6 +617,11 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     loaded_weight = loaded_weight.view(3, visual_num_heads, head_size)
                     loaded_weight = loaded_weight.transpose(0, 1)
                     loaded_weight = loaded_weight.reshape(-1)
+
+                if "visual" in name:
+                    # adapt to VisionAttention
+                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+
                 try:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:

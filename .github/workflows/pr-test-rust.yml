@@ -4,11 +4,11 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "rust/**"
+      - "sgl-router/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "rust/**"
+      - "sgl-router/**"
   workflow_dispatch:
 
 concurrency:
@@ -30,17 +30,17 @@ jobs:
       - name: Run fmt
         run: |
           source "$HOME/.cargo/env"
-          cd rust/
+          cd sgl-router/
           cargo fmt -- --check
 
       - name: Run test
         timeout-minutes: 20
         run: |
           source "$HOME/.cargo/env"
-          cd rust/
+          cd sgl-router/
           cargo test
 
-  e2e-rust:
+  e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
     steps:
@@ -54,17 +54,18 @@ jobs:
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
-          cd rust
+          cd sgl-router
           pip install setuptools-rust wheel build
           python3 -m build
-          pip install dist/*.whl
+          pip install --force-reinstall dist/*.whl
       - name: Run e2e test
         run: |
-          cd rust/py_test
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-router/py_test
           python3 run_suite.py
 
   finish:
-    needs: [unit-test-rust, e2e-rust]
+    needs: [unit-test-rust, e2e-python]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

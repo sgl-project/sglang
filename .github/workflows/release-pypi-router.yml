@@ -7,7 +7,7 @@ on:
     branches:
       - main
     paths:
-      - rust/pyproject.toml
+      - sgl-router/pyproject.toml
   workflow_dispatch:
 
 jobs:
@@ -26,9 +26,9 @@ jobs:
         with:
           path: sglang-repo
 
-      - name: Move rust folder to root and delete sglang-repo
+      - name: Move sgl-router folder to root and delete sglang-repo
         run: |
-          mv sglang-repo/rust/* .
+          mv sglang-repo/sgl-router/* .
           rm -rf sglang-repo
           ls -alt
 
@@ -69,9 +69,9 @@ jobs:
         with:
           path: sglang-repo
 
-      - name: Move rust folder to root, copy the license file, and delete sglang-repo
+      - name: Move sgl-router folder to root, copy the license file, and delete sglang-repo
         run: |
-          mv sglang-repo/rust/* .
+          mv sglang-repo/sgl-router/* .
           mv sglang-repo/LICENSE .
           rm -rf sglang-repo
           ls -alt
@@ -84,6 +84,7 @@ jobs:
       - name: Build SDist
         run: |
           pip install build
+          python -m pip install -U packaging
           python -m build --sdist
 
       - uses: actions/upload-artifact@v4

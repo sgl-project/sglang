@@ -2,6 +2,7 @@
 /python/sglang/srt @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
 /python/sglang/srt/constrained @hnyls2002
 /python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock
+/python/sglang/srt/layers/moe/fused_moe_triton @zhyncs @ispobock @HaiShaw
 /python/sglang/srt/lora @Ying1123
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002
@@ -11,4 +12,5 @@
 /python/sglang/srt/sampling @merrymercy @hnyls2002
 /test/lang @merrymercy @Ying1123 @ByronHsu
 /test/srt @merrymercy @Ying1123 @zhyncs
-/rust @ByronHsu @Ying1123
+/sgl-router @ByronHsu @Ying1123
+/sgl-kernel @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @merrymercy

@@ -220,3 +220,10 @@ work_dirs/
 *.app
 
 compile_commands.json
+
+*.iml
+
+# VSCode
+.vscode
+
+1

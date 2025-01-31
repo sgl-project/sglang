@@ -1,19 +1,28 @@
-.PHONY: tree ln install build clean test
+.PHONY: tree ln submodule install build clean rebuild test format
 
 tree:
-	@tree --prune -I "__pycache__|*.egg-info|*.so|build"
+	@tree --prune -I "__pycache__|*.egg-info|*.so|build|3rdparty|dist"
 
-ln:
-	@rm -rf build && cmake . -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_CUDA_COMPILER=nvcc -B build && rm -rf compile_commands.json && ln -s build/compile_commands.json compile_commands.json
+submodule:
+	@git submodule update --init --recursive
 
-install:
+ln: submodule
+	@rm -rf build && bear python3 setup.py build
+
+install: submodule
 	@pip install -e .
 
-build:
-	@python3 setup.py bdist_wheel
+build: submodule
+	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel && pip3 install dist/*whl --force-reinstall --no-deps
 
 clean:
 	@rm -rf build dist *.egg-info
 
+rebuild: clean submodule build
+	@echo "Succeed to rebuild"
+
 test:
-	@pytest tests/
+	@find tests -name "test_*.py" | xargs -n 1 python3
+
+format:
+	@find src tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i && find src tests -name '*.py' | xargs isort && find src tests -name '*.py' | xargs black

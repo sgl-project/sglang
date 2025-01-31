@@ -1,0 +1,7 @@
+tasks:
+  - name: sglang-benchmark
+    server_cmd: python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disable-radix-cache
+    client_cmd: python3 -m sglang.bench_serving --backend sglang --dataset-name sharegpt --request-rate 16
+  - name: vllm-benchmark
+    server_cmd: python3 -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.1-8B-Instruct --disable-log-requests
+    client_cmd: python3 -m sglang.bench_serving --backend vllm --dataset-name sharegpt --request-rate 16

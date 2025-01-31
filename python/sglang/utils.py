@@ -1,7 +1,6 @@
-"""Common utilities."""
+"""Common utilities"""
 
 import base64
-import gc
 import importlib
 import json
 import logging
@@ -15,7 +14,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Optional, Union
+from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import requests
@@ -79,7 +78,15 @@ class HttpResponse:
         return self.resp.status
 
 
-def http_request(url, json=None, stream=False, api_key=None, verify=None, timeout=None):
+def http_request(
+    url,
+    json=None,
+    stream=False,
+    api_key=None,
+    verify=None,
+    timeout=None,
+    method: Optional[str] = None,
+):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
 
@@ -92,7 +99,7 @@ def http_request(url, json=None, stream=False, api_key=None, verify=None, timeou
             url, json=json, stream=True, headers=headers, timeout=timeout
         )
     else:
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers=headers, method=method)
         if json is None:
             data = None
         else:
@@ -360,3 +367,56 @@ def terminate_process(process):
 def print_highlight(html_content: str):
     html_content = str(html_content).replace("\n", "<br>")
     display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
+
+
+class TypeBasedDispatcher:
+    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+        self._mapping = mapping
+
+    def __call__(self, obj: Any):
+        for ty, fn in self._mapping:
+            if isinstance(obj, ty):
+                return fn(obj)
+        raise ValueError(f"Invalid object: {obj}")
+
+
+def trim_overlap(existing_text, new_chunk):
+    """
+    Finds the largest suffix of 'existing_text' that is a prefix of 'new_chunk'
+    and removes that overlap from the start of 'new_chunk'.
+    """
+    max_overlap = 0
+    max_possible = min(len(existing_text), len(new_chunk))
+    for i in range(max_possible, 0, -1):
+        if existing_text.endswith(new_chunk[:i]):
+            max_overlap = i
+            break
+    return new_chunk[max_overlap:]
+
+
+def stream_and_merge(llm, prompt, sampling_params):
+    """
+    1) Streams the text,
+    2) Removes chunk overlaps,
+    3) Returns the merged text.
+    """
+    final_text = ""
+    for chunk in llm.generate(prompt, sampling_params, stream=True):
+        chunk_text = chunk["text"]
+        cleaned_chunk = trim_overlap(final_text, chunk_text)
+        final_text += cleaned_chunk
+    return final_text
+
+
+async def async_stream_and_merge(llm, prompt, sampling_params):
+    """
+    Streams tokens asynchronously, removes chunk overlaps,
+    and yields the cleaned chunk in real time for printing.
+    """
+    final_text = ""
+    generator = await llm.async_generate(prompt, sampling_params, stream=True)
+    async for chunk in generator:
+        chunk_text = chunk["text"]
+        cleaned_chunk = trim_overlap(final_text, chunk_text)
+        final_text += cleaned_chunk
+        yield cleaned_chunk  # yield the non-overlapping portion

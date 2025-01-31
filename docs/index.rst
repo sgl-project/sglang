@@ -28,7 +28,10 @@ The core features include:
    backend/openai_api_embeddings.ipynb
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
-   backend/backend.md
+   backend/structured_outputs.ipynb
+   backend/speculative_decoding.ipynb
+   backend/function_calling.ipynb
+   backend/server_arguments.md
 
 
 .. toctree::
@@ -55,7 +58,10 @@ The core features include:
    references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
    references/custom_chat_template.md
-   references/contributor_guide.md
+   references/deepseek.md
+   references/llama_405B.md
+   references/modelscope.md
+   references/contribution_guide.md
    references/troubleshooting.md
    references/faq.md
    references/learn_more.md

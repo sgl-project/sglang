@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -30,7 +30,7 @@ class ChunkCache(BasePrefixCache):
     def reset(self):
         self.entries = {}
 
-    def match_prefix(self, rid: int, key: List[int]):
+    def match_prefix(self, rid: int, key: List[int]) -> Tuple[List[int], int]:
         if rid not in self.entries:
             return [], None
 
@@ -84,4 +84,7 @@ class ChunkCache(BasePrefixCache):
         return 0
 
     def evictable_size(self):
+        return 0
+
+    def protected_size(self):
         return 0

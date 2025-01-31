@@ -29,7 +29,7 @@ concurrency:
 jobs:
 
   unit-test-frontend:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -37,7 +37,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -45,35 +45,38 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/lang
-          python3 run_suite.py --suite minimal
+          python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     strategy:
+      fail-fast: false
       matrix:
-        range: [0-6, 6-15, 15-23, 23-30, 30-100]
+        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-100]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 25
         run: |
-          cd test/srt
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
           range_end=${RANGE#*-}
-          python3 run_suite.py --suite minimal --range-begin ${range_begin} --range-end ${range_end}
+
+          cd test/srt
+          python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
+
 
   unit-test-backend-2-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -81,22 +84,20 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
-      - name: Evaluate data parallelism accuracy (DP=2)
+      - name: Test data parallelism (DP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 test_data_parallelism.py
 
-      - name: Evaluate MLA accuracy (TP=2)
+      - name: Test data parallelism attention (DP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 test_mla.py
-          python3 test_mla_fp8.py
           python3 test_dp_attention.py
 
       - name: Test update weights from distributed
@@ -105,14 +106,14 @@ jobs:
           cd test/srt
           python3 test_update_weights_from_distributed.py
 
-      - name: Evaluate MoE EP accuracy (TP=2)
+      - name: Test expert parallelism (EP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 test_moe_ep.py
 
   performance-test-1-gpu-part-1:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -120,7 +121,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -128,7 +129,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_default
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1
 
       - name: Benchmark online latency
         timeout-minutes: 10
@@ -148,8 +149,15 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
+      - name: Benchmark online latency (EAGLE)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+
+
   performance-test-1-gpu-part-2:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -157,7 +165,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -180,7 +188,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -188,7 +196,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -196,7 +204,13 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_default
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
+      - name: Benchmark single latency + torch.compile (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
 
       - name: Benchmark offline throughput (TP=2)
         timeout-minutes: 10
@@ -210,8 +224,9 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
+
   accuracy-test-1-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -219,7 +234,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -235,7 +250,7 @@ jobs:
 
 
   accuracy-test-2-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -243,7 +258,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu121/torch2.4/' || 'https://flashinfer.ai/whl/cu121/torch2.4/' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 

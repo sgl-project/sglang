@@ -20,7 +20,9 @@ class Shortfin(BaseBackend):
         if base_url is None:
             raise ValueError("`base_url` is required for Shortfin backend")
 
-        self.chat_template = chat_template or get_chat_template_by_model_path("default")
+        self.chat_template = chat_template or get_chat_template_by_model_path(
+            "llama-3-instruct"
+        )
 
         self.client_params = {"base_url": base_url, "timeout": timeout}
 
@@ -39,7 +41,7 @@ class Shortfin(BaseBackend):
             raise RuntimeError(res.json())
 
     def _clean_response_message(self, text):
-        return text.replace(b"data: ", b"").strip(b"\n")
+        return text[text.find(": ") + 2 :].rstrip("\n")
 
     def get_chat_template(self):
         return self.chat_template
@@ -61,9 +63,9 @@ class Shortfin(BaseBackend):
         )
         self._assert_success(resp)
 
-        response_message = resp.resp.read()
+        response_message = resp.resp.read().decode()
         response_message = self._clean_response_message(response_message)
-        return response_message.decode("utf-8"), {}
+        return response_message, {}
 
     def generate_stream(
         self,
@@ -81,15 +83,13 @@ class Shortfin(BaseBackend):
             json=shortfin_kwargs,
             stream=True,
             timeout=self.client_params["timeout"],
+            method="POST",
         )
         self._assert_success(resp)
-
-        prefix = b""
         for chunk in resp:
             if chunk == b"data: [DONE]\n\n":
                 break
-            text = chunk[len(prefix) :]
-            prefix += text.strip(b"\n")
+            text = chunk.decode()
             text = self._clean_response_message(text)
             if text is not None:
-                yield text.decode("utf-8"), {}
+                yield text, {}

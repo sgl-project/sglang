@@ -1,8 +1,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 
-from typing import Callable, Dict, Optional, Type
+from typing import Dict, Type
 
-import torch
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
@@ -22,7 +21,9 @@ from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -32,6 +33,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
+    "modelopt": ModelOptFp8Config,
     "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
     "gptq_marlin": GPTQMarlinConfig,
@@ -41,6 +43,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
     "experts_int8": ExpertsInt8Config,
+    "w8a8_int8": W8A8Int8Config,
 }
 
 
@@ -53,78 +56,14 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     return QUANTIZATION_METHODS[quantization]
 
 
-def fp8_moe_apply(
-    self,
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    use_grouped_topk: bool,
-    topk_group: Optional[int] = None,
-    num_expert_group: Optional[int] = None,
-    custom_routing_function: Optional[Callable] = None,
-) -> torch.Tensor:
-    """Enhanced apply method for FP8 MoE."""
-    from sglang.srt.layers.fused_moe_triton import FusedMoE
-    from sglang.srt.layers.fused_moe_triton.fused_moe import fused_experts
-
-    # Expert selection
-    topk_weights, topk_ids = FusedMoE.select_experts(
-        hidden_states=x,
-        router_logits=router_logits,
-        use_grouped_topk=use_grouped_topk,
-        top_k=top_k,
-        renormalize=renormalize,
-        topk_group=topk_group,
-        num_expert_group=num_expert_group,
-        custom_routing_function=custom_routing_function,
-    )
-
-    # Expert fusion with FP8 quantization
-    return fused_experts(
-        x,
-        layer.w13_weight,
-        layer.w2_weight,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        inplace=True,
-        use_fp8_w8a8=True,
-        w1_scale=layer.w13_weight_scale,
-        w2_scale=layer.w2_weight_scale,
-        a1_scale=layer.w13_input_scale,
-        a2_scale=layer.w2_input_scale,
-    )
-
-
-def fp8_get_quant_method(self, layer, prefix):
-    """Enhanced get_quant_method for FP8 config."""
-    from vllm.model_executor.layers.linear import LinearBase
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        is_layer_skipped,
-    )
-
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.linear import UnquantizedLinearMethod
-    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-    if isinstance(layer, LinearBase):
-        if is_layer_skipped(prefix, self.ignored_layers):
-            return UnquantizedLinearMethod()
-        return Fp8LinearMethod(self)
-    elif isinstance(layer, FusedMoE):
-        return Fp8MoEMethod(self)
-    return None
-
-
 def gptq_get_quant_method(self, layer, prefix):
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
         GPTQMarlinMoEMethod,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return GPTQMarlinLinearMethod(self)
@@ -134,13 +73,13 @@ def gptq_get_quant_method(self, layer, prefix):
 
 
 def awq_get_quant_method(self, layer, prefix):
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.awq_marlin import (
         AWQMarlinLinearMethod,
         AWQMoEMethod,
     )
 
-    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return AWQMarlinLinearMethod(self)
@@ -149,14 +88,30 @@ def awq_get_quant_method(self, layer, prefix):
     return None
 
 
+def patch_vllm_linear_base_isinstance():
+    import builtins
+
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from sglang.srt.layers.linear import LinearBase as PatchedLinearBase
+
+    original_isinstance = builtins.isinstance
+
+    def patched_isinstance(obj, classinfo):
+        if classinfo is LinearBase:
+            return original_isinstance(obj, PatchedLinearBase)
+        return original_isinstance(obj, classinfo)
+
+    builtins.isinstance = patched_isinstance
+
+
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
-    setattr(Fp8MoEMethod, "apply", fp8_moe_apply)
-    setattr(Fp8Config, "get_quant_method", fp8_get_quant_method)
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
 
 
+patch_vllm_linear_base_isinstance()
 # Apply patches when module is imported
 apply_monkey_patches()
 

@@ -1,0 +1,24 @@
+{
+    "name": "sglang",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "devuser",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Python development
+                "ms-python.python",
+                "charliermarsh.ruff",
+                // Rust development
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    },
+    "forwardPorts": [],
+    "runArgs": [
+        "--gpus",
+        "all"
+    ]
+}

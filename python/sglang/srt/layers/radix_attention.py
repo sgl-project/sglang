@@ -47,8 +47,17 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
+        self.k_scale = None
+        self.v_scale = None
 
-    def forward(self, q, k, v, forward_batch: ForwardBatch, save_kv_cache=True):
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None

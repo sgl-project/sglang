@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.0.post1"
+version = "0.4.2.post1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -13,31 +13,42 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["requests", "tqdm", "numpy", "IPython"]
+dependencies = ["requests", "tqdm", "numpy", "IPython", "setproctitle"]
 
 [project.optional-dependencies]
-runtime_common = ["aiohttp", "decord", "fastapi",
+runtime_common = [
+    "aiohttp", "decord", "fastapi",
     "hf_transfer", "huggingface_hub", "interegular", "modelscope",
     "orjson", "outlines>=0.0.44,<0.1.0",
     "packaging", "pillow", "prometheus-client>=0.20.0",
     "psutil", "pydantic", "python-multipart",
-    "pyzmq>=25.1.2", "torchao", "uvicorn", "uvloop",
-    "xgrammar>=0.1.4"]
-srt = ["sglang[runtime_common]", "torch", "vllm>=0.6.3.post1,<=0.6.4.post1", "cuda-python", "flashinfer>=0.1.6"]
+    "pyzmq>=25.1.2", "torchao>=0.7.0", "uvicorn", "uvloop",
+    "xgrammar>=0.1.10"
+]
+srt = [
+    "sglang[runtime_common]", "cuda-python",
+    "sgl-kernel>=0.0.3", "torch", "vllm==0.6.4.post1",
+    "flashinfer==0.1.6"
+]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20241022, not from public vllm whl
-srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.3.dev13"]
+srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.3.post2.dev1"]
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
 srt_xpu = ["sglang[runtime_common]"]
 #For Intel Gaudi(device : hpu) follow the installation guide
 #https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu =  ["sglang[runtime_common]"]
+srt_hpu = ["sglang[runtime_common]"]
+# CPU: currently, there are no pre-built vllm wheels for CPU.
+# To install vllm for CPU, please follow the instruction here:
+# https://docs.vllm.ai/en/latest/getting_started/installation/cpu/index.html
+srt_cpu = ["sglang[runtime_common]", "torch"]
 
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
+torch_memory_saver = ["torch_memory_saver"]
 test = [
     "jsonlines",
     "matplotlib",
@@ -50,14 +61,20 @@ all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+
 dev = ["sglang[all]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_cpu = ["sglang[all_cpu]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[tool.setuptools.package-data]
+"sglang" = ["srt/layers/moe/fused_moe_triton/configs/*.json", "srt/layers/quantization/configs/*.json"]
 
 [tool.setuptools.packages.find]
 exclude = [

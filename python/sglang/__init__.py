@@ -1,5 +1,6 @@
-# SGL API Components
+# SGLang public APIs
 
+# Frontend Language APIs
 from sglang.api import (
     Engine,
     Runtime,
@@ -23,16 +24,27 @@ from sglang.api import (
     user_end,
     video,
 )
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.lang.choices import (
     greedy_token_selection,
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
+from sglang.utils import LazyImport
 
-# SGLang DSL APIs
+Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
+LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
+OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
+VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
+Shortfin = LazyImport("sglang.lang.backend.shortfin", "Shortfin")
+
+# Other configs
+from sglang.global_config import global_config
+from sglang.version import __version__
+
 __all__ = [
-    "Runtime",
     "Engine",
+    "Runtime",
     "assistant",
     "assistant_begin",
     "assistant_end",
@@ -52,28 +64,15 @@ __all__ = [
     "user_begin",
     "user_end",
     "video",
+    "RuntimeEndpoint",
     "greedy_token_selection",
     "token_length_normalized",
     "unconditional_likelihood_normalized",
+    "Anthropic",
+    "LiteLLM",
+    "OpenAI",
+    "VertexAI",
+    "Shortfin",
+    "global_config",
+    "__version__",
 ]
-
-# Global Configurations
-from sglang.global_config import global_config
-
-__all__ += ["global_config"]
-
-from sglang.version import __version__
-
-__all__ += ["__version__"]
-
-# SGLang Backends
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.utils import LazyImport
-
-Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
-LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
-OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
-VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
-Shortfin = LazyImport("sglang.lang.backend.shortfin", "Shortfin")
-
-__all__ += ["Anthropic", "LiteLLM", "OpenAI", "VertexAI", "Shortfin", "RuntimeEndpoint"]

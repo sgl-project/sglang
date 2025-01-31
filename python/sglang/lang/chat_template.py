@@ -88,7 +88,6 @@ register_chat_template(
     )
 )
 
-
 register_chat_template(
     ChatTemplate(
         name="claude",
@@ -100,7 +99,6 @@ register_chat_template(
         },
     )
 )
-
 
 register_chat_template(
     ChatTemplate(
@@ -116,7 +114,6 @@ register_chat_template(
     )
 )
 
-
 register_chat_template(
     ChatTemplate(
         name="chatml-llava",
@@ -131,7 +128,6 @@ register_chat_template(
         image_token="<image>\n",
     )
 )
-
 
 # There is default system prompt for qwen
 # reference: https://modelscope.cn/models/qwen/Qwen2-72B-Instruct/file/view/master?fileName=tokenizer_config.json&status=1
@@ -216,6 +212,21 @@ register_chat_template(
         },
         stop_str=("<|eot_id|>",),
         image_token="<|image|>",
+    )
+)
+
+# https://huggingface.co/openbmb/MiniCPM-V-2_6
+register_chat_template(
+    ChatTemplate(
+        name="minicpmv",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", " "),
+            "user": ("user:", " "),
+            "assistant": ("assistant:", "</s>"),
+        },
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
     )
 )
 
@@ -320,6 +331,59 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="granite-3-instruct",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|start_of_role|>system<|end_of_role|>",
+                "<|end_of_text|>",
+            ),
+            "user": (
+                "<|start_of_role|>user<|end_of_role|>",
+                "<|end_of_text|>",
+            ),
+            "assistant": (
+                "<|start_of_role|>assistant<|end_of_role|>",
+                "<|end_of_text|>",
+            ),
+        },
+        stop_str=("<|end_of_text|>",),
+    )
+)
+
+
+register_chat_template(
+    ChatTemplate(
+        name="deepseek-v3",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "",
+                "",
+            ),
+            "user": (
+                "<｜User｜>",
+                "",
+            ),
+            "assistant": (
+                "<｜Assistant｜>",
+                "<｜end▁of▁sentence｜>",
+            ),
+        },
+        stop_str=("<｜end▁of▁sentence｜>",),
+    )
+)
+
+
+@register_chat_template_matching_function
+def match_deepseek(model_path: str):
+    if (
+        "deepseek-v3" in model_path.lower() or "deepseek-r1" in model_path.lower()
+    ) and "base" not in model_path.lower():
+        return get_chat_template("deepseek-v3")
+
 
 @register_chat_template_matching_function
 def match_dbrx(model_path: str):
@@ -400,6 +464,16 @@ def match_c4ai_command_r(model_path: str):
     model_path = model_path.lower()
     if "c4ai-command-r" in model_path:
         return get_chat_template("c4ai-command-r")
+
+
+@register_chat_template_matching_function
+def match_granite_instruct(model_path: str):
+    model_path = model_path.lower()
+    # When future versions of Granite are released, this code may
+    # need to be updated. For now, assume that the Granite 3.0
+    # template works across the board.
+    if "granite" in model_path and "instruct" in model_path:
+        return get_chat_template("granite-3-instruct")
 
 
 if __name__ == "__main__":
