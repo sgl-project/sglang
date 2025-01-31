@@ -9,7 +9,7 @@ For optimizations made on the DeepSeek series models regarding SGLang, please re
 ## Hardware Recommendation
 - 8 x NVIDIA H200 GPUs
 
-If you do not have GPUs with large enough memory, please try multi-node tensor parallelism. There is an example serving with [2 H20 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) below.
+If you do not have GPUs with large enough memory, please try multi-node tensor parallelism. There is an example serving with [2 H20 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes) below.
 
 ## Installation & Launch
 
