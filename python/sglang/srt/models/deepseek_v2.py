@@ -656,24 +656,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
-        #q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        #if self.w_kc.dtype == torch.float8_e4m3fnuz:
-        #    # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
-        #    q_nope_out = torch.bmm(
-        #        q_nope.to(torch.bfloat16).transpose(0, 1),
-        #        self.w_kc.to(torch.bfloat16) * self.w_scale,
-        #    )
-        #elif self.w_kc.dtype == torch.float8_e4m3fn:
-        #    q_nope_val, q_nope_scale = input_to_float8(
-        #        q_nope.transpose(0, 1), torch.float8_e4m3fn
-        #    )
-        #    q_nope_out = bmm_fp8(
-        #        q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-        #    )
-        #else:
-        #    q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-        #q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         attn_out = torch.empty_like(q)
@@ -685,45 +667,33 @@ class DeepseekV2AttentionMLA(nn.Module):
         w_kc, w_vc = w.unflatten(
                     0, (-1, self.qk_nope_head_dim + self.v_head_dim)
                 ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        num_kv_split = 8 ## Took from Triton backend default value.
+        sm_scale = self.scaling
+        attn_logits = torch.empty(
+                             (
+                                forward_batch.batch_size,
+                                num_local_heads,
+                                num_kv_split,
+                                self.kv_lora_rank + 1,
+                             ), dtype=torch.float32, device=self.device)
+
+        decode_attention_fwd_normal(
+                        q,
+                        latent_cache,
+                        w_kc,
+                        w_vc,
+                        cos_sin_cache,
+                        positions,
+                        self.qk_rope_head_dim,
+                        self.qk_nope_head_dim,
+                        attn_out,
+                        req_to_token,
+                        b_req_idx,
+                        b_seq_len,
+                        attn_logits,
+                        num_kv_split)
+        return attn_out
         
-
-        #v_input = latent_cache[..., : self.kv_lora_rank]
-        #v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
-        #k_input = latent_cache.unsqueeze(1)
-        #k_input[..., : self.kv_lora_rank] = v_input
-        #k_pe = k_input[..., self.kv_lora_rank :]
-
-        #q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        #q_input[..., self.kv_lora_rank :] = q_pe
-        #k_input[..., self.kv_lora_rank :] = k_pe
-
-        #attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
-        #attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-
-        #if self.w_vc.dtype == torch.float8_e4m3fnuz:
-        #    # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
-        #    attn_bmm_output = torch.bmm(
-        #        attn_output.to(torch.bfloat16).transpose(0, 1),
-        #        self.w_vc.to(torch.bfloat16) * self.w_scale,
-        #    )
-        #elif self.w_vc.dtype == torch.float8_e4m3fn:
-        #    attn_output_val, attn_output_scale = input_to_float8(
-        #        attn_output.transpose(0, 1), torch.float8_e4m3fn
-        #    )
-        #    attn_bmm_output = bmm_fp8(
-        #        attn_output_val,
-        #        self.w_vc,
-        #        attn_output_scale,
-        #        self.w_scale,
-        #        torch.bfloat16,
-        #    )
-        #else:
-        #    attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-        #attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        #output, _ = self.o_proj(attn_output)
-
-        #return output
-
 def all_gather(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
 ):
