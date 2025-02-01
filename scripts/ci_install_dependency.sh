@@ -4,13 +4,13 @@ set -euxo pipefail
 # Install the dependency in CI.
 
 # Use repo from environment variable, passed from GitHub Actions
-FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu124/torch2.4/flashinfer}"
+FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu124/torch2.5/flashinfer}"
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
 pip install --upgrade pip
-pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
+pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
 
 # Force reinstall flashinfer and torch_memory_saver
 pip install flashinfer==0.2.0.post2 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
