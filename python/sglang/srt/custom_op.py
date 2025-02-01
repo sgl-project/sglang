@@ -1,8 +1,9 @@
-from torch import nn
 import torch
+from torch import nn
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 _is_rocm = torch.cuda.is_available() and torch.version.hip
+
 
 class CustomOp(nn.Module):
     def __init__(self):
