@@ -13,7 +13,7 @@ pip install --upgrade pip
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 
 # Force reinstall flashinfer and torch_memory_saver
-pip install flashinfer==0.1.6 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
+pip install flashinfer==0.2.0.post2 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
 pip install torch_memory_saver --force-reinstall
 
 pip install transformers==4.45.2 sentence_transformers accelerate peft
