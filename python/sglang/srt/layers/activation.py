@@ -72,6 +72,15 @@ class GeluAndMul(CustomOp):
         return out
 
 
+class QuickGELU(CustomOp):
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.sigmoid(1.702 * x)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
+        return self.forward_native(x)
+
+
 class ScaledActivation(nn.Module):
     """An activation function with post-scale parameters.
 
