@@ -110,7 +110,6 @@ def sgemm_lora_a_fwd(
     assert x.shape[-1] == K
 
     # Block shapes
-    # FIXME: Add autotune
     BLOCK_S = 16
     BLOCK_K = 256
     BLOCK_R = 16

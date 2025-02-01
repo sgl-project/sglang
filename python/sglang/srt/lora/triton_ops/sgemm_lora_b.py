@@ -30,6 +30,9 @@ def _sgemm_lora_b_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # For fused output scaling and adding
+    fuse_scaling_add,
+    scaling,
 ):
     # x: (s, K), s is the sum of sequence lengths
     # weights: (num_lora, N, K)
@@ -81,16 +84,23 @@ def _sgemm_lora_b_kernel(
         w_ptrs += BLOCK_K * w_stride_2
 
     # Store result to output matrix
+    partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = (output + seg_start * output_stride_0) + (
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     output_mask = s_offset[:, None] < seg_len
+    if fuse_scaling_add:
+        partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
 def sgemm_lora_b_fwd(
-    x: torch.Tensor, weights: torch.Tensor, batch_info: LoraBatchInfo
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoraBatchInfo,
+    base_output: torch.Tensor = None,
+    scaling: float = 1.0,
 ) -> torch.Tensor:
     # x: (s, r)
     # weights: (num_lora, output_dim, r)
@@ -108,7 +118,6 @@ def sgemm_lora_b_fwd(
     assert x.shape[-1] == R
 
     # Block shapes
-    # FIXME: Add autotune
     BLOCK_S = 16
     BLOCK_R = 16
     BLOCK_N = 256
@@ -118,7 +127,13 @@ def sgemm_lora_b_fwd(
         batch_info.bs,
     )
 
-    output = torch.empty((S, N), device=x.device, dtype=x.dtype)
+    if base_output is None:
+        output = torch.empty((S, N), device=x.device, dtype=x.dtype)
+        fuse_scaling_add = False
+    else:
+        output = base_output
+        fuse_scaling_add = True
+
     _sgemm_lora_b_kernel[grid](
         x,
         weights,
@@ -138,5 +153,7 @@ def sgemm_lora_b_fwd(
         BLOCK_S,
         BLOCK_N,
         BLOCK_R,
+        fuse_scaling_add,
+        scaling,
     )
     return output

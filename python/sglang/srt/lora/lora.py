@@ -153,17 +153,54 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     ):
         self.set_lora = True
         self.A_buffer_qkv = A_buffer_qkv
-        self.B_buffer_q = B_buffer_q
-        self.B_buffer_kv = B_buffer_kv
+
+        if self.lora_backend.fuse_qkv_lora_b:
+            assert (
+                B_buffer_q.shape[-1] == B_buffer_kv.shape[-1]
+            ), "The lora rank of q and kv should be the same when enabling fusion of qkv lora_b"
+            output_dim_q, output_dim_kv = B_buffer_q.shape[-2], B_buffer_kv.shape[-2]
+
+            # B_buffer_qkv: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+            self.B_buffer_qkv = torch.cat(
+                (B_buffer_q[0], B_buffer_kv[0], B_buffer_kv[1]), dim=-2
+            ).contiguous()
+
+            # Offsets of q/k/v in output dimension
+            self.output_offset = torch.tensor(
+                [
+                    0,
+                    output_dim_q,
+                    output_dim_q + output_dim_kv,
+                    output_dim_q + 2 * output_dim_kv,
+                ],
+                dtype=torch.int32,
+                device=B_buffer_q.device,
+            )
+            # For computing number of launched blocks
+            self.max_qkv_out_dim = max(output_dim_q, output_dim_kv)
+        else:
+            self.B_buffer_qkv = (
+                B_buffer_q,
+                B_buffer_kv,
+            )
+            self.output_offset = None
+            self.max_qkv_out_dim = None
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_output = self.lora_backend.run_qkv_lora(
-            x=x,
-            qkv_lora_a=self.A_buffer_qkv,
-            q_lora_b=self.B_buffer_q,
-            kv_lora_b=self.B_buffer_kv,
+            x,
+            self.A_buffer_qkv,
+            self.B_buffer_qkv,
+            output_offset=self.output_offset,
+            max_qkv_out_dim=self.max_qkv_out_dim,
+            base_output=base_output,
+            scaling=self.scaling,
         )
-        return base_output + lora_output * self.scaling
+        return (
+            lora_output
+            if self.lora_backend.fuse_output_scaling_add
+            else base_output + lora_output * self.scaling
+        )
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
@@ -178,11 +215,18 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.lora_backend.run_lora_a_sgemm(x=x, weights=self.A_buffer)
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
-            x=lora_a_output, weights=self.B_buffer[0]
+            lora_a_output,
+            self.B_buffer[0],
+            base_output=base_output,
+            scaling=self.scaling,
         )
-        return base_output + lora_output * self.scaling
+        return (
+            lora_output
+            if self.lora_backend.fuse_output_scaling_add
+            else base_output + lora_output * self.scaling
+        )
 
     def forward(self, input_):
         # duplicate the logic in RowParallelLinear

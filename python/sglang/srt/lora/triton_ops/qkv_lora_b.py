@@ -13,8 +13,7 @@ def _qkv_lora_b_kernel(
     output,
     # Parameters of size
     K,  # K = R
-    N_Q,
-    N_KV,
+    max_qkv_out_dim,  # max(output_q_dim, output_kv_dim)
     # Strides
     x_stride_0,
     x_stride_1,
@@ -28,11 +27,14 @@ def _qkv_lora_b_kernel(
     seg_indptr,
     weight_indices,
     # Offsets of q/k/v slice on output dimension
-    n_indptr,
+    n_offs,
     # Meta parameters
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # For fused output scaling and adding
+    fuse_scaling_add,
+    scaling,
 ):
     # This kernel packs 3 sgemms (q/k/v) into a single kernel.
 
@@ -50,11 +52,11 @@ def _qkv_lora_b_kernel(
     seg_len = tl.load(seg_lens + batch_id)
     w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
-    n_start = tl.load(n_indptr + qkv_id)
-    n_size = tl.load(n_indptr + qkv_id + 1) - n_start
+    n_start = tl.load(n_offs + qkv_id)
+    n_size = tl.load(n_offs + qkv_id + 1) - n_start
 
     # The tile in output matrix will have (pid_s, pid_n) as id
-    num_pid_n = tl.cdiv(max(N_Q, N_KV), BLOCK_N)
+    num_pid_n = tl.cdiv(max_qkv_out_dim, BLOCK_N)
     pid_s = pid // num_pid_n
     pid_n = pid % num_pid_n
 
@@ -92,28 +94,36 @@ def _qkv_lora_b_kernel(
         w_ptrs += BLOCK_K * w_stride_2
 
     # Store result to output matrix
+    partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = (output + seg_start * output_stride_0 + n_start * output_stride_1) + (
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     output_mask = (s_offset[:, None] < seg_len) and (n_offset[None, :] < n_size)
+    if fuse_scaling_add:
+        partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
 def qkv_lora_b_fwd(
     x: torch.Tensor,
-    q_lora_b: torch.Tensor,
-    kv_lora_b: torch.Tensor,
+    qkv_lora_b: torch.Tensor,
     batch_info: LoraBatchInfo,
+    output_offset: torch.Tensor,
+    max_qkv_out_dim: int,
+    base_output: torch.Tensor = None,
+    scaling: float = 1.0,
 ) -> torch.Tensor:
 
     # x: (s, 3 * r)
-    # q_lora_b: (1, num_lora, output_dim_q, r)
-    # kv_lora_b: (2, num_lora, output_dim_kv, r)
+    # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+    # output_offset = [0, output_dim_q, output_dim_q + output_dim_kv,
+    #                     output_dim_q + 2 * output_dim_kv]
+    # max_qkv_out_dim = max(output_dim_q, output_dim_kv)
     # output: (s, output_dim_q + 2 * output_dim_kv)
 
     # Compute lora_output with shape (s, output_dim) as follows:
-    # lora_output[:, :output_dim_q] = sgemm(lora_output_a[:, :r], q_lora_b[0])
+    # lora_output[:, :output_dim_q] = sgemm(lora_output_a[:, :r], )
     # lora_output[:, output_dim_q: output_dim_q + output_dim_kv]
     #      = sgemm(lora_output_a[:, r: 2 * r], kv_lora_b[0])
     # lora_output[:, output_dim_q + output_dim_kv: ]
@@ -122,59 +132,51 @@ def qkv_lora_b_fwd(
     # Get dims
     s = x.shape[0]
     input_dim = x.shape[1]
-    r = q_lora_b.shape[-1]
-    output_dim_q = q_lora_b.shape[-2]
-    output_dim_kv = kv_lora_b.shape[-2]
-    output_dim = output_dim_q + 2 * output_dim_kv
+    r = qkv_lora_b.shape[-1]
+    output_dim = qkv_lora_b.shape[-2]
     assert input_dim == 3 * r
+    assert output_offset.shape[0] == 4
 
-    # FIXME: replace with autotune
     BLOCK_S = 16
     BLOCK_R = 16
     BLOCK_OUT = 64
 
     grid_b = (
         triton.cdiv(batch_info.max_len, BLOCK_S)
-        * triton.cdiv(max(output_dim_q, output_dim_kv), BLOCK_OUT),
+        * triton.cdiv(max_qkv_out_dim, BLOCK_OUT),
         3,  # this dimension decides current block computes on q, k or v
         batch_info.bs,
     )
 
-    # w_lora_b with shape (num_lora, output_dim_q + 2 * output_dim_kv, r) is passed to kernel
-    w_lora_b = torch.cat((q_lora_b[0], kv_lora_b[0], kv_lora_b[1]), dim=-2).contiguous()
-    lora_output = torch.empty((s, output_dim), device=x.device, dtype=x.dtype)
-    n_indptr = torch.tensor(
-        [
-            0,
-            output_dim_q,
-            output_dim_q + output_dim_kv,
-            output_dim_q + 2 * output_dim_kv,
-        ],
-        dtype=torch.int32,
-        device=x.device,
-    )
+    if base_output is None:
+        output = torch.empty((s, output_dim), device=x.device, dtype=x.dtype)
+        fuse_scaling_add = False
+    else:
+        output = base_output
+        fuse_scaling_add = True
 
     _qkv_lora_b_kernel[grid_b](
         x,
-        w_lora_b,
-        lora_output,
+        qkv_lora_b,
+        output,
         r,
-        output_dim_q,
-        output_dim_kv,
+        max_qkv_out_dim,
         x.stride(0),
         x.stride(1),
-        w_lora_b.stride(0),
-        w_lora_b.stride(1),
-        w_lora_b.stride(2),
-        lora_output.stride(0),
-        lora_output.stride(1),
+        qkv_lora_b.stride(0),
+        qkv_lora_b.stride(1),
+        qkv_lora_b.stride(2),
+        output.stride(0),
+        output.stride(1),
         batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
-        n_indptr,
+        output_offset,
         BLOCK_S,
         BLOCK_OUT,
         BLOCK_R,
+        fuse_scaling_add,
+        scaling,
     )
 
-    return lora_output
+    return output

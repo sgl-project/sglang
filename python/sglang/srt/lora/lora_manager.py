@@ -84,7 +84,9 @@ def get_backend_from_name(name):
     if name in backend_mapping:
         return backend_mapping[name]
 
-    raise Exception(f"No supported lora backend called {name}.")
+    raise Exception(
+        f"No supported lora backend called {name}. It should be one of {list(backend_mapping.keys())}"
+    )
 
 
 def get_layer_id(name):
