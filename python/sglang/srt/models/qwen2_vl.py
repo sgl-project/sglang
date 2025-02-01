@@ -31,10 +31,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from vllm.model_executor.layers.activation import QuickGELU
 
 from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
