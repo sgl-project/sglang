@@ -436,7 +436,7 @@ def _decode_grouped_att_m_fwd(
     if is_hip_:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_grouped_kernel_stage1[grid](
         q,
