@@ -2,9 +2,9 @@
 
 This guide shows how to evaluate model accuracy using SGLang's [built-in benchmarks](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark).
 
-## Evalutating model accuracy with SGLang
+## Benchmarking Model Accuracy
 
-This is a reference workflow for the [MMLU benchmark](). For more details or other benchmarks, please refer to the README in each specific benchmark folder under [sglang/benchmark](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark).
+This is a reference workflow for the [MMLU benchmark](https://github.com/sgl-project/sglang/tree/main/benchmark/mmlu). For more details or other benchmarks, please refer to the README in each specific benchmark folder under [sglang/benchmark](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark).
 
 ```bash
 # Step 1: Download the dataset
