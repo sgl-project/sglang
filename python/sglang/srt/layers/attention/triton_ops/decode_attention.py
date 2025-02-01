@@ -180,7 +180,10 @@ def _decode_att_m_fwd(
     sm_scale,
     logit_cap,
 ):
-    BLOCK = 8
+    BLOCK = 64
+    # [TODO] work around SGPR limit on MI3xx
+    if is_hip_:
+        BLOCK = 8
     NUM_KV_SPLITS = num_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
@@ -193,7 +196,9 @@ def _decode_att_m_fwd(
     if kv_group_num == 1:
         num_warps = 4
     else:
-        num_warps = 1
+        num_warps = 2
+        if is_hip_:
+            num_warps = 1
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
@@ -433,10 +438,12 @@ def _decode_grouped_att_m_fwd(
     )
 
     extra_kargs = {}
+    num_stages = 2
     if is_hip_:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -467,7 +474,7 @@ def _decode_grouped_att_m_fwd(
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         logit_cap=logit_cap,
         num_warps=4,
-        num_stages=1,
+        num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
         **extra_kargs,

@@ -154,7 +154,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
-    triton_attention_num_kv_splits: int = 16
+    triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
@@ -272,6 +272,10 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
+
+        # AMD-specific Triton attention KV splits default number
+        if is_hip():
+            self.triton_attention_num_kv_splits = 16
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
