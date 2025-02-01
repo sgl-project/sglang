@@ -180,7 +180,7 @@ def _decode_att_m_fwd(
     sm_scale,
     logit_cap,
 ):
-    BLOCK = 64
+    BLOCK = 8
     NUM_KV_SPLITS = num_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
@@ -193,7 +193,7 @@ def _decode_att_m_fwd(
     if kv_group_num == 1:
         num_warps = 4
     else:
-        num_warps = 2
+        num_warps = 1
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)

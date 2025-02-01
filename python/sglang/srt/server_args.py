@@ -154,7 +154,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
-    triton_attention_num_kv_splits: int = 8
+    triton_attention_num_kv_splits: int = 16
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
