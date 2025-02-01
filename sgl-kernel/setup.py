@@ -39,8 +39,6 @@ cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
 turbomind = root / "3rdparty" / "turbomind"
-tensorrt_llm_parent = root / "3rdparty"
-tensorrt_llm = root / "3rdparty" / "tensorrt_llm"
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
@@ -53,8 +51,6 @@ include_dirs = [
     "cublasLt",
     turbomind.resolve(),
     turbomind.resolve() / "src",
-    tensorrt_llm_parent.resolve(),
-    tensorrt_llm.resolve() / "cutlass_extensions" / "include",
 ]
 
 nvcc_flags = [
