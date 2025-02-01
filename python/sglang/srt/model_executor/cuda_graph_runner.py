@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
-from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
