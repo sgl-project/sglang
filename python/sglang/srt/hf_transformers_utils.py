@@ -33,13 +33,14 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
 
-    from sglang.srt.configs import ExaoneConfig, Qwen2VLConfig
+    from sglang.srt.configs import ExaoneConfig, Qwen2VLConfig, DeepseekVL2Config
 
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         ChatGLMConfig.model_type: ChatGLMConfig,
         DbrxConfig.model_type: DbrxConfig,
         ExaoneConfig.model_type: ExaoneConfig,
         Qwen2VLConfig.model_type: Qwen2VLConfig,
+        DeepseekVL2Config.model_type:DeepseekVL2Config,
     }
 except ImportError:
     # We want this file to run without vllm dependency
@@ -49,6 +50,9 @@ for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
 
+for sglang.srt.configs import DeepseekVLV2Processor
+with contextlib.suppress(ValueError):
+    AutoProcessor.register("DeepseekVLV2Processor",DeepseekVLV2Processor)
 
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):

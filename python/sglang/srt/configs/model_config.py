@@ -108,6 +108,11 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        elif "DeepseekVL2ForCausalLM" in self.hf_text_config.architectures:
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -300,6 +305,8 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+    if hasattr(config, "language_config"):
+        return config.language_config
     else:
         return config
 

@@ -1,11 +1,11 @@
-import os
+import os 
 from typing import Tuple
 
 from transformers import PretrainedConfig
 
 class DeepseekVL2VisionEncoderConfig(PretrainedConfig):
-    model_type:str="vision"
-    
+    model_type: str = "vision"
+
     model_name: str = "siglip_large_patch16_384"
     image_size: int = 384
     patch_size: int = 16
@@ -21,7 +21,7 @@ class DeepseekVL2VisionEncoderConfig(PretrainedConfig):
     weight_init: str = "skip"
     deterministic: bool = False
     num_recomputing_layers: int = 0
-    
+
     def __init__(
             self,
             model_name: str = "siglip_large_patch16_384",
@@ -53,6 +53,7 @@ class DeepseekVL2VisionEncoderConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
         
+        
 class DeepseekVL2MlpProjectorConfig(PretrainedConfig):
     model_type = "mlp_projector"
     projector_type: str = "downsample_mlp_gelu"
@@ -83,6 +84,7 @@ class DeepseekVL2MlpProjectorConfig(PretrainedConfig):
         super().__init__(**kwargs)
         
 class DeepseekV2Config(PretrainedConfig):
+    
     model_type = "deepseek_v2"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -180,11 +182,12 @@ class DeepseekV2Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-        
+
+
 class DeepseekVL2Config(PretrainedConfig):
     model_type = "deepseek_vl_v2"
-    vision_config: DeepseekVL2VisionEncoderConfig
-    projector_config: DeepseekVL2MlpProjectorConfig
+    vision_config: VisionEncoderConfig
+    projector_config: MlpProjectorConfig
     language_config: DeepseekV2Config
 
     tile_tag: str = "2D"
@@ -192,27 +195,27 @@ class DeepseekVL2Config(PretrainedConfig):
     candidate_resolutions: Tuple[Tuple[int, int]] = ((384, 384),)
 
     def __init__(
-            self,
-            tile_tag: str = "tile_tag",
-            global_view_pos: str = "head",
-            candidate_resolutions: Tuple[Tuple[int, int]] = ((384, 384),),
-            **kwargs
-    ):
-        super().__init__(**kwargs)
+                self,
+                tile_tag: str = "tile_tag",
+                global_view_pos: str = "head",
+                candidate_resolutions: Tuple[Tuple[int, int]] = ((384, 384),),
+                **kwargs
+        ):
+            super().__init__(**kwargs)
 
-        vision_config = kwargs.get("vision_config", {})
-        self.vision_config = DeepseekVL2VisionEncoderConfig(**vision_config)
+            vision_config = kwargs.get("vision_config", {})
+            self.vision_config = DeepseekVL2VisionEncoderConfig(**vision_config)
 
-        projector_config = kwargs.get("projector_config", {})
-        self.projector_config = DeepseekVL2MlpProjectorConfig(**projector_config)
+            projector_config = kwargs.get("projector_config", {})
+            self.projector_config = DeepseekVL2MlpProjectorConfig(**projector_config)
 
-        language_config = kwargs.get("language_config", {})
-        
-        if isinstance(language_config, DeepseekV2Config):
-            self.language_config = language_config
-        else:
-            self.language_config = DeepseekV2Config(**language_config)
+            language_config = kwargs.get("language_config", {})
+            if isinstance(language_config, DeepseekV2Config):
+                self.language_config = language_config
+            else:
+                self.language_config = DeepseekV2Config(**language_config)
 
-        self.tile_tag = tile_tag
-        self.global_view_pos = global_view_pos
-        self.candidate_resolutions = candidate_resolutions
+            self.tile_tag = tile_tag
+            self.global_view_pos = global_view_pos
+            self.candidate_resolutions = candidate_resolutions
+            self.architectures=["DeepseekVL2ForCausalLM"]
