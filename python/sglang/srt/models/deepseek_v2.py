@@ -58,7 +58,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
+from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
 
 is_hip_ = is_hip()
 
@@ -520,7 +520,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                     return self.forward_absorb_fused_mla(positions, hidden_states, forward_batch)
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
-            return self.forward_absorb(positions, hidden_states, forward_batch)
+            else:
+                return self.forward_absorb(positions, hidden_states, forward_batch)
 
     def forward_normal(
         self,
@@ -659,7 +660,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        attn_out = torch.empty_like(q)
+        attn_out = torch.empty_like(hidden_states)
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         b_req_idx = forward_batch.req_pool_indices
         b_seq_len = forward_batch.seq_lens
