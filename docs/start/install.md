@@ -54,7 +54,7 @@ docker run --gpus all \
 Note: To AMD ROCm system with Instinct/MI GPUs, it is recommended to use `docker/Dockerfile.rocm` to build images, example and usage as below:
 
 ```bash
-docker build --build-arg SGL_BRANCH=v0.4.2.post1 -t v0.4.2.post1-rocm620 -f Dockerfile.rocm .
+docker build --build-arg SGL_BRANCH=v0.4.2.post1 -t v0.4.2.post1-rocm630 -f Dockerfile.rocm .
 
 alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/dri --ipc=host \
     --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -63,11 +63,11 @@ alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/d
 drun -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<secret>" \
-    v0.4.2.post1-rocm620 \
+    v0.4.2.post1-rocm630 \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 
 # Till flashinfer backend available, --attention-backend triton --sampling-backend pytorch are set by default
-drun v0.4.2.post1-rocm620 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
+drun v0.4.2.post1-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
 ## Method 4: Using docker compose
