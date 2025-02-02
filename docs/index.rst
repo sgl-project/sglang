@@ -63,6 +63,7 @@ The core features include:
    references/modelscope.md
    references/contribution_guide.md
    references/troubleshooting.md
+   references/nvidia_jetson.md
    references/faq.md
    references/learn_more.md
-   references/nvidia_jetson.md
+
