@@ -1,7 +1,7 @@
 # Sampling Parameters in SGLang Runtime
 This doc describes the sampling parameters of the SGLang Runtime.
 It is the low-level endpoint of the runtime.
-If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](../backend/openai_api_completions.ipynb).
+If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](https://docs.sglang.ai/backend/openai_api_completions.html).
 
 ## `/generate` Endpoint
 *SV: Maybe we can put this either into [native api docs](https://docs.sglang.ai/backend/native_api.html#) or make a dedicated section on it. For now we leave it here.*
@@ -53,13 +53,13 @@ class GenerateReqInput:
 
 ## Sampling params
 
-* max_new_tokens: TODO
-* stop: TODO
-* stop_token_ids: TODO
-* temperature: TODO
-* top_p: TODO
-* top_k: TODO
-* min_p: TODO
+* `max_new_tokens`: The maximum output length measured in tokens.
+* `stop`: One or multiple [stop words](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#let_the_model_know_when_to_stop). Generation will stop if one of these words is sampled.
+* `stop_token_ids`: Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled.
+* `temperature`: [Temperature](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) when sampling the next token. `temperature = 0` corresponds to greedy sampling, higher temperature leads to more diversity.
+* top_p: [Top-p](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens.
+* top_k: [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens.
+* min_p: [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`.
 * frequency_penalty: TODO
 * presence_penalty: TODO
 * repetition_penalty: TODO
