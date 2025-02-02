@@ -146,6 +146,10 @@ Then you can access the Grafana dashboard at http://localhost:3000.
 
 ### Grafana Dashboard
 
+In a new Grafana setup, ensure that you have the `Prometheus` data source enabled. To check that, go to `http://localhost:3000/connections/datasources` and ensure that `Prometheus` is enabled.
+
+If not, click `Add data source` -> `Prometheus`, set Prometheus URL to `http://localhost:9090`, and click `Save & Test`.
+
 To import the Grafana dashboard, click `+` -> `Import` -> `Upload JSON file` -> `Upload` and select [grafana.json](../examples/monitoring/grafana.json).
 
 ### Troubleshooting
