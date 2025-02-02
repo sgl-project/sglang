@@ -273,6 +273,10 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        # AMD-specific Triton attention KV splits default number
+        if is_hip():
+            self.triton_attention_num_kv_splits = 16
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args

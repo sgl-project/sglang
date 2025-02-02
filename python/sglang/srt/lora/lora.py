@@ -23,7 +23,6 @@ import re
 
 import torch
 from torch import nn
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -31,6 +30,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
 

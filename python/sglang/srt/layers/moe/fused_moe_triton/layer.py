@@ -5,14 +5,13 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -67,7 +66,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
-@register_custom_op("sglang_unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
