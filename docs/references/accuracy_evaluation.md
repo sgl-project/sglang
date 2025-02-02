@@ -1,6 +1,6 @@
 # Measuring Model Accuracy in SGLang
 
-This guide shows how to evaluate model accuracy using SGLang's [built-in benchmarks](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark).
+This guide shows how to evaluate model accuracy using SGLang's [built-in benchmarks](https://github.com/sgl-project/sglang/tree/b045841baeff37a5601fcde23fa98bd09d942c36/benchmark). Please include accuracy on crucial benchmarks in your PR if you make modifications on the model side, like the kernel and model architecture.
 
 ## Benchmarking Model Accuracy
 
@@ -47,7 +47,7 @@ def few_shot_gsm8k(s, question):
     )
 ```
 
-These adjustments give us the us the reported accuracy.
+These adjustments should return the desired accuracy.
 
 ## Extending Evaluation Capabilities
 
