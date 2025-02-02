@@ -533,15 +533,15 @@ def decode_attention_fwd_normal(
 #    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal().item()
 
 
-#def quantize_input_fp8(q, w_kc, w_vc, use_fp8):
-#    q_descale = w_kc_descale = w_vc_descale = None
-#
-#    if use_fp8:
-#        q, q_descale = input_to_float8(q)
-#        w_kc, w_kc_descale = input_to_float8(w_kc)
-#        w_vc, w_vc_descale = input_to_float8(w_vc)
-#
-#    return q, q_descale, w_kc, w_kc_descale, w_vc, w_vc_descale
+def quantize_input_fp8(q, w_kc, w_vc, use_fp8):
+    q_descale = w_kc_descale = w_vc_descale = None
+
+    if use_fp8:
+        q, q_descale = input_to_float8(q)
+        w_kc, w_kc_descale = input_to_float8(w_kc)
+        w_vc, w_vc_descale = input_to_float8(w_vc)
+
+    return q, q_descale, w_kc, w_kc_descale, w_vc, w_vc_descale
 
 #@pytest.mark.parametrize('B, H, S, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim', [
 #    (8, 128, 2048, 512, 128, 64),
