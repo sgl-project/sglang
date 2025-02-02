@@ -57,7 +57,6 @@ def prefill_attention_wave(
     assert shape.num_query_heads % shape.num_kv_heads == 0
 
     output_shape = (shape.total_seq_len, shape.num_query_heads, shape.head_size_kv)
-    permuted_value = v.permute(1, 2, 0)
     # Run the wave kernel.
     mfma_variant =(MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
     (prefill, hyperparams) = get_prefill_attention_kernel(
@@ -65,8 +64,11 @@ def prefill_attention_wave(
         mfma_variant,
         q.shape,
         k.shape,
-        permuted_value.shape,
+        v.shape,
         output_shape,
+        input_dtype=q.dtype,
+        output_dtype=o.dtype,
+        size_dtype=b_seq_len.dtype,
     )
 
     hyperparams.update(get_default_scheduling_params())
@@ -89,9 +91,9 @@ def prefill_attention_wave(
         mb = prefill(
             q * dk_sqrt * log2e,
             k,
-            permuted_value,
-            b_start_loc.to(torch.int32),
-            b_seq_len.to(torch.int32),
+            v,
+            b_start_loc,
+            b_seq_len,
             o,
         )
         if dump_generated_mlir:

@@ -114,7 +114,7 @@ class TestWaveAttention(unittest.TestCase):
 
     def test_grouped_decode_attention(self):
         # seq_lens = [5, 100, 128, 500]
-        seq_lens = [128,]
+        seq_lens = [100,]
         configs = [
             # (2, 16, 16, 64, 64),
             # (2, 16, 1, 64, 64), uncomment this
@@ -132,15 +132,16 @@ class TestWaveAttention(unittest.TestCase):
         # Set up a simple test case
         dtype = torch.float16
         num_heads = 4
-        seq_lens = [64, 128]
+        kv_heads = 1
+        seq_lens = [128, 256]
         max_seq_len = max(seq_lens)
 
         # Create random input tensors
         q = torch.randn(sum(seq_lens), num_heads, head_dim, dtype=dtype, device="cuda")
-        k = torch.randn(sum(seq_lens), num_heads, head_dim, dtype=dtype, device="cuda")
-        v = torch.randn(sum(seq_lens), num_heads, head_dim, dtype=dtype, device="cuda")
+        k = torch.randn(sum(seq_lens), kv_heads, head_dim, dtype=dtype, device="cuda")
+        v = torch.randn(sum(seq_lens), kv_heads, head_dim, dtype=dtype, device="cuda")
         o_triton = torch.zeros(sum(seq_lens), num_heads, head_dim, dtype=dtype, device="cuda")
-        o = torch.zeros(sum(seq_lens), num_heads, head_dim, dtype=torch.float32, device="cuda")
+        o = torch.zeros(sum(seq_lens), num_heads, head_dim, dtype=dtype, device="cuda")
 
         # Create b_start_loc and b_seq_len tensors
         b_start_loc = torch.tensor([0, seq_lens[0]], device="cuda")
@@ -151,11 +152,11 @@ class TestWaveAttention(unittest.TestCase):
         )
         prefill_attention_wave(q, k, v, o, b_start_loc, b_seq_len, max_seq_len, is_causal=is_causal)
         cos_sim = torch.nn.functional.cosine_similarity(
-            o.flatten(), o_triton.to(torch.float32).flatten(), dim=0
+            o.flatten(), o_triton.flatten(), dim=0
         )
 
         print(cos_sim.item())
-        self.assertTrue(torch.allclose(o, o_triton.to(torch.float32), atol=3e-2))
+        self.assertTrue(torch.allclose(o, o_triton, atol=3e-2))
         self.assertTrue(cos_sim.item() > 1 - (1e-5))
 
     def test_context_attention(self):
