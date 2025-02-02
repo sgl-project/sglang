@@ -673,10 +673,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_logits = torch.empty(
                              (
                                 forward_batch.batch_size,
-                                num_local_heads,
+                                self.num_local_heads,
                                 num_kv_split,
                                 self.kv_lora_rank + 1,
-                             ), dtype=torch.float32, device=self.device)
+                             ), dtype=torch.float32, device=q.device)
 
         decode_attention_fwd_normal(
                         q,
