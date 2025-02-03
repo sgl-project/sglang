@@ -82,6 +82,7 @@ sources = [
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
+    "src/sgl-kernel/csrc/fp8_blockwise_gemm_kernel.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
     "src/sgl-kernel/csrc/fused_add_rms_norm_kernel.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
