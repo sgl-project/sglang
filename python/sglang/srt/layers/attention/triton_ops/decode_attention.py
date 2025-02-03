@@ -640,6 +640,9 @@ def decode_attention_fwd(
 ):
     assert num_kv_splits == attn_logits.shape[2]
     kv_group_num = q.shape[1] // v_buffer.shape[1]
+    print ("--> decode_attention_fwd q={}:{}, k_buffer={}:{}, v_buffer={}:{}, o={}:{}".format(q.size(), q.dtype, k_buffer.size(), k_buffer.dtype, v_buffer.size(), v_buffer.dtype, o.size(), o.dtype))
+    print ("req_to_token={}:{}, b_req_idx={}:{}, b_seq_len={}:{}".format(req_to_token.size(), req_to_token.dtype, b_req_idx.size(), b_req_idx.dtype, b_seq_len.size(), b_seq_len.dtype))
+    print ("attn_logits={}:{}, num_kv_splits={}, sm_scale={}, logit_cap={}, kv_num_group={}".format(attn_logits.size(), attn_logits.dtype, num_kv_splits, sm_scale, logit_cap, kv_group_num))
 
     if kv_group_num == 1:
         # MHA

@@ -59,6 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
 from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
+#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
 
 is_hip_ = is_hip()
 
@@ -583,6 +584,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
+        print ("-------------------------------------------")
+        print ("CHAI: Forward absorb kernel ...")
+        
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         if self.w_kc.dtype == torch.float8_e4m3fnuz:
@@ -603,6 +607,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        print ("q={}:{}, latent_cache={}:{}, w_kc={}:{}, w_vc={}:{}".format(q.size(), q.dtype, latent_cache.size(), latent_cache.dtype, self.w_kc.size(), self.w_kc.dtype, self.w_vc.size(), self.w_vc.dtype))
         v_input = latent_cache[..., : self.kv_lora_rank]
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
@@ -610,11 +615,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_pe = k_input[..., self.kv_lora_rank :]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        print ("positions={}:{}, cos_sin_cache={}:{}".format(positions.size(), positions.dtype, self.rotary_emb.cos_sin_cache.size(), self.rotary_emb.cos_sin_cache.dtype))
         q_input[..., self.kv_lora_rank :] = q_pe
         k_input[..., self.kv_lora_rank :] = k_pe
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
+        '''
+                    self.attn_mqa = RadixAttention(
+            self.num_local_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.scaling,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=self.kv_lora_rank,
+        )
+
+        '''
+        print ("num_local_heads={}, kv_lora_rank={}, qk_rope_head_dim={}, scaling={}, num_kv_heads={}, v_head_dim={}".format(self.num_local_heads,
+                    self.kv_lora_rank, self.qk_rope_head_dim, self.scaling, 1, self.kv_lora_rank))
+        print ("attn_output size initial={}:{}".format(attn_output.size(), attn_output.dtype))
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        print ("attn_output size initial={}:{}".format(attn_output.size(), attn_output.dtype))
 
         if self.w_vc.dtype == torch.float8_e4m3fnuz:
             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
@@ -635,8 +656,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        #attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        attn_output = attn_bmm_output.transpose(0, 1)#.flatten(1, 2)
+        print ("attn_output after transpose={}:{}".format(attn_output.size(), attn_output.dtype))
+        attn_output = attn_output.flatten(1, 2)
+        print ("attn_output after flatten={}:{}".format(attn_output.size(), attn_output.dtype))
         output, _ = self.o_proj(attn_output)
+        print ("output shape={}:{}".format(output.size(), output.dtype))
 
         return output
 
@@ -660,7 +686,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        attn_out = torch.empty_like(hidden_states)
+        attn_out = torch.empty((q_len, self.num_local_heads, self.qk_nope_head_dim), dtype=q.dtype, device=q.device) #torch.empty_like(hidden_states)
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         b_req_idx = forward_batch.req_pool_indices
         b_seq_len = forward_batch.seq_lens
@@ -678,12 +704,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                                 num_kv_split,
                                 self.kv_lora_rank + 1,
                              ), dtype=torch.float32, device=q.device)
-
+        print ("----------------------------------------------")
+        print ("CHAI: forward_absorb_fused_mla_kernel q={}:{}, latent_cache={}:{}".format(q.size(), q.dtype, latent_cache.size(), latent_cache.dtype))
+        print ("w_kc={}:{}, w_vc={}:{}, cos_sin_cache={}:{}, positions={}:{}".format(w_kc.size(), w_kc.dtype, w_vc.size(), w_vc.dtype, cos_sin_cache.size(), cos_sin_cache.dtype, positions.size(), positions.dtype))
+        print ("qk_rope_head_dim={}, qk_nope_head_dim={}, attn_out={}:{}".format(self.qk_rope_head_dim, self.qk_nope_head_dim, attn_out.size(), attn_out.dtype))
+        print ("req_to_token={}:{}, b_req_idx={}:{}, b_seq_len={}:{}, attn_logits={}:{}".format(req_to_token.size(), req_to_token.dtype, b_req_idx.size(), b_req_idx.dtype, b_seq_len.size(), b_seq_len.dtype,  attn_logits.size(), attn_logits.dtype))
+        print ("num_kv_splits={}, sm_scale={}, self.w_scale={}".format(num_kv_split, sm_scale, self.w_scale))
+        use_fp8 = True if w_kc.dtype == torch.float8_e4m3fnuz else False
         decode_attention_fwd_normal(
                         q,
                         latent_cache,
-                        w_kc,
-                        w_vc,
+                        w_kc, #.to(dtype=torch.bfloat16),
+                        w_vc, #.to(dtype=torch.bfloat16),
                         cos_sin_cache,
                         positions,
                         self.qk_rope_head_dim,
@@ -694,8 +726,37 @@ class DeepseekV2AttentionMLA(nn.Module):
                         b_seq_len,
                         attn_logits,
                         num_kv_split,
-                        sm_scale)
-        return attn_out
+                        sm_scale,
+                        logit_cap=0.0,)
+                        #fuse_rope=False,
+                        #use_fp8=use_fp8)
+
+        #decode_attention_fwd_normal(
+        #                q,
+        #                latent_cache,
+        #                w_kc,
+        #                w_vc,
+        #                self.w_scale,
+        #                cos_sin_cache,
+        #                positions,
+        #                self.qk_rope_head_dim,
+        #                self.v_head_dim,
+        #                attn_out,
+        #                req_to_token,
+        #                b_req_idx,
+        #                b_seq_len,
+        #                attn_logits,
+        #                num_kv_split,
+        #                sm_scale,
+        #                logit_cap=0.0,)
+        #                #fuse_rope=False,
+        #                #use_fp8=use_fp8)
+
+        attn_out = attn_out.flatten(1, 2)
+        print ("attn_output={}:{}".format(attn_out.size(), attn_out.dtype))
+        output, _ = self.o_proj(attn_out)
+        print ("output={}:{}".format(output.size(), output.dtype))
+        return output #attn_out
         
 def all_gather(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
