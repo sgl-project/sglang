@@ -51,7 +51,6 @@ For general installation instructions, see the official [SGLang Installation Doc
 ### Install from Source
 
 ```bash
-# Use the last release branch
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
