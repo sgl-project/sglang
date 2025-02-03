@@ -117,7 +117,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   // deepseek v3 fused gate module
-  m.def("deepseekv3_fused_gate(Tensor input, Tensor bias, int num_rows) -> (Tensor[])");
+  m.def("deepseekv3_fused_gate(Tensor input, Tensor bias) -> (Tensor[])");
   m.impl("deepseekv3_fused_gate", torch::kCUDA, &deepseekv3_fused_gate);
 
 }

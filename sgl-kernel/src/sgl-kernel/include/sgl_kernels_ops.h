@@ -114,4 +114,4 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
                                       int64_t cuda_stream);
 
 
-std::vector<at::Tensor> deepseekv3_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t n_rows);
+std::vector<at::Tensor> deepseekv3_fused_gate(at::Tensor& input, at::Tensor& bias);
