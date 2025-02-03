@@ -20,13 +20,16 @@ class WaveAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.wave_ops.decode_attention import (
             decode_attention_fwd,
         )
+        from sglang.srt.layers.attention.wave_ops.extend_attention import (
+            extend_attention_wave,
+        )
 
         # TODO: Add support for extend attention
 
         super().__init__()
 
         self.decode_attention_fwd = decode_attention_fwd
-        self.extend_attention_fwd = None
+        self.extend_attention_fwd = extend_attention_wave
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -154,7 +157,6 @@ class WaveAttnBackend(AttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             forward_batch.req_to_token_pool.req_to_token,
@@ -163,8 +165,10 @@ class WaveAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens,
             forward_batch.extend_start_loc,
             max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            # TODO: Add additional parameters for logit_cap and scaling.
+            # layer.scaling,
+            # layer.logit_cap,
         )
         return o
 
