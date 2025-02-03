@@ -711,36 +711,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         print ("req_to_token={}:{}, b_req_idx={}:{}, b_seq_len={}:{}, attn_logits={}:{}".format(req_to_token.size(), req_to_token.dtype, b_req_idx.size(), b_req_idx.dtype, b_seq_len.size(), b_seq_len.dtype,  attn_logits.size(), attn_logits.dtype))
         print ("num_kv_splits={}, sm_scale={}, self.w_scale={}".format(num_kv_split, sm_scale, self.w_scale))
         use_fp8 = True if w_kc.dtype == torch.float8_e4m3fnuz else False
-        decode_attention_fwd_normal(
-                        q,
-                        latent_cache,
-                        w_kc, #.to(dtype=torch.bfloat16),
-                        w_vc, #.to(dtype=torch.bfloat16),
-                        cos_sin_cache,
-                        positions,
-                        self.qk_rope_head_dim,
-                        self.qk_nope_head_dim,
-                        attn_out,
-                        req_to_token,
-                        b_req_idx,
-                        b_seq_len,
-                        attn_logits,
-                        num_kv_split,
-                        sm_scale,
-                        logit_cap=0.0,)
-                        #fuse_rope=False,
-                        #use_fp8=use_fp8)
-
         #decode_attention_fwd_normal(
         #                q,
         #                latent_cache,
-        #                w_kc,
-        #                w_vc,
-        #                self.w_scale,
+        #                w_kc, #.to(dtype=torch.bfloat16),
+        #                w_vc, #.to(dtype=torch.bfloat16),
         #                cos_sin_cache,
         #                positions,
         #                self.qk_rope_head_dim,
-        #                self.v_head_dim,
+        #                self.qk_nope_head_dim,
         #                attn_out,
         #                req_to_token,
         #                b_req_idx,
@@ -751,6 +730,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         #                logit_cap=0.0,)
         #                #fuse_rope=False,
         #                #use_fp8=use_fp8)
+
+        decode_attention_fwd_normal(
+                        q,
+                        latent_cache,
+                        w_kc,
+                        w_vc,
+                        self.w_scale,
+                        cos_sin_cache,
+                        positions,
+                        self.qk_rope_head_dim,
+                        self.v_head_dim,
+                        attn_out,
+                        req_to_token,
+                        b_req_idx,
+                        b_seq_len,
+                        attn_logits,
+                        num_kv_split,
+                        sm_scale,
+                        logit_cap=0.0,)
+                        #fuse_rope=False,
+                        #use_fp8=use_fp8)
 
         attn_out = attn_out.flatten(1, 2)
         print ("attn_output={}:{}".format(attn_out.size(), attn_out.dtype))
