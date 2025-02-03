@@ -18,7 +18,7 @@ pip install torch --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
  ```
 * * * * *
 ## Installation
-Installation guide for FlashInfer and SGLang please refer to [Installation Guide](https://docs.sglang.ai/start/install.html).
+Please refer to [Installation Guide](https://docs.sglang.ai/start/install.html) to install FlashInfer and SGLang.
 * * * * *
 
 Running Inference
