@@ -13,11 +13,11 @@
 
 This document describes how to set up an AMD-based environment for [SGLang](https://docs.sglang.ai). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues) on the SGLang repository.
 
-## System Configuration
+## System Configure
 
 When using AMD GPUs (such as MI300X), certain system-level optimizations help ensure stable performance.
 
-### MI300X Notes
+### MI300X
 
 AMD provides official documentation for MI300X optimization and system tuning:
 
