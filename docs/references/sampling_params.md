@@ -53,26 +53,41 @@ class GenerateReqInput:
 
 ## Sampling params
 
+### TODO
 * `max_new_tokens`: The maximum output length measured in tokens.
 * `stop`: One or multiple [stop words](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#let_the_model_know_when_to_stop). Generation will stop if one of these words is sampled.
 * `stop_token_ids`: Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled.
 * `temperature`: [Temperature](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) when sampling the next token. `temperature = 0` corresponds to greedy sampling, higher temperature leads to more diversity.
-* top_p: [Top-p](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens.
-* top_k: [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens.
-* min_p: [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`.
-* frequency_penalty: TODO
-* presence_penalty: TODO
-* repetition_penalty: TODO
-* min_new_tokens: TODO
-* spaces_between_special_tokens: TODO
-* n: TODO
-* json_schema: TODO
-* regex: TODO
-* ebnf: TODO
-* no_stop_trim: TODO
-* ignore_eos: TODO
-* skip_special_tokens: TODO
-* custom_params: TODO
+* `top_p`: [Top-p](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens.
+* `top_k`: [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens.
+* `min_p`: [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`.
+
+### Penalizers
+
+To use penalizers you will need to `--disable-overlap`.
+
+* `frequency_penalty`: Penalizes token generation based on their occurence count in the preceeding steps.
+* `presence_penalty`: TODO
+* `repetition_penalty`: TODO
+* `min_new_tokens`: TODO
+
+### TODO
+* `spaces_between_special_tokens`: TODO
+* `n`: TODO
+
+### Constrained decoding
+
+Please refer to our dedicated guide on [constrained decoding](https://docs.sglang.ai/backend/structured_outputs.html#Native-API-and-SGLang-Runtime-(SRT)) for the following parameters.
+
+* `json_schema`
+* `regex`
+* `ebnf`
+
+### TODO
+* `no_stop_trim`: TODO
+* `ignore_eos`: TODO
+* `skip_special_tokens`: TODO
+* `custom_params`: TODO
 
 ## Examples
 
