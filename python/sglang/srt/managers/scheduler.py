@@ -963,11 +963,13 @@ class Scheduler:
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
 
-            if req.last_node:
+            if self.enable_hierarchical_cache and req.last_node is not None:
                 if req.last_node.evicted:
                     # loading KV cache for the request
                     req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-                        req.last_node, req.prefix_indices, adder.rem_total_tokens
+                        req.last_node,
+                        req.prefix_indices,
+                        adder.rem_total_tokens,
                     )
                     if req.last_node.loading:
                         # to prevent frequent cache invalidation

@@ -261,8 +261,8 @@ class HiRadixCache(RadixCache):
                     if len(prefix_indices) == 0
                     else torch.cat([prefix_indices, loading_values])
                 )
-                logger.info(
-                    f"load back {len(loading_values)} tokens for {last_node.id}"
+                logger.debug(
+                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
 
             while last_node.evicted:
