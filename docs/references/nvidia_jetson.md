@@ -1,4 +1,4 @@
-# Step-by-Step Guide to Use SGLang on NVIDIA Jetson Orin platform
+# Apply SGLang on NVIDIA Jetson Orin
 
 This is a replicate from https://github.com/shahizat/SGLang-Jetson, thanks to the support from [shahizat](https://github.com/shahizat).
 ## Prerequisites
@@ -19,10 +19,10 @@ pip install torch --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
  ```
 * * * * *
 ## Installation
-Installation guide for FlashInfer and SGLang please refer to [[Installation Guide]](https://docs.sglang.ai/start/install.html)
+Installation guide for FlashInfer and SGLang please refer to [Installation Guide](https://docs.sglang.ai/start/install.html)
 * * * * *
 
-Running Inference with FlashInfer Backend
+Running Inference
 -----------------------------------------
 
 Launch the server:
@@ -35,23 +35,13 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.8 \
   --context-length 8192 
 ```
-The quantization and  limited context length`--dtype half --context-length 8192` are due to the limited computational resources in [Nvidia jetson kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/). \
-`--dtype half` refer to the arg in [server_args.py](https://github.com/sgl-project/sglang/blob/959dca4fc7d720b8885e74761f7b098bed2bdeb7/python/sglang/srt/server_args.py#L347) \
-`--context-length 8192` same as above. 
+The quantization and  limited context length`--dtype half --context-length 8192` are due to the limited computational resources in [Nvidia jetson kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/).
+`--dtype half` refer to the arg in [server_args.py](https://github.com/sgl-project/sglang/blob/959dca4fc7d720b8885e74761f7b098bed2bdeb7/python/sglang/srt/server_args.py#L347) `--context-length 8192` same as above. 
 
-Run a sample inference script:\
-    Create a Python script (e.g., `inference.py`) with the following content:\
-    Please refer to the documentation of [Chat completions in SGLang doc](https://docs.sglang.ai/backend/openai_api_completions.html#Usage)
-
-
-```
-Performance metrics
-```bash
-[2025-01-26 21:32:18 TP0] Decode batch. #running-req: 1, #token: 1351, token usage: 0.01, gen throughput (token/s): 11.19, #queue-req: 0
-```
+After launching the engine, create a Python script (e.g., inference.py) to test the performance. Please refer to the documentation of [Chat completions](https://docs.sglang.ai/backend/openai_api_completions.html#Usage).
 * * * * *
 
-Running Inference with other Attension Backend
+Running Inference with other Attention Backend
 -------------------------------------------
 
 Launch the server:
@@ -82,8 +72,7 @@ python -m sglang.launch_server \
     --context-length 8192 \
     --torchao-config int4wo-128
 ```
-This enables TorchAO's int4 weight-only quantization with 128-group size.
-The usage of `--torchao-config int4wo-128` is a result of memory efficiency. 
+This enables TorchAO's int4 weight-only quantization with a 128-group size. The usage of `--torchao-config int4wo-128` is for memory efficiency.
 
 ```bash
 [2025-01-27 00:06:47 TP0] Decode batch. #running-req: 1, #token: 115, token usage: 0.00, gen throughput (token/s): 30.84, #queue-req:
@@ -92,16 +81,9 @@ The usage of `--torchao-config int4wo-128` is a result of memory efficiency.
 * * * * *
 Structured output with XGrammar
 -------------------------------
-Please refer to [SGLang doc structured output](https://docs.sglang.ai/backend/structured_outputs.html)
+Please refer to [SGLang doc structured output](https://docs.sglang.ai/backend/structured_outputs.html).
 * * * * *
 
 References
 ----------
-
--   [SGLang Official Documentation](https://docs.sglang.ai/index.html)
-
--   [FlashInfer GitHub Repository](https://github.com/flashinfer-ai/flashinfer)
-
--   [SGLang GitHub Repository](https://github.com/sgl-project/sglang)
-
 -   [NVIDIA Jetson AGX Orin Documentation](https://developer.nvidia.com/embedded/jetson-agx-orin)
