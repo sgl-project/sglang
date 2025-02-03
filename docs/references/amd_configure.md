@@ -6,7 +6,7 @@
 - [System Configure](#system-configure)
   - [MI300X](#mi300x)
 - [Installing SGLang](#installing-sglang)
-  - [Install from Source](#install-to-source)
+  - [Install from Source](#install-from-source)
   - [Install Using Docker](#install-using-docker)
 
 ## Introduction
