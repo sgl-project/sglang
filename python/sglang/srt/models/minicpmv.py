@@ -1,6 +1,6 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The vLLM team.
+# Copyright 2023 The SGLang team.
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -20,7 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
-from functools import cached_property, partial
+from functools import partial
 from typing import (
     Any,
     Callable,
@@ -33,16 +33,13 @@ from typing import (
     Union,
 )
 
+import numpy as np
 import torch
 import torch.types
 from PIL import Image
 from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
-from vllm.model_executor.layers.resampler import get_2d_sincos_pos_embed
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
-from vllm.model_executor.models.module_mapping import MultiModelKeys
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 
 from sglang.srt.distributed import divide, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
@@ -61,6 +58,88 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 
 RawImageType = Union[Image.Image, torch.Tensor]
+
+
+# sin/cos positional embedding helpers are adapted from:
+# https://github.com/facebookresearch/mae/blob/efb2a8062c206524e35e47d04501ed4f544c0ae8/util/pos_embed.py#L20
+def get_1d_sincos_pos_embed_from_grid(
+    embed_dim: int, pos: np.ndarray, version: Tuple[int, int] = (2, 0)
+) -> torch.Tensor:
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,) / (H, W)
+    out: (M, D) / (H, W, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega  # (D/2,)
+
+    if version == (2, 0):
+        pos = pos.reshape(-1)  # (M,)
+        out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+        emb_sin = np.sin(out)  # (M, D/2)
+        emb_cos = np.cos(out)  # (M, D/2)
+        emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    else:
+        out = np.einsum("hw,d->hwd", pos, omega)  # (H, W, D/2), outer product
+        emb_sin = np.sin(out)  # (H, W, D/2)
+        emb_cos = np.cos(out)  # (H, W, D/2)
+        emb = np.concatenate([emb_sin, emb_cos], axis=-1)  # (H, W, D)
+    return emb
+
+
+def get_2d_sincos_pos_embed_from_grid(
+    embed_dim: int, grid: np.ndarray, version: Tuple[int, int] = (2, 0)
+) -> torch.Tensor:
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[0], version
+    )  # (H*W, D/2) or (H, W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[1], version
+    )  # (H*W, D/2) or (H, W, D/2)
+
+    if version == (2, 0):
+        emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+    else:
+        emb = np.concatenate([emb_h, emb_w], axis=-1)  # (H, W, D)
+    return emb
+
+
+def get_2d_sincos_pos_embed(
+    embed_dim: int,
+    grid_size: Union[int, Tuple[int, int]],
+    cls_token: bool = False,
+    version: Tuple[int, int] = (2, 0),
+) -> torch.Tensor:
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or
+                [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    if isinstance(grid_size, int):
+        grid_h_size, grid_w_size = grid_size, grid_size
+    else:
+        grid_h_size, grid_w_size = grid_size[0], grid_size[1]
+
+    grid_h = np.arange(grid_h_size, dtype=np.float32)
+    grid_w = np.arange(grid_w_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+    assert isinstance(grid, np.ndarray) and grid.shape == (2, grid_h_size, grid_w_size)
+
+    if version == (2, 0):
+        grid = grid.reshape([2, 1, grid_h_size, grid_w_size])
+        pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid, version)
+        if cls_token:
+            pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    else:
+        pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid, version)
+    return pos_embed
 
 
 class Idefics2VisionMLP(nn.Module):
@@ -116,6 +195,10 @@ class Idefics2EncoderLayer(nn.Module):
             projection_size=config.intermediate_size,
             use_qkv_parallel=True,
             quant_config=quant_config,
+            dropout=config.attention_dropout,
+            use_context_forward=False,
+            use_full_precision_softmax=True,
+            flatten_batch=False,
             prefix=f"{prefix}.self_attn",
         )
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
@@ -126,7 +209,6 @@ class Idefics2EncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """
         Args:
@@ -136,11 +218,8 @@ class Idefics2EncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states,
-            cu_seqlens=cu_seqlens,
-            # , forward_batch=forward_batch
-        )
+        hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens)
+
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
@@ -181,7 +260,6 @@ class Idefics2Encoder(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -195,7 +273,8 @@ class Idefics2Encoder(nn.Module):
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
-                hidden_states, cu_seqlens=cu_seqlens, forward_batch=forward_batch
+                hidden_states,
+                cu_seqlens=cu_seqlens,
             )
             hidden_states = layer_outputs
         return hidden_states
@@ -232,19 +311,14 @@ class Idefics2VisionEmbeddings(nn.Module):
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
-    def forward(
+    def get_position_ids(
         self,
         pixel_values: torch.FloatTensor,
         patch_attention_mask: torch.BoolTensor,
         tgt_sizes: Optional[torch.IntTensor] = None,
-    ) -> torch.Tensor:
+    ):
         batch_size, _, max_im_h, max_im_w = pixel_values.shape
-        target_dtype = self.patch_embedding.weight.dtype
-        pixel_values = pixel_values.to(
-            device=self.patch_embedding.weight.device, dtype=target_dtype
-        )
-        patch_embeds = self.patch_embedding(pixel_values)
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)
+
         max_nb_patches_h, max_nb_patches_w = (
             max_im_h // self.patch_size,
             max_im_w // self.patch_size,
@@ -277,6 +351,24 @@ class Idefics2VisionEmbeddings(nn.Module):
             ).flatten()
             position_ids[batch_idx][p_attn_mask.view(-1).cpu()] = pos_ids
         position_ids = position_ids.to(self.position_embedding.weight.device)
+        return position_ids
+
+    def forward(
+        self,
+        pixel_values: torch.FloatTensor,
+        patch_attention_mask: torch.BoolTensor,
+        tgt_sizes: Optional[torch.IntTensor] = None,
+    ) -> torch.Tensor:
+        target_dtype = self.patch_embedding.weight.dtype
+        pixel_values = pixel_values.to(
+            device=self.patch_embedding.weight.device, dtype=target_dtype
+        )
+        patch_embeds = self.patch_embedding(pixel_values)
+        embeddings = patch_embeds.flatten(2).transpose(1, 2)
+        position_ids = self.get_position_ids(
+            pixel_values, patch_attention_mask, tgt_sizes
+        )
+
         embeddings = embeddings + self.position_embedding(position_ids)
         return embeddings
 
@@ -287,7 +379,6 @@ class Idefics2VisionTransformer(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -302,8 +393,6 @@ class Idefics2VisionTransformer(nn.Module):
 
     def compute_cu_seqlens(self, tgt_sizes: torch.Tensor) -> torch.Tensor:
         patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]  # shape: (batch_size,)
-
-        # 做 prefix sum 来得到 cu_seqlens，注意在最前面插一个 0 作为 offset
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=patch_len.device, dtype=torch.int32),
@@ -316,19 +405,18 @@ class Idefics2VisionTransformer(nn.Module):
     def forward(
         self,
         pixel_values,
-        forward_batch: ForwardBatch,
         patch_attention_mask: Optional[torch.BoolTensor] = None,
         tgt_sizes: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.embeddings(
             pixel_values=pixel_values,
             patch_attention_mask=patch_attention_mask,
-            # forward_batch=forward_batch,
             tgt_sizes=tgt_sizes,
         )
         cu_seqlens = self.compute_cu_seqlens(tgt_sizes)
         encoder_outputs = self.encoder(
-            hidden_states, cu_seqlens=cu_seqlens, forward_batch=forward_batch
+            hidden_states,
+            cu_seqlens=cu_seqlens,
         )
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
@@ -573,14 +661,12 @@ class MiniCPMVBaseModel(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ):
-        # multimodal_config = config.model_config.multimodal_config
         super().__init__()
         # All MiniCPM-V models disable `tie_word_embeddings` but
         # `PretrainedConfig.tie_word_embeddings` defaults to True; we cannot
-        # check `tie_word_embeddings` until vLLM integrate MiniCPM-V model
+        # check `tie_word_embeddings` until SGLang integrate MiniCPM-V model
         # and config class
         self.config = config
-        # self.multimodal_config = multimodal_config
 
         self.version = get_version_by_config(self.config)
         self.llm = self.init_llm(config=config, quant_config=quant_config)
@@ -597,13 +683,6 @@ class MiniCPMVBaseModel(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(config)
-
-    @cached_property
-    def sampler(self):
-        if hasattr(self.llm, "sampler"):
-            return self.llm.sampler
-
-        return get_sampler()
 
     def _get_image_bounds(
         self,
@@ -666,7 +745,6 @@ class MiniCPMVBaseModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         image_inputs: Optional[MiniCPMVImageInputs],
-        forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         vlm_embedding: torch.Tensor = self.llm.get_input_embeddings(input_ids)
 
@@ -680,10 +758,7 @@ class MiniCPMVBaseModel(nn.Module):
                     .to(vlm_embedding.device)
                 )
             else:
-                vision_hidden_states = self.get_vision_hidden_states(
-                    forward_batch, image_inputs
-                )
-
+                vision_hidden_states = self.get_vision_hidden_states(image_inputs)
             # See NOTE in _parse_and_validate_inputs
             image_bounds = image_inputs["image_bounds"]
             if len(image_bounds) > 0:
@@ -693,6 +768,7 @@ class MiniCPMVBaseModel(nn.Module):
                         for start, end in image_bounds.tolist()
                     ]
                 ).to(vlm_embedding.device)
+
                 vlm_embedding.scatter_(
                     0,
                     image_indices.view(-1, 1).repeat(1, vlm_embedding.shape[-1]),
@@ -839,7 +915,7 @@ class MiniCPMVBaseModel(nn.Module):
         # There values are useless because their embeddings will be replaced by vision embeddings anyway.
         input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
-        vlm_embeddings, _ = self.get_embedding(input_ids, image_inputs, forward_batch)
+        vlm_embeddings, _ = self.get_embedding(input_ids, image_inputs)
 
         # always pass the input via `inputs_embeds`
         # to make sure the computation graph is consistent
@@ -855,29 +931,6 @@ class MiniCPMVBaseModel(nn.Module):
 
         return self.logits_processor(
             input_ids, hidden_states, self.llm.lm_head, forward_batch
-        )
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        return self.llm.compute_logits(hidden_states, sampling_metadata)
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
-
-    def get_mm_mapping(self) -> MultiModelKeys:
-        """
-        Get the module prefix in multimodal models
-        """
-        return MultiModelKeys.from_string_field(
-            language_model="llm", connector="resampler", tower_model="vpm"
         )
 
     def init_llm(
@@ -910,9 +963,7 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_vision_hidden_states(
-        self, forward_batch: ForwardBatch, data: MiniCPMVImageInputs
-    ) -> torch.Tensor:
+    def get_vision_hidden_states(self, data: MiniCPMVImageInputs) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -1019,7 +1070,6 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
 
     def get_vision_hidden_states(
         self,
-        forward_batch: ForwardBatch,
         data: MiniCPMVImageInputs,
     ) -> torch.Tensor:
         pixel_values = data["data"]
@@ -1042,15 +1092,18 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         patch_attn_mask = torch.zeros(
             (B, 1, max_patches), dtype=torch.bool, device=device
         )
-        for i in range(B):
-            patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
+
+        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
+        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
+        patch_attn_mask[:, 0, :] = torch.arange(
+            patch_attn_mask.size(2), device=patch_attn_mask.device
+        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
         vision_embedding = self.vpm(
             all_pixel_values.type(dtype),
-            forward_batch=forward_batch,
             patch_attention_mask=patch_attn_mask,
             tgt_sizes=tgt_sizes,
         )
-
         return self.resampler(vision_embedding, tgt_sizes)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
@@ -1138,7 +1191,7 @@ class MiniCPMV:
     """
     Different versions of MiniCPMV use different visual encoders and LLMs,
     which is not conducive to the current integration logic of LoRA and
-    bitsandbytes in vLLM. Therefore, it is necessary to separate them.
+    bitsandbytes in SGLang. Therefore, it is necessary to separate them.
     """
 
     # Ensure that the LoRA support check passes when the class is not

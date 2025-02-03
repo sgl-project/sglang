@@ -1,5 +1,6 @@
 import multiprocessing
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -9,14 +10,8 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 root = Path(__file__).parent.resolve()
 
 
-def _update_wheel_platform_tag():
-    wheel_dir = Path("dist")
-    if wheel_dir.exists() and wheel_dir.is_dir():
-        old_wheel = next(wheel_dir.glob("*.whl"))
-        new_wheel = wheel_dir / old_wheel.name.replace(
-            "linux_x86_64", "manylinux2014_x86_64"
-        )
-        old_wheel.rename(new_wheel)
+if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
+    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
 
 def _get_cuda_version():
@@ -163,5 +158,3 @@ setup(
     },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
-
-_update_wheel_platform_tag()
