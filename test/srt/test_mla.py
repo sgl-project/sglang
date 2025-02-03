@@ -62,7 +62,12 @@ class TestDeepseekV3(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code"],
+            other_args=[
+                "--trust-remote-code",
+                "--enable-torch-compile",
+                "--cuda-graph-max-bs",
+                "2",
+            ],
         )
 
     @classmethod
