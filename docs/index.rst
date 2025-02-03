@@ -66,4 +66,3 @@ The core features include:
    references/nvidia_jetson.md
    references/faq.md
    references/learn_more.md
-

@@ -32,7 +32,7 @@ python -m sglang.launch_server \
   --dtype half \
   --attention-backend flashinfer \
   --mem-fraction-static 0.8 \
-  --context-length 8192 
+  --context-length 8192
 ```
 The quantization and limited context length (`--dtype half --context-length 8192`) are due to the limited computational resources in [Nvidia jetson kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/). A detailed explanation can be found in [Server Arguments](https://docs.sglang.ai/backend/server_arguments.html).
 
