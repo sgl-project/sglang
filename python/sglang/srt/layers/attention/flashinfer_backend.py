@@ -1130,10 +1130,6 @@ def fast_decode_plan(
             raise ValueError(
                 "The size of indices should be less than or equal to the allocated buffer"
             )
-        # Skip these copies
-        # self._paged_kv_indptr_buf.copy_(indptr)
-        # self._paged_kv_indices_buf[: len(indices)] = indices
-        # self._paged_kv_last_page_len_buf.copy_(last_page_len)
     else:
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
