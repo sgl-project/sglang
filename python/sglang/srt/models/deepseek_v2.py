@@ -58,8 +58,8 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
-#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
+#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
+from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
 
 is_hip_ = is_hip()
 
