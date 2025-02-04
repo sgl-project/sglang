@@ -14,6 +14,7 @@
 """Constrained decoding with llguidance backend."""
 
 import os
+import json
 import llguidance
 import llguidance.hf
 import llguidance.torch
@@ -25,6 +26,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.constrained.llguidance_utils import ebnf_to_lark
 
 class GuidanceGrammar(BaseGrammarObject):
     def __init__(self, llguidance_tokenizer: llguidance.LLTokenizer, 
@@ -125,7 +127,15 @@ class GuidanceBackend(BaseGrammarBackend):
             compiler = llguidance.RegexCompiler()
             serialized_grammar = compiler.compile(regex=value)
         elif mode == "ebnf":
-            serialized_grammar = value
+            serialized_grammar = json.dumps(
+                {
+                    "grammars" : [
+                        {
+                            "lark_grammar": ebnf_to_lark(value)
+                        }
+                    ]
+                }
+            )
 
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
