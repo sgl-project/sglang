@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
+import datetime
 
 try:
     from outlines.fsm.json_schema import convert_json_schema_to_str
@@ -913,6 +914,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        date_string=datetime.date.today().strftime("%d %b %Y"),
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -924,6 +926,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        date_string=datetime.date.today().strftime("%d %b %Y"),
                     )
 
                 if assistant_prefix:
