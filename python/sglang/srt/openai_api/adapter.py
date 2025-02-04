@@ -1276,6 +1276,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         choice_logprobs = None
 
                     finish_reason = content["meta_info"]["finish_reason"]
+                    finish_reason_type = finish_reason["type"] if finish_reason else None
 
                     if is_first:
                         # First chunk with role
@@ -1284,7 +1285,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             index=index,
                             delta=DeltaMessage(role="assistant", content=""),
                             finish_reason=(
-                                finish_reason["type"] if finish_reason else ""
+                                None
+                                if finish_reason_type and len(finish_reason_type) == 0
+                                else finish_reason_type,
                             ),
                             matched_stop=(
                                 finish_reason["matched"]
@@ -1316,7 +1319,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                                 index=index,
                                 delta=DeltaMessage(reasoning_content=parse_result.reasoning_text),
                                 finish_reason=(
-                                    finish_reason["type"] if finish_reason else ""
+                                    None
+                                    if finish_reason_type and len(finish_reason_type) == 0
+                                    else finish_reason_type,
                                 ),
                             )
                             chunk = ChatCompletionStreamResponse(
@@ -1344,7 +1349,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                                 index=index,
                                 delta=DeltaMessage(content=normal_text),
                                 finish_reason=(
-                                    finish_reason["type"] if finish_reason else ""
+                                    None
+                                    if finish_reason_type and len(finish_reason_type) == 0
+                                    else finish_reason_type,
                                 ),
                             )
                             chunk = ChatCompletionStreamResponse(
@@ -1413,7 +1420,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             index=index,
                             delta=DeltaMessage(content=delta),
                             finish_reason=(
-                                finish_reason["type"] if finish_reason else ""
+                                None
+                                if finish_reason_type and len(finish_reason_type) == 0
+                                else finish_reason_type,
                             ),
                             matched_stop=(
                                 finish_reason["matched"]
