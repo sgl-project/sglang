@@ -20,13 +20,12 @@ import llguidance.hf
 import llguidance.torch
 import torch
 
-
+from llguidance.gbnf_to_lark import any_to_lark
 from typing import List, Tuple, Optional
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
-from sglang.srt.constrained.llguidance_utils import ebnf_to_lark
 
 class GuidanceGrammar(BaseGrammarObject):
     def __init__(self, llguidance_tokenizer: llguidance.LLTokenizer, 
@@ -131,7 +130,7 @@ class GuidanceBackend(BaseGrammarBackend):
                 {
                     "grammars" : [
                         {
-                            "lark_grammar": ebnf_to_lark(value)
+                            "lark_grammar": any_to_lark(value)
                         }
                     ]
                 }
