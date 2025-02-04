@@ -127,7 +127,9 @@ class TpModelWorkerClient:
             from hip.models.hip_attention.gen3 import HiPMaskRefreshState
 
             # For keeping track of HiP attention mask refresh cycles
-            hip_mask_refresh_state = HiPMaskRefreshState()
+            hip_mask_refresh_state = HiPMaskRefreshState(
+                self.hip_attention_config,
+            )
 
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
@@ -139,7 +141,6 @@ class TpModelWorkerClient:
                     hip_mask_refresh_state.update(
                         model_worker_batch.forward_mode.is_decode(),
                         model_worker_batch.forward_mode.is_extend(),
-                        self.hip_attention_config,
                     )
                 )
 
