@@ -530,6 +530,7 @@ class ModelRunner:
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,
+            lora_backend=self.server_args.lora_backend,
         )
         logger.info("LoRA manager ready.")
 
