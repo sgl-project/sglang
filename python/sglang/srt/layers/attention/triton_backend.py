@@ -36,6 +36,7 @@ class TritonAttnBackend(AttentionBackend):
         self.kv_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -102,7 +103,12 @@ class TritonAttnBackend(AttentionBackend):
         self.cuda_graph_attn_logits = torch.empty(
             (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
             dtype=torch.float32,
-            device="cuda",
+            device=self.device,
+        )
+        self.cuda_graph_kv_indices = torch.zeros(
+            (max_bs * self.cuda_graph_max_seq_len),
+            dtype=torch.int32,
+            device=self.device,
         )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -119,9 +125,25 @@ class TritonAttnBackend(AttentionBackend):
         assert forward_mode.is_decode(), "Not supported"
         assert spec_info is None, "Not supported"
 
+        kv_indptr = self.kv_indptr
+        kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+        kv_indptr = kv_indptr[: bs + 1]
+        kv_indices = self.cuda_graph_kv_indices
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
+
         self.forward_metadata = (
             self.cuda_graph_attn_logits,
             None,
+            kv_indptr,
+            kv_indices,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -137,6 +159,20 @@ class TritonAttnBackend(AttentionBackend):
         # NOTE: encoder_lens expected to be zeros or None
         self.cuda_graph_start_loc.zero_()
         self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
+
+        kv_indptr = self.kv_indptr
+        kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+        kv_indptr = kv_indptr[: bs + 1]
+        kv_indices = self.cuda_graph_kv_indices
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
