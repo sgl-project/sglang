@@ -25,6 +25,12 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 root = Path(__file__).parent.resolve()
 
 
+def is_rocm() -> bool:
+    """Return whether it is HIP on the AMD ROCm platform."""
+    return torch.cuda.is_available() and torch.version.hip is not None
+
+_rocm = is_rocm()
+
 if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
     sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
@@ -144,31 +150,80 @@ cxx_flags = ["-O3"]
 libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
-ext_modules = [
-    CUDAExtension(
-        name="sgl_kernel.ops._kernels",
-        sources=sources,
-        include_dirs=include_dirs,
-        extra_compile_args={
-            "nvcc": nvcc_flags,
-            "cxx": cxx_flags,
-        },
-        libraries=libraries,
-        extra_link_args=extra_link_args,
-        py_limited_api=True,
-    ),
-]
+if not _rocm:
+    ext_modules = [
+        CUDAExtension(
+            name="sgl_kernel.ops._kernels",
+            sources=sources,
+            include_dirs=include_dirs,
+            extra_compile_args={
+                "nvcc": nvcc_flags,
+                "cxx": cxx_flags,
+            },
+            libraries=libraries,
+            extra_link_args=extra_link_args,
+            py_limited_api=True,
+        ),
+    ]
 
-setup(
-    name="sgl-kernel",
-    version=_get_version(),
-    packages=find_packages(),
-    package_dir={"": "src"},
-    ext_modules=ext_modules,
-    cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=True, max_jobs=multiprocessing.cpu_count()
-        )
-    },
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
-)
+    setup(
+        name="sgl-kernel",
+        version=_get_version(),
+        packages=find_packages(),
+        package_dir={"": "src"},
+        ext_modules=ext_modules,
+        cmdclass={
+            "build_ext": BuildExtension.with_options(
+                use_ninja=True, max_jobs=multiprocessing.cpu_count()
+            )
+        },
+        options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    )
+
+else:
+    # ROCm/HIP block
+    hipcc_flags = [
+        "-DNDEBUG",
+        f"-DOPERATOR_NAMESPACE={operator_namespace}",
+        "-O3",
+        "-Xcompiler",
+        "-fPIC",
+        "-std=c++17",
+        "-D__HIP_PLATFORM_AMD__=1",
+        "--amdgpu-target=gfx942",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+    ]
+    setup(
+        name="sgl-kernel",
+        version=_get_version(),
+        packages=find_packages(),
+        package_dir={"": "src"},
+        ext_modules=[
+            CUDAExtension(
+                name="sgl_kernel.ops._kernels",
+                sources=[
+                    "src/sgl-kernel/torch_extension_rocm.cc",
+                    "src/sgl-kernel/csrc/moe_align_kernel.cu",
+                ],
+                include_dirs=[
+                    root / "src" / "sgl-kernel" / "include",
+                    root / "src" / "sgl-kernel" / "csrc",
+                ],
+                extra_compile_args={
+                    "nvcc": hipcc_flags,
+                    "cxx": ["-O3"],
+                },
+                libraries=["hiprtc", "amdhip64", "c10", "torch", "torch_python"],
+                extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+                py_limited_api=True,
+            ),
+        ],
+        cmdclass={
+            "build_ext": BuildExtension.with_options(
+                use_ninja=True, max_jobs=multiprocessing.cpu_count()
+            )
+        },
+        options={"bdist_wheel": {"py_limited_api": "cp39"}},
+        install_requires=["torch"],
+    )

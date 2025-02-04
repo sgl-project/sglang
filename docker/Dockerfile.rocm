@@ -28,6 +28,9 @@ RUN git clone ${SGL_REPO} \
          echo "Using ${SGL_BRANCH} branch."; \
          git checkout ${SGL_BRANCH}; \
        fi \
+    && cd sgl-kernel \
+    && python setup.py install \
+    && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip]"; \
        else \
