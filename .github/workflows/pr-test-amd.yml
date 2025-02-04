@@ -22,7 +22,7 @@ jobs:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: linux-mi300-gpu-1
     container:
-      image: lmsysorg/sglang:v0.4.1.post7-rocm620
+      image: henryx/haisgl:v0.4.2.post2-rocm630
       options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -33,6 +33,9 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
+          cd sgl-kernel
+          python3 setup_rocm.py install
+          cd ..
           pip install -e "python[dev_hip]"
 
           git clone https://github.com/merrymercy/human-eval.git
@@ -49,7 +52,7 @@ jobs:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-2
     container:
-      image: lmsysorg/sglang:v0.4.1.post7-rocm620
+      image: henryx/haisgl:v0.4.2.post2-rocm630
       options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -60,6 +63,9 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
+          cd sgl-kernel
+          python3 setup_rocm.py install
+          cd ..
           pip install -e "python[dev_hip]"
 
           git clone https://github.com/merrymercy/human-eval.git
