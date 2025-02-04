@@ -73,10 +73,6 @@ def extend_attention_wave(
 
     assert shape.num_query_heads % shape.num_kv_heads == 0
 
-    # Transose the V tensor.
-    v_extend_t = v_extend.permute(1, 2, 0)
-    v_buffer_t = v_buffer.permute(1, 2, 0)
-
     # Run the wave kernel.
     mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
     (
@@ -87,10 +83,10 @@ def extend_attention_wave(
         mfma_variant,
         q_extend.shape,
         k_extend.shape,
-        v_extend_t.shape,
+        v_extend.shape,
         req_to_tokens.shape,
         k_buffer.shape,
-        v_buffer_t.shape,
+        v_buffer.shape,
         output.shape,
         input_dtype=q_extend.dtype,
         output_dtype=output.dtype,
@@ -113,13 +109,12 @@ def extend_attention_wave(
         use_scheduling_barriers=False,
     ):
         # TODO: Add scaling of QK as part of kernel.
-        # TODO: Add variant of non-transposed V attention kernel.
         mb = extend_attention(
             q_extend * dk_sqrt * log2e,
             k_extend,
-            v_extend_t,
+            v_extend,
             k_buffer,
-            v_buffer_t,
+            v_buffer,
             req_to_tokens,
             b_req_idx,
             b_seq_len,
