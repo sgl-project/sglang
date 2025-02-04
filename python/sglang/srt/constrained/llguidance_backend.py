@@ -129,15 +129,8 @@ class GuidanceBackend(BaseGrammarBackend):
             compiler = llguidance.RegexCompiler()
             serialized_grammar = compiler.compile(regex=value)
         elif mode == "ebnf":
-            serialized_grammar = json.dumps(
-                {
-                    "grammars" : [
-                        {
-                            "lark_grammar": any_to_lark(value)
-                        }
-                    ]
-                }
-            )
+            compiler = llguidance.LarkCompiler()
+            serialized_grammar = compiler.compile(any_to_lark(value))
 
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
