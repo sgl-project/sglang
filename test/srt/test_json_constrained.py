@@ -1,6 +1,7 @@
 """
 python3 -m unittest test_json_constrained.TestJSONConstrainedOutlinesBackend.test_json_generate
 python3 -m unittest test_json_constrained.TestJSONConstrainedXGrammarBackend.test_json_generate
+python3 -m unittest test_json_constrained.TestJSONConstrainedLLGuidanceBackend.test_json_generate
 """
 
 import json
@@ -30,6 +31,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
                 "population": {"type": "integer"},
             },
             "required": ["name", "population"],
+            "additionalProperties": False
         }
     )
 
@@ -143,6 +145,12 @@ class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, backend="xgrammar", disable_overlap=False)
+        cls.check_jump_forward = False
+
+class TestJSONConstrainedLLGuidanceBackend(TestJSONConstrainedOutlinesBackend):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="llguidance", disable_overlap=False)
         cls.check_jump_forward = False
 
 
