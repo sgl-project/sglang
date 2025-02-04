@@ -6,7 +6,7 @@ You can install SGLang using any of the methods below.
 ```
 pip install --upgrade pip
 pip install sgl-kernel --force-reinstall --no-deps
-pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
+pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
 ```
 
 Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
@@ -19,7 +19,7 @@ cd sglang
 
 pip install --upgrade pip
 pip install sgl-kernel --force-reinstall --no-deps
-pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
+pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
 ```
 
 Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions. If you meet with issue like **ImportError: cannot import name `_grouped_size_compiled_for_decode_kernels`**, installing FlashInfer with some older version like 0.1.6 instead of the latest version could solve it.
