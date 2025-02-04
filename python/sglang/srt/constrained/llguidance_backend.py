@@ -122,7 +122,8 @@ class GuidanceBackend(BaseGrammarBackend):
             compiler = llguidance.JsonCompiler(whitespace_flexible=self.whitespace_flexible)
             serialized_grammar = compiler.compile(json_schema)
         elif mode == "regex":
-            serialized_grammar = value
+            compiler = llguidance.RegexCompiler()
+            serialized_grammar = compiler.compile(regex=value)
         elif mode == "ebnf":
             serialized_grammar = value
 
