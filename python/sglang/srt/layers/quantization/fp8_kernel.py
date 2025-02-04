@@ -219,6 +219,7 @@ def _w8a8_block_fp8_matmul(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 @triton.jit
 def _w8a8_block_fp8_matmul_unrolledx4(
     # Pointers to inputs and output
@@ -450,7 +451,9 @@ def w8a8_block_fp8_matmul(
         )
 
     # Use manually unrolledx4 kernel on AMD GPU.
-    kernel = _w8a8_block_fp8_matmul_unrolledx4 if is_hip_ == True else _w8a8_block_fp8_matmul
+    kernel = (
+        _w8a8_block_fp8_matmul_unrolledx4 if is_hip_ == True else _w8a8_block_fp8_matmul
+    )
 
     kernel[grid](
         A,
