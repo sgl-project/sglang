@@ -4,7 +4,6 @@ It is the low-level endpoint of the runtime.
 If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](https://docs.sglang.ai/backend/openai_api_completions.html).
 
 ## `/generate` Endpoint
-*SV: Maybe we can put this either into [native api docs](https://docs.sglang.ai/backend/native_api.html#) or make a dedicated section on it. For now we leave it here.*
 
 The `/generate` endpoint accepts the following arguments in the JSON format.
 
@@ -53,7 +52,8 @@ class GenerateReqInput:
 
 ## Sampling params
 
-### TODO
+### Basic Sampling Parameters
+
 * `max_new_tokens`: The maximum output length measured in tokens.
 * `stop`: One or multiple [stop words](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#let_the_model_know_when_to_stop). Generation will stop if one of these words is sampled.
 * `stop_token_ids`: Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled.
@@ -64,16 +64,16 @@ class GenerateReqInput:
 
 ### Penalizers
 
-To use penalizers you will need to `--disable-overlap`.
+To use penalizers you will need to `--disable-overlap`. Please note that this might degrade performance.
 
-* `frequency_penalty`: Penalizes token generation based on their occurence count in the preceeding steps.
-* `presence_penalty`: TODO
-* `repetition_penalty`: TODO
-* `min_new_tokens`: TODO
+* `frequency_penalty`: Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token.
+* `presence_penalty`: Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occured.
+* `repetition_penalty`: Penalizes tokens if they appeared in prompt or generation so far. Must be between `0` and `2` where numbers smaller than `1` encourage repeatment of tokens and numbers larger than `2` encourages sampling of new tokens. The penalization scales multiplicatively.
+* `min_new_tokens`: Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior for example if the distribution is highly skewed towards these tokens.
 
 ### TODO
-* `spaces_between_special_tokens`: TODO
-* `n`: TODO
+* `spaces_between_special_tokens`: Whether or not to add spaces between special tokens during detokenization.
+* `n`: `TODO`
 
 ### Constrained decoding
 
@@ -83,11 +83,11 @@ Please refer to our dedicated guide on [constrained decoding](https://docs.sglan
 * `regex`
 * `ebnf`
 
-### TODO
-* `no_stop_trim`: TODO
-* `ignore_eos`: TODO
-* `skip_special_tokens`: TODO
-* `custom_params`: TODO
+### Other options
+* `no_stop_trim`: ?
+* `ignore_eos`: Don't stop generation when EOS token is sampled.
+* `skip_special_tokens`: Remove special tokens during decoding.
+* `custom_params`: Used when employing `CustomLogitProcessor`. For usage see below.
 
 ## Examples
 
