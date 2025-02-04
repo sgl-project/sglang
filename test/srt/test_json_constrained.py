@@ -31,7 +31,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
                 "population": {"type": "integer"},
             },
             "required": ["name", "population"],
-            "additionalProperties": False
+            "additionalProperties": False,
         }
     )
 
@@ -146,6 +146,7 @@ class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
     def setUpClass(cls):
         setup_class(cls, backend="xgrammar", disable_overlap=False)
         cls.check_jump_forward = False
+
 
 class TestJSONConstrainedLLGuidanceBackend(TestJSONConstrainedOutlinesBackend):
     @classmethod
