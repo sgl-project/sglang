@@ -69,6 +69,7 @@ class EagleDraftInput:
         accept_length_cpu = batch.spec_info.accept_length_cpu
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
+        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         seq_lens_cpu = batch.seq_lens.tolist()
 
         pt = 0
@@ -353,8 +354,12 @@ class EagleVerifyInput:
             ]
             if has_finished:
                 draft_input.seq_lens_for_draft_extend = batch.seq_lens[unfinished_index]
+                draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices[
+                    unfinished_index
+                ]
             else:
                 draft_input.seq_lens_for_draft_extend = batch.seq_lens
+                draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
 
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         return (
