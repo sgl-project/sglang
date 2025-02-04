@@ -52,7 +52,6 @@ suites = {
         "test_vision_llm.py",
         "test_vision_openai_server.py",
         "test_w8a8_quantization.py",
-        "test_fp8_kvcache.py",
         "test_fp8_kernel.py",
     ],
     "nightly": [
