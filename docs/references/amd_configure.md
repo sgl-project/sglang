@@ -26,7 +26,7 @@ AMD provides official documentation for MI300X optimization and system tuning:
   - [AMD Instinct MI300X System Optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html)
   - [AMD Instinct MI300X Workload Optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html)
 
-> **Tip:** We strongly recommend reading the entire `System Optimization` guide to fully configure your system.
+> **NOTE:** We strongly recommend reading the entire `System Optimization` guide to fully configure your system.
 
 Below are a few key settings to confirm or enable:
 
@@ -61,15 +61,13 @@ pip install -e "python[all_hip]"
 
 ### Install Using Docker
 
-> **NOTE:** Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens)
-
-1. Build the Docker Image
+1. Build the docker image.
 
 ```bash
 docker build -t sglang_image -f Dockerfile.rocm .
 ```
 
-2. Create a Convenient Alias
+2. Create a convenient alias.
 
 ```bash
 alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/dri \
@@ -79,7 +77,9 @@ alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/d
     -v /data:/data'
 ```
 
-3. Launch the Server
+3. Launch the server.
+
+> **NOTE:** Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens)
 
 ```bash
 drun -p 30000:30000 \
@@ -92,7 +92,7 @@ drun -p 30000:30000 \
     --port 30000
 ```
 
-4. In a Different Terminal, Run a Benchmark
+4. To verify the utility, you can run a benchmark in another terminal.
 
 ```bash
 drun sglang_image \
