@@ -13,23 +13,26 @@
 # ==============================================================================
 """Constrained decoding with llguidance backend."""
 
-import os
 import json
+import os
+from typing import List, Optional, Tuple
+
 import llguidance
 import llguidance.hf
 import llguidance.torch
 import torch
-
 from llguidance.gbnf_to_lark import any_to_lark
-from typing import List, Tuple, Optional
+
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
 
+
 class GuidanceGrammar(BaseGrammarObject):
-    def __init__(self, llguidance_tokenizer: llguidance.LLTokenizer, 
-                        serialized_grammar: str):
+    def __init__(
+        self, llguidance_tokenizer: llguidance.LLTokenizer, serialized_grammar: str
+    ):
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
         self.ll_interpreter = llguidance.LLInterpreter(
@@ -49,12 +52,12 @@ class GuidanceGrammar(BaseGrammarObject):
             ff_tokens = self.pending_ff_tokens
             self.pending_ff_tokens = []
             return (ff_tokens, s)
-            
+
         return None
-    
+
     def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
         return "", -1
-    
+
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
     ):
@@ -78,25 +81,27 @@ class GuidanceGrammar(BaseGrammarObject):
 
         if self.ll_interpreter.has_pending_stop():
             self.finished = True
-            
+
         llguidance.torch.fill_next_token_bitmask(self.ll_interpreter, vocab_mask, idx)
-        
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
         if self.bitmask is None or self.bitmask.shape[0] < batch_size:
             # only create bitmask when batch gets larger
-            self.bitmask = llguidance.torch.allocate_token_bitmask(batch_size, self.llguidance_tokenizer.vocab_size)
+            self.bitmask = llguidance.torch.allocate_token_bitmask(
+                batch_size, self.llguidance_tokenizer.vocab_size
+            )
             bitmask = self.bitmask
         else:
             bitmask = self.bitmask[:batch_size]
 
         return bitmask
-    
+
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return vocab_mask.to(device, non_blocking=True)
-    
+
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         llguidance.torch.apply_token_bitmask_inplace(logits, vocab_mask)
@@ -104,26 +109,27 @@ class GuidanceGrammar(BaseGrammarObject):
     def copy(self):
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
-            serialized_grammar=self.serialized_grammar
+            serialized_grammar=self.serialized_grammar,
         )
 
+
 class GuidanceBackend(BaseGrammarBackend):
-    def __init__(
-        self,
-        tokenizer,
-        whitespace_pattern: Optional[str] = None
-    ):
+    def __init__(self, tokenizer, whitespace_pattern: Optional[str] = None):
         super().__init__()
 
         self.tokenizer = tokenizer
-        self.whitespace_flexible = True if whitespace_pattern == "whitespace_flexible" else False
+        self.whitespace_flexible = (
+            True if whitespace_pattern == "whitespace_flexible" else False
+        )
         self.llguidance_tokenizer = llguidance.hf.from_tokenizer(self.tokenizer, None)
 
     def init_value_impl(self, key: Tuple[str, str]) -> GuidanceGrammar:
         mode, value = key
         if mode == "json":
             json_schema = value
-            compiler = llguidance.JsonCompiler(whitespace_flexible=self.whitespace_flexible)
+            compiler = llguidance.JsonCompiler(
+                whitespace_flexible=self.whitespace_flexible
+            )
             serialized_grammar = compiler.compile(json_schema)
         elif mode == "regex":
             compiler = llguidance.RegexCompiler()
@@ -134,7 +140,5 @@ class GuidanceBackend(BaseGrammarBackend):
 
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
-            serialized_grammar=serialized_grammar
+            serialized_grammar=serialized_grammar,
         )
-
-        

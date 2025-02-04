@@ -237,6 +237,7 @@ class TestEBNFConstrained(unittest.TestCase):
             n=3,
         )
 
+
 class TestEBNFConstrainedLLGuidance(TestEBNFConstrained):
     @classmethod
     def setUpClass(cls):

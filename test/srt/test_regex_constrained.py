@@ -183,10 +183,12 @@ class TestJumpForward(TestRegexConstrained):
         setup_class(cls, "xgrammar", disable_overlap=True)
         cls.check_jump_forward = True
 
+
 class TestRegexConstrainedLLGuidance(TestRegexConstrained):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, "llguidance", disable_overlap=True)
+
 
 if __name__ == "__main__":
     unittest.main()

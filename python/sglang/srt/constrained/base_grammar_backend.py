@@ -89,8 +89,10 @@ def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
     elif server_args.grammar_backend == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 
-        grammar_backend = GuidanceBackend(tokenizer=tokenizer, 
-                                          whitespace_pattern=server_args.constrained_json_whitespace_pattern)
+        grammar_backend = GuidanceBackend(
+            tokenizer=tokenizer,
+            whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+        )
     else:
         raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
 
