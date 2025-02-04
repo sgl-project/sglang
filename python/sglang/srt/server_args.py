@@ -1006,17 +1006,17 @@ class PortArgs:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
                 dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
-            elif server_args.dist_init_addr.startswith('['): # ipv6 address
+            elif server_args.dist_init_addr.startswith("["):  # ipv6 address
                 # extract host and port from ipv6 address
                 addr = server_args.dist_init_addr
-                end = addr.find(']')
+                end = addr.find("]")
                 if end == -1:
                     raise ValueError("Invalid IPv6 address format: missing ']'")
-                host = addr[:end+1]
+                host = addr[: end + 1]
                 port = None
                 # check if : is provided after ]
-                if len(addr) > end + 1 and addr[end+1] == ':':
-                    port = addr[end+2:]
+                if len(addr) > end + 1 and addr[end + 1] == ":":
+                    port = addr[end + 2 :]
                 dist_init_addr = (host, port)
             else:
                 dist_init_addr = server_args.dist_init_addr.split(":")
