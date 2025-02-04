@@ -29,6 +29,7 @@ def is_rocm() -> bool:
     """Return whether it is HIP on the AMD ROCm platform."""
     return torch.cuda.is_available() and torch.version.hip is not None
 
+
 _rocm = is_rocm()
 
 if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
