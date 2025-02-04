@@ -314,7 +314,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                         custom_mask_buf=self.cuda_graph_custom_mask,
-                        qk_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
