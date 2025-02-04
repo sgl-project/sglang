@@ -32,7 +32,9 @@ git clone -b v0.4.2.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
-pip install sgl-kernel --force-reinstall --no-deps
+cd sgl-kernel
+python setup_rocm.py install
+cd ..
 pip install -e "python[all_hip]"
 ```
 
