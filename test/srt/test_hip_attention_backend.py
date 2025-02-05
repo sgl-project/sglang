@@ -126,19 +126,19 @@ class TestHiPAttnBackend(unittest.TestCase):
         self._measure_latency([])
 
     def test_latency_offload(self):
-        self._measure_latency(["--enable-hip-offload"])
+        self._measure_latency(["--enable-hip-offload", "--max-running-request", "1"])
 
     def test_mmlu(self):
         self._measure_mmlu([])
 
     def test_mmlu_offload(self):
-        self._measure_mmlu(["--enable-hip-offload"])
+        self._measure_mmlu(["--enable-hip-offload", "--max-running-request", "1"])
 
     def test_passkey(self):
         self._run_passkey([])
 
     def test_passkey_offload(self):
-        self._run_passkey(["--enable-hip-offload"])
+        self._run_passkey(["--enable-hip-offload", "--max-running-request", "1"])
 
 
 if __name__ == "__main__":
