@@ -2,7 +2,7 @@
 
 ## Generative Models
 - Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2
-- Mistral / Mixtral / Mistral NeMo
+- Mistral / Mixtral / Mistral NeMo / Mistral Small 3
 - Gemma / Gemma 2
 - Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL
 - DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
@@ -78,6 +78,7 @@ Another valuable resource is the [vLLM Models Directory](https://github.com/vllm
 To port a model from vLLM to SGLang, you can compare these two files [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama.py) and [vLLM Llama Implementation](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py). This comparison will help you understand how to convert a model implementation from vLLM to SGLang. The major difference is the replacement of Attention with RadixAttention. The other parts are almost identical. Specifically,
   - Replace vllm's `Attention` with `RadixAttention`. Note that you need to pass `layer_id` all the way to `RadixAttention`.
   - Replace vllm's `LogitsProcessor` with SGLang's `LogitsProcessor`.
+  - Replace Multi-headed `Attention` of ViT with SGLang's `VisionAttention`.
   - Replace other vLLM layers with SGLang layers (e.g., `RMSNorm`, `SiluAndMul`).
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.

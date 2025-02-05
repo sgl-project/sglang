@@ -1,8 +1,8 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.2 -t v0.4.2-rocm620 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.2.post1 -t v0.4.2.post1-rocm630 -f Dockerfile.rocm .
 
 # default base image
-ARG BASE_IMAGE="rocmshared/vllm-rocm:20250114-tuned-elementwise-layernorm"
+ARG BASE_IMAGE="rocm/vllm-dev:20250114"
 
 FROM $BASE_IMAGE AS base
 USER root
@@ -28,6 +28,9 @@ RUN git clone ${SGL_REPO} \
          echo "Using ${SGL_BRANCH} branch."; \
          git checkout ${SGL_BRANCH}; \
        fi \
+    && cd sgl-kernel \
+    && python setup_rocm.py install \
+    && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip]"; \
        else \
@@ -58,6 +61,7 @@ RUN git clone ${ATER_REPO} \
 # Performance environment variable.
 
 ENV HIP_FORCE_DEV_KERNARG=1
+ENV HSA_NO_SCRATCH_RECLAIM=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV NCCL_MIN_NCHANNELS=112
