@@ -57,6 +57,7 @@ The core features include:
    references/sampling_params.md
    references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
+   references/accuracy_evaluation.md
    references/custom_chat_template.md
    references/deepseek.md
    references/llama_405B.md
