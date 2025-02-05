@@ -216,6 +216,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             correction_bias,
         )
 
+    def forward_hpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        return moe_forward_native(
+            layer,
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            custom_routing_function,
+            correction_bias,
+            activation,
+        )
+
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 

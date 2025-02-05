@@ -1063,9 +1063,10 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         try:
             major, minor = torch.hpu.get_device_capability(device_id)
         except Exception as e:
-            raise RuntimeError(
-                f"An error occurred while getting device capability of hpu: {e}."
-            ) from e
+            pass
+            # raise RuntimeError(
+            #     f"An error occurred while getting device capability of hpu: {e}."
+            # ) from e
 
     return major, minor
 

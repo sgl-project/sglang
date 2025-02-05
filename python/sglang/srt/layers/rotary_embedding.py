@@ -1254,7 +1254,7 @@ def get_rope_wrapper(
     partial_rotary_factor: float = 1.0,
     device: Optional[str] = None,
 ):
-    if device != "cpu":
+    if device != "cpu" and device != "hpu":
         return get_rope(
             head_size,
             rotary_dim,

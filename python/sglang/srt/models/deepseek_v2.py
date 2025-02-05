@@ -461,13 +461,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:

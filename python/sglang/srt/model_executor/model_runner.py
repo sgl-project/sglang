@@ -109,7 +109,7 @@ class ModelRunner:
             and not self.server_args.disable_mla
         ):
             # TODO: add MLA optimization on CPU
-            if self.server_args.device != "cpu":
+            if self.server_args.device != "cpu" and self.server_args.device != "hpu":
                 logger.info("MLA optimization is turned on. Use triton backend.")
                 self.server_args.attention_backend = "triton"
 

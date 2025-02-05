@@ -3,6 +3,7 @@ from torch import nn
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 _is_rocm = torch.cuda.is_available() and torch.version.hip
+_is_hpu = torch.hpu.is_available() # TODO torch.version.hpu is not supported
 
 
 class CustomOp(nn.Module):
@@ -36,5 +37,7 @@ class CustomOp(nn.Module):
             return self.forward_cuda
         elif _is_rocm:
             return self.forward_hip
+        elif _is_hpu:
+            return self.forward_hpu
         else:
             return self.forward_native
