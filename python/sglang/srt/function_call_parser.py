@@ -388,6 +388,12 @@ class MistralDetector(BaseFormatDetector):
 
 
 class Llama32Detector(BaseFormatDetector):
+    """
+    Detector for Llama 3.2 models.
+    Assumes function call format:
+      <|python_tag|>{"name":"xxx", "arguments":{...}}
+    """
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<|python_tag|>"
