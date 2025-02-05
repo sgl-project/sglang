@@ -57,6 +57,9 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
+        bs = forward_batch.batch_size
+        kv_indptr = self.kv_indptr
+
         if forward_batch.forward_mode.is_decode():
             attn_logits = torch.empty(
                 (
@@ -71,8 +74,6 @@ class TritonAttnBackend(AttentionBackend):
 
             max_extend_len = None
 
-            kv_indptr = self.kv_indptr
-            bs = forward_batch.batch_size
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
@@ -91,8 +92,6 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = None
             custom_mask = None
         else:
-            kv_indptr = self.kv_indptr
-            bs = forward_batch.batch_size
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
             )
