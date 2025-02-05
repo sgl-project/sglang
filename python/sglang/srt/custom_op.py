@@ -20,7 +20,7 @@ class CustomOp(nn.Module):
         raise NotImplementedError
 
     def forward_hip(self, *args, **kwargs):
-        return self.forward_native(*args, **kwargs)
+        return self.forward_cuda(*args, **kwargs)
 
     def forward_xpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
