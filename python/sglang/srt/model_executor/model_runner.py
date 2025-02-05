@@ -133,7 +133,6 @@ class ModelRunner:
         elif server_args.enable_hip_attention:
             logger.info("HIP attention is turned on.")
             server_args.attention_backend = "hip_attention"
-            self.init_hip_attention_config(server_args.hip_attention_config)
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
@@ -682,7 +681,7 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=torch.device(self.gpu_id),
-                hip_config=self.hip_attention_config,
+                hip_config=self.server_args.hip_attention_config,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -705,7 +704,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 context_length=self.model_config.context_len,
                 device=self.device,
-                hip_config=self.hip_attention_config,
+                hip_config=self.server_args.hip_attention_config,
             )
 
         logger.info(
@@ -764,18 +763,6 @@ class ModelRunner:
                 .contiguous()
                 .cuda()
             )
-
-    def init_hip_attention_config(self, hip_attention_config):
-        from hip.models.hip_attention.gen3 import HiPAttentionConfig
-
-        if hip_attention_config is None:
-            hip_attention_config = {}
-        elif hip_attention_config.startswith("{"):
-            hip_attention_config = json.loads(hip_attention_config)
-        else:
-            with open(hip_attention_config, "r") as f:
-                hip_attention_config = json.load(f)
-        self.hip_attention_config = HiPAttentionConfig(parsed_json=hip_attention_config)
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""

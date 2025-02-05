@@ -13,12 +13,14 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import logging
 import random
 import tempfile
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -33,6 +35,9 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+
+if TYPE_CHECKING:
+    from hip.models.hip_attention.gen3 import HiPAttentionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +117,7 @@ class ServerArgs:
 
     # HiP Attention
     enable_hip_attention: bool = False
-    hip_attention_config: str = None
+    hip_attention_config: Optional[HiPAttentionConfig] = None
 
     # HiP Attention Offload
     enable_hip_offload: bool = False
@@ -951,6 +956,14 @@ class ServerArgs:
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+
+        if args.enable_hip_attention:
+            from hip.models.hip_attention.gen3 import HiPAttentionConfig
+
+            args.hip_attention_config = HiPAttentionConfig(
+                json_or_path=args.hip_attention_config
+            )
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 

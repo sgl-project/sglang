@@ -75,7 +75,7 @@ class TpModelWorkerClient:
         # Init hip attention config
         self.hip_attention_config = None
         if server_args.enable_hip_attention:
-            self.hip_attention_config = self.worker.model_runner.hip_attention_config
+            self.hip_attention_config = self.worker.model_runner.server_args.hip_attention_config
 
         # Launch threads
         self.input_queue = Queue()

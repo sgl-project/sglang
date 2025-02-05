@@ -120,7 +120,7 @@ class CudaGraphRunner:
         self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
         self.enable_hip_attention = self.model_runner.server_args.enable_hip_attention
         if self.enable_hip_attention:
-            self.hip_config = self.model_runner.hip_attention_config
+            self.hip_config = self.model_runner.server_args.hip_attention_config
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.server_args.dp_size
 

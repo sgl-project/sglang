@@ -33,7 +33,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
         self.forward_paged_hip = forward_paged_hip
 
-        self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config
+        self.hip_config: HiPAttentionConfig = model_runner.server_args.hip_attention_config
         self.is_offload_enabled = model_runner.server_args.enable_hip_offload
 
         self.max_context_len = model_runner.model_config.context_len
