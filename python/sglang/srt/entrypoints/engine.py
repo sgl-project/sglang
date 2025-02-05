@@ -316,8 +316,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
-            "flashinfer",
-            "0.1.6",
+            "flashinfer_python",
+            "0.2.0.post2",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",

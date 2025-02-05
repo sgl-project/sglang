@@ -8,6 +8,7 @@ suites = {
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
+        "models/test_lora_backend.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
         "sampling/penaltylib",
@@ -51,7 +52,6 @@ suites = {
         "test_vision_llm.py",
         "test_vision_openai_server.py",
         "test_w8a8_quantization.py",
-        "test_fp8_kvcache.py",
         "test_fp8_kernel.py",
     ],
     "nightly": [

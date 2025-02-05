@@ -79,11 +79,13 @@ __global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected
 )
 
 
-def build_tree_kernel(parent_list, top_score_index, seq_lens, topk, depth, draft_token):
+def build_tree_kernel(
+    parent_list, top_score_index, seq_lens, seq_lens_sum, topk, depth, draft_token
+):
     bs = seq_lens.numel()
     device = parent_list.device
     tree_mask = torch.full(
-        (torch.sum(seq_lens).item() * draft_token + draft_token * draft_token * bs,),
+        (seq_lens_sum * draft_token + draft_token * draft_token * bs,),
         True,
         device=device,
     )

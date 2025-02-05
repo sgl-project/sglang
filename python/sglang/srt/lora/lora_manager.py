@@ -20,15 +20,13 @@ import re
 
 import torch
 
-from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
+from sglang.srt.lora.backend import FlashInferLoraBackend, TritonLoraBackend
+from sglang.srt.lora.lora import LoRAAdapter, LoraBatchInfo, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_flashinfer_available, replace_submodule
 
 logger = logging.getLogger(__name__)
-
-if is_flashinfer_available():
-    from flashinfer import SegmentGEMMWrapper
 
 
 def get_module_name(name):
@@ -77,6 +75,20 @@ def get_stacked_name(name):
     return params_mapping.get(name, (name, name))
 
 
+def get_backend_from_name(name):
+    backend_mapping = {
+        "triton": TritonLoraBackend,
+        "flashinfer": FlashInferLoraBackend,
+    }
+
+    if name in backend_mapping:
+        return backend_mapping[name]
+
+    raise Exception(
+        f"No supported lora backend called {name}. It should be one of {list(backend_mapping.keys())}"
+    )
+
+
 def get_layer_id(name):
     match = re.search(r"layers\.(\d+)\.", name)
     if match is None:
@@ -93,6 +105,7 @@ class LoRAManager:
         max_loras_per_batch,
         load_config,
         dtype,
+        lora_backend,
     ):
         self.base_model = base_model
         self.lora_paths = lora_paths
@@ -101,8 +114,9 @@ class LoRAManager:
         self.load_config = load_config
         self.dtype = dtype
 
-        workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
-        self.segment_gemm = SegmentGEMMWrapper(workspace_buffer)
+        logger.info(f"Using {lora_backend} as backend of Lora kernels.")
+        backend_type = get_backend_from_name(lora_backend)
+        self.lora_backend = backend_type(lora_backend)
 
         self.init_loras()
         self.init_lora_memory_pool()
@@ -123,7 +137,7 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(
-            module, self.segment_gemm, self.max_lora_dim, self.scaling
+            module, self.max_lora_dim, self.scaling, self.lora_backend
         )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
@@ -162,7 +176,11 @@ class LoRAManager:
             self.lora_id[name] = len(self.loras)
             self.loras.append(
                 LoRAAdapter(
-                    name, self.configs[name], self.base_hf_config, self.load_config
+                    name,
+                    self.configs[name],
+                    self.base_hf_config,
+                    self.load_config,
+                    self.lora_backend,
                 )
             )
             self.loras[-1].initialize_weights()
@@ -226,8 +244,9 @@ class LoRAManager:
                 self.B_buffer[module_B] = [
                     torch.empty(
                         (
+                            c,
                             self.max_loras_per_batch,
-                            hidden_dim_B * c,
+                            hidden_dim_B,
                             self.max_lora_dim,
                         ),
                         dtype=self.dtype,
@@ -263,7 +282,16 @@ class LoRAManager:
                 else:
                     lora_weight_name = self.get_weight_name(name, 1)
                     if lora_weight_name:
-                        self.B_buffer[lora_weight_name][i][buffer_id].copy_(weights)
+                        c = self.loras[-1].get_stacked_multiply(lora_weight_name)
+                        if c > 1:
+                            for j in range(c):
+                                self.B_buffer[lora_weight_name][i][j][buffer_id].copy_(
+                                    weights[j]
+                                )
+                        else:
+                            self.B_buffer[lora_weight_name][i][0][buffer_id].copy_(
+                                weights
+                            )
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # load active loras into lora memory pool
@@ -292,20 +320,30 @@ class LoRAManager:
         if cur_uids == set([None]):
             return
 
-        # setup lora in forward modules
+        # set up batch info shared by all lora moruldes
         bs = forward_batch.batch_size
         seg_lens = (
             forward_batch.extend_seq_lens
             if forward_batch.forward_mode.is_extend()
             else torch.ones(bs, device="cuda")
         )
-        # FIXME: reuse the data rather than recompute
         seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+        max_len = int(torch.max(seg_lens))
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.buffer_id[lora_path]
 
+        batch_info = LoraBatchInfo(
+            bs=bs,
+            seg_lens=seg_lens,
+            seg_indptr=seg_indptr,
+            max_len=max_len,
+            weight_indices=weight_indices,
+        )
+        self.lora_backend.set_batch_info(batch_info)
+
+        # call set_lora_info for each lora modules
         for module_name, module in self.lora_modules:
             layer_id = get_layer_id(module_name)
 
@@ -314,16 +352,10 @@ class LoRAManager:
                 module.set_lora_info(
                     self.A_buffer[weight_name][layer_id],
                     self.B_buffer[weight_name][layer_id],
-                    bs,
-                    seg_indptr,
-                    weight_indices,
                 )
             else:
                 module.set_lora_info(
                     self.A_buffer["qkv_proj"][layer_id],
                     self.B_buffer["q_proj"][layer_id],
                     self.B_buffer["kv_proj"][layer_id],
-                    bs,
-                    seg_indptr,
-                    weight_indices,
                 )
