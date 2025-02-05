@@ -162,6 +162,9 @@ class CudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
+        self.enable_hip_attention = model_runner.server_args.enable_hip_attention
+        if self.enable_hip_attention:
+            self.hip_config = model_runner.server_args.hip_attention_config
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
 
