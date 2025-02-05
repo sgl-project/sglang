@@ -49,6 +49,8 @@ def _fwd_kernel(
     qo_indptr,
     kv_indptr,
     kv_indices,
+    mask_ptr,
+    mask_offsets,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -71,6 +73,7 @@ def _fwd_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_CUSTOM_MASK: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -81,6 +84,10 @@ def _fwd_kernel(
     cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
     cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
     cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+    cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+
+    if USE_CUSTOM_MASK:
+        cur_seq_mask_start_idx = tl.load(mask_offsets + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -152,7 +159,20 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
+        if USE_CUSTOM_MASK:
+            custom_mask = tl.load(
+                mask_ptr
+                + cur_seq_mask_start_idx
+                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
+                + start_n
+                + offs_n[None, :],
+                mask=(mask_m[:, None] & mask_n[None, :]),
+                other=0,
+            )
+            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(custom_mask, qk, float("-inf"))
+        else:
+            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -172,7 +192,7 @@ def _fwd_kernel(
 
         e_max = n_e_max
 
-    # stage 2: compute the trianlge part
+    # stage 2: compute the triangle part
 
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):
@@ -208,11 +228,25 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
-            start_n + offs_n[None, :]
-        )
-        mask_causual &= mask_m[:, None] & mask_n[None, :]
-        qk = tl.where(mask_causual, qk, float("-inf"))
+        if USE_CUSTOM_MASK:
+            custom_mask = tl.load(
+                mask_ptr
+                + cur_seq_mask_start_idx
+                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
+                + cur_seq_len_prefix
+                + start_n
+                + offs_n[None, :],
+                mask=(mask_m[:, None] & mask_n[None, :]),
+                other=0,
+            )
+            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(custom_mask, qk, float("-inf"))
+        else:
+            mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
+                start_n + offs_n[None, :]
+            )
+            mask_causual &= mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(mask_causual, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -253,6 +287,8 @@ def extend_attention_fwd(
     qo_indptr,
     kv_indptr,
     kv_indices,
+    custom_mask,
+    mask_offsets,
     max_len_extend,
     sm_scale=None,
     logit_cap=0.0,
@@ -308,6 +344,8 @@ def extend_attention_fwd(
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
+    USE_CUSTOM_MASK = custom_mask is not None
+
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 
@@ -325,6 +363,8 @@ def extend_attention_fwd(
         qo_indptr,
         kv_indptr,
         kv_indices,
+        custom_mask,
+        mask_offsets,
         sm_scale,
         kv_group_num,
         q_extend.stride(0),
@@ -347,6 +387,7 @@ def extend_attention_fwd(
         BLOCK_N=BLOCK_N,
         Lq=Lq,
         Lv=Lv,
+        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
