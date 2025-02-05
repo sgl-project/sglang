@@ -693,8 +693,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                              ), dtype=torch.float32, device=q.device)
 
         ## get previous latent cached_buffer.
-        latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
         forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
+        latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
 
         decode_attention_fwd_normal(
                         q,
