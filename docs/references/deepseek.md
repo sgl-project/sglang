@@ -2,22 +2,31 @@
 
 SGLang provides several optimizations specifically designed for the DeepSeek model to boost its inference speed. This document outlines current optimizations for DeepSeek. Additionally, the SGLang team is actively developing enhancements for [DeepSeek-V3](https://github.com/sgl-project/sglang/issues/2591).
 
-## Use DeepSeek_V3 on SGLang
+## Launch DeepSeek_V3 with SGLang
 SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
 
 ### Install and Launch
-Please refer to [DeepSeek_V3 install](https://github.com/sgl-project/sglang/blob/7ab84948d87d2c264cccc4ae8c1db339b9efea6a/docs/backend/server_arguments.md) for installation.
+Please refer to [DeepSeek_V3 install](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch) for installation.
 
 ### Launch with One node
 ```bash
 # launching one node
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr <host>:<port>
 ```
+Replace `<host>` and `<port>` with your server's hostname and port number.
 ### Multi-node
 Please refer to [multi_node](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node.md) for help.
 
 ### Do not use quantization
 Deepseek V3 is already in FP8. So we should not run it with  `--quantization fp8 --kv-cache-dtype fp8_e5m2`
+
+## Launch DeepSeek_R1 with SGLang
+```bash
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1 --tp 8 --trust-remote-code
+```
+It worth to notice that `--enable-dp-attention` can be useful optimisations for both Deepseek_V3 and DeepSeek_R1 for [parallelism-attention](https://github.com/sgl-project/sglang/blob/main/docs/references/deepseek.md#data-parallelism-attention).
+## Example: Serving with two H200*8 nodes and docker
+Please refer to [deepseek_v3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h2008-nodes-and-docker) benchmark.
 
 ## Optimisations
 ### Multi-head Latent Attention (MLA) Throughput Optimizations
