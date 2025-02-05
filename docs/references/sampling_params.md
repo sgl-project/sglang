@@ -1,58 +1,33 @@
 # Sampling Parameters in SGLang Runtime
+
 This doc describes the sampling parameters of the SGLang Runtime.
 It is the low-level endpoint of the runtime.
 If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](https://docs.sglang.ai/backend/openai_api_completions.html).
 
 ## `/generate` Endpoint
 
-The `/generate` endpoint accepts the following arguments in the JSON format.
+The `/generate` endpoint accepts the following parameters in JSON format. For in detail usage see the [native api doc](https://docs.sglang.ai/backend/native_api.html).
 
-```python
-@dataclass
-class GenerateReqInput:
-    # The input prompt. It can be a single prompt or a batch of prompts.
-    text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # The image input. It can be a file name, a url, or base64 encoded string.
-    # See also python/sglang/srt/utils.py:load_image.
-    image_data: Optional[Union[List[str], str]] = None
-    # The sampling_params. See descriptions below.
-    sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
-    # Whether to return logprobs.
-    return_logprob: Optional[Union[List[bool], bool]] = None
-    # If return logprobs, the start location in the prompt for returning logprobs.
-    # By default, this value is "-1", which means it will only return logprobs for output tokens.
-    logprob_start_len: Optional[Union[List[int], int]] = None
-    # If return logprobs, the number of top logprobs to return at each position.
-    top_logprobs_num: Optional[Union[List[int], int]] = None
-    # Whether to detokenize tokens in text in the returned logprobs.
-    return_text_in_logprobs: bool = False
-    # Whether to stream output.
-    stream: bool = False
-    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
-    log_metrics: bool = True
-
-    # The modalities of the image data [image, multi-images, video]
-    modalities: Optional[List[str]] = None
-    # LoRA related
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-
-    # Session info for continual prompting
-    session_params: Optional[Union[List[Dict], Dict]] = None
-    # Custom logit processor for advanced sampling control. Must be a serialized instance
-    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
-    # Use the processor's `to_str()` method to generate the serialized string.
-    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
-```
+* `text`: The input prompt. Can be a single prompt or a batch of prompts.
+* `input_ids`: Alternative to `text`. Specify the input as token IDs instead of text.
+* `input_embeds`: Alternative to `text` and `input_ids`. Specify the input as embeddings.
+* `image_data`: Image input as a file path, URL, base64 string, raw bytes, or video frame.
+* `sampling_params`: The sampling parameters as described in the sections below.
+* `rid`: Request identifier.
+* `return_logprob`: Whether to return log probabilities for tokens.
+* `logprob_start_len`: If returning log probabilities, specifies the start position in the prompt. Default is "-1" which returns logprobs only for output tokens.
+* `top_logprobs_num`: If returning log probabilities, specifies the number of top logprobs to return at each position.
+* `return_text_in_logprobs`: Whether to include decoded text alongside token IDs in logprob outputs.
+* `stream`: Whether to stream the output.
+* `log_metrics`: Whether to log metrics for this request.
+* `modalities`: The modalities of the image data. Can be `image`, `multi-images`, or `video`.
+* `lora_path`: Path to LoRA weights.
+* `session_params`: Session information, controls multi-turn conversation state.
+* `custom_logit_processor`: Custom logit processor for advanced sampling control. For usage see below.
 
 ## Sampling params
 
-### Basic Sampling Parameters
+### Core Parameters
 
 * `max_new_tokens`: The maximum output length measured in tokens.
 * `stop`: One or multiple [stop words](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#let_the_model_know_when_to_stop). Generation will stop if one of these words is sampled.
@@ -71,10 +46,6 @@ To use penalizers you will need to `--disable-overlap`. Please note that this mi
 * `repetition_penalty`: Penalizes tokens if they appeared in prompt or generation so far. Must be between `0` and `2` where numbers smaller than `1` encourage repeatment of tokens and numbers larger than `2` encourages sampling of new tokens. The penalization scales multiplicatively.
 * `min_new_tokens`: Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior for example if the distribution is highly skewed towards these tokens.
 
-### TODO
-* `spaces_between_special_tokens`: Whether or not to add spaces between special tokens during detokenization.
-* `n`: `TODO`
-
 ### Constrained decoding
 
 Please refer to our dedicated guide on [constrained decoding](https://docs.sglang.ai/backend/structured_outputs.html#Native-API-and-SGLang-Runtime-(SRT)) for the following parameters.
@@ -84,25 +55,14 @@ Please refer to our dedicated guide on [constrained decoding](https://docs.sglan
 * `ebnf`
 
 ### Other options
-* `no_stop_trim`: ?
+
+* `n`: ?
+* `spaces_between_special_tokens`: Whether or not to add spaces between special tokens during detokenization.
+* `no_stop_trim`: Don't trim stop words or EOS token from the generated text.
 * `ignore_eos`: Don't stop generation when EOS token is sampled.
 * `skip_special_tokens`: Remove special tokens during decoding.
 * `custom_params`: Used when employing `CustomLogitProcessor`. For usage see below.
 
-## Examples
-
-### Normal
-*SV: This is described in  [native api doc](https://docs.sglang.ai/backend/native_api.html#).*
-
-### Streaming
-*SV: This section should be potentially moved to [native api doc](https://docs.sglang.ai/backend/native_api.html#) or have a section on its own.*
-
-### Multi modal
-
-*SV: This section should be potentially moved to [native api doc](https://docs.sglang.ai/backend/native_api.html#) or have a section on its own.*
-
-### Structured Outputs (JSON, Regex, EBNF)
-*SV: This section can be deleted, we have it in [structured outputs](https://docs.sglang.ai/backend/structured_outputs.html).*
 
 ### Custom Logit Processor
 Launch a server with `--enable-custom-logit-processor` flag on.
@@ -111,6 +71,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 
 Define a custom logit processor that will always sample a specific token id.
+
 ```python
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 
@@ -133,6 +94,7 @@ class DeterministicLogitProcessor(CustomLogitProcessor):
 ```
 
 Send a request
+
 ```python
 import requests
 
