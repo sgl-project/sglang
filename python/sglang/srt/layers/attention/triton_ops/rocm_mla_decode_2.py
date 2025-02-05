@@ -448,6 +448,7 @@ def decode_attention_fwd_normal(
     kv_cache,
     w_kc,
     w_vc,
+    w_scale,
     cos_sin_cache,
     positions,
     rotary_dim,
@@ -460,8 +461,7 @@ def decode_attention_fwd_normal(
     num_kv_splits,
     sm_scale,
     logit_cap=0.0,
-    fuse_rope=False,
-    use_fp8=False,
+    fuse_rope=False
 ):
 
     kv_lora_rank = w_kc.shape[-1]
@@ -469,60 +469,71 @@ def decode_attention_fwd_normal(
     qk_rope_head_dim = kv_cache.shape[-1] - kv_lora_rank
     q_nope, q_rope = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
 
-    q_nope, q_nope_descale, w_kc, w_kc_descale, w_vc, w_vc_descale = quantize_input_fp8(q_nope, w_kc, w_vc, use_fp8)
+    is_fp8_w_kc = w_kc.dtype == torch.float8_e4m3fnuz
+    is_fp8_w_vc = w_vc.dtype == torch.float8_e4m3fnuz
+
+    if is_fp8_w_kc:
+        q_nope, q_nope_scale = input_to_float8(q_nope)
+    else:
+        q_nope_scale = None
+
+    _decode_att_m_fwd(q_nope, q_rope, kv_cache, attn_logits, w_kc, cos_sin_cache, positions, rotary_dim, q_nope_scale, w_scale, req_to_token, b_req_idx, b_seq_len, num_kv_splits, sm_scale,
+                      logit_cap, fuse_rope, is_fp8_w_kc)
+
+    _decode_softmax_reducev_fwd(attn_logits, w_vc, q, o, w_scale, v_head_dim, b_seq_len, num_kv_splits, is_fp8_w_vc)
 
 
-    _decode_att_m_fwd(q_nope, q_rope, kv_cache, attn_logits, w_kc, cos_sin_cache, positions, rotary_dim, q_nope_descale, w_kc_descale, req_to_token, b_req_idx, b_seq_len, num_kv_splits, sm_scale,
-                      logit_cap, fuse_rope, use_fp8)
+def attn_mqa(q_input, k_input, v_input, Req_to_tokens, B_req_idx, B_Seqlen, num_kv_splits, sm_scale, logit_cap):
+    #from utils.sglang_ref import decode_attention_fwd_normal as decode_attention_fwd_normal_ref
+    from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd_normal as decode_attention_fwd_normal_ref
+    B, H = q_input.shape[0], q_input.shape[1]
+    kv_lora_rank = v_input.shape[-1]
+    device = q_input.device
 
-    _decode_softmax_reducev_fwd(attn_logits, w_vc, q, o, w_vc_descale, v_head_dim, b_seq_len, num_kv_splits, use_fp8)
+    o = torch.empty((*q_input.shape[:-1], v_input.shape[-1]), dtype=q_input.dtype, device=q_input.device)
+    attn_logits = torch.empty(B, H, num_kv_splits, kv_lora_rank + 1, dtype=q_input.dtype, device=device)
+    decode_attention_fwd_normal_ref(q_input, k_input, v_input, o, Req_to_tokens, B_req_idx, B_Seqlen, attn_logits,
+                                    num_kv_splits, sm_scale, logit_cap)
+    return o, attn_logits
 
-#
-#def attn_mqa(q_input, k_input, v_input, Req_to_tokens, B_req_idx, B_Seqlen, num_kv_splits, sm_scale, logit_cap):
-#    #from utils.sglang_ref import decode_attention_fwd_normal as decode_attention_fwd_normal_ref
-#    from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd_normal as decode_attention_fwd_normal_ref
-#    B, H = q_input.shape[0], q_input.shape[1]
-#    kv_lora_rank = v_input.shape[-1]
-#    device = q_input.device
-#
-#    o = torch.empty((*q_input.shape[:-1], v_input.shape[-1]), dtype=q_input.dtype, device=q_input.device)
-#    attn_logits = torch.empty(B, H, num_kv_splits, kv_lora_rank + 1, dtype=q_input.dtype, device=device)
-#    decode_attention_fwd_normal_ref(q_input, k_input, v_input, o, Req_to_tokens, B_req_idx, B_Seqlen, attn_logits,
-#                                    num_kv_splits, sm_scale, logit_cap)
-#    return o, attn_logits
-#
 
-#def input_helper(B, H, S, D, kv_lora_rank, qk_rope_head_dim, num_kv_splits, dtype, device, rope_base=10, rope_max_seq_len=16324, rope_scaling=1.0):
-#    Req_to_tokens = torch.arange(B * S, device=device).reshape(B, S)
-#    B_req_idx = torch.arange(B, device=device)
-#    B_Seqlen = torch.full((B, ), S, device=device)
-#
-#    q = torch.randn(B, H, D + qk_rope_head_dim, dtype=dtype, device=device)
-#    kv_cache = torch.randn(B * S, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
-#    # v = k[:,:kv_lora_rank]
-#
-#    att_out = torch.empty(B, H, D, dtype=dtype, device=device)
-#    attn_logits = torch.empty(B, H, num_kv_splits, kv_lora_rank + 1, dtype=dtype, device=device)
-#
-#    w_kc = torch.randn(H, D, kv_lora_rank, dtype=dtype, device=device)
-#    w_vc = torch.randn(H, kv_lora_rank, D, dtype=dtype, device=device)
-#
-#
-#    rotary_dim = qk_rope_head_dim
-#    rotary_emb = DeepseekScalingRotaryEmbedding(
-#            qk_rope_head_dim,
-#            rotary_dim,
-#            rope_max_seq_len,
-#            rope_base,
-#            True,
-#            rope_scaling,
-#            q.dtype,
-#            device=device,
-#        )
-#
-#    positions = torch.tensor([S], device=device).unsqueeze(0).repeat(B, 1) # k positions and q position as last
-#
-#    return Req_to_tokens, B_req_idx, B_Seqlen, q, kv_cache, att_out, attn_logits, w_kc, w_vc, rotary_dim, rotary_emb, positions
+def input_helper(B, H, S, D, kv_lora_rank, qk_rope_head_dim, num_kv_splits, dtype, device, rope_base=10, rope_max_seq_len=16324, rope_scaling=1.0, use_fp8=False):
+    Req_to_tokens = torch.arange(B * S, device=device).reshape(B, S)
+    B_req_idx = torch.arange(B, device=device)
+    B_Seqlen = torch.full((B, ), S, device=device)
+
+    q = torch.randn(B, H, D + qk_rope_head_dim, dtype=dtype, device=device)
+    kv_cache = torch.randn(B * S, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
+    # v = k[:,:kv_lora_rank]
+
+    att_out = torch.empty(B, H, D, dtype=dtype, device=device)
+    attn_logits = torch.empty(B, H, num_kv_splits, kv_lora_rank + 1, dtype=dtype, device=device)
+
+    # w_kc = torch.randn(H, D, kv_lora_rank, dtype=dtype, device=device)
+    # w_vc = torch.randn(H, kv_lora_rank, D, dtype=dtype, device=device)
+
+    w = torch.randn(H, D, kv_lora_rank * 2, dtype=dtype, device=device)
+
+    if use_fp8:
+        w, w_scale = input_to_float8(w)
+        w_kc, w_vc = torch.split(w, kv_lora_rank, dim=2)
+        w_vc = w_vc.permute([0, 2, 1])
+
+    rotary_dim = qk_rope_head_dim
+    rotary_emb = DeepseekScalingRotaryEmbedding(
+            qk_rope_head_dim,
+            rotary_dim,
+            rope_max_seq_len,
+            rope_base,
+            True,
+            rope_scaling,
+            q.dtype,
+            device=device,
+        )
+
+    positions = torch.tensor([S], device=device).unsqueeze(0).repeat(B, 1) # k positions and q position as last
+
+    return Req_to_tokens, B_req_idx, B_Seqlen, q, kv_cache, att_out, attn_logits, w_kc, w_vc, w_scale, rotary_dim, rotary_emb, positions
 
 
 def input_to_float8(x, dtype=torch.float8_e4m3fnuz):
@@ -533,29 +544,19 @@ def input_to_float8(x, dtype=torch.float8_e4m3fnuz):
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal().item()
 
 
-def quantize_input_fp8(q, w_kc, w_vc, use_fp8):
-    q_descale = w_kc_descale = w_vc_descale = None
-
-    if use_fp8:
-        q, q_descale = input_to_float8(q)
-        w_kc, w_kc_descale = input_to_float8(w_kc)
-        w_vc, w_vc_descale = input_to_float8(w_vc)
-
-    return q, q_descale, w_kc, w_kc_descale, w_vc, w_vc_descale
-
 @pytest.mark.parametrize('B, H, S, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim', [
     (8, 128, 2048, 512, 128, 64),
 ])
 @pytest.mark.parametrize('fuse_rope', [False])
 @pytest.mark.parametrize('use_fp8', [False, True])
-@pytest.mark.parametrize('dtype', [torch.float16, torch.float32])
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 def test_op_fwd(B, H, S, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, fuse_rope, use_fp8, dtype, num_kv_splits=2, sm_scale=1.0, logit_cap=0.0,
                 device="cuda"):
     torch.manual_seed(0)
 
     D = qk_nope_head_dim
-    Req_to_tokens, B_req_idx, B_Seqlen, q, kv_cache, att_out, attn_logits, w_kc, w_vc, rotary_dim, rotary_emb, positions = input_helper(
-        B, H, S, D, kv_lora_rank, qk_rope_head_dim, num_kv_splits, dtype, device)
+    Req_to_tokens, B_req_idx, B_Seqlen, q, kv_cache, att_out, attn_logits, w_kc, w_vc, w_scale, rotary_dim, rotary_emb, positions = input_helper(
+        B, H, S, D, kv_lora_rank, qk_rope_head_dim, num_kv_splits, dtype, device, use_fp8=use_fp8)
 
     # Initialize additional parameters
 
@@ -564,6 +565,7 @@ def test_op_fwd(B, H, S, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, fuse_
                     kv_cache,
                     w_kc,
                     w_vc,
+                    w_scale,
                     rotary_emb.cos_sin_cache,
                     positions,
                     rotary_dim,
@@ -576,16 +578,18 @@ def test_op_fwd(B, H, S, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, fuse_
                     num_kv_splits,
                     sm_scale,
                     logit_cap=0.0,
-                    fuse_rope=fuse_rope,
-                    use_fp8=use_fp8
+                    fuse_rope=fuse_rope
                 )
 
     tri_output, tri_logits = att_out, attn_logits  # .flatten(1,2)
 
     # reference
     k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
-    ref_output, ref_logits = ref_compute(q, k_input, v_input, w_kc, w_vc, Req_to_tokens, B_req_idx, B_Seqlen, num_kv_splits, sm_scale,
-                                  logit_cap, rotary_emb, positions,  rope_fused=fuse_rope, use_fp8=use_fp8, device="cuda")
+    ref_output, ref_logits = ref_compute(q, k_input, v_input, w_kc, w_vc, w_scale, Req_to_tokens, B_req_idx, B_Seqlen, num_kv_splits, sm_scale,
+                                  logit_cap, rotary_emb, positions,  rope_fused=fuse_rope, device="cuda")
+
+    print(f"ref: {ref_logits[2, 35, 1, 488:]}") # to debug the rope, check last split
+    print(f"tri: {tri_logits[2, 35, 1, 488:]}")
 
     print("first 10 logits:")
     print(f"ref: {ref_logits[:,:,-1].flatten()[:]}") # to debug the rope, check last split
@@ -607,7 +611,7 @@ def ref_preprocess(kv_cache, kv_lora_rank):
     k_input[..., :kv_lora_rank] = v_input
     return k_input, v_input
 
-def ref_compute(q, k_input, v_input, w_kc, w_vc, Req_to_tokens, B_req_idx, B_Seqlen, num_kv_splits, sm_scale, logit_cap, rotary_emb, positions, rope_fused=False, use_fp8=False,
+def ref_compute(q, k_input, v_input, w_kc, w_vc, w_scale, Req_to_tokens, B_req_idx, B_Seqlen, num_kv_splits, sm_scale, logit_cap, rotary_emb, positions, rope_fused=False,
              device="cuda"):
 
     B, H = q.shape[0], q.shape[1]
@@ -618,12 +622,12 @@ def ref_compute(q, k_input, v_input, w_kc, w_vc, Req_to_tokens, B_req_idx, B_Seq
 
     q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(device)
     q_nope, q_pe = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
-    q_nope, q_nope_descale, w_kc, w_kc_descale, w_vc, w_vc_descale = quantize_input_fp8(q_nope, w_kc, w_vc, use_fp8)
 
-    if use_fp8:
+    if w_kc.dtype == torch.float8_e4m3fnuz:
+        q_nope, q_nope_scale = input_to_float8(q_nope)
         q_nope_out = torch.bmm(q_nope.transpose(0, 1).float(), w_kc.float())
-        q_nope_out *= q_nope_descale
-        q_nope_out *= w_kc_descale
+        q_nope_out *= q_nope_scale
+        q_nope_out *= w_scale
         q_nope_out = q_nope_out.to(q.dtype)
     else:
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), w_kc)
@@ -643,12 +647,11 @@ def ref_compute(q, k_input, v_input, w_kc, w_vc, Req_to_tokens, B_req_idx, B_Seq
 
     attn_output = attn_output.view(-1, H, kv_lora_rank)
 
-    if use_fp8:
-        attn_output, attn_output_descale = input_to_float8(attn_output)
-
+    if w_vc.dtype == torch.float8_e4m3fnuz:
+        attn_output, attn_output_scale = input_to_float8(attn_output)
         attn_bmm_output = torch.bmm(attn_output.transpose(0, 1).float(), w_vc.float())
-        attn_bmm_output *= attn_output_descale
-        attn_bmm_output *= w_vc_descale
+        attn_bmm_output *= attn_output_scale
+        attn_bmm_output *= w_scale
         attn_bmm_output = attn_bmm_output.to(q.dtype)
     else:
         attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), w_vc)
@@ -663,7 +666,6 @@ def benchmark(args):
     fp8_gemm = args.fp8_gemm
     dtype = arg_to_torch_dtype[args.dtype]
     configs = []
-
 
     x_vals_list = [(1, 128, 2048, 512, 128, 64, 8)]
     x_names = ["B", "H", "S", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "num_kv_splits"]

@@ -58,7 +58,8 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
+#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
+from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
 
 is_hip_ = is_hip()
 
@@ -583,6 +584,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
+        
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         if self.w_kc.dtype == torch.float8_e4m3fnuz:
@@ -658,9 +660,20 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        attn_out = torch.empty_like(hidden_states)
+        v_input = latent_cache[..., : self.kv_lora_rank]
+        v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
+        k_input = latent_cache.unsqueeze(1)
+        k_input[..., : self.kv_lora_rank] = v_input
+        k_pe = k_input[..., self.kv_lora_rank :]
+
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q_input[..., self.kv_lora_rank :] = q_pe
+        k_input[..., self.kv_lora_rank :] = k_pe
+
+        attn_out = torch.empty((q_len, self.num_local_heads, self.qk_nope_head_dim), dtype=q.dtype, device=q.device) #torch.empty_like(hidden_states)
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         b_req_idx = forward_batch.req_pool_indices
         b_seq_len = forward_batch.seq_lens
@@ -679,23 +692,34 @@ class DeepseekV2AttentionMLA(nn.Module):
                                 self.kv_lora_rank + 1,
                              ), dtype=torch.float32, device=q.device)
 
+        ## get previous latent cached_buffer.
+        forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
+        latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
+
         decode_attention_fwd_normal(
                         q,
-                        latent_cache,
+                        latent_cache_buf,
                         w_kc,
                         w_vc,
+                        self.w_scale.item(),
                         cos_sin_cache,
                         positions,
                         self.qk_rope_head_dim,
-                        self.qk_nope_head_dim,
+                        self.v_head_dim,
                         attn_out,
                         req_to_token,
                         b_req_idx,
                         b_seq_len,
                         attn_logits,
                         num_kv_split,
-                        sm_scale)
-        return attn_out
+                        sm_scale,
+                        logit_cap=0.0)
+                        #fuse_rope=False,
+                        #use_fp8=use_fp8)
+
+        attn_out = attn_out.flatten(1, 2)
+        output, _ = self.o_proj(attn_out)
+        return output #attn_out
         
 def all_gather(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
