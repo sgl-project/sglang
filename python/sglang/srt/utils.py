@@ -1251,8 +1251,6 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
         x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
     elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
         x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
-    elif x.dtype == torch.int32 or x.dtype == torch.uint32:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 8), 4, 2)
     else:
         return x_
 

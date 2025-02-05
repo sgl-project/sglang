@@ -456,7 +456,7 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.int32
+            params_dtype = torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
