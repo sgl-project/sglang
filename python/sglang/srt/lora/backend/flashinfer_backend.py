@@ -1,10 +1,13 @@
 from typing import Tuple
 
 import torch
-from flashinfer import SegmentGEMMWrapper
 
 from sglang.srt.lora.backend import BaseLoraBackend
 from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.utils import is_flashinfer_available
+
+if is_flashinfer_available():
+    from flashinfer import SegmentGEMMWrapper
 
 
 class FlashInferLoraBackend(BaseLoraBackend):
