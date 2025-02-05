@@ -1323,6 +1323,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
                         delta = parse_result.normal_text
+                        if len(delta) == 0:
+                            stream_buffers[index] = new_stream_buffer
+                            is_firsts[index] = is_first
+                            continue
 
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:
