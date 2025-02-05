@@ -20,7 +20,12 @@ concurrency:
 jobs:
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner-amd
+    runs-on: linux-mi300-gpu-1
+    container:
+      image: lmsysorg/sglang:v0.4.2.post2-rocm630
+      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -28,8 +33,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "python[runtime_common, test]"
-          pip install -e "python" --no-deps
+          cd sgl-kernel
+          python3 setup_rocm.py install
+          cd ..
+          pip install -e "python[dev_hip]"
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
