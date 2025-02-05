@@ -1,5 +1,21 @@
+# Copyright 2025 SGLang Team. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import multiprocessing
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -9,14 +25,8 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 root = Path(__file__).parent.resolve()
 
 
-def _update_wheel_platform_tag():
-    wheel_dir = Path("dist")
-    if wheel_dir.exists() and wheel_dir.is_dir():
-        old_wheel = next(wheel_dir.glob("*.whl"))
-        new_wheel = wheel_dir / old_wheel.name.replace(
-            "linux_x86_64", "manylinux2014_x86_64"
-        )
-        old_wheel.rename(new_wheel)
+if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
+    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
 
 def _get_cuda_version():
@@ -162,5 +172,3 @@ setup(
     },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
-
-_update_wheel_platform_tag()

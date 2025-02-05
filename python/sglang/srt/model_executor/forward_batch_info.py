@@ -203,64 +203,6 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
-    def compute_mrope_positions(
-        self, model_runner: ModelRunner, batch: ModelWorkerBatch
-    ):
-        device = model_runner.device
-        hf_config = model_runner.model_config.hf_config
-        mrope_positions_list = [None] * self.seq_lens.shape[0]
-        if self.forward_mode.is_decode():
-            for i, _ in enumerate(mrope_positions_list):
-                mrope_position_delta = (
-                    0
-                    if batch.image_inputs[i] is None
-                    else batch.image_inputs[i].mrope_position_delta
-                )
-                mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
-                    mrope_position_delta,
-                    int(self.seq_lens[i]) - 1,
-                    int(self.seq_lens[i]),
-                )
-        elif self.forward_mode.is_extend():
-            extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
-            for i, image_inputs in enumerate(batch.image_inputs):
-                extend_start_loc, extend_seq_len, extend_prefix_len = (
-                    extend_start_loc_cpu[i],
-                    batch.extend_seq_lens[i],
-                    batch.extend_prefix_lens[i],
-                )
-                if image_inputs is None:
-                    # text only
-                    mrope_positions = [
-                        [
-                            pos
-                            for pos in range(
-                                extend_prefix_len, extend_prefix_len + extend_seq_len
-                            )
-                        ]
-                    ] * 3
-                else:
-                    # TODO: current qwen2-vl do not support radix cache since mrope position calculation
-                    mrope_positions, mrope_position_delta = (
-                        MRotaryEmbedding.get_input_positions(
-                            input_tokens=self.input_ids[
-                                extend_start_loc : extend_start_loc + extend_seq_len
-                            ],
-                            image_grid_thw=image_inputs.image_grid_thws,
-                            vision_start_token_id=hf_config.vision_start_token_id,
-                            spatial_merge_size=hf_config.vision_config.spatial_merge_size,
-                            context_len=0,
-                        )
-                    )
-                    batch.image_inputs[i].mrope_position_delta = mrope_position_delta
-                mrope_positions_list[i] = mrope_positions
-
-        self.mrope_positions = torch.concat(
-            [torch.tensor(pos, device=device) for pos in mrope_positions_list],
-            axis=1,
-        )
-        self.mrope_positions = self.mrope_positions.to(torch.int64)
-
     @classmethod
     def init_new(
         cls,
@@ -343,7 +285,7 @@ class ForwardBatch:
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
-            ret.compute_mrope_positions(model_runner, batch)
+            ret._compute_mrope_positions(model_runner, batch)
 
         # Init HiP attention information
         if model_runner.hip_metadata_cache_pool is not None:
@@ -355,6 +297,63 @@ class ForwardBatch:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def _compute_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
+        device = model_runner.device
+        hf_config = model_runner.model_config.hf_config
+        mrope_positions_list = [None] * self.seq_lens.shape[0]
+        if self.forward_mode.is_decode():
+            for i, _ in enumerate(mrope_positions_list):
+                mrope_position_delta = (
+                    0
+                    if batch.image_inputs[i] is None
+                    else batch.image_inputs[i].mrope_position_delta
+                )
+                mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
+                    mrope_position_delta,
+                    int(self.seq_lens[i]) - 1,
+                    int(self.seq_lens[i]),
+                )
+        elif self.forward_mode.is_extend():
+            extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
+            for i, image_inputs in enumerate(batch.image_inputs):
+                extend_start_loc, extend_seq_len, extend_prefix_len = (
+                    extend_start_loc_cpu[i],
+                    batch.extend_seq_lens[i],
+                    batch.extend_prefix_lens[i],
+                )
+                if image_inputs is None:
+                    # text only
+                    mrope_positions = [
+                        [
+                            pos
+                            for pos in range(
+                                extend_prefix_len, extend_prefix_len + extend_seq_len
+                            )
+                        ]
+                    ] * 3
+                else:
+                    # TODO: current qwen2-vl do not support radix cache since mrope position calculation
+                    mrope_positions, mrope_position_delta = (
+                        MRotaryEmbedding.get_input_positions(
+                            input_tokens=self.input_ids[
+                                extend_start_loc : extend_start_loc + extend_seq_len
+                            ],
+                            image_grid_thw=image_inputs.image_grid_thws,
+                            vision_start_token_id=hf_config.vision_start_token_id,
+                            spatial_merge_size=hf_config.vision_config.spatial_merge_size,
+                            context_len=0,
+                        )
+                    )
+                    batch.image_inputs[i].mrope_position_delta = mrope_position_delta
+                mrope_positions_list[i] = mrope_positions
+        self.mrope_positions = torch.concat(
+            [torch.tensor(pos, device=device) for pos in mrope_positions_list],
+            axis=1,
+        )
+        self.mrope_positions = self.mrope_positions.to(torch.int64)
 
     def on_model_start(self):
         self.token_to_kv_pool.on_model_start(self)
