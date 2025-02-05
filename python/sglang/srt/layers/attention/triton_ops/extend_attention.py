@@ -169,7 +169,10 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            qk = tl.where(custom_mask, qk, float("-inf"))
+            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(
+                custom_mask & (mask_m[:, None] & mask_n[None, :]), qk, float("-inf")
+            )
         else:
             qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
@@ -232,11 +235,13 @@ def _fwd_kernel(
                 mask_ptr
                 + cur_seq_mask_start_idx
                 + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
+                + cur_seq_len_prefix
                 + start_n
                 + offs_n[None, :],
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
+            custom_mask &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(custom_mask, qk, float("-inf"))
         else:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
