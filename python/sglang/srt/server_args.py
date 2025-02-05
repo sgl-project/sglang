@@ -13,12 +13,14 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import logging
 import random
 import tempfile
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -33,6 +35,9 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+
+if TYPE_CHECKING:
+    from hip.models.hip_attention.gen3 import HiPAttentionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +117,7 @@ class ServerArgs:
 
     # HiP Attention
     enable_hip_attention: bool = False
-    hip_attention_config: str = None
+    hip_attention_config: Optional[HiPAttentionConfig] = None
 
     # HiP Attention Offload
     enable_hip_offload: bool = False
@@ -668,7 +673,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-hip-offload",
             action="store_true",
-            help="Enable HiP offloading. This flag should be set with --enable--hip-attention.",
+            help="Enable HiP KV cache offloading. This option should be set with --enable-hip-attention.",
         )
         parser.add_argument(
             "--hip-max-mask-cache-token-size",
@@ -676,7 +681,7 @@ class ServerArgs:
             default=128 * 1024,
             help=(
                 "On-gpu cache size of HiP masking kernels. "
-                "This will be major factor to determine mask refreshing decoding step."
+                "This will be a major determining factor for mask-refreshing decoding step latency."
             ),
         )
         parser.add_argument(
@@ -685,7 +690,7 @@ class ServerArgs:
             default=16 * 1024,
             help=(
                 "On-gpu cache size of sparse attention kernels. "
-                "This will be major factor to determine mask cached decoding step."
+                "This will be a major determining factor for mask-cached decoding step latency."
             ),
         )
 
@@ -951,6 +956,14 @@ class ServerArgs:
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+
+        if args.enable_hip_attention:
+            from hip.models.hip_attention.gen3 import HiPAttentionConfig
+
+            args.hip_attention_config = HiPAttentionConfig(
+                json_or_path=args.hip_attention_config
+            )
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 

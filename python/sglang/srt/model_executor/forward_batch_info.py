@@ -188,7 +188,7 @@ class ForwardBatch:
 
     # For HiP attention
     hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
-    hip_metadata_cached_stage: Optional[int] = None
+    hip_metadata_cached_stages: Optional[int] = None
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -348,7 +348,7 @@ class ForwardBatch:
         # Init HiP attention information
         if model_runner.hip_metadata_cache_pool is not None:
             ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
-            ret.hip_metadata_cached_stage = batch.hip_metadata_cached_stages
+            ret.hip_metadata_cached_stages = batch.hip_metadata_cached_stages
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:

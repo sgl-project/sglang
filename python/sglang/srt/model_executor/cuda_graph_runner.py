@@ -120,7 +120,7 @@ class CudaGraphRunner:
         self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
         self.enable_hip_attention = self.model_runner.server_args.enable_hip_attention
         if self.enable_hip_attention:
-            self.hip_config = self.model_runner.hip_attention_config
+            self.hip_config = self.model_runner.server_args.hip_attention_config
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.server_args.dp_size
 
@@ -355,7 +355,7 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
-            hip_metadata_cached_stage=hip_num_cached_stages,
+            hip_metadata_cached_stages=hip_num_cached_stages,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum(),
             encoder_lens=encoder_lens,
@@ -455,7 +455,7 @@ class CudaGraphRunner:
         # Replay
         graph_handle = (bs,)
         if self.enable_hip_attention:
-            graph_handle = (bs, forward_batch.hip_metadata_cached_stage)
+            graph_handle = (bs, forward_batch.hip_metadata_cached_stages)
         self.graphs[graph_handle].replay()
         next_token_logits, hidden_states = self.output_buffers[graph_handle]
 

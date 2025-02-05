@@ -33,7 +33,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
 
         self.forward_paged_hip = forward_paged_hip
 
-        self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config
+        self.hip_config: HiPAttentionConfig = (
+            model_runner.server_args.hip_attention_config
+        )
         self.is_offload_enabled = model_runner.server_args.enable_hip_offload
 
         self.max_context_len = model_runner.model_config.context_len
@@ -193,12 +195,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         metadata = None
-        if forward_batch.hip_metadata_cached_stage is not None:
+        if forward_batch.hip_metadata_cached_stages != 0:
             metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
                 layer.layer_id,
                 q.shape[0],
                 forward_batch.batch_size,
-                forward_batch.hip_metadata_cached_stage,
+                forward_batch.hip_metadata_cached_stages,
             )
 
         if not self.is_offload_enabled:
