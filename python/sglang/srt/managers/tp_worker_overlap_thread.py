@@ -72,11 +72,6 @@ class TpModelWorkerClient:
             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
         )
 
-        # Init hip attention config
-        self.hip_attention_config = None
-        if server_args.enable_hip_attention:
-            self.hip_attention_config = self.worker.model_runner.server_args.hip_attention_config
-
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
@@ -122,27 +117,10 @@ class TpModelWorkerClient:
         batch_pt = 0
         batch_lists = [None] * 2
 
-        hip_mask_refresh_state = None
-        if self.hip_attention_config is not None:
-            from hip.models.hip_attention.gen3 import HiPMaskRefreshState
-
-            # For keeping track of HiP attention mask refresh cycles
-            hip_mask_refresh_state = HiPMaskRefreshState(
-                self.hip_attention_config,
-            )
-
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
-
-            if hip_mask_refresh_state is not None:
-                model_worker_batch.hip_metadata_cached_stages = (
-                    hip_mask_refresh_state.update(
-                        model_worker_batch.forward_mode.is_decode(),
-                        model_worker_batch.forward_mode.is_extend(),
-                    )
-                )
 
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released

@@ -673,7 +673,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-hip-offload",
             action="store_true",
-            help="Enable HiP offloading. This flag should be set with --enable--hip-attention.",
+            help="Enable HiP KV cache offloading. This option should be set with --enable-hip-attention.",
         )
         parser.add_argument(
             "--hip-max-mask-cache-token-size",
@@ -681,7 +681,7 @@ class ServerArgs:
             default=128 * 1024,
             help=(
                 "On-gpu cache size of HiP masking kernels. "
-                "This will be major factor to determine mask refreshing decoding step."
+                "This will be a major determining factor for mask-refreshing decoding step latency."
             ),
         )
         parser.add_argument(
@@ -690,7 +690,7 @@ class ServerArgs:
             default=16 * 1024,
             help=(
                 "On-gpu cache size of sparse attention kernels. "
-                "This will be major factor to determine mask cached decoding step."
+                "This will be a major determining factor for mask-cached decoding step latency."
             ),
         )
 
