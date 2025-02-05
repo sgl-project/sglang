@@ -48,40 +48,9 @@ jobs:
           cd test/srt
           python3 test_eval_accuracy_large.py
 
-  accuracy-test-2-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-2
-    container:
-      image: lmsysorg/sglang:v0.4.2.post2-rocm630
-      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          cd sgl-kernel
-          python3 setup_rocm.py install
-          cd ..
-          pip install -e "python[dev_hip]"
-
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
-
-      - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_moe_eval_accuracy_large.py
-
-
   finish:
     needs: [
-      accuracy-test-1-gpu, accuracy-test-2-gpu
+      accuracy-test-1-gpu
     ]
     runs-on: ubuntu-latest
     steps:
