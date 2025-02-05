@@ -14,6 +14,7 @@
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -25,7 +26,6 @@ from typing import Dict, List, Optional
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
-import datetime
 
 try:
     from outlines.fsm.json_schema import convert_json_schema_to_str
