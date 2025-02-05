@@ -26,8 +26,10 @@ class TestHiPAttnBackend(unittest.TestCase):
         output_throughput = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST,
             [
-                # "--input",
-                # "32000",
+                "--input",
+                "32000",
+                "--output-len",
+                "512",
                 "--enable-hip-attention",
                 "--cuda-graph-max-bs",
                 "1",
@@ -36,7 +38,7 @@ class TestHiPAttnBackend(unittest.TestCase):
         )
 
         if is_in_ci():
-            self.assertGreater(output_throughput, 40)
+            self.assertGreater(output_throughput, 90)
 
     def _measure_mmlu(self, extra_args):
         model = DEFAULT_MODEL_NAME_FOR_TEST
