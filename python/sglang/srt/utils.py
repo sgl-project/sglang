@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import base64
+import ctypes
 import dataclasses
 import io
 import ipaddress
@@ -29,6 +30,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import warnings
@@ -72,7 +74,7 @@ def is_hip() -> bool:
 
 
 def is_cuda():
-    return hasattr(torch, "cuda") and torch.cuda.is_available()
+    return hasattr(torch, "cuda") and torch.version.cuda is not None
 
 
 def is_cuda_alike():
@@ -99,14 +101,6 @@ def is_flashinfer_available():
 
 def is_cuda_available():
     return torch.cuda.is_available() and torch.version.cuda
-
-
-def is_ipv6(address):
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ipaddress.AddressValueError:
-        return False
 
 
 def enable_show_time_cost():
@@ -221,6 +215,10 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
+
+    elif device == "cpu":
+        # TODO: rename the variables in the current function to be not GPU specific
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -511,76 +509,32 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
-def monkey_patch_vllm_p2p_access_check(gpu_id: int):
+def monkey_patch_p2p_access_check():
     """
-    Monkey patch the slow p2p access check in vllm.
+    Monkey patch the slow p2p access check.
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
     # Suppress the warnings from this delete function when using sglang.bench_one_batch
-    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
-vllm_all_gather_backup = None
-
-
-def monkey_patch_vllm_all_gather(reverse: bool = False):
-    """Monkey patch all-gather to remove in-place operations."""
-    from torch.distributed import _functional_collectives as funcol
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    global vllm_all_gather_backup
-    if vllm_all_gather_backup is None:
-        vllm_all_gather_backup = GroupCoordinator.all_gather
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        input_size = input_.size()
-        # Allocate output tensor.
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-
-        output_tensor = funcol.all_gather_tensor(
-            input_, gather_dim=0, group=self.device_group
-        ).view((world_size,) + input_size)
-
-        # Reshape
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
-        return output_tensor
-
-    if reverse:
-        setattr(GroupCoordinator, "all_gather", vllm_all_gather_backup)
-    else:
-        setattr(GroupCoordinator, "all_gather", all_gather)
-
-
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
         GGUFEmbeddingMethod,
         GGUFLinearMethod,
     )
 
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
@@ -788,7 +742,9 @@ def first_rank_print(*args, **kwargs):
         pass
 
 
-def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -801,19 +757,22 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     if socket_type == zmq.PUSH:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-        socket.connect(f"ipc://{endpoint}")
     elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-        socket.bind(f"ipc://{endpoint}")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
 
     return socket
 
 
 def dump_to_file(dirpath, name, value):
-    from vllm.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() != 0:
         return
@@ -1250,9 +1209,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
-            return f'"{data[:half_length]} ... {data[-half_length:]}"'
+            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
         else:
-            return f'"{data}"'
+            return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -1263,7 +1222,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             "{"
             + ", ".join(
-                f"{k}: {dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
                 for k, v in data.items()
             )
             + "}"
@@ -1280,68 +1239,6 @@ def dataclass_to_string_truncated(data, max_length=2048):
         )
     else:
         return str(data)
-
-
-TOOLS_TAG_LIST = ["<|plugin|>", "<function=", "<tool_call>", "<|python_tag|>"]
-
-
-def parse_tool_response(text, tools, **kwargs):
-    """Parse model response containing tool information.
-
-    Args:
-        text(str): model response in string format
-        tools(List): tools from user request
-    """
-    if "<|plugin|>" in text:  # internlm2
-        text, action = text.split("<|action_start|><|plugin|>")
-        action = action.split("<|action_end|>".strip())[0]
-        action = action[action.find("{") :]
-        action = json.loads(action)
-        name, parameters = action["name"], json.dumps(
-            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
-        )
-        call_info_list = [(name, parameters)]
-    elif "<function=" in text:  # llama3.1
-        action, _ = text.split("</function>")
-        parameters = action[action.find("{") :]
-        name = action.split("<function=")[1].split(">{")[0]
-        call_info_list = [(name, parameters)]
-    elif "<tool_call>" in text and "</tool_call>" in text:  # qwen2.5
-        # get tool_call in text
-        pattern = r"<tool_call>(.*?)</tool_call>"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
-        call_info_list = []
-        for match_result in match_result_list:
-            action = json.loads(match_result)
-            call_info_list.append(
-                (action["name"], json.dumps(action["arguments"], ensure_ascii=False))
-            )
-        # get text outside of tags
-        if not text.startswith("<tool_call>"):
-            text = text[: text.find("<tool_call>")]
-        elif not text.endswith("</tool_call>"):
-            text = text[text.rfind("</tool_call>") + len("</tool_call>") :]
-        else:
-            text = ""
-    elif "<|python_tag|>" in text:  # llama3.2
-        _, action = text.split("<|python_tag|>")
-        action = json.loads(action)
-        name, parameters = action["name"], json.dumps(
-            action.get("parameters", action.get("arguments", {})), ensure_ascii=False
-        )
-        call_info_list = [(name, parameters)]
-    else:
-        raise RuntimeError(f"Unexpected model response: {text}")
-
-    call_info_list = [
-        (
-            [tool.function.name for tool in tools].index(call_info[0]),
-            call_info[0],
-            call_info[1],
-        )
-        for call_info in call_info_list
-    ]
-    return text, call_info_list
 
 
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
@@ -1406,3 +1303,139 @@ def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
+
+
+def pyspy_dump_schedulers():
+    """py-spy dump on all scheduler in a local node."""
+    try:
+        pid = psutil.Process().pid
+        # Command to run py-spy with the PID
+        cmd = f"py-spy dump --pid {pid}"
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, check=True
+        )
+        logger.info(f"Profile for PID {pid}:\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logger.info(f"Failed to profile PID {pid}. Error: {e.stderr}")
+
+
+def kill_itself_when_parent_died():
+    if sys.platform == "linux":
+        # sigkill this process when parent worker manager dies
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    else:
+        logger.warninig("kill_itself_when_parent_died is only supported in linux.")
+
+
+def set_uvicorn_logging_configs():
+    from uvicorn.config import LOGGING_CONFIG
+
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    LOGGING_CONFIG["formatters"]["access"][
+        "fmt"
+    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+
+def get_ip() -> str:
+    # SGLANG_HOST_IP env can be ignore
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
+
+    # IP is not set, try to get it from the network interface
+
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    warnings.warn(
+        "Failed to get the IP address, using 0.0.0.0 by default."
+        "The value can be set by the environment variable"
+        " SGLANG_HOST_IP or HOST_IP.",
+        stacklevel=2,
+    )
+    return "0.0.0.0"
+
+
+def get_open_port() -> int:
+
+    port = os.getenv("SGLANG_PORT")
+    if port is not None:
+        while True:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    return port
+            except OSError:
+                port += 1  # Increment port number if already in use
+                logger.info("Port %d is already in use, trying port %d", port - 1, port)
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ValueError:
+        return False
+
+
+def rank0_print(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        print(msg, flush=True)
+
+
+def launch_dummy_health_check_server(host, port):
+    import uvicorn
+    from fastapi import FastAPI, Response
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    @app.get("/health_generate")
+    async def health_generate():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        timeout_keep_alive=5,
+        loop="uvloop",
+    )

@@ -5,14 +5,14 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from vllm.distributed import (
+
+from sglang.srt.custom_op import CustomOp
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.custom_op import CustomOp
-
-from sglang.srt.layers.custom_op_util import register_custom_op
+from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -66,7 +66,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
-@register_custom_op("sglang_unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
@@ -125,6 +124,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -137,6 +137,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            activation=activation,
         )
 
     def forward_cuda(
@@ -151,6 +152,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -168,6 +170,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             import ater
             from ater.fused_moe import fused_experts_ck
 
+            assert activation == "silu", f"{activation=} is not supported."
+
             return fused_experts_ck(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -183,10 +187,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 inplace=True,
+                activation=activation,
             )
 
-    def forward_cpu(self, *args, **kwargs):
-        raise NotImplementedError("The CPU backend currently does not support MoE.")
+    def forward_cpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return moe_forward_native(
+            layer,
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            custom_routing_function,
+            correction_bias,
+        )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
@@ -232,6 +260,7 @@ class FusedMoE(torch.nn.Module):
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
         use_presharded_weights: bool = False,
     ):
         super().__init__()
@@ -255,6 +284,7 @@ class FusedMoE(torch.nn.Module):
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
+        self.activation = activation
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -565,6 +595,7 @@ class FusedMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
+            activation=self.activation,
         )
 
         if self.reduce_results and self.tp_size > 1:

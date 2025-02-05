@@ -29,8 +29,8 @@ from sglang.srt.utils import (
     get_nvgpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
-    is_ipv6,
     is_port_available,
+    is_valid_ipv6_address,
     nullable_str,
 )
 
@@ -75,6 +75,7 @@ class ServerArgs:
     # Other runtime options
     tp_size: int = 1
     stream_interval: int = 1
+    stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
@@ -112,6 +113,7 @@ class ServerArgs:
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
+    lora_backend: str = "triton"
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -157,6 +159,12 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
+    allow_auto_truncate: bool = False
+
+    # Custom logit processor
+    enable_custom_logit_processor: bool = False
+    tool_call_parser: str = None
+    enable_hierarchical_cache: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -240,14 +248,13 @@ class ServerArgs:
         # Others
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
+            assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // 2
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            self.disable_overlap_schedule = True
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
-                "Overlap scheduler is disabled."
             )
 
         # Speculative Decoding
@@ -266,6 +273,10 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
+
+        # AMD-specific Triton attention KV splits default number
+        if is_hip():
+            self.triton_attention_num_kv_splits = 16
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -314,6 +325,7 @@ class ServerArgs:
                 "dummy",
                 "gguf",
                 "bitsandbytes",
+                "layered",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -327,7 +339,10 @@ class ServerArgs:
             "which is mainly for profiling."
             '"gguf" will load the weights in the gguf format. '
             '"bitsandbytes" will load the weights using bitsandbytes '
-            "quantization.",
+            "quantization."
+            '"layered" loads weights layer by layer so that one can quantize a '
+            "layer before loading another to make the peak memory envelope "
+            "smaller.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -392,7 +407,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda", "xpu", "hpu"],
+            choices=["cuda", "xpu", "hpu", "cpu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -491,6 +506,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.stream_interval,
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+        )
+        parser.add_argument(
+            "--stream-output",
+            action="store_true",
+            help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
             "--random-seed",
@@ -634,13 +654,19 @@ class ServerArgs:
             nargs="*",
             default=None,
             action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}.",
         )
         parser.add_argument(
             "--max-loras-per-batch",
             type=int,
             default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
+            help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--lora-backend",
+            type=str,
+            default="triton",
+            help="Choose the kernel backend for multi-LoRA serving.",
         )
 
         # Kernel backend
@@ -860,6 +886,29 @@ class ServerArgs:
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
+        parser.add_argument(
+            "--allow-auto-truncate",
+            action="store_true",
+            help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
+        )
+        parser.add_argument(
+            "--enable-custom-logit-processor",
+            action="store_true",
+            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        # Function Calling
+        parser.add_argument(
+            "--tool-call-parser",
+            type=str,
+            choices=["qwen25", "mistral", "llama3"],
+            default=ServerArgs.tool_call_parser,
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+        )
+        parser.add_argument(
+            "--enable-hierarchical-cache",
+            action="store_true",
+            help="Enable hierarchical cache",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -870,7 +919,7 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_ipv6(self.host):
+        if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
@@ -880,8 +929,8 @@ class ServerArgs:
             self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
         assert not (
-            self.dp_size > 1 and self.nnodes != 1
-        ), "multi-node data parallel is not supported"
+            self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
+        ), "multi-node data parallel is not supported unless dp attention!"
         assert (
             self.max_loras_per_batch > 0
             # FIXME
@@ -919,6 +968,9 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     return server_args
 
 
+ZMQ_TCP_PORT_DELTA = 233
+
+
 @dataclasses.dataclass
 class PortArgs:
     # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
@@ -932,7 +984,7 @@ class PortArgs:
     nccl_port: int
 
     @staticmethod
-    def init_new(server_args) -> "PortArgs":
+    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         port = server_args.port + random.randint(100, 1000)
         while True:
             if is_port_available(port):
@@ -942,12 +994,39 @@ class PortArgs:
             else:
                 port -= 43
 
-        return PortArgs(
-            tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            nccl_port=port,
-        )
+        if not server_args.enable_dp_attention:
+            # Normal case, use IPC within a single node
+            return PortArgs(
+                tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                nccl_port=port,
+            )
+        else:
+            # DP attention. Use TCP + port to handle both single-node and multi-node.
+            if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+                dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+            else:
+                dist_init_addr = server_args.dist_init_addr.split(":")
+            assert (
+                len(dist_init_addr) == 2
+            ), "please provide --dist-init-addr as host:port of head node"
+
+            dist_init_host, dist_init_port = dist_init_addr
+            port_base = int(dist_init_port) + 1
+            if dp_rank is None:
+                scheduler_input_port = (
+                    port_base + 2
+                )  # TokenizerManager to DataParallelController
+            else:
+                scheduler_input_port = port_base + 2 + 1 + dp_rank
+
+            return PortArgs(
+                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
+                scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+                detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                nccl_port=port,
+            )
 
 
 class LoRAPathAction(argparse.Action):

@@ -34,12 +34,16 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
+
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmzheng/sglang-EAGLE-llama2-chat-7B"
 
 
 def is_in_ci():
@@ -129,10 +133,6 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     obj = res.json()
     pred = obj["text"]
     return pred
-
-
-def call_generate_gserver(prompt, temperature, max_tokens, stop=None, url=None):
-    raise NotImplementedError()
 
 
 def call_generate_guidance(
@@ -405,7 +405,7 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: tuple = (),
+    other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
 ):
@@ -526,6 +526,48 @@ def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
 
+def get_benchmark_args(
+    base_url="",
+    dataset_name="",
+    dataset_path="",
+    tokenizer="",
+    num_prompts=500,
+    random_input_len=4096,
+    random_output_len=2048,
+    request_rate=float("inf"),
+    disable_stream=False,
+    disable_ignore_eos=False,
+):
+    return SimpleNamespace(
+        backend="sglang",
+        base_url=base_url,
+        host=None,
+        port=None,
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        model=None,
+        tokenizer=tokenizer,
+        num_prompts=num_prompts,
+        sharegpt_output_len=None,
+        sharegpt_context_len=None,
+        random_input_len=random_input_len,
+        random_output_len=random_output_len,
+        random_range_ratio=0.0,
+        request_rate=request_rate,
+        multi=None,
+        output_file=None,
+        disable_tqdm=False,
+        disable_stream=disable_stream,
+        return_logprob=False,
+        seed=0,
+        disable_ignore_eos=disable_ignore_eos,
+        extra_request_body=None,
+        apply_chat_template=False,
+        profile=None,
+        lora_name=None,
+    )
+
+
 def run_bench_serving(
     model,
     num_prompts,
@@ -537,6 +579,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    disable_ignore_eos=False,
     need_warmup=False,
 ):
     # Launch the server
@@ -549,31 +592,17 @@ def run_bench_serving(
     )
 
     # Run benchmark
-    args = SimpleNamespace(
-        backend="sglang",
+    args = get_benchmark_args(
         base_url=base_url,
-        host=None,
-        port=None,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
-        model=None,
         tokenizer=tokenizer,
         num_prompts=num_prompts,
-        sharegpt_output_len=None,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
-        random_range_ratio=0.0,
         request_rate=request_rate,
-        multi=None,
-        seed=0,
-        output_file=None,
-        disable_tqdm=False,
         disable_stream=disable_stream,
-        disable_ignore_eos=False,
-        return_logprob=False,
-        lora_name=None,
-        extra_request_body=None,
-        profile=None,
+        disable_ignore_eos=disable_ignore_eos,
     )
 
     try:
@@ -587,6 +616,38 @@ def run_bench_serving(
 
     assert res["completed"] == num_prompts
     return res
+
+
+def run_bench_serving_multi(
+    model,
+    base_url,
+    other_server_args,
+    benchmark_args,
+    need_warmup=False,
+):
+    # Launch the server
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    # run benchmark for all
+    res_l = []
+    try:
+        for args in benchmark_args:
+            if need_warmup:
+                warmup_args = copy.deepcopy(args)
+                warmup_args.num_prompts = 16
+                run_benchmark(warmup_args)
+
+            res = run_benchmark(args)
+            res_l.append((args, res))
+    finally:
+        kill_process_tree(process.pid)
+
+    return res_l
 
 
 def run_bench_one_batch(model, other_args):

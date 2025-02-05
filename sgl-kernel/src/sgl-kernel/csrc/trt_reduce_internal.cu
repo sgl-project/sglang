@@ -1,3 +1,18 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 // reference:
 // https://github.com/NVIDIA/TensorRT-LLM/blob/release/0.14/cpp/tensorrt_llm/kernels/customAllReduceKernels.cu
 /*
@@ -26,6 +41,7 @@
 #include <tuple>
 
 #include "trt_reduce_internal.cuh"
+#include "utils.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -160,7 +176,7 @@ __inline__ __device__ void block_barrier(uint32_t** signals, uint32_t const flag
 }
 
 template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true>
-static __global__ void oneShotAllReduceKernel(AllReduceParams params) {
+static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduceParams params) {
   // Suppose that two GPUs participate in the AR exchange, and we start four blocks.
   // The message is partitioned into chunks as detailed below:
   //               message

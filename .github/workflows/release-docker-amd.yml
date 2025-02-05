@@ -10,11 +10,11 @@ on:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
+    runs-on: amd-docker
     environment: 'prod'
     strategy:
       matrix:
-        rocm_version: ['6.2.0']
+        rocm_version: ['6.3.0']
         build_type: ['all', 'srt']
     steps:
       - name: Checkout repository
@@ -41,8 +41,8 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
 
-          if [ "${{ matrix.rocm_version }}" = "6.2.0" ]; then
-            rocm_tag="rocm620"
+          if [ "${{ matrix.rocm_version }}" = "6.3.0" ]; then
+            rocm_tag="rocm630"
           else
             echo "Unsupported ROCm version"
             exit 1

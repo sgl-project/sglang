@@ -82,6 +82,8 @@ class TpModelWorkerClient:
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
+        if self.device == "cpu":
+            self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -91,6 +93,9 @@ class TpModelWorkerClient:
 
     def get_tp_cpu_group(self):
         return self.worker.get_tp_cpu_group()
+
+    def get_attention_tp_cpu_group(self):
+        return self.worker.get_attention_tp_cpu_group()
 
     def get_memory_pool(self):
         return (

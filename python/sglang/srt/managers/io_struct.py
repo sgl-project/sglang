@@ -17,7 +17,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -59,6 +59,9 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
+
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # LoRA related
@@ -66,6 +69,10 @@ class GenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -180,6 +187,13 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
+            if self.custom_logit_processor is None:
+                self.custom_logit_processor = [None] * num
+            elif not isinstance(self.custom_logit_processor, list):
+                self.custom_logit_processor = [self.custom_logit_processor] * num
+            else:
+                assert self.parallel_sample_num == 1
+
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
@@ -196,8 +210,14 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
+            log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            custom_logit_processor=(
+                self.custom_logit_processor[i]
+                if self.custom_logit_processor is not None
+                else None
+            ),
         )
 
 
@@ -230,6 +250,11 @@ class TokenizedGenerateReqInput:
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[str] = None
+
 
 @dataclass
 class EmbeddingReqInput:
@@ -243,6 +268,8 @@ class EmbeddingReqInput:
     sampling_params: Union[List[Dict], Dict] = None
     # Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -327,10 +354,13 @@ class BatchTokenIDOut:
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     no_stop_trim: List[bool]
+
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    spec_verify_ct: List[int]
+
     # Logprobs
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -355,6 +385,7 @@ class BatchStrOut:
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    spec_verify_ct: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -489,6 +520,7 @@ class ProfileReq(Enum):
 @dataclass
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
 
@@ -508,3 +540,27 @@ class CloseSessionReqInput:
 class OpenSessionReqOutput:
     session_id: Optional[str]
     success: bool
+
+
+@dataclass
+class Function:
+    description: Optional[str] = None
+    name: Optional[str] = None
+    parameters: Optional[object] = None
+
+
+@dataclass
+class Tool:
+    function: Function
+    type: Optional[str] = "function"
+
+
+@dataclass
+class FunctionCallReqInput:
+    text: str  # The text to parse.
+    tools: List[Tool] = field(
+        default_factory=list
+    )  # A list of available function tools (name, parameters, etc.).
+    tool_call_parser: Optional[str] = (
+        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+    )
