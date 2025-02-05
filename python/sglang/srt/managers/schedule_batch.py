@@ -50,8 +50,9 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    from hip.models.hip_attention.gen3 import HiPAttentionConfig, HiPMaskRefreshState
+
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
-    from hip.models.hip_attention.gen3 import HiPMaskRefreshState, HiPAttentionConfig
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 

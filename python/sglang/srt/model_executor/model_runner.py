@@ -701,8 +701,7 @@ class ModelRunner:
             self.hip_metadata_cache_pool = HiPMetadataCachePool(
                 self.max_total_num_tokens,
                 query_head_num=(
-                    self.model_config.num_attention_heads
-                    // self.server_args.tp_size
+                    self.model_config.num_attention_heads // self.server_args.tp_size
                 ),
                 layer_num=self.model_config.num_hidden_layers,
                 context_length=self.model_config.context_len,
