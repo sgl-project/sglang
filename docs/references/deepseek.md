@@ -13,17 +13,9 @@ Please refer to [DeepSeek_V3 install](https://github.com/sgl-project/sglang/blob
 # launching one node
 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000
 ```
+### Multi-node
+Please refer to [multi_node](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node.md) for help.
 
-### Multiple nodes
-```bash
-# launching Multiple node, we use two nodes as an example here
-# Node 0
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 0
-
-# Node 1
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 1
-```
-For high QPS scenarios, add the `--enable-dp-attention` [argument](https://github.com/sgl-project/sglang/blob/7ab84948d87d2c264cccc4ae8c1db339b9efea6a/docs/backend/server_arguments.md#optimization) to boost throughput.
 ### Do not use quantization
 Deepseek V3 is already in FP8. So we should not run it with  `--quantization fp8 --kv-cache-dtype fp8_e5m2`
 
