@@ -1,9 +1,34 @@
-# DeepSeek Model Optimizations
+# DeepSeek Model Usage and Optimisation
 
 SGLang provides several optimizations specifically designed for the DeepSeek model to boost its inference speed. This document outlines current optimizations for DeepSeek. Additionally, the SGLang team is actively developing enhancements for [DeepSeek-V3](https://github.com/sgl-project/sglang/issues/2591).
 
+## Use DeepSeek_V3 on SGLang
+SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
 
-## Multi-head Latent Attention (MLA) Throughput Optimizations
+### Install and Launch
+Please refer to [DeepSeek_V3 install](https://github.com/sgl-project/sglang/blob/7ab84948d87d2c264cccc4ae8c1db339b9efea6a/docs/backend/server_arguments.md) for installation.
+
+### Launch with One node
+```bash
+# launching one node
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000
+```
+
+### Multiple nodes
+```bash
+# launching Multiple node, we use two nodes as an example here
+# Node 0
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 0
+
+# Node 1
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 1
+```
+For high QPS scenarios, add the `--enable-dp-attention` [argument](https://github.com/sgl-project/sglang/blob/7ab84948d87d2c264cccc4ae8c1db339b9efea6a/docs/backend/server_arguments.md#optimization) to boost throughput.
+### Do not use quantization
+Deepseek V3 is already in FP8. So we should not run it with  `--quantization fp8 --kv-cache-dtype fp8_e5m2`
+
+## Optimisations
+### Multi-head Latent Attention (MLA) Throughput Optimizations
 
 **Description**: [MLA](https://arxiv.org/pdf/2405.04434) is an innovative attention mechanism introduced by the DeepSeek team, aimed at improving inference efficiency. SGLang has implemented specific optimizations for this, including:
 
@@ -24,7 +49,7 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [Slides](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/lmsys_1st_meetup_deepseek_mla.pdf) for more details.
 
-## Data Parallelism Attention
+### Data Parallelism Attention
 
 **Description**: This optimization involves data parallelism (DP) for the MLA attention mechanism of DeepSeek Series Models, which allows for a significant reduction in the KV cache size, enabling larger batch sizes. Each DP worker independently handles different types of batches (prefill, decode, idle), which are then synchronized before and after processing through the Mixture-of-Experts (MoE) layer.
 
@@ -40,13 +65,13 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 
-## Multi Node Tensor Parallelism
+### Multi Node Tensor Parallelism
 
 **Description**: For users with limited memory on a single node, SGLang supports serving DeepSeek Series Models, including DeepSeek V3, across multiple nodes using tensor parallelism. This approach partitions the model parameters across multiple GPUs or nodes to handle models that are too large for one node's memory.
 
 **Usage**: Check [here](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) for usage examples.
 
-## Block-wise FP8
+### Block-wise FP8
 
 **Description**: SGLang implements block-wise FP8 quantization with two key optimizations:
 
