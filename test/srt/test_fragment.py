@@ -41,7 +41,8 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     # dict(model_path="Qwen/Qwen2-1.5B"),
-    dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
+    dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True,
+         decode_tolerance=1.3),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
     # dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
     # dict(model_path="allenai/OLMo-1B-0724-hf"),
     # dict(model_path="THUDM/glm-4-9b-chat", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
@@ -66,8 +67,8 @@ class TestFragment(unittest.TestCase):
         mem_fraction_static: float = 0.4,
         tp_size: int = 2,
         tight_memory: bool = False,
-        prefill_tolerance: float = 0.2,
-        decode_tolerance: float = 0.2,
+        prefill_tolerance: float = 0.1,
+        decode_tolerance: float = 0.1,
     ):
         nccl_port = find_available_port(12345)
         master_port = find_available_port(23456)
