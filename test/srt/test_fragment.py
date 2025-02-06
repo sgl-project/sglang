@@ -9,6 +9,7 @@ import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server.engine_fragment import EngineFragment
+from sglang.srt.server_args import find_available_port
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.runners import check_close_model_outputs
 from sglang.test.test_utils import is_in_ci
@@ -56,9 +57,8 @@ class TestFragment(unittest.TestCase):
         multiprocessing.set_start_method("spawn")
 
     def assert_fragment_e2e_execution(self, index: int, model_path: str):
-        # different port for maximum isolation
-        nccl_port = 12345 + index
-        master_port = 23456 + index
+        nccl_port = find_available_port(12345)
+        master_port = find_available_port(23456)
 
         print(f'assert_fragment_e2e_execution START {index=} {model_path=}')
 
