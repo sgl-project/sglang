@@ -10,8 +10,7 @@ from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import is_in_ci
-from test.srt.models.test_generation_models import check_close_model_outputs, CI_MODELS, ALL_OTHER_MODELS
+from sglang.test.runners import check_close_model_outputs
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
