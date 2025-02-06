@@ -27,6 +27,23 @@ _TP_SIZE = 2
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
 
+# TODO maybe we should add more other models?
+CI_MODELS = [
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "google/gemma-2-2b",
+]
+ALL_OTHER_MODELS = [
+    "Qwen/Qwen2-1.5B",
+    "Qwen/Qwen2.5-14B-Instruct",
+    "HuggingFaceTB/SmolLM-135M-Instruct",
+    "allenai/OLMo-1B-0724-hf",
+    "THUDM/glm-4-9b-chat",
+    "openai-community/gpt2",
+    "microsoft/Phi-3-small-8k-instruct",
+    "allenai/OLMo-2-1124-7B-Instruct",
+    "ibm-granite/granite-3.0-2b-instruct",
+]
+
 
 class TestFragment(unittest.TestCase):
     def assert_fragment_e2e_execution(self, index: int, model_path: str):
@@ -53,15 +70,15 @@ class TestFragment(unittest.TestCase):
             p.join()
 
     def test_ci_models(self):
-        for index, model_case in enumerate(CI_MODELS):
-            self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
+        for index, model_path in enumerate(CI_MODELS):
+            self.assert_fragment_e2e_execution(index=index, model_path=model_path)
 
     def test_others(self):
         if is_in_ci():
             return
 
-        for index, model_case in enumerate(ALL_OTHER_MODELS):
-            self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
+        for index, model_path in enumerate(ALL_OTHER_MODELS):
+            self.assert_fragment_e2e_execution(index=index, model_path=model_path)
 
     # def test_adhoc(self):
     #     self.assert_fragment_e2e_execution(index=0, model_path="meta-llama/Llama-3.2-1B-Instruct")
