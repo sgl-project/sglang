@@ -158,68 +158,7 @@ class HFRunner:
 
             if prompts is not None:
                 if self.model_type == "generation":
-                    output_strs = []
-                    top_input_logprobs = []
-                    top_output_logprobs = []
-                    for i, p in enumerate(prompts):
-                        if isinstance(p, str):
-                            input_ids = self.tokenizer.encode(
-                                p, return_tensors="pt"
-                            ).cuda()
-                        else:
-                            input_ids = torch.tensor([p], device="cuda")
-
-                        if lora_paths is not None and lora_paths[i] is not None:
-                            from peft import PeftModel
-
-                            self.model = PeftModel.from_pretrained(
-                                self.base_model,
-                                lora_paths[i],
-                                torch_dtype=torch_dtype,
-                                is_trainable=False,
-                            )
-                        else:
-                            self.model = self.base_model
-
-                        outputs = self.model.generate(
-                            input_ids,
-                            do_sample=False,
-                            temperature=None,
-                            top_p=None,
-                            max_new_tokens=max_new_tokens,
-                            return_dict_in_generate=True,
-                            output_scores=(not self.output_str_only),
-                        )
-                        output_strs.append(
-                            self.tokenizer.decode(outputs[0][0][len(input_ids[0]) :])
-                        )
-                        if not self.output_str_only:
-                            # outputs.scores: (num_token, 1, vocab_size)
-                            top_output_logprobs.append(
-                                [
-                                    get_top_logprobs(
-                                        logits[0], NUM_TOP_LOGPROBS
-                                    ).tolist()
-                                    for logits in outputs.scores
-                                ]
-                            )
-                            del outputs
-
-                            input_logits = self.model.forward(input_ids).logits[0]
-                            top_input_logprobs.append(
-                                get_top_logprobs(
-                                    input_logits, NUM_TOP_LOGPROBS
-                                ).tolist()
-                            )
-                            del input_logits
-
-                    out_queue.put(
-                        ModelOutput(
-                            output_strs=output_strs,
-                            top_input_logprobs=top_input_logprobs,
-                            top_output_logprobs=top_output_logprobs,
-                        )
-                    )
+                    out_queue.put(self.forward_generation_raw())
 
                 elif self.model_type == "embedding":
                     assert not self.output_str_only
@@ -262,6 +201,68 @@ class HFRunner:
         self.model_proc.terminate()
         self.in_queue = self.out_queue = None
 
+    @staticmethod
+    def forward_generation_raw():
+        output_strs = []
+        top_input_logprobs = []
+        top_output_logprobs = []
+        for i, p in enumerate(prompts):
+            if isinstance(p, str):
+                input_ids = self.tokenizer.encode(
+                    p, return_tensors="pt"
+                ).cuda()
+            else:
+                input_ids = torch.tensor([p], device="cuda")
+
+            if lora_paths is not None and lora_paths[i] is not None:
+                from peft import PeftModel
+
+                self.model = PeftModel.from_pretrained(
+                    self.base_model,
+                    lora_paths[i],
+                    torch_dtype=torch_dtype,
+                    is_trainable=False,
+                )
+            else:
+                self.model = self.base_model
+
+            outputs = self.model.generate(
+                input_ids,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
+                output_scores=(not self.output_str_only),
+            )
+            output_strs.append(
+                self.tokenizer.decode(outputs[0][0][len(input_ids[0]) :])
+            )
+            if not self.output_str_only:
+                # outputs.scores: (num_token, 1, vocab_size)
+                top_output_logprobs.append(
+                    [
+                        get_top_logprobs(
+                            logits[0], NUM_TOP_LOGPROBS
+                        ).tolist()
+                        for logits in outputs.scores
+                    ]
+                )
+                del outputs
+
+                input_logits = self.model.forward(input_ids).logits[0]
+                top_input_logprobs.append(
+                    get_top_logprobs(
+                        input_logits, NUM_TOP_LOGPROBS
+                    ).tolist()
+                )
+                del input_logits
+
+        return ModelOutput(
+            output_strs=output_strs,
+            top_input_logprobs=top_input_logprobs,
+            top_output_logprobs=top_output_logprobs,
+        )
 
 class SRTRunner:
     def __init__(
