@@ -79,3 +79,15 @@ inline int getSMVersion() {
         return false;                                                                    \
     }                                                                                    \
   }()
+
+#define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
+  AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
+  AT_DISPATCH_CASE(at::ScalarType::Char, __VA_ARGS__)  \
+  AT_DISPATCH_CASE(at::ScalarType::Short, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Int, __VA_ARGS__)   \
+  AT_DISPATCH_CASE(at::ScalarType::Long, __VA_ARGS__)
+
+#define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
+
+#define CEILDIV(x, y) (((x) + (y)-1) / (y))
