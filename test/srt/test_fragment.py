@@ -94,8 +94,14 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
+        # create hf model for comparison
+        with torch.device("cuda"):
+            hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+            hf_model.to(torch.bfloat16)
+        hf_model.cuda()
+
         # test update weights
-        fsdp_state_dict = _get_fsdp_state_dict(model_path=model_path)
+        fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
         print(
             f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
             flush=True,
@@ -136,12 +142,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
 
 
 # Adapted from https://github.com/volcengine/verl/blob/main/tests/rollout/run_fsdp_vllm.py
-def _get_fsdp_state_dict(model_path: str):
-    with torch.device("cuda"):
-        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-        model.to(torch.bfloat16)
-    model.cuda()
-
+def _get_fsdp_state_dict(hf_model):
     device_mesh = init_device_mesh(
         "cuda", mesh_shape=(_TP_SIZE,), mesh_dim_names=["fsdp"]
     )
@@ -152,7 +153,7 @@ def _get_fsdp_state_dict(model_path: str):
         buffer_dtype=torch.float32,
     )
     fsdp_model = FSDP(
-        model,
+        hf_model,
         use_orig_params=True,
         auto_wrap_policy=None,
         device_id=torch.cuda.current_device(),
