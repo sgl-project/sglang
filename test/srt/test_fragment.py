@@ -41,9 +41,8 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     # dict(model_path="Qwen/Qwen2-1.5B"),
-    # dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True,
-    #      prefill_tolerance=0.3, decode_tolerance=1.3),
-    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3, prefill_tolerance=0.3, decode_tolerance=0.3),
+    # dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
+    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
     # dict(model_path="allenai/OLMo-1B-0724-hf"),
     # dict(model_path="THUDM/glm-4-9b-chat", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
     # dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
@@ -166,9 +165,8 @@ def _run_subprocess(
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
         # hf model is used for comparison
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-        hf_model.to(_TORCH_DTYPE)
-        hf_model.cuda()
+        hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=_TORCH_DTYPE,
+                                                        trust_remote_code=True).cuda()
         hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
 
         hf_outputs = HFRunner.forward_generation_raw(
