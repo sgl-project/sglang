@@ -273,24 +273,8 @@ jobs:
     if: contains(github.event.pull_request.changed_files, 'docs/**')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
-      - name: Install dependencies
-        run: |
-          pip install -r docs/requirements.txt
-
-      - name: Execute notebooks
-        timeout-minutes: 40
-        run: |
-          cd docs
-          make clean
-          make compile
+      - name: fake pass
+        run: echo "Docs changed, will be tested in docs CI."
 
   finish:
     needs:
