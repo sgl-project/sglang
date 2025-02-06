@@ -41,7 +41,7 @@ ALL_OTHER_MODELS = [
     "meta-llama/Llama-3.2-1B-Instruct",
     "Qwen/Qwen2-1.5B",
     # "Qwen/Qwen2.5-14B-Instruct", # CUDA OOM for this script, so temporarily test others first
-    "HuggingFaceTB/SmolLM-135M-Instruct",
+    # "HuggingFaceTB/SmolLM-135M-Instruct", # total_num_heads % tp_size nonzero, test it later
     "allenai/OLMo-1B-0724-hf",
     "THUDM/glm-4-9b-chat",
     "openai-community/gpt2",
