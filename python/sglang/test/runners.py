@@ -183,6 +183,12 @@ class HFRunner:
     def forward_raw(
         prompts: Union[List[str], List[torch.Tensor]],
         max_new_tokens: int,
+        base_model,
+        tokenizer,
+        lora_paths,
+        torch_dtype: torch.dtype,
+        model_type: str = "generation",
+        output_str_only: bool = False,
     ):
         if model_type == "generation":
             output_strs = []
