@@ -53,6 +53,8 @@ class TestFragment(unittest.TestCase):
         nccl_port = 12345 + index
         master_port = 23456 + index
 
+        print(f'assert_fragment_e2e_execution START {index=} {model_path=}')
+
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         for tp_rank in range(_TP_SIZE):
@@ -64,7 +66,8 @@ class TestFragment(unittest.TestCase):
             processes.append(p)
 
         for _ in range(_TP_SIZE):
-            self.assertTrue(output_reader.recv(), 'Subprocess has error, please see logs above')
+            self.assertTrue(output_reader.recv(),
+                            f'Subprocess has error, please see logs above. ({index=} {model_path=})')
 
         for p in processes:
             p.join()
