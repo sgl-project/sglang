@@ -28,8 +28,8 @@ _MAX_NEW_TOKENS = 8
 _PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
 
 # Set to false to temporarily debug issues unrelated to weight update
-# _ENABLE_UPDATE_WEIGHTS = True
-_ENABLE_UPDATE_WEIGHTS = False
+_ENABLE_UPDATE_WEIGHTS = True
+# _ENABLE_UPDATE_WEIGHTS = False
 
 # TODO maybe we should add more other models?
 CI_MODELS = [
