@@ -157,90 +157,7 @@ class HFRunner:
                 assert len(prompts) == len(lora_paths)
 
             if prompts is not None:
-                if self.model_type == "generation":
-                    output_strs = []
-                    top_input_logprobs = []
-                    top_output_logprobs = []
-                    for i, p in enumerate(prompts):
-                        if isinstance(p, str):
-                            input_ids = self.tokenizer.encode(
-                                p, return_tensors="pt"
-                            ).cuda()
-                        else:
-                            input_ids = torch.tensor([p], device="cuda")
-
-                        if lora_paths is not None and lora_paths[i] is not None:
-                            from peft import PeftModel
-
-                            self.model = PeftModel.from_pretrained(
-                                self.base_model,
-                                lora_paths[i],
-                                torch_dtype=torch_dtype,
-                                is_trainable=False,
-                            )
-                        else:
-                            self.model = self.base_model
-
-                        outputs = self.model.generate(
-                            input_ids,
-                            do_sample=False,
-                            temperature=None,
-                            top_p=None,
-                            max_new_tokens=max_new_tokens,
-                            return_dict_in_generate=True,
-                            output_scores=(not self.output_str_only),
-                        )
-                        output_strs.append(
-                            self.tokenizer.decode(outputs[0][0][len(input_ids[0]) :])
-                        )
-                        if not self.output_str_only:
-                            # outputs.scores: (num_token, 1, vocab_size)
-                            top_output_logprobs.append(
-                                [
-                                    get_top_logprobs(
-                                        logits[0], NUM_TOP_LOGPROBS
-                                    ).tolist()
-                                    for logits in outputs.scores
-                                ]
-                            )
-                            del outputs
-
-                            input_logits = self.model.forward(input_ids).logits[0]
-                            top_input_logprobs.append(
-                                get_top_logprobs(
-                                    input_logits, NUM_TOP_LOGPROBS
-                                ).tolist()
-                            )
-                            del input_logits
-
-                    out_queue.put(
-                        ModelOutput(
-                            output_strs=output_strs,
-                            top_input_logprobs=top_input_logprobs,
-                            top_output_logprobs=top_output_logprobs,
-                        )
-                    )
-
-                elif self.model_type == "embedding":
-                    assert not self.output_str_only
-                    logits = self.model.encode(prompts).tolist()
-                    out_queue.put(ModelOutput(embed_logits=logits))
-
-                elif self.model_type == "reward":
-                    scores = []
-                    for conv in prompts:
-                        conv_formatted = self.tokenizer.apply_chat_template(
-                            conv, tokenize=False
-                        )
-                        conv_tokenized = self.tokenizer(
-                            conv_formatted, return_tensors="pt"
-                        ).to("cuda")
-                        scores.append(
-                            float(self.model(**conv_tokenized).logits[0][0].item())
-                        )
-                    out_queue.put(ModelOutput(scores=scores))
-                else:
-                    raise Exception(f"Unrecognized model type {self.model_type}")
+                out_queue.put(self.forward_raw())
 
     def forward(
         self,
@@ -261,6 +178,94 @@ class HFRunner:
     def __exit__(self, exc_type, exc_value, traceback):
         self.model_proc.terminate()
         self.in_queue = self.out_queue = None
+
+    @staticmethod
+    def forward_raw(
+        prompts: Union[List[str], List[torch.Tensor]],
+        max_new_tokens: int,
+    ):
+        if model_type == "generation":
+            output_strs = []
+            top_input_logprobs = []
+            top_output_logprobs = []
+            for i, p in enumerate(prompts):
+                if isinstance(p, str):
+                    input_ids = tokenizer.encode(
+                        p, return_tensors="pt"
+                    ).cuda()
+                else:
+                    input_ids = torch.tensor([p], device="cuda")
+
+                if lora_paths is not None and lora_paths[i] is not None:
+                    from peft import PeftModel
+
+                    model = PeftModel.from_pretrained(
+                        base_model,
+                        lora_paths[i],
+                        torch_dtype=torch_dtype,
+                        is_trainable=False,
+                    )
+                else:
+                    model = base_model
+
+                outputs = model.generate(
+                    input_ids,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    max_new_tokens=max_new_tokens,
+                    return_dict_in_generate=True,
+                    output_scores=(not output_str_only),
+                )
+                output_strs.append(
+                    tokenizer.decode(outputs[0][0][len(input_ids[0]) :])
+                )
+                if not output_str_only:
+                    # outputs.scores: (num_token, 1, vocab_size)
+                    top_output_logprobs.append(
+                        [
+                            get_top_logprobs(
+                                logits[0], NUM_TOP_LOGPROBS
+                            ).tolist()
+                            for logits in outputs.scores
+                        ]
+                    )
+                    del outputs
+
+                    input_logits = model.forward(input_ids).logits[0]
+                    top_input_logprobs.append(
+                        get_top_logprobs(
+                            input_logits, NUM_TOP_LOGPROBS
+                        ).tolist()
+                    )
+                    del input_logits
+
+            return ModelOutput(
+                output_strs=output_strs,
+                top_input_logprobs=top_input_logprobs,
+                top_output_logprobs=top_output_logprobs,
+            )
+
+        elif model_type == "embedding":
+            assert not output_str_only
+            logits = model.encode(prompts).tolist()
+            return ModelOutput(embed_logits=logits)
+
+        elif model_type == "reward":
+            scores = []
+            for conv in prompts:
+                conv_formatted = tokenizer.apply_chat_template(
+                    conv, tokenize=False
+                )
+                conv_tokenized = tokenizer(
+                    conv_formatted, return_tensors="pt"
+                ).to("cuda")
+                scores.append(
+                    float(model(**conv_tokenized).logits[0][0].item())
+                )
+            return ModelOutput(scores=scores)
+        else:
+            raise Exception(f"Unrecognized model type {model_type}")
 
 
 class SRTRunner:
