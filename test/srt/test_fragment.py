@@ -9,7 +9,7 @@ import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server.engine_fragment import EngineFragment
-from sglang.test.runners import HFRunner
+from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
@@ -24,6 +24,7 @@ from transformers import AutoModelForCausalLM
 
 _TP_SIZE = 2
 _MAX_NEW_TOKENS = 8
+_PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
 
 
 class TestFragment(unittest.TestCase):
@@ -93,7 +94,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         hf_tokenizer = get_tokenizer(model_path)
 
         hf_outputs = HFRunner.forward_generation_raw(
-            prompts=prompts,
+            prompts=_PROMPTS,
             max_new_tokens=_MAX_NEW_TOKENS,
             base_model=hf_model,
             tokenizer=hf_tokenizer,
@@ -112,24 +113,14 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             [(k, v) for k, v in fsdp_state_dict.items()]
         )
 
-        # NOTE: We deliberately call fragment.generate *twice* to confirm this function can be called multiple times
-        # In real batch generation, surely we should only call fragment.generate once
-        ans = []
-        for prompt in [
-            ["Today is a sunny day and I like", "I have a very good idea on"],
-            ["Hello, I am", "What is your name?", "Mathematics is defined as"],
-        ]:
-            print(f"subprocess[{tp_rank=}] Start generation", flush=True)
-            outputs = fragment.generate(
-                prompt=prompt,
-                sampling_params=[dict(max_new_tokens=16, temperature=0.0)]
-                                * len(prompt),
-            )
-            print(
-                f"subprocess[{tp_rank=}] End generation {prompt=} {outputs=}",
-                flush=True,
-            )
-            ans += [o["text"] for o in outputs]
+        srt_outputs = SRTRunner.forward_generation_raw(
+            prompts=_PROMPTS,
+            max_new_tokens=_MAX_NEW_TOKENS,
+            lora_paths=None,
+            engine=fragment,
+        )
+
+        TODO_assertion
 
         execution_ok = False
 
