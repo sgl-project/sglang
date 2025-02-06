@@ -6,11 +6,13 @@ on:
     paths:
       - "python/sglang/**"
       - "test/**"
+      - "sgl-kernel/**"
   pull_request:
     branches: [ main ]
     paths:
       - "python/sglang/**"
       - "test/**"
+      - "sgl-kernel/**"
   workflow_dispatch:
 
 concurrency:
@@ -18,8 +20,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  accuracy-test-1-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+  accuracy-test-1-gpu-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
@@ -56,7 +58,7 @@ jobs:
 
   finish:
     needs: [
-      accuracy-test-1-gpu
+      accuracy-test-1-gpu-amd
     ]
     runs-on: ubuntu-latest
     steps:
