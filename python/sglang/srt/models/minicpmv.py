@@ -41,7 +41,6 @@ from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import divide, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
@@ -51,7 +50,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import ImageInputs, MediaPaddingHelperTokenPairs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -185,13 +184,10 @@ class Idefics2EncoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_dim = config.hidden_size
-
         self.num_heads = config.num_attention_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        num_heads_per_partition = divide(self.num_heads, tp_size)
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
-            num_heads=num_heads_per_partition,
+            num_heads=self.num_heads,
             projection_size=config.intermediate_size,
             use_qkv_parallel=True,
             quant_config=quant_config,
@@ -1112,76 +1108,18 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         ):
             return input_ids
 
-        new_input_ids = []
-        last_idx = 0
-        image_idx = -1
-        image_inputs.image_offsets = []
-
         # Get all special token IDs
-        im_start_id = (
-            image_inputs.im_start_id[0].item()
-            if isinstance(image_inputs.im_start_id[0], torch.Tensor)
-            else image_inputs.im_start_id[0]
-        )
-        im_end_id = (
-            image_inputs.im_end_id[0].item()
-            if isinstance(image_inputs.im_end_id[0], torch.Tensor)
-            else image_inputs.im_end_id[0]
-        )
-        slice_start_id = (
-            image_inputs.slice_start_id[0].item()
-            if isinstance(image_inputs.slice_start_id[0], torch.Tensor)
-            else image_inputs.slice_start_id[0]
-        )
-        slice_end_id = (
-            image_inputs.slice_end_id[0].item()
-            if isinstance(image_inputs.slice_end_id[0], torch.Tensor)
-            else image_inputs.slice_end_id[0]
+        im_start_id: int = image_inputs.im_start_id[0]
+        im_end_id: int = image_inputs.im_end_id[0]
+        slice_start_id: int = image_inputs.slice_start_id[0]
+        slice_end_id: int = image_inputs.slice_end_id[0]
+
+        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
+        image_inputs.media_padding_helper = MediaPaddingHelperTokenPairs(
+            media_token_pairs
         )
 
-        # Find all start and end positions for both types
-        start_indices = [
-            i
-            for i, x in enumerate(input_ids)
-            if x == im_start_id or x == slice_start_id
-        ]
-        end_indices = [
-            i for i, x in enumerate(input_ids) if x == im_end_id or x == slice_end_id
-        ]
-
-        if len(start_indices) != len(end_indices):
-            return input_ids
-        # Process each region (both image and slice)
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            # Add non-image tokens before this region
-            new_input_ids.extend(
-                input_ids[last_idx : start_idx + 1]
-            )  # include start token
-
-            is_image_start = input_ids[start_idx] == im_start_id
-
-            if is_image_start:
-                image_inputs.image_offsets += [start_idx]
-                image_idx += 1
-
-            num_tokens = end_idx - start_idx - 1  # exclude start and end tokens
-
-            # Generate pad_ids
-            pad_values = [image_inputs.pad_values[image_idx]]
-
-            pad_ids = pad_values * ((num_tokens + len(pad_values)) // len(pad_values))
-            pad_ids = pad_ids[:num_tokens]
-
-            # Add pad_ids
-            new_input_ids.extend(pad_ids)
-
-            # Update last_idx to after end token
-            last_idx = end_idx
-
-        # Add remaining tokens after last region
-        new_input_ids.extend(input_ids[last_idx:])
-        assert len(input_ids) == len(new_input_ids)
-        return new_input_ids
+        return image_inputs.pad_media_tokens(input_ids)
 
 
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6}

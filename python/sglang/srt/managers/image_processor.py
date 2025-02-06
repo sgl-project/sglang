@@ -2,17 +2,22 @@
 import asyncio
 import concurrent.futures
 import dataclasses
+import importlib
 import logging
 import multiprocessing as mp
 import os
+import pkgutil
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from typing import List, Optional, Union
 
 import numpy as np
 import PIL
+import torch
 import transformers
 from decord import VideoReader, cpu
 from PIL import Image
+from transformers import IMAGE_PROCESSOR_MAPPING
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.mm_utils import expand2square, process_anyres_image
@@ -25,15 +30,16 @@ logger = logging.getLogger(__name__)
 global global_processor
 
 
-def init_global_processor(server_args: ServerArgs):
-    """Init the global processor for multi modal models."""
+def init_global_processor(sglang_image_processor, server_args: ServerArgs):
+    """Init the global processor for multi-modal models."""
     global global_processor
     transformers.logging.set_verbosity_error()
-    global_processor = get_processor(
-        server_args.tokenizer_path,
-        tokenizer_mode=server_args.tokenizer_mode,
-        trust_remote_code=server_args.trust_remote_code,
-    )
+    global_processor = sglang_image_processor._build_processor(server_args=server_args)
+
+
+def get_global_processor():
+    global global_processor
+    return global_processor
 
 
 @dataclasses.dataclass
@@ -46,6 +52,7 @@ class BaseImageProcessorOutput:
 
 
 class BaseImageProcessor(ABC):
+
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
         self._processor = _processor
@@ -55,9 +62,20 @@ class BaseImageProcessor(ABC):
 
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
+            initargs=(
+                self,
+                server_args,
+            ),
             mp_context=mp.get_context("fork"),
-            initargs=(server_args,),
             max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
+        )
+
+    def _build_processor(self, server_args):
+        """Init the global processor for multi modal models."""
+        return get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
         )
 
     @abstractmethod
@@ -203,7 +221,9 @@ class LlavaImageProcessor(BaseImageProcessor):
         image_grid_pinpoints: Optional[str] = None,
         image_processor=None,
     ):
-        image_processor = image_processor or global_processor.image_processor
+        processor = global_processor
+
+        image_processor = image_processor or processor.image_processor
 
         try:
             image, image_size = load_image(image_data)
@@ -369,6 +389,29 @@ class MllamaImageProcessor(BaseImageProcessor):
         return image_inputs
 
 
+def encode_video(video_path, frame_count_limit=None):
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
+
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_idx = [i for i in range(0, len(vr), sample_fps)]
+    if frame_count_limit is not None and len(frame_idx) > frame_count_limit:
+        frame_idx = uniform_sample(frame_idx, frame_count_limit)
+    frames = vr.get_batch(frame_idx).asnumpy()
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    return frames
+
+
 class MiniCPMVImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
@@ -376,9 +419,8 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
     @staticmethod
     def _process_images_task(images, input_text):
-        result = global_processor.__call__(
-            text=input_text, images=images, return_tensors="pt"
-        )
+        processor = global_processor
+        result = processor.__call__(text=input_text, images=images, return_tensors="pt")
         return {
             "input_ids": result.input_ids,
             "pixel_values": result.pixel_values,
@@ -432,6 +474,7 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         if tokenizer.slice_start_id:
             slice_start_id = [tokenizer.slice_start_id]
             slice_end_id = [tokenizer.slice_end_id]
+
         return {
             "input_ids": res["input_ids"].flatten().tolist(),
             "pixel_values": res["pixel_values"],
@@ -446,15 +489,10 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _image_processor):
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
         self.hf_config = hf_config
-        self._image_processor = _image_processor
-        self.executor = concurrent.futures.ProcessPoolExecutor(
-            initializer=init_global_processor,
-            mp_context=mp.get_context("fork"),
-            initargs=(server_args,),
-            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
-        )
+        self._image_processor = _processor
 
     @staticmethod
     def _process_single_image_task(
@@ -554,10 +592,10 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             image_grid_thws = [image_grid_thw]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
-
         return {
             "pixel_values": pixel_values,
             "image_hashes": image_hashes,
+            "im_token_id": self.hf_config.image_token_id,
             "image_sizes": image_sizes,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": image_grid_thws,
@@ -627,22 +665,283 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         }
 
 
+class InternVLImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _image_processor):
+        super().__init__(hf_config, server_args, _image_processor)
+        self._image_processor = _image_processor
+        image_size = hf_config.force_image_size or hf_config.vision_config.image_size
+        patch_size = hf_config.vision_config.patch_size
+
+        self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+        self.IMG_START_TOKEN = "<img>"
+        self.IMG_END_TOKEN = "</img>"
+        self.num_image_token = int(
+            (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
+        )
+
+        tokenizer = self._processor
+        self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
+        self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
+        self.img_context_token_id = tokenizer.convert_tokens_to_ids(
+            self.IMG_CONTEXT_TOKEN
+        )
+
+    @staticmethod
+    def _process_single_image_task(
+        image_data: Union[str, bytes],
+        image_processor=None,
+    ):
+        pass
+
+    @staticmethod
+    def build_transform(input_size):
+        IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_STD = (0.229, 0.224, 0.225)
+
+        def resize_image(img, size):
+            return img.resize((size, size), Image.Resampling.BICUBIC)
+
+        def to_tensor(img):
+            # Convert PIL Image to numpy array
+            img_array = np.array(img).astype(np.float32) / 255.0
+            # Convert HWC to CHW format
+            img_array = img_array.transpose(2, 0, 1)
+            return torch.from_numpy(img_array)
+
+        def normalize(tensor, mean, std):
+            mean = torch.tensor(mean).view(-1, 1, 1)
+            std = torch.tensor(std).view(-1, 1, 1)
+            return (tensor - mean) / std
+
+        def transform(img):
+            img = img.convert("RGB") if img.mode != "RGB" else img
+            img = resize_image(img, input_size)
+            tensor = to_tensor(img)
+            tensor = normalize(tensor, IMAGENET_MEAN, IMAGENET_STD)
+            return tensor
+
+        return transform
+
+    @staticmethod
+    def dynamic_preprocess(
+        image, min_num=1, max_num=12, image_size=448, use_thumbnail=False
+    ):
+
+        def find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, width, height, image_size
+        ):
+            best_ratio_diff = float("inf")
+            best_ratio = (1, 1)
+            area = width * height
+            for ratio in target_ratios:
+                target_aspect_ratio = ratio[0] / ratio[1]
+                ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+                if ratio_diff < best_ratio_diff:
+                    best_ratio_diff = ratio_diff
+                    best_ratio = ratio
+                elif ratio_diff == best_ratio_diff:
+                    if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                        best_ratio = ratio
+            return best_ratio
+
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        # calculate the existing image aspect ratio
+        target_ratios = set(
+            (i, j)
+            for n in range(min_num, max_num + 1)
+            for i in range(1, n + 1)
+            for j in range(1, n + 1)
+            if i * j <= max_num and i * j >= min_num
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        # find the closest aspect ratio to the target
+        target_aspect_ratio = find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size
+        )
+
+        # calculate the target width and height
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+        # resize the image
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size,
+            )
+            # split the image
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        return processed_images
+
+    @staticmethod
+    def get_index(bound, fps, max_frame, first_idx=0, num_segments=32):
+        if bound:
+            start, end = bound[0], bound[1]
+        else:
+            start, end = -100000, 100000
+        start_idx = max(first_idx, round(start * fps))
+        end_idx = min(round(end * fps), max_frame)
+        seg_size = float(end_idx - start_idx) / num_segments
+        frame_indices = np.array(
+            [
+                int(start_idx + (seg_size / 2) + np.round(seg_size * idx))
+                for idx in range(num_segments)
+            ]
+        )
+        return frame_indices
+
+    @staticmethod
+    def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=32):
+        vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+        max_frame = len(vr) - 1
+        fps = float(vr.get_avg_fps())
+
+        pixel_values_list, num_patches_list = [], []
+        transform = InternVLImageProcessor.build_transform(input_size=input_size)
+        frame_indices = InternVLImageProcessor.get_index(
+            bound, fps, max_frame, first_idx=0, num_segments=num_segments
+        )
+        for frame_index in frame_indices:
+            img = Image.fromarray(vr[frame_index].asnumpy()).convert("RGB")
+            img = InternVLImageProcessor.dynamic_preprocess(
+                img, image_size=input_size, use_thumbnail=True, max_num=max_num
+            )
+            pixel_values = [transform(tile) for tile in img]
+            pixel_values = torch.stack(pixel_values)
+            num_patches_list.append(pixel_values.shape[0])
+            pixel_values_list.append(pixel_values)
+        pixel_values = torch.cat(pixel_values_list)
+        return pixel_values, num_patches_list
+
+    async def process_images_async(
+        self,
+        image_data: List[Union[str, bytes]],
+        input_ids,
+        request_obj,
+        *args,
+        **kwargs,
+    ):
+        if not image_data:
+            return None
+
+        tokenizer = self._processor
+
+        input_text = tokenizer.decode(input_ids)
+
+        # print(f"input_text: {input_text}")
+
+        image_hashes, image_sizes = [], []
+
+        all_frames = []
+
+        def load_image_internvl(image_file, input_size=448, max_num=12):
+            image, _size = load_image(image_file)
+            transform = InternVLImageProcessor.build_transform(input_size=input_size)
+            images = InternVLImageProcessor.dynamic_preprocess(
+                image, image_size=input_size, use_thumbnail=True, max_num=max_num
+            )
+            pixel_values = [transform(image) for image in images]
+            pixel_values = torch.stack(pixel_values)
+            return pixel_values
+
+        num_patches_list = []
+
+        # Process each input with allocated frames
+        for image_index, (image) in enumerate(image_data):
+            try:
+                if isinstance(image, str) and image.startswith("video:"):
+                    path = image[len("video:") :]
+                    pixel_values, num_patches_list_video = (
+                        InternVLImageProcessor.load_video(path)
+                    )
+
+                    frames = [pixel_values.to(torch.bfloat16).cuda()]
+                    num_patches_list += num_patches_list_video
+                else:
+                    raw_image = load_image_internvl(image)
+                    frames = [raw_image.to(torch.bfloat16).cuda()]
+                    num_patches = raw_image.shape[0]
+                    num_patches_list += [num_patches]
+
+            except FileNotFoundError as e:
+                print(e)
+                return None
+            image_hashes += [hash(image)] * len(frames)
+            all_frames += frames
+
+        pixel_values = torch.cat(all_frames, dim=0)
+        for idx, num_patches in enumerate(num_patches_list):
+            image_tokens = (
+                self.IMG_START_TOKEN
+                + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
+                + self.IMG_END_TOKEN
+            )
+            input_text = input_text.replace("<image>", image_tokens, 1)
+
+        return {
+            "input_ids": tokenizer(input_text, return_tensors="pt")["input_ids"]
+            .flatten()
+            .tolist(),
+            "pixel_values": pixel_values,
+            "im_start_id": self.img_start_token_id,
+            "im_end_id": self.img_end_token_id,
+            "im_token_id": self.img_context_token_id,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "modalities": request_obj.modalities or ["image"],
+        }
+
+
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor
 ) -> BaseImageProcessor:
-    if "MllamaForConditionalGeneration" in hf_config.architectures:
-        return MllamaImageProcessor(hf_config, server_args, processor)
-    elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
-
-        return Qwen2VLImageProcessor(hf_config, server_args, processor)
-    elif "Qwen2_5_VLForConditionalGeneration" in hf_config.architectures:
-        return Qwen2_5VLImageProcessor(hf_config, server_args, processor)
-
-    elif "MiniCPMV" in hf_config.architectures:
-        return MiniCPMVImageProcessor(hf_config, server_args, processor)
-    else:
-        return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
+    for name, cls in IMAGE_PROCESSOR_MAPPING.items():
+        if name in hf_config.architectures:
+            return cls(hf_config, server_args, processor)
+    return LlavaImageProcessor(hf_config, server_args, processor)
 
 
 def get_dummy_image_processor():
     return DummyImageProcessor()
+
+
+IMAGE_PROCESSOR_MAPPING = {
+    "MllamaForConditionalGeneration": MllamaImageProcessor,
+    "Qwen2VLForConditionalGeneration": Qwen2VLImageProcessor,
+    "MiniCPMV": MiniCPMVImageProcessor,
+    "InternVLChatModel": InternVLImageProcessor,
+}
+
+
+@lru_cache()
+def import_image_processors():
+    package_name = "sglang.srt.managers.image_processors"
+    package = importlib.import_module(package_name)
+    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
+        if not ispkg:
+            try:
+                module = importlib.import_module(name)
+            except Exception as e:
+                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                continue
+            if hasattr(module, "EntryClass"):
+                entry = module.EntryClass
+                if isinstance(entry, dict):
+                    for processor_name, cls in entry.items():
+                        IMAGE_PROCESSOR_MAPPING[processor_name] = cls
+
+
+import_image_processors()

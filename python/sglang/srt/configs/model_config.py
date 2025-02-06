@@ -380,7 +380,7 @@ def _get_and_verify_dtype(
 
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
-    # 1. Check the model architectue
+    # 1. Check the model architecture
     # 2. check the `is_embedding` server args
 
     if (
@@ -405,6 +405,8 @@ def is_multimodal_model(model_architectures: List[str]):
         or "Qwen2VLForConditionalGeneration" in model_architectures
         or "Qwen2_5_VLForConditionalGeneration" in model_architectures
         or "MiniCPMV" in model_architectures
+        or "MultiModalityCausalLM" in model_architectures
+        or "InternVLChatModel" in model_architectures
     ):
         return True
     else:
