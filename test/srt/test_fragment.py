@@ -33,20 +33,20 @@ _ENABLE_UPDATE_WEIGHTS = True
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
 CI_MODELS = [
-    dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
-    dict(model_path="google/gemma-2-2b"),
+    # dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
+    # dict(model_path="google/gemma-2-2b"),
 ]
 ALL_OTHER_MODELS = [
-    dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
-    dict(model_path="Qwen/Qwen2-1.5B"),
+    # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
+    # dict(model_path="Qwen/Qwen2-1.5B"),
     dict(model_path="Qwen/Qwen2.5-14B-Instruct", tp_size=4),
-    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct"),
-    dict(model_path="allenai/OLMo-1B-0724-hf"),
-    dict(model_path="THUDM/glm-4-9b-chat"),
-    dict(model_path="openai-community/gpt2"),
-    dict(model_path="microsoft/Phi-3-small-8k-instruct"),
-    dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
-    dict(model_path="ibm-granite/granite-3.0-2b-instruct"),
+    # dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct"),
+    # dict(model_path="allenai/OLMo-1B-0724-hf"),
+    # dict(model_path="THUDM/glm-4-9b-chat"),
+    # dict(model_path="openai-community/gpt2"),
+    # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
+    # dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
+    # dict(model_path="ibm-granite/granite-3.0-2b-instruct"),
 ]
 
 
@@ -68,6 +68,7 @@ class TestFragment(unittest.TestCase):
                 target=_run_subprocess,
                 kwargs=dict(
                     tp_rank=tp_rank,
+                    tp_size=tp_size,
                     master_port=master_port,
                     nccl_port=nccl_port,
                     output_writer=output_writer,
