@@ -20,11 +20,10 @@ from typing import List, Union
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
-
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server import Runtime
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+from transformers import AutoModelForCausalLM
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -252,7 +251,7 @@ class HFRunner:
                 output_scores=(not output_str_only),
             )
             output_strs.append(
-                tokenizer.decode(outputs[0][0][len(input_ids[0]) :])
+                tokenizer.decode(outputs[0][0][len(input_ids[0]):])
             )
             if not output_str_only:
                 # outputs.scores: (num_token, 1, vocab_size)
@@ -279,6 +278,7 @@ class HFRunner:
             top_input_logprobs=top_input_logprobs,
             top_output_logprobs=top_output_logprobs,
         )
+
 
 class SRTRunner:
     def __init__(
@@ -317,7 +317,12 @@ class SRTRunner:
         lora_paths=None,
     ):
         if self.is_generation:
-            self.forward_generation_raw()
+            self.forward_generation_raw(
+                prompts=prompts,
+                max_new_tokens=max_new_tokens,
+                lora_paths=lora_paths,
+                engine=self.engine,
+            )
         else:
             response = self.runtime.encode(prompts)
             response = json.loads(response)
@@ -375,6 +380,7 @@ class SRTRunner:
         prompts: Union[List[str], List[torch.Tensor]],
         max_new_tokens,
         lora_paths,
+        engine,
     ):
         # the return value contains logprobs from prefill
         output_strs = []
@@ -382,7 +388,7 @@ class SRTRunner:
         top_output_logprobs = []
         sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
         for i, prompt in enumerate(prompts):
-            response = runtime.generate(
+            response = engine.generate(
                 prompt,
                 lora_path=lora_paths[i] if lora_paths else None,
                 sampling_params=sampling_params,
@@ -390,7 +396,6 @@ class SRTRunner:
                 logprob_start_len=0,
                 top_logprobs_num=NUM_TOP_LOGPROBS,
             )
-            response = json.loads(response)
             output_strs.append(response["text"])
             top_input_logprobs.append(
                 [
@@ -418,6 +423,7 @@ class SRTRunner:
             top_input_logprobs=top_input_logprobs,
             top_output_logprobs=top_output_logprobs,
         )
+
 
 def monkey_patch_gemma2_sdpa():
     """
