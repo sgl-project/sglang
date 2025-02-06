@@ -51,6 +51,7 @@ ALL_OTHER_MODELS = [
 
 
 class TestFragment(unittest.TestCase):
+    @classmethod
     def setUpClass(cls):
         multiprocessing.set_start_method("spawn")
 
