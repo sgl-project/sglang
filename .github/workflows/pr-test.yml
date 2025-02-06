@@ -112,6 +112,163 @@ jobs:
           cd test/srt
           python3 test_moe_ep.py
 
+  performance-test-1-gpu-part-1:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false && (contains(github.event.pull_request.changed_files, 'python/sglang') || contains(github.event.pull_request.changed_files, 'test'))
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Benchmark single latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1
+
+      - name: Benchmark online latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+
+      - name: Benchmark offline throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+
+      - name: Benchmark offline throughput (Non-streaming, small batch size)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+
+      - name: Benchmark online latency (EAGLE)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+
+  performance-test-1-gpu-part-2:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false && (contains(github.event.pull_request.changed_files, 'python/sglang') || contains(github.event.pull_request.changed_files, 'test'))
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Benchmark offline throughput (w/o RadixAttention)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+
+      - name: Benchmark offline throughput (w/ Triton)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+
+      - name: Benchmark offline throughput (w/ FP8)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+
+  performance-test-2-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false && (contains(github.event.pull_request.changed_files, 'python/sglang') || contains(github.event.pull_request.changed_files, 'test'))
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Benchmark single latency (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
+      - name: Benchmark single latency + torch.compile (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
+
+      - name: Benchmark offline throughput (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+
+      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+
+  accuracy-test-1-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false && (contains(github.event.pull_request.changed_files, 'python/sglang') || contains(github.event.pull_request.changed_files, 'test'))
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py
+
+  accuracy-test-2-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false && (contains(github.event.pull_request.changed_files, 'python/sglang') || contains(github.event.pull_request.changed_files, 'test'))
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate accuracy (TP=2)
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_moe_eval_accuracy_large.py
+
   doc-test:
     if: contains(github.event.pull_request.changed_files, 'docs/**')
     runs-on: ubuntu-latest
@@ -140,6 +297,11 @@ jobs:
       - unit-test-frontend
       - unit-test-backend-1-gpu
       - unit-test-backend-2-gpu
+      - performance-test-1-gpu-part-1
+      - performance-test-1-gpu-part-2
+      - performance-test-2-gpu
+      - accuracy-test-1-gpu
+      - accuracy-test-2-gpu
       - doc-test
     runs-on: ubuntu-latest
     if: >
@@ -154,13 +316,23 @@ jobs:
           needs.unit-test-frontend.result == 'success' &&
           needs.unit-test-backend-1-gpu.result == 'success' &&
           needs.unit-test-backend-2-gpu.result == 'success' &&
+          needs.performance-test-1-gpu-part-1.result == 'success' &&
+          needs.performance-test-1-gpu-part-2.result == 'success' &&
+          needs.performance-test-2-gpu.result == 'success' &&
+          needs.accuracy-test-1-gpu.result == 'success' &&
+          needs.accuracy-test-2-gpu.result == 'success' &&
           !contains(github.event.pull_request.changed_files, 'docs/**')
         ) ||
         (
           needs.doc-test.result == 'success' &&
           needs.unit-test-frontend.result == 'success' &&
           needs.unit-test-backend-1-gpu.result == 'success' &&
-          needs.unit-test-backend-2-gpu.result == 'success'
+          needs.unit-test-backend-2-gpu.result == 'success' &&
+          needs.performance-test-1-gpu-part-1.result == 'success' &&
+          needs.performance-test-1-gpu-part-2.result == 'success' &&
+          needs.performance-test-2-gpu.result == 'success' &&
+          needs.accuracy-test-1-gpu.result == 'success' &&
+          needs.accuracy-test-2-gpu.result == 'success'
         )
       )
     steps:
