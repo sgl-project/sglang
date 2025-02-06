@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import json
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
@@ -21,7 +20,7 @@ from typing import List, Union
 import torch
 import torch.nn.functional as F
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server import Runtime
+from sglang.srt.server import Engine
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 from transformers import AutoModelForCausalLM
 
@@ -295,7 +294,7 @@ class SRTRunner:
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
-        self.runtime = Runtime(
+        self.engine = Engine(
             model_path=model_path,
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
@@ -324,8 +323,7 @@ class SRTRunner:
                 engine=self.engine,
             )
         else:
-            response = self.runtime.encode(prompts)
-            response = json.loads(response)
+            response = self.engine.encode(prompts)
             if self.model_type == "embedding":
                 logits = [x["embedding"] for x in response]
                 return ModelOutput(embed_logits=logits)
@@ -347,20 +345,18 @@ class SRTRunner:
             # the return value contains logprobs from prefill
             output_strs = []
             sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
-            response = self.runtime.generate(
+            response = self.engine.generate(
                 prompts,
                 lora_path=lora_paths if lora_paths else None,
                 sampling_params=sampling_params,
             )
-            response = json.loads(response)
             output_strs = [r["text"] for r in response]
 
             return ModelOutput(
                 output_strs=output_strs,
             )
         else:
-            response = self.runtime.encode(prompts)
-            response = json.loads(response)
+            response = self.engine.encode(prompts)
             if self.model_type == "embedding":
                 logits = [x["embedding"] for x in response]
                 return ModelOutput(embed_logits=logits)
@@ -372,8 +368,8 @@ class SRTRunner:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.runtime.shutdown()
-        del self.runtime
+        self.engine.shutdown()
+        del self.engine
 
     @staticmethod
     def forward_generation_raw(
