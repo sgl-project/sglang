@@ -16,6 +16,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_image
 from sglang.utils import get_exception_traceback
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 global global_processor
@@ -343,9 +345,47 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         }
 
 class DeepseekVL2ImageProcessor(BaseImageProcessor):
-    #todo finish imageprocessor
-    def __init__(self, hf_config, server_args, _image_processor):
-        super.__init__(hf_config, server_args, _image_processor)
+    def __init__(self, hf_config, server_args, _processor):
+        super.__init__(hf_config, server_args, _processor)
+        self.processor=_processor
+    
+    async def _process_single_image(self,image_data: Union[bytes,str],input_text):
+        image_inputs=self.processor.__call__(conversations=input_text,images=image_data,force_batchify=False,system_prompt="")
+        
+        return image_inputs
+    
+    async def process_images_async(self, image_data, input_text, request_obj):
+        if not image_data:
+            return None
+        
+        if not isinstance(image_data,list):
+            image_data=[image_data]
+        
+        image_hashes,image_sizes=[],[]
+        
+        if len(image_data)>0:
+            images=[load_image(image)[0] for image in image_data]
+        else:
+            images=load_image(image_data[0])[0]
+        res=await self._process_single_image(images,input_text)
+        pixel_values=res["images"]
+        image_hashes=[hash(str(image_data))]
+        input_ids=res["input_ids"]
+        images_seq_mask=res["image_seq_mask"]
+        images_spatial_crop=res["images_spatial_crop"]
+        batched_images_spatial_crop=[]
+        batched_images_spatial_crop.append(images_spatial_crop)
+        batched_images_spatial_crop=torch.stack(batched_images_spatial_crop,dim=0)
+        
+        return{
+            "input_ids":input_ids.tolist(),
+            "pixel_values":pixel_values,
+            "image_hashes":image_hashes,
+            "image_sizes":image_sizes,
+            "image_seq_mask":images_seq_mask,
+            "images_spatial_crop": batched_images_spatial_crop,
+            "modalities":request_obj.modalities or ["image"],
+        }
 
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor

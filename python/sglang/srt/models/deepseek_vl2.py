@@ -2,7 +2,7 @@ import collections
 import math
 from enum import Enum
 from functools import partial
-from typing import Callable, List, Optional, Tuple, Type, Union
+from typing import Callable, List, Optional, Tuple, Type, Union, Iterable
 
 import torch
 import torch.nn.functional as F
@@ -743,7 +743,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         # ----------- language model ------------
         language_config = config.language_config
-        self.language = DeepseekV2ForCausalLM(language_config)
+        self.language_model = DeepseekV2ForCausalLM(language_config)
 
     def forward(
         self,
@@ -752,23 +752,126 @@ class DeepseekVL2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: object,
     ):
-        if inputs_embeds is None:
-            inputs_embeds = self.prepare_inputs_embeds(
-                input_ids=input_ids,
-                images=images,
-                images_seq_mask=images_seq_mask,
-                images_spatial_crop=images_spatial_crop,
-            )
+        if forward_batch.image_inputs[0] is not None:
+            if forward_batch.forward_mode.is_decode():
+                input_embeds=self.language_model.model.embed_tokens(input_ids)
+            else:
+                pixel_values=forward_batch.image_inputs[0].pixel_values.to(device="cuda",dtype=torch.bfloat16)
+                image_seq_mask=forward_batch.image_inputs[0].image_seq_mask.to(device="cuda")
+                image_spatial_crop=forward_batch.image_inputs[0].image_spatial_crop
+                image_feature=self.vision.forward_features(pixel_values)
+                images_embeds=self.projector(image_feature)
+                _,hw,n_dim=images_embeds.shape
+                h=w=int(hw**0.5)
+                
+                tile_index=0
+                input_embeds=self.language_model.model.embed_tokens(input_ids)
+                for idx in range(image_spatial_crop.shape[0]):
+                    images_in_this_batch=[]
+                    for jdx in range(image_spatial_crop.shape[1]):
+                        num_width_tiles, num_height_tiles = image_spatial_crop[idx,jdx]
+                        if num_width_tiles == 0 or num_height_tiles == 0:
+                            break
+                        num_tiles_in_image = num_width_tiles * num_height_tiles
 
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(inputs_embeds.device)
+                        # [hw, D]
+                        global_features = images_embeds[tile_index]
 
+                        # [num_height_tiles * num_width_tiles, hw, D]
+                        local_features = images_embeds[tile_index + 1:tile_index + 1 +
+                                                    num_tiles_in_image]
+                        tile_index += num_tiles_in_image + 1
+
+                        # format global and local features
+                        # ----------------- global view add newline -----------------
+                        # [hw, D] -> [h, w, D]
+                        global_features = global_features.view(h, w, n_dim)
+
+                        # [D]     -> [h, 1, D]
+                        new_lines_in_global = repeat(self.image_newline, "d -> h 1 d", h=h)
+
+                        # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
+                        global_features = torch.cat([global_features, new_lines_in_global],
+                                                    dim=1)
+
+                        # [h, w + 1, D] -> [h * (w + 1), D]
+                        global_features = global_features.view(-1, n_dim)
+
+                        # ----------------- local view add newline -----------------
+                        # [num_height_tiles * num_width_tiles, h * w, D] ->
+                        # [num_height_tiles * h, num_width_tiles * w, D]
+                        local_features = rearrange(local_features,
+                                                "(th tw) (h w) d -> (th h) (tw w) d",
+                                                th=num_height_tiles,
+                                                tw=num_width_tiles,
+                                                h=h,
+                                                w=w)
+
+                        # [D] -> [num_height_tiles * h, 1, D]
+                        new_lines_in_local = repeat(self.image_newline,
+                                                    "d -> (th h) 1 d",
+                                                    th=num_height_tiles,
+                                                    h=h)
+
+                        # [num_height_tiles * h, num_width_tiles * w + 1, D]
+                        local_features = torch.cat([local_features, new_lines_in_local],
+                                                dim=1)
+
+                        # [num_height_tiles * h, num_width_tiles * w + 1, D]
+                        #   --> [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
+                        local_features = local_features.view(-1, n_dim)
+
+                        # merge global and local tiles
+                        if self.global_view_pos == "head":
+                            global_local_features = torch.cat([
+                                global_features,
+                                self.view_seperator[None, :],
+                                local_features,
+                            ])
+                        else:
+                            global_local_features = torch.cat([
+                                local_features,
+                                self.view_seperator[None, :],
+                                global_features,
+                            ])
+
+                        images_in_this_batch.append(global_local_features)
+                    
+                    if len(images_in_this_batch)>0:
+                        images_in_this_batch=torch.cat(images_in_this_batch,dim=0)
+                        input_embeds[idx].masked_scatter_(image_seq_mask[idx].unsqueeze(-1),images_in_this_batch)
+        else:
+            input_embeds=None
+            
         outputs = self.language.forward(
-            input_ids=input_ids, positions=positions, forward_batch=forward_batch
+            input_ids=input_ids, positions=positions, forward_batch=forward_batch,input_embeds=input_embeds,
         )
 
         return outputs
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0),
+        ]
+        params_dict = dict(self.named_parameters())
+        weights=list(weights)
+        for name,loaded_weight in weights:
+            if "language" in name:
+                name=name.replace('language.','')
+                self.language_model.load_weights([(name,loaded_weight)])
+            else:
+                param=params_dict[name]
+                weights_loader=getattr(param,"weight_loader",default_weight_loader)
+                weights_loader(param,loaded_weight)
+                
+    def pad_input_ids(self,input_ids: List[int],image_inputs:ImageInputs):
+        return input_ids
+    
     def prepare_inputs_embeds(
         self,
         input_ids: torch.LongTensor,

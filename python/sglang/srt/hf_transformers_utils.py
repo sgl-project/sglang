@@ -50,7 +50,7 @@ for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
 
-for sglang.srt.configs import DeepseekVLV2Processor
+from sglang.srt.configs import DeepseekVLV2Processor
 with contextlib.suppress(ValueError):
     AutoProcessor.register("DeepseekVLV2Processor",DeepseekVLV2Processor)
 

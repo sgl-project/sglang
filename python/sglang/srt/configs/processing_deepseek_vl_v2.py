@@ -70,7 +70,6 @@ class VLChatProcessorOutput(DictOutput):
     images: torch.Tensor
     images_seq_mask: torch.BoolTensor
     images_spatial_crop: torch.LongTensor
-    num_image_tokens: List[int]
 
     def __len__(self):
         return len(self.input_ids)
@@ -246,78 +245,21 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         image_index = 0
 
-        conv = get_conv_template(self.sft_format)
-        conv_system_message = conv.system_message
+        tokenized_str,images,seq_mask,spatial_crop=self.tokenize_with_images(messages,pil_images,bos=False,eos=True,cropping=len(pil_images)<=2)
 
-        for idx, message in enumerate(messages):
-            if idx == 0:
-                tokenized_data += [self.bos_id]
-                masked_tokenized_data += [self.bos_id]
-                images_seq_mask += [False]
-                conv.system_message = conv_system_message
-            else:
-                conv.system_message = ''
-
-            if message['role'] == conv.roles[0] or message['role'] == "user":
-                conv.reset_message()
-                conv.append_message(conv.roles[0], str(message['content']).strip())
-                conv.append_message(conv.roles[1], '')
-                formatted_question = conv.get_prompt()
-                tokenized_str, images, seq_mask, spatial_crop, n_image_tokens = self.tokenize_with_images(
-                    formatted_question,
-                    pil_images[image_index: image_index + formatted_question.count(self.image_token)],
-                    bos=False,
-                    eos=False,
-                    cropping=len(pil_images) <= 2
-                )
-                image_index += formatted_question.count(self.image_token)
-
-                tokenized_data += tokenized_str
-                if self.mask_prompt:
-                    masked_tokenized_data += [self.ignore_id] * len(tokenized_str)
-                else:
-                    masked_tokenized_data += tokenized_str
-                images_list += images
-                images_seq_mask += seq_mask
-                images_spatial_crop += spatial_crop
-                num_image_tokens += n_image_tokens
-
-            elif message['role'] == conv.roles[1] or message['role'] == "assistant":
-                formatted_answer = message['content'].strip()
-                assert formatted_answer.count(
-                    self.image_token) == 0, f"there should be no {self.image_token} in the assistant's reply, but got {messages}"
-                tokenized_str, images, seq_mask, spatial_crop, n_image_tokens = self.tokenize_with_images(
-                    formatted_answer,
-                    [],
-                    bos=False,
-                    eos=True,
-                    cropping=len(pil_images) <= 2)
-
-                tokenized_data += tokenized_str
-                masked_tokenized_data += tokenized_str
-                images_seq_mask += seq_mask
-
-            elif message['role'] == 'system' or message['role'] == 'deepseekapi-sys':
-                # 如果message里面有system，那就只允许出现在message的第一句，同时conv原本的system就会失效
-                assert idx == 0, 'system information should only exist in the begining of the conversation'
-                formatted_system = message['content'].strip()
-                tokenized_str = self.encode(formatted_system, bos=False, eos=False)
-                tokenized_data += tokenized_str
-                if self.mask_prompt:
-                    masked_tokenized_data += [self.ignore_id] * len(tokenized_str)
-                else:
-                    masked_tokenized_data += tokenized_str
-                seq_mask = [False] * len(tokenized_str)
-                images_seq_mask += seq_mask
-
-            else:
-                assert False, f"Unknown role: {message['role']}"
-
+        image_index=1
+        if self.mask_prompt:
+            masked_tokenized_data += [self.ignore_id] * len(tokenized_str)
+        else:
+            masked_tokenized_data += tokenized_str
+        images_list += images
+        images_seq_mask += seq_mask
+        images_spatial_crop += spatial_crop
+        
         assert len(tokenized_data) == len(
             images_seq_mask), f"format_messages_v2: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
-        assert len(images_spatial_crop) == len(num_image_tokens), f"image number should be compatible"
 
-        return tokenized_data, masked_tokenized_data, images_list, images_seq_mask, images_spatial_crop, num_image_tokens
+        return tokenized_data, masked_tokenized_data, images_list, images_seq_mask, images_spatial_crop
 
     def format_prompts(
             self,
@@ -406,32 +348,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 prompt is None or conversations is None
         ), "prompt and conversations cannot be used at the same time."
 
-        if prompt is None:
-            # apply sft format
-            sft_format = self.format_messages(
-                conversations=conversations,
-                sft_format=self.sft_format,
-                system_prompt=system_prompt,
-            )
-            tokenized_str, masked_tokenized_str, images_list, images_seq_mask, images_spatial_crop, num_image_tokens = self.format_messages_v2(
+        tokenized_str, masked_tokenized_str, images_list, images_seq_mask, images_spatial_crop = self.format_messages_v2(
                 conversations, images)
-        else:
-            if apply_sft_format:
-                sft_format = self.format_prompts(
-                    prompts=prompt,
-                    sft_format=self.sft_format,
-                    system_prompt=system_prompt
-                )
-            else:
-                sft_format = prompt
-            tokenized_str, images_list, images_seq_mask, images_spatial_crop, num_image_tokens = self.tokenize_with_images(
-                sft_format, images, bos=True, eos=True, cropping=len(images) <= 2)
-            masked_tokenized_str = []
-            for token_index in tokenized_str:
-                if token_index != self.image_token_id:
-                    masked_tokenized_str.append(token_index)
-                else:
-                    masked_tokenized_str.append(self.ignore_id)
+           
 
         assert len(tokenized_str) == len(images_seq_mask) == len(masked_tokenized_str), \
             (f"tokenized_str's length {len(tokenized_str)}, input_ids' length {len(masked_tokenized_str)}, "
@@ -466,7 +385,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             images=images,
             images_seq_mask=images_seq_mask,
             images_spatial_crop=images_spatial_crop,
-            num_image_tokens=num_image_tokens
         )
 
         return prepare
@@ -527,14 +445,11 @@ class DeepseekVLV2Processor(ProcessorMixin):
             cropping: bool = True,
     ):
         """Tokenize text with <image> tags."""
-        assert conversation.count(self.image_token) == len(images)
-        text_splits = conversation.split(self.image_token)
         images_list, images_seq_mask, images_spatial_crop = [], [], []
-        num_image_tokens = []
         tokenized_str = []
-        for text_sep, image in zip(text_splits, images):
+        for image in images:
             """encode text_sep"""
-            tokenized_sep = self.encode(text_sep, bos=False, eos=False)
+            tokenized_sep = conversation
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
@@ -573,13 +488,12 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
             tokenized_str += tokenized_image
             images_seq_mask += [True] * len(tokenized_image)
-            num_image_tokens.append(len(tokenized_image))
             # print(width_crop_num, height_crop_num, len(tokenized_image)) # test the correctness of the number of image-related tokens
 
         """process the last text split"""
-        tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
-        tokenized_str += tokenized_sep
-        images_seq_mask += [False] * len(tokenized_sep)
+        # tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
+        # tokenized_str += tokenized_sep
+        # images_seq_mask += [False] * len(tokenized_sep)
 
         """add the bos and eos tokens"""
         if bos:
@@ -592,7 +506,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         assert len(tokenized_str) == len(
             images_seq_mask), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
 
-        return tokenized_str, images_list, images_seq_mask, images_spatial_crop, num_image_tokens
+        return tokenized_str, images_list, images_seq_mask, images_spatial_crop
 
     def batchify(
             self,

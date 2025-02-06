@@ -810,8 +810,12 @@ class DeepseekV2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -853,8 +857,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states = self.model(input_ids, positions, forward_batch,input_embeds)
         if not forward_batch.forward_mode.is_idle():
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
