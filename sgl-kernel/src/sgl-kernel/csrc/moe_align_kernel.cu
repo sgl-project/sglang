@@ -25,6 +25,27 @@ limitations under the License.
 #define WARP_SIZE 32
 
 template <typename scalar_t>
+__global__ void sort_token_ids_kernel(scalar_t* __restrict__ topk_ids, 
+                                    int32_t* sorted_token_ids,
+                                    int32_t* token_cnts_buffer,
+                                    const int32_t* cumsum,
+                                    int32_t num_experts,
+                                    size_t numel,
+                                    int32_t tokens_per_block) {
+    const size_t start_idx = blockIdx.x * tokens_per_block;
+    const size_t end_idx = min(start_idx + tokens_per_block, numel);
+    
+    const size_t off_t = blockIdx.x * num_experts;
+    
+    for (size_t i = start_idx + threadIdx.x; i < end_idx; i += blockDim.x) {
+        int expert_id = topk_ids[i];
+        int token_cnt = atomicAdd(&token_cnts_buffer[off_t + expert_id], 1);
+        int rank_post_pad = token_cnt + cumsum[expert_id];
+        sorted_token_ids[rank_post_pad] = i;
+    }
+}
+
+template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
                                             int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
                                             int32_t block_size, size_t numel, int32_t* cumsum) {
@@ -82,11 +103,11 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
   // kernel can achieve state-of-the-art performance across all token cases. However, once multiple blocks are used,
   // illegal memory access occurs. Even replacing these lines of code with the stage 4 kernel from the Triton version
   // results in the same issue, and a correct solution has not yet been found.
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
-    int32_t expert_id = topk_ids[i];
-    int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
-    sorted_token_ids[rank_post_pad] = i;
-  }
+  // for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
+  //   int32_t expert_id = topk_ids[i];
+  //   int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
+  //   sorted_token_ids[rank_post_pad] = i;
+  // }
 }
 
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
@@ -100,5 +121,15 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
     align_kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                          experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
                                          num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
+    auto sort_kernel = sort_token_ids_kernel<scalar_t>;
+    const int tokens_per_block = CEILDIV(topk_ids.numel(), num_experts);
+    sort_kernel<<<num_experts, 256, 0, stream>>>(
+        topk_ids.data_ptr<scalar_t>(),
+        sorted_token_ids.data_ptr<int32_t>(),
+        token_cnts_buffer.data_ptr<int32_t>(),
+        cumsum_buffer.data_ptr<int32_t>(),
+        num_experts,
+        topk_ids.numel(),
+        tokens_per_block);
   });
 }
