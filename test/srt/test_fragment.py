@@ -25,7 +25,7 @@ from torch.distributed.fsdp.api import (
 from transformers import AutoModelForCausalLM
 
 _MAX_NEW_TOKENS = 8
-_PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
+_PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
 
 # Set to false to temporarily debug issues unrelated to weight update
 _ENABLE_UPDATE_WEIGHTS = True
@@ -40,7 +40,7 @@ ALL_OTHER_MODELS = [
     # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     # dict(model_path="Qwen/Qwen2-1.5B"),
     # dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
-    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3, prefill_tolerance=0.25),
+    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3, prefill_tolerance=0.25, decode_tolerance=0.25),
     # dict(model_path="allenai/OLMo-1B-0724-hf"),
     # dict(model_path="THUDM/glm-4-9b-chat", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
     # dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
