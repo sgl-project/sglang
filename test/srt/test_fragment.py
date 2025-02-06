@@ -117,15 +117,16 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             output_str_only=False,
         )
 
-        # test update weights
-        fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
-        print(
-            f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
-            flush=True,
-        )
-        fragment.update_weights_from_tensor(
-            [(k, v) for k, v in fsdp_state_dict.items()]
-        )
+        if 0:
+            # test update weights
+            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
+            print(
+                f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
+                flush=True,
+            )
+            fragment.update_weights_from_tensor(
+                [(k, v) for k, v in fsdp_state_dict.items()]
+            )
 
         srt_outputs = SRTRunner.forward_generation_raw(
             prompts=_PROMPTS,
