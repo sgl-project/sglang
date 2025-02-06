@@ -49,7 +49,7 @@ CI_MODELS = [
 # All other models that do not run on the CI
 ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2-1.5B"),
-    ModelCase("Qwen/Qwen2.5-14B-Instruct", prefill_tolerance=8e-2),
+    ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
     ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
     ModelCase("THUDM/glm-4-9b-chat"),
