@@ -145,7 +145,7 @@ def check_close_model_outputs(
     rouge_l_tolerance: float,
     debug_text: str,
 ):
-    for i in range(len(prompts)):
+    for i in range(len(hf_outputs.output_strs)):
         # Compare input logprobs
         hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
         srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
