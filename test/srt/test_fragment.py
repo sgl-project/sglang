@@ -32,13 +32,14 @@ class TestFragment(unittest.TestCase):
     def assert_fragment_e2e_execution(self, model_path: str):
         multiprocessing.set_start_method("spawn")
         nccl_port = 12345
+        master_port = 23456
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         for tp_rank in range(_TP_SIZE):
             p = Process(
                 target=_run_subprocess,
-                args=(tp_rank, nccl_port, output_writer, model_path),
+                args=(tp_rank, master_port, nccl_port, output_writer, model_path),
             )
             p.start()
             processes.append(p)
@@ -61,12 +62,12 @@ class TestFragment(unittest.TestCase):
             self.assert_fragment_e2e_execution(model_path=model_case.model_path)
 
 
-def _run_subprocess(tp_rank: int, nccl_port: int, output_writer, model_path: str):
+def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_writer, model_path: str):
     try:
         print(f"subprocess[{tp_rank=}] Start {os.environ['CUDA_VISIBLE_DEVICES']=}")
 
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "23456"
+        os.environ["MASTER_PORT"] = str(master_port)
         torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
 
         mesh_kwargs = dict(mesh_shape=(_TP_SIZE, 1), mesh_dim_names=["tp", "pp"])
