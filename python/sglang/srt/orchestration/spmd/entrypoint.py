@@ -32,7 +32,8 @@ class Entrypoint:
 
     def generate(self, obj: GenerateReqInput):
         obj.normalize_batch_and_arguments()
-        tokenized_requests = self._generation_converter.tokenize_requests(obj)
+        objs = [obj] if obj.is_single else [obj[i] for i in range(obj.batch_size)]
+        tokenized_requests = self._generation_converter.tokenize_requests(objs)
         rid_to_req_index = {r.rid: i for i, r in enumerate(tokenized_requests)}
 
         outputs: List[Dict[str, Any]] = [None] * obj.batch_size
@@ -44,7 +45,7 @@ class Entrypoint:
             for output_index in range(len(batch_str_out.rids)):
                 req_index = rid_to_req_index[batch_str_out.rids[output_index]]
                 outputs[req_index] = self._generation_converter.postprocess_response(
-                    batch_str_out, index=output_index, req_obj=obj[req_index]
+                    batch_str_out, index=output_index, req_obj=objs[req_index]
                 )
 
         self._scheduler.callback = SchedulerCallback(

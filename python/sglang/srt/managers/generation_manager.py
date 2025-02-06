@@ -382,9 +382,8 @@ class GenerationConverter:
 
     def tokenize_requests(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        objs: List[Union[GenerateReqInput, EmbeddingReqInput]],
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
-        objs = [obj] if obj.is_single else [obj[i] for i in range(obj.batch_size)]
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             asyncio.gather(*(self.tokenize_request(obj) for obj in objs))
