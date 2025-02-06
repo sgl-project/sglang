@@ -218,7 +218,7 @@ class HFRunner:
         lora_paths,
         torch_dtype: torch.dtype,
         output_str_only: bool,
-    ):
+    ) -> ModelOutput:
         output_strs = []
         top_input_logprobs = []
         top_output_logprobs = []
@@ -317,48 +317,7 @@ class SRTRunner:
         lora_paths=None,
     ):
         if self.is_generation:
-            # the return value contains logprobs from prefill
-            output_strs = []
-            top_input_logprobs = []
-            top_output_logprobs = []
-            sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
-            for i, prompt in enumerate(prompts):
-                response = self.runtime.generate(
-                    prompt,
-                    lora_path=lora_paths[i] if lora_paths else None,
-                    sampling_params=sampling_params,
-                    return_logprob=True,
-                    logprob_start_len=0,
-                    top_logprobs_num=NUM_TOP_LOGPROBS,
-                )
-                response = json.loads(response)
-                output_strs.append(response["text"])
-                top_input_logprobs.append(
-                    [
-                        [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                        for x in response["meta_info"]["input_top_logprobs"][1:]
-                    ]
-                    + [
-                        [
-                            tup[0]
-                            for tup in response["meta_info"]["output_top_logprobs"][0][
-                                :NUM_TOP_LOGPROBS
-                            ]
-                        ]
-                    ]
-                )
-                top_output_logprobs.append(
-                    [
-                        [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                        for x in response["meta_info"]["output_top_logprobs"]
-                    ]
-                )
-
-            return ModelOutput(
-                output_strs=output_strs,
-                top_input_logprobs=top_input_logprobs,
-                top_output_logprobs=top_output_logprobs,
-            )
+            self.forward_generation_raw()
         else:
             response = self.runtime.encode(prompts)
             response = json.loads(response)
@@ -411,6 +370,54 @@ class SRTRunner:
         self.runtime.shutdown()
         del self.runtime
 
+    @staticmethod
+    def forward_generation_raw(
+        prompts: Union[List[str], List[torch.Tensor]],
+        max_new_tokens,
+        lora_paths,
+    ):
+        # the return value contains logprobs from prefill
+        output_strs = []
+        top_input_logprobs = []
+        top_output_logprobs = []
+        sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+        for i, prompt in enumerate(prompts):
+            response = runtime.generate(
+                prompt,
+                lora_path=lora_paths[i] if lora_paths else None,
+                sampling_params=sampling_params,
+                return_logprob=True,
+                logprob_start_len=0,
+                top_logprobs_num=NUM_TOP_LOGPROBS,
+            )
+            response = json.loads(response)
+            output_strs.append(response["text"])
+            top_input_logprobs.append(
+                [
+                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
+                    for x in response["meta_info"]["input_top_logprobs"][1:]
+                ]
+                + [
+                    [
+                        tup[0]
+                        for tup in response["meta_info"]["output_top_logprobs"][0][
+                                   :NUM_TOP_LOGPROBS
+                                   ]
+                    ]
+                ]
+            )
+            top_output_logprobs.append(
+                [
+                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
+                    for x in response["meta_info"]["output_top_logprobs"]
+                ]
+            )
+
+        return ModelOutput(
+            output_strs=output_strs,
+            top_input_logprobs=top_input_logprobs,
+            top_output_logprobs=top_output_logprobs,
+        )
 
 def monkey_patch_gemma2_sdpa():
     """
