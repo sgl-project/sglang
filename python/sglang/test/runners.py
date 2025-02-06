@@ -147,7 +147,7 @@ class HFRunner:
             ).cuda()
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
-        self.tokenizer = get_tokenizer(model_path, torch_dtype=torch.dtype)
+        self.tokenizer = get_tokenizer(model_path, torch_dtype=torch.dtype, trust_remote_code=True)
 
         # Run forward
         while True:
@@ -301,7 +301,7 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             mem_fraction_static=0.65,
-            trust_remote_code=False,
+            trust_remote_code=True,
             is_embedding=not self.is_generation,
             lora_paths=lora_paths,
             max_loras_per_batch=max_loras_per_batch,
