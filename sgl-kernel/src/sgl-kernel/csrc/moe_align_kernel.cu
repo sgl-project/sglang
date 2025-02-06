@@ -25,27 +25,6 @@ limitations under the License.
 #define WARP_SIZE 32
 
 template <typename scalar_t>
-__global__ void sort_token_ids_kernel(scalar_t* __restrict__ topk_ids, 
-                                    int32_t* sorted_token_ids,
-                                    int32_t* token_cnts_buffer,
-                                    const int32_t* cumsum,
-                                    int32_t num_experts,
-                                    size_t numel,
-                                    int32_t tokens_per_block) {
-    const size_t start_idx = blockIdx.x * tokens_per_block;
-    const size_t end_idx = min(start_idx + tokens_per_block, numel);
-    
-    const size_t off_t = blockIdx.x * num_experts;
-    
-    for (size_t i = start_idx + threadIdx.x; i < end_idx; i += blockDim.x) {
-        int expert_id = topk_ids[i];
-        int token_cnt = atomicAdd(&token_cnts_buffer[off_t + expert_id], 1);
-        int rank_post_pad = token_cnt + cumsum[expert_id];
-        sorted_token_ids[rank_post_pad] = i;
-    }
-}
-
-template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
                                             int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
                                             int32_t block_size, size_t numel, int32_t* cumsum) {
@@ -97,17 +76,21 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
   }
 
   __syncthreads();
+}
 
-  // Note: For the moe_align_kernel, the primary bottleneck lies in the atomic add and non-coalesced memory writes here.
-  // If these operations can be performed using multiple blocks, similar to the Triton version, the performance of this
-  // kernel can achieve state-of-the-art performance across all token cases. However, once multiple blocks are used,
-  // illegal memory access occurs. Even replacing these lines of code with the stage 4 kernel from the Triton version
-  // results in the same issue, and a correct solution has not yet been found.
-  // for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
-  //   int32_t expert_id = topk_ids[i];
-  //   int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
-  //   sorted_token_ids[rank_post_pad] = i;
-  // }
+template <typename scalar_t>
+__global__ void moe_token_sort_kernel(scalar_t* __restrict__ topk_ids, 
+                                    int32_t* sorted_token_ids,
+                                    int32_t* local_offsets,
+                                    size_t numel) {
+  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = blockDim.x * gridDim.x;
+
+  for (size_t i = tid; i < numel; i += stride) {
+    int32_t expert_id = topk_ids[i];
+    int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
+    sorted_token_ids[rank_post_pad] = i;
+  }
 }
 
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
@@ -117,19 +100,22 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
   TORCH_CHECK(num_experts == 256, "moe_align_block_size kernel only support deepseek v3 now.");
 
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
+    // First kernel for counting and preparing offsets
     auto align_kernel = moe_align_block_size_kernel<scalar_t>;
     align_kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                          experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
                                          num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
-    auto sort_kernel = sort_token_ids_kernel<scalar_t>;
-    const int tokens_per_block = CEILDIV(topk_ids.numel(), num_experts);
-    sort_kernel<<<num_experts, 256, 0, stream>>>(
+
+    const int block_threads = 256;
+    const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
+    const int max_blocks = 65535; 
+    const int actual_blocks = std::min(num_blocks, max_blocks);
+    
+    auto sort_kernel = moe_token_sort_kernel<scalar_t>;
+    sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
         topk_ids.data_ptr<scalar_t>(),
         sorted_token_ids.data_ptr<int32_t>(),
-        token_cnts_buffer.data_ptr<int32_t>(),
         cumsum_buffer.data_ptr<int32_t>(),
-        num_experts,
-        topk_ids.numel(),
-        tokens_per_block);
+        topk_ids.numel());
   });
 }
