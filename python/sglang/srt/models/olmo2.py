@@ -19,9 +19,6 @@ from functools import partial
 from typing import Iterable, Optional, Tuple
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -46,6 +43,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
+from torch import nn
+from transformers import PretrainedConfig
 
 
 class Olmo2Attention(nn.Module):
@@ -56,32 +55,32 @@ class Olmo2Attention(nn.Module):
     """
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: PretrainedConfig,
+            layer_id: int = 0,
+            quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
 
         assert self.hidden_size % self.total_num_heads == 0
-        assert self.total_num_heads % tp_size == 0
+        assert self.total_num_heads % self.tp_size == 0
 
-        self.num_heads = self.total_num_heads // tp_size
+        self.num_heads = self.total_num_heads // self.tp_size
         self.total_num_kv_heads = self.config.num_key_value_heads
 
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= self.tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % self.tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert self.tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
 
         self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
@@ -108,7 +107,7 @@ class Olmo2Attention(nn.Module):
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
         )
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -125,7 +124,7 @@ class Olmo2Attention(nn.Module):
         )
 
     def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
+            self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
@@ -139,10 +138,10 @@ class Olmo2Attention(nn.Module):
         return q, k
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
@@ -161,9 +160,9 @@ class Olmo2MLP(nn.Module):
     """
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -190,8 +189,8 @@ class Olmo2MLP(nn.Module):
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
+            self,
+            x: torch.Tensor,
     ) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -207,10 +206,10 @@ class Olmo2DecoderLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: PretrainedConfig,
+            layer_id: int = 0,
+            quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         # Attention block.
@@ -229,10 +228,10 @@ class Olmo2DecoderLayer(nn.Module):
         )
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # Attention block.
         residual = hidden_states
@@ -251,9 +250,9 @@ class Olmo2DecoderLayer(nn.Module):
 class Olmo2Model(nn.Module):
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -272,11 +271,11 @@ class Olmo2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+            input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -310,9 +309,9 @@ class Olmo2ForCausalLM(nn.Module):
     """
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: PretrainedConfig,
+            quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -330,11 +329,11 @@ class Olmo2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+            input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids=input_ids,
