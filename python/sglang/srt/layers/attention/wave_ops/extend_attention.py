@@ -56,11 +56,6 @@ def extend_attention_wave(
     is_causal=True,
 ):
 
-    if is_causal:
-        raise NotImplementedError(
-            "non causal mask not supported yet on extend_attention wave backend."
-        )
-
     shape = AttentionShape(
         num_query_heads=q_extend.shape[1],
         num_kv_heads=k_extend.shape[1],
@@ -91,6 +86,7 @@ def extend_attention_wave(
         input_dtype=q_extend.dtype,
         output_dtype=output.dtype,
         size_dtype=b_seq_len.dtype,
+        is_causal=is_causal,
     )
 
     hyperparams.update(get_default_scheduling_params())
