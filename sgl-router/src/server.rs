@@ -18,45 +18,45 @@ impl AppState {
         worker_urls: Vec<String>,
         client: reqwest::Client,
         policy_config: PolicyConfig,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // Create router based on policy
-        let router = match Router::new(worker_urls, policy_config) {
-            Ok(router) => router,
-            Err(error) => panic!("Failed to create router: {}", error),
-        };
-
-        Self { router, client }
+        let router = Router::new(worker_urls, policy_config)?;
+        Ok(Self { router, client })
     }
 }
 
 #[get("/health")]
-async fn health(data: web::Data<AppState>) -> impl Responder {
-    data.router.route_to_first(&data.client, "/health").await
+async fn health(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
+    data.router
+        .route_to_first(&data.client, "/health", &req)
+        .await
 }
 
 #[get("/health_generate")]
-async fn health_generate(data: web::Data<AppState>) -> impl Responder {
+async fn health_generate(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/health_generate")
+        .route_to_first(&data.client, "/health_generate", &req)
         .await
 }
 
 #[get("/get_server_info")]
-async fn get_server_info(data: web::Data<AppState>) -> impl Responder {
+async fn get_server_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/get_server_info")
+        .route_to_first(&data.client, "/get_server_info", &req)
         .await
 }
 
 #[get("/v1/models")]
-async fn v1_models(data: web::Data<AppState>) -> impl Responder {
-    data.router.route_to_first(&data.client, "/v1/models").await
+async fn v1_models(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
+    data.router
+        .route_to_first(&data.client, "/v1/models", &req)
+        .await
 }
 
 #[get("/get_model_info")]
-async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
+async fn get_model_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/get_model_info")
+        .route_to_first(&data.client, "/get_model_info", &req)
         .await
 }
 
@@ -131,6 +131,7 @@ pub struct ServerConfig {
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
+    // Initialize logger
     Builder::new()
         .format(|buf, record| {
             use chrono::Local;
@@ -152,23 +153,29 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         )
         .init();
 
+    info!("🚧 Initializing router on {}:{}", config.host, config.port);
+    info!("🚧 Initializing workers on {:?}", config.worker_urls);
+    info!("🚧 Policy Config: {:?}", config.policy_config);
+    info!(
+        "🚧 Max payload size: {} MB",
+        config.max_payload_size / (1024 * 1024)
+    );
+
     let client = reqwest::Client::builder()
         .build()
         .expect("Failed to create HTTP client");
 
-    let app_state = web::Data::new(AppState::new(
-        config.worker_urls.clone(),
-        client,
-        config.policy_config.clone(),
-    ));
-
-    info!("✅ Starting router on {}:{}", config.host, config.port);
-    info!("✅ Serving Worker URLs: {:?}", config.worker_urls);
-    info!("✅ Policy Config: {:?}", config.policy_config);
-    info!(
-        "✅ Max payload size: {} MB",
-        config.max_payload_size / (1024 * 1024)
+    let app_state = web::Data::new(
+        AppState::new(
+            config.worker_urls.clone(),
+            client,
+            config.policy_config.clone(),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
     );
+
+    info!("✅ Serving router on {}:{}", config.host, config.port);
+    info!("✅ Serving workers on {:?}", config.worker_urls);
 
     HttpServer::new(move || {
         App::new()

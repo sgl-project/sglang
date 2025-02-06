@@ -1,30 +1,31 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 // Adapted from https://github.com/vllm-project/vllm/blob/v0.6.5/csrc/moe/moe_align_sum_kernels.cu
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
 
 #include <THC/THCAtomics.cuh>
 
-#include "utils.hpp"
-
-#ifdef USE_ROCM
-#include <hip/hip_runtime.h>
-#endif
-
-#ifndef USE_ROCM
 #define WARP_SIZE 32
-#else
-#define WARP_SIZE warpSize
-#endif
 
-#ifndef USE_ROCM
 #define DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
   cudaFuncSetAttribute(FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize, VAL)
-#else
-#define DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
-  hipFuncSetAttribute(FUNC, hipFuncAttributeMaxDynamicSharedMemorySize, VAL)
-#endif
 
 #define CEILDIV(x, y) (((x) + (y)-1) / (y))
 
@@ -39,7 +40,6 @@
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
 __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t col) {
-  // don't worry about overflow because num_experts is relatively small
   return row * total_col + col;
 }
 

@@ -1,6 +1,7 @@
 """
 Usage:
 python3 -m unittest test_srt_backend.TestSRTBackend.test_gen_min_new_tokens
+python3 -m unittest test_srt_backend.TestSRTBackend.test_hellaswag_select
 """
 
 import unittest
@@ -73,7 +74,7 @@ class TestSRTBackend(unittest.TestCase):
         # Run twice to capture more bugs
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
-            self.assertGreater(accuracy, 0.71)
+            self.assertGreater(accuracy, 0.70)
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()

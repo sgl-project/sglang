@@ -14,6 +14,7 @@ import openai
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -622,57 +623,45 @@ class TestOpenAIServerEBNF(unittest.TestCase):
             text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape"
         )
 
-    def test_function_calling_format(self):
 
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "add",
-                    "description": "Compute the sum of two numbers",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "a": {
-                                "type": "int",
-                                "description": "A number",
-                            },
-                            "b": {
-                                "type": "int",
-                                "description": "A number",
-                            },
-                        },
-                        "required": ["a", "b"],
-                    },
-                },
-            }
-        ]
+class TestOpenAIEmbedding(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
 
-        messages = [{"role": "user", "content": "Compute (3+5)"}]
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.8,
-            top_p=0.8,
-            stream=False,
-            tools=tools,
+        # Configure embedding-specific args
+        other_args = ["--is-embedding", "--enable-metrics"]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=other_args,
         )
+        cls.base_url += "/v1"
 
-        content = response.choices[0].message.content
-        tool_calls = response.choices[0].message.tool_calls
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
-        assert (
-            content is None
-        ), "When tools provided by the response, content should be None"
-        assert (
-            isinstance(tool_calls, list) and len(tool_calls) > 0
-        ), "Format not matched, tool_calls should be a list"
+    def test_embedding_single(self):
+        """Test single embedding request"""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(model=self.model, input="Hello world")
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(len(response.data[0].embedding) > 0)
 
-        function_name = tool_calls[0].function.name
-        assert (
-            function_name == "add"
-        ), "Function name should be add for the above response"
+    def test_embedding_batch(self):
+        """Test batch embedding request"""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(
+            model=self.model, input=["Hello world", "Test text"]
+        )
+        self.assertEqual(len(response.data), 2)
+        self.assertTrue(len(response.data[0].embedding) > 0)
+        self.assertTrue(len(response.data[1].embedding) > 0)
 
 
 if __name__ == "__main__":

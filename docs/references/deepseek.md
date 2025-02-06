@@ -1,4 +1,4 @@
-# DeepSeek Model Optimizations in SGLang
+# DeepSeek Model Optimizations
 
 SGLang provides several optimizations specifically designed for the DeepSeek model to boost its inference speed. This document outlines current optimizations for DeepSeek. Additionally, the SGLang team is actively developing enhancements for [DeepSeek-V3](https://github.com/sgl-project/sglang/issues/2591).
 
@@ -16,7 +16,9 @@ SGLang provides several optimizations specifically designed for the DeepSeek mod
 
 Overall, with these optimizations, we have achieved up to a 7x acceleration in output throughput compared to the previous version.
 
-![Multi-head Latent Attention for DeepSeek Series Models](https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg)
+<p align="center">
+  <img src="https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg" alt="Multi-head Latent Attention for DeepSeek Series Models">
+</p>
 
 **Usage**: MLA optimization is enabled by defalut, to disable, use `--disable-mla`.
 
@@ -26,9 +28,15 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 **Description**: This optimization involves data parallelism (DP) for the MLA attention mechanism of DeepSeek Series Models, which allows for a significant reduction in the KV cache size, enabling larger batch sizes. Each DP worker independently handles different types of batches (prefill, decode, idle), which are then synchronized before and after processing through the Mixture-of-Experts (MoE) layer.
 
-![Data Parallelism Attention for DeepSeek Series Models](https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg).
+<p align="center">
+  <img src="https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg" alt="Data Parallelism Attention for DeepSeek Series Models">
+</p>
 
 **Usage**: This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). Data Parallelism Attention optimization can be enabeld by `--enable-dp-attention` for DeepSeek Series Models.
+
+<p align="center">
+  <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison">
+</p>
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 

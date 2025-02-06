@@ -40,7 +40,7 @@ jobs:
           cd sgl-router/
           cargo test
 
-  e2e-rust:
+  e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
     steps:
@@ -65,7 +65,7 @@ jobs:
           python3 run_suite.py
 
   finish:
-    needs: [unit-test-rust, e2e-rust]
+    needs: [unit-test-rust, e2e-python]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
