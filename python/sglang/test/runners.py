@@ -458,6 +458,7 @@ def check_close_model_outputs(
     decode_tolerance: float,
     rouge_l_tolerance: float,
     debug_text: str = '',
+    check_logprobs: bool = True,
 ):
     # Compare output strings
     print(f"{hf_outputs.output_strs=}")
@@ -470,31 +471,32 @@ def check_close_model_outputs(
         score >= rouge_l_tolerance for score in rouge_l_scores
     ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
 
-    for i in range(len(hf_outputs.output_strs)):
-        # Compare input logprobs
-        hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
-        srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
-        input_len = hf_logprobs.shape[0]
-        print(
-            "prefill logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
-        )
-        if input_len <= 100:
-            assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
-                f"prefill logprobs are not all close with {debug_text} "
-                f"prefill_tolerance={prefill_tolerance}."
-                f"{hf_logprobs=}, {srt_logprobs=}"
+    if check_logprobs:
+        for i in range(len(hf_outputs.output_strs)):
+            # Compare input logprobs
+            hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
+            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
+            input_len = hf_logprobs.shape[0]
+            print(
+                "prefill logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
             )
+            if input_len <= 100:
+                assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
+                    f"prefill logprobs are not all close with {debug_text} "
+                    f"prefill_tolerance={prefill_tolerance}."
+                    f"{hf_logprobs=}, {srt_logprobs=}"
+                )
 
-        # Compare output logprobs
-        hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
-        srt_logprobs = torch.Tensor(srt_outputs.top_output_logprobs[i])
+            # Compare output logprobs
+            hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
+            srt_logprobs = torch.Tensor(srt_outputs.top_output_logprobs[i])
 
-        print(
-            "decode logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
-        )
-        if input_len <= 100:
-            assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
-                f"decode logprobs are not all close with {debug_text} "
-                f"decode_tolerance={decode_tolerance}."
-                f"{hf_logprobs=}, {srt_logprobs=}"
+            print(
+                "decode logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
             )
+            if input_len <= 100:
+                assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
+                    f"decode logprobs are not all close with {debug_text} "
+                    f"decode_tolerance={decode_tolerance}."
+                    f"{hf_logprobs=}, {srt_logprobs=}"
+                )

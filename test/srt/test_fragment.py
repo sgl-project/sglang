@@ -222,6 +222,7 @@ def _run_subprocess(
                 prefill_tolerance=prefill_tolerance,
                 decode_tolerance=decode_tolerance,
                 rouge_l_tolerance=1,
+                check_logprobs=not enable_batch,
                 debug_text=f'{enable_batch=} {tp_rank=}',
             )
 
