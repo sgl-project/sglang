@@ -146,12 +146,12 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             rouge_l_tolerance=1,
         )
 
-        execution_ok = False
+        execution_ok = True
 
     except Exception as e:
         print(f"subprocess[{tp_rank=}] has error: {e}", flush=True)
         traceback.print_exc()
-        execution_ok = True
+        execution_ok = False
 
     output_writer.send(execution_ok)
     output_writer.close()
