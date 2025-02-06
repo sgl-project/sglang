@@ -216,9 +216,7 @@ def _get_fsdp_state_dict(hf_model):
         state_dict_config=ShardedStateDictConfig(),
     )
 
-    state_dict = fsdp_model.state_dict()
-    # small models have weight tieing, thus we skip it
-    return {k: v for k, v in state_dict.items() if k not in ["lm_head.weight"]}
+    return fsdp_model.state_dict()
 
 
 if __name__ == "__main__":
