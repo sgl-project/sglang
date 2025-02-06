@@ -36,9 +36,13 @@ def _get_version():
 
 
 operator_namespace = "sgl_kernels"
+flashinfer = root / "3rdparty" / "flashinfer"
 include_dirs = [
     root / "src" / "sgl-kernel" / "include",
     root / "src" / "sgl-kernel" / "csrc",
+    flashinfer.resolve() / "include",
+    flashinfer.resolve() / "include" / "gemm",
+    flashinfer.resolve() / "csrc",
 ]
 
 sources = [
