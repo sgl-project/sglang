@@ -73,6 +73,8 @@ def extend_attention_wave(
     (
         extend_attention,
         hyperparams,
+        dynamic_symbols,
+        dynamic_symbols_map,
     ) = get_extend_attention_kernel(
         shape,
         mfma_variant,
@@ -103,6 +105,8 @@ def extend_attention_wave(
         run_config=config,
         schedule=False,
         use_scheduling_barriers=False,
+        dynamic_symbols=dynamic_symbols,
+        dynamic_symbols_map=dynamic_symbols_map,
     ):
         # TODO: Add scaling of QK as part of kernel.
         mb = extend_attention(
