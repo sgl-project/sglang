@@ -109,28 +109,6 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
 
-        # hf model is used for comparison
-        with torch.device("cuda"):
-            hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-            hf_model.to(torch.bfloat16)
-        hf_model.cuda()
-        hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
-
-        hf_outputs = HFRunner.forward_generation_raw(
-            prompts=_PROMPTS,
-            max_new_tokens=_MAX_NEW_TOKENS,
-            base_model=hf_model,
-            tokenizer=hf_tokenizer,
-            lora_paths=None,
-            torch_dtype=torch.float16,
-            output_str_only=False,
-        )
-
-        if _ENABLE_UPDATE_WEIGHTS:
-            # test update weights
-            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
-            del hf_model
-
         fragment = EngineFragment(
             model_path=model_path,
             load_format='dummy' if _ENABLE_UPDATE_WEIGHTS else 'auto',
@@ -151,7 +129,26 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
+        # hf model is used for comparison
+        with torch.device("cuda"):
+            hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+            hf_model.to(torch.bfloat16)
+        hf_model.cuda()
+        hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
+
+        hf_outputs = HFRunner.forward_generation_raw(
+            prompts=_PROMPTS,
+            max_new_tokens=_MAX_NEW_TOKENS,
+            base_model=hf_model,
+            tokenizer=hf_tokenizer,
+            lora_paths=None,
+            torch_dtype=torch.float16,
+            output_str_only=False,
+        )
+
         if _ENABLE_UPDATE_WEIGHTS:
+            # test update weights
+            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
             print(
                 f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
                 flush=True,
