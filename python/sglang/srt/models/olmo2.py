@@ -55,10 +55,10 @@ class Olmo2Attention(nn.Module):
     """
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            layer_id: int = 0,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: PretrainedConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -124,7 +124,7 @@ class Olmo2Attention(nn.Module):
         )
 
     def _apply_qk_norm(
-            self, q: torch.Tensor, k: torch.Tensor
+        self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
@@ -138,10 +138,10 @@ class Olmo2Attention(nn.Module):
         return q, k
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
@@ -160,9 +160,9 @@ class Olmo2MLP(nn.Module):
     """
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -189,8 +189,8 @@ class Olmo2MLP(nn.Module):
         )
 
     def forward(
-            self,
-            x: torch.Tensor,
+        self,
+        x: torch.Tensor,
     ) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -206,10 +206,10 @@ class Olmo2DecoderLayer(nn.Module):
     """
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            layer_id: int = 0,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: PretrainedConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         # Attention block.
@@ -228,10 +228,10 @@ class Olmo2DecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # Attention block.
         residual = hidden_states
@@ -250,9 +250,9 @@ class Olmo2DecoderLayer(nn.Module):
 class Olmo2Model(nn.Module):
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -271,11 +271,11 @@ class Olmo2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            forward_batch: ForwardBatch,
-            input_embeds: torch.Tensor = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -309,9 +309,9 @@ class Olmo2ForCausalLM(nn.Module):
     """
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -329,11 +329,11 @@ class Olmo2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            forward_batch: ForwardBatch,
-            input_embeds: torch.Tensor = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids=input_ids,
@@ -342,7 +342,7 @@ class Olmo2ForCausalLM(nn.Module):
             input_embeds=input_embeds,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
