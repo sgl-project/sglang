@@ -105,7 +105,7 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
         fragment = EngineFragment(
             model_path=model_path,
             load_format='dummy',
-            mem_fraction_static=0.5,
+            mem_fraction_static=0.4,
             tp_size=_TP_SIZE,
             random_seed=42,
             # fragment args
