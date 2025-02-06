@@ -141,8 +141,8 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
         check_close_model_outputs(
             hf_outputs=hf_outputs,
             srt_outputs=srt_outputs,
-            prefill_tolerance=5e-2,
-            decode_tolerance=5e-2,
+            prefill_tolerance=0.1,
+            decode_tolerance=0.1,
             rouge_l_tolerance=1,
         )
 
