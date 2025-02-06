@@ -58,7 +58,7 @@ class Entrypoint:
         while self._scheduler.process_batch():
             pass
 
-        return outputs
+        return outputs[0] if obj.is_single else outputs
 
     def update_weights_from_tensor(
         self,
