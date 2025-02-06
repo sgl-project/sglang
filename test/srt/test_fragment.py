@@ -34,8 +34,7 @@ _ENABLE_UPDATE_WEIGHTS = True
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
 CI_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
-    # TODO no permission yet
-    # "google/gemma-2-2b",
+    "google/gemma-2-2b",
 ]
 ALL_OTHER_MODELS = [
     "meta-llama/Llama-3.2-1B-Instruct",
