@@ -1,8 +1,9 @@
 import collections
 import math
+import warnings
 from enum import Enum
 from functools import partial
-from typing import Callable, List, Optional, Tuple, Type, Union, Iterable
+from typing import Callable, Iterable, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn.functional as F
@@ -10,14 +11,18 @@ from einops import rearrange, repeat
 from torch import nn
 
 from sglang.srt.configs import DeepseekVL2Config
+from sglang.srt.configs.deepseekvl2 import (
+    DeepseekVL2Config,
+    DeepseekVL2MlpProjectorConfig,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -56,6 +61,7 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
         tensor.copy_(tensor_dtpye)
 
 
+# NOTE: Init functions not modified for TP, not sure if they will be used
 def init_weights(self):
     if self.pos_embed is not None:
         trunc_normal_(self.pos_embed, std=self.pos_embed.shape[1] ** -0.5)
@@ -65,7 +71,7 @@ def init_weights(self):
 def init_weights_vit_timm(
     module: nn.Module,
 ) -> None:
-    if isinstance(module, nn.Linear):
+    if isinstance(module, LinearBase):
         trunc_normal_(module.weight, std=0.02)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
@@ -91,6 +97,29 @@ class Format(str, Enum):
     NHWC = "NHWC"
     NCL = "NCL"
     NLC = "NLC"
+
+
+def named_apply(
+    fn: Callable,
+    module: nn.Module,
+    name="",
+    depth_first: bool = True,
+    include_root: bool = False,
+) -> nn.Module:
+    if not depth_first and include_root:
+        fn(module=module, name=name)
+    for child_name, child_module in module.named_children():
+        child_name = ".".join((name, child_name)) if name else child_name
+        named_apply(
+            fn=fn,
+            module=child_module,
+            name=child_name,
+            depth_first=depth_first,
+            include_root=True,
+        )
+    if depth_first and include_root:
+        fn(module=module, name=name)
+    return module
 
 
 # https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/patch_embed.py
@@ -173,6 +202,7 @@ def nchw_to(x: torch.Tensor, fmt: Format):
     return x
 
 
+# Copied modules from timm
 class PatchEmbed(nn.Module):
     """2D Image to Patch Embedding"""
 
@@ -315,19 +345,21 @@ class Mlp(nn.Module):
         bias=True,
         drop=0.0,
         use_conv=False,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         bias = to_2tuple(bias)
         drop_probs = to_2tuple(drop)
-        # linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
         if use_conv:
             self.fc1 = nn.Conv2d(
                 in_features, hidden_features, kernel_size=1, bias=bias[0]
             )
         else:
-            self.fc1 = ColumnParallelLinear(in_features, hidden_features, bias=bias[0])
+            self.fc1 = ColumnParallelLinear(
+                in_features, hidden_features, bias=bias[0], quant_config=quant_config
+            )
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
         self.norm = (
@@ -339,7 +371,9 @@ class Mlp(nn.Module):
                 hidden_features, out_features, kernel_size=1, bias=bias[1]
             )
         else:
-            self.fc2 = RowParallelLinear(hidden_features, out_features, bias=bias[1])
+            self.fc2 = RowParallelLinear(
+                hidden_features, out_features, bias=bias[1], quant_config=quant_config
+            )
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def forward(self, x):
@@ -403,6 +437,63 @@ class DropPath(nn.Module):
         return f"drop_prob={round(self.drop_prob,3):0.3f}"
 
 
+# Modified for https://github.com/deepseek-ai/DeepSeek-VL2/blob/a698c36a4cfbd3ca700e79e936f7bc16b6fd5957/deepseek_vl2/models/siglip_vit.py#L106C1-L174C17
+# Removed qk_norm option for simplicity
+class DeepseekVL2Attention(nn.Module):
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        norm_layer: nn.Module = nn.LayerNorm,
+        deterministic: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.qk_norm = qk_norm
+        self.deterministic = deterministic
+
+        self.qkv = ColumnParallelLinear(
+            dim, dim * 3, bias=qkv_bias, quant_config=quant_config
+        )
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = RowParallelLinear(dim, dim, quant_config=quant_config)
+        self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        with torch.backends.cuda.sdp_kernel(
+            enable_math=False, enable_mem_efficient=False
+        ):
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -419,20 +510,20 @@ class Block(nn.Module):
         norm_layer: nn.Module = nn.LayerNorm,
         mlp_layer: nn.Module = Mlp,
         deterministic: bool = False,
-        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = RadixAttention(
+        self.attn = DeepseekVL2Attention(
             num_heads=num_heads,
             head_dim=dim,
-            # qkv_bias=qkv_bias,
-            # qk_norm=qk_norm,
-            # attn_drop=attn_drop,
-            # proj_drop=proj_drop,
-            # norm_layer=norm_layer,
-            # deterministic=deterministic,
-            layer_id=layer_id,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
+            deterministic=deterministic,
+            quant_config=quant_config,
         )
         self.ls1 = (
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -445,6 +536,7 @@ class Block(nn.Module):
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
             drop=proj_drop,
+            quant_config=quant_config,
         )
         self.ls2 = (
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -454,6 +546,111 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
+
+class AttentionPoolLatent(nn.Module):
+    """Attention pooling w/ latent query"""
+
+    fused_attn: torch.jit.Final[bool]
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int = None,
+        embed_dim: int = None,
+        num_heads: int = 8,
+        feat_size: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        latent_len: int = 1,
+        latent_dim: int = None,
+        pos_embed: str = "",
+        pool_type: str = "token",
+        norm_layer: Optional[nn.Module] = None,
+        drop: float = 0.0,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        embed_dim = embed_dim or in_features
+        out_features = out_features or in_features
+        assert embed_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.feat_size = feat_size
+        self.scale = self.head_dim**-0.5
+        self.pool = pool_type
+
+        if pos_embed == "abs":
+            assert feat_size is not None
+            self.pos_embed = nn.Parameter(torch.zeros(feat_size, in_features))
+        else:
+            self.pos_embed = None
+
+        self.latent_dim = latent_dim or embed_dim
+        self.latent_len = latent_len
+        self.latent = nn.Parameter(torch.zeros(1, self.latent_len, embed_dim))
+
+        self.q = ColumnParallelLinear(
+            embed_dim, embed_dim, bias=qkv_bias, quant_config=quant_config
+        )
+        self.kv = ColumnParallelLinear(
+            embed_dim, embed_dim * 2, bias=qkv_bias, quant_config=quant_config
+        )
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.proj = RowParallelLinear(embed_dim, embed_dim, quant_config=quant_config)
+        self.proj_drop = nn.Dropout(drop)
+        self.norm = (
+            norm_layer(out_features) if norm_layer is not None else nn.Identity()
+        )
+        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio), quant_config=quant_config)
+
+        self.init_weights()
+
+    def init_weights(self):
+        if self.pos_embed is not None:
+            # Don't want to copy timm's trunc_normal_
+            nn.init._no_grad_trunc_normal_(
+                self.pos_embed, std=self.pos_embed.shape[1] ** -0.5
+            )
+        nn.init._no_grad_trunc_normal_(self.latent, std=self.latent_dim**-0.5)
+
+    def forward(self, x):
+        B, N, C = x.shape
+
+        if self.pos_embed is not None:
+            x = x + self.pos_embed.unsqueeze(0).to(x.dtype)
+
+        q_latent = self.latent.expand(B, -1, -1)
+        q = (
+            self.q(q_latent)
+            .reshape(B, self.latent_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+
+        kv = (
+            self.kv(x)
+            .reshape(B, N, 2, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        k, v = kv.unbind(0)
+
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        x = F.scaled_dot_product_attention(q, k, v)  # Cannot use radix attn here
+        x = x.transpose(1, 2).reshape(B, self.latent_len, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        x = x + self.mlp(self.norm(x))
+
+        # optional pool if latent seq_len > 1 and pooled output is desired
+        if self.pool == "token":
+            x = x[:, 0]
+        elif self.pool == "avg":
+            x = x.mean(1)
         return x
 
 
@@ -497,6 +694,7 @@ class DeepseekVL2VisionTransformer(nn.Module):
         ignore_head: bool = False,
         deterministic: bool = False,
         num_recomputing_layers: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
 
         super.__init__()
@@ -562,6 +760,7 @@ class DeepseekVL2VisionTransformer(nn.Module):
                     act_layer=act_layer,
                     mlp_layer=mlp_layer,
                     deterministic=deterministic,
+                    quant_config=quant_config,
                 )
                 for i in range(depth)
             ]
@@ -575,10 +774,13 @@ class DeepseekVL2VisionTransformer(nn.Module):
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
                 norm_layer=norm_layer,
+                quant_config=quant_config,
             )
         self.head_drop = nn.Dropout(drop_rate)
         self.head = (
-            nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+            ReplicatedLinear(self.embed_dim, num_classes, quant_config=quant_config)
+            if num_classes > 0
+            else nn.Identity()
         )
 
         # 初始化权重
@@ -633,59 +835,126 @@ class DeepseekVL2VisionTransformer(nn.Module):
 
 
 class DeepseekVL2MlpProjector(nn.Module):
-    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None):
-        super.__init__()
+    def __init__(
+        self,
+        config: DeepseekVL2MlpProjectorConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+
+        super().__init__()
+
         self.config = config
-        self.quant_config = quant_config
-        if config.projector_type == "downsample_mlp_gelu":
+
+        if config.projector_type == "identity":
+            modules = nn.Identity()
+
+        elif config.projector_type == "linear":
+            modules = ReplicatedLinear(
+                config.input_dim,
+                config.n_embed,
+                quant_config=quant_config,
+                gather_output=True,
+            )
+
+        elif config.projector_type == "mlp_gelu":
+            mlp_depth = config.depth
+            modules = ReplicatedLinear(
+                config.input_dim,
+                config.n_embed,
+                quant_config=quant_config,
+                gather_output=True,
+            )
+            for _ in range(1, mlp_depth):
+                modules.append(nn.GELU())
+                modules.append(
+                    ReplicatedLinear(
+                        config.n_embed,
+                        config.n_embed,
+                        quant_config=quant_config,
+                        gather_output=True,
+                    )
+                )
+            modules = nn.Sequential(*modules)
+
+        elif config.projector_type == "downsample_mlp_gelu":
             mlp_depth = config.depth
             mlp_ratio = config.mlp_ratio
-            modules = [
-                nn.Linear(
-                    config.input_dim
-                    * config.downsample_ratio
-                    * config.downsample_ratio,
-                    config.n_embed * mlp_ratio,
-                )
-            ]
+            modules = ReplicatedLinear(
+                config.input_dim * config.downsample_ratio * config.downsample_ratio,
+                config.n_embed * mlp_ratio,
+                quant_config=quant_config,
+                gather_output=True,
+            )
             for _ in range(1, mlp_depth - 1):
                 modules.append(nn.GELU())
                 modules.append(
-                    nn.Linear(config.n_embed * mlp_ratio, config.n_embed * mlp_ratio)
+                    ReplicatedLinear(
+                        config.n_embed * mlp_ratio,
+                        config.n_embed * mlp_ratio,
+                        quant_config=quant_config,
+                        gather_output=True,
+                    )
                 )
             modules.append(nn.GELU())
-            modules.append(nn.Linear(config.n_embed * mlp_ratio, config.n_embed))
+            modules.append(
+                ReplicatedLinear(
+                    config.n_embed * mlp_ratio,
+                    config.n_embed,
+                    quant_config=quant_config,
+                    gather_output=True,
+                )
+            )
             modules = nn.Sequential(*modules)
 
         else:
-            raise NotImplementedError(
-                f"Unsupported projector type: {config.projector_type}"
+            raise ValueError(f"Unknown projector type: {config.projector_type}")
+
+        if config.token_pooling:
+            self.token_pooling_layer = ReplicatedLinear(
+                config.input_dim * 4, config.input_dim, quant_config=quant_config
             )
 
         self.layers = modules
 
     def forward(self, x):
-        bs, hw, input_dim = x.shape
-        h = w = int((hw) ** 0.5)
+        if self.config.token_pooling:
+            batch_size, wxh, channels = x.shape
+            w = h = int(wxh**0.5)
+            x = x.view(batch_size, w, h, channels)
+            x = x.permute(0, 3, 1, 2)
 
-        """compute padding"""
-        if h % self.cfg.downsample_ratio:
-            pad = self.cfg.downsample_ratio - h % self.cfg.downsample_ratio
-        else:
-            pad = 0
-        x = x.reshape(bs, h, w, input_dim)
-        if pad > 0:
-            x = F.pad(x, (0, 0, 0, pad, 0, pad), "constant", 0)
+            patches = x.unfold(2, 2, 2).unfold(3, 2, 2)
+            batch_size, channels, h_patches, w_patches, _, _ = patches.size()
+            patches = patches.contiguous().view(
+                batch_size, channels, h_patches * w_patches, -1
+            )
+            patches = patches.permute(0, 2, 1, 3).contiguous()
+            patches = patches.view(batch_size, h_patches * w_patches, channels * 4)
 
-        """4 to 1 concat"""
-        x = x.permute(0, 3, 1, 2)  # B, C, H, W
-        x = F.unfold(
-            x,
-            kernel_size=self.cfg.downsample_ratio,
-            stride=self.cfg.downsample_ratio,
-            padding=0,
-        )  # B, C*4, HW // 4
-        x = x.permute(0, 2, 1)
+            x = self.token_pooling_layer(patches)
+
+        elif self.config.projector_type == "downsample_mlp_gelu":
+            bs, hw, input_dim = x.shape
+            h = w = int((hw) ** 0.5)
+
+            """compute padding"""
+            if h % self.config.downsample_ratio:
+                pad = self.config.downsample_ratio - h % self.config.downsample_ratio
+            else:
+                pad = 0
+            x = x.reshape(bs, h, w, input_dim)
+            if pad > 0:
+                x = F.pad(x, (0, 0, 0, pad, 0, pad), "constant", 0)
+
+            """4 to 1 concat"""
+            x = x.permute(0, 3, 1, 2)  # B, C, H, W
+            x = F.unfold(
+                x,
+                kernel_size=self.config.downsample_ratio,
+                stride=self.config.downsample_ratio,
+                padding=0,
+            )  # B, C*4, HW // 4
+            x = x.permute(0, 2, 1)
 
         return self.layers(x)
 
@@ -754,22 +1023,26 @@ class DeepseekVL2ForCausalLM(nn.Module):
     ):
         if forward_batch.image_inputs[0] is not None:
             if forward_batch.forward_mode.is_decode():
-                input_embeds=self.language_model.model.embed_tokens(input_ids)
+                input_embeds = self.language_model.model.embed_tokens(input_ids)
             else:
-                pixel_values=forward_batch.image_inputs[0].pixel_values.to(device="cuda",dtype=torch.bfloat16)
-                image_seq_mask=forward_batch.image_inputs[0].image_seq_mask.to(device="cuda")
-                image_spatial_crop=forward_batch.image_inputs[0].image_spatial_crop
-                image_feature=self.vision.forward_features(pixel_values)
-                images_embeds=self.projector(image_feature)
-                _,hw,n_dim=images_embeds.shape
-                h=w=int(hw**0.5)
-                
-                tile_index=0
-                input_embeds=self.language_model.model.embed_tokens(input_ids)
+                pixel_values = forward_batch.image_inputs[0].pixel_values.to(
+                    device="cuda", dtype=torch.bfloat16
+                )
+                image_seq_mask = forward_batch.image_inputs[0].image_seq_mask.to(
+                    device="cuda"
+                )
+                image_spatial_crop = forward_batch.image_inputs[0].image_spatial_crop
+                image_feature = self.vision.forward_features(pixel_values)
+                images_embeds = self.projector(image_feature)
+                _, hw, n_dim = images_embeds.shape
+                h = w = int(hw**0.5)
+
+                tile_index = 0
+                input_embeds = self.language_model.model.embed_tokens(input_ids)
                 for idx in range(image_spatial_crop.shape[0]):
-                    images_in_this_batch=[]
+                    images_in_this_batch = []
                     for jdx in range(image_spatial_crop.shape[1]):
-                        num_width_tiles, num_height_tiles = image_spatial_crop[idx,jdx]
+                        num_width_tiles, num_height_tiles = image_spatial_crop[idx, jdx]
                         if num_width_tiles == 0 or num_height_tiles == 0:
                             break
                         num_tiles_in_image = num_width_tiles * num_height_tiles
@@ -778,8 +1051,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
                         global_features = images_embeds[tile_index]
 
                         # [num_height_tiles * num_width_tiles, hw, D]
-                        local_features = images_embeds[tile_index + 1:tile_index + 1 +
-                                                    num_tiles_in_image]
+                        local_features = images_embeds[
+                            tile_index + 1 : tile_index + 1 + num_tiles_in_image
+                        ]
                         tile_index += num_tiles_in_image + 1
 
                         # format global and local features
@@ -788,11 +1062,14 @@ class DeepseekVL2ForCausalLM(nn.Module):
                         global_features = global_features.view(h, w, n_dim)
 
                         # [D]     -> [h, 1, D]
-                        new_lines_in_global = repeat(self.image_newline, "d -> h 1 d", h=h)
+                        new_lines_in_global = repeat(
+                            self.image_newline, "d -> h 1 d", h=h
+                        )
 
                         # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
-                        global_features = torch.cat([global_features, new_lines_in_global],
-                                                    dim=1)
+                        global_features = torch.cat(
+                            [global_features, new_lines_in_global], dim=1
+                        )
 
                         # [h, w + 1, D] -> [h * (w + 1), D]
                         global_features = global_features.view(-1, n_dim)
@@ -800,22 +1077,27 @@ class DeepseekVL2ForCausalLM(nn.Module):
                         # ----------------- local view add newline -----------------
                         # [num_height_tiles * num_width_tiles, h * w, D] ->
                         # [num_height_tiles * h, num_width_tiles * w, D]
-                        local_features = rearrange(local_features,
-                                                "(th tw) (h w) d -> (th h) (tw w) d",
-                                                th=num_height_tiles,
-                                                tw=num_width_tiles,
-                                                h=h,
-                                                w=w)
+                        local_features = rearrange(
+                            local_features,
+                            "(th tw) (h w) d -> (th h) (tw w) d",
+                            th=num_height_tiles,
+                            tw=num_width_tiles,
+                            h=h,
+                            w=w,
+                        )
 
                         # [D] -> [num_height_tiles * h, 1, D]
-                        new_lines_in_local = repeat(self.image_newline,
-                                                    "d -> (th h) 1 d",
-                                                    th=num_height_tiles,
-                                                    h=h)
+                        new_lines_in_local = repeat(
+                            self.image_newline,
+                            "d -> (th h) 1 d",
+                            th=num_height_tiles,
+                            h=h,
+                        )
 
                         # [num_height_tiles * h, num_width_tiles * w + 1, D]
-                        local_features = torch.cat([local_features, new_lines_in_local],
-                                                dim=1)
+                        local_features = torch.cat(
+                            [local_features, new_lines_in_local], dim=1
+                        )
 
                         # [num_height_tiles * h, num_width_tiles * w + 1, D]
                         #   --> [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
@@ -823,28 +1105,37 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
                         # merge global and local tiles
                         if self.global_view_pos == "head":
-                            global_local_features = torch.cat([
-                                global_features,
-                                self.view_seperator[None, :],
-                                local_features,
-                            ])
+                            global_local_features = torch.cat(
+                                [
+                                    global_features,
+                                    self.view_seperator[None, :],
+                                    local_features,
+                                ]
+                            )
                         else:
-                            global_local_features = torch.cat([
-                                local_features,
-                                self.view_seperator[None, :],
-                                global_features,
-                            ])
+                            global_local_features = torch.cat(
+                                [
+                                    local_features,
+                                    self.view_seperator[None, :],
+                                    global_features,
+                                ]
+                            )
 
                         images_in_this_batch.append(global_local_features)
-                    
-                    if len(images_in_this_batch)>0:
-                        images_in_this_batch=torch.cat(images_in_this_batch,dim=0)
-                        input_embeds[idx].masked_scatter_(image_seq_mask[idx].unsqueeze(-1),images_in_this_batch)
+
+                    if len(images_in_this_batch) > 0:
+                        images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
+                        input_embeds[idx].masked_scatter_(
+                            image_seq_mask[idx].unsqueeze(-1), images_in_this_batch
+                        )
         else:
-            input_embeds=None
-            
+            input_embeds = None
+
         outputs = self.language.forward(
-            input_ids=input_ids, positions=positions, forward_batch=forward_batch,input_embeds=input_embeds,
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
         )
 
         return outputs
@@ -859,19 +1150,19 @@ class DeepseekVL2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters())
-        weights=list(weights)
-        for name,loaded_weight in weights:
+        weights = list(weights)
+        for name, loaded_weight in weights:
             if "language" in name:
-                name=name.replace('language.','')
-                self.language_model.load_weights([(name,loaded_weight)])
+                name = name.replace("language.", "")
+                self.language_model.load_weights([(name, loaded_weight)])
             else:
-                param=params_dict[name]
-                weights_loader=getattr(param,"weight_loader",default_weight_loader)
-                weights_loader(param,loaded_weight)
-                
-    def pad_input_ids(self,input_ids: List[int],image_inputs:ImageInputs):
+                param = params_dict[name]
+                weights_loader = getattr(param, "weight_loader", default_weight_loader)
+                weights_loader(param, loaded_weight)
+
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         return input_ids
-    
+
     def prepare_inputs_embeds(
         self,
         input_ids: torch.LongTensor,
