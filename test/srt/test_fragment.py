@@ -11,6 +11,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.runners import check_close_model_outputs
+from sglang.test.test_utils import is_in_ci
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -51,19 +52,19 @@ class TestFragment(unittest.TestCase):
         for p in processes:
             p.join()
 
-    # def test_ci_models(self):
-    #     for index, model_case in enumerate(CI_MODELS):
-    #         self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
-    #
-    # def test_others(self):
-    #     if is_in_ci():
-    #         return
-    #
-    #     for index, model_case in enumerate(ALL_OTHER_MODELS):
-    #         self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
-    #
-    def test_temp(self):
-        self.assert_fragment_e2e_execution(index=0, model_path="meta-llama/Llama-3.2-1B-Instruct")
+    def test_ci_models(self):
+        for index, model_case in enumerate(CI_MODELS):
+            self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
+
+    def test_others(self):
+        if is_in_ci():
+            return
+
+        for index, model_case in enumerate(ALL_OTHER_MODELS):
+            self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
+
+    # def test_adhoc(self):
+    #     self.assert_fragment_e2e_execution(index=0, model_path="meta-llama/Llama-3.2-1B-Instruct")
 
 
 def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_writer, model_path: str):
