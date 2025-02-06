@@ -40,7 +40,7 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     dict(model_path="Qwen/Qwen2-1.5B"),
-    dict(model_path="Qwen/Qwen2.5-14B-Instruct"),
+    dict(model_path="Qwen/Qwen2.5-14B-Instruct", tp_size=4),
     dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct"),
     dict(model_path="allenai/OLMo-1B-0724-hf"),
     dict(model_path="THUDM/glm-4-9b-chat"),
@@ -56,7 +56,7 @@ class TestFragment(unittest.TestCase):
     def setUpClass(cls):
         multiprocessing.set_start_method("spawn")
 
-    def assert_fragment_e2e_execution(self, index: int, model_path: str):
+    def assert_fragment_e2e_execution(self, index: int, model_path: str, tp_size: int = 2):
         nccl_port = find_available_port(12345)
         master_port = find_available_port(23456)
 
