@@ -1,4 +1,5 @@
 import itertools
+
 import pytest
 import torch
 import triton
@@ -138,11 +139,13 @@ def moe_align_block_size_triton(
 
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk",
-    list(itertools.product(
-        [32, 64, 128, 256],  # block_size
-        [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],  # num_tokens
-        [1, 2, 4, 8, 16, 32, 64]  # topk
-    ))
+    list(
+        itertools.product(
+            [32, 64, 128, 256],  # block_size
+            [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],  # num_tokens
+            [1, 2, 4, 8, 16, 32, 64],  # topk
+        )
+    ),
 )
 def test_moe_align_block_size_compare_implementations(block_size, num_tokens, topk):
     # For DeepSeek V3, we have 256 experts
@@ -156,7 +159,7 @@ def test_moe_align_block_size_compare_implementations(block_size, num_tokens, to
     )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    
+
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
@@ -203,11 +206,11 @@ def test_moe_align_block_size_compare_implementations(block_size, num_tokens, to
     )
 
     assert torch.allclose(expert_ids_cuda, expert_ids_triton), (
-                        f"Expert IDs mismatch for block_size={block_size}, "
-                        f"num_tokens={num_tokens}, topk={topk}\n"
-                        f"CUDA expert_ids: {expert_ids_cuda}\n"
-                        f"Triton expert_ids: {expert_ids_triton}"
-                    )
+        f"Expert IDs mismatch for block_size={block_size}, "
+        f"num_tokens={num_tokens}, topk={topk}\n"
+        f"CUDA expert_ids: {expert_ids_cuda}\n"
+        f"Triton expert_ids: {expert_ids_triton}"
+    )
 
     assert torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_triton), (
         f"Num tokens post pad mismatch for block_size={block_size}, "
@@ -215,6 +218,7 @@ def test_moe_align_block_size_compare_implementations(block_size, num_tokens, to
         f"CUDA num_tokens_post_pad: {num_tokens_post_pad_cuda}\n"
         f"Triton num_tokens_post_pad: {num_tokens_post_pad_triton}"
     )
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

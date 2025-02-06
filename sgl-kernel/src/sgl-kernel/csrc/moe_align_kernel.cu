@@ -17,6 +17,7 @@ limitations under the License.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
+
 #include <THC/THCAtomics.cuh>
 
 #include "utils.h"
@@ -76,7 +77,11 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
 
   __syncthreads();
 
-  // Note: For the moe_align_kernel, the primary bottleneck lies in the atomic add and non-coalesced memory writes here. If these operations can be performed using multiple blocks, similar to the Triton version, the performance of this kernel can achieve state-of-the-art performance across all token cases. However, once multiple blocks are used, illegal memory access occurs. Even replacing these lines of code with the stage 4 kernel from the Triton version results in the same issue, and a correct solution has not yet been found.
+  // Note: For the moe_align_kernel, the primary bottleneck lies in the atomic add and non-coalesced memory writes here.
+  // If these operations can be performed using multiple blocks, similar to the Triton version, the performance of this
+  // kernel can achieve state-of-the-art performance across all token cases. However, once multiple blocks are used,
+  // illegal memory access occurs. Even replacing these lines of code with the stage 4 kernel from the Triton version
+  // results in the same issue, and a correct solution has not yet been found.
   for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
     int32_t expert_id = topk_ids[i];
     int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
@@ -93,7 +98,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     auto align_kernel = moe_align_block_size_kernel<scalar_t>;
     align_kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-                                   experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
-                                   num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
+                                         experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
+                                         num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
   });
 }
