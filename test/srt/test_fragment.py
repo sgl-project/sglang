@@ -24,7 +24,6 @@ from torch.distributed.fsdp.api import (
 )
 from transformers import AutoModelForCausalLM
 
-_TP_SIZE = 2
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
 
@@ -64,15 +63,21 @@ class TestFragment(unittest.TestCase):
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
-        for tp_rank in range(_TP_SIZE):
+        for tp_rank in range(tp_size):
             p = Process(
                 target=_run_subprocess,
-                args=(tp_rank, master_port, nccl_port, output_writer, model_path),
+                kwargs=dict(
+                    tp_rank=tp_rank,
+                    master_port=master_port,
+                    nccl_port=nccl_port,
+                    output_writer=output_writer,
+                    model_path=model_path,
+                ),
             )
             p.start()
             processes.append(p)
 
-        for _ in range(_TP_SIZE):
+        for _ in range(tp_size):
             self.assertTrue(output_reader.recv(),
                             f'Subprocess has error, please see logs above. ({index=} {model_path=})')
 
@@ -94,15 +99,22 @@ class TestFragment(unittest.TestCase):
     #     self.assert_fragment_e2e_execution(index=0, model_path="meta-llama/Llama-3.2-1B-Instruct")
 
 
-def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_writer, model_path: str):
+def _run_subprocess(
+    tp_rank: int,
+    tp_size: int,
+    master_port: int,
+    nccl_port: int,
+    output_writer,
+    model_path: str,
+):
     try:
         print(f"subprocess[{tp_rank=}] Start {os.environ['CUDA_VISIBLE_DEVICES']=}")
 
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
-        torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
+        torch.distributed.init_process_group(rank=tp_rank, world_size=tp_size)
 
-        mesh_kwargs = dict(mesh_shape=(_TP_SIZE, 1), mesh_dim_names=["tp", "pp"])
+        mesh_kwargs = dict(mesh_shape=(tp_size, 1), mesh_dim_names=["tp", "pp"])
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
         inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
         print(
@@ -113,7 +125,7 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             model_path=model_path,
             load_format='dummy' if _ENABLE_UPDATE_WEIGHTS else 'auto',
             mem_fraction_static=0.4,
-            tp_size=_TP_SIZE,
+            tp_size=tp_size,
             random_seed=42,
             trust_remote_code=True,
             # fragment args
@@ -148,7 +160,7 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
 
         if _ENABLE_UPDATE_WEIGHTS:
             # test update weights
-            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
+            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model, tp_size=tp_size)
             print(
                 f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
                 flush=True,
@@ -191,9 +203,9 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
 
 
 # Adapted from https://github.com/volcengine/verl/blob/main/tests/rollout/run_fsdp_vllm.py
-def _get_fsdp_state_dict(hf_model):
+def _get_fsdp_state_dict(hf_model, tp_size: int):
     device_mesh = init_device_mesh(
-        "cuda", mesh_shape=(_TP_SIZE,), mesh_dim_names=["fsdp"]
+        "cuda", mesh_shape=(tp_size,), mesh_dim_names=["fsdp"]
     )
 
     mixed_precision = MixedPrecision(
