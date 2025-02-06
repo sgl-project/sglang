@@ -8,6 +8,7 @@ from multiprocessing import Process
 import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.server.engine_fragment import EngineFragment
+from sglang.test.runners import HFRunner
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
@@ -21,6 +22,7 @@ from torch.distributed.fsdp.api import (
 from transformers import AutoModelForCausalLM
 
 _TP_SIZE = 2
+_MAX_NEW_TOKENS = 8
 
 
 class TestFragment(unittest.TestCase):
@@ -82,11 +84,21 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
-        # create hf model for comparison
+        # hf model is used for comparison
         with torch.device("cuda"):
             hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
             hf_model.to(torch.bfloat16)
         hf_model.cuda()
+
+        hf_outputs = HFRunner.forward_generation_raw(
+            prompts=prompts,
+            max_new_tokens=_MAX_NEW_TOKENS,
+            base_model=hf_model,
+            tokenizer=TODO,
+            lora_paths=None,
+            torch_dtype=torch.float16,
+            output_str_only=False,
+        )
 
         # test update weights
         fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
