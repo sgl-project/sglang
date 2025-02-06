@@ -77,11 +77,6 @@ class TestGenerationModels(unittest.TestCase):
         torch_dtype: torch.dtype,
     ) -> None:
         model_path = model_case.model_path
-        prefill_tolerance, decode_tolerance, rouge_l_tolerance = (
-            model_case.prefill_tolerance,
-            model_case.decode_tolerance,
-            model_case.rouge_l_tolerance,
-        )
         max_new_tokens = 32
 
         with HFRunner(
@@ -100,8 +95,12 @@ class TestGenerationModels(unittest.TestCase):
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
         check_close_model_outputs(
-            a_outputs=hf_outputs,
-            b_outputs=srt_outputs,
+            hf_outputs=hf_outputs,
+            srt_outputs=srt_outputs,
+            prefill_tolerance=model_case.prefill_tolerance,
+            decode_tolerance=model_case.decode_tolerance,
+            rouge_l_tolerance=model_case.rouge_l_tolerance,
+            debug_text=f"model_path={model_path} prompts={prompts}",
         )
 
     def test_ci_models(self):
@@ -141,10 +140,10 @@ class TestGenerationModels(unittest.TestCase):
 def check_close_model_outputs(
     hf_outputs: ModelOutput,
     srt_outputs: ModelOutput,
-    prompts: List[str],
     prefill_tolerance: float,
     decode_tolerance: float,
     rouge_l_tolerance: float,
+    debug_text: str,
 ):
     for i in range(len(prompts)):
         # Compare input logprobs
@@ -156,7 +155,7 @@ def check_close_model_outputs(
         )
         if input_len <= 100:
             assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
-                f"prefill logprobs are not all close with model_path={model_path} prompts={prompts} "
+                f"prefill logprobs are not all close with {debug_text} "
                 f"prefill_tolerance={prefill_tolerance}."
                 f"{hf_logprobs=}, {srt_logprobs=}"
             )
@@ -170,7 +169,7 @@ def check_close_model_outputs(
         )
         if input_len <= 100:
             assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
-                f"decode logprobs are not all close with model_path={model_path} prompts={prompts} "
+                f"decode logprobs are not all close with {debug_text} "
                 f"decode_tolerance={decode_tolerance}."
                 f"{hf_logprobs=}, {srt_logprobs=}"
             )
