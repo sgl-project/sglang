@@ -130,7 +130,7 @@ class HFRunner:
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
-                trust_remote_code=False,
+                trust_remote_code=True,
                 low_cpu_mem_usage=True,
             ).cuda()
         elif self.model_type == "embedding":
