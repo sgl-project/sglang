@@ -317,7 +317,7 @@ class SRTRunner:
         lora_paths=None,
     ):
         if self.is_generation:
-            self.forward_generation_raw(
+            return self.forward_generation_raw(
                 prompts=prompts,
                 max_new_tokens=max_new_tokens,
                 lora_paths=lora_paths,
@@ -434,6 +434,7 @@ class SRTRunner:
         return ModelOutput(
             output_strs=output_strs,
         )
+
 
 def monkey_patch_gemma2_sdpa():
     """
