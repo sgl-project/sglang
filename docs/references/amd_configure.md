@@ -1,14 +1,5 @@
 # AMD Configuration and Setup for SGLang
 
-## Table of Contents
-
-- [Introduction](#introduction)
-- [System Configure](#system-configure)
-  - [MI300X](#mi300x)
-- [Installing SGLang](#installing-sglang)
-  - [Install from Source](#install-from-source)
-  - [Install Using Docker](#install-using-docker)
-
 ## Introduction
 
 This document describes how to set up an AMD-based environment for [SGLang](https://docs.sglang.ai). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues) on the SGLang repository.
@@ -26,7 +17,7 @@ AMD provides official documentation for MI300X optimization and system tuning:
   - [AMD Instinct MI300X System Optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html)
   - [AMD Instinct MI300X Workload Optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html)
 
-> **NOTE:** We strongly recommend reading the entire `System Optimization` guide to fully configure your system.
+**NOTE:** We strongly recommend reading the entire `System Optimization` guide to fully configure your system.
 
 Below are a few key settings to confirm or enable:
 
@@ -40,7 +31,7 @@ Below are a few key settings to confirm or enable:
    ```bash
    sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
    ```
-   - You can automate or verify this change using [this helpful script](https://github.com/ROCm/triton/blob/rocm_env/scripts/amd/env_check.sh)
+   You can automate or verify this change using [this helpful script](https://github.com/ROCm/triton/blob/rocm_env/scripts/amd/env_check.sh)
 
 Again, please go through the entire documentation to confirm your system is using the recommended configuration.
 
@@ -79,7 +70,7 @@ alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/d
 
 3. Launch the server.
 
-> **NOTE:** Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens)
+**NOTE:** Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens)
 
 ```bash
 drun -p 30000:30000 \
@@ -92,7 +83,7 @@ drun -p 30000:30000 \
     --port 30000
 ```
 
-4. To verify the utility, you can run a benchmark in another terminal.
+4. To verify the utility, you can run a benchmark in another terminal or refer to other docs to send requests to the engine.
 
 ```bash
 drun sglang_image \
