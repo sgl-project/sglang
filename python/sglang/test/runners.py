@@ -343,18 +343,11 @@ class SRTRunner:
         only return output strings and no logprobs
         """
         if self.is_generation:
-            # the return value contains logprobs from prefill
-            output_strs = []
-            sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
-            response = self.engine.generate(
-                prompts,
-                lora_path=lora_paths if lora_paths else None,
-                sampling_params=sampling_params,
-            )
-            output_strs = [r["text"] for r in response]
-
-            return ModelOutput(
-                output_strs=output_strs,
+            return self.batch_forward_generation_raw(
+                prompts=prompts,
+                max_new_tokens=max_new_tokens,
+                lora_paths=lora_paths,
+                engine=self.engine,
             )
         else:
             response = self.engine.encode(prompts)
@@ -421,6 +414,26 @@ class SRTRunner:
             top_output_logprobs=top_output_logprobs,
         )
 
+    @staticmethod
+    def batch_forward_generation_raw(
+        prompts: Union[List[str], List[torch.Tensor]],
+        max_new_tokens,
+        lora_paths,
+        engine,
+    ):
+        # the return value contains logprobs from prefill
+        output_strs = []
+        sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+        response = engine.generate(
+            prompts,
+            lora_path=lora_paths if lora_paths else None,
+            sampling_params=sampling_params,
+        )
+        output_strs = [r["text"] for r in response]
+
+        return ModelOutput(
+            output_strs=output_strs,
+        )
 
 def monkey_patch_gemma2_sdpa():
     """
