@@ -120,6 +120,10 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             lora_paths=None,
             engine=fragment,
         )
+        print(
+            f"subprocess[{tp_rank=}] call srt.forward {srt_outputs=}",
+            flush=True,
+        )
 
         check_close_model_outputs(
             hf_outputs=hf_outputs,
