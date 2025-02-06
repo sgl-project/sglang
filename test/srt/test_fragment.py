@@ -166,6 +166,10 @@ def _run_subprocess(
             torch_dtype=torch.float16,
             output_str_only=False,
         )
+        print(
+            f"subprocess[{tp_rank=}] call hf.forward {hf_outputs=}",
+            flush=True,
+        )
 
         if _ENABLE_UPDATE_WEIGHTS:
             hf_model.cpu()
