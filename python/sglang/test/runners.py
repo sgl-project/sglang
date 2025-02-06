@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server import Engine
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+from sglang.test.test_utils import calculate_rouge_l
 from transformers import AutoModelForCausalLM
 
 DEFAULT_PROMPTS = [
@@ -434,3 +435,52 @@ def monkey_patch_gemma2_sdpa():
         return config
 
     setattr(Gemma2PreTrainedModel, "_check_and_enable_sdpa", _check_and_enable_sdpa)
+
+
+def check_close_model_outputs(
+    hf_outputs: ModelOutput,
+    srt_outputs: ModelOutput,
+    prefill_tolerance: float,
+    decode_tolerance: float,
+    rouge_l_tolerance: float,
+    debug_text: str = '',
+):
+    for i in range(len(hf_outputs.output_strs)):
+        # Compare input logprobs
+        hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
+        srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
+        input_len = hf_logprobs.shape[0]
+        print(
+            "prefill logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
+        )
+        if input_len <= 100:
+            assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
+                f"prefill logprobs are not all close with {debug_text} "
+                f"prefill_tolerance={prefill_tolerance}."
+                f"{hf_logprobs=}, {srt_logprobs=}"
+            )
+
+        # Compare output logprobs
+        hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
+        srt_logprobs = torch.Tensor(srt_outputs.top_output_logprobs[i])
+
+        print(
+            "decode logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
+        )
+        if input_len <= 100:
+            assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
+                f"decode logprobs are not all close with {debug_text} "
+                f"decode_tolerance={decode_tolerance}."
+                f"{hf_logprobs=}, {srt_logprobs=}"
+            )
+
+    # Compare output strings
+    print(f"{hf_outputs.output_strs=}")
+    print(f"{srt_outputs.output_strs=}")
+    rouge_l_scores = calculate_rouge_l(
+        hf_outputs.output_strs, srt_outputs.output_strs
+    )
+    print(f"{rouge_l_scores=}")
+    assert all(
+        score >= rouge_l_tolerance for score in rouge_l_scores
+    ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
