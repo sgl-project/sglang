@@ -315,6 +315,8 @@ class Req:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
                 self.output_top_logprobs_val
             ) = self.output_top_logprobs_idx = None
+        
+        self.hidden_states = []
 
         # Logprobs (internal values)
         # The tokens is prefilled but need to be considered as decode tokens
@@ -1192,7 +1194,7 @@ class ScheduleBatch:
             capture_hidden_mode=(
                 getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
                 if self.spec_info
-                else CaptureHiddenMode.NULL
+                else CaptureHiddenMode.FULL
             ),
         )
 

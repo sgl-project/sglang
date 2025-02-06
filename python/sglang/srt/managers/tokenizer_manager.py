@@ -792,6 +792,8 @@ class TokenizerManager:
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+            
+            meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
             if isinstance(recv_obj, BatchStrOut):
                 out_dict = {
