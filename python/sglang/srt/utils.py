@@ -1384,7 +1384,7 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
             )
             ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
         else:
-            ans = TODO
+            ans = w.full_tensor().narrow(dim, start, length)
 
         # print(f'weight_loader_narrow END {rank_via_mesh=} {size_via_mesh=} {ans.shape=}')
         assert ans.shape[dim] == length, (
