@@ -42,10 +42,10 @@ ALL_OTHER_MODELS = [
     # dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
     # dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3, prefill_tolerance=0.25),
     # dict(model_path="allenai/OLMo-1B-0724-hf"),
-    # dict(model_path="THUDM/glm-4-9b-chat", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
+    dict(model_path="THUDM/glm-4-9b-chat", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
     # dict(model_path="openai-community/gpt2"),
     # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
-    dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
+    # dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
     # dict(model_path="ibm-granite/granite-3.0-2b-instruct"),
 ]
 
