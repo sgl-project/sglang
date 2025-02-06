@@ -24,12 +24,27 @@ limitations under the License.
 
 #define WARP_SIZE 32
 
+
+template <typename scalar_t>
+__global__ void moe_token_sort_kernel(scalar_t* __restrict__ topk_ids, 
+                                    int32_t* sorted_token_ids,
+                                    int32_t* cumsum_buffer,
+                                    size_t numel) {
+  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = blockDim.x * gridDim.x;
+
+  for (size_t i = tid; i < numel; i += stride) {
+    int32_t expert_id = topk_ids[i];
+    int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
+    sorted_token_ids[rank_post_pad] = i;
+  }
+}
+
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
                                             int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
                                             int32_t block_size, size_t numel, int32_t* cumsum) {
   __shared__ int32_t shared_counts[WARP_SIZE][8];
-  __shared__ int32_t local_offsets[256];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
   const int experts_per_warp = 8;
@@ -72,25 +87,8 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
     for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
       expert_ids[i / block_size] = threadIdx.x;
     }
-    local_offsets[threadIdx.x] = cumsum[threadIdx.x];
   }
 
-  __syncthreads();
-}
-
-template <typename scalar_t>
-__global__ void moe_token_sort_kernel(scalar_t* __restrict__ topk_ids, 
-                                    int32_t* sorted_token_ids,
-                                    int32_t* local_offsets,
-                                    size_t numel) {
-  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t stride = blockDim.x * gridDim.x;
-
-  for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i];
-    int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
-    sorted_token_ids[rank_post_pad] = i;
-  }
 }
 
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
@@ -100,7 +98,6 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
   TORCH_CHECK(num_experts == 256, "moe_align_block_size kernel only support deepseek v3 now.");
 
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-    // First kernel for counting and preparing offsets
     auto align_kernel = moe_align_block_size_kernel<scalar_t>;
     align_kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                          experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
