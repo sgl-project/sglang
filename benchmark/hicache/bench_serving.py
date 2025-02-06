@@ -242,7 +242,13 @@ async def async_request_sglang_generate(
         # Now we simply concatenate all the prompts and responses in the
         # text field
 
-        messages.append(prompt)
+        # NOTE: We specialize for the case of nextqa
+        if isinstance(prompt, List):
+            messages.append(prompt[1]["text"])
+            payload["image_data"] = prompt[0]["image_url"]["url"]
+        elif isinstance(prompt, str):
+            messages.append(prompt)
+
         payload["text"] = " ".join(messages)
         payload["sampling_params"]["max_new_tokens"] = max_tokens
 
