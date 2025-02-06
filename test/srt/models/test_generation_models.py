@@ -29,6 +29,7 @@ import torch
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
+from sglang.test.runners import ModelOutput
 
 
 @dataclasses.dataclass
@@ -98,45 +99,10 @@ class TestGenerationModels(unittest.TestCase):
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
-        for i in range(len(prompts)):
-            # Compare input logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
-            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
-            input_len = hf_logprobs.shape[0]
-            print(
-                "prefill logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
-            )
-            if input_len <= 100:
-                assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
-                    f"prefill logprobs are not all close with model_path={model_path} prompts={prompts} "
-                    f"prefill_tolerance={prefill_tolerance}."
-                    f"{hf_logprobs=}, {srt_logprobs=}"
-                )
-
-            # Compare output logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
-            srt_logprobs = torch.Tensor(srt_outputs.top_output_logprobs[i])
-
-            print(
-                "decode logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
-            )
-            if input_len <= 100:
-                assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
-                    f"decode logprobs are not all close with model_path={model_path} prompts={prompts} "
-                    f"decode_tolerance={decode_tolerance}."
-                    f"{hf_logprobs=}, {srt_logprobs=}"
-                )
-
-        # Compare output strings
-        print(f"{hf_outputs.output_strs=}")
-        print(f"{srt_outputs.output_strs=}")
-        rouge_l_scores = calculate_rouge_l(
-            hf_outputs.output_strs, srt_outputs.output_strs
+        check_close_model_outputs(
+            a_outputs=hf_outputs,
+            b_outputs=srt_outputs,
         )
-        print(f"{rouge_l_scores=}")
-        assert all(
-            score >= rouge_l_tolerance for score in rouge_l_scores
-        ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
 
     def test_ci_models(self):
         for model_case in CI_MODELS:
@@ -172,6 +138,53 @@ class TestGenerationModels(unittest.TestCase):
             # Assert the logits and output strs are close
             self.assert_close_logits_and_output_strs(prompts, model_case, torch.float16)
 
+def check_close_model_outputs(
+    hf_outputs: ModelOutput,
+    srt_outputs: ModelOutput,
+    prompts: List[str],
+    prefill_tolerance: float,
+    decode_tolerance: float,
+    rouge_l_tolerance: float,
+):
+    for i in range(len(prompts)):
+        # Compare input logprobs
+        hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
+        srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
+        input_len = hf_logprobs.shape[0]
+        print(
+            "prefill logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
+        )
+        if input_len <= 100:
+            assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
+                f"prefill logprobs are not all close with model_path={model_path} prompts={prompts} "
+                f"prefill_tolerance={prefill_tolerance}."
+                f"{hf_logprobs=}, {srt_logprobs=}"
+            )
+
+        # Compare output logprobs
+        hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
+        srt_logprobs = torch.Tensor(srt_outputs.top_output_logprobs[i])
+
+        print(
+            "decode logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
+        )
+        if input_len <= 100:
+            assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
+                f"decode logprobs are not all close with model_path={model_path} prompts={prompts} "
+                f"decode_tolerance={decode_tolerance}."
+                f"{hf_logprobs=}, {srt_logprobs=}"
+            )
+
+    # Compare output strings
+    print(f"{hf_outputs.output_strs=}")
+    print(f"{srt_outputs.output_strs=}")
+    rouge_l_scores = calculate_rouge_l(
+        hf_outputs.output_strs, srt_outputs.output_strs
+    )
+    print(f"{rouge_l_scores=}")
+    assert all(
+        score >= rouge_l_tolerance for score in rouge_l_scores
+    ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
 
 if __name__ == "__main__":
     unittest.main()
