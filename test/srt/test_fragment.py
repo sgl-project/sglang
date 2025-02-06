@@ -31,12 +31,13 @@ _PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
 _ENABLE_UPDATE_WEIGHTS = True
 # _ENABLE_UPDATE_WEIGHTS = False
 
-# TODO maybe we should add more other models?
+# TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
 CI_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
     "google/gemma-2-2b",
 ]
 ALL_OTHER_MODELS = [
+    "meta-llama/Llama-3.2-1B-Instruct",
     "Qwen/Qwen2-1.5B",
     "Qwen/Qwen2.5-14B-Instruct",
     "HuggingFaceTB/SmolLM-135M-Instruct",
