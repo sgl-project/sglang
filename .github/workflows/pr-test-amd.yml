@@ -21,32 +21,38 @@ jobs:
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: linux-mi300-gpu-1
-    container:
-      image: lmsysorg/sglang:v0.4.2.post2-rocm630
-      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker pull lmsysorg/sglang:v0.4.2.post2-rocm630
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            lmsysorg/sglang:v0.4.2.post2-rocm630
+
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          cd sgl-kernel
-          python3 setup_rocm.py install
-          cd ..
-          pip install -e "python[dev_hip]"
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 setup_rocm.py install
+          docker exec ci_sglang pip install -e "python[dev_hip]"
 
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
 
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
-          cd test/srt
-          python3 test_eval_accuracy_large.py
+          docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_eval_accuracy_large.py
 
   finish:
     needs: [
