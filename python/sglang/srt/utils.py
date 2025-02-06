@@ -1388,7 +1388,7 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
             (size_via_mesh == size_via_arg) and
             (ans.shape[dim] == length)
         ), (
-            f'weight_loader_narrow '
+            f'weight_loader_tp_narrow '
             f'{w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} '
             f'{w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=} '
             f'{rank_via_mesh=} {rank_via_arg=} {size_via_mesh=} {size_via_arg=} {ans.shape=}'
