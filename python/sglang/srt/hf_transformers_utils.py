@@ -19,6 +19,7 @@ import warnings
 from pathlib import Path
 from typing import Dict, Optional, Type, Union
 
+import transformers
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
@@ -26,6 +27,7 @@ from transformers import (
     AutoTokenizer,
     PretrainedConfig,
     PreTrainedTokenizer,
+    PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -46,11 +48,26 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
+    MultiModalityConfig.model_type: MultiModalityConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
+
+
+def suppress_transformers_warnings():
+    transformers.logging.set_verbosity_error()
+    warnings.simplefilter("ignore")
+
+
+@contextlib.contextmanager
+def suppress_warnings():
+    warnings.simplefilter("ignore")
+    try:
+        yield
+    finally:
+        warnings.resetwarnings()
 
 
 def download_from_hf(model_path: str):
@@ -67,6 +84,7 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
+    suppress_transformers_warnings()
     is_gguf = check_gguf_file(model)
     if is_gguf:
         kwargs["gguf_file"] = model
@@ -82,6 +100,13 @@ def get_config(
         for key, val in config.language_config.__dict__.items():
             setattr(config, key, val)
         setattr(config, "architectures", ["MultiModalityCausalLM"])
+
+    # Pour langauge_config to first-level
+    if isinstance(model, str) and "InternVL" in model:
+        for key, val in config.llm_config.__dict__.items():
+            if not hasattr(config, key):
+                setattr(config, key, val)
+
 
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
@@ -209,6 +234,12 @@ def get_tokenizer(
     return tokenizer
 
 
+def get_tokenizer_from_processor(processor):
+    if isinstance(processor, PreTrainedTokenizerBase):
+        return processor
+    return processor.tokenizer
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -244,7 +275,9 @@ def get_processor(
         **kwargs,
     )
 
-    attach_additional_stop_token_ids(processor.tokenizer)
+    tokenizer = get_tokenizer_from_processor(processor)
+
+    attach_additional_stop_token_ids(tokenizer)
     return processor
 
 

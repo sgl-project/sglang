@@ -638,7 +638,7 @@ class Resampler2_5(BaseResampler):
             x + pos_embed,  # L * B * D +  L * B * D
             x,
             key_padding_mask=key_padding_mask,
-        )[0]
+            )[0]
         #  out: Q * B * D
         x = out.permute(1, 0, 2)  # B * Q * D
 

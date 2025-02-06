@@ -369,7 +369,7 @@ class Qwen2VisionTransformer(nn.Module):
                     self.spatial_merge_size,
                     w // self.spatial_merge_size,
                     self.spatial_merge_size,
-                )
+                    )
                 .permute(0, 2, 1, 3)
                 .flatten()
             )
@@ -379,7 +379,7 @@ class Qwen2VisionTransformer(nn.Module):
                     self.spatial_merge_size,
                     w // self.spatial_merge_size,
                     self.spatial_merge_size,
-                )
+                    )
                 .permute(0, 2, 1, 3)
                 .flatten()
             )
