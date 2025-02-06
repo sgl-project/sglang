@@ -223,7 +223,7 @@ class TestWaveAttention(unittest.TestCase):
             b_start_loc_extend,
             max_len_extend,
             o_wave,
-            is_causal=False,
+            is_causal=True,
         )
 
         # Since we are not doing causal attention, we need a separate
@@ -239,7 +239,7 @@ class TestWaveAttention(unittest.TestCase):
             max_len_in_batch,
             extend_token_num,
             dtype,
-            is_causal=False,
+            is_causal=True,
         )
 
         self.assertTrue(torch.allclose(o_triton, o_redundant, rtol=1e-2))
