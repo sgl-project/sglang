@@ -53,7 +53,6 @@ def run():
         "LOCAL_WORLD_SIZE",
         "MASTER_ADDR",
         "MASTER_PORT",
-        "NCCL_DEBUG",
         "OMP_NUM_THREADS",
         "RANK",
         "ROLE_NAME",
