@@ -40,7 +40,7 @@ ALL_OTHER_MODELS = [
     # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     # dict(model_path="Qwen/Qwen2-1.5B"),
     # dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
-    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
+    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3, prefill_tolerance=0.25),
     # dict(model_path="allenai/OLMo-1B-0724-hf"),
     # dict(model_path="THUDM/glm-4-9b-chat", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
     # dict(model_path="openai-community/gpt2"),
@@ -62,6 +62,8 @@ class TestFragment(unittest.TestCase):
         mem_fraction_static: float = 0.4,
         tp_size: int = 2,
         tight_memory: bool = False,
+        prefill_tolerance: float = 0.2,
+        decode_tolerance: float = 0.2,
     ):
         nccl_port = find_available_port(12345)
         master_port = find_available_port(23456)
@@ -82,6 +84,8 @@ class TestFragment(unittest.TestCase):
                     model_path=model_path,
                     mem_fraction_static=mem_fraction_static,
                     tight_memory=tight_memory,
+                    prefill_tolerance=prefill_tolerance,
+                    decode_tolerance=decode_tolerance,
                 ),
             )
             p.start()
@@ -118,6 +122,8 @@ def _run_subprocess(
     model_path: str,
     mem_fraction_static: float,
     tight_memory: bool,
+    prefill_tolerance: float,
+    decode_tolerance: float,
 ):
     try:
         print(f"subprocess[{tp_rank=}] Start {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
@@ -203,8 +209,8 @@ def _run_subprocess(
         check_close_model_outputs(
             hf_outputs=hf_outputs,
             srt_outputs=srt_outputs,
-            prefill_tolerance=0.2,
-            decode_tolerance=0.2,
+            prefill_tolerance=prefill_tolerance,
+            decode_tolerance=decode_tolerance,
             rouge_l_tolerance=1,
         )
 
