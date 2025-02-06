@@ -1,4 +1,4 @@
-# DeepSeek Model Usage and Optimization
+# DeepSeek Model Usage and Optimizations
 
 SGLang provides several optimizations specifically designed for the DeepSeek model to boost its inference speed. This document outlines current optimizations for DeepSeek. Additionally, the SGLang team is actively developing enhancements for [DeepSeek V3](https://github.com/sgl-project/sglang/issues/2591).
 
