@@ -59,8 +59,6 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         torch.distributed.init_process_group(rank=tp_rank, world_size=_TP_SIZE)
 
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        changed_model_path = model_path.replace("-Instruct", "")
-        assert changed_model_path != model_path
 
         mesh_kwargs = dict(mesh_shape=(_TP_SIZE, 1), mesh_dim_names=["tp", "pp"])
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
@@ -70,7 +68,8 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         )
 
         fragment = EngineFragment(
-            model_path=changed_model_path,
+            model_path=model_path,
+            load_format='dummy',
             mem_fraction_static=0.1,
             tp_size=_TP_SIZE,
             random_seed=42,
