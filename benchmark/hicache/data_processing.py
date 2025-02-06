@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import requests
-from nextqa.video import NExTQALoader, VideoPrompt, encode_video_base64
+from nextqa.video import NExTQALoader, VideoPrompt
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -19,6 +19,7 @@ from sglang.bench_serving import (
     get_gen_prefix_cache_path,
 )
 from sglang.srt.openai_api.protocol import ChatCompletionMessageContentPart
+from sglang.utils import encode_video_base64
 
 # type of content fields, can be only prompts or with images/videos
 MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
