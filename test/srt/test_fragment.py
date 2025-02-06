@@ -39,7 +39,7 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     # dict(model_path="Qwen/Qwen2-1.5B"),
-    dict(model_path="Qwen/Qwen2.5-14B-Instruct", tp_size=4),
+    dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8),
     # dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct"),
     # dict(model_path="allenai/OLMo-1B-0724-hf"),
     # dict(model_path="THUDM/glm-4-9b-chat"),
@@ -55,7 +55,13 @@ class TestFragment(unittest.TestCase):
     def setUpClass(cls):
         multiprocessing.set_start_method("spawn")
 
-    def assert_fragment_e2e_execution(self, index: int, model_path: str, tp_size: int = 2):
+    def assert_fragment_e2e_execution(
+        self,
+        index: int,
+        model_path: str,
+        mem_fraction_static: float = 0.4,
+        tp_size: int = 2,
+    ):
         nccl_port = find_available_port(12345)
         master_port = find_available_port(23456)
 
@@ -73,6 +79,7 @@ class TestFragment(unittest.TestCase):
                     nccl_port=nccl_port,
                     output_writer=output_writer,
                     model_path=model_path,
+                    mem_fraction_static=mem_fraction_static,
                 ),
             )
             p.start()
@@ -107,9 +114,10 @@ def _run_subprocess(
     nccl_port: int,
     output_writer,
     model_path: str,
+    mem_fraction_static: float,
 ):
     try:
-        print(f"subprocess[{tp_rank=}] Start {os.environ['CUDA_VISIBLE_DEVICES']=}")
+        print(f"subprocess[{tp_rank=}] Start {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
 
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
@@ -125,7 +133,7 @@ def _run_subprocess(
         fragment = EngineFragment(
             model_path=model_path,
             load_format='dummy' if _ENABLE_UPDATE_WEIGHTS else 'auto',
-            mem_fraction_static=0.4,
+            mem_fraction_static=mem_fraction_static,
             tp_size=tp_size,
             random_seed=42,
             trust_remote_code=True,
@@ -143,9 +151,8 @@ def _run_subprocess(
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
         # hf model is used for comparison
-        with torch.device("cuda"):
-            hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-            hf_model.to(torch.bfloat16)
+        hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, device_map='cpu')
+        hf_model.to(torch.bfloat16)
         hf_model.cuda()
         hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
 
@@ -160,6 +167,9 @@ def _run_subprocess(
         )
 
         if _ENABLE_UPDATE_WEIGHTS:
+            hf_model.cpu()
+            torch.cuda.empty_cache()
+
             # test update weights
             fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model, tp_size=tp_size)
             print(
