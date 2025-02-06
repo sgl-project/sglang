@@ -1372,23 +1372,22 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
         size_via_mesh = tp_device_mesh.size()
         size_via_arg = w.shape[dim] // length
 
-        ans = w
-        # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
-        # Now we can either do this hacky full_tensor+from_local+redistribute (to test logical correctness and
-        # easier to flip in the future), or do full_tensor+narrow
-        ans = DTensor.from_local(
-            ans.full_tensor(),
-            device_mesh=tp_device_mesh,
-            placements=[Replicate() for _ in range(tp_device_mesh.ndim)],
-        )
-        ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
+        if (rank_via_mesh == rank_via_arg) and (size_via_mesh == size_via_arg):
+            ans = w
+            # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
+            # Now we can either do this hacky full_tensor+from_local+redistribute (to test logical correctness and
+            # easier to flip in the future), or do full_tensor+narrow
+            ans = DTensor.from_local(
+                ans.full_tensor(),
+                device_mesh=tp_device_mesh,
+                placements=[Replicate() for _ in range(tp_device_mesh.ndim)],
+            )
+            ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
+        else:
+            ans = TODO
 
         # print(f'weight_loader_narrow END {rank_via_mesh=} {size_via_mesh=} {ans.shape=}')
-        assert (
-            (rank_via_mesh == rank_via_arg) and
-            (size_via_mesh == size_via_arg) and
-            (ans.shape[dim] == length)
-        ), (
+        assert ans.shape[dim] == length, (
             f'weight_loader_tp_narrow '
             f'{w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} '
             f'{w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=} '
