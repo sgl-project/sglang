@@ -2,9 +2,9 @@ import argparse
 
 import torch
 import triton
+import vllm
 from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
-import vllm
 
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_sglang,
@@ -42,9 +42,11 @@ def get_model_config(model_name: str, tp_size: int):
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
 
-    vllm_version_num = (vllm.__version_tuple__[0] * 100 
-                     + vllm.__version_tuple__[1] *10
-                     + vllm.__version_tuple__[2] )
+    vllm_version_num = (
+        vllm.__version_tuple__[0] * 100
+        + vllm.__version_tuple__[1] * 10
+        + vllm.__version_tuple__[2]
+    )
     block_shape = None
     if (
         vllm_version_num < 66
@@ -53,7 +55,7 @@ def get_model_config(model_name: str, tp_size: int):
     ):
         block_shape = config.quantization_config["weight_block_size"]
         assert len(block_shape) == 2
-    
+
     shape_configs = {
         "num_experts": E,
         "topk": topk,
@@ -79,7 +81,7 @@ def fused_moe_vllm_api(
     a2_scale=None,
     block_shape=None,
 ):
-    if block_shape is not None: 
+    if block_shape is not None:
         return fused_moe_vllm(
             x,
             w1,
@@ -124,7 +126,7 @@ def fused_moe_sglang_api(
     a1_scale=None,
     a2_scale=None,
     block_shape=None,
-): 
+):
     return fused_moe_sglang(
         x,
         w1,
