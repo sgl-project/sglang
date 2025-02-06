@@ -24,12 +24,9 @@ limitations under the License.
 
 #define WARP_SIZE 32
 
-
 template <typename scalar_t>
-__global__ void moe_token_sort_kernel(scalar_t* __restrict__ topk_ids, 
-                                    int32_t* sorted_token_ids,
-                                    int32_t* cumsum_buffer,
-                                    size_t numel) {
+__global__ void moe_token_sort_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
+                                      int32_t* cumsum_buffer, size_t numel) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
@@ -88,7 +85,6 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
       expert_ids[i / block_size] = threadIdx.x;
     }
   }
-
 }
 
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
@@ -105,14 +101,12 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
 
     const int block_threads = 256;
     const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
-    const int max_blocks = 65535; 
+    const int max_blocks = 65535;
     const int actual_blocks = std::min(num_blocks, max_blocks);
-    
+
     auto sort_kernel = moe_token_sort_kernel<scalar_t>;
-    sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
-        topk_ids.data_ptr<scalar_t>(),
-        sorted_token_ids.data_ptr<int32_t>(),
-        cumsum_buffer.data_ptr<int32_t>(),
-        topk_ids.numel());
+    sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(topk_ids.data_ptr<scalar_t>(),
+                                                             sorted_token_ids.data_ptr<int32_t>(),
+                                                             cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel());
   });
 }
