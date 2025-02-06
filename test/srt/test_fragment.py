@@ -50,9 +50,10 @@ ALL_OTHER_MODELS = [
 
 
 class TestFragment(unittest.TestCase):
-    def assert_fragment_e2e_execution(self, index: int, model_path: str):
+    def setUpClass(cls):
         multiprocessing.set_start_method("spawn")
 
+    def assert_fragment_e2e_execution(self, index: int, model_path: str):
         # different port for maximum isolation
         nccl_port = 12345 + index
         master_port = 23456 + index
