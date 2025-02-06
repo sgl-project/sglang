@@ -115,6 +115,7 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             mem_fraction_static=0.4,
             tp_size=_TP_SIZE,
             random_seed=42,
+            trust_remote_code=True,
             # fragment args
             tp_rank=tp_rank,
             gpu_id=tp_rank,
@@ -133,7 +134,7 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
             hf_model.to(torch.bfloat16)
         hf_model.cuda()
-        hf_tokenizer = get_tokenizer(model_path)
+        hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
 
         hf_outputs = HFRunner.forward_generation_raw(
             prompts=_PROMPTS,
