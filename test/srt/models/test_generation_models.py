@@ -143,7 +143,7 @@ def check_close_model_outputs(
     prefill_tolerance: float,
     decode_tolerance: float,
     rouge_l_tolerance: float,
-    debug_text: str,
+    debug_text: str = '',
 ):
     for i in range(len(hf_outputs.output_strs)):
         # Compare input logprobs

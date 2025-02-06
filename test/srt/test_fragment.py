@@ -11,6 +11,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from test.srt.models.test_generation_models import check_close_model_outputs
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -120,7 +121,13 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             engine=fragment,
         )
 
-        TODO_assertion
+        check_close_model_outputs(
+            hf_outputs=hf_outputs,
+            srt_outputs=srt_outputs,
+            prefill_tolerance=5e-2,
+            decode_tolerance=5e-2,
+            rouge_l_tolerance=1,
+        )
 
         execution_ok = False
 
