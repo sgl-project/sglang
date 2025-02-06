@@ -109,26 +109,6 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
 
-        fragment = EngineFragment(
-            model_path=model_path,
-            load_format='dummy' if _ENABLE_UPDATE_WEIGHTS else 'auto',
-            mem_fraction_static=0.4,
-            tp_size=_TP_SIZE,
-            random_seed=42,
-            trust_remote_code=True,
-            # fragment args
-            tp_rank=tp_rank,
-            gpu_id=tp_rank,
-            nccl_port=nccl_port,
-            parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
-                device_mesh_device=inference_device_mesh_device,
-                device_mesh_cpu=inference_device_mesh_cpu,
-                dim_tp="tp",
-                dim_pp="pp",
-            ),
-        )
-        print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
-
         # hf model is used for comparison
         with torch.device("cuda"):
             hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
@@ -149,6 +129,29 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
         if _ENABLE_UPDATE_WEIGHTS:
             # test update weights
             fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
+            del hf_model
+
+        fragment = EngineFragment(
+            model_path=model_path,
+            load_format='dummy' if _ENABLE_UPDATE_WEIGHTS else 'auto',
+            mem_fraction_static=0.4,
+            tp_size=_TP_SIZE,
+            random_seed=42,
+            trust_remote_code=True,
+            # fragment args
+            tp_rank=tp_rank,
+            gpu_id=tp_rank,
+            nccl_port=nccl_port,
+            parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
+                device_mesh_device=inference_device_mesh_device,
+                device_mesh_cpu=inference_device_mesh_cpu,
+                dim_tp="tp",
+                dim_pp="pp",
+            ),
+        )
+        print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
+
+        if _ENABLE_UPDATE_WEIGHTS:
             print(
                 f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
                 flush=True,
