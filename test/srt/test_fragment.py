@@ -34,20 +34,20 @@ _ENABLE_UPDATE_WEIGHTS = True
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
 CI_MODELS = [
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "google/gemma-2-2b",
+    dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
+    dict(model_path="google/gemma-2-2b"),
 ]
 ALL_OTHER_MODELS = [
-    "meta-llama/Llama-3.2-1B-Instruct",
-    "Qwen/Qwen2-1.5B",
-    # "Qwen/Qwen2.5-14B-Instruct", # CUDA OOM for this script, so temporarily test others first
-    # "HuggingFaceTB/SmolLM-135M-Instruct", # total_num_heads % tp_size nonzero, test it later
-    "allenai/OLMo-1B-0724-hf",
-    "THUDM/glm-4-9b-chat",
-    "openai-community/gpt2",
-    "microsoft/Phi-3-small-8k-instruct",
-    "allenai/OLMo-2-1124-7B-Instruct",
-    "ibm-granite/granite-3.0-2b-instruct",
+    dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
+    dict(model_path="Qwen/Qwen2-1.5B"),
+    dict(model_path="Qwen/Qwen2.5-14B-Instruct"),
+    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct"),
+    dict(model_path="allenai/OLMo-1B-0724-hf"),
+    dict(model_path="THUDM/glm-4-9b-chat"),
+    dict(model_path="openai-community/gpt2"),
+    dict(model_path="microsoft/Phi-3-small-8k-instruct"),
+    dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
+    dict(model_path="ibm-granite/granite-3.0-2b-instruct"),
 ]
 
 
@@ -80,15 +80,15 @@ class TestFragment(unittest.TestCase):
             p.join()
 
     def test_ci_models(self):
-        for index, model_path in enumerate(CI_MODELS):
-            self.assert_fragment_e2e_execution(index=index, model_path=model_path)
+        for index, model_info in enumerate(CI_MODELS):
+            self.assert_fragment_e2e_execution(index=index, **model_info)
 
     def test_others(self):
         if is_in_ci():
             return
 
-        for index, model_path in enumerate(ALL_OTHER_MODELS):
-            self.assert_fragment_e2e_execution(index=index, model_path=model_path)
+        for index, model_info in enumerate(ALL_OTHER_MODELS):
+            self.assert_fragment_e2e_execution(index=index, **model_info)
 
     # def test_adhoc(self):
     #     self.assert_fragment_e2e_execution(index=0, model_path="meta-llama/Llama-3.2-1B-Instruct")
