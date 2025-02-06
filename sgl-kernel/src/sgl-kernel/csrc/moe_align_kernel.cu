@@ -13,41 +13,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Adapted from https://github.com/vllm-project/vllm/blob/v0.6.5/csrc/moe/moe_align_sum_kernels.cu
-
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
-
 #include <THC/THCAtomics.cuh>
 
+#include "utils.h"
+
 #define WARP_SIZE 32
-
-#define DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
-  cudaFuncSetAttribute(FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize, VAL)
-
-#define CEILDIV(x, y) (((x) + (y)-1) / (y))
-
-#define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
-  AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
-  AT_DISPATCH_CASE(at::ScalarType::Char, __VA_ARGS__)  \
-  AT_DISPATCH_CASE(at::ScalarType::Short, __VA_ARGS__) \
-  AT_DISPATCH_CASE(at::ScalarType::Int, __VA_ARGS__)   \
-  AT_DISPATCH_CASE(at::ScalarType::Long, __VA_ARGS__)
-
-#define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
-  AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
-
-__device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t col) {
-  return row * total_col + col;
-}
 
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
                                             int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
                                             int32_t block_size, size_t numel, int32_t* cumsum) {
-  __shared__ int32_t shared_counts[32][8];
+  __shared__ int32_t shared_counts[WARP_SIZE][8];
   __shared__ int32_t local_offsets[256];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
@@ -96,6 +76,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
 
   __syncthreads();
 
+  // Note: For the moe_align_kernel, the primary bottleneck lies in the atomic add and non-coalesced memory writes here. If these operations can be performed using multiple blocks, similar to the Triton version, the performance of this kernel can achieve state-of-the-art performance across all token cases. However, once multiple blocks are used, illegal memory access occurs. Even replacing these lines of code with the stage 4 kernel from the Triton version results in the same issue, and a correct solution has not yet been found.
   for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
     int32_t expert_id = topk_ids[i];
     int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
@@ -107,9 +88,11 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
                           torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
                           torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK(num_experts == 256, "moe_align_block_size kernel only support deepseek v3 now.");
+
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-    auto kernel = moe_align_block_size_kernel<scalar_t>;
-    kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+    auto align_kernel = moe_align_block_size_kernel<scalar_t>;
+    align_kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                    experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
                                    num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
   });
