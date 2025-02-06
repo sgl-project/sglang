@@ -459,6 +459,17 @@ def check_close_model_outputs(
     rouge_l_tolerance: float,
     debug_text: str = '',
 ):
+    # Compare output strings
+    print(f"{hf_outputs.output_strs=}")
+    print(f"{srt_outputs.output_strs=}")
+    rouge_l_scores = calculate_rouge_l(
+        hf_outputs.output_strs, srt_outputs.output_strs
+    )
+    print(f"{rouge_l_scores=}")
+    assert all(
+        score >= rouge_l_tolerance for score in rouge_l_scores
+    ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
+
     for i in range(len(hf_outputs.output_strs)):
         # Compare input logprobs
         hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
@@ -487,14 +498,3 @@ def check_close_model_outputs(
                 f"decode_tolerance={decode_tolerance}."
                 f"{hf_logprobs=}, {srt_logprobs=}"
             )
-
-    # Compare output strings
-    print(f"{hf_outputs.output_strs=}")
-    print(f"{srt_outputs.output_strs=}")
-    rouge_l_scores = calculate_rouge_l(
-        hf_outputs.output_strs, srt_outputs.output_strs
-    )
-    print(f"{rouge_l_scores=}")
-    assert all(
-        score >= rouge_l_tolerance for score in rouge_l_scores
-    ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
