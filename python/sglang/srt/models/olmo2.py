@@ -19,6 +19,9 @@ from functools import partial
 from typing import Iterable, Optional, Tuple
 
 import torch
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -43,8 +46,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
-from torch import nn
-from transformers import PretrainedConfig
 
 
 class Olmo2Attention(nn.Module):
@@ -107,7 +108,7 @@ class Olmo2Attention(nn.Module):
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
         )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
