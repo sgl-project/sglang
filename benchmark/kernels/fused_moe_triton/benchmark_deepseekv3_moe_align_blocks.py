@@ -310,4 +310,4 @@ if __name__ == "__main__":
 
     calculate_diff(batch_size=4, seq_len=1024)
 
-    benchmark.run(print_data=True, save_path=args.save_path)
+    benchmark.run(print_data=True)
