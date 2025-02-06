@@ -27,6 +27,10 @@ _TP_SIZE = 2
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
 
+# Set to false to temporarily debug issues unrelated to weight update
+# _ENABLE_UPDATE_WEIGHTS = True
+_ENABLE_UPDATE_WEIGHTS = False
+
 # TODO maybe we should add more other models?
 CI_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
@@ -104,7 +108,7 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
 
         fragment = EngineFragment(
             model_path=model_path,
-            load_format='dummy',
+            load_format='dummy' if _ENABLE_UPDATE_WEIGHTS else 'auto',
             mem_fraction_static=0.4,
             tp_size=_TP_SIZE,
             random_seed=42,
@@ -138,15 +142,16 @@ def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_write
             output_str_only=False,
         )
 
-        # test update weights
-        fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
-        print(
-            f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
-            flush=True,
-        )
-        fragment.update_weights_from_tensor(
-            [(k, v) for k, v in fsdp_state_dict.items()]
-        )
+        if _ENABLE_UPDATE_WEIGHTS:
+            # test update weights
+            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model)
+            print(
+                f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
+                flush=True,
+            )
+            fragment.update_weights_from_tensor(
+                [(k, v) for k, v in fsdp_state_dict.items()]
+            )
 
         srt_outputs = SRTRunner.forward_generation_raw(
             prompts=_PROMPTS,
