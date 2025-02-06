@@ -151,8 +151,9 @@ def _run_subprocess(
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
         # hf model is used for comparison
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, device_map='cpu')
-        hf_model.to(torch.bfloat16)
+        with torch.device("cuda"):
+            hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+            hf_model.to(torch.bfloat16)
         hf_model.cuda()
         hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
 
