@@ -199,24 +199,31 @@ def _run_subprocess(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
 
-        srt_outputs = SRTRunner.forward_generation_raw(
-            prompts=_PROMPTS,
-            max_new_tokens=_MAX_NEW_TOKENS,
-            lora_paths=None,
-            engine=fragment,
-        )
-        print(
-            f"subprocess[{tp_rank=}] call srt.forward {srt_outputs=}",
-            flush=True,
-        )
+        for enable_batch in [False, True]:
+            if enable_batch:
+                fn = SRTRunner.batch_forward_generation_raw
+            else:
+                fn = SRTRunner.forward_generation_raw
 
-        check_close_model_outputs(
-            hf_outputs=hf_outputs,
-            srt_outputs=srt_outputs,
-            prefill_tolerance=prefill_tolerance,
-            decode_tolerance=decode_tolerance,
-            rouge_l_tolerance=1,
-        )
+            srt_outputs = fn(
+                prompts=_PROMPTS,
+                max_new_tokens=_MAX_NEW_TOKENS,
+                lora_paths=None,
+                engine=fragment,
+            )
+            print(
+                f"subprocess[{tp_rank=}] call srt.forward {enable_batch=} {srt_outputs=}",
+                flush=True,
+            )
+
+            check_close_model_outputs(
+                hf_outputs=hf_outputs,
+                srt_outputs=srt_outputs,
+                prefill_tolerance=prefill_tolerance,
+                decode_tolerance=decode_tolerance,
+                rouge_l_tolerance=1,
+                debug_text=f'{enable_batch=} {tp_rank=}',
+            )
 
         execution_ok = True
 
