@@ -24,7 +24,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      
+
       - name: Setup docker
         run: |
           # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
@@ -48,7 +48,7 @@ jobs:
 
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
           docker exec -w /human-eval ci_sglang pip install -e .
-      
+
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
