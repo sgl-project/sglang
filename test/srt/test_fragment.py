@@ -7,6 +7,7 @@ from multiprocessing import Process
 
 import torch
 from sglang.srt.distributed import ParallelProcessGroups
+from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.test.runners import HFRunner
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -89,12 +90,13 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
             hf_model.to(torch.bfloat16)
         hf_model.cuda()
+        hf_tokenizer = get_tokenizer(model_path)
 
         hf_outputs = HFRunner.forward_generation_raw(
             prompts=prompts,
             max_new_tokens=_MAX_NEW_TOKENS,
             base_model=hf_model,
-            tokenizer=TODO,
+            tokenizer=hf_tokenizer,
             lora_paths=None,
             torch_dtype=torch.float16,
             output_str_only=False,
