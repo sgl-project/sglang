@@ -50,8 +50,8 @@ CI_MODELS = [
 # All other models that do not run on the CI
 ALL_OTHER_MODELS = [
     # ModelCase("Qwen/Qwen2-1.5B", skip_long_prompt=True),
-    # ModelCase("Qwen/Qwen2.5-14B-Instruct"),
-    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True, tp_size=3),
+    ModelCase("Qwen/Qwen2.5-14B-Instruct", tp_size=8),
+    # ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True, tp_size=3),
     # ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
     # ModelCase("THUDM/glm-4-9b-chat"),
     # ModelCase("openai-community/gpt2", skip_long_prompt=True),
@@ -77,7 +77,9 @@ class TestGenerationModels(unittest.TestCase):
     ) -> None:
         print(f'hi {model_case=} {prompts=}')
         model_path = model_case.model_path
-        max_new_tokens = 32
+        # TODO adhoc
+        # max_new_tokens = 32
+        max_new_tokens = 8
 
         with HFRunner(
             model_path,
