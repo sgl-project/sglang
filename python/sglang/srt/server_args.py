@@ -127,6 +127,7 @@ class ServerArgs:
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
+    lora_backend: str = "triton"
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -286,6 +287,10 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
+
+        # AMD-specific Triton attention KV splits default number
+        if is_hip():
+            self.triton_attention_num_kv_splits = 16
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -701,13 +706,19 @@ class ServerArgs:
             nargs="*",
             default=None,
             action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}.",
         )
         parser.add_argument(
             "--max-loras-per-batch",
             type=int,
             default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
+            help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--lora-backend",
+            type=str,
+            default="triton",
+            help="Choose the kernel backend for multi-LoRA serving.",
         )
 
         # Kernel backend

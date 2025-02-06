@@ -46,11 +46,9 @@ def _fwd_kernel(
     O_Extend,
     K_Buffer,
     V_Buffer,
-    Req_to_tokens,
-    B_req_idx,
-    B_Seq_Len,
-    B_Start_Loc_Extend,
-    B_Seq_Len_Extend,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -65,7 +63,6 @@ def _fwd_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    stride_req_to_tokens_b,
     logit_cap: tl.constexpr,
     Lq: tl.constexpr,
     Lv: tl.constexpr,
@@ -80,13 +77,10 @@ def _fwd_kernel(
     cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
 
-    cur_seq_len = tl.load(B_Seq_Len + cur_seq)
-    cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq)
-    cur_seq_len_prefix = cur_seq_len - cur_seq_len_extend
-
-    cur_seq_prefix_start_in_loc = 0
-    cur_seq_extend_start_contiguous = tl.load(B_Start_Loc_Extend + cur_seq)
-    cur_batch_req_idx = tl.load(B_req_idx + cur_seq)
+    cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
+    cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
+    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -97,7 +91,7 @@ def _fwd_kernel(
     mask_dv = offs_dv < Lv
 
     offs_q = (
-        (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
+        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_qbs
         + cur_head * stride_qh
         + offs_d[None, :]
@@ -109,7 +103,7 @@ def _fwd_kernel(
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         offs_qpe = (
-            (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
+            (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
             * stride_qbs
             + cur_head * stride_qh
             + offs_dpe[None, :]
@@ -126,10 +120,9 @@ def _fwd_kernel(
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
-        offs_b_loc_prefix = cur_batch_req_idx * stride_req_to_tokens_b + (
-            cur_seq_prefix_start_in_loc + start_n + offs_n
+        offs_kv_loc = tl.load(
+            kv_indices + cur_seq_kv_start_idx + start_n + offs_n, mask=mask_n, other=0
         )
-        offs_kv_loc = tl.load(Req_to_tokens + offs_b_loc_prefix, mask=mask_n, other=0)
 
         # load k in transposed way
         offs_buf_k = (
@@ -188,7 +181,7 @@ def _fwd_kernel(
 
         # load k in transposed way
         offs_k = (
-            (cur_seq_extend_start_contiguous + start_n + offs_n[None, :]) * stride_kbs
+            (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
             + cur_kv_head * stride_kh
             + offs_d[:, None]
         )
@@ -199,8 +192,7 @@ def _fwd_kernel(
         qk = tl.dot(q, k, out_dtype=tl.float32)
         if BLOCK_DPE > 0:
             offs_kpe = (
-                (cur_seq_extend_start_contiguous + start_n + offs_n[None, :])
-                * stride_kbs
+                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
                 + cur_kv_head * stride_kh
                 + offs_dpe[:, None]
             )
@@ -228,7 +220,7 @@ def _fwd_kernel(
         deno = deno * re_scale + tl.sum(p, 1)
 
         offs_v = (
-            (cur_seq_extend_start_contiguous + start_n + offs_n[:, None]) * stride_vbs
+            (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
             + cur_kv_head * stride_vh
             + offs_dv[None, :]
         )
@@ -241,7 +233,7 @@ def _fwd_kernel(
         e_max = n_e_max
 
     offs_o = (
-        (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
+        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_obs
         + cur_head * stride_oh
         + offs_dv[None, :]
@@ -258,11 +250,9 @@ def extend_attention_fwd(
     o_extend,
     k_buffer,
     v_buffer,
-    req_to_tokens,
-    b_req_idx,
-    b_seq_len,
-    b_seq_len_extend,
-    b_start_loc_extend,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
     max_len_extend,
     sm_scale=None,
     logit_cap=0.0,
@@ -315,7 +305,7 @@ def extend_attention_fwd(
         num_warps = 4 if Lk <= 64 else 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
-    batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
+    batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
@@ -332,11 +322,9 @@ def extend_attention_fwd(
         o_extend,
         k_buffer,
         v_buffer,
-        req_to_tokens,
-        b_req_idx,
-        b_seq_len,
-        b_start_loc_extend,
-        b_seq_len_extend,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
         sm_scale,
         kv_group_num,
         q_extend.stride(0),
@@ -351,7 +339,6 @@ def extend_attention_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
-        req_to_tokens.stride(0),
         logit_cap=logit_cap,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
