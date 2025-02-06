@@ -43,21 +43,21 @@ class ModelCase:
 
 # Popular models that run on the CI
 CI_MODELS = [
-    # ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
-    # ModelCase("google/gemma-2-2b"),
+    ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
+    ModelCase("google/gemma-2-2b"),
 ]
 
 # All other models that do not run on the CI
 ALL_OTHER_MODELS = [
-    # ModelCase("Qwen/Qwen2-1.5B", skip_long_prompt=True),
-    # ModelCase("Qwen/Qwen2.5-14B-Instruct"),
-    # ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
-    # ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
-    # ModelCase("THUDM/glm-4-9b-chat"),
-    # ModelCase("openai-community/gpt2", skip_long_prompt=True),
+    ModelCase("Qwen/Qwen2-1.5B", skip_long_prompt=True),
+    ModelCase("Qwen/Qwen2.5-14B-Instruct"),
+    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
+    ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
+    ModelCase("THUDM/glm-4-9b-chat"),
+    ModelCase("openai-community/gpt2", skip_long_prompt=True),
     ModelCase("microsoft/Phi-3-small-8k-instruct", skip_long_prompt=True),
-    # ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
-    # ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
+    ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
+    ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
 ]
 
 TORCH_DTYPES = [torch.float16]
