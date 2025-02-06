@@ -75,7 +75,7 @@ class TestGenerationModels(unittest.TestCase):
         model_case: ModelCase,
         torch_dtype: torch.dtype,
     ) -> None:
-        print(f'hi {model_case=}')
+        print(f'hi {model_case=} {prompts=}')
         model_path = model_case.model_path
         max_new_tokens = 32
 

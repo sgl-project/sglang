@@ -12,6 +12,7 @@ from sglang.srt.server.engine_fragment import EngineFragment
 from sglang.srt.server_args import find_available_port
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.runners import check_close_model_outputs
+from sglang.test.runners import get_dtype_str
 from sglang.test.test_utils import is_in_ci
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
@@ -27,7 +28,6 @@ from transformers import AutoModelForCausalLM
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
 _TORCH_DTYPE = torch.float16
-_TORCH_DTYPE_STR = 'float16'
 
 # Set to false to temporarily debug issues unrelated to weight update
 _ENABLE_UPDATE_WEIGHTS = True
@@ -151,7 +151,7 @@ def _run_subprocess(
             tp_size=tp_size,
             random_seed=42,
             trust_remote_code=True,
-            torch_dtype=_TORCH_DTYPE_STR,
+            dtype=get_dtype_str(_TORCH_DTYPE),
             # fragment args
             tp_rank=tp_rank,
             gpu_id=tp_rank,
