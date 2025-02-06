@@ -29,10 +29,12 @@ _PROMPTS = ["Today is a sunny day and I like", "I have a very good idea on"]
 
 
 class TestFragment(unittest.TestCase):
-    def assert_fragment_e2e_execution(self, model_path: str):
+    def assert_fragment_e2e_execution(self, index: int, model_path: str):
         multiprocessing.set_start_method("spawn")
-        nccl_port = 12345
-        master_port = 23456
+
+        # different port for maximum isolation
+        nccl_port = 12345 + index
+        master_port = 23456 + index
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
@@ -51,15 +53,15 @@ class TestFragment(unittest.TestCase):
             p.join()
 
     def test_ci_models(self):
-        for model_case in CI_MODELS:
-            self.assert_fragment_e2e_execution(model_path=model_case.model_path)
+        for index, model_case in enumerate(CI_MODELS):
+            self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
 
     def test_others(self):
         if is_in_ci():
             return
 
-        for model_case in ALL_OTHER_MODELS:
-            self.assert_fragment_e2e_execution(model_path=model_case.model_path)
+        for index, model_case in enumerate(ALL_OTHER_MODELS):
+            self.assert_fragment_e2e_execution(index=index, model_path=model_case.model_path)
 
 
 def _run_subprocess(tp_rank: int, master_port: int, nccl_port: int, output_writer, model_path: str):
