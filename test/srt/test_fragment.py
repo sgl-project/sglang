@@ -26,6 +26,8 @@ from transformers import AutoModelForCausalLM
 
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
+_TORCH_DTYPE = torch.float16
+_TORCH_DTYPE_STR = 'float16'
 
 # Set to false to temporarily debug issues unrelated to weight update
 _ENABLE_UPDATE_WEIGHTS = True
@@ -149,6 +151,7 @@ def _run_subprocess(
             tp_size=tp_size,
             random_seed=42,
             trust_remote_code=True,
+            torch_dtype=_TORCH_DTYPE_STR,
             # fragment args
             tp_rank=tp_rank,
             gpu_id=tp_rank,
@@ -164,7 +167,7 @@ def _run_subprocess(
 
         # hf model is used for comparison
         hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-        hf_model.to(torch.bfloat16)
+        hf_model.to(_TORCH_DTYPE)
         hf_model.cuda()
         hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
 
@@ -174,7 +177,7 @@ def _run_subprocess(
             base_model=hf_model,
             tokenizer=hf_tokenizer,
             lora_paths=None,
-            torch_dtype=torch.float16,
+            torch_dtype=_TORCH_DTYPE,
             output_str_only=False,
         )
         print(
