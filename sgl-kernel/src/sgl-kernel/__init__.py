@@ -3,6 +3,7 @@ from sgl_kernel.ops import (
     bmm_fp8,
     custom_dispose,
     custom_reduce,
+    deepseekv3_fused_gate,
     fp8_scaled_mm,
     fused_add_rmsnorm,
     gelu_and_mul,
@@ -48,4 +49,5 @@ __all__ = [
     "top_k_renorm_prob",
     "top_k_top_p_sampling_from_probs",
     "top_p_renorm_prob",
+    "deepseekv3_fused_gate",
 ]
