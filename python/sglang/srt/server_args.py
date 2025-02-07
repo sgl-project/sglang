@@ -166,6 +166,9 @@ class ServerArgs:
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
 
+    # tensor parallel checkpoint pattern
+    tp_checkpoint_name_pattern: Optional[str] = None
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -908,6 +911,12 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--tp-checkpoint-name-pattern",
+            type=str,
+            default=ServerArgs.tp_checkpoint_name_pattern,
+            help="Specify filename pattern for per-tp checkpoint. E.g. `rank-` for rank-`tp`",
         )
 
     @classmethod

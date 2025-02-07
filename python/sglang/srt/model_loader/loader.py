@@ -294,6 +294,13 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
+        if (
+            get_tensor_model_parallel_world_size() > 1
+            and self.load_config.tp_checkpoint_name_pattern
+        ):
+            ranked = f"{self.load_config.tp_checkpoint_name_pattern}{get_tensor_model_parallel_rank()}"
+            hf_weights_files = [f for f in hf_weights_files if ranked in f]
+
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
