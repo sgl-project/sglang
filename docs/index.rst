@@ -59,8 +59,9 @@ The core features include:
    references/benchmark_and_profiling.md
    references/accuracy_evaluation.md
    references/custom_chat_template.md
+   references/amd_configure.md
    references/deepseek.md
-   references/llama_405B.md
+   references/multi_node.md
    references/modelscope.md
    references/contribution_guide.md
    references/troubleshooting.md

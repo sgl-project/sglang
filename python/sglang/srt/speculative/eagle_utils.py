@@ -177,29 +177,21 @@ class EagleVerifyInput:
         spec_steps: int,
         num_verify_token: int,
     ):
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(score_list, num_verify_token - 1, dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-        draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1)
-        parent_list = torch.cat(parents_list[:-1], dim=1)
-        tree_mask, position, retrive_index, retrive_cum_len = build_tree_kernel(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            seq_lens_sum,
-            topk,
-            spec_steps,
-            num_verify_token,
+        tree_mask, position, retrive_index, retrive_cum_len, draft_tokens = (
+            build_tree_kernel(
+                verified_id,
+                score_list,
+                token_list,
+                parents_list,
+                seq_lens,
+                seq_lens_sum,
+                topk,
+                spec_steps,
+                num_verify_token,
+            )
         )
         return cls(
-            draft_tokens.flatten(),
+            draft_tokens,
             tree_mask,
             position,
             retrive_index,
@@ -258,39 +250,77 @@ class EagleVerifyInput:
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
-        predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-        predict = torch.cat(
-            [predict, torch.full([1], -1, dtype=torch.long, device="cuda")], dim=-1
-        )
         draft_token = torch.cat(
-            [self.draft_token, torch.full([1], -1, dtype=torch.long, device="cuda")],
+            [self.draft_token, torch.full([1], -1, dtype=torch.int32, device="cuda")],
             dim=-1,
         )
-        target_predict = predict[self.retrive_index]
         candidates = draft_token[self.retrive_index]
-        # logits = logits_output.next_token_logits[self.retrive_index]
-        # target_predict = torch.argmax(logits[:, :-1], dim=-1)
-        accept_mask = candidates[:, 1:] == target_predict[:, :-1]
-        accept_mask = (torch.cumprod(accept_mask, dim=1)).sum(dim=1)
-        bs = self.retrive_cum_len.numel() - 1
+        if batch.sampling_info.is_all_greedy:
+            # temp == 0
+            bs = self.retrive_cum_len.numel() - 1
+            predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+            predict = torch.cat(
+                [predict, torch.full([1], -1, dtype=torch.int32, device="cuda")], dim=-1
+            )
+            target_predict = predict[self.retrive_index]
+            # logits = logits_output.next_token_logits[self.retrive_index]
+            # target_predict = torch.argmax(logits[:, :-1], dim=-1)
+            accept_mask = candidates[:, 1:] == target_predict[:, :-1]
 
-        max_draft_len = self.retrive_index.shape[-1]
-        accept_index = torch.full(
-            (bs, max_draft_len), -1, dtype=torch.long, device="cuda"
-        )
-        accept_length = torch.empty((bs,), dtype=torch.int, device="cuda")
-        extract_index = torch.full((bs * 2,), 0, dtype=torch.int, device="cuda")
-        eagle_verify_retrive[(bs,)](
-            self.retrive_index.contiguous(),
-            accept_mask.contiguous(),
-            self.retrive_cum_len,
-            accept_index,
-            accept_length,
-            extract_index,
-            max_draft_len,
-            self.draft_token_num,
-            triton.next_power_of_2(max_draft_len),
-        )
+            accept_mask = (torch.cumprod(accept_mask, dim=1)).sum(dim=1)
+            max_draft_len = self.retrive_index.shape[-1]
+            accept_index = torch.full(
+                (bs, max_draft_len), -1, dtype=torch.int32, device="cuda"
+            )
+            accept_length = torch.empty((bs,), dtype=torch.int, device="cuda")
+            extract_index = torch.full((bs * 2,), 0, dtype=torch.int, device="cuda")
+            eagle_verify_retrive[(bs,)](
+                self.retrive_index.contiguous(),
+                accept_mask.contiguous(),
+                self.retrive_cum_len,
+                accept_index,
+                accept_length,
+                extract_index,
+                max_draft_len,
+                self.draft_token_num,
+                triton.next_power_of_2(max_draft_len),
+            )
+        else:
+            # temp > 0
+            bs = self.retrive_index.shape[0]
+            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+            predict_shape[-1] += 1
+            target_logits = logits_output.next_token_logits[self.retrive_index]
+            predict = torch.full(predict_shape, -1, dtype=torch.int32, device="cuda")
+            accept_index = torch.full(
+                (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+            )
+            accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+            expanded_temperature = batch.sampling_info.temperatures.unsqueeze(1)
+            target_probs = F.softmax(target_logits / expanded_temperature, dim=-1)
+            draft_probs = torch.full_like(
+                target_probs, 0, dtype=torch.float32, device="cuda"
+            )
+            coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
+            tree_speculative_sampling_target_only(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_length,  # mutable
+                candidates=candidates.to(torch.int32),
+                retrive_index=self.retrive_index.to(torch.int32),
+                retrive_next_token=self.retrive_next_token.to(torch.int32),
+                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
+                uniform_samples=coins,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=global_server_args_dict[
+                    "speculative_accept_threshold_single"
+                ],
+                threshold_acc=global_server_args_dict[
+                    "speculative_accept_threshold_acc"
+                ],
+                deterministic=True,
+            )
 
         new_accept_index = []
         unfinished_index = []
