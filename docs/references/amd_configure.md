@@ -20,7 +20,7 @@ Below are a few key settings to confirm or enable:
 ### Update GRUB Settings
 
 In `/etc/default/grub`, append the following to `GRUB_CMDLINE_LINUX`:
-   
+
 ```text
 pci=realloc=off iommu=pt
 ```
@@ -32,7 +32,7 @@ Afterward, run `sudo update-grub` (or your distro’s equivalent) and reboot.
 ```bash
 sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
 ```
-  
+
 You can automate or verify this change using [this helpful script](https://github.com/ROCm/triton/blob/rocm_env/scripts/amd/env_check.sh).
 
 Again, please go through the entire documentation to confirm your system is using the recommended configuration.
