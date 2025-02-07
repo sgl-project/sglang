@@ -1,8 +1,9 @@
-from .base_backend import BaseLoraBackend
-from .flashinfer_backend import FlashInferLoraBackend
-from .triton_backend import TritonLoraBackend
+from .base_backend import BaseLoRABackend
+from .flashinfer_backend import FlashInferLoRABackend
+from .triton_backend import TritonLoRABackend
 
 __all__ = [
-    "FlashInferLoraBackend",
-    "TritonLoraBackend",
+    "BaseLoRABackend",
+    "FlashInferLoRABackend",
+    "TritonLoRABackend",
 ]

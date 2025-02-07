@@ -2,17 +2,17 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.lora.backend import BaseLoraBackend
-from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.lora import LoRABatchInfo
 from sglang.srt.utils import is_flashinfer_available
 
 if is_flashinfer_available():
     from flashinfer import SegmentGEMMWrapper
 
 
-class FlashInferLoraBackend(BaseLoraBackend):
+class FlashInferLoRABackend(BaseLoRABackend):
 
-    def __init__(self, name: str, batch_info: LoraBatchInfo = None):
+    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         super().__init__(name, batch_info)
 
         # Set up SGemm Wrapper from flashinfer

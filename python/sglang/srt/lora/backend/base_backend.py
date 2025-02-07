@@ -2,7 +2,7 @@ from typing import Tuple, Union
 
 import torch
 
-from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.lora.lora import LoRABatchInfo
 
 
 def get_fuse_output_scaling_add_from_name(name: str) -> bool:
@@ -21,7 +21,7 @@ def get_fuse_qkv_lora_b_from_name(name: str) -> bool:
     return mapping.get(name, False)
 
 
-class BaseLoraBackend:
+class BaseLoRABackend:
     """Base class for different Lora backends.
        Each backend has its own implementation of Lora kernels.
 
@@ -32,7 +32,7 @@ class BaseLoraBackend:
                                  and the operation of scaling and adding will be fused into kernel
     """
 
-    def __init__(self, name: str, batch_info: LoraBatchInfo = None):
+    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         self.name = name
         self.batch_info = batch_info
         self.fuse_output_scaling_add = get_fuse_output_scaling_add_from_name(name)
@@ -91,5 +91,5 @@ class BaseLoraBackend:
         """
         pass
 
-    def set_batch_info(self, batch_info: LoraBatchInfo):
+    def set_batch_info(self, batch_info: LoRABatchInfo):
         self.batch_info = batch_info

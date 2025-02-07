@@ -1,7 +1,7 @@
 import torch
 
-from sglang.srt.lora.backend import BaseLoraBackend
-from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.lora import LoRABatchInfo
 from sglang.srt.lora.triton_ops import (
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
@@ -9,9 +9,9 @@ from sglang.srt.lora.triton_ops import (
 )
 
 
-class TritonLoraBackend(BaseLoraBackend):
+class TritonLoRABackend(BaseLoRABackend):
 
-    def __init__(self, name: str, batch_info: LoraBatchInfo = None):
+    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         super().__init__(name, batch_info)
 
     def run_lora_a_sgemm(

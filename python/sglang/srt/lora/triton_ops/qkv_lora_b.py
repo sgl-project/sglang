@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.lora.lora import LoRABatchInfo
 
 
 @triton.jit
@@ -108,7 +108,7 @@ def _qkv_lora_b_kernel(
 def qkv_lora_b_fwd(
     x: torch.Tensor,
     qkv_lora_b: torch.Tensor,
-    batch_info: LoraBatchInfo,
+    batch_info: LoRABatchInfo,
     output_offset: torch.Tensor,
     max_qkv_out_dim: int,
     base_output: torch.Tensor = None,
