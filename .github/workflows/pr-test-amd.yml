@@ -38,7 +38,7 @@ jobs:
           docker pull lmsysorg/sglang:v0.4.2.post2-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
-            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.HF_TOKEN }} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
             lmsysorg/sglang:v0.4.2.post2-rocm630
 
@@ -51,15 +51,15 @@ jobs:
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
           docker exec -w /human-eval ci_sglang pip install -e .
 
-      - name: Evaluate Accuracy
-        timeout-minutes: 20
-        run: |
-          docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_eval_accuracy_large.py
-
       - name: MLA TEST
         timeout-minutes: 20
         run: |
           docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_mla.py
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_eval_accuracy_large.py
 
   finish:
     needs: [
