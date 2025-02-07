@@ -967,6 +967,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.return_hidden_states,
         )
         new_batch.prepare_for_extend()
 
@@ -1130,6 +1131,11 @@ class Scheduler:
                         logits_output.input_token_logprobs.tolist()
                     )
 
+            if logits_output.hidden_states is not None:
+                logits_output.hidden_states = logits_output.hidden_states.cpu()
+                offset = 0
+                # Cuts up the hidden states for each request
+                logits_output.hidden_states = [logits_output.hidden_states[offset: (offset := offset + len(req.origin_input_ids))] for req in batch.reqs]
             # Check finish conditions
             logprob_pt = 0
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -1155,6 +1161,9 @@ class Scheduler:
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
+
+                    if logits_output.hidden_states is not None:
+                        req.hidden_states.append(logits_output.hidden_states[i])
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
@@ -1219,6 +1228,8 @@ class Scheduler:
 
         self.token_to_kv_pool.free_group_begin()
 
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states.cpu()
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
@@ -1248,6 +1259,9 @@ class Scheduler:
                     req.output_top_logprobs_idx.append(
                         logits_output.next_token_top_logprobs_idx[i]
                     )
+            
+            if logits_output.hidden_states is not None:
+                req.hidden_states.append(logits_output.hidden_states[i])
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
@@ -1371,6 +1385,7 @@ class Scheduler:
             prompt_tokens = []
             completion_tokens = []
             cached_tokens = []
+            hidden_states = []
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1433,6 +1448,8 @@ class Scheduler:
                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
+                    
+                    hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
             if rids:
@@ -1459,6 +1476,7 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
+                        hidden_states,
                     )
                 )
         else:  # embedding or reward model
@@ -1522,6 +1540,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.return_hidden_states,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
