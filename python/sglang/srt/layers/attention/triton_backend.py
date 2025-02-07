@@ -91,7 +91,7 @@ class TritonAttnBackend(AttentionBackend):
 
             qo_indptr = None
             custom_mask = None
-            mask_offsets = None
+            mask_indptr = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
@@ -116,7 +116,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
-            mask_offsets = None
+            mask_indptr = None
 
             attn_logits = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
@@ -128,7 +128,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices,
             qo_indptr,
             custom_mask,
-            mask_offsets,
+            mask_indptr,
         )
 
     def init_cuda_graph_state(self, max_bs: int):
@@ -244,7 +244,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices,
             qo_indptr,
             custom_mask,
-            mask_offsets,
+            mask_indptr,
         ) = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -257,7 +257,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr,
             kv_indices,
             custom_mask,
-            mask_offsets,
+            mask_indptr,
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
