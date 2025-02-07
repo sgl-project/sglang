@@ -5,7 +5,7 @@ import asyncio
 
 def main():
     MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    llm = sgl.Engine(model_path=MODEL_NAME, skip_tokenizer_init=True, disable_cuda_graph=False)
+    llm = sgl.Engine(model_path=MODEL_NAME, skip_tokenizer_init=True, disable_cuda_graph=False, return_hidden_states=True)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     prompts = [
@@ -25,7 +25,8 @@ def main():
         print(output)
         print()
         print(input_id, output['token_ids'], len(input_id), len(output['token_ids']))
-        print([i.shape for i in output['meta_info']['hidden_states']], len(output['meta_info']['hidden_states']))
+        if 'hidden_states' in output['meta_info']:
+            print([i.shape for i in output['meta_info']['hidden_states']], len(output['meta_info']['hidden_states']))
         #print(f"Prompt: {prompt}\nGenerated text: {output['text']}")
 
 if __name__ == "__main__":
