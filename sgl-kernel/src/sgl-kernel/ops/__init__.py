@@ -496,6 +496,7 @@ def min_p_sampling_from_probs(
         probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
     )
 
+
 def tree_speculative_sampling_target_only(
     predicts: torch.Tensor,  # mutable
     accept_index: torch.Tensor,  # mutable

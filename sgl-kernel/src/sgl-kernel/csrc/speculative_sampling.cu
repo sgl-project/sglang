@@ -29,12 +29,12 @@ using namespace flashinfer;
 // retrive_next_sibling: [bs, num_draft_tokens]
 // uniform_samples: [bs, num_draft_tokens]
 // target_probs: [bs, num_draft_tokens, vocab_size]
-void tree_speculative_sampling_target_only(
-    at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num, // mutable
-    at::Tensor candidates, at::Tensor retrive_index, at::Tensor retrive_next_token, at::Tensor retrive_next_sibling,
-    at::Tensor uniform_samples, at::Tensor target_probs, at::Tensor draft_probs,
-    bool deterministic, int64_t cuda_stream = 0
-) {
+void tree_speculative_sampling_target_only(at::Tensor predicts, at::Tensor accept_index,
+                                           at::Tensor accept_token_num,  // mutable
+                                           at::Tensor candidates, at::Tensor retrive_index,
+                                           at::Tensor retrive_next_token, at::Tensor retrive_next_sibling,
+                                           at::Tensor uniform_samples, at::Tensor target_probs, at::Tensor draft_probs,
+                                           bool deterministic, int64_t cuda_stream = 0) {
   CHECK_INPUT(candidates);
   CHECK_INPUT(retrive_index);
   CHECK_INPUT(retrive_next_token);
@@ -93,7 +93,7 @@ void tree_speculative_sampling_target_only(
   if (retrive_next_token.scalar_type() != at::kInt) {
     throw std::runtime_error("Expected 'retrive_next_token' to be of type int (torch.int32).");
   }
-   if (retrive_next_sibling.scalar_type() != at::kInt) {
+  if (retrive_next_sibling.scalar_type() != at::kInt) {
     throw std::runtime_error("Expected 'retrive_next_sibling' to be of type int (torch.int32).");
   }
   if (uniform_samples.scalar_type() != at::kFloat) {
@@ -108,19 +108,13 @@ void tree_speculative_sampling_target_only(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int>(
-      static_cast<int*>(predicts.data_ptr()),
-      static_cast<int*>(accept_index.data_ptr()),
-      static_cast<int*>(accept_token_num.data_ptr()),
-      static_cast<int*>(candidates.data_ptr()),
-      static_cast<int*>(retrive_index.data_ptr()),
-      static_cast<int*>(retrive_next_token.data_ptr()),
-      static_cast<int*>(retrive_next_sibling.data_ptr()),
-      static_cast<float*>(uniform_samples.data_ptr()),
-      static_cast<float*>(target_probs.data_ptr()),
-      static_cast<float*>(draft_probs.data_ptr()),
-      batch_size, num_spec_step, num_draft_tokens,
-      vocab_size, deterministic, stream);
+      static_cast<int*>(predicts.data_ptr()), static_cast<int*>(accept_index.data_ptr()),
+      static_cast<int*>(accept_token_num.data_ptr()), static_cast<int*>(candidates.data_ptr()),
+      static_cast<int*>(retrive_index.data_ptr()), static_cast<int*>(retrive_next_token.data_ptr()),
+      static_cast<int*>(retrive_next_sibling.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
+      static_cast<float*>(target_probs.data_ptr()), static_cast<float*>(draft_probs.data_ptr()), batch_size,
+      num_spec_step, num_draft_tokens, vocab_size, deterministic, stream);
 
-  TORCH_CHECK(status == cudaSuccess, "TreeSpeculativeSamplingTargetOnly failed with error code " +
-                                         std::string(cudaGetErrorString(status)));
+  TORCH_CHECK(status == cudaSuccess,
+              "TreeSpeculativeSamplingTargetOnly failed with error code " + std::string(cudaGetErrorString(status)));
 }
