@@ -144,4 +144,4 @@ if __name__ == "__main__":
     main(args)
 ```
 
-[This blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang) contains more details about why you would use SLURM and who is this useful for
+The example is based on [this blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang)
