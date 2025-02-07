@@ -184,3 +184,31 @@ Please consult the documentation below to learn more about the parameters you ma
 * `cuda_graph_bs`: The batch sizes to capture by `CudaGraphRunner`. By default this is done for you.
 * `torchao_config`: Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row.
 * `triton_attention_num_kv_splits`: Use to adjust the number of KV splits in triton kernels. Default is 8.
+
+## Examples
+
+### Return Hidden States
+```python
+import sglang as sgl
+
+def main():
+    llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct", return_hidden_states=True)
+
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
+    sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 10}
+
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    for output in outputs:
+        print("===============================")
+        print(output)
+        print()
+
+if __name__ == "__main__":
+    main()
+```
