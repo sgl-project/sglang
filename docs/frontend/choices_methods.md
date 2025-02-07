@@ -7,7 +7,7 @@ The optional `choices_method` arg determines how options supplied to SGLang's `c
 
 ### Token Length Normalized
 
-Token length normalized is the default SGLang choices method. It selects the option with the highest average logprob across all of its tokens.
+Token length normalized is the default SGLang choices method. It selects the option with the highest average logprob across all of its tokens. [test]
 
 Usage example (alternatively, simply omit the `choices_method` arg):
 ```python
