@@ -161,6 +161,8 @@ class OpenAI(BaseBackend):
                 prompt = s.text_
 
             kwargs = sampling_params.to_openai_kwargs()
+            if self.model_name.startswith("o1"):
+                kwargs.pop("max_tokens", None)
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,

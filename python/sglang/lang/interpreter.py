@@ -746,6 +746,7 @@ class StreamExecutor:
 
         for item in [
             "max_new_tokens",
+            "max_completion_tokens",
             "min_new_tokens",
             "stop",
             "stop_token_ids",
