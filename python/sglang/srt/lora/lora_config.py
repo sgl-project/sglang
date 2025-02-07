@@ -33,7 +33,6 @@ class LoRAConfig:
         if dummy:
             raise NotImplementedError()
         else:
-            print("test")
             if not os.path.isdir(self.path):
                 weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
             else:
