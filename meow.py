@@ -5,7 +5,7 @@ import asyncio
 
 def main():
     MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    llm = sgl.Engine(model_path=MODEL_NAME, skip_tokenizer_init=True, disable_cuda_graph=True)
+    llm = sgl.Engine(model_path=MODEL_NAME, skip_tokenizer_init=True, disable_cuda_graph=False)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     prompts = [
