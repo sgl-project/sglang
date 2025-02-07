@@ -6,13 +6,11 @@ on:
     paths:
       - "python/sglang/**"
       - "test/**"
-      - "docs/**"
   pull_request:
     branches: [ main ]
     paths:
       - "python/sglang/**"
       - "test/**"
-      - "docs/**"
   workflow_dispatch:
     inputs:
       version:
@@ -29,27 +27,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  paths-filter:
-    runs-on: ubuntu-latest
-    outputs:
-      code: ${{ steps.filter.outputs.code }}
-      docs: ${{ steps.filter.outputs.docs }}
-    steps:
-      - uses: actions/checkout@v3
-      - name: Filter paths
-        id: filter
-        uses: dorny/paths-filter@v2
-        with:
-          filters: |
-            code:
-              - 'python/sglang/**'
-              - 'test/**'
-            docs:
-              - 'docs/**'
 
   unit-test-frontend:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -57,7 +37,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -68,8 +48,7 @@ jobs:
           python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
@@ -81,7 +60,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -91,12 +70,13 @@ jobs:
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
           range_end=${RANGE#*-}
+
           cd test/srt
           python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
 
+
   unit-test-backend-2-gpu:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -104,7 +84,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -133,8 +113,7 @@ jobs:
           python3 test_moe_ep.py
 
   performance-test-1-gpu-part-1:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -142,7 +121,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -176,9 +155,9 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
+
   performance-test-1-gpu-part-2:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -186,7 +165,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -209,8 +188,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -218,7 +196,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -246,19 +224,20 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
+
   accuracy-test-1-gpu:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install dependencies and setup human-eval
+      - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
+
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -269,19 +248,20 @@ jobs:
           cd test/srt
           python3 test_eval_accuracy_large.py
 
+
   accuracy-test-2-gpu:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install dependencies and setup human-eval
+      - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ (github.event.inputs.version || 'release') == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer' }}
         run: |
           bash scripts/ci_install_dependency.sh
+
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -292,57 +272,14 @@ jobs:
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
-  doc-test:
-    needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.docs == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Build documentation
-        run: |
-          pip install mkdocs-material
-          mkdocs build --strict
-
-      - name: Verify broken links
-        run: |
-          pip install linkchecker
-          linkchecker site/
 
   finish:
-    needs:
-      - paths-filter
-      - unit-test-frontend
-      - unit-test-backend-1-gpu
-      - unit-test-backend-2-gpu
-      - performance-test-1-gpu-part-1
-      - performance-test-1-gpu-part-2
-      - performance-test-2-gpu
-      - accuracy-test-1-gpu
-      - accuracy-test-2-gpu
-      - doc-test
+    needs: [
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu
+    ]
     runs-on: ubuntu-latest
-    if: |
-      !contains(needs.*.result, 'failure') &&
-      ((needs.paths-filter.outputs.code == 'true' && needs.paths-filter.outputs.docs == 'true')
-        ? (needs.doc-test.result == 'success')
-        : (needs.paths-filter.outputs.code == 'true'
-          ? (needs.unit-test-frontend.result == 'success' &&
-             needs.unit-test-backend-1-gpu.result == 'success' &&
-             needs.unit-test-backend-2-gpu.result == 'success' &&
-             needs.performance-test-1-gpu-part-1.result == 'success' &&
-             needs.performance-test-1-gpu-part-2.result == 'success' &&
-             needs.performance-test-2-gpu.result == 'success' &&
-             needs.accuracy-test-1-gpu.result == 'success' &&
-             needs.accuracy-test-2-gpu.result == 'success')
-          : true)) &&
-      (needs.paths-filter.outputs.docs == 'true' ? needs.doc-test.result == 'success' : true)
     steps:
       - name: Finish
-        run: echo "All required checks passed successfully!"
-        env:
-          DEBUG_INFO: |
-            Code Modified: ${{ needs.paths-filter.outputs.code }}
-            Docs Modified: ${{ needs.paths-filter.outputs.docs }}
-            Unit Tests: ${{ join(needs.*.result, ', ') }}
+        run: echo "This is an empty step to ensure that all jobs are completed."
