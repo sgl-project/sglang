@@ -1,10 +1,10 @@
 import argparse
 import os
 
-NUM_LORAS = 8
+NUM_LORAS = 4
 LORA_PATH = {
-    "base": "mistralai/Mistral-7B-Instruct-v0.3",
-    "lora": "/home/ying/test_lora",
+    "base": "meta-llama/Llama-2-7b-hf",
+    "lora": "winddude/wizardLM-LlaMA-LoRA-7B",
 }
 
 
@@ -21,7 +21,8 @@ def launch_server(args):
             cmd += f"{lora_name}={lora_path} "
     cmd += f"--disable-radix --disable-cuda-graph "
     cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
-    cmd += f"--max-running-requests {args.max_running_requests}"
+    cmd += f"--max-running-requests {args.max_running_requests} "
+    cmd += f"--lora-backend {args.lora_backend}"
     print(cmd)
     os.system(cmd)
 
@@ -41,6 +42,11 @@ if __name__ == "__main__":
         "--max-running-requests",
         type=int,
         default=8,
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default="triton",
     )
     args = parser.parse_args()
 
