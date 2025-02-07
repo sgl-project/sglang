@@ -161,8 +161,11 @@ class OpenAI(BaseBackend):
                 prompt = s.text_
 
             kwargs = sampling_params.to_openai_kwargs()
-            if self.model_name.startswith("o1"):
+            if self.model_name.startswith("o1") or self.model_name.startswith("o3"):
                 kwargs.pop("max_tokens", None)
+            print("kwargs")
+            print(kwargs)
+            kwargs.setdefault("n", 2)
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
@@ -177,6 +180,7 @@ class OpenAI(BaseBackend):
             ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
+
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
