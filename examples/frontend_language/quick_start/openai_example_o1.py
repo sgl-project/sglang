@@ -28,9 +28,6 @@ def single():
     print("\n-- answer_1 --\n", state["answer_1"])
 
 
-
-
-
 def batch():
     states = multi_turn_question.run_batch(
         [
