@@ -1,9 +1,3 @@
-import openai
-
-
-client = openai.Client(base_url="https://api.openai.com/v1/", api_key="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")
-
-
 """
 Usage:
 export OPENAI_API_KEY=sk-******
