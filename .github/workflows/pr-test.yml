@@ -49,7 +49,7 @@ jobs:
 
   unit-test-frontend:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -69,7 +69,7 @@ jobs:
 
   unit-test-backend-1-gpu:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
@@ -96,7 +96,7 @@ jobs:
 
   unit-test-backend-2-gpu:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -134,7 +134,7 @@ jobs:
 
   performance-test-1-gpu-part-1:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -178,7 +178,7 @@ jobs:
 
   performance-test-1-gpu-part-2:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -210,7 +210,7 @@ jobs:
 
   performance-test-2-gpu:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -248,7 +248,7 @@ jobs:
 
   accuracy-test-1-gpu:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -271,7 +271,7 @@ jobs:
 
   accuracy-test-2-gpu:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.code == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.code == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -294,7 +294,7 @@ jobs:
 
   doc-test:
     needs: paths-filter
-    if: ${{ needs.paths-filter.outputs.docs == 'true' && (github.event_name != 'pull_request' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    if: ${{ needs.paths-filter.outputs.docs == 'true' && ( github.event_name != 'pull_request' || ( github.event.pull_request != null && github.event.pull_request.draft == false ) ) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
