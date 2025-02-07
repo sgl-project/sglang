@@ -1204,9 +1204,13 @@ class ScheduleBatch:
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
-                else getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
-                if self.spec_info
-                else CaptureHiddenMode.NULL
+                else (
+                    getattr(
+                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                    )
+                    if self.spec_info
+                    else CaptureHiddenMode.NULL
+                )
             ),
         )
 

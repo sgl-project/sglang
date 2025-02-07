@@ -795,7 +795,7 @@ class TokenizerManager:
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
-            
+
             if len(recv_obj.output_hidden_states[i]) > 0:
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 

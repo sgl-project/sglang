@@ -1161,7 +1161,12 @@ class Scheduler:
                 logits_output.hidden_states = logits_output.hidden_states.cpu()
                 offset = 0
                 # Cuts up the hidden states for each request
-                logits_output.hidden_states = [logits_output.hidden_states[offset: (offset := offset + len(req.origin_input_ids))] for req in batch.reqs]
+                logits_output.hidden_states = [
+                    logits_output.hidden_states[
+                        offset : (offset := offset + len(req.origin_input_ids))
+                    ]
+                    for req in batch.reqs
+                ]
             # Check finish conditions
             logprob_pt = 0
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -1285,7 +1290,7 @@ class Scheduler:
                     req.output_top_logprobs_idx.append(
                         logits_output.next_token_top_logprobs_idx[i]
                     )
-            
+
             if logits_output.hidden_states is not None:
                 req.hidden_states.append(logits_output.hidden_states[i])
 
@@ -1478,7 +1483,7 @@ class Scheduler:
                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
-                    
+
                     hidden_states.append(req.hidden_states)
 
             # Send to detokenizer

@@ -401,6 +401,7 @@ class BatchStrOut:
 
     output_hidden_states: List[List[float]]
 
+
 @dataclass
 class BatchEmbeddingOut:
     # The request id
