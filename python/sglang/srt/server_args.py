@@ -160,6 +160,7 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
+    return_hidden_states: bool = False
 
     # Custom logit processor
     enable_custom_logit_processor: bool = False

@@ -997,6 +997,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.return_hidden_states,
         )
         new_batch.prepare_for_extend()
 
@@ -1187,7 +1188,8 @@ class Scheduler:
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
 
-                    req.hidden_states.append(logits_output.hidden_states[i])
+                    if logits_output.hidden_states is not None:
+                        req.hidden_states.append(logits_output.hidden_states[i])
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
@@ -1284,7 +1286,8 @@ class Scheduler:
                         logits_output.next_token_top_logprobs_idx[i]
                     )
             
-            req.hidden_states.append(logits_output.hidden_states[i])
+            if logits_output.hidden_states is not None:
+                req.hidden_states.append(logits_output.hidden_states[i])
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
@@ -1568,6 +1571,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.return_hidden_states,
         )
         idle_batch.prepare_for_idle()
         return idle_batch

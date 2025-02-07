@@ -348,7 +348,7 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.FULL
+                CaptureHiddenMode.FULL if self.model_runner.server_args.return_hidden_states else spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
         )
 
