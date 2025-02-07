@@ -1,5 +1,7 @@
 # Multi-Node LLM Inference with SGLang on SLURM Enabled Clusters
 
+This example will showcase how you can run an OpenAI compatible server via SGLang across multiple nodes. This is especially useful for large models which do not fit within one node. A lot of insitutes/organizations only allow access to big GPU clusters via SLURM and this example focuses on this usecase where you can only interact with your nodes via SLURM commands.
+
 SLURM Submit Script - 
 
 ```
