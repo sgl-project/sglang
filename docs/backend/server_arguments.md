@@ -103,6 +103,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `download_dir`: Use to override the default Hugging Face cache directory for model weights.
 * `base_gpu_id`: Use to adjust first GPU used to distribute the model across available GPUs.
 * `allow_auto_truncate`: Automatically truncate requests that exceed the maximum input length.
+* `return_hidden_states`: Return hidden states in the response.
 
 ## Logging
 
