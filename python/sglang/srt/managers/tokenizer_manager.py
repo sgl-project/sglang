@@ -796,7 +796,7 @@ class TokenizerManager:
                     }
                 )
 
-            if len(recv_obj.output_hidden_states[i]) > 0:
+            if hasattr(recv_obj, "output_hidden_states") and len(recv_obj.output_hidden_states[i]) > 0:
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
             if isinstance(recv_obj, BatchStrOut):
