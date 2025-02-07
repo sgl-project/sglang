@@ -351,7 +351,7 @@ def extend_attention_fwd(
 
     extra_kargs = {}
     if is_hip_:
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
         q_extend,
