@@ -2,36 +2,38 @@
 
 ## Introduction
 
-This document describes how to set up an AMD-based environment for [SGLang](https://docs.sglang.ai). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues) on the SGLang repository.
+This document describes how to set up an AMD-based environment for [SGLang](https://github.com/sgl-project/sglang). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues) on the SGLang repository.
 
 ## System Configure
 
-When using AMD GPUs (such as MI300X), certain system-level optimizations help ensure stable performance.
-
-### MI300X
-
-AMD provides official documentation for MI300X optimization and system tuning:
+When using AMD GPUs (such as MI300X), certain system-level optimizations help ensure stable performance. Here we take MI300X as an example. AMD provides official documentation for MI300X optimization and system tuning:
 
 - [AMD MI300X Tuning Guides](https://rocm.docs.amd.com/en/latest/how-to/tuning-guides/mi300x/index.html)
   - [LLM inference performance validation on AMD Instinct MI300X](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference/vllm-benchmark.html)
   - [AMD Instinct MI300X System Optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html)
   - [AMD Instinct MI300X Workload Optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html)
 
-**NOTE:** We strongly recommend reading the entire `System Optimization` guide to fully configure your system.
+**NOTE:** We strongly recommend reading theses docs entirely guide to fully utilize your system.
 
 Below are a few key settings to confirm or enable:
 
-1. **Update GRUB Settings**
-   In `/etc/default/grub`, append the following to `GRUB_CMDLINE_LINUX`:
-   ```text
-   pci=realloc=off iommu=pt
-   ```
-   Afterward, run `sudo update-grub` (or your distro’s equivalent) and reboot.
-2. **Disable NUMA Auto-Balancing**
-   ```bash
-   sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
-   ```
-   You can automate or verify this change using [this helpful script](https://github.com/ROCm/triton/blob/rocm_env/scripts/amd/env_check.sh)
+### Update GRUB Settings
+
+In `/etc/default/grub`, append the following to `GRUB_CMDLINE_LINUX`:
+   
+```text
+pci=realloc=off iommu=pt
+```
+
+Afterward, run `sudo update-grub` (or your distro’s equivalent) and reboot.
+
+### Disable NUMA Auto-Balancing
+
+```bash
+sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
+```
+  
+You can automate or verify this change using [this helpful script](https://github.com/ROCm/triton/blob/rocm_env/scripts/amd/env_check.sh).
 
 Again, please go through the entire documentation to confirm your system is using the recommended configuration.
 
@@ -50,7 +52,7 @@ pip install sgl-kernel --force-reinstall --no-deps
 pip install -e "python[all_hip]"
 ```
 
-### Install Using Docker
+### Install Using Docker (Recommended)
 
 1. Build the docker image.
 
@@ -70,7 +72,7 @@ alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/d
 
 3. Launch the server.
 
-**NOTE:** Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens)
+**NOTE:** Replace `<secret>` below with your [huggingface hub token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
 drun -p 30000:30000 \
@@ -83,7 +85,7 @@ drun -p 30000:30000 \
     --port 30000
 ```
 
-4. To verify the utility, you can run a benchmark in another terminal or refer to other docs to send requests to the engine.
+4. To verify the utility, you can run a benchmark in another terminal or refer to [other docs](https://docs.sglang.ai/backend/openai_api_completions.html) to send requests to the engine.
 
 ```bash
 drun sglang_image \
