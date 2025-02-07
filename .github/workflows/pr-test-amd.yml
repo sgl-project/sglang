@@ -38,7 +38,7 @@ jobs:
           docker pull lmsysorg/sglang:v0.4.2.post2-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
-            --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.HF_TOKEN }} --security-opt seccomp=unconfined \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
             lmsysorg/sglang:v0.4.2.post2-rocm630
 
