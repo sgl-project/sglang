@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -33,8 +33,11 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: List[int],
         extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: List[int],
         extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: List[int],
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -70,10 +73,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
 
-            extend_seq_len_q = extend_seq_lens[seq_idx]
-            prefill_seq_len_q = extend_prefix_lens[seq_idx]
+            extend_seq_len_q = extend_seq_lens_cpu[seq_idx]
+            prefill_seq_len_q = extend_prefix_lens_cpu[seq_idx]
 
-            seq_len_kv = seq_lens[seq_idx]
+            seq_len_kv = seq_lens_cpu[seq_idx]
             end_q = start_q + extend_seq_len_q
             end_kv = start_kv + seq_len_kv
 
@@ -89,7 +92,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            # per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            curr_req_to_tokens = torch.index_select(
+                req_to_token, 0, req_pool_idx).squeeze(0)
+            per_req_tokens = curr_req_to_tokens[:seq_len_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -105,7 +111,8 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            output[start_q:end_q, :,
+                   :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -118,6 +125,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: List[int],
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -149,18 +157,24 @@ class TorchNativeAttnBackend(AttentionBackend):
             # Need optimize the performance later.
 
             seq_len_q = 1
-            seq_len_kv = seq_lens[seq_idx]
-            end_q = start_q + seq_len_q
-            end_kv = start_kv + seq_len_kv
+            seq_len_kv = seq_lens_cpu[seq_idx]  # get a scalar
+            end_q = start_q + seq_len_q  # pure python scalar add
+            end_kv = start_kv + seq_len_kv  # tensor add
 
-            per_req_query = query[:, start_q:end_q, :]
+            per_req_query = query[:, start_q:end_q, :]  # slice
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
+            # select, get a scalar tensor
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            # per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv] # item+select+item+slice
+            curr_req_to_tokens = torch.index_select(
+                req_to_token, 0, req_pool_idx).squeeze(0)
+            per_req_tokens = curr_req_to_tokens[:seq_len_kv]
+            per_req_key = k_cache[per_req_tokens].movedim(
+                0, query.dim() - 2)  # index + movedim
+            per_req_value = v_cache[per_req_tokens].movedim(
+                0, query.dim() - 2)  # index + movedim
 
             per_req_out = (
                 scaled_dot_product_attention(
@@ -189,7 +203,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
@@ -215,8 +230,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
+            forward_batch.seq_lens_cpu,
             forward_batch.extend_prefix_lens,
+            forward_batch.extend_prefix_lens_cpu,
             forward_batch.extend_seq_lens,
+            forward_batch.extend_seq_lens_cpu,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
@@ -237,7 +255,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
@@ -259,6 +278,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
+            forward_batch.seq_lens_cpu,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=False,
