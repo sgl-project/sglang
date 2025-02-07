@@ -184,6 +184,28 @@ class TestSRTEngine(unittest.TestCase):
         result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertGreater(result["total_throughput"], 3000)
 
+    def test_8_return_hidden_states(self):
+        prompts = ["Today is", "Today is a sunny day and I like"]
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
+        engine = sgl.Engine(
+            model_path=model_path, random_seed=42, return_hidden_states=True
+        )
+        out1 = engine.generate(prompts, sampling_params)
+        engine.shutdown()
+
+        for _out1 in out1:
+            self.assertEqual(len(_out1["meta_info"]["hidden_states"]), 8)
+            for hidden_state in _out1["meta_info"]["hidden_states"]:
+                self.assertIsInstance(hidden_state, torch.Tensor)
+        # Checks that splicing of the batch was done correctly
+        self.assertGreater(
+            out1[1]["meta_info"]["hidden_states"][0].shape[0],
+            out1[0]["meta_info"]["hidden_states"][0].shape[0],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
