@@ -28,7 +28,7 @@ docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/roo
     python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
 ```
 
-For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
+Add [performance optimization options](#performance-optimization-options) as needed.
 
 ### Using pip
 ```bash
@@ -39,7 +39,13 @@ pip install "sglang[all]>=0.4.2.post2" --find-links https://flashinfer.ai/whl/cu
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 ```
 
-For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
+Add [performance optimization options](#performance-optimization-options) as needed.
+
+### Performance Optimization Options
+[MLA optimizations](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) are enabled by default. Here are some optional optimizations can be enabled as needed.
+
+- [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models): For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
+- [Torch.compile Optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#torchcompile-latency-optimizations): Add `--enable-torch-compile` argument to enable it. This will take some time while server starts. The maximum batch size for torch.compile optimization can be controlled with `--torch-compile-max-bs`. It's recommended to set it between `1` and `8`. (e.g., `--torch-compile-max-bs 8`)
 
 ### Example: Sending requests with OpenAI API
 
