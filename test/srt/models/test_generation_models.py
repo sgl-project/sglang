@@ -75,6 +75,8 @@ class TestGenerationModels(unittest.TestCase):
         model_case: ModelCase,
         torch_dtype: torch.dtype,
     ) -> None:
+        print(f"assert_close_logits_and_output_strs {model_case=}")
+
         model_path = model_case.model_path
         prefill_tolerance, decode_tolerance, rouge_l_tolerance = (
             model_case.prefill_tolerance,
