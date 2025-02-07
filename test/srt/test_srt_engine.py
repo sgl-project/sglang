@@ -9,6 +9,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
 from sglang.bench_offline_throughput import BenchArgs, throughput_test
@@ -184,27 +185,64 @@ class TestSRTEngine(unittest.TestCase):
         result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertGreater(result["total_throughput"], 3000)
 
-    def test_8_return_hidden_states(self):
+    def test_8_engine_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        input_ids = tokenizer(prompts).input_ids
 
-        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+        sampling_params = {"temperature": 0, "max_new_tokens": 1}
 
         engine = sgl.Engine(
-            model_path=model_path, random_seed=42, return_hidden_states=True
+            model_path=model_path,
+            random_seed=42,
+            return_hidden_states=True,
+            skip_tokenizer_init=True,
         )
-        out1 = engine.generate(prompts, sampling_params)
+        outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
         engine.shutdown()
 
-        for _out1 in out1:
-            self.assertEqual(len(_out1["meta_info"]["hidden_states"]), 8)
-            for hidden_state in _out1["meta_info"]["hidden_states"]:
+        for output in outputs:
+            self.assertEqual(len(output["meta_info"]["hidden_states"]), 1)
+            for hidden_state in output["meta_info"]["hidden_states"]:
                 self.assertIsInstance(hidden_state, torch.Tensor)
         # Checks that splicing of the batch was done correctly
         self.assertGreater(
-            out1[1]["meta_info"]["hidden_states"][0].shape[0],
-            out1[0]["meta_info"]["hidden_states"][0].shape[0],
+            outputs[1]["meta_info"]["hidden_states"][0].shape[0],
+            outputs[0]["meta_info"]["hidden_states"][0].shape[0],
         )
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, device_map="cuda"
+        )
+
+        for input_id, output in zip(input_ids, outputs):
+            print(input_id, output["token_ids"])
+            with torch.inference_mode():
+                hf_out = model(
+                    torch.tensor(
+                        [input_id + output["token_ids"][:-1]], device=model.device
+                    ),
+                    output_hidden_states=True,
+                )
+            print(hf_out["hidden_states"][-1])
+            print("===")
+            sg_hidden_states = torch.cat(
+                [
+                    i.unsqueeze(0) if len(i.shape) == 1 else i
+                    for i in output["meta_info"]["hidden_states"]
+                ]
+            )
+            print(sg_hidden_states)
+
+            self.assertTrue(
+                torch.allclose(
+                    hf_out["hidden_states"][-1],
+                    sg_hidden_states.to("cuda"),
+                    atol=1e-1,
+                    rtol=1e-1,
+                )
+            )
 
 
 if __name__ == "__main__":
