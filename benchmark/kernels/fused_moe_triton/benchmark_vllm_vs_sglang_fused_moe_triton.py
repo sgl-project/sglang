@@ -180,10 +180,7 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
     block_shape = getattr(model_config, "block_shape", None)
 
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    w1_scale = None
-    w2_scale = None
-    a1_scale = None
-    a2_scale = None
+    w1_scale = w2_scale = a1_scale = a2_scale = None
 
     if use_fp8:
         init_dtype = dtype
@@ -218,7 +215,6 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
         w2 = torch.randn(
             num_experts, hidden_size, shard_intermediate_size // 2, dtype=dtype
         )
-        w1_scale = w2_scale = a1_scale = a2_scale = None
 
     input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
 
