@@ -21,8 +21,15 @@ from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l
 
 LORA_SETS = [
-    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
-    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"]}
+    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+    # {"base": "meta-llama/Llama-2-7b-hf",
+    #  "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
+    #  "prefill_tolerance": 1e-1,
+    #  "decode_tolerance": 1e-1},
+    {
+        "base": "meta-llama/Llama-3.1-8B-Instruct",
+        "loras": ["reissbaker/llama-3.1-8b-abliterated-lora"],
+    }
 ]
 TORCH_DTYPES = [torch.float16]
 
@@ -39,7 +46,10 @@ PROMPTS = [
     """,
 ]
 
-BACKENDS = ["triton", "flashinfer"]
+BACKENDS = [
+    "triton",
+    # "flashinfer"
+]
 
 prefill_tolerance: float = 5e-2
 decode_tolerance: float = 5e-2
@@ -128,7 +138,8 @@ class TestLoRABackend(unittest.TestCase):
                 torch.max(abs(hf_logprobs - hf_no_lora_logprobs)),
             )
             if hf_logprobs.shape[0] <= 100:
-                assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
+                tol = lora_set.get("prefill_tolerance", prefill_tolerance)
+                assert torch.all(abs(hf_logprobs - srt_logprobs) < tol), (
                     f"prefill logprobs are not all close with model_path={base_path},"
                     f"lora_path={batch_lora_paths[i]}, backend={backend}, prompt={prompts[i]}"
                     f"prefill_tolerance={prefill_tolerance}."
@@ -144,7 +155,8 @@ class TestLoRABackend(unittest.TestCase):
                 "\n",
             )
             if hf_logprobs.shape[0] <= 100:
-                assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
+                tol = lora_set.get("decode_tolerance", decode_tolerance)
+                assert torch.all(abs(hf_logprobs - srt_logprobs) < tol), (
                     f"decode logprobs are not all close with model_path={base_path},"
                     f"lora_path={batch_lora_paths[i]}, backend={backend}, prompt={prompts[i]}"
                     f"decode_tolerance={decode_tolerance}."

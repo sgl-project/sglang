@@ -86,7 +86,7 @@ class LoRAManager:
         )
 
         # load all weights to cpu
-        self.loras: Dict[Optional[str], LoRAAdapter] = {}
+        self.loras: Dict[str, LoRAAdapter] = {}
         for name in self.lora_paths.keys():
             lora_adapter = LoRAAdapter(
                 name,
@@ -101,9 +101,9 @@ class LoRAManager:
         # misc lora configs
         # FIXME remove the restrictions after implementing unified paging
         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
-        self.scaling: float = self.loras[0].scaling
+        self.scaling: float = list(self.loras.values())[0].scaling
         assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
-        assert all(x.scaling == self.scaling for x in self.loras)
+        assert all(x.scaling == self.scaling for x in self.loras.values())
 
         # Convert original model layers to layers with LoRA
         self.convert_to_lora_layers()
@@ -139,7 +139,7 @@ class LoRAManager:
         max_len = int(torch.max(seg_lens))
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
         for i, lora_path in enumerate(forward_batch.lora_paths):
-            weight_indices[i] = self.memory_pool.get_buffer_id[lora_path]
+            weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
 
         batch_info = LoRABatchInfo(
             bs=bs,

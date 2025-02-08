@@ -40,7 +40,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.lora.backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
@@ -69,14 +68,14 @@ class BaseLayerWithLoRA(nn.Module):
         base_layer: nn.Module,
         lora_rank: int,
         scaling: float,
-        lora_backend: BaseLoRABackend,
+        lora_backend: "BaseLoRABackend",
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
         self.lora_rank: int = lora_rank
         self.scaling: float = scaling
         self.set_lora: bool = False
-        self.lora_backend: BaseLoRABackend = lora_backend
+        self.lora_backend: "BaseLoRABackend" = lora_backend
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -91,7 +90,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         base_layer: VocabParallelEmbedding,
         lora_rank: int,
         scaling: float,
-        lora_backend: BaseLoRABackend,
+        lora_backend: "BaseLoRABackend",
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
         self.weight = base_layer.weight
@@ -103,7 +102,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: ColumnParallelLinear,
         lora_rank: int,
         scaling: float,
-        lora_backend: BaseLoRABackend,
+        lora_backend: "BaseLoRABackend",
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -135,7 +134,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: MergedColumnParallelLinear,
         lora_rank: int,
         scaling: float,
-        lora_backend: BaseLoRABackend,
+        lora_backend: "BaseLoRABackend",
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -174,7 +173,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: QKVParallelLinear,
         lora_rank: int,
         scaling: float,
-        lora_backend: BaseLoRABackend,
+        lora_backend: "BaseLoRABackend",
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -242,7 +241,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: RowParallelLinear,
         lora_rank: int,
         scaling: float,
-        lora_backend: BaseLoRABackend,
+        lora_backend: "BaseLoRABackend",
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
@@ -301,7 +300,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module, lora_rank: int, scaling: int, lora_backend: BaseLoRABackend
+    layer: nn.Module, lora_rank: int, scaling: int, lora_backend: "BaseLoRABackend"
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
@@ -342,7 +341,7 @@ class LoRAAdapter(nn.Module):
         config: LoRAConfig,
         base_hf_config: AutoConfig,
         load_config: LoadConfig,
-        lora_backend: BaseLoRABackend,
+        lora_backend: "BaseLoRABackend",
     ):
         super().__init__()
         self.uid: str = uid
@@ -350,7 +349,7 @@ class LoRAAdapter(nn.Module):
         assert self.config.hf_config["peft_type"].lower() == "lora"
         self.base_hf_config: AutoConfig = base_hf_config
         self.load_config: LoadConfig = load_config
-        self.lora_backend: BaseLoRABackend = lora_backend
+        self.lora_backend: "BaseLoRABackend" = lora_backend
         self.scaling: float = self.config.lora_alpha / self.config.r
 
         self.layers: List[LoRALayer] = nn.ModuleList(
@@ -396,44 +395,77 @@ class LoRAAdapter(nn.Module):
         for i in range(self.base_hf_config.num_hidden_layers):
             layer = self.layers[i]
             weight_names = [name for name, _ in layer.weights.items()]
-            for weight_name in weight_names:
-                if "k_proj" in weight_name:
-                    q_name = weight_name.replace("k_proj", "q_proj")
-                    v_name = weight_name.replace("k_proj", "v_proj")
-                    kv_name = weight_name.replace("k_proj", "kv_proj")
-                    qkv_name = weight_name.replace("k_proj", "qkv_proj")
-                    if "lora_A" in weight_name:
-                        layer.weights[qkv_name] = torch.cat(
-                            (
-                                layer.weights[q_name],
-                                layer.weights[weight_name],
-                                layer.weights[v_name],
-                            ),
-                            0,
-                        )
-                        layer.weights.pop(q_name)
-                        layer.weights.pop(weight_name)
-                        layer.weights.pop(v_name)
-                    else:
-                        layer.weights[kv_name] = torch.stack(
-                            [
-                                layer.weights[weight_name],
-                                layer.weights[v_name],
-                            ],
-                            dim=0,
-                        )
-                        layer.weights.pop(weight_name)
-                        layer.weights.pop(v_name)
-                elif "gate_proj" in weight_name:
-                    up_name = weight_name.replace("gate_proj", "up_proj")
-                    gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
-                    if "lora_A" in weight_name:
-                        layer.weights[gate_up_name] = torch.cat(
-                            (layer.weights[weight_name], layer.weights[up_name]), 0
-                        )
-                    else:
-                        layer.weights[gate_up_name] = torch.stack(
-                            [layer.weights[weight_name], layer.weights[up_name]], dim=0
-                        )
-                    layer.weights.pop(weight_name)
-                    layer.weights.pop(up_name)
+            self.stack_qkv_proj(weight_names, layer.weights)
+            self.stack_gate_up_proj(weight_names, layer.weights)
+
+    def stack_qkv_proj(self, weight_names: List[str], weights: Dict[str, torch.Tensor]):
+
+        # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
+        target_module = set()
+        for weight_name in weight_names:
+            if "k_proj" in weight_name:
+                target_module.add("k_proj")
+            if "q_proj" in weight_name:
+                target_module.add("q_proj")
+            if "v_proj" in weight_name:
+                target_module.add("v_proj")
+        if len(target_module) == 0:
+            return
+
+        for weight_name in weight_names:
+            # We assume every lora adaptor should contain lora modules for q_proj
+            if "q_proj" in weight_name:
+                q_name = weight_name
+                k_name = weight_name.replace("q_proj", "k_proj")
+                v_name = weight_name.replace("q_proj", "v_proj")
+                kv_name = weight_name.replace("q_proj", "kv_proj")
+                qkv_name = weight_name.replace("q_proj", "qkv_proj")
+
+                # If k_proj doesn't have lora, initialize it to zero
+                k_proj_weight = (
+                    weights[k_name]
+                    if "k_proj" in target_module
+                    else torch.zeros_like(weights[v_name])
+                )
+                if "lora_A" in weight_name:
+                    weights[qkv_name] = torch.cat(
+                        (
+                            weights[q_name],
+                            k_proj_weight,
+                            weights[v_name],
+                        ),
+                        0,
+                    )
+                    weights.pop(q_name)
+                    if "k_proj" in target_module:
+                        weights.pop(k_name)
+                    weights.pop(v_name)
+                else:
+                    weights[kv_name] = torch.stack(
+                        [
+                            k_proj_weight,
+                            weights[v_name],
+                        ],
+                        dim=0,
+                    )
+                    if "k_proj" in target_module:
+                        weights.pop(k_name)
+                    weights.pop(v_name)
+
+    def stack_gate_up_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        for weight_name in weight_names:
+            if "gate_proj" in weight_name:
+                up_name = weight_name.replace("gate_proj", "up_proj")
+                gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
+                if "lora_A" in weight_name:
+                    weights[gate_up_name] = torch.cat(
+                        (weights[weight_name], weights[up_name]), 0
+                    )
+                else:
+                    weights[gate_up_name] = torch.stack(
+                        [weights[weight_name], weights[up_name]], dim=0
+                    )
+                weights.pop(weight_name)
+                weights.pop(up_name)

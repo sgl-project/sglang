@@ -138,7 +138,7 @@ def get_weight_name(
     If there is a weight name in lora_weight_names that can match target_name, return this name
     Else return None
     """
+    idx = 0 if lora_type == LoRAType.LORA_A else 1
     for weight_name_pair in lora_weight_names:
-        if weight_name_pair[lora_type] in target_name:
-            return weight_name_pair[lora_type]
-        return None
+        if weight_name_pair[idx] in target_name:
+            return weight_name_pair[idx]

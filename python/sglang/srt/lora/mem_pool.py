@@ -94,7 +94,7 @@ class LoRAMemoryPool:
     def prepare_lora_batch(
         self,
         cur_uids: Set[Optional[str]],
-        lora_adapters: Dict[Optional[str], LoRAAdapter],
+        lora_adapters: Dict[str, LoRAAdapter],
     ):
 
         def get_available_buffer_slot():
@@ -113,16 +113,18 @@ class LoRAMemoryPool:
             )
 
         for uid in cur_uids:
-            if uid not in self.active_uids:
+            if uid not in self.uid_to_buffer_id:
                 buffer_id, evicted_lora_uid = get_available_buffer_slot()
                 if evicted_lora_uid != "":
                     self.uid_to_buffer_id.pop(evicted_lora_uid)
-                self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapters[uid])
+                self.load_lora_weight_to_buffer(
+                    uid, buffer_id, lora_adapters.get(uid, None)
+                )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
     def load_lora_weight_to_buffer(
-        self, uid: str, buffer_id: int, lora_adapter: LoRAAdapter
+        self, uid: str, buffer_id: int, lora_adapter: LoRAAdapter = None
     ):
 
         if uid is None:
@@ -131,8 +133,9 @@ class LoRAMemoryPool:
                     self.A_buffer[k][i][buffer_id] *= 0
             return
 
+        assert lora_adapter is not None
         for layer_id in range(self.num_layer):
-            layer_weights = lora_adapter.layers[i].weights
+            layer_weights = lora_adapter.layers[layer_id].weights
             for name, weights in layer_weights.items():
                 if "lora_A" in name:
                     lora_weight_name = get_weight_name(
