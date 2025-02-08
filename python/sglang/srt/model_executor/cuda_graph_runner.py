@@ -462,8 +462,11 @@ class CudaGraphRunner:
                     ),
                     positions=None,
                     retrive_index=None,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
                     retrive_cum_len=None,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    spec_steps=self.model_runner.server_args.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
 

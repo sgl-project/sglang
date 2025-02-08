@@ -168,13 +168,12 @@ class EagleVerifyInput:
     custom_mask: torch.Tensor
     positions: torch.Tensor
     retrive_index: torch.Tensor
+    retrive_next_token: torch.Tensor
+    retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
     draft_token_num: int
+    spec_steps: int
     capture_hidden_mode: CaptureHiddenMode
-    spec_steps: int = 0
-    retrive_next_token: torch.Tensor = None
-    retrive_next_sibling: torch.Tensor = None
-    non_greedy_retrive_index: torch.Tensor = None
 
     @classmethod
     def create(
@@ -187,10 +186,45 @@ class EagleVerifyInput:
         seq_lens_sum: int,
         topk: int,
         spec_steps: int,
-        num_verify_token: int,
+        num_verify_tokens: int,
+        is_all_greedy: bool,
     ):
-        tree_mask, position, retrive_index, retrive_cum_len, draft_tokens = (
-            build_tree_kernel(
+        if is_all_greedy:
+            tree_mask, position, retrive_index, retrive_cum_len, draft_tokens = (
+                build_tree_kernel(
+                    verified_id,
+                    score_list,  # b, n, topk; n= 1 + (num_steps-1) * self.topk
+                    token_list,
+                    parents_list,
+                    seq_lens,
+                    seq_lens_sum,
+                    topk,
+                    spec_steps,
+                    num_verify_tokens,
+                )
+            )
+
+            return cls(
+                draft_tokens,
+                tree_mask,
+                position,
+                retrive_index,
+                None,
+                None,
+                retrive_cum_len,
+                num_verify_tokens,
+                spec_steps,
+                CaptureHiddenMode.FULL,
+            )
+        else:
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
                 verified_id,
                 score_list,
                 token_list,
@@ -199,35 +233,21 @@ class EagleVerifyInput:
                 seq_lens_sum,
                 topk,
                 spec_steps,
-                num_verify_token,
+                num_verify_tokens,
             )
-        )
-        _, _, non_greedy_retrive_index, retrive_next_token, retrive_next_sibling, _ = (
-            build_tree_kernel_efficient(
-                verified_id,
-                score_list,
-                token_list,
-                parents_list,
-                seq_lens,
-                seq_lens_sum,
-                topk,
+
+            return cls(
+                draft_tokens,
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                None,
+                num_verify_tokens,
                 spec_steps,
-                num_verify_token,
+                CaptureHiddenMode.FULL,
             )
-        )
-        return cls(
-            draft_tokens,
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_cum_len,
-            num_verify_token,
-            CaptureHiddenMode.FULL,
-            spec_steps,
-            retrive_next_token,
-            retrive_next_sibling,
-            non_greedy_retrive_index,
-        )
 
     def prepare_for_verify(self, batch: ScheduleBatch):
         batch.input_ids = self.draft_token
@@ -283,9 +303,9 @@ class EagleVerifyInput:
             [self.draft_token, torch.full([1], -1, dtype=torch.int32, device="cuda")],
             dim=-1,
         )
+        candidates = draft_token[self.retrive_index]
         if batch.sampling_info.is_all_greedy:
             # temp == 0
-            candidates = draft_token[self.retrive_index]
             bs = self.retrive_cum_len.numel() - 1
             predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             predict = torch.cat(
@@ -316,13 +336,10 @@ class EagleVerifyInput:
             )
         else:
             # temp > 0
-            candidates = draft_token[self.non_greedy_retrive_index]
-            bs = self.non_greedy_retrive_index.shape[0]
+            bs = self.retrive_index.shape[0]
             predict_shape = list(logits_output.next_token_logits.shape)[:-1]
             predict_shape[-1] += 1
-            target_logits = logits_output.next_token_logits[
-                self.non_greedy_retrive_index
-            ]
+            target_logits = logits_output.next_token_logits[self.retrive_index]
             predict = torch.full(predict_shape, -1, dtype=torch.int32, device="cuda")
             accept_index = torch.full(
                 (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
@@ -339,7 +356,7 @@ class EagleVerifyInput:
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
                 candidates=candidates.to(torch.int32),
-                retrive_index=self.non_greedy_retrive_index.to(torch.int32),
+                retrive_index=self.retrive_index.to(torch.int32),
                 retrive_next_token=self.retrive_next_token.to(torch.int32),
                 retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
                 uniform_samples=coins,
