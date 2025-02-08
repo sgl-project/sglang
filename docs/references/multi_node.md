@@ -41,6 +41,8 @@ This example showcases how to serve SGLang server across multiple nodes by SLURM
 # Total tasks across all nodes
 
 #SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=224GB
 
@@ -86,6 +88,7 @@ srun --ntasks=1 --nodes=1 --exclusive --output="SLURM_Logs/%x_%j_node0.out" \
     --error="SLURM_Logs/%x_%j_node0.err" \
     python3 -m sglang.launch_server \
     --model-path "$model" \
+    --grammar-backend "xgrammar" \
     --tp "$tp_size" \
     --nccl-init-addr "$NCCL_INIT_ADDR" \
     --nnodes 2 \
@@ -93,20 +96,20 @@ srun --ntasks=1 --nodes=1 --exclusive --output="SLURM_Logs/%x_%j_node0.out" \
 
 export OUTLINES_CACHE_DIR="/tmp/node_1_cache"
 
-srun --ntasks=1 --nodes=1 --exclusive --output="SLURM_Logs/%x_%j_node1.out" \
-    --error="SLURM_Logs/%x_%j_node1.err" \
+srun --ntasks=1 --nodes=1 --output="SLURM_Logs/%x_%j_node$SLURM_NODEID.out" \
+    --error="SLURM_Logs/%x_%j_node$SLURM_NODEID.err" \
     python3 -m sglang.launch_server \
     --model-path "$model" \
     --tp "$tp_size" \
     --nccl-init-addr "$NCCL_INIT_ADDR" \
     --nnodes 2 \
-    --node-rank 1 &
+--node-rank "$SLURM_NODEID" &
 
 # Wait for localhost:30000 to accept connections
 
-while ! nc -z localhost 30000; do
-    sleep 1
-    echo "[INFO] Waiting for localhost:30000 to accept connections"
+while ! nc -z "$HEAD_NODE" 30000; do
+sleep 1
+echo "[INFO] Waiting for $HEAD_NODE:30000 to accept connections"
 done
 
 echo "[INFO] localhost:30000 is ready to accept connections"
