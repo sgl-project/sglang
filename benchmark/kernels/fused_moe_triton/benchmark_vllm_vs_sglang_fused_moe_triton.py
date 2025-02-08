@@ -49,12 +49,12 @@ def get_model_config(model_name: str, tp_size: int):
     )
     block_shape = None
     if (
-        vllm_version_num < 66
-        and hasattr(config, "quantization_config")
+        hasattr(config, "quantization_config")
         and "weight_block_size" in config.quantization_config
     ):
         block_shape = config.quantization_config["weight_block_size"]
         assert len(block_shape) == 2
+        assert vllm_version_num >= 66, "Block-wise quantized fp8 fused_moe is only supported for VLLM>=0.6.6.post1"
 
     shape_configs = {
         "num_experts": E,
@@ -180,6 +180,10 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
     block_shape = model_config["block_shape"]
 
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    w1_scale = None
+    w2_scale = None
+    a1_scale = None
+    a2_scale = None
 
     if use_fp8:
         init_dtype = dtype
