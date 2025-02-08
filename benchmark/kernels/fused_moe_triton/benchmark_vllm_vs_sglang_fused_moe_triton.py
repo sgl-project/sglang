@@ -54,7 +54,9 @@ def get_model_config(model_name: str, tp_size: int):
     ):
         block_shape = config.quantization_config["weight_block_size"]
         assert len(block_shape) == 2
-        assert vllm_version_num >= 66, "Block-wise quantized fp8 fused_moe is only supported for VLLM>=0.6.6.post1"
+        assert (
+            vllm_version_num >= 66
+        ), "Block-wise quantized fp8 fused_moe is only supported for VLLM>=0.6.6.post1"
 
     shape_configs = {
         "num_experts": E,
