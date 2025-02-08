@@ -127,3 +127,19 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                       at::Tensor cos_sin_cache, at::Tensor pos_ids, bool interleave,
                                       int64_t cuda_stream);
+
+void tree_speculative_sampling_target_only(at::Tensor predicts, at::Tensor accept_index,
+                                           at::Tensor accept_token_num,  // mutable
+                                           at::Tensor candidates, at::Tensor retrive_index,
+                                           at::Tensor retrive_next_token, at::Tensor retrive_next_sibling,
+                                           at::Tensor uniform_samples, at::Tensor target_probs, at::Tensor draft_probs,
+                                           bool deterministic = true, int64_t cuda_stream = 0);
+
+void build_tree_kernel_efficient(at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
+                                 at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index,
+                                 at::Tensor retrive_next_token, at::Tensor retrive_next_sibling, int64_t topk,
+                                 int64_t depth, int64_t draft_token_num);
+
+void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
+                       at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index, int64_t topk,
+                       int64_t depth, int64_t draft_token_num);
