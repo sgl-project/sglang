@@ -24,6 +24,7 @@ if torch.version.hip is not None:
         gelu_tanh_and_mul,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
+        get_device_bdf,             # TODO (hubert), ok
         get_graph_buffer_ipc_meta,  # TODO (hubert), ok
         get_meta_buffer_ipc_handle, # TODO (hubert), ok
         init_custom_ar,             # TODO (hubert), ok
@@ -55,6 +56,7 @@ if torch.version.hip is not None:
         "gelu_tanh_and_mul",
         "gemma_fused_add_rmsnorm",
         "gemma_rmsnorm",
+        "get_device_bdf",             # TODO (hubert), ok
         "get_graph_buffer_ipc_meta",  # TODO (hubert), ok
         "get_meta_buffer_ipc_handle", # TODO (hubert), ok
         "init_custom_ar",             # TODO (hubert), ok

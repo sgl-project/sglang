@@ -33,8 +33,8 @@ if is_hip():
         from amdsmi import (AmdSmiException,
                             amdsmi_get_processor_handle_from_bdf, amdsmi_init,
                             amdsmi_shut_down, amdsmi_topo_get_link_type)
-        except ImportError as e:
-        logger.warning("Failed to import amdsmi with %r", e)
+    except ImportError as e:
+    logger.warning("Failed to import amdsmi with %r", e)
     
 try:
     if ops.use_vllm_custom_allreduce:
@@ -77,7 +77,7 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
     """
     if is_hip():
         # get devices' BDF in order to get XGMI link info from  amdsmi
-        bdf = custom_ar.get_device_bdf(torch.cuda.current_device())
+        bdf = ops.get_device_bdf(torch.cuda.current_device())
         all_bdf = [0] * world_size
         dist.all_gather_object(all_bdf, bdf)
         hsmi = [None] * world_size

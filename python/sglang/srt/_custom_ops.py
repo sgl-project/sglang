@@ -26,7 +26,6 @@ if not is_hpu():
         except ImportError as e:
             logger.warning("Failed to import from custom_ar with %r", e)
 
-
 def hint_on_error(fn):
 
     @functools.wraps(fn)
@@ -132,6 +131,8 @@ else:
 
         def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
             return sgl_kernel.ops.get_meta_buffer_ipc_handle(inp)
+        def get_device_bdf(dev :int) -> List[int]:
+            return sgl_kernel.ops.get_device_bdf(inp)
     else:
         # custom ar
         def init_custom_ar(
