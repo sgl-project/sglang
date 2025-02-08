@@ -337,7 +337,7 @@ class RadixCache(BasePrefixCache):
         while stack:
             current_node = stack.pop()
             total_size += len(current_node.value)
-            for child in node.children.values():
+            for child in current_node.children.values():
                 if child.evicted:
                     continue
                 stack.append(child)
