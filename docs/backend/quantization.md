@@ -2,7 +2,7 @@
 
 `SGLang` support various quantization methods, including online dynamic quantization and offline quantization.
 
-Online quantization computes weight scaling stats(max/min) dynamically at runtime, as examplified by the delayed scaling in NVIDIA FP8 training. For inference this quantizes the model once on loading.
+Online quantization computes weight scaling stats(max/min) dynamically at runtime, as examplified by the [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html#Mixed-precision-training-with-FP8) in NVIDIA FP8 training. For inference this quantizes the model once on loading.
 
 Offline quantization saves pre-quantized model weights and loads during inference. This is useful for methods requiring pre-computed stats such as AWQ, which collects activation stats from the pre-training set.
 
@@ -10,7 +10,7 @@ Please visit [here](https://huggingface.co/collections/neuralmagic) for some pop
 
 ## Online Quantization
 
-> Note: Although we support online quantization, we recommend users to use quantized models.
+> Note: Although we support online quantization, we recommend users to use offline quantized (by community or officially) models.
 
 To enable online quantization, you can simply specify `--quantization` in the command line. For example, if you want to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
@@ -21,7 +21,7 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-Our team is working on supporting more quantization methods. We will soon support other quantization methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
+Our team is working on supporting more online quantization methods. We will soon support methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
 
 We also support quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
@@ -46,6 +46,12 @@ python3 -m sglang.launch_server \
 
 
 ## Offline Quantization
+To load already quantized models, simply load the model weights and config.
+```bash
+python3 -m sglang.launch_server \
+    --model-path hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4 \
+    --port 30000 --host 0.0.0.0
+```
 
 To do offline quantization for your model, firstly you need to install [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:
 
@@ -90,7 +96,7 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-**Note: If the model has already quantized offline, please **do not** add `--quantization` argument when starting the engine.**
+If the model has been quantized offline, there's no need to add `--quantization` argument when starting the engine. The quantization method will be parsed from the downloaded huggingface config.
 
 
 ## Reference
