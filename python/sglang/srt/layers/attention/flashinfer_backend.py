@@ -99,7 +99,6 @@ class FlashInferAttnBackend(AttentionBackend):
             device=model_runner.device,
         )
         max_bs = model_runner.req_to_token_pool.size
-        print(f"max batch size = {max_bs}")
         # mixed mode: one fore prefill, one for decode
         self.kv_indptr = [
             torch.zeros(
@@ -520,9 +519,6 @@ class FlashInferAttnBackend(AttentionBackend):
         q_extend, q_decode = q[:extend_tokens], q[extend_tokens:]
         k_extend, k_decode = k[:extend_tokens], k[extend_tokens:]
         v_extend, v_decode = v[:extend_tokens], v[extend_tokens:]
-
-        print(f"q_extend={q_extend.shape}, q_decode={q_decode.shape}")
-        print(f"k_extend={k_extend.shape}, k_decode={k_decode.shape}")
 
         out_cache_loc_extend = forward_batch.out_cache_loc[:extend_tokens]
         out_cache_loc_decode = forward_batch.out_cache_loc[extend_tokens:]

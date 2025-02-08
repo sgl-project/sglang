@@ -846,7 +846,6 @@ class ScheduleBatch:
         print(f"seq_lens: {self.seq_lens}")
         print(f"seq_lens_sum: {self.seq_lens_sum}")
         print(f"batch_size: {self.batch_size()}")
-        print(f"self.out_cache_loc: {self.out_cache_loc}")
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
@@ -1103,9 +1102,6 @@ class ScheduleBatch:
         print(f"self.seq_lens: {self.seq_lens}, other.seq_lens: {other.seq_lens}")
         print(
             f"self.seq_lens_sum: {self.seq_lens_sum}, other.seq_lens_sum: {other.seq_lens_sum}"
-        )
-        print(
-            f"self.out_cache_loc: {self.out_cache_loc}, other.out_cache_loc: {other.out_cache_loc}"
         )
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
