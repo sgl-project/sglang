@@ -296,9 +296,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         if (
             get_tensor_model_parallel_world_size() > 1
-            and self.load_config.tp_checkpoint_name_pattern
+            and self.load_config.name_pattern_tp_checkpoint
         ):
-            ranked = f"{self.load_config.tp_checkpoint_name_pattern}{get_tensor_model_parallel_rank()}"
+            ranked = f"{self.load_config.name_pattern_tp_checkpoint}{get_tensor_model_parallel_rank()}"
             hf_weights_files = [f for f in hf_weights_files if ranked in f]
 
         return hf_folder, hf_weights_files, use_safetensors

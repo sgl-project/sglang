@@ -49,7 +49,7 @@ class LoadConfig:
     download_dir: Optional[str] = None
     model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
     ignore_patterns: Optional[Union[List[str], str]] = None
-    tp_checkpoint_name_pattern: Optional[str] = None
+    name_pattern_tp_checkpoint: Optional[str] = None
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
