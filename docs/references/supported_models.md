@@ -54,6 +54,24 @@ To support a new model in SGLang, you only need to add a single file under [SGLa
 You can learn from existing model implementations and create new files for the new models.
 For most models, you should be able to find a similar model to start with (e.g., starting from Llama).
 
+## How to Support a New vision LLM
+
+To support a new vision-language model (vLM) in SGLang, there are several key components in addition to the standard
+LLM:
+
+1. **Register your new model as multimodal**: Extend `is_multimodal_model` in [`model_config.py`](https://github.com/sgl-project/sglang/blob/b8318aec48f6413b5e4286bc28ba17b62063df87/python/sglang/srt/configs/model_config.py#L4) to return True for your model.
+2. **Process Images**:
+
+- Create a new `ImageProcessor` class that inherits from `BaseImageProcessor`
+- Register this processor as your model's dedicated processor. See `image_processor.py` for more details.
+
+3. **Handle Image Tokens**: Implement a `pad_input_ids` function for your new model, in which image tokens in the prompt
+   should be expanded and replaced with image-hashes, so that SGLang can recognize different images for `RadixAttention`.
+4. Replace Multi-headed `Attention` of ViT with SGLang's `VisionAttention`.
+
+You can refer [Qwen2VL](https://github.com/sgl-project/sglang/blob/b8318aec48f6413b5e4286bc28ba17b62063df87/python/sglang/srt/models/qwen2_vl.py) or other vLMs. These models demonstrate how to properly handle both
+visual and textual inputs.
+
 ### Test the correctness
 
 #### Interactive debugging
