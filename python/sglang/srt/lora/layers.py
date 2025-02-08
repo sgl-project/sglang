@@ -107,16 +107,14 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
         output_dim = base_output.shape[-1]
         lora_output = torch.empty_like(base_output)
-        lora_output[:, :output_dim] = self.lora_backend.run_lora_b_sgemm(
-            x=lora_a_output[:, 0 : self.lora_rank].contiguous(),
+        lora_output[:, : output_dim // 2] = self.lora_backend.run_lora_b_sgemm(
+            x=lora_a_output[:, : self.lora_rank].contiguous(),
             weights=self.B_buffer[0],
         )
 
-        lora_output[:, output_dim : 2 * output_dim] = (
-            self.lora_backend.run_lora_b_sgemm(
-                x=lora_a_output[:, self.lora_rank : 2 * self.lora_rank].contiguous(),
-                weights=self.B_buffer[1],
-            )
+        lora_output[:, output_dim // 2 :] = self.lora_backend.run_lora_b_sgemm(
+            x=lora_a_output[:, self.lora_rank :].contiguous(),
+            weights=self.B_buffer[1],
         )
 
         return base_output + lora_output * self.scaling

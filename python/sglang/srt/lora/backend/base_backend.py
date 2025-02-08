@@ -46,10 +46,11 @@ class BaseLoRABackend:
 
         Args:
              x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
-             weights: a set of lora weights with shape (num_lora, r, input_dim), here r is lora rank
+             weights: a set of lora weights with shape (num_lora, c * r, input_dim),
+                      here r is lora rank, c is a multiplier for stacked modules (e.g., c=3 for qkv_proj, c=2 for gate_up_proj)
                       usually input_dim is much larger than r
         Returns:
-             result with shape (s, r)
+             result with shape (s, c * r)
         """
         pass
 

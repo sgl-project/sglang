@@ -21,15 +21,15 @@ from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l
 
 LORA_SETS = [
-    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
     # {"base": "meta-llama/Llama-2-7b-hf",
     #  "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     #  "prefill_tolerance": 1e-1,
     #  "decode_tolerance": 1e-1},
-    # {
-    #     "base": "meta-llama/Llama-3.1-8B-Instruct",
-    #     "loras": ["reissbaker/llama-3.1-8b-abliterated-lora"],
-    # }
+    {
+        "base": "meta-llama/Llama-3.1-8B-Instruct",
+        "loras": ["reissbaker/llama-3.1-8b-abliterated-lora"],
+    }
 ]
 TORCH_DTYPES = [torch.float16]
 
@@ -165,7 +165,7 @@ class TestLoRABackend(unittest.TestCase):
 
             # compare output strings
             srt_output_str = srt_outputs.output_strs[i].strip(" ")
-            hf_output_str = hf_outputs.output_strs[i]
+            hf_output_str = hf_outputs.output_strs[i].strip(" ")
             print(f"srt_output_str={srt_output_str}")
             print(f"hf_output_str={hf_output_str}")
             rouge_l_scores = calculate_rouge_l([srt_output_str], [hf_output_str])
