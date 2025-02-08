@@ -2,7 +2,7 @@ from typing import Tuple, Union
 
 import torch
 
-from sglang.srt.lora.lora import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 def get_fuse_output_scaling_add_from_name(name: str) -> bool:

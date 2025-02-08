@@ -21,15 +21,15 @@ from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l
 
 LORA_SETS = [
-    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
     # {"base": "meta-llama/Llama-2-7b-hf",
     #  "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     #  "prefill_tolerance": 1e-1,
     #  "decode_tolerance": 1e-1},
-    {
-        "base": "meta-llama/Llama-3.1-8B-Instruct",
-        "loras": ["reissbaker/llama-3.1-8b-abliterated-lora"],
-    }
+    # {
+    #     "base": "meta-llama/Llama-3.1-8B-Instruct",
+    #     "loras": ["reissbaker/llama-3.1-8b-abliterated-lora"],
+    # }
 ]
 TORCH_DTYPES = [torch.float16]
 

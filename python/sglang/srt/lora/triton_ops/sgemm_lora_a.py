@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.lora import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 @triton.jit

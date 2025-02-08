@@ -16,19 +16,20 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend import BaseLoRABackend
-from sglang.srt.lora.lora import LoRAAdapter, LoRABatchInfo, get_lora_layer
+from sglang.srt.lora.backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.lora.layers import get_lora_layer
+from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    LoRABatchInfo,
     LoRAType,
-    get_backend_from_name,
     get_customized_names_from_hf_names,
     get_layer_id,
     get_stacked_name,

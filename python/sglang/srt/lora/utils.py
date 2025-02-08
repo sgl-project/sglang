@@ -1,37 +1,34 @@
 import re
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Set, Tuple
 
 import torch
 
 from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend import (
-    BaseLoRABackend,
-    FlashInferLoRABackend,
-    TritonLoRABackend,
-)
+
+
+@dataclass
+class LoRABatchInfo:
+    # Batch size
+    bs: int
+
+    # Lengths of each sequence in shape (bs,)
+    seg_lens: torch.Tensor
+
+    # Indice pointers of each sequence in shape (bs + 1, )
+    seg_indptr: torch.Tensor
+
+    # Maximum sequence length of current batch
+    max_len: int
+
+    # The index of lora adapter used by each sequence, in shape (bs,)
+    weight_indices: torch.Tensor
 
 
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
-
-
-def get_backend_from_name(name: str) -> BaseLoRABackend:
-    """
-    Get corresponding backend class from backend's name
-    """
-    backend_mapping = {
-        "triton": TritonLoRABackend,
-        "flashinfer": FlashInferLoRABackend,
-    }
-
-    if name in backend_mapping:
-        return backend_mapping[name]
-
-    raise Exception(
-        f"No supported lora backend called {name}. It should be one of {list(backend_mapping.keys())}"
-    )
 
 
 def get_layer_id(name: str) -> int:

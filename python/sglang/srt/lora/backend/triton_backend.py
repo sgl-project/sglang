@@ -1,12 +1,12 @@
 import torch
 
 from sglang.srt.lora.backend import BaseLoRABackend
-from sglang.srt.lora.lora import LoRABatchInfo
 from sglang.srt.lora.triton_ops import (
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 class TritonLoRABackend(BaseLoRABackend):
