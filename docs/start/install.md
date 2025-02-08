@@ -38,6 +38,15 @@ cd ..
 pip install -e "python[all_hip]"
 ```
 
+Note: To Intel GPU, do following instead:
+
+```
+git clone -b v0.4.2.post3 https://github.com/sgl-project/sglang.git
+cd sglang
+pip install --upgrade pip
+pip install -e "python[all_xpu]"
+```
+
 ## Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
