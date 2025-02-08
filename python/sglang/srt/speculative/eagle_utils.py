@@ -4,6 +4,7 @@ import dataclasses
 from typing import TYPE_CHECKING, List
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -11,7 +12,14 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.build_eagle_tree import build_tree_kernel
+from sglang.srt.speculative.build_eagle_tree import (
+    build_tree_kernel,
+    build_tree_kernel_efficient,
+)
+from sglang.srt.utils import is_cuda_available
+
+if is_cuda_available():
+    from sgl_kernel import tree_speculative_sampling_target_only
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -163,6 +171,10 @@ class EagleVerifyInput:
     retrive_cum_len: torch.Tensor
     draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
+    spec_steps: int = 0
+    retrive_next_token: torch.Tensor = None
+    retrive_next_sibling: torch.Tensor = None
+    non_greedy_retrive_index: torch.Tensor = None
 
     @classmethod
     def create(
@@ -190,6 +202,19 @@ class EagleVerifyInput:
                 num_verify_token,
             )
         )
+        _, _, non_greedy_retrive_index, retrive_next_token, retrive_next_sibling, _ = (
+            build_tree_kernel_efficient(
+                verified_id,
+                score_list,
+                token_list,
+                parents_list,
+                seq_lens,
+                seq_lens_sum,
+                topk,
+                spec_steps,
+                num_verify_token,
+            )
+        )
         return cls(
             draft_tokens,
             tree_mask,
@@ -198,6 +223,10 @@ class EagleVerifyInput:
             retrive_cum_len,
             num_verify_token,
             CaptureHiddenMode.FULL,
+            spec_steps,
+            retrive_next_token,
+            retrive_next_sibling,
+            non_greedy_retrive_index,
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch):
@@ -254,9 +283,9 @@ class EagleVerifyInput:
             [self.draft_token, torch.full([1], -1, dtype=torch.int32, device="cuda")],
             dim=-1,
         )
-        candidates = draft_token[self.retrive_index]
         if batch.sampling_info.is_all_greedy:
             # temp == 0
+            candidates = draft_token[self.retrive_index]
             bs = self.retrive_cum_len.numel() - 1
             predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             predict = torch.cat(
@@ -287,10 +316,13 @@ class EagleVerifyInput:
             )
         else:
             # temp > 0
-            bs = self.retrive_index.shape[0]
+            candidates = draft_token[self.non_greedy_retrive_index]
+            bs = self.non_greedy_retrive_index.shape[0]
             predict_shape = list(logits_output.next_token_logits.shape)[:-1]
             predict_shape[-1] += 1
-            target_logits = logits_output.next_token_logits[self.retrive_index]
+            target_logits = logits_output.next_token_logits[
+                self.non_greedy_retrive_index
+            ]
             predict = torch.full(predict_shape, -1, dtype=torch.int32, device="cuda")
             accept_index = torch.full(
                 (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
@@ -307,18 +339,12 @@ class EagleVerifyInput:
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
                 candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
+                retrive_index=self.non_greedy_retrive_index.to(torch.int32),
                 retrive_next_token=self.retrive_next_token.to(torch.int32),
                 retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
                 uniform_samples=coins,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=global_server_args_dict[
-                    "speculative_accept_threshold_single"
-                ],
-                threshold_acc=global_server_args_dict[
-                    "speculative_accept_threshold_acc"
-                ],
                 deterministic=True,
             )
 
