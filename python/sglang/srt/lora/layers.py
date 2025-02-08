@@ -61,9 +61,28 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
-    def apply_lora(self, output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        # FIXME Implement this!
-        return output
+    def set_lora_info(
+        self,
+        A_buffer: torch.Tensor,
+        B_buffer: torch.Tensor,
+    ):
+        self.set_lora = True
+        self.A_buffer = A_buffer
+        self.B_buffer = B_buffer
+
+    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
+        lora_output = self.lora_backend.run_lora_b_sgemm(
+            lora_a_output,
+            self.B_buffer[0],
+            **backend_kwargs,
+        )
+        return (
+            lora_output
+            if self.lora_backend.fuse_output_scaling_add
+            else base_output + lora_output * self.scaling
+        )
 
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in ColumnParallelLinear
