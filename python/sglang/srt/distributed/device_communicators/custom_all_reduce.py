@@ -30,14 +30,14 @@ if is_cuda():
 
 if is_hip():
     try:
-        from amdsmi import (AmdSmiException,
-                            amdsmi_get_processor_handle_from_bdf, amdsmi_init,
-                            amdsmi_shut_down, amdsmi_topo_get_link_type)
+        from amdsmi import (AmdSmiException, amdsmi_get_gpu_board_info,
+                    amdsmi_get_processor_handles, amdsmi_init,
+                    amdsmi_shut_down, amdsmi_topo_get_link_type)
     except ImportError as e:
-    logger.warning("Failed to import amdsmi with %r", e)
+        logger.warning("Failed to import amdsmi with %r", e)
     
 try:
-    if ops.use_vllm_custom_allreduce:
+    if ops.use_vllm_custom_allreduce and not is_hip():
         ops.meta_size()
     else:
         import sgl_kernel
@@ -58,7 +58,7 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
         if torch.version.hip:
             try:
                 amdsmi_init()
-                yield
+                return fn(*args, **kwargs)
             finally:
                 amdsmi_shut_down()
         else:
@@ -69,33 +69,33 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
                 pynvml.nvmlShutdown()
     return wrapper
 
-
 @with_nvml_context
 def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
-    """
-    query if the set of gpus are fully connected by nvlink (1 hop)
-    """
     if is_hip():
-        # get devices' BDF in order to get XGMI link info from  amdsmi
-        bdf = ops.get_device_bdf(torch.cuda.current_device())
-        all_bdf = [0] * world_size
-        dist.all_gather_object(all_bdf, bdf)
-        hsmi = [None] * world_size
-        try:
-            for i in range(world_size):
-                bdf_str = str(bytes(all_bdf[i]).decode("utf-8"))
-                hsmi[i] = amdsmi_get_processor_handle_from_bdf(bdf_str)
-            for i in range(world_size):
-                if i != 0:
-                    link_type = amdsmi_topo_get_link_type(hsmi[0], hsmi[i])
-                    # type is 2 for XGMI
-                    if link_type['hops'] != 1 or link_type['type'] != 2:
+        """
+        query if the set of gpus are fully connected by xgmi (1 hop)
+        """
+        handles = [
+            amdsmi_get_processor_handles()[i] for i in physical_device_ids
+        ]
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i < j:
+                    try:
+                        link_type = amdsmi_topo_get_link_type(
+                            handle, peer_handle)
+                        # type is 2 for XGMI
+                        if link_type["hops"] != 1 or link_type["type"] != 2:
+                            return False
+                    except AmdSmiException as error:
+                        logger.error("AMD 1 hop XGMI detection failed.",
+                                     exc_info=error)
                         return False
-        except AmdSmiException as e:
-            logger.warning(e)
-            return False
         return True
     else:
+        """
+        query if the set of gpus are fully connected by nvlink (1 hop)
+        """
         handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
@@ -163,8 +163,6 @@ class CustomAllreduce:
         if not custom_ar:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
-            print("=========== TODO (hubert): This should not be called ======")
-            assert False
             return
 
         self.group = group
@@ -249,7 +247,7 @@ class CustomAllreduce:
         self.world_size = world_size
         self.full_nvlink = full_nvlink
 
-        if ops.use_vllm_custom_allreduce:
+        if ops.use_vllm_custom_allreduce and not is_hip():
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
@@ -273,7 +271,6 @@ class CustomAllreduce:
             ops.register_buffer(self._ptr, self.buffer_ptrs)
         else:
             if is_hip():
-                # TODO (hubert): start to implement custom allreduce!
                 # meta data buffers need to be "uncached" for signal on MI200
                 self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
                 self.buffer = torch.empty(max_size,
@@ -285,6 +282,9 @@ class CustomAllreduce:
                     0,  # offset of base ptr
                 )
                 handles, offsets = self._gather_ipc_meta(shard_data)
+                self.rank_data = torch.empty(8 * 1024 * 1024,
+                                     dtype=torch.uint8,
+                                     device=self.device)
                 self._ptr = ops.init_custom_ar(self.meta, self.rank_data, handles,
                                                offsets, rank, self.full_nvlink)
                 self.register_buffer(self.buffer)
