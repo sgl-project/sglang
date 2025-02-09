@@ -446,11 +446,12 @@ def generate_chat_conv(
                 if num_image_url > 1:
                     image_token = conv.image_token
                 else:
-                    image_token = (
-                        conv.image_token + "\n"
-                        if conv.name != "qwen2-vl"
-                        else conv.image_token
-                    )
+                    if conv.name != "deepseek":
+                        image_token = (
+                            conv.image_token + "\n"
+                            if conv.name != "qwen2-vl"
+                            else conv.image_token
+                        )
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
@@ -458,7 +459,8 @@ def generate_chat_conv(
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: Only works for llava
-                        real_content += image_token
+                        if conv.name != "deepseek":
+                            real_content += image_token
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
