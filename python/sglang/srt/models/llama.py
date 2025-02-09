@@ -206,6 +206,7 @@ class LlamaDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
+        self.layer_id = layer_id
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -245,15 +246,31 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if forward_batch.forward_mode.is_decode() and self.layer_id == 0:
+            print("res:")
+            print(residual)
+            print(id(residual))
+            print(residual._version)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
 
+        if forward_batch.forward_mode.is_decode() and self.layer_id == 0:
+            print("res after attn:")
+            print(residual)
+            print(id(residual))
+            print(residual._version)
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        if forward_batch.forward_mode.is_decode() and self.layer_id == 0:
+            print("hidden_states after attn:")
+            print(hidden_states)
         return hidden_states, residual
 
 
