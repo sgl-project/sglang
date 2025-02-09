@@ -70,6 +70,8 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         super().__init__()
 
+        self.is_multimodal = model_runner.model_config.is_multimodal
+
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
@@ -213,8 +215,12 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            use_ragged = True
-            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            if self.is_multimodal:
+                use_ragged = False
+                extend_no_prefix = False
+            else:
+                use_ragged = True
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
