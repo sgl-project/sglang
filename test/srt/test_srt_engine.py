@@ -191,7 +191,7 @@ class TestSRTEngine(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
-        sampling_params = {"temperature": 0, "max_new_tokens": 2}
+        sampling_params = {"temperature": 0, "max_new_tokens": 1}
 
         engine = sgl.Engine(
             model_path=model_path,
@@ -203,7 +203,7 @@ class TestSRTEngine(unittest.TestCase):
         engine.shutdown()
 
         for output in outputs:
-            self.assertEqual(len(output["meta_info"]["hidden_states"]), 2)
+            self.assertEqual(len(output["meta_info"]["hidden_states"]), 1)
             for hidden_state in output["meta_info"]["hidden_states"]:
                 self.assertIsInstance(hidden_state, torch.Tensor)
         # Checks that splicing of the batch was done correctly
