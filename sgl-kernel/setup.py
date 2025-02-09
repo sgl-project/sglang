@@ -63,7 +63,6 @@ include_dirs = [
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
     "cublas",
-    "cublasLt",
     turbomind.resolve(),
     turbomind.resolve() / "src",
 ]
@@ -143,7 +142,7 @@ for flag in [
         pass
 
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
+libraries = ["c10", "torch", "torch_python", "cuda", "cublas"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
