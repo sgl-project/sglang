@@ -18,10 +18,10 @@
         "waves_per_eu": 0
     },
     "4": {
-        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_M": 32,
         "BLOCK_SIZE_N": 16,
         "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 4,
+        "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 0
