@@ -1,4 +1,5 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/device_communicators/custom_all_reduce.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce.py
+
 import ctypes
 import logging
 import os
@@ -6,7 +7,6 @@ from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, List, Optional, TypeVar, Union
 
-import pynvml
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -20,15 +20,25 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import cuda_device_count_stateless, is_cuda
 
+logger = logging.getLogger(__name__)
+
+if is_cuda():
+    try:
+        import pynvml
+    except ImportError as e:
+        logger.warning("Failed to import pynvml with %r", e)
+
 try:
-    ops.meta_size()
+    if ops.use_vllm_custom_allreduce:
+        ops.meta_size()
+    else:
+        import sgl_kernel
     custom_ar = True
 except Exception:
     # For AMD GPUs and CPUs
     custom_ar = False
 
 logger = logging.getLogger(__name__)
-
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -47,7 +57,7 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 @with_nvml_context
-def is_full_nvlink(cls, physical_device_ids: List[int]) -> bool:
+def is_full_nvlink(physical_device_ids: List[int]) -> bool:
     """
     query if the set of gpus are fully connected by nvlink (1 hop)
     """
@@ -175,9 +185,12 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        assert is_cuda()
+        if is_cuda():
+            assert is_cuda()
 
-        full_nvlink = is_full_nvlink(physical_device_ids)
+            full_nvlink = is_full_nvlink(physical_device_ids)
+        else:
+            full_nvlink = False
         if world_size > 2 and not full_nvlink:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
@@ -196,32 +209,64 @@ class CustomAllreduce:
             )
             return
 
-        self.disabled = False
-        # Buffers memory are owned by this Python class and passed to C++.
-        # Meta data composes of two parts: meta data for synchronization and a
-        # temporary buffer for storing intermediate allreduce results.
-        self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size, group=group
-        )
-        # This is a pre-registered IPC buffer. In eager mode, input tensors
-        # are first copied into this buffer before allreduce is performed
-        self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
-        # This is a buffer for storing the tuples of pointers pointing to
-        # IPC buffers from all ranks. Each registered tuple has size of
-        # 8*world_size bytes where world_size is at most 8. Allocating 8MB
-        # is enough for 131072 such tuples. The largest model I've seen only
-        # needs less than 10000 of registered tuples.
-        self.rank_data = torch.empty(
-            8 * 1024 * 1024, dtype=torch.uint8, device=self.device
-        )
         self.max_size = max_size
         self.rank = rank
         self.world_size = world_size
         self.full_nvlink = full_nvlink
-        self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.full_nvlink
-        )
-        ops.register_buffer(self._ptr, self.buffer_ptrs)
+
+        if ops.use_vllm_custom_allreduce:
+            # Buffers memory are owned by this Python class and passed to C++.
+            # Meta data composes of two parts: meta data for synchronization and a
+            # temporary buffer for storing intermediate allreduce results.
+            self.meta_ptrs = self.create_shared_buffer(
+                ops.meta_size() + max_size, group=group
+            )
+            # This is a pre-registered IPC buffer. In eager mode, input tensors
+            # are first copied into this buffer before allreduce is performed
+            self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+            # This is a buffer for storing the tuples of pointers pointing to
+            # IPC buffers from all ranks. Each registered tuple has size of
+            # 8*world_size bytes where world_size is at most 8. Allocating 8MB
+            # is enough for 131072 such tuples. The largest model I've seen only
+            # needs less than 10000 of registered tuples.
+            self.rank_data = torch.empty(
+                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+            )
+            self._ptr = ops.init_custom_ar(
+                self.meta_ptrs, self.rank_data, rank, self.full_nvlink
+            )
+            ops.register_buffer(self._ptr, self.buffer_ptrs)
+        else:
+            # From TensorRT-LLM getMaxRequiredWorkspaceSize
+            self.max_required_workspace_size = [16 * 1024 * 1024, 8 * 1024 * 1024]
+
+            # sizeof(uint32_t) * (MAX_ALL_REDUCE_BLOCKS + 2) * MAX_RANKS_PER_NODE;
+            self.barrier_max_size = 8 * (36 + 2) * 8
+
+            self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+            self.tmp_result_buffer_ptrs = self.create_shared_buffer(
+                max_size, group=group
+            )
+            self.rank_data_base = torch.empty(
+                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+            )
+            self.barrier_in_ptrs = self.create_shared_buffer(
+                self.barrier_max_size, group=group
+            )
+            self.barrier_out_ptrs = self.create_shared_buffer(
+                self.barrier_max_size, group=group
+            )
+
+            self._ptr = ops.init_custom_ar(
+                rank,
+                world_size,
+                self.rank_data_base,
+                self.buffer_ptrs,
+                self.tmp_result_buffer_ptrs,
+                self.barrier_in_ptrs,
+                self.barrier_out_ptrs,
+            )
+        self.disabled = False
 
     @staticmethod
     def create_shared_buffer(
@@ -300,12 +345,31 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        if self.world_size == 2 or self.full_nvlink:
-            return inp_size < self.max_size
+        if ops.use_vllm_custom_allreduce:
+            if self.world_size == 2 or self.full_nvlink:
+                return inp_size < self.max_size
+            return False
+
+        if self.world_size == 2:
+            return (
+                inp_size < self.max_size
+                and inp_size < self.max_required_workspace_size[0]
+            )
+
+        if self.full_nvlink:
+            return (
+                inp_size < self.max_size
+                and inp_size < self.max_required_workspace_size[1]
+            )
+
         return False
 
     def all_reduce(
-        self, inp: torch.Tensor, *, out: torch.Tensor = None, registered: bool = False
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor = None,
+        registered: bool = False,
     ):
         """Performs an out-of-place all reduce.
 
@@ -315,12 +379,15 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
+        if ops.use_vllm_custom_allreduce:
+            if registered:
+                ops.all_reduce(self._ptr, inp, out, 0, 0)
+            else:
+                ops.all_reduce(
+                    self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
+                )
         else:
-            ops.all_reduce(
-                self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
-            )
+            ops.all_reduce(self._ptr, inp, out)
         return out
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
@@ -336,17 +403,20 @@ class CustomAllreduce:
                 # allreduce is out-of-place.
                 return torch.empty_like(input)
         else:
-            # Note: outside of cuda graph context, custom allreduce incurs a
-            # cost of cudaMemcpy, which should be small (<=1% of overall
-            # latency) compared to the performance gain of using custom kernels
             return self.all_reduce(input, registered=False)
 
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)
+            if ops.use_vllm_custom_allreduce:
+                self.free_shared_buffer(self.meta_ptrs)
+                self.free_shared_buffer(self.buffer_ptrs)
+            else:
+                self.free_shared_buffer(self.buffer_ptrs)
+                self.free_shared_buffer(self.tmp_result_buffer_ptrs)
+                self.free_shared_buffer(self.barrier_in_ptrs)
+                self.free_shared_buffer(self.barrier_out_ptrs)
             self._ptr = 0
-            self.free_shared_buffer(self.meta_ptrs)
-            self.free_shared_buffer(self.buffer_ptrs)
 
     def __del__(self):
         self.close()

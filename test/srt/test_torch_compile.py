@@ -23,7 +23,7 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile"],
+            other_args=["--enable-torch-compile", "--cuda-graph-max-bs", "4"],
         )
 
     @classmethod

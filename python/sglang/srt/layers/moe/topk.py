@@ -17,6 +17,8 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.utils import get_compiler_backend
+
 
 def fused_topk_native(
     hidden_states: torch.Tensor,
@@ -24,7 +26,9 @@ def fused_topk_native(
     topk: int,
     renormalize: bool,
 ):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert (
+        hidden_states.shape[0] == gating_output.shape[0]
+    ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
     M, _ = hidden_states.shape
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device
@@ -72,6 +76,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek-V2 model
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -106,6 +111,7 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def biased_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -180,7 +186,7 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
             )
-    elif torch_native:
+    elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,

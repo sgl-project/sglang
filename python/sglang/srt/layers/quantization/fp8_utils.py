@@ -1,8 +1,8 @@
 from typing import List, Optional, Tuple
 
 import torch
-from vllm.model_executor.parameter import RowvLLMParameter, _ColumnvLLMParameter
 
+from sglang.srt.layers.parameter import RowvLLMParameter, _ColumnvLLMParameter
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,

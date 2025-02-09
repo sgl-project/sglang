@@ -483,7 +483,6 @@ def generate_chat_conv(
 
     # Add a blank message for the assistant.
     conv.append_message(conv.roles[1], None)
-
     return conv
 
 
@@ -618,5 +617,18 @@ register_conv_template(
         sep2="<｜end▁of▁sentence｜>",
         stop_token_ids=[100001],
         stop_str=["User:", "<｜end▁of▁sentence｜>"]
+    )
+)
+# Reference: https://huggingface.co/openbmb/MiniCPM-V-2_6#usage
+register_conv_template(
+    Conversation(
+        name="minicpmv",
+        system_message="You are a helpful assistant",
+        system_template="<|im_start|>system\n{system_message}.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
     )
 )

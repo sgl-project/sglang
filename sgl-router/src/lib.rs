@@ -17,6 +17,8 @@ struct Router {
     port: u16,
     worker_urls: Vec<String>,
     policy: PolicyType,
+    worker_startup_timeout_secs: u64,
+    worker_startup_check_interval: u64,
     cache_threshold: f32,
     balance_abs_threshold: usize,
     balance_rel_threshold: f32,
@@ -34,6 +36,8 @@ impl Router {
         policy = PolicyType::RoundRobin,
         host = String::from("127.0.0.1"),
         port = 3001,
+        worker_startup_timeout_secs = 300,
+        worker_startup_check_interval = 10,
         cache_threshold = 0.50,
         balance_abs_threshold = 32,
         balance_rel_threshold = 1.0001,
@@ -47,6 +51,8 @@ impl Router {
         policy: PolicyType,
         host: String,
         port: u16,
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval: u64,
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
@@ -60,6 +66,8 @@ impl Router {
             port,
             worker_urls,
             policy,
+            worker_startup_timeout_secs,
+            worker_startup_check_interval,
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
@@ -72,9 +80,17 @@ impl Router {
 
     fn start(&self) -> PyResult<()> {
         let policy_config = match &self.policy {
-            PolicyType::Random => router::PolicyConfig::RandomConfig,
-            PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
+            PolicyType::Random => router::PolicyConfig::RandomConfig {
+                timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
+            },
+            PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig {
+                timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
+            },
             PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
+                timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,
@@ -93,10 +109,9 @@ impl Router {
                 max_payload_size: self.max_payload_size,
             })
             .await
-            .unwrap();
-        });
-
-        Ok(())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
     }
 }
 

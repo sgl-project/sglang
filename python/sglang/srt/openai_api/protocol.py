@@ -180,6 +180,7 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_params: Optional[Dict] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -261,7 +262,7 @@ class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: str
+    name: Optional[str] = None
     parameters: Optional[object] = None
 
 
@@ -275,7 +276,7 @@ class Tool(BaseModel):
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
-    name: str
+    name: Optional[str] = None
 
 
 class ToolChoice(BaseModel):
@@ -322,13 +323,14 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_params: Optional[Dict] = None
 
 
 class FunctionResponse(BaseModel):
     """Function response."""
 
-    name: str
-    arguments: str
+    name: Optional[str] = None
+    arguments: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -365,6 +367,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
