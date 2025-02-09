@@ -247,11 +247,11 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if forward_batch.forward_mode.is_decode() and self.layer_id == 0:
-            print("res:")
-            print(residual)
-            print(id(residual))
-            print(residual._version)
+        # if forward_batch.forward_mode.is_decode() and self.layer_id == 0:
+        #     print("res:")
+        #     print(residual)
+        #     print(id(residual))
+        #     print(residual._version)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -259,11 +259,11 @@ class LlamaDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        if forward_batch.forward_mode.is_decode() and self.layer_id == 0:
-            print("res after attn:")
-            print(residual)
-            print(id(residual))
-            print(residual._version)
+        # if forward_batch.forward_mode.is_decode() and self.layer_id == 0:
+        #     print("res after attn:")
+        #     print(residual)
+        #     print(id(residual))
+        #     print(residual._version)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)

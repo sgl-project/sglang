@@ -56,6 +56,8 @@ class TritonAttnBackend(AttentionBackend):
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
         )
 
+        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -144,7 +146,9 @@ class TritonAttnBackend(AttentionBackend):
                         self.req_to_token,
                     )
                 )
-                seq_mask_len = forward_batch.extend_seq_lens * forward_batch.seq_lens
+                seq_mask_len = self.num_draft_tokens * (
+                    forward_batch.seq_lens + self.num_draft_tokens
+                )
                 mask_indptr = self.mask_indptr
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
                 mask_indptr = mask_indptr[: bs + 1]
