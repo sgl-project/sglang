@@ -1,3 +1,18 @@
+# Copyright 2025 SGLang Team. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import multiprocessing
 import os
 import sys
@@ -48,7 +63,6 @@ include_dirs = [
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
     "cublas",
-    "cublasLt",
     turbomind.resolve(),
     turbomind.resolve() / "src",
 ]
@@ -84,6 +98,8 @@ sources = [
     "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
     "src/sgl-kernel/csrc/fused_add_rms_norm_kernel.cu",
+    "src/sgl-kernel/csrc/eagle_utils.cu",
+    "src/sgl-kernel/csrc/speculative_sampling.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
@@ -126,7 +142,7 @@ for flag in [
         pass
 
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
+libraries = ["c10", "torch", "torch_python", "cuda", "cublas"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
