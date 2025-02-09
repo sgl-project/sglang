@@ -101,6 +101,5 @@ If the model has been quantized offline, there's no need to add `--quantization`
 
 ## Reference
 
-
 - [torchao](https://github.com/pytorch/ao)
 
