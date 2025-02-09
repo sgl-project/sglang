@@ -925,11 +925,6 @@ class FlashInferMultiStepDraftBackend:
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len
-        self.kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
-            dtype=torch.int32,
-            device="cuda",
-        )
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
 
