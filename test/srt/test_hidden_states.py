@@ -1,4 +1,3 @@
-
 """
 Usage:
 python3 test_hidden_states.py
@@ -10,6 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
+
 
 class TestHiddenState(unittest.TestCase):
     def test_return_hidden_states(self):
