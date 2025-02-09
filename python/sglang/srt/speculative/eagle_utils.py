@@ -649,6 +649,7 @@ def generate_draft_decode_kv_indices(
     tl.store(kv_indptr + zid, base + zid * iters)
 
 
+@torch.compile
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,

@@ -191,6 +191,13 @@ class EAGLEWorker(TpModelWorker):
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
+        print("score_list")
+        print(score_list)
+        print("token_list")
+        print(token_list)
+        print("parents_list")
+        print(parents_list)
+
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
             score_list,
