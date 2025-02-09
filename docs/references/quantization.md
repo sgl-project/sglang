@@ -104,4 +104,3 @@ If the model has been quantized offline, there's no need to add `--quantization`
 
 - [torchao](https://github.com/pytorch/ao)
 
-- [llm-compressor](https://github.com/vllm-project/llm-compressor/)
