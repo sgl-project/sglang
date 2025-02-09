@@ -9,7 +9,7 @@ on:
     branches:
       - main
     paths:
-      - sgl-kernel/version.py
+      - sgl-kernel/src/sgl-kernel/version.py
 
 jobs:
   build-wheels:
