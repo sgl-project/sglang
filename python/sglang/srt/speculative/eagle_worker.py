@@ -185,6 +185,7 @@ class EAGLEWorker(TpModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.server_args.speculative_num_draft_tokens,
+            batch.sampling_info.is_all_greedy,
         )
 
         # Free cache locations
