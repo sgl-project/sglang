@@ -101,7 +101,6 @@ If the model has been quantized offline, there's no need to add `--quantization`
 
 ## Reference
 
-- [quantization document of vllm](https://docs.vllm.ai/en/latest/quantization/fp8.html)
 
 - [torchao](https://github.com/pytorch/ao)
 
