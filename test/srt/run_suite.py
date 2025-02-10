@@ -46,6 +46,7 @@ suites = {
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",
+        "test_hidden_states.py",
         "test_update_weights_from_disk.py",
         "test_update_weights_from_tensor.py",
         "test_vision_chunked_prefill.py",
@@ -53,7 +54,6 @@ suites = {
         "test_vision_openai_server.py",
         "test_w8a8_quantization.py",
         "test_fp8_kernel.py",
-        "test_hidden_states.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
