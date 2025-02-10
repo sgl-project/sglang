@@ -821,8 +821,14 @@ def pytorch_profile(name, func, *args, data_size=-1):
     """
     global step_counter
     os.makedirs("trace", exist_ok=True)
+    activities = [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ]
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        activities.append(torch.profiler.ProfilerActivity.HPU)
     with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        activities=activities,
         # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
         # on_trace_ready=tensorboard_trace_handler('./log_dir'),
         record_shapes=True,

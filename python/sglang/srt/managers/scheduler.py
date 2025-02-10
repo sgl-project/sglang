@@ -1661,6 +1661,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
         if activities is None:
             activities = ["CPU", "GPU"]
+            if self.device == "hpu":
+                activities.append["HPU"]
 
         self.torch_profiler_output_dir = output_dir
         self.torch_profiler_activities = activities
@@ -1673,6 +1675,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+        if self.device == "hpu":
+            activity_map["HPU"] = torch.profiler.ProfilerActivity.HPU
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
