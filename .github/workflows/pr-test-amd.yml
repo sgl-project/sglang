@@ -57,7 +57,7 @@ jobs:
           docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_eval_accuracy_large.py
 
   mla-test-1-gpu-amd:
-    if: github.repository == 'sgl-project/sglang' && github.event.pull_request.draft == false
+    if: github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
