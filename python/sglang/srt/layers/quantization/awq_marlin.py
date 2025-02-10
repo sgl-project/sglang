@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn import Parameter
-
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import (

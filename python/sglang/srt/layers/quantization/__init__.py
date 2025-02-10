@@ -19,11 +19,11 @@ from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
+from sglang.srt.layers.quantization.awq_marlin import AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.layers.quantization.awq_marlin import AWQMarlinConfig
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -73,13 +73,12 @@ def gptq_get_quant_method(self, layer, prefix):
 
 
 def awq_get_quant_method(self, layer, prefix):
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.quantization.awq_marlin import (
         AWQMarlinLinearMethod,
         AWQMoEMethod,
     )
-
-    from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return AWQMarlinLinearMethod(self)
