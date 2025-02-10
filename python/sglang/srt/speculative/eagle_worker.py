@@ -234,6 +234,10 @@ class EAGLEWorker(TpModelWorker):
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
 
+            # we don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+            if i == self.speculative_num_steps - 1:
+                break
+
             # Set inputs
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[
