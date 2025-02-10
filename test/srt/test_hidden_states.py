@@ -51,12 +51,16 @@ class TestHiddenState(unittest.TestCase):
                     ),
                     output_hidden_states=True,
                 )
+            print("=== HF Hiddens ===")
+            print(hf_out["hidden_states"][-1][0])
             sg_hidden_states = torch.cat(
                 [
                     i.unsqueeze(0) if len(i.shape) == 1 else i
                     for i in output["meta_info"]["hidden_states"]
                 ]
             ).to("cuda")
+            print("=== SRT Hiddens ===")
+            print(sg_hidden_states)
 
             self.assertTrue(
                 torch.allclose(
