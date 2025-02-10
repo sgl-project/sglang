@@ -60,6 +60,19 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "Tensor");
   m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
 
+  // CUTLASS nvfp4 block scaled GEMM
+  m.def(
+      "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
+      "                      Tensor block_scale_a, Tensor block_scale_b,"
+      "                      Tensor alpha) -> ()");
+  m.impl("cutlass_scaled_fp4_mm", torch::kCUDA, &cutlass_scaled_fp4_mm);
+
+  // Compute NVFP4 block quantized tensor.
+  m.def(
+      "scaled_fp4_quant(Tensor! output, Tensor! input,"
+      "                 Tensor! output_scale, Tensor! input_scale) -> ()");
+  m.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
+
   // lightning_attention_decode
   m.def(
       "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
