@@ -74,7 +74,6 @@ def get_server_info(backend: Optional[BaseBackend] = None):
 def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
-    max_completion_tokens: Optional[int] = None,
     min_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
@@ -115,7 +114,6 @@ def gen(
     return SglGen(
         name,
         max_tokens,
-        max_completion_tokens,
         min_tokens,
         stop,
         stop_token_ids,
@@ -139,7 +137,6 @@ def gen(
 def gen_int(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
-    max_completion_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
@@ -157,7 +154,6 @@ def gen_int(
     return SglGen(
         name,
         max_tokens,
-        max_completion_tokens,
         None,
         stop,
         stop_token_ids,
@@ -180,7 +176,6 @@ def gen_int(
 def gen_string(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
-    max_completion_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
@@ -198,7 +193,6 @@ def gen_string(
     return SglGen(
         name,
         max_tokens,
-        max_completion_tokens,
         None,
         stop,
         stop_token_ids,
