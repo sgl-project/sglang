@@ -7,11 +7,6 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from torch.nn import Parameter
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE,
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
-)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -40,6 +35,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
+)
+from sglang.srt.layers.moe.topk import select_experts
 
 logger = logging.getLogger(__name__)
 
@@ -508,7 +510,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -517,8 +519,8 @@ class AWQMoEMethod(FusedMoEMethodBase):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
+            correction_bias=e_score_correction_bias,
+            # scoring_func=scoring_func,
         )
 
         return torch.ops.vllm.fused_marlin_moe(
