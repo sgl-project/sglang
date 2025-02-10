@@ -4,7 +4,6 @@ from typing import Dict, Type
 
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
-from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
 from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -24,6 +23,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.layers.quantization.awq_marlin import AWQMarlinConfig
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -73,7 +73,7 @@ def gptq_get_quant_method(self, layer, prefix):
 
 
 def awq_get_quant_method(self, layer, prefix):
-    from vllm.model_executor.layers.quantization.awq_marlin import (
+    from sglang.srt.layers.quantization.awq_marlin import (
         AWQMarlinLinearMethod,
         AWQMoEMethod,
     )
