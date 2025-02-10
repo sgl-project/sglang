@@ -74,7 +74,6 @@ def get_server_info(backend: Optional[BaseBackend] = None):
 def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
-    max_completion_tokens: Optional[int] = None,
     n: Optional[int] = None,
     min_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
@@ -116,7 +115,6 @@ def gen(
     return SglGen(
         name,
         max_tokens,
-        max_completion_tokens,
         n,
         min_tokens,
         stop,
