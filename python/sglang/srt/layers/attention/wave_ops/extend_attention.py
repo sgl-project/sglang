@@ -54,6 +54,8 @@ def extend_attention_wave(
     max_seq_len,
     output,
     is_causal=True,
+    layer_scaling=None,
+    logit_cap=0,
 ):
 
     shape = AttentionShape(
@@ -89,13 +91,12 @@ def extend_attention_wave(
         output_dtype=output.dtype,
         size_dtype=b_seq_len.dtype,
         is_causal=is_causal,
+        layer_scaling=layer_scaling,
+        logit_cap=logit_cap,
     )
 
     hyperparams.update(get_default_scheduling_params())
     config = get_default_run_config()
-
-    log2e = 1.44269504089
-    dk_sqrt = math.sqrt(1.0 / shape.head_size)
 
     with tk.gen.TestLaunchContext(
         hyperparams,
@@ -110,7 +111,7 @@ def extend_attention_wave(
     ):
         # TODO: Add scaling of QK as part of kernel.
         mb = extend_attention(
-            q_extend * dk_sqrt * log2e,
+            q_extend,
             k_extend,
             v_extend,
             k_buffer,
