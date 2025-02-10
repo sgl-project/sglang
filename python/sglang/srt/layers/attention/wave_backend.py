@@ -17,14 +17,13 @@ if TYPE_CHECKING:
 class WaveAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.wave_ops.decode_attention import (
+        # TODO: Switch to wave decode.
+        from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.wave_ops.extend_attention import (
             extend_attention_wave,
         )
-
-        # TODO: Add support for extend attention
 
         super().__init__()
 
@@ -35,8 +34,7 @@ class WaveAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
 
-        # TODO: Make this a configurable parameter.
-        self.num_kv_splits = 8
+        self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
         self.forward_metadata = None
@@ -51,19 +49,10 @@ class WaveAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode():
             attn_logits = torch.empty(
                 (
-                    self.num_kv_splits,
                     forward_batch.batch_size,
                     self.num_head,
-                    self.v_head_dim,
-                ),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            attn_logits_max = torch.empty(
-                (
                     self.num_kv_splits,
-                    forward_batch.batch_size,
-                    self.num_head,
+                    self.v_head_dim + 1,
                 ),
                 dtype=torch.float32,
                 device=self.device,
@@ -72,10 +61,9 @@ class WaveAttnBackend(AttentionBackend):
             max_extend_len = None
         else:
             attn_logits = None
-            attn_logits_max = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
-        self.forward_metadata = attn_logits, attn_logits_max, max_extend_len
+        self.forward_metadata = attn_logits, max_extend_len
 
     def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
@@ -84,13 +72,7 @@ class WaveAttnBackend(AttentionBackend):
             (max_bs,), dtype=torch.int32, device=self.device
         )
         self.cuda_graph_attn_logits = torch.empty(
-            (self.num_kv_splits, max_bs, self.num_head, self.v_head_dim),
-            dtype=torch.float32,
-            device="cuda",
-        )
-
-        self.cuda_graph_attn_logits_max = torch.empty(
-            (self.num_kv_splits, max_bs, self.num_head),
+            (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
             dtype=torch.float32,
             device="cuda",
         )
@@ -111,7 +93,6 @@ class WaveAttnBackend(AttentionBackend):
 
         self.forward_metadata = (
             self.cuda_graph_attn_logits,
-            self.cuda_graph_attn_logits_max,
             None,
         )
 
@@ -153,6 +134,15 @@ class WaveAttnBackend(AttentionBackend):
             )
 
         _, max_extend_len = self.forward_metadata
+        # TODO: We ran into situtations where q_extend.shape[0] was
+        # not equal to the value in extend_seq_lens which was max_extend_len.
+        # This should not be required and is probably a bug in sglang.
+        computed_max_ext_seq_len = torch.max(forward_batch.extend_seq_lens)
+        if computed_max_ext_seq_len != max_extend_len:
+            assert len(forward_batch.extend_seq_lens) == 1
+            forward_batch.extend_seq_lens[0] = max_extend_len
+            forward_batch.seq_lens = max_extend_len
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -166,9 +156,9 @@ class WaveAttnBackend(AttentionBackend):
             forward_batch.extend_start_loc,
             max_extend_len,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            # TODO: Add additional parameters for logit_cap and scaling.
-            # layer.scaling,
-            # layer.logit_cap,
+            is_causal=True,
+            layer_scaling=layer.scaling,
+            logit_cap=layer.logit_cap,
         )
         return o
 
@@ -191,7 +181,7 @@ class WaveAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        attn_logits, attn_logits_max, _ = self.forward_metadata
+        attn_logits, _ = self.forward_metadata
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -207,7 +197,6 @@ class WaveAttnBackend(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             attn_logits,
-            attn_logits_max,
             self.num_kv_splits,
             layer.scaling,
             layer.logit_cap,
