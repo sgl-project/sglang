@@ -496,6 +496,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w2_qzeros", marlin_w2_zp)
 
+    # TODO(lsyin): monkey patch here
     def apply(
         self,
         layer: torch.nn.Module,
@@ -509,6 +510,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
