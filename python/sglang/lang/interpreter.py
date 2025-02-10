@@ -40,6 +40,9 @@ from sglang.utils import (
 
 def run_internal(state, program, func_args, func_kwargs, sync):
     try:
+        print("run_internal")
+        print(program.func, type(program.func))
+        print(program, type(program))
         state.ret_value = program.func(state, *func_args, **func_kwargs)
     except Exception as e:
         raise e
@@ -85,6 +88,8 @@ def run_program(
         t.start()
         return state
     else:
+        print("run_program")
+        print(func_kwargs)
         run_internal(state, program, func_args, func_kwargs, sync)
         return state
 
@@ -747,6 +752,7 @@ class StreamExecutor:
         for item in [
             "max_new_tokens",
             "max_completion_tokens",
+            "n",
             "min_new_tokens",
             "stop",
             "stop_token_ids",
