@@ -2,7 +2,7 @@ from typing import Tuple, Union
 
 import torch
 
-from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 def get_fuse_output_scaling_add_from_name(name: str) -> bool:
@@ -13,7 +13,7 @@ def get_fuse_output_scaling_add_from_name(name: str) -> bool:
     return mapping.get(name, False)
 
 
-def get_fuse_qkv_lora_b_from_name(name: str) -> bool:
+def get_fuse_stacked_lora_b_from_name(name: str) -> bool:
     mapping = {
         "triton": True,
         "flashinfer": False,
@@ -21,7 +21,7 @@ def get_fuse_qkv_lora_b_from_name(name: str) -> bool:
     return mapping.get(name, False)
 
 
-class BaseLoraBackend:
+class BaseLoRABackend:
     """Base class for different Lora backends.
        Each backend has its own implementation of Lora kernels.
 
@@ -32,11 +32,11 @@ class BaseLoraBackend:
                                  and the operation of scaling and adding will be fused into kernel
     """
 
-    def __init__(self, name: str, batch_info: LoraBatchInfo = None):
+    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         self.name = name
         self.batch_info = batch_info
         self.fuse_output_scaling_add = get_fuse_output_scaling_add_from_name(name)
-        self.fuse_qkv_lora_b = get_fuse_qkv_lora_b_from_name(name)
+        self.fuse_stacked_lora_b = get_fuse_stacked_lora_b_from_name(name)
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -46,10 +46,11 @@ class BaseLoraBackend:
 
         Args:
              x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
-             weights: a set of lora weights with shape (num_lora, r, input_dim), here r is lora rank
+             weights: a set of lora weights with shape (num_lora, c * r, input_dim),
+                      here r is lora rank, c is a multiplier for stacked modules (e.g., c=3 for qkv_proj, c=2 for gate_up_proj)
                       usually input_dim is much larger than r
         Returns:
-             result with shape (s, r)
+             result with shape (s, c * r)
         """
         pass
 
@@ -83,7 +84,7 @@ class BaseLoraBackend:
             qkv_lora_a: lora_a module for qkv, with shape (num_lora, 3 * r, input_dim)
             qkv_lora_b: lora_b module for qkv.
                         If passed in as a tensor, its shape should be (num_lora,output_dim_q + 2 * output_dim_kv, r)
-                        If passed in as a tuple of two tensors containing:
+                        If passed in as a tuple of two tensors, it should contain:
                            a lora_b module for q, with shape (1, num_lora, output_dim_q, r)
                            and a combined lora_b module for kv, with shape (2, num_lora, output_dim_kv, r)
         Returns:
@@ -91,5 +92,26 @@ class BaseLoraBackend:
         """
         pass
 
-    def set_batch_info(self, batch_info: LoraBatchInfo):
+    def run_gate_up_lora(
+        self,
+        x: torch.Tensor,
+        gate_up_lora_a: torch.Tensor,
+        gate_up_lora_b: Union[torch.Tensor, Tuple[torch.Tensor]],
+        *args,
+        **kwargs
+    ) -> torch.Tensor:
+        """Run the lora pass for gate_up_proj, usually attached to MergedColumnParallelLayer.
+
+        Args:
+            x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
+            gate_up_lora_a: lora_a module for gate_up_proj, with shape (num_lora, 2 * r, input_dim)
+            gate_up_lora_b: lora_b module for qkv.
+                        If passed in as a tensor, its shape should be (num_lora, 2 * output_dim, r)
+                        If passed in as a tuple, it should contain two tensors with shape (num_lora, output_dim, r)
+        Returns:
+            result with shape (s, 2 * output_dim)
+        """
+        pass
+
+    def set_batch_info(self, batch_info: LoRABatchInfo):
         self.batch_info = batch_info
