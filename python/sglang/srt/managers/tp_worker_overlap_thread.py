@@ -174,6 +174,8 @@ class TpModelWorkerClient:
                 logits_output.input_token_logprobs = (
                     logits_output.input_token_logprobs.tolist()
                 )
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states.clone()
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids
 

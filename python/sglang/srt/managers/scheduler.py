@@ -1157,16 +1157,8 @@ class Scheduler:
                         logits_output.input_token_logprobs.tolist()
                     )
 
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states.cpu()
-                offset = 0
-                # Cuts up the hidden states for each request
-                logits_output.hidden_states = [
-                    logits_output.hidden_states[
-                        offset : (offset := offset + len(req.origin_input_ids))
-                    ]
-                    for req in batch.reqs
-                ]
+            hidden_state_offset = 0
+
             # Check finish conditions
             logprob_pt = 0
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -1197,7 +1189,16 @@ class Scheduler:
                         self.server_args.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
-                        req.hidden_states.append(logits_output.hidden_states[i])
+                        req.hidden_states.append(
+                            logits_output.hidden_states[
+                                hidden_state_offset : (
+                                    hidden_state_offset := hidden_state_offset
+                                    + len(req.origin_input_ids)
+                                )
+                            ]
+                            .cpu()
+                            .clone()
+                        )
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
@@ -1262,8 +1263,6 @@ class Scheduler:
 
         self.token_to_kv_pool.free_group_begin()
 
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states.cpu()
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
@@ -1298,7 +1297,7 @@ class Scheduler:
                 self.server_args.return_hidden_states
                 and logits_output.hidden_states is not None
             ):
-                req.hidden_states.append(logits_output.hidden_states[i])
+                req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
