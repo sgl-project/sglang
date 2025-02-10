@@ -160,6 +160,7 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
+    return_hidden_states: bool = False
 
     # Custom logit processor
     enable_custom_logit_processor: bool = False
@@ -895,6 +896,11 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        parser.add_argument(
+            "--return-hidden-states",
+            action="store_true",
+            help="Return hidden states in the response.",
         )
         # Function Calling
         parser.add_argument(
