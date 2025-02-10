@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 @triton.jit
@@ -98,7 +98,7 @@ def _sgemm_lora_b_kernel(
 def sgemm_lora_b_fwd(
     x: torch.Tensor,
     weights: torch.Tensor,
-    batch_info: LoraBatchInfo,
+    batch_info: LoRABatchInfo,
     base_output: torch.Tensor = None,
     scaling: float = 1.0,
 ) -> torch.Tensor:
