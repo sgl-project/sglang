@@ -435,10 +435,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
         o = o.view(-1, layer.tp_q_head_num * layer.head_dim)
-        if forward_batch.forward_mode.is_target_verify():
-            print("target verify o:")
-            print(o.shape)
-            print(o)
         return o
 
     def forward_decode(
@@ -643,9 +639,6 @@ class FlashInferIndicesUpdaterDecode:
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
-
-            print("indices:")
-            print(kv_indices)
 
         wrapper.end_forward()
         wrapper.begin_forward(

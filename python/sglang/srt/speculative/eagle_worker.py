@@ -191,13 +191,6 @@ class EAGLEWorker(TpModelWorker):
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
-        print("score_list")
-        print(score_list)
-        print("token_list")
-        print(token_list)
-        print("parents_list")
-        print(parents_list)
-
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
             score_list,
@@ -237,7 +230,7 @@ class EAGLEWorker(TpModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            print(scores)
+
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -259,8 +252,6 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
-            # print(logits_output.next_token_logits.shape)
-            print(logits_output.next_token_logits)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             hidden_states = logits_output.hidden_states

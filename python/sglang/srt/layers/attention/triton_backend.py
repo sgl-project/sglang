@@ -79,23 +79,10 @@ class TritonAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            attn_logits = torch.empty(
-                (
-                    forward_batch.batch_size,
-                    self.num_head,
-                    self.num_kv_splits,
-                    self.v_head_dim + 1,
-                ),
-                dtype=torch.float32,
-                device=self.device,
-            )
-
-            max_extend_len = None
-
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
+                kv_indices = torch.zeros(
                     forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
@@ -109,10 +96,23 @@ class TritonAttnBackend(AttentionBackend):
                 )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                bs = kv_indptr.shape[0] - 1
+
+            attn_logits = torch.zeros(
+                (
+                    bs,
+                    self.num_head,
+                    self.num_kv_splits,
+                    self.v_head_dim + 1,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
+            max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             kv_indices, _, qo_indptr, custom_mask = spec_info.generate_attn_arg_prefill(
                 forward_batch.req_pool_indices,
@@ -149,7 +149,7 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens, dim=0
             )
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
+            kv_indices = torch.zeros(
                 forward_batch.extend_prefix_lens.sum().item(),
                 dtype=torch.int32,
                 device=self.device,
@@ -189,7 +189,7 @@ class TritonAttnBackend(AttentionBackend):
         self.cuda_graph_start_loc = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_attn_logits = torch.empty(
+        self.cuda_graph_attn_logits = torch.zeros(
             (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
             dtype=torch.float32,
             device=self.device,
@@ -298,6 +298,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask,
             mask_indptr,
         ) = self.forward_metadata
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -314,10 +315,6 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
         )
-        if forward_batch.forward_mode.is_target_verify():
-            print("target verify o:")
-            print(o.shape)
-            print(o)
         return o
 
     def forward_decode(
@@ -341,10 +338,6 @@ class TritonAttnBackend(AttentionBackend):
 
         attn_logits, _, kv_indptr, kv_indices, _, _, _ = self.forward_metadata
 
-        print("kv_indptr:")
-        print(kv_indptr)
-        print(kv_indices)
-
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
@@ -362,8 +355,6 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
         )
-        # print("o:")
-        # print(o)
         return o
 
 
