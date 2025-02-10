@@ -457,6 +457,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
             quant_config=quant_config,
+            # FIXME: quick fix for skip quantization
+            prefix=f"self_attn.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
