@@ -795,7 +795,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-mla",
             action="store_true",
-            help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+            help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
