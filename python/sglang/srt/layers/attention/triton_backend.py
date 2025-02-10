@@ -128,7 +128,6 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = torch.zeros(
                 kv_indptr[-1], dtype=torch.int32, device=self.device
             )
-
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 forward_batch.req_pool_indices,

@@ -434,8 +434,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-        o = o.view(-1, layer.tp_q_head_num * layer.head_dim)
-        return o
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,

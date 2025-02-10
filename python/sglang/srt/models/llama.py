@@ -206,7 +206,6 @@ class LlamaDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
-        self.layer_id = layer_id
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -246,7 +245,6 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
