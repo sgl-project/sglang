@@ -4,6 +4,7 @@ from typing import Dict, Type
 
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
+from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
 from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -19,7 +20,6 @@ from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
-from sglang.srt.layers.quantization.awq_marlin import AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
@@ -72,6 +72,28 @@ def gptq_get_quant_method(self, layer, prefix):
     return None
 
 
+def awq_get_quant_method(self, layer, prefix):
+    from vllm.model_executor.layers.quantization.awq import is_layer_skipped_awq
+    from vllm.model_executor.layers.quantization.awq_marlin import (
+        AWQMarlinLinearMethod,
+        AWQMoEMethod,
+    )
+
+    from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+    if isinstance(layer, LinearBase) or (
+        isinstance(layer, ParallelLMHead) and self.lm_head_quantized
+    ):
+        if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            return UnquantizedLinearMethod()
+        return AWQMarlinLinearMethod(self)
+    elif isinstance(layer, FusedMoE):
+        return AWQMoEMethod(self)
+    return None
+
+
 def patch_vllm_linear_base_isinstance():
     import builtins
 
@@ -92,6 +114,7 @@ def patch_vllm_linear_base_isinstance():
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
+    setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
 
 
 patch_vllm_linear_base_isinstance()
