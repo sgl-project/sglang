@@ -7,12 +7,6 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from torch.nn import Parameter
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-    set_weight_attrs,
-)
 from vllm.model_executor.layers.quantization.awq import is_layer_skipped_awq
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -36,6 +30,12 @@ from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMPa
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
+from sglang.srt.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+    set_weight_attrs,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     FusedMoEMethodBase,
