@@ -118,25 +118,29 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         B_buffer: torch.Tensor,
     ):
         self.set_lora = True
-        self.A_buffer = A_buffer
-        self.B_buffer = B_buffer
+        self.A_buffer_gate_up = A_buffer
+        if self.lora_backend.fuse_stacked_lora_b:
+            # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
+            self.B_buffer_gate_up = torch.cat(
+                (B_buffer[0], B_buffer[1]), dim=-2
+            ).contiguous()
+        else:
+            self.B_buffer_gate_up = (B_buffer[0], B_buffer[1])
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.lora_backend.run_lora_a_sgemm(x=x, weights=self.A_buffer)
+        backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
 
-        output_dim = base_output.shape[-1]
-        lora_output = torch.empty_like(base_output)
-        lora_output[:, : output_dim // 2] = self.lora_backend.run_lora_b_sgemm(
-            x=lora_a_output[:, : self.lora_rank].contiguous(),
-            weights=self.B_buffer[0],
+        lora_output = self.lora_backend.run_gate_up_lora(
+            x,
+            self.A_buffer_gate_up,
+            self.B_buffer_gate_up,
+            **backend_kwargs,
         )
-
-        lora_output[:, output_dim // 2 :] = self.lora_backend.run_lora_b_sgemm(
-            x=lora_a_output[:, self.lora_rank :].contiguous(),
-            weights=self.B_buffer[1],
+        return (
+            lora_output
+            if self.lora_backend.fuse_output_scaling_add
+            else base_output + lora_output * self.scaling
         )
-
-        return base_output + lora_output * self.scaling
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -158,7 +162,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.set_lora = True
         self.A_buffer_qkv = A_buffer_qkv
 
-        if self.lora_backend.fuse_qkv_lora_b:
+        if self.lora_backend.fuse_stacked_lora_b:
             assert (
                 B_buffer_q.shape[-1] == B_buffer_kv.shape[-1]
             ), "The lora rank of q and kv should be the same when enabling fusion of qkv lora_b"
@@ -190,7 +194,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
-        if self.lora_backend.fuse_qkv_lora_b:
+        if self.lora_backend.fuse_stacked_lora_b:
             backend_kwargs["output_offset"] = self.output_offset
             backend_kwargs["max_qkv_out_dim"] = self.max_qkv_out_dim
 

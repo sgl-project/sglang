@@ -55,6 +55,8 @@ class FlashInferLoRABackend(BaseLoRABackend):
         **kwargs,
     ) -> torch.Tensor:
 
+        assert isinstance(qkv_lora_b, tuple) and len(qkv_lora_b) == 2
+
         # Shape of lora_a_output: (s, 3 * r)
         lora_a_output = self.run_lora_a_sgemm(x=x, weights=qkv_lora_a)
 
@@ -86,6 +88,41 @@ class FlashInferLoRABackend(BaseLoRABackend):
         ] = self.run_lora_b_sgemm(
             x=lora_a_output[:, 2 * lora_rank : 3 * lora_rank].contiguous(),
             weights=kv_lora_b[1],
+        )
+
+        return lora_output
+
+    def run_gate_up_lora(
+        self,
+        x: torch.Tensor,
+        gate_up_lora_a: torch.Tensor,
+        gate_up_lora_b: Tuple[torch.Tensor],
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        assert isinstance(gate_up_lora_b, tuple) and len(gate_up_lora_b) == 2
+        lora_rank = gate_up_lora_b[0].shape[-1]
+        output_dim = gate_up_lora_b[0].shape[-2]
+
+        # Shape of lora_a_output: (s, 2 * r)
+        lora_a_output = self.run_lora_a_sgemm(x=x, weights=gate_up_lora_a)
+
+        lora_output = torch.empty(
+            (x.shape[0], 2 * output_dim),
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        # Compute lora for gate and up proj respectively
+        lora_output[:, :output_dim] = self.run_lora_b_sgemm(
+            x=lora_a_output[:, :lora_rank].contiguous(),
+            weights=gate_up_lora_b[0],
+        )
+
+        lora_output[:, output_dim:] = self.run_lora_b_sgemm(
+            x=lora_a_output[:, lora_rank:].contiguous(),
+            weights=gate_up_lora_b[1],
         )
 
         return lora_output

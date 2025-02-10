@@ -98,7 +98,6 @@ class LoRAAdapter(nn.Module):
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            print(name, loaded_weight.shape)
             match = re.search(r"layers\.(\d+)\.", name)
             if match is not None:
                 layer_id = int(match.group(1))
