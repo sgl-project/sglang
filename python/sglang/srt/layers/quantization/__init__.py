@@ -72,21 +72,6 @@ def gptq_get_quant_method(self, layer, prefix):
     return None
 
 
-def awq_get_quant_method(self, layer, prefix):
-    from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.awq_marlin import (
-        AWQMarlinLinearMethod,
-        AWQMoEMethod,
-    )
-
-    if isinstance(layer, LinearBase):
-        return AWQMarlinLinearMethod(self)
-    elif isinstance(layer, FusedMoE):
-        return AWQMoEMethod(self)
-    return None
-
-
 def patch_vllm_linear_base_isinstance():
     import builtins
 
@@ -107,7 +92,6 @@ def patch_vllm_linear_base_isinstance():
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
-    setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
 
 
 patch_vllm_linear_base_isinstance()
