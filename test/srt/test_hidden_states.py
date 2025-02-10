@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 test_hidden_states.py
-"""
-
 import unittest
 
 import torch
