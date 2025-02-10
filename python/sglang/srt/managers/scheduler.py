@@ -1193,7 +1193,10 @@ class Scheduler:
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
 
-                    if logits_output.hidden_states is not None:
+                    if (
+                        self.server_args.return_hidden_states
+                        and logits_output.hidden_states is not None
+                    ):
                         req.hidden_states.append(logits_output.hidden_states[i])
 
                     if req.grammar is not None:
@@ -1291,7 +1294,10 @@ class Scheduler:
                         logits_output.next_token_top_logprobs_idx[i]
                     )
 
-            if logits_output.hidden_states is not None:
+            if (
+                self.server_args.return_hidden_states
+                and logits_output.hidden_states is not None
+            ):
                 req.hidden_states.append(logits_output.hidden_states[i])
 
             if req.grammar is not None:
