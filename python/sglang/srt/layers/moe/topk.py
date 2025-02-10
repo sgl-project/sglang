@@ -75,7 +75,7 @@ def fused_topk(
     return topk_weights, topk_ids
 
 
-# This is used by the Deepseek-V2 model
+# This is used by the Deepseek V2/V3/R1 series models
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk(
     hidden_states: torch.Tensor,
