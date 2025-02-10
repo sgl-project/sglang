@@ -114,35 +114,50 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
-            kv_indices, _, qo_indptr, custom_mask = spec_info.generate_attn_arg_prefill(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                self.req_to_token,
+            bs = len(forward_batch.req_pool_indices)
+            qo_indptr = torch.arange(
+                0,
+                (1 + bs) * self.num_draft_tokens,
+                step=self.num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
             )
             # Different with flashinfer kv_indptr and kv_indices construction
-            # TODO: Reconstruct kv_indices
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = torch.zeros(
+                kv_indptr[-1], dtype=torch.int32, device=self.device
+            )
 
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            custom_mask = spec_info.custom_mask
             seq_mask_len = self.num_draft_tokens * (
                 forward_batch.seq_lens + self.num_draft_tokens
             )
             mask_indptr = self.mask_indptr
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
-
             max_extend_len = self.num_draft_tokens
             attn_logits = None
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
-                    forward_batch.extend_prefix_lens,
+                    forward_batch.seq_lens,
                     self.req_to_token,
                 )
             )
             mask_indptr = None
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            max_extend_len = torch.max(spec_info.accept_length).item()
             attn_logits = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
@@ -169,7 +184,6 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
             mask_indptr = None
-
             attn_logits = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
