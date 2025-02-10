@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     kill_process_tree,
+    launch_dummy_health_check_server,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
@@ -315,8 +316,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
-            "flashinfer",
-            "0.1.6",
+            "flashinfer_python",
+            "0.2.0.post2",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -400,14 +401,16 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return
+            return None, None
+
+        launch_dummy_health_check_server(server_args.host, server_args.port)
 
         for proc in scheduler_procs:
             proc.join()
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return
+        return None, None
 
     # Launch detokenizer process
     detoken_proc = mp.Process(

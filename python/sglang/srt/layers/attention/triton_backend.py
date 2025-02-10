@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import (
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -29,6 +32,15 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
+        max_bs = model_runner.req_to_token_pool.size
+        self.kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+        )
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.qo_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+        )
+
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -45,6 +57,9 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
+        bs = forward_batch.batch_size
+        kv_indptr = self.kv_indptr
+
         if forward_batch.forward_mode.is_decode():
             attn_logits = torch.empty(
                 (
@@ -58,11 +73,63 @@ class TritonAttnBackend(AttentionBackend):
             )
 
             max_extend_len = None
+
+            kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = torch.empty(
+                forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            qo_indptr = None
+            custom_mask = None
+            mask_offsets = None
         else:
+            kv_indptr[1 : bs + 1] = torch.cumsum(
+                forward_batch.extend_prefix_lens, dim=0
+            )
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = torch.empty(
+                forward_batch.extend_prefix_lens.sum().item(),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.extend_prefix_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            qo_indptr = self.qo_indptr
+            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            qo_indptr = qo_indptr[: bs + 1]
+            custom_mask = None
+            mask_offsets = None
+
             attn_logits = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
-        self.forward_metadata = attn_logits, max_extend_len
+        self.forward_metadata = (
+            attn_logits,
+            max_extend_len,
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
+            custom_mask,
+            mask_offsets,
+        )
 
     def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
@@ -73,7 +140,12 @@ class TritonAttnBackend(AttentionBackend):
         self.cuda_graph_attn_logits = torch.empty(
             (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
             dtype=torch.float32,
-            device="cuda",
+            device=self.device,
+        )
+        self.cuda_graph_kv_indices = torch.zeros(
+            (max_bs * self.cuda_graph_max_seq_len),
+            dtype=torch.int32,
+            device=self.device,
         )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -90,8 +162,27 @@ class TritonAttnBackend(AttentionBackend):
         assert forward_mode.is_decode(), "Not supported"
         assert spec_info is None, "Not supported"
 
+        kv_indptr = self.kv_indptr
+        kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+        kv_indptr = kv_indptr[: bs + 1]
+        kv_indices = self.cuda_graph_kv_indices
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
+
         self.forward_metadata = (
             self.cuda_graph_attn_logits,
+            None,
+            kv_indptr,
+            kv_indices,
+            None,
+            None,
             None,
         )
 
@@ -108,6 +199,20 @@ class TritonAttnBackend(AttentionBackend):
         # NOTE: encoder_lens expected to be zeros or None
         self.cuda_graph_start_loc.zero_()
         self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
+
+        kv_indptr = self.kv_indptr
+        kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+        kv_indptr = kv_indptr[: bs + 1]
+        kv_indices = self.cuda_graph_kv_indices
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -132,7 +237,15 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        _, max_extend_len = self.forward_metadata
+        (
+            _,
+            max_extend_len,
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
+            custom_mask,
+            mask_offsets,
+        ) = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -140,11 +253,11 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            mask_offsets,
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
@@ -170,7 +283,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        attn_logits, _ = self.forward_metadata
+        attn_logits, _, kv_indptr, kv_indices, _, _, _ = self.forward_metadata
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -182,9 +295,8 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            kv_indptr,
+            kv_indices,
             attn_logits,
             self.num_kv_splits,
             layer.scaling,

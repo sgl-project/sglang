@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import ServerArgs
@@ -218,7 +219,7 @@ class ModelRunner:
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
-        # Init torch distributed
+
         torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
@@ -529,6 +530,7 @@ class ModelRunner:
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,
+            lora_backend=self.server_args.lora_backend,
         )
         logger.info("LoRA manager ready.")
 
@@ -714,8 +716,6 @@ class ModelRunner:
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-
         self.cuda_graph_runner = None
 
         if not self.is_generation:

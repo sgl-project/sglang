@@ -247,12 +247,12 @@ class Req:
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
+        self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
 
         # Sampling info
         self.sampling_params = sampling_params
-        self.lora_path = lora_path
         self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
@@ -300,7 +300,7 @@ class Req:
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
 
-        # Logprobs (return value)
+        # Logprobs (return values)
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
         self.input_top_logprobs_val: Optional[List[float]] = None
@@ -329,9 +329,14 @@ class Req:
         # Constrained decoding
         self.grammar: Optional[BaseGrammarObject] = None
 
-        # The number of cached tokens, that were already cached in the KV cache
+        # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+
+        # The number of verification forward passes in the speculative decoding.
+        # This is used to compute the average acceptance length per request.
+        self.spec_verify_ct = 0
+        self.lora_path = lora_path
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:

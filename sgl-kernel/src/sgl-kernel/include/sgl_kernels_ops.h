@@ -1,3 +1,18 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 #pragma once
 
 #include <Python.h>
@@ -50,15 +65,11 @@ void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, 
                                 const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
                                 torch::Tensor new_kv);
 
-// rotary embedding
-void rotary_embedding(torch::Tensor& positions, torch::Tensor& query, torch::Tensor& key, int64_t head_size,
-                      torch::Tensor& cos_sin_cache, bool is_neox);
-
 // rms norm
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
 
 // fused rms norm
-void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
+void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 
 // gemma rms norm
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
@@ -112,3 +123,23 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_sample
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples, at::Tensor success,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic,
                                int64_t cuda_stream);
+
+void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                                      at::Tensor cos_sin_cache, at::Tensor pos_ids, bool interleave,
+                                      int64_t cuda_stream);
+
+void tree_speculative_sampling_target_only(at::Tensor predicts, at::Tensor accept_index,
+                                           at::Tensor accept_token_num,  // mutable
+                                           at::Tensor candidates, at::Tensor retrive_index,
+                                           at::Tensor retrive_next_token, at::Tensor retrive_next_sibling,
+                                           at::Tensor uniform_samples, at::Tensor target_probs, at::Tensor draft_probs,
+                                           bool deterministic = true, int64_t cuda_stream = 0);
+
+void build_tree_kernel_efficient(at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
+                                 at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index,
+                                 at::Tensor retrive_next_token, at::Tensor retrive_next_sibling, int64_t topk,
+                                 int64_t depth, int64_t draft_token_num);
+
+void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
+                       at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index, int64_t topk,
+                       int64_t depth, int64_t draft_token_num);

@@ -10,6 +10,60 @@ from sgl_kernel.ops.utils import (
 )
 
 
+def apply_rope_with_cos_sin_cache_inplace(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    r"""
+    Apply rotary embedding to keys and queries with precomputed cos/sin values.
+    This is designed to be compatible with the SGL/vLLM implementation.
+    The result is inplace applied to the input tensors.
+
+    Parameters
+    ----------
+    positions : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    query : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
+    key : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    cos_sin_cache : torch.Tensor
+        Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
+        Cosine is the first half and Sine is the second half on rotary_dim.
+    is_neox : bool
+        Whether to use Neox style RoPE, default: ``True``.
+
+        * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+        * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+    Note
+    ----
+    The rotary dimension is determined by the cosine cache and sine cache.
+    """
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+
+    with query.device as device:
+        positions = positions.int()
+        torch.ops.sgl_kernels.apply_rope_pos_ids_cos_sin_cache(
+            q=query.view(query.shape[0], -1, head_size),
+            k=key.view(key.shape[0], -1, head_size),
+            q_rope=query.view(query.shape[0], -1, head_size),
+            k_rope=key.view(key.shape[0], -1, head_size),
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=positions,
+            interleave=(not is_neox),
+            cuda_stream=_get_cuda_stream(device),
+        )
+
+
 def init_custom_reduce(
     rank_id, num_devices, rank_data, buffers, tmp_buffers, barrier_in, barrier_out
 ):
@@ -88,12 +142,6 @@ def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
     )
 
 
-def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
-    return torch.ops.sgl_kernels.rotary_embedding(
-        positions, query, key, head_size, cos_sin_cache, is_neox
-    )
-
-
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
 # Kudos to @yzh119
 def rmsnorm(
@@ -113,9 +161,7 @@ def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
     with input.device as device:
-        torch.ops.sgl_kernels.fused_add_rmsnorm(
-            input, residual, weight, eps, _get_cuda_stream(device)
-        )
+        torch.ops.sgl_kernels.fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
@@ -449,3 +495,87 @@ def min_p_sampling_from_probs(
     return _min_p_sampling_from_probs_internal(
         probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
     )
+
+
+def tree_speculative_sampling_target_only(
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
+    accept_token_num: torch.Tensor,  # mutable
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    deterministic: bool = True,
+) -> None:
+    with predicts.device as device:
+        torch.ops.sgl_kernels.tree_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            uniform_samples,
+            target_probs,
+            draft_probs,
+            deterministic,
+            _get_cuda_stream(device),
+        )
+
+
+def build_tree_kernel_efficient(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+) -> None:
+    with parent_list.device as device:
+        torch.ops.sgl_kernels.build_tree_kernel_efficient(
+            parent_list,
+            selected_index,
+            verified_seq_len,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            topk,
+            depth,
+            draft_token_num,
+        )
+
+
+def build_tree_kernel(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+) -> None:
+    with parent_list.device as device:
+        torch.ops.sgl_kernels.build_tree_kernel(
+            parent_list,
+            selected_index,
+            verified_seq_len,
+            tree_mask,
+            positions,
+            retrive_index,
+            topk,
+            depth,
+            draft_token_num,
+        )
