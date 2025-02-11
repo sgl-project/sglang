@@ -1125,8 +1125,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
                     if len(images_in_this_batch) > 0:
                         images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
-                        input_embeds[idx].masked_scatter_(
-                            image_seq_mask[idx].unsqueeze(-1), images_in_this_batch
+                        input_embeds.masked_scatter_(
+                            image_seq_mask.unsqueeze(-1), images_in_this_batch
                         )
         else:
             input_embeds = None
