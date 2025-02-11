@@ -101,7 +101,7 @@ With your AMD system properly configured and SGLang installed, you can now fully
 
 ## Running DeepSeek-V3
 
-To run DeepSeek-V3 the only difference is when launching the server.
+The only difference in running DeepSeek-V3 is when starting the server.
 
 ```bash
 drun -p 30000:30000 \
