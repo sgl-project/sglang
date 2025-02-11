@@ -203,8 +203,6 @@ def benchmark(batch_size, seq_len, group_size, provider):
 
 if __name__ == "__main__":
 
-    # 运行正确性测试
     calculate_diff(batch_size=4, seq_len=128, group_size=64)
 
-    # 运行性能测试
     benchmark.run(print_data=True)
