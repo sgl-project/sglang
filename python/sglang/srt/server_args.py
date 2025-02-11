@@ -140,6 +140,7 @@ class ServerArgs:
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
@@ -782,6 +783,11 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--enable-nccl-nvls",
+            action="store_true",
+            help="Enable NCCL NVLS for prefill heavy requests when available.",
         )
         parser.add_argument(
             "--disable-outlines-disk-cache",
