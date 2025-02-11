@@ -157,6 +157,7 @@ MLA_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "ascend",
+    "torch_native",
 ]
 
 
@@ -547,9 +548,17 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                if server_args.attention_backend != "intel_amx":
+                if server_args.attention_backend in [
+                    "intel_amx",
+                    "torch_native",
+                ]:
+                    if self.should_log:
+                        logger.info(
+                            f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
+                        )
+                else:
                     raise ValueError(
-                        "MLA optimization not supported on CPU except for intel_amx backend."
+                        f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
 
         if (
