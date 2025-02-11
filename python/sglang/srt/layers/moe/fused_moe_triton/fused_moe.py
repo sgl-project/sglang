@@ -1094,7 +1094,7 @@ def fused_moe(
     - num_expert_group: Optional[int]: additional parameter for grouped_topk
     - topk_group: Optional[int]: additional parameter for grouped_topk
     - use_grouped_topk: If True, use grouped_topk instead of fused_topk
-        note: Deepseekv2 model uses grouped_topk
+        note: Deepseek V2/V3/R1 series models use grouped_topk
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_int8_w8a16 (bool): If True, use fp8 arithmetic to compute the inner
