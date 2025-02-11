@@ -27,6 +27,8 @@ class TorchNativeAttnBackend(AttentionBackend):
     def _run_sdpa_forward_extend(
         self,
         query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         output: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -67,41 +69,69 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
+        key = key.movedim(0, key.dim() - 2)
+        value = value.movedim(0, value.dim() - 2)
 
-        start_q, start_kv = 0, 0
+        start_extend = 0
         for seq_idx in range(seq_lens.shape[0]):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
 
-            extend_seq_len_q = extend_seq_lens_cpu[seq_idx]
-            prefill_seq_len_q = extend_prefix_lens_cpu[seq_idx]
+            extend_seq_len = extend_seq_lens_cpu[seq_idx]
+            prefix_seq_len = extend_prefix_lens_cpu[seq_idx]
+            is_prefill = prefix_seq_len == 0
 
-            seq_len_kv = seq_lens_cpu[seq_idx]
-            end_q = start_q + extend_seq_len_q
-            end_kv = start_kv + seq_len_kv
+            seq_len = seq_lens_cpu[seq_idx]
+            end_extend = start_extend + extend_seq_len
 
-            per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
+            per_req_extend_query = query[:, start_extend:end_extend, :]
+            per_req_extend_key = key[:, start_extend:end_extend, :]
+            per_req_extend_value = value[:, start_extend:end_extend, :]
 
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+            if not is_prefill: # extend, prefix len is not 0
+                per_req_query = torch.empty(
+                    (per_req_extend_query.shape[0], seq_len, per_req_extend_query.shape[2]),
+                    dtype=per_req_extend_query.dtype,
+                    device=per_req_extend_query.device,
+                )
 
-            # get key and value from cache. per_req_tokens contains the kv cache
-            # index for each token in the sequence.
-            req_pool_idx = req_pool_indices[seq_idx]
-            # per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            curr_req_to_tokens = torch.index_select(
-                req_to_token, 0, req_pool_idx).squeeze(0)
-            per_req_tokens = curr_req_to_tokens[:seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+                per_req_query[:, prefix_seq_len:, :] = per_req_extend_query
 
-            per_req_out_redudant = (
+                per_req_key = torch.empty(
+                    (per_req_extend_key.shape[0], seq_len, per_req_extend_key.shape[2]),
+                    dtype=per_req_extend_key.dtype,
+                    device=per_req_extend_key.device,
+                )
+                per_req_value = torch.empty(
+                    (per_req_extend_value.shape[0], seq_len, per_req_extend_value.shape[2]),
+                    dtype=per_req_extend_value.dtype,
+                    device=per_req_extend_value.device,
+                )
+
+                # get the cached prefix kv
+                # get key and value from cache. per_req_tokens contains the kv cache
+                # index for each token in the sequence.
+                req_pool_idx = req_pool_indices[seq_idx]
+                # per_req_tokens = req_to_token[req_pool_idx, :seq_len]
+                curr_req_to_tokens = torch.index_select(
+                    req_to_token, 0, req_pool_idx).squeeze(0)
+                per_req_prefix_tokens = curr_req_to_tokens[:prefix_seq_len]
+                per_req_prefix_key = k_cache[per_req_prefix_tokens].movedim(0, query.dim() - 2)
+                per_req_prefix_value = v_cache[per_req_prefix_tokens].movedim(0, query.dim() - 2)
+
+                # concat prefix kv and extend kv
+                per_req_key[:, prefix_seq_len:, :] = per_req_extend_key
+                per_req_value[:, prefix_seq_len:, :] = per_req_extend_value
+                per_req_key[:, :prefix_seq_len, :] = per_req_prefix_key
+                per_req_value[:, :prefix_seq_len, :] = per_req_prefix_value
+            else: # prefill, prefix len is 0
+                per_req_query = per_req_extend_query
+                per_req_key = per_req_extend_key
+                per_req_value = per_req_extend_value
+
+            per_req_out = (
                 scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
+                    per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
                     enable_gqa=enable_gqa,
@@ -111,9 +141,9 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :,
-                   :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
-            start_q, start_kv = end_q, end_kv
+            output[start_extend:end_extend, :,
+                   :] = per_req_out[prefix_seq_len:, :, :]
+            start_extend = end_extend
         return output
 
     def _run_sdpa_forward_decode(
@@ -216,6 +246,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_ = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_ = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
         causal = True
@@ -224,6 +256,8 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         self._run_sdpa_forward_extend(
             q_,
+            k_,
+            v_,
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
