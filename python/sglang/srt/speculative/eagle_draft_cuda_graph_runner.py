@@ -21,7 +21,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.eagle_utils import EagleDraftInput
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 
@@ -85,7 +84,6 @@ class EAGLEDraftCudaGraphRunner:
                 "1. disable cuda graph by --disable-cuda-graph\n"
                 "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. specify --dtype to the same dtype (e.g. bfloat16)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
