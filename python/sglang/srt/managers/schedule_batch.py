@@ -43,14 +43,15 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -230,6 +231,7 @@ class Req:
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
+        token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
@@ -259,7 +261,7 @@ class Req:
         self.custom_logit_processor = custom_logit_processor
 
         # Memory pool info
-        self.req_pool_idx = None
+        self.req_pool_idx: Optional[int] = None
 
         # Check finish
         self.tokenizer = None
@@ -292,14 +294,17 @@ class Req:
         self.extend_input_len = 0
         self.last_node = None
 
-        # Chunked prefill
-        self.is_being_chunked = 0
+        # Whether or not if it is chunked. It increments whenever
+        # it is chunked, and decrement whenever chunked request is
+        # processed.
+        self.is_chunked = 0
 
         # For retraction
         self.is_retracted = False
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
+        # Start index to compute logprob from.
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
 
@@ -341,6 +346,10 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
         self.lora_path = lora_path
+
+    @property
+    def seqlen(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
@@ -524,11 +533,11 @@ class Req:
         self.last_node = None
         self.extend_input_len = 0
         self.is_retracted = True
+        self.extend_logprob_start_len = 0
+        self.is_chunked = 0
+        self.req_pool_idx = None
 
-        # For incremental logprobs
-        # TODO: Fix the `logprob_start_len`
         self.last_update_decode_tokens = 0
-        self.logprob_start_len = 10**9
 
     def __repr__(self):
         return (
@@ -547,7 +556,7 @@ class ScheduleBatch:
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool: BaseTokenToKVPool = None
+    token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -603,7 +612,7 @@ class ScheduleBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[SpecInfo] = None
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
 
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
@@ -613,7 +622,7 @@ class ScheduleBatch:
         cls,
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
@@ -623,7 +632,7 @@ class ScheduleBatch:
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool=token_to_kv_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             model_config=model_config,
             enable_overlap=enable_overlap,
@@ -651,19 +660,19 @@ class ScheduleBatch:
         return req_pool_indices
 
     def alloc_token_slots(self, num_tokens: int):
-        out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
 
         if out_cache_loc is None:
             if self.tree_cache is not None:
-                self.tree_cache.evict(num_tokens, self.token_to_kv_pool.free)
-                out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+                self.tree_cache.evict(num_tokens, self.token_to_kv_pool_allocator.free)
+                out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
 
             if out_cache_loc is None:
                 phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
                 logger.error(
                     f"{phase_str} out of memory. Try to lower your batch size.\n"
                     f"Try to allocate {num_tokens} tokens.\n"
-                    f"Avaliable tokens: {self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()}\n"
+                    f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 )
                 if self.tree_cache is not None:
                     self.tree_cache.pretty_print()
@@ -887,41 +896,60 @@ class ScheduleBatch:
 
     def check_decode_mem(self, buf_multiplier=1):
         bs = len(self.reqs) * buf_multiplier
-        if self.token_to_kv_pool.available_size() >= bs:
+        if self.token_to_kv_pool_allocator.available_size() >= bs:
             return True
 
-        self.tree_cache.evict(bs, self.token_to_kv_pool.free)
+        self.tree_cache.evict(bs, self.token_to_kv_pool_allocator.free)
 
-        if self.token_to_kv_pool.available_size() >= bs:
+        if self.token_to_kv_pool_allocator.available_size() >= bs:
             return True
 
         return False
 
-    def retract_decode(self):
+    def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = [i for i in range(len(self.reqs))]
 
         # TODO(lsyin): improve retraction policy for radix cache
-        sorted_indices.sort(
-            key=lambda i: (
-                len(self.reqs[i].output_ids),
-                -len(self.reqs[i].origin_input_ids),
-            ),
-            reverse=True,
-        )
+        # For spec decoding, filter_batch API can only filter
+        # requests from the back, so we can only retract from the back.
+        # TODO(sang): Clean up finish path and support better retract
+        # policy.
+        if not server_args.speculative_algorithm:
+            sorted_indices.sort(
+                key=lambda i: (
+                    len(self.reqs[i].output_ids),
+                    -len(self.reqs[i].origin_input_ids),
+                ),
+                reverse=True,
+            )
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
+
+        def get_required_tokens(num_reqs: int):
+            headroom_for_spec_decode = 0
+            if server_args.speculative_algorithm:
+                headroom_for_spec_decode += (
+                    num_reqs
+                    * server_args.speculative_eagle_topk
+                    * server_args.speculative_num_steps
+                    + num_reqs * server_args.speculative_num_draft_tokens
+                )
+            return (
+                num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
+            )
+
         while (
-            self.token_to_kv_pool.available_size()
-            < len(sorted_indices) * global_config.retract_decode_steps
+            self.token_to_kv_pool_allocator.available_size()
+            < get_required_tokens(len(sorted_indices))
             or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
-                    self.token_to_kv_pool.available_size() > 0
+                    self.token_to_kv_pool_allocator.available_size() > 0
                 ), "No space left for only one request"
                 break
 
@@ -935,7 +963,7 @@ class ScheduleBatch:
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, : seq_lens_cpu[idx]
                 ]
-                self.token_to_kv_pool.free(token_indices)
+                self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
                 del self.tree_cache.entries[req.rid]
             else:
@@ -944,7 +972,7 @@ class ScheduleBatch:
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
                 ]
-                self.token_to_kv_pool.free(token_indices)
+                self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
 
                 # release the last node
@@ -953,10 +981,13 @@ class ScheduleBatch:
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 residual_size = (
                     len(sorted_indices) * global_config.retract_decode_steps
-                    - self.token_to_kv_pool.available_size()
+                    - self.token_to_kv_pool_allocator.available_size()
                 )
                 residual_size = max(0, residual_size)
-                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
+                self.tree_cache.evict(
+                    residual_size, self.token_to_kv_pool_allocator.free
+                )
+
             req.reset_for_retract()
 
         self.filter_batch(keep_indices=sorted_indices)
@@ -1046,6 +1077,8 @@ class ScheduleBatch:
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         if self.spec_algorithm.is_eagle():
+            # if spec decoding is used, the decode batch is prepared inside
+            # `forward_batch_speculative_generation` after running draft models.
             return
 
         self.input_ids = self.output_ids
@@ -1078,14 +1111,15 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
-        being_chunked_req: Optional[Req] = None,
+        chunked_req_to_exclude: Optional[Req] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
+                if not self.reqs[i].finished()
+                and self.reqs[i] is not chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1153,11 +1187,10 @@ class ScheduleBatch:
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
-
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    def get_model_worker_batch(self):
+    def get_model_worker_batch(self) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1185,6 +1218,7 @@ class ScheduleBatch:
             top_logprobs_nums=self.top_logprobs_nums,
             global_num_tokens=self.global_num_tokens,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            temperature=self.sampling_info.temperatures,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1244,7 +1278,7 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    # The indices of output tokens in the token_to_kv_pool
+    # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
 
     # The sum of all sequence lengths
@@ -1284,7 +1318,8 @@ class ModelWorkerBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[SpecInfo] = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
 
