@@ -1,15 +1,17 @@
-from typing import Any, Dict, List, Optional, Tuple
 import itertools
 import math
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from sgl_kernel import sgl_per_token_group_quant_fp8
+
 from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
 
 is_hip_ = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+
 
 @triton.jit
 def _per_token_group_quant_fp8(
@@ -112,11 +114,13 @@ def triton_per_token_group_quant_fp8(
 
     return x_q, x_s
 
+
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = fp8_type_,):
+    dtype: torch.dtype = fp8_type_,
+):
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
@@ -140,32 +144,31 @@ def sglang_per_token_group_quant_fp8(
 
     return x_q, x_s
 
+
 def calculate_diff(batch_size, seq_len, group_size):
     dtype = torch.float16
     device = torch.device("cuda")
     hidden_dim = group_size * 2
 
-    x = torch.randn(
-        batch_size, seq_len, hidden_dim, 
-        device=device, dtype=dtype
-    )
+    x = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
 
     x_q_triton, x_s_triton = triton_per_token_group_quant_fp8(x.clone(), group_size)
     x_q_sglang, x_s_sglang = sglang_per_token_group_quant_fp8(x.clone(), group_size)
 
-    if (
-        torch.allclose(x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5)
-        and torch.allclose(x_s_triton, x_s_sglang, rtol=1e-3, atol=1e-5)
-    ):
+    if torch.allclose(
+        x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5
+    ) and torch.allclose(x_s_triton, x_s_sglang, rtol=1e-3, atol=1e-5):
         print("✅ All implementations match")
     else:
         print("❌ Implementations differ")
 
+
 batch_size_range = [1, 2, 4, 8, 16, 32, 64]
 seq_len_range = [64, 128, 256, 512, 1024, 2048]
-group_size_range = [128] # For DeepSeek V3/R1
+group_size_range = [128]  # For DeepSeek V3/R1
 
 configs = list(itertools.product(batch_size_range, seq_len_range, group_size_range))
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -185,10 +188,7 @@ def benchmark(batch_size, seq_len, group_size, provider):
     device = torch.device("cuda")
     hidden_dim = group_size * 2
 
-    x = torch.randn(
-        batch_size, seq_len, hidden_dim, 
-        device=device, dtype=dtype
-    )
+    x = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
 
@@ -200,6 +200,7 @@ def benchmark(batch_size, seq_len, group_size, provider):
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+
 
 if __name__ == "__main__":
 
