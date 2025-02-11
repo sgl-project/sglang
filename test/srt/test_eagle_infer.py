@@ -216,8 +216,6 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "0.7",
                 "--attention-backend",
                 "triton",
-                # TODO: Support cuda graph
-                "--disable-cuda-graph",
             ],
         )
 
