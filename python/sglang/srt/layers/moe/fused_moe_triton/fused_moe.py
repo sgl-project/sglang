@@ -712,7 +712,8 @@ def get_config_dtype_str(
         return "float32"
     return None
 
-
+from sglang.utils import rpd_mark
+@rpd_mark()
 def inplace_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -771,7 +772,8 @@ direct_register_custom_op(
     fake_impl=inplace_fused_experts_fake,
 )
 
-
+from sglang.utils import rpd_mark
+@rpd_mark()
 def outplace_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -881,7 +883,8 @@ def fused_experts(
             block_shape,
         )
 
-
+from sglang.utils import rpd_mark
+@rpd_mark()
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,

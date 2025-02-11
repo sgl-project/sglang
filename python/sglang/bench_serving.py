@@ -53,6 +53,7 @@ class RequestFuncInput:
     model: str
     lora_name: str
     extra_request_body: Dict[str, Any]
+    profile_stop: bool = False # Stop profiler
 
 
 @dataclass
@@ -361,7 +362,6 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
-
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
@@ -410,6 +410,24 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
     return output
 
+async def handle_task_completion(task, request_num, profile_request_start, profile_request_end, base_url):
+    result = await task
+    if request_num == profile_request_start:  # Start profiling
+        print("Starting profiler...")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/start_profile"
+        )
+        if profile_output.success:
+            print("Profiler started")
+
+    if request_num == profile_request_end:  # Stop profiling
+        print("Stopping profiler...")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/stop_profile"
+        )
+        if profile_output.success:
+            print("Profiler stopped")
+    return result
 
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
@@ -911,7 +929,9 @@ async def benchmark(
     lora_name: str,
     extra_request_body: Dict[str, Any],
     profile: bool,
+    profile_request_count: Optional[int],
 ):
+    #profile_request_count = 1
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -953,9 +973,13 @@ async def benchmark(
         requests.post(base_url + "/flush_cache")
 
     time.sleep(1.0)
+    if profile_request_count is not None:
+        # capture the beginning and ending requests from the middle of total size of input_requests
+        profile_request_start = len(input_requests) // 2 - profile_request_count // 2
+        profile_request_end = profile_request_start + profile_request_count
 
     # Start profiler
-    if profile:
+    if profile and profile_request_count == None:
         print("Starting profiler...")
         profile_output = await async_request_profile(
             api_url=base_url + "/start_profile"
@@ -968,7 +992,9 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    request_num = 0
     async for request in get_request(input_requests, request_rate):
+        request_num += 1
         prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -979,15 +1005,16 @@ async def benchmark(
             lora_name=lora_name,
             extra_request_body=extra_request_body,
         )
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
-            )
+        task = asyncio.create_task(
+            limited_request_func(request_func_input=request_func_input, pbar=pbar)
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+        tasks.append(handle_task_completion(task, request_num, profile_request_start, profile_request_end, base_url)
+                      if profile_request_count is not None else task)
 
+    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    
     # Stop profiler
-    if profile:
+    if profile and profile_request_count == None:
         print("Stopping profiler...")
         profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
         if profile_output.success:
@@ -1284,6 +1311,7 @@ def run_benchmark(args_: argparse.Namespace):
                 lora_name=args.lora_name,
                 extra_request_body=extra_request_body,
                 profile=args.profile,
+                profile_request_count=args.profile_request_count,
             )
         )
     else:
@@ -1468,8 +1496,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Use Torch Profiler. The endpoint must be launched with "
-        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        help="Use Torch/RPD Profiler. The endpoint must be launched with "
+        "SGLANG_TORCH_PROFILER_DIR or SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--profile-request-count",
+        type=int,
+        help="Number of requests to profile. If not set, the profiler will profile all requests.",
+        default=None,
     )
     parser.add_argument(
         "--lora-name",

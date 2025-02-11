@@ -69,6 +69,7 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
+from sglang.utils import rpd_mark
 
 logger = logging.getLogger(__name__)
 
@@ -747,12 +748,14 @@ class ModelRunner:
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
 
+    @rpd_mark()
     def forward_decode(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
-
+    
+    @rpd_mark()
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
@@ -775,7 +778,7 @@ class ModelRunner:
                 forward_batch,
                 get_embedding=True,
             )
-
+    @rpd_mark()
     def forward_idle(self, forward_batch: ForwardBatch):
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch

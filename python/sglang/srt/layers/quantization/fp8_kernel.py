@@ -75,7 +75,6 @@ def _per_token_group_quant_fp8(
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
 
-
 @triton.jit
 def _per_token_group_quant_fp8_colmajor(
     # Pointers to inputs and output

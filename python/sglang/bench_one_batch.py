@@ -72,7 +72,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
-
+from pathlib import Path
 
 @dataclasses.dataclass
 class BenchArgs:
@@ -85,6 +85,7 @@ class BenchArgs:
     # This is only used for correctness test
     cut_len: int = 4
     profile: bool = False
+    profile_rpd: bool = False
     profile_filename_prefix: str = "profile"
 
     @staticmethod
@@ -106,6 +107,9 @@ class BenchArgs:
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
         parser.add_argument(
             "--profile", action="store_true", help="Use Torch Profiler."
+        )
+        parser.add_argument(
+            "--profile-rpd", action="store_true", help="Use RPD Profiler."
         )
         parser.add_argument(
             "--profile-filename-prefix",
@@ -314,7 +318,9 @@ def latency_test_run_once(
     input_len,
     output_len,
     device,
+    tp_rank,
     profile,
+    profile_rpd,
     profile_filename_prefix,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -338,7 +344,8 @@ def latency_test_run_once(
     tot_latency = 0
 
     profiler = None
-    if profile:
+    print(f'>>>> BATCH {batch_size}')
+    if profile and tp_rank == 0:
         profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -347,6 +354,19 @@ def latency_test_run_once(
             with_stack=True,
         )
         profiler.start()
+    elif profile_rpd:
+        from sglang.utils import rpd_trace
+        SGLANG_RPD_PROFILER_DIR=os.getenv("SGLANG_RPD_PROFILER_DIR", "")
+        rpd_profiler_trace_dir = Path(SGLANG_RPD_PROFILER_DIR)
+        rpd_profiler_trace_dir.parent.mkdir(parents=True, exist_ok=True)
+        rpd_profiler_trace_dir = f"{rpd_profiler_trace_dir}/{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.trace.rpd"
+        if(tp_rank == 0):
+            rpd_trace.create_file(filename=str(rpd_profiler_trace_dir))
+
+        profiler = rpd_trace(filename=str(rpd_profiler_trace_dir),
+                                    name='Worker RPD Enabled',
+                                    nvtx=True)
+        profiler.__enter__()
 
     # Prefill
     synchronize(device)
@@ -378,13 +398,15 @@ def latency_test_run_once(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
-    if profile:
+    if profile and tp_rank == 0:
         profiler.stop()
         profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.trace.json.gz"
         parent_dir = os.path.dirname(os.path.abspath(profile_filename))
         os.makedirs(parent_dir, exist_ok=True)
         profiler.export_chrome_trace(profile_filename)
         rank_print(f"torch profiler chrome trace saved to {profile_filename}")
+    elif profile_rpd:
+        profiler.__exit__()
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -438,7 +460,9 @@ def latency_test(
         bench_args.input_len[0],
         8,  # shorter decoding to speed up the warmup
         server_args.device,
+        tp_rank,
         profile=False,
+        profile_rpd=False,
         profile_filename_prefix="",  # not used
     )
 
@@ -459,7 +483,9 @@ def latency_test(
             il,
             ol,
             server_args.device,
-            bench_args.profile if tp_rank == 0 else None,
+            tp_rank,
+            bench_args.profile,
+            bench_args.profile_rpd,
             bench_args.profile_filename_prefix,
         )
         if ret is not None:

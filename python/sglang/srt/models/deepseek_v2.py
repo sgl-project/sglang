@@ -165,7 +165,8 @@ class DeepseekV2MoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
             )
-
+    from sglang.utils import rpd_mark
+    @rpd_mark("DeepseekMoE_Forward")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -827,6 +828,7 @@ class DeepseekV2Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(

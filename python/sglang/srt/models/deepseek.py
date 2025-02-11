@@ -148,7 +148,8 @@ class DeepseekMoE(nn.Module):
             param.data = data
 
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
-
+    from sglang.utils import rpd_mark
+    @rpd_mark("DeepseekMoE_Forward")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
