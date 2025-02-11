@@ -5,7 +5,7 @@
 #pragma once
 
 #include <cutlass/gemm/collective/builders/sm90_gmma_builder.inl>
-
+#include "cutlass_extensions/gemm/dispatch_policy.hpp"
 #include "cutlass_extensions/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp"
 
 

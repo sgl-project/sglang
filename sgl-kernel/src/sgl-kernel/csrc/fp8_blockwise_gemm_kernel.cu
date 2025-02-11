@@ -129,9 +129,8 @@ void launch_sm90_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tensor
 template <typename OutType>
 void sm90_fp8_blockwise_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
                                        const torch::Tensor& scales_a, const torch::Tensor& scales_b) {
-  // TODO: switch different tileshape and clustershape with different m and n
   using TileShape = Shape<_128, _128, _128>;
-  using ClusterShape = Shape<_1, _2, _1>;
+  using ClusterShape = Shape<_1, _1, _1>;
   launch_sm90_fp8_blockwise_scaled_mm<OutType, TileShape, ClusterShape>(out, a, b, scales_a, scales_b);
 }
 
