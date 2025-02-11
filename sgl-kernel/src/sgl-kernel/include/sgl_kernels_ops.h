@@ -145,5 +145,5 @@ void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Te
                        int64_t depth, int64_t draft_token_num);
 
 // sgl_per_token_group_quant_fp8
-void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s,
-                      int64_t group_size, double eps, double fp8_min, double fp8_max);
+void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size,
+                                   double eps, double fp8_min, double fp8_max);
