@@ -14,7 +14,7 @@ import triton.language as tl
 from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
 is_hip_flag = is_hip()
@@ -488,7 +488,7 @@ def invoke_fused_moe_kernel(
         else:
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            A, A_scale = per_token_group_quant_fp8(A, block_k)
+            A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
