@@ -88,9 +88,13 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_extend_key = key[:, start_extend:end_extend, :]
             per_req_extend_value = value[:, start_extend:end_extend, :]
 
-            if not is_prefill: # extend, prefix len is not 0
+            if not is_prefill:
                 per_req_query = torch.empty(
-                    (per_req_extend_query.shape[0], seq_len, per_req_extend_query.shape[2]),
+                    (
+                        per_req_extend_query.shape[0],
+                        seq_len,
+                        per_req_extend_query.shape[2],
+                    ),
                     dtype=per_req_extend_query.dtype,
                     device=per_req_extend_query.device,
                 )
@@ -103,7 +107,11 @@ class TorchNativeAttnBackend(AttentionBackend):
                     device=per_req_extend_key.device,
                 )
                 per_req_value = torch.empty(
-                    (per_req_extend_value.shape[0], seq_len, per_req_extend_value.shape[2]),
+                    (
+                        per_req_extend_value.shape[0],
+                        seq_len,
+                        per_req_extend_value.shape[2],
+                    ),
                     dtype=per_req_extend_value.dtype,
                     device=per_req_extend_value.device,
                 )
@@ -112,19 +120,23 @@ class TorchNativeAttnBackend(AttentionBackend):
                 # get key and value from cache. per_req_tokens contains the kv cache
                 # index for each token in the sequence.
                 req_pool_idx = req_pool_indices[seq_idx]
-                # per_req_tokens = req_to_token[req_pool_idx, :seq_len]
                 curr_req_to_tokens = torch.index_select(
-                    req_to_token, 0, req_pool_idx).squeeze(0)
+                    req_to_token, 0, req_pool_idx
+                ).squeeze(0)
                 per_req_prefix_tokens = curr_req_to_tokens[:prefix_seq_len]
-                per_req_prefix_key = k_cache[per_req_prefix_tokens].movedim(0, query.dim() - 2)
-                per_req_prefix_value = v_cache[per_req_prefix_tokens].movedim(0, query.dim() - 2)
+                per_req_prefix_key = k_cache[per_req_prefix_tokens].movedim(
+                    0, query.dim() - 2
+                )
+                per_req_prefix_value = v_cache[per_req_prefix_tokens].movedim(
+                    0, query.dim() - 2
+                )
 
                 # concat prefix kv and extend kv
                 per_req_key[:, prefix_seq_len:, :] = per_req_extend_key
                 per_req_value[:, prefix_seq_len:, :] = per_req_extend_value
                 per_req_key[:, :prefix_seq_len, :] = per_req_prefix_key
                 per_req_value[:, :prefix_seq_len, :] = per_req_prefix_value
-            else: # prefill, prefix len is 0
+            else:
                 per_req_query = per_req_extend_query
                 per_req_key = per_req_extend_key
                 per_req_value = per_req_extend_value
@@ -141,8 +153,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_extend:end_extend, :,
-                   :] = per_req_out[prefix_seq_len:, :, :]
+            output[start_extend:end_extend, :, :] = per_req_out[prefix_seq_len:, :, :]
             start_extend = end_extend
         return output
 
@@ -197,14 +208,12 @@ class TorchNativeAttnBackend(AttentionBackend):
             # index for each token in the sequence.
             # select, get a scalar tensor
             req_pool_idx = req_pool_indices[seq_idx]
-            # per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv] # item+select+item+slice
             curr_req_to_tokens = torch.index_select(
-                req_to_token, 0, req_pool_idx).squeeze(0)
+                req_to_token, 0, req_pool_idx
+            ).squeeze(0)
             per_req_tokens = curr_req_to_tokens[:seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(
-                0, query.dim() - 2)  # index + movedim
-            per_req_value = v_cache[per_req_tokens].movedim(
-                0, query.dim() - 2)  # index + movedim
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
             per_req_out = (
                 scaled_dot_product_attention(
@@ -233,8 +242,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
@@ -289,8 +297,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
