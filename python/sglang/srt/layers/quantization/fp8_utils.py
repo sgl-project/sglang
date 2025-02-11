@@ -1,5 +1,5 @@
 from typing import List, Optional, Tuple
-
+import os
 import torch
 from packaging.version import Version
 
@@ -9,15 +9,17 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
 )
-
-if is_cuda():
-    from sgl_kernel import fp8_scaled_mm
-
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+use_vllm_cutlass_w8a8_fp8_kernel = os.environ.get("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL", default=False)
+if is_cuda():
+    if use_vllm_cutlass_w8a8_fp8_kernel:
+        from vllm import _custom_ops as ops
+    else:
+        from sgl_kernel import fp8_scaled_mm
 
 is_hip_ = is_hip()
 
@@ -163,12 +165,21 @@ def apply_fp8_linear(
         )
 
     if cutlass_fp8_supported:
-        assert (
-            weight_scale.numel() == weight.shape[1]
-        ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-        output = fp8_scaled_mm(
-            qinput, weight, x_scale, weight_scale, out_dtype=input.dtype, bias=bias
-        )
+        if use_vllm_cutlass_w8a8_fp8_kernel:
+            # Fall back to vllm cutlass w8a8 fp8 kernel
+            output = ops.cutlass_scaled_mm(qinput,
+                                            weight,
+                                            out_dtype=input.dtype,
+                                            scale_a=x_scale,
+                                            scale_b=weight_scale,
+                                            bias=bias)
+        else:
+            assert (
+                weight_scale.numel() == weight.shape[1]
+            ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+            output = fp8_scaled_mm(
+                qinput, weight, x_scale, weight_scale, out_dtype=input.dtype, bias=bias
+            )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only
