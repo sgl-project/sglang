@@ -38,6 +38,8 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
+        self.skip_prefill = skip_prefill
+
         max_bs = model_runner.req_to_token_pool.size
 
         if kv_indptr_buf is None:
@@ -48,13 +50,15 @@ class TritonAttnBackend(AttentionBackend):
             self.kv_indptr = kv_indptr_buf
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.qo_indptr = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-        )
 
-        self.mask_indptr = torch.zeros(
-            (max_bs + 1,), dtype=torch.int64, device=model_runner.device
-        )
+        if not self.skip_prefill:
+            self.qo_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
+
+            self.mask_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
+            )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
@@ -213,6 +217,13 @@ class TritonAttnBackend(AttentionBackend):
             device=self.device,
         )
 
+        if not self.skip_prefill:
+            self.cuda_graph_custom_mask = torch.zeros(
+                (max_bs * self.max_context_len),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -224,32 +235,35 @@ class TritonAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInfo],
     ):
         assert encoder_lens is None, "Not supported"
-        assert forward_mode.is_decode(), "Not supported"
-        assert spec_info is None, "Not supported"
 
-        kv_indptr = self.kv_indptr
-        kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-        kv_indptr = kv_indptr[: bs + 1]
-        kv_indices = self.cuda_graph_kv_indices
-        create_flashinfer_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            req_pool_indices,
-            seq_lens,
-            kv_indptr,
-            None,
-            kv_indices,
-            self.req_to_token.stride(0),
-        )
+        if forward_mode.is_decode_or_idle():
+            kv_indptr = self.kv_indptr
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
 
-        self.forward_metadata = (
-            self.cuda_graph_attn_logits,
-            None,
-            kv_indptr,
-            kv_indices,
-            None,
-            None,
-            None,
-        )
+            self.forward_metadata = (
+                self.cuda_graph_attn_logits,
+                None,
+                kv_indptr,
+                kv_indices,
+                None,
+                None,
+                None,
+            )
+        elif forward_mode.is_target_verify():
+            pass
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
 
     def init_forward_metadata_replay_cuda_graph(
         self,
