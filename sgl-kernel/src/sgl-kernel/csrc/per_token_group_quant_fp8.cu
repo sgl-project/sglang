@@ -55,6 +55,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     if (local_tid < 8) {
       WarpReduce(&s_absmax[local_group_id][0], local_tid);
     }
+    __syncthreads();
 
     // Get the maximum value for this group
     const float group_absmax = s_absmax[local_group_id][0];
