@@ -153,6 +153,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
       "int topk, int depth, int draft_token_num) -> ()");
   m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
+
+  // per_token_group_quant_fp8
+  m.def("sgl_per_token_group_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+        " float eps, float fp8_min, float fp8_max) -> ()");
+  m.impl("sgl_per_token_group_quant_fp8", torch::kCUDA, &sgl_per_token_group_quant_fp8);
 }
 
 REGISTER_EXTENSION(_kernels)

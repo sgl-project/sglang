@@ -143,3 +143,7 @@ void build_tree_kernel_efficient(at::Tensor parent_list, at::Tensor selected_ind
 void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
                        at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index, int64_t topk,
                        int64_t depth, int64_t draft_token_num);
+
+// sgl_per_token_group_quant_fp8
+void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s,
+                      int64_t group_size, double eps, double fp8_min, double fp8_max);
