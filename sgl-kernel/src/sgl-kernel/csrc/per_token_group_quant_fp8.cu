@@ -40,7 +40,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     FP8_TYPE* group_output = static_cast<FP8_TYPE*>(output_q) + (block_group_id + local_group_id) * group_size;
     float* scale_output = output_s + block_group_id + local_group_id;
 
-    // 1. Calculate local maximum absolute value
+    // Calculate local maximum absolute value
     for (int i = local_tid; i < group_size; i += 16) {
       float val = static_cast<float>(group_input[i]);
       float abs_val = fabsf(val);
