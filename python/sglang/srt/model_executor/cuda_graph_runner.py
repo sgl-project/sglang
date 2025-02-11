@@ -237,6 +237,7 @@ class CudaGraphRunner:
                 "1. disable cuda graph by --disable-cuda-graph\n"
                 "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
+                "4. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -348,7 +349,13 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL
+                if self.model_runner.server_args.return_hidden_states
+                else (
+                    spec_info.capture_hidden_mode
+                    if spec_info
+                    else CaptureHiddenMode.NULL
+                )
             ),
         )
 
@@ -462,8 +469,11 @@ class CudaGraphRunner:
                     ),
                     positions=None,
                     retrive_index=None,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
                     retrive_cum_len=None,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    spec_steps=self.model_runner.server_args.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
 
