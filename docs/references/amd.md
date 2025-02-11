@@ -98,3 +98,21 @@ drun sglang_image \
 ```
 
 With your AMD system properly configured and SGLang installed, you can now fully leverage AMD hardware to power SGLang’s machine learning capabilities.
+
+## Running DeepSeek-V3
+
+The only difference in running DeepSeek-V3 is when starting the server.
+
+```bash
+drun -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --ipc=host \
+    --env "HF_TOKEN=<secret>" \
+    sglang_image \
+    python3 -m sglang.launch_server \
+    --model deepseek-ai/DeepSeek-V3 # <- here \
+    --tp 8 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 30000
+```
