@@ -143,7 +143,7 @@ def sglang_per_token_group_quant_fp8(
 def calculate_diff(batch_size, seq_len, group_size):
     dtype = torch.float16
     device = torch.device("cuda")
-    hidden_dim = group_size * 2  # 确保能被group_size整除
+    hidden_dim = group_size * 2
 
     x = torch.randn(
         batch_size, seq_len, hidden_dim, 
@@ -183,7 +183,7 @@ configs = list(itertools.product(batch_size_range, seq_len_range, group_size_ran
 def benchmark(batch_size, seq_len, group_size, provider):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    hidden_dim = group_size * 2  # 确保能被group_size整除
+    hidden_dim = group_size * 2
 
     x = torch.randn(
         batch_size, seq_len, hidden_dim, 
