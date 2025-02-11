@@ -65,15 +65,31 @@ class EAGLEWorker(TpModelWorker):
         self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
 
         # Create multi-step attn backends and cuda graph runners
-        from sglang.srt.layers.attention.flashinfer_backend import (
-            FlashInferMultiStepDraftBackend,
-        )
+        if server_args.attention_backend == "flashinfer":
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferMultiStepDraftBackend,
+            )
 
-        self.draft_attn_backend = FlashInferMultiStepDraftBackend(
-            self.model_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
+            self.draft_attn_backend = FlashInferMultiStepDraftBackend(
+                self.model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+        elif server_args.attention_backend == "triton":
+            from sglang.srt.layers.attention.triton_backend import (
+                TritonMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = TritonMultiStepDraftBackend(
+                self.model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+        else:
+            raise ValueError(
+                f"EAGLE is not supportted in attention backend {server_args.attention_backend}"
+            )
+
         self.model_runner.draft_attn_backend = self.draft_attn_backend
         self.init_cuda_graphs()
 
@@ -185,6 +201,7 @@ class EAGLEWorker(TpModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.server_args.speculative_num_draft_tokens,
+            batch.sampling_info.is_all_greedy,
         )
 
         # Free cache locations
@@ -216,6 +233,10 @@ class EAGLEWorker(TpModelWorker):
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
+
+            # we don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+            if i == self.speculative_num_steps - 1:
+                break
 
             # Set inputs
             forward_batch.input_ids = input_ids
