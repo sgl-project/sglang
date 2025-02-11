@@ -116,6 +116,8 @@ class ModelRunner:
                         "FlashInfer MLA optimization is turned on. Use flashinfer backend for DeepseekV3ForCausalLM."
                     )
                     self.server_args.attention_backend = "flashinfer"
+                elif self.server_args.attention_backend == "torch_native":
+                    logger.info("MLA optimization is turned on. Use torch_native backend for DeepseekV3ForCausalLM.")
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
                     self.server_args.attention_backend = "triton"
