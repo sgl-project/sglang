@@ -113,6 +113,7 @@ class ServerArgs:
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
+    lora_backend: str = "triton"
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -139,6 +140,7 @@ class ServerArgs:
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
@@ -159,6 +161,7 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
+    return_hidden_states: bool = False
 
     # Custom logit processor
     enable_custom_logit_processor: bool = False
@@ -653,13 +656,19 @@ class ServerArgs:
             nargs="*",
             default=None,
             action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}.",
         )
         parser.add_argument(
             "--max-loras-per-batch",
             type=int,
             default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
+            help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--lora-backend",
+            type=str,
+            default="triton",
+            help="Choose the kernel backend for multi-LoRA serving.",
         )
 
         # Kernel backend
@@ -776,6 +785,11 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
+            "--enable-nccl-nvls",
+            action="store_true",
+            help="Enable NCCL NVLS for prefill heavy requests when available.",
+        )
+        parser.add_argument(
             "--disable-outlines-disk-cache",
             action="store_true",
             help="Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -788,7 +802,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-mla",
             action="store_true",
-            help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+            help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -888,6 +902,11 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        parser.add_argument(
+            "--return-hidden-states",
+            action="store_true",
+            help="Return hidden states in the response.",
         )
         # Function Calling
         parser.add_argument(
