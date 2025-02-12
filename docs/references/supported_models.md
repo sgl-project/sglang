@@ -36,7 +36,7 @@
 
 - LlamaEmbeddingModel
 - Mistral embedding models
-- QWen embedding models
+- Qwen embedding models
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
 ## Reward Models
