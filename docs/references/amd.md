@@ -137,6 +137,6 @@ drun -p 30000:30000 \
     --port 30000
 ```
 
-### Verification Step
+### Warmup Step
 
 As before, you can use the verification step to confirm that the `sglang` server is running the correct model (DeepSeek-V3 or Llama3.1) as expected.
