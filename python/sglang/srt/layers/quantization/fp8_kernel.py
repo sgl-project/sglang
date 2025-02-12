@@ -299,7 +299,7 @@ def _w8a8_block_fp8_matmul(
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=2):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
@@ -386,7 +386,7 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # manually unroll to 4 iterations
     UNROLL_FACTOR = 4
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR)):
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR), num_stages=2):
         # 1st iteration
         a = tl.load(
             a_ptrs,
