@@ -275,8 +275,13 @@ class ServerArgs:
         if self.speculative_algorithm == "LOOKAHEAD":
             self.disable_overlap_schedule = True
             self.chunked_prefill_size = -1
+            self.disable_mla = True
+            self.enable_double_sparsity = False
+            assert (
+                self.attention_backend == "flashinfer"
+            ), "Lookahead speculative decoding only support flashinfer for now."
             logger.info(
-                "The and chunked_prefill, overlap scheduler are disabled because of using lookahead speculative decoding."
+                "The mla, chunked_prefill, overlap scheduler and double_sparsity are disabled because of lookahead speculative decoding."
             )
 
         # GGUF

@@ -174,9 +174,11 @@ class CudaGraphRunner:
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
-
+        self.is_spec = is_spec
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner, is_spec)
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, is_spec
+        )
         self.capture_forward_mode = ForwardMode.DECODE
         self.num_tokens_per_bs = 1
         if model_runner.spec_algorithm.is_eagle():
@@ -193,7 +195,6 @@ class CudaGraphRunner:
             self.num_tokens_per_bs = (
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
-
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
