@@ -60,6 +60,11 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
                             const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                             const c10::optional<torch::Tensor>& bias);
 
+// fp8_blockwise_scaled_mm
+torch::Tensor fp8_blockwise_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                                      const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                                      const torch::Dtype& out_dtype);
+
 // lightning_attention_decode
 void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
                                 const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
