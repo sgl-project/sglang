@@ -9,7 +9,11 @@ from typing import List, Optional, Union
 
 import numpy as np
 import transformers
-from decord import VideoReader, cpu
+try:
+    from decord import VideoReader, cpu
+except ImportError:
+    VideoReader = None
+    cpu = None
 from PIL import Image
 
 from sglang.srt.hf_transformers_utils import get_processor
@@ -305,6 +309,8 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
             estimated_frames_list = []
             for image in image_data:
                 if isinstance(image, str) and image.startswith("video:"):
+                    if VideoReader is None:
+                        raise ValueError("Video support requires the decord python package.")
                     path = image[len("video:") :]
                     # Estimate frames for the video
                     vr = VideoReader(path, ctx=cpu(0))
@@ -321,6 +327,9 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         scaling_factor = min(1.0, MAX_NUM_FRAMES / total_frame_count)
 
         def encode_video(video_path, frame_count_limit=None):
+            if VideoReader is None:
+                raise ValueError("Video support requires the decord python package.")
+
             if not os.path.exists(video_path):
                 logger.error(f"Video {video_path} does not exist")
                 return []
