@@ -67,7 +67,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
-        weight_scale = layer.weight_scale
+        weight_scale = layer.weight_scale.detach()
         if is_hip():
             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(weight=weight, weight_scale=weight_scale)
         layer.weight = Parameter(weight.t(), requires_grad=False)
