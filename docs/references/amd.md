@@ -1,4 +1,4 @@
-# AMD Configuration and Setup for SGLang
+# SGLang on AMD
 
 ## Introduction
 
@@ -98,3 +98,45 @@ drun sglang_image \
 ```
 
 With your AMD system properly configured and SGLang installed, you can now fully leverage AMD hardware to power SGLang’s machine learning capabilities.
+
+## Examples
+
+### Running DeepSeek-V3
+
+The only difference in running DeepSeek-V3 is when starting the server. Here's an example command:
+
+```bash
+drun -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --ipc=host \
+    --env "HF_TOKEN=<secret>" \
+    sglang_image \
+    python3 -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-V3 \ # <- here
+    --tp 8 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+### Running Llama3.1
+
+Running Llama3.1 is nearly identical. The only difference is in the model specified when starting the server, shown by the following example command:
+
+```bash
+drun -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --ipc=host \
+    --env "HF_TOKEN=<secret>" \
+    sglang_image \
+    python3 -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \ # <- here
+    --tp 8 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+### Warmup Step
+
+When the server displays "The server is fired up and ready to roll!", it means the startup is successful.
