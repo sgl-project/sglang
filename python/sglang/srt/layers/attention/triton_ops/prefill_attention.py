@@ -32,7 +32,7 @@ if _is_cuda or _is_hip:
 
 
 @triton.jit
-def _fwd_kernel(
+def _redundant_fwd_kernel(
     Q,
     K,
     V,
@@ -190,7 +190,7 @@ def context_attention_fwd(
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
     num_warps = 4 if Lk <= 64 else 8
 
-    _fwd_kernel[grid](
+    _redundant_fwd_kernel[grid](
         q,
         k,
         v,
