@@ -19,7 +19,10 @@ from sglang.utils import dump_state_text
 
 @sgl.function
 def reasoning_gen(s, question: str):
-    s += sgl.user(question + "\nPlease reason step by step, and put your final answer within \boxed{}.")
+    s += sgl.user(
+        question
+        + "\nPlease reason step by step, and put your final answer within \boxed{}."
+    )
     s += sgl.assistant(
         sgl.gen(
             "answer",
@@ -40,7 +43,7 @@ def convert_dataset(path: str):
 
 
 def extract_boxed_text(text: str):
-    pattern = r'oxed{(.*?)}'
+    pattern = r"oxed{(.*?)}"
     matches = re.findall(pattern, text)
     if not matches:
         return ""
@@ -48,6 +51,7 @@ def extract_boxed_text(text: str):
         if match != "":
             return match
     return ""
+
 
 def main(args):
     # Select backend
