@@ -130,6 +130,35 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+
+  // tree spec decode
+  m.def(
+      "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor uniform_samples, Tensor target_probs, Tensor draft_probs, "
+      "bool deterministic, int cuda_stream) -> ()");
+  m.impl("tree_speculative_sampling_target_only", torch::kCUDA, &tree_speculative_sampling_target_only);
+
+  // eagle build tree
+  m.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! "
+      "retrive_next_sibling, "
+      "int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+
+  // eagle build tree
+  m.def(
+      "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
+      "int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
+
+  // per_token_group_quant_fp8
+  m.def(
+      "sgl_per_token_group_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, float fp8_min, float fp8_max) -> ()");
+  m.impl("sgl_per_token_group_quant_fp8", torch::kCUDA, &sgl_per_token_group_quant_fp8);
 }
 
 REGISTER_EXTENSION(_kernels)
