@@ -19,6 +19,7 @@ from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
 is_hip_flag = is_hip()
 
+
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
