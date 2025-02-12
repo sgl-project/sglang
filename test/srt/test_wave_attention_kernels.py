@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.wave_ops.extend_attention import (
 )
 from sglang.srt.layers.attention.triton_ops.extend_attention import (
     redundant_attention,
+    extend_attention_fwd,
 )
 
 class TestWaveAttention(unittest.TestCase):
@@ -111,6 +112,24 @@ class TestWaveAttention(unittest.TestCase):
             max_len_in_batch,
         )
 
+        o_extend = torch.empty(
+            (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
+        )
+        extend_attention_fwd(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_tokens,
+            b_req_idx,
+            b_seq_len,
+            b_seq_len_extend,
+            b_start_loc_extend,
+            max_len_extend,
+        )
+
         o_wave = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
 
         extend_attention_wave(
@@ -129,6 +148,7 @@ class TestWaveAttention(unittest.TestCase):
             is_causal=True,
         )
 
+        self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2))
         self.assertTrue(torch.allclose(o_wave, o_redundant, rtol=1e-2))
 
     def test_extend_attention(self):
