@@ -63,6 +63,7 @@ The core features include:
    references/deepseek.md
    references/multi_node.md
    references/modelscope.md
+   references/quantization.md
    references/contribution_guide.md
    references/troubleshooting.md
    references/nvidia_jetson.md
