@@ -139,4 +139,4 @@ drun -p 30000:30000 \
 
 ### Warmup Step
 
-As before, you can use the verification step to confirm that the `sglang` server is running the correct model (DeepSeek-V3 or Llama3.1) as expected.
+When the server displays "The server is fired up and ready to roll!", it means the startup is successful.
