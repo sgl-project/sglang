@@ -41,6 +41,7 @@ python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-r
 
 Add [performance optimization options](#performance-optimization-options) as needed.
 
+<a id="option_args"></a>
 ### Performance Optimization Options
 [MLA optimizations](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) are enabled by default. Here are some optional optimizations can be enabled as needed.
 
@@ -81,6 +82,8 @@ python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --d
 ```
 
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
+
+> **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
 
 ### Example: Serving with two H200*8 nodes and docker
 There are two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 192.168.114.10:20000`.
@@ -131,6 +134,8 @@ docker run --gpus all \
     python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1 --random-output 512 --random-range-ratio 1 --num-prompts 1 --host 0.0.0.0 --port 40000 --output-file "deepseekv3_multinode.jsonl"
 ```
 
+> **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
+
 ### Example: Serving with four A100*8 nodes
 To serve DeepSeek-V3 with A100 GPUs, we need to convert the [FP8 model checkpoints](https://huggingface.co/deepseek-ai/DeepSeek-V3) to BF16 with [script](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) mentioned [here](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) first.
 
@@ -149,6 +154,8 @@ python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 -
 # node 4
 python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 3 --trust-remote-code
 ```
+
+> **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
 
 Then we can benchmark the accuracy and latency by accessing the first node's exposed port with the following example commands.
 
