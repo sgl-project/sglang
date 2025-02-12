@@ -142,13 +142,16 @@ def is_weak_contiguous(inp: torch.Tensor):
 class CustomAllreduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
-
+    _MAX_CAR_SIZE = 8192 * 1024
+    if is_hip():
+        # crossover is at 16MB buffer size for ROCm
+        _MAX_CAR_SIZE = 2 * 8192 * 1024    # TODO (hubert): Check this
     # max_size: max supported allreduce size
     def __init__(
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=8192 * 1024,
+        max_size=_MAX_CAR_SIZE,
     ) -> None:
         """
         Args:
@@ -286,7 +289,7 @@ class CustomAllreduce:
                 )
                 handles, offsets = self._gather_ipc_meta(shard_data)
                 self.rank_data = torch.empty(
-                    8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                    8 * 1024 * 1024, dtype=torch.uint8, device=self.device   # TODO (hubert): check this
                 )
                 self._ptr = ops.init_custom_ar(
                     self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
@@ -372,7 +375,6 @@ class CustomAllreduce:
             if not self.disabled:
                 self.register_graph_buffers()
 
-    # TODO (hubert): check this
     def _get_ipc_meta(self, inp: torch.Tensor):
         # _share_cuda_() doesn't accept meta buffer not allocated from
         # PyTorch cache allocator, use direct HIP call to get IPC handle
@@ -383,7 +385,6 @@ class CustomAllreduce:
         )
         return self._gather_ipc_meta(shard_data)
 
-    # TODO (hubert): check this
     def _gather_ipc_meta(self, shard_data):
         # Note: don't use `[[None]] * self.world_size` here
         # because it will create a list of the same reference
@@ -408,14 +409,12 @@ class CustomAllreduce:
             offsets.append(all_data[i][0][1])  # type: ignore
         return handles, offsets
 
-    # TODO (hubert): check this
     def register_buffer(self, inp: torch.Tensor):
         handles, offsets = self._get_ipc_meta(inp)
         ops.register_buffer(self._ptr, inp, handles, offsets)
 
     def register_graph_buffers(self):
         if is_hip():
-            # TODO (hubert): remove redundant code here
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
             logger.info("Registering %d cuda graph addresses", len(offset))
@@ -542,11 +541,7 @@ class CustomAllreduce:
             if ops.use_vllm_custom_allreduce:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
-            elif is_hip():
-                # TODO (hubert)
-                if not self.disabled and self._ptr:
-                    ops.dispose(self._ptr)
-            else:
+            elif is_cuda():
                 self.free_shared_buffer(self.buffer_ptrs)
                 self.free_shared_buffer(self.tmp_result_buffer_ptrs)
                 self.free_shared_buffer(self.barrier_in_ptrs)
