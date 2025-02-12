@@ -1,20 +1,24 @@
-from typing import List, Optional, Tuple
 import os
+from typing import List, Optional, Tuple
+
 import torch
 from packaging.version import Version
 
+from sglang.srt.layers.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    static_quant_fp8,
+    w8a8_block_fp8_matmul,
+)
 from sglang.srt.utils import (
     get_device_capability,
     get_nvcc_cuda_version,
     is_cuda,
     is_hip,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    static_quant_fp8,
-    w8a8_block_fp8_matmul,
+
+use_vllm_cutlass_w8a8_fp8_kernel = os.environ.get(
+    "USE_VLLM_CUTLASS_W8A8_FP8_KERNEL", default=False
 )
-use_vllm_cutlass_w8a8_fp8_kernel = os.environ.get("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL", default=False)
 if is_cuda():
     if use_vllm_cutlass_w8a8_fp8_kernel:
         from vllm import _custom_ops as ops
@@ -167,12 +171,14 @@ def apply_fp8_linear(
     if cutlass_fp8_supported:
         if use_vllm_cutlass_w8a8_fp8_kernel:
             # Fall back to vllm cutlass w8a8 fp8 kernel
-            output = ops.cutlass_scaled_mm(qinput,
-                                            weight,
-                                            out_dtype=input.dtype,
-                                            scale_a=x_scale,
-                                            scale_b=weight_scale,
-                                            bias=bias)
+            output = ops.cutlass_scaled_mm(
+                qinput,
+                weight,
+                out_dtype=input.dtype,
+                scale_a=x_scale,
+                scale_b=weight_scale,
+                bias=bias,
+            )
         else:
             assert (
                 weight_scale.numel() == weight.shape[1]

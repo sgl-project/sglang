@@ -23,8 +23,8 @@ from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,

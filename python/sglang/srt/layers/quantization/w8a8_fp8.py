@@ -1,7 +1,6 @@
 from typing import Any, Dict, List, Optional
 
 import torch
-
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.linear import LinearMethodBase
@@ -10,7 +9,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz, apply_fp8_linear, cutlass_fp8_supported
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear,
+    cutlass_fp8_supported,
+    normalize_e4m3fn_to_e4m3fnuz,
+)
 from sglang.srt.utils import is_hip
 
 
@@ -69,7 +72,9 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         weight = layer.weight
         weight_scale = layer.weight_scale.detach()
         if is_hip():
-            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(weight=weight, weight_scale=weight_scale)
+            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=weight, weight_scale=weight_scale
+            )
         layer.weight = Parameter(weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
@@ -89,7 +94,9 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
 
         weight = ModelWeightParameter(
             data=torch.empty(
-                sum(output_partition_sizes), input_size_per_partition, dtype=torch.float8_e4m3fn
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
             output_dim=0,
