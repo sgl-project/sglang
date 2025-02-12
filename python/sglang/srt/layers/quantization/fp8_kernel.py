@@ -272,6 +272,7 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    num_stages: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -299,7 +300,7 @@ def _w8a8_block_fp8_matmul(
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=num_stages):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
@@ -357,6 +358,7 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    num_stages: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -386,7 +388,9 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # manually unroll to 4 iterations
     UNROLL_FACTOR = 4
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR)):
+    for k in tl.range(
+        0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR), num_stages=num_stages
+    ):
         # 1st iteration
         a = tl.load(
             a_ptrs,
