@@ -44,8 +44,7 @@ class SeparatorStyle(IntEnum):
     CHATGLM3 = auto()
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
-    DeepSeek = auto()
-    DeepSeekV2 = auto()
+    DeepSeekVL2 = auto()
 
 
 @dataclasses.dataclass
@@ -78,7 +77,8 @@ class Conversation:
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
-        system_prompt = self.system_template.format(system_message=self.system_message)
+        system_prompt = self.system_template.format(
+            system_message=self.system_message)
         if self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
             ret = system_prompt + self.sep
             for role, message in self.messages:
@@ -277,7 +277,7 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.DeepSeek:
+        elif self.sep_style == SeparatorStyle.DeepSeekVL2:
             seps = [self.sep, self.sep2]
             if system_prompt == "" or system_prompt is None:
                 ret = ""
@@ -288,21 +288,6 @@ class Conversation:
                     ret += role + ": " + message + seps[i % 2]
                 else:
                     ret += role + ":"
-            return ret
-        elif self.sep_style == SeparatorStyle.DeepSeekV2:
-            seps = [self.sep, self.sep2]
-            if system_prompt == "" or system_prompt is None:
-                ret = ""
-            else:
-                ret = system_prompt + seps[0]
-            for i, (role, message) in enumerate(self.messages):
-                if message:
-                    if role == "User":
-                        ret += "<｜sft▁begin｜>\n" + message + self.sep #<｜sft▁begin｜>User Input<｜sft▁end｜>\nResponse<｜end▁of▁sentence｜>
-                    else:
-                        ret += message + self.sep2
-                else:
-                    ret = ret
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -330,7 +315,7 @@ class Conversation:
     def to_gradio_chatbot(self):
         """Convert the conversation to gradio chatbot format."""
         ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset :]):
+        for i, (role, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
                 ret.append([msg, None])
             else:
@@ -344,7 +329,7 @@ class Conversation:
         else:
             ret = [{"role": "system", "content": self.system_message}]
 
-        for i, (_, msg) in enumerate(self.messages[self.offset :]):
+        for i, (_, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
                 ret.append({"role": "user", "content": msg})
             else:
@@ -427,9 +412,11 @@ def generate_chat_conv(
                     len(message.content) != 1
                     or getattr(message.content[0], "type", None) != "text"
                 ):
-                    raise ValueError("The system message should be a single text.")
+                    raise ValueError(
+                        "The system message should be a single text.")
                 else:
-                    conv.system_message = getattr(message.content[0], "text", "")
+                    conv.system_message = getattr(
+                        message.content[0], "text", "")
         elif msg_role == "user":
             # Handle the various types of Chat Request content types here.
             role = conv.roles[0]
@@ -446,7 +433,7 @@ def generate_chat_conv(
                 if num_image_url > 1:
                     image_token = conv.image_token
                 else:
-                    if conv.name != "deepseek":
+                    if conv.name != "deepseek-vl2":
                         image_token = (
                             conv.image_token + "\n"
                             if conv.name != "qwen2-vl"
@@ -459,7 +446,7 @@ def generate_chat_conv(
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: Only works for llava
-                        if conv.name != "deepseek":
+                        if conv.name != "deepseek-vl2":
                             real_content += image_token
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
@@ -588,7 +575,7 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
-        name="deepseek",
+        name="deepseek-vl2",
         system_template="{system_message}",
         # system_message="You are a helpful assistant. Please answer truthfully and write out your "
         # "thinking step by step to be sure you get the right answer.",
@@ -596,7 +583,7 @@ register_conv_template(
         roles=("<|User|>", "<|Assistant|>"),
         messages=(),
         offset=0,
-        sep_style=SeparatorStyle.DeepSeek,
+        sep_style=SeparatorStyle.DeepSeekVL2,
         sep="\n\n",
         sep2="<｜end▁of▁sentence｜>",
         stop_token_ids=[100001],
@@ -604,21 +591,6 @@ register_conv_template(
     )
 )
 
-register_conv_template(
-    Conversation(
-        name="deepseekv2",
-        system_template="{system_message}",
-        system_message="",
-        roles=("|<User>|", "|<Assistant>|"),
-        messages=(),
-        offset=0,
-        sep_style=SeparatorStyle.DeepSeekV2,
-        sep="\n<｜sft▁end｜>",
-        sep2="<｜end▁of▁sentence｜>",
-        stop_token_ids=[100001],
-        stop_str=["User:", "<｜end▁of▁sentence｜>"]
-    )
-)
 # Reference: https://huggingface.co/openbmb/MiniCPM-V-2_6#usage
 register_conv_template(
     Conversation(

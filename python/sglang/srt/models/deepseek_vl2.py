@@ -224,7 +224,8 @@ class PatchEmbed(nn.Module):
     ):
         super().__init__()
         self.patch_size = to_2tuple(patch_size)
-        self.img_size, self.grid_size, self.num_patches = self._init_img_size(img_size)
+        self.img_size, self.grid_size, self.num_patches = self._init_img_size(
+            img_size)
 
         if output_fmt is not None:
             self.flatten = False
@@ -268,7 +269,8 @@ class PatchEmbed(nn.Module):
                     bias=self.proj.bias is not None,
                 )
                 new_proj.weight.copy_(
-                    resample_patch_embed(self.proj.weight, new_patch_size, verbose=True)
+                    resample_patch_embed(
+                        self.proj.weight, new_patch_size, verbose=True)
                 )
                 if self.proj.bias is not None:
                     new_proj.bias.copy_(self.proj.bias)
@@ -316,8 +318,10 @@ class PatchEmbed(nn.Module):
                     W % self.patch_size[1] == 0
                 ), f"Input width ({W}) should be divisible by patch size ({self.patch_size[1]})."
         if self.dynamic_img_pad:
-            pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
-            pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
+            pad_h = (self.patch_size[0] - H %
+                     self.patch_size[0]) % self.patch_size[0]
+            pad_w = (self.patch_size[1] - W %
+                     self.patch_size[1]) % self.patch_size[1]
             x = F.pad(x, (0, pad_w, 0, pad_h))
         x = self.proj(x)
         if self.flatten:
@@ -363,7 +367,8 @@ class Mlp(nn.Module):
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
         self.norm = (
-            norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
+            norm_layer(
+                hidden_features) if norm_layer is not None else nn.Identity()
         )
         # self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
         if use_conv:
@@ -434,7 +439,7 @@ class DropPath(nn.Module):
         return self.drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
 
     def extra_repr(self):
-        return f"drop_prob={round(self.drop_prob,3):0.3f}"
+        return f"drop_prob={round(self.drop_prob, 3):0.3f}"
 
 
 # Modified for https://github.com/deepseek-ai/DeepSeek-VL2/blob/a698c36a4cfbd3ca700e79e936f7bc16b6fd5957/deepseek_vl2/models/siglip_vit.py#L106C1-L174C17
@@ -468,7 +473,8 @@ class DeepseekVL2Attention(nn.Module):
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = RowParallelLinear(dim, dim, quant_config=quant_config)
-        self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
+        self.proj_drop = nn.Dropout(
+            proj_drop) if proj_drop > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -526,9 +532,11 @@ class Block(nn.Module):
             quant_config=quant_config,
         )
         self.ls1 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+            LayerScale(
+                dim, init_values=init_values) if init_values else nn.Identity()
         )
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
@@ -539,9 +547,11 @@ class Block(nn.Module):
             quant_config=quant_config,
         )
         self.ls2 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+            LayerScale(
+                dim, init_values=init_values) if init_values else nn.Identity()
         )
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path2 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
@@ -600,12 +610,15 @@ class AttentionPoolLatent(nn.Module):
         )
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.proj = RowParallelLinear(embed_dim, embed_dim, quant_config=quant_config)
+        self.proj = RowParallelLinear(
+            embed_dim, embed_dim, quant_config=quant_config)
         self.proj_drop = nn.Dropout(drop)
         self.norm = (
-            norm_layer(out_features) if norm_layer is not None else nn.Identity()
+            norm_layer(
+                out_features) if norm_layer is not None else nn.Identity()
         )
-        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio), quant_config=quant_config)
+        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio),
+                       quant_config=quant_config)
 
         self.init_weights()
 
@@ -639,7 +652,8 @@ class AttentionPoolLatent(nn.Module):
 
         q, k = self.q_norm(q), self.k_norm(k)
 
-        x = F.scaled_dot_product_attention(q, k, v)  # Cannot use radix attn here
+        x = F.scaled_dot_product_attention(
+            q, k, v)  # Cannot use radix attn here
         x = x.transpose(1, 2).reshape(B, self.latent_len, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -728,12 +742,14 @@ class DeepseekVL2VisionTransformer(nn.Module):
             nn.Parameter(torch.zeros(1, 1, embed_dim)) if class_token else None
         )
         self.reg_token = (
-            nn.Parameter(torch.zeros(1, reg_tokens, embed_dim)) if reg_tokens else None
+            nn.Parameter(torch.zeros(1, reg_tokens, embed_dim)
+                         ) if reg_tokens else None
         )
         embed_len = (
             num_patches if no_embed_class else num_patches + self.num_prefix_tokens
         )
-        self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * 0.02)
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, embed_len, embed_dim) * 0.02)
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
 
         self.patch_drop = nn.Identity()
@@ -778,7 +794,8 @@ class DeepseekVL2VisionTransformer(nn.Module):
             )
         self.head_drop = nn.Dropout(drop_rate)
         self.head = (
-            ReplicatedLinear(self.embed_dim, num_classes, quant_config=quant_config)
+            ReplicatedLinear(self.embed_dim, num_classes,
+                             quant_config=quant_config)
             if num_classes > 0
             else nn.Identity()
         )
@@ -907,7 +924,8 @@ class DeepseekVL2MlpProjector(nn.Module):
             modules = nn.Sequential(*modules)
 
         else:
-            raise ValueError(f"Unknown projector type: {config.projector_type}")
+            raise ValueError(
+                f"Unknown projector type: {config.projector_type}")
 
         if config.token_pooling:
             self.token_pooling_layer = ReplicatedLinear(
@@ -929,7 +947,8 @@ class DeepseekVL2MlpProjector(nn.Module):
                 batch_size, channels, h_patches * w_patches, -1
             )
             patches = patches.permute(0, 2, 1, 3).contiguous()
-            patches = patches.view(batch_size, h_patches * w_patches, channels * 4)
+            patches = patches.view(
+                batch_size, h_patches * w_patches, channels * 4)
 
             x = self.token_pooling_layer(patches)
 
@@ -992,7 +1011,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         # ----------- vl projector ------------
         projector_config = config.projector_config
-        self.projector = DeepseekVL2MlpProjector(projector_config, quant_config)
+        self.projector = DeepseekVL2MlpProjector(
+            projector_config, quant_config)
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
@@ -1021,115 +1041,17 @@ class DeepseekVL2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: object,
     ):
-        if forward_batch.image_inputs[0] is not None:
-            if forward_batch.forward_mode.is_decode():
-                input_embeds = self.language_model.model.embed_tokens(input_ids)
-            else:
-                pixel_values = forward_batch.image_inputs[0].pixel_values.to(
-                    device="cuda", dtype=torch.bfloat16
-                )
-                image_seq_mask = forward_batch.image_inputs[0].image_seq_mask.to(
-                    device="cuda"
-                )
-                image_spatial_crop = forward_batch.image_inputs[0].image_spatial_crop
-                image_feature = self.vision.forward_features(pixel_values)
-                images_embeds = self.projector(image_feature)
-                _, hw, n_dim = images_embeds.shape
-                h = w = int(hw**0.5)
 
-                tile_index = 0
-                input_embeds = self.language_model.model.embed_tokens(input_ids)
-                for idx in range(image_spatial_crop.shape[0]):
-                    images_in_this_batch = []
-                    for jdx in range(image_spatial_crop.shape[1]):
-                        num_width_tiles, num_height_tiles = image_spatial_crop[idx, jdx]
-                        if num_width_tiles == 0 or num_height_tiles == 0:
-                            break
-                        num_tiles_in_image = num_width_tiles * num_height_tiles
-
-                        # [hw, D]
-                        global_features = images_embeds[tile_index]
-
-                        # [num_height_tiles * num_width_tiles, hw, D]
-                        local_features = images_embeds[
-                            tile_index + 1 : tile_index + 1 + num_tiles_in_image
-                        ]
-                        tile_index += num_tiles_in_image + 1
-
-                        # format global and local features
-                        # ----------------- global view add newline -----------------
-                        # [hw, D] -> [h, w, D]
-                        global_features = global_features.view(h, w, n_dim)
-
-                        # [D]     -> [h, 1, D]
-                        new_lines_in_global = repeat(
-                            self.image_newline, "d -> h 1 d", h=h
-                        )
-
-                        # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
-                        global_features = torch.cat(
-                            [global_features, new_lines_in_global], dim=1
-                        )
-
-                        # [h, w + 1, D] -> [h * (w + 1), D]
-                        global_features = global_features.view(-1, n_dim)
-
-                        # ----------------- local view add newline -----------------
-                        # [num_height_tiles * num_width_tiles, h * w, D] ->
-                        # [num_height_tiles * h, num_width_tiles * w, D]
-                        local_features = rearrange(
-                            local_features,
-                            "(th tw) (h w) d -> (th h) (tw w) d",
-                            th=num_height_tiles,
-                            tw=num_width_tiles,
-                            h=h,
-                            w=w,
-                        )
-
-                        # [D] -> [num_height_tiles * h, 1, D]
-                        new_lines_in_local = repeat(
-                            self.image_newline,
-                            "d -> (th h) 1 d",
-                            th=num_height_tiles,
-                            h=h,
-                        )
-
-                        # [num_height_tiles * h, num_width_tiles * w + 1, D]
-                        local_features = torch.cat(
-                            [local_features, new_lines_in_local], dim=1
-                        )
-
-                        # [num_height_tiles * h, num_width_tiles * w + 1, D]
-                        #   --> [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
-                        local_features = local_features.view(-1, n_dim)
-
-                        # merge global and local tiles
-                        if self.global_view_pos == "head":
-                            global_local_features = torch.cat(
-                                [
-                                    global_features,
-                                    self.view_seperator[None, :],
-                                    local_features,
-                                ]
-                            )
-                        else:
-                            global_local_features = torch.cat(
-                                [
-                                    local_features,
-                                    self.view_seperator[None, :],
-                                    global_features,
-                                ]
-                            )
-
-                        images_in_this_batch.append(global_local_features)
-
-                    if len(images_in_this_batch) > 0:
-                        images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
-                        input_embeds.masked_scatter_(
-                            image_seq_mask.unsqueeze(-1), images_in_this_batch
-                        )
+        if forward_batch.forward_mode.is_extend() and forward_batch.image_inputs[0] is not None:
+            pixel_values = forward_batch.image_inputs[0].pixel_values.to(
+                device="cuda", dtype=torch.bfloat16)
+            images_seq_mask = forward_batch.image_inputs[0].images_seq_mask.to(
+                device="cuda")
+            images_spatial_crop = forward_batch.image_inputs[0].images_spatial_crop
+            input_embeds = self.prepare_inputs_embeds(
+                pixel_values, images_seq_mask, images_spatial_crop, input_ids)
         else:
-            input_embeds = None
+            input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         outputs = self.language.forward(
             input_ids=input_ids,
@@ -1157,7 +1079,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 self.language_model.load_weights([(name, loaded_weight)])
             else:
                 param = params_dict[name]
-                weights_loader = getattr(param, "weight_loader", default_weight_loader)
+                weights_loader = getattr(
+                    param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
@@ -1165,122 +1088,106 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
     def prepare_inputs_embeds(
         self,
-        input_ids: torch.LongTensor,
-        images: Optional[torch.FloatTensor] = None,
-        images_seq_mask: Optional[torch.LongTensor] = None,
-        images_spatial_crop: Optional[torch.LongTensor] = None,
-        **ignore_kwargs,
+        pixel_values,
+        images_seq_mask,
+        images_spatial_crop,
+        input_ids,
     ):
-        # todo: find the get_input_embeddings api
-        if images is None or images_spatial_crop.sum() == 0:
-            return self.language.get_input_embeddings()(input_ids)
-
-        bs, max_n_images, _ = images_spatial_crop.shape
-        batch_num_tiles = [0 for _ in range(bs)]
-        total_tiles = []
-        for idx in range(bs):
-            for jdx in range(max_n_images):
-                num_width_tiles, num_height_tiles = images_spatial_crop[idx, jdx]
-                if num_width_tiles == 0 or num_height_tiles == 0:
-                    break
-                batch_num_tiles[idx] += 1 + num_width_tiles * num_height_tiles
-
-            total_tiles.append(images[idx, : batch_num_tiles[idx]])
-
-        # [batch_all_tiles, 3, height, width]
-        total_tiles = torch.cat(total_tiles, dim=0)
-        assert total_tiles.shape[0] == sum(batch_num_tiles)
-        if total_tiles.shape[0] == 0:
-            return self.language.get_input_embeddings()(input_ids)
-
-        # [batch_all_tiles, vit_seq_len, c]
-        images_feature = self.vision(total_tiles)
-
-        # [batch_all_tiles, hw, D]
-        images_embeds = self.projector(images_feature)
+        image_feature = self.vision.forward_features(pixel_values)
+        images_embeds = self.projector(image_feature)
         _, hw, n_dim = images_embeds.shape
         h = w = int(hw**0.5)
 
-        # put image tokens into the input_embeds, [b, T, D]
-        input_embeds = self.language.get_input_embeddings()(input_ids)
-
-        # 根据self.tile_tag & self.global_view_pos填充image token sequence
         tile_index = 0
-        for idx in range(images_spatial_crop.shape[0]):
-            images_in_this_batch = []
-            for jdx in range(images_spatial_crop.shape[1]):
+        input_embeds = self.language_model.model.embed_tokens(input_ids)
+        images_in_this_batch = []
+        for jdx in range(images_spatial_crop.shape[1]):
+            num_width_tiles, num_height_tiles = images_spatial_crop[0, jdx]
+            if num_width_tiles == 0 or num_height_tiles == 0:
+                break
+            num_tiles_in_image = num_width_tiles * num_height_tiles
 
-                # extra global & local features
-                num_width_tiles, num_height_tiles = images_spatial_crop[idx, jdx]
-                if num_width_tiles == 0 or num_height_tiles == 0:
-                    break
+            # [hw, D]
+            global_features = images_embeds[tile_index]
 
-                num_tiles_in_image = num_width_tiles * num_height_tiles
+            # [num_height_tiles * num_width_tiles, hw, D]
+            local_features = images_embeds[
+                tile_index + 1: tile_index + 1 + num_tiles_in_image
+            ]
+            tile_index += num_tiles_in_image + 1
 
-                # [hw, D]
-                global_features = images_embeds[tile_index]
+            # format global and local features
+            # ----------------- global view add newline -----------------
+            # [hw, D] -> [h, w, D]
+            global_features = global_features.view(h, w, n_dim)
 
-                # [num_height_tiles * num_width_tiles, hw, D]
-                local_features = images_embeds[
-                    tile_index + 1 : tile_index + 1 + num_tiles_in_image
-                ]
+            # [D]     -> [h, 1, D]
+            new_lines_in_global = repeat(
+                self.image_newline, "d -> h 1 d", h=h
+            )
 
-                tile_index += num_tiles_in_image + 1
+            # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
+            global_features = torch.cat(
+                [global_features, new_lines_in_global], dim=1
+            )
 
-                # ----------------- global view add newline -----------------
-                # [hw, D] -> [h, w, D]
-                global_features = global_features.view(h, w, n_dim)
-                # [D]     -> [h, 1, D]
-                new_lines_in_global = repeat(self.image_newline, "d -> h 1 d", h=h)
-                # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
-                global_features = torch.cat(
-                    [global_features, new_lines_in_global], dim=1
+            # [h, w + 1, D] -> [h * (w + 1), D]
+            global_features = global_features.view(-1, n_dim)
+
+            # ----------------- local view add newline -----------------
+            # [num_height_tiles * num_width_tiles, h * w, D] ->
+            # [num_height_tiles * h, num_width_tiles * w, D]
+            local_features = rearrange(
+                local_features,
+                "(th tw) (h w) d -> (th h) (tw w) d",
+                th=num_height_tiles,
+                tw=num_width_tiles,
+                h=h,
+                w=w,
+            )
+
+            # [D] -> [num_height_tiles * h, 1, D]
+            new_lines_in_local = repeat(
+                self.image_newline,
+                "d -> (th h) 1 d",
+                th=num_height_tiles,
+                h=h,
+            )
+
+            # [num_height_tiles * h, num_width_tiles * w + 1, D]
+            local_features = torch.cat(
+                [local_features, new_lines_in_local], dim=1
+            )
+
+            # [num_height_tiles * h, num_width_tiles * w + 1, D]
+            #   --> [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
+            local_features = local_features.view(-1, n_dim)
+
+            # merge global and local tiles
+            if self.global_view_pos == "head":
+                global_local_features = torch.cat(
+                    [
+                        global_features,
+                        self.view_seperator[None, :],
+                        local_features,
+                    ]
                 )
-                # [h, w + 1, D] -> [h * (w + 1), D]
-                global_features = global_features.view(-1, n_dim)
-
-                # ----------------- local view add newline -----------------
-                # [num_height_tiles * num_width_tiles, h * w, D] -> [num_height_tiles * h, num_width_tiles * w, D]
-                local_features = rearrange(
-                    local_features,
-                    "(th tw) (h w) d -> (th h) (tw w) d",
-                    th=num_height_tiles,
-                    tw=num_width_tiles,
-                    h=h,
-                    w=w,
+            else:
+                global_local_features = torch.cat(
+                    [
+                        local_features,
+                        self.view_seperator[None, :],
+                        global_features,
+                    ]
                 )
 
-                # [D] -> [num_height_tiles * h, 1, D]
-                new_lines_in_local = repeat(
-                    self.image_newline, "d -> (th h) 1 d", th=num_height_tiles, h=h
-                )
+            images_in_this_batch.append(global_local_features)
 
-                # [num_height_tiles * h, num_width_tiles * w + 1, D]
-                local_features = torch.cat([local_features, new_lines_in_local], dim=1)
-
-                # [num_height_tiles * h, num_width_tiles * w + 1, D]
-                #   --> [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
-                local_features = local_features.view(-1, n_dim)
-
-                # ----------------- merge global and local tiles -----------------
-                if self.global_view_pos == "head":
-                    global_local_features = torch.cat(
-                        [global_features, self.view_seperator[None, :], local_features],
-                        dim=0,
-                    )
-                else:
-                    global_local_features = torch.cat(
-                        [local_features, self.view_seperator[None, :], global_features],
-                        dim=0,
-                    )
-
-                images_in_this_batch.append(global_local_features)
-
-            if len(images_in_this_batch) > 0:
-                images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
-                input_embeds[idx].masked_scatter_(
-                    images_seq_mask[idx].unsqueeze(-1), images_in_this_batch
-                )
+        if len(images_in_this_batch) > 0:
+            images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
+            input_embeds.masked_scatter_(
+                images_seq_mask.unsqueeze(-1), images_in_this_batch
+            )
 
         return input_embeds
 
