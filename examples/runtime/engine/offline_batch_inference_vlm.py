@@ -1,6 +1,6 @@
 """
 Usage:
-python offline_batch_inference_vlm.py  --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template=qwen2-vl
+python offline_batch_inference_vlm.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template=qwen2-vl
 """
 
 import argparse
@@ -37,7 +37,7 @@ def main(
     ]
     chat_request = ChatCompletionRequest(
         messages=messages,
-        model="Qwen/Qwen2-VL-7B-Instruct",
+        model=server_args.model_path,
         temperature=0.8,
         top_p=0.95,
     )
