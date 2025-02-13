@@ -61,13 +61,14 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
+        text = text.replace(self.think_start_token, "").strip()
         if self.think_end_token not in text:
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=text)
 
         # Extract reasoning content
         splits = text.split(self.think_end_token, splits=1)
-        reasoning_text = splits[0].replace(self.think_start_token, "").strip()
+        reasoning_text = splits[0]
         text = splits[1].strip()
 
         return StreamingParseResult(
@@ -119,10 +120,10 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
-                return StreamingParseResult(reasoning_text=new_text)
+                return StreamingParseResult(reasoning_text=current_text)
             else:
                 # Accumulate content but don't return it yet
-                self._current_reasoning += new_text
+                self._current_reasoning += current_text
                 return StreamingParseResult()
 
         # If we're not in a reasoning block return as normal text
