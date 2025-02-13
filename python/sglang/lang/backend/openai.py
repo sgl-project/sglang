@@ -163,6 +163,8 @@ class OpenAI(BaseBackend):
             kwargs = sampling_params.to_openai_kwargs()
             if self.model_name.startswith("o1") or self.model_name.startswith("o3"):
                 kwargs.pop("max_tokens", None)
+            else:
+                kwargs.pop("max_completion_tokens", None) 
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
