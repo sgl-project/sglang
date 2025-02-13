@@ -313,7 +313,10 @@ class CudaGraphRunner:
 
     def capture_configs(self):
         if self.enable_hip_attention:
-            from hip.models.hip_attention.gen3.paged_hip import cuda_graph_capture_configs
+            from hip.models.hip_attention.gen3.paged_hip import (
+                cuda_graph_capture_configs,
+            )
+
             return cuda_graph_capture_configs(self.hip_config)
         else:
             return [()]
