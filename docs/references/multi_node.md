@@ -1,6 +1,8 @@
-# Run Multi-Node Inference
+# Multi-Node Inference
 
-## Llama 3.1 405B
+## Manual Deployment
+
+### Llama 3.1 405B
 
 **Run 405B (fp16) on Two Nodes**
 
@@ -20,13 +22,21 @@ Note that LLama 405B (fp8) can also be launched on a single node.
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
 ```
 
-## DeepSeek V3/R1
+### DeepSeek V3/R1
 
 Please refer to [DeepSeek documents for reference.](https://docs.sglang.ai/references/deepseek.html#running-examples-on-multi-node).
 
-## Multi-Node Inference on SLURM
+## Multi-Node Inference on Kubernetes with LWS
 
-This example showcases how to serve SGLang server across multiple nodes by SLURM. Submit the following job to the SLURM cluster.
+[LeaderWorkerSet](https://github.com/kubernetes-sigs/lws) (LWS) is a Kubernetes API that aims to address common deployment patterns of AI/ML inference workloads. A major use case is for multi-host/multi-node distributed inference.
+
+SGLang can be deployed with LWS on Kubernetes for distributed model serving.
+
+Please see this [guide](https://github.com/kubernetes-sigs/lws/blob/main/docs/examples/sglang/README.md) for more details on deploying SGLang on Kubernetes using LWS.
+
+## Multi-Node Inference on Slurm
+
+This example showcases how to serve SGLang server across multiple nodes by Slurm. Submit the following job to the Slurm cluster.
 
 ```
 #!/bin/bash -l
@@ -64,7 +74,7 @@ HEAD_NODE=$(scontrol show hostname "$SLURM_NODELIST" | head -n 1)
 NCCL_INIT_ADDR="${HEAD_NODE}:8000"
 echo "[INFO] NCCL_INIT_ADDR: $NCCL_INIT_ADDR"
 
-# Launch the model server on each node using SLURM
+# Launch the model server on each node using Slurm
 srun --ntasks=2 --nodes=2 --output="SLURM_Logs/%x_%j_node$SLURM_NODEID.out" \
     --error="SLURM_Logs/%x_%j_node$SLURM_NODEID.err" \
     python3 -m sglang.launch_server \
@@ -83,7 +93,7 @@ done
 
 echo "[INFO] $HEAD_NODE:30000 is ready to accept connections"
 
-# Keep the script running until the SLURM job times out
+# Keep the script running until the Slurm job times out
 wait
 ```
 
