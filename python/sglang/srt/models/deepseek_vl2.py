@@ -986,7 +986,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         config: DeepseekVL2Config,
         quant_config: Optional[QuantizationConfig] = None,
     ):
-        super().__init__(config)
+        super().__init__()
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
