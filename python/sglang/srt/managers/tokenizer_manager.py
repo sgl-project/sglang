@@ -174,6 +174,20 @@ class TokenizerManager:
         # Create tokenizer
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
+
+            # While we skip the tokenizer init, we still need to init the image processor.
+            if self.model_config.is_multimodal:
+                _processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+
+                # We want to parallelize the image pre-processing so we create an executor for it
+                self.image_processor = get_image_processor(
+                    self.model_config.hf_config, server_args, _processor
+                )
         else:
             if self.model_config.is_multimodal:
                 self.processor = get_processor(
