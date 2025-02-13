@@ -63,7 +63,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         """
         if self.think_end_token not in text:
             # Assume reasoning was truncated before `</think>` token
-            return StreamingParseResult(reasoning_text==text)
+            return StreamingParseResult(reasoning_text=text)
 
         # Extract reasoning content
         splits = text.split(self.think_end_token, splits=1)
