@@ -169,7 +169,7 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1
 
 #### Troubleshooting
 
-If you see the following error:
+If you encounter the following error with fp16/bf16 checkpoint:
 
 ```bash
 ValueError: Weight output_partition_size = 576 is not divisible by weight quantization block_n = 128.
