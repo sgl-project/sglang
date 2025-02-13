@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -32,9 +33,10 @@ logger = logging.getLogger(__name__)
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
 
-    def __init__(self, device, use_flashinfer: bool = False):
+    def __init__(self, device, is_block_quant, use_flashinfer: bool = False):
         super().__init__()
         self.device = device
+        self.is_block_quant = is_block_quant
         self.use_flashinfer = use_flashinfer
         if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
@@ -75,19 +77,22 @@ class GroupedGemmRunner(torch.nn.Module):
                 weight_indices=weight_indices,
             )
         else:
-            assert weight_column_major == True
-            c = grouped_gemm_triton(
-                a,
-                b,
-                c,
-                batch_size,
-                weight_column_major,
-                seg_indptr,
-                weight_indices,
-                use_fp8_w8a8,
-                scale_a,
-                scale_b,
-            )
+            if self.is_block_quant:
+                pass
+            else:
+                assert weight_column_major == True
+                c = grouped_gemm_triton(
+                    a,
+                    b,
+                    c,
+                    batch_size,
+                    weight_column_major,
+                    seg_indptr,
+                    weight_indices,
+                    use_fp8_w8a8,
+                    scale_a,
+                    scale_b,
+                )
         return c
 
 
@@ -173,7 +178,9 @@ class EPMoE(torch.nn.Module):
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
+                hidden_states.device,
+                self.quant_method.block_quant,
+                use_flashinfer=False,  # TODO: use flashinfer
             )
 
         topk_weights, topk_ids = select_experts(
@@ -508,8 +515,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
