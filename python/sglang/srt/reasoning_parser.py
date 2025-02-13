@@ -107,7 +107,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             self._buffer = ""
 
             return StreamingParseResult(
-                normal_text=None if len(normal_text) == 0 else normal_text,
+                normal_text=normal_text,
                 reasoning_text=reasoning_text.rstrip()
             )
 
