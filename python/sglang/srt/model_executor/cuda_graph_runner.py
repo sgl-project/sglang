@@ -313,11 +313,8 @@ class CudaGraphRunner:
 
     def capture_configs(self):
         if self.enable_hip_attention:
-            num_stages = len(self.hip_config.layers[0].stages)
-            cache_configs = [(None,)]  # (num_stage_cached,)
-            for i_stage in range(num_stages):
-                cache_configs.append((i_stage,))
-            return cache_configs
+            from hip.models.hip_attention.gen3.paged_hip import cuda_graph_capture_configs
+            return cuda_graph_capture_configs(self.hip_config)
         else:
             return [()]
 
