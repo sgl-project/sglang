@@ -115,13 +115,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
         self.model = DeepseekModelNextN(config, quant_config)
 
-        head_prefix = "model.layers.0.shared_head"
         if global_server_args_dict["enable_dp_attention"]:
             self.model.shared_head.head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
-                prefix=head_prefix,
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
@@ -129,7 +127,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                prefix=head_prefix,
             )
             self.logits_processor = LogitsProcessor(config)
 

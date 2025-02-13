@@ -246,21 +246,10 @@ class Scheduler:
         )
 
         # Launch a worker for speculative decoding if needed
-        if self.spec_algorithm.is_eagle():
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_nextn():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        if self.spec_algorithm.is_nextn():
-            from sglang.srt.speculative.nextn_worker import NextNWorker
-
-            self.draft_worker = NextNWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 server_args=server_args,

@@ -510,6 +510,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+
         if global_server_args_dict["enable_flashinfer_mla"]:
             if forward_batch.forward_mode.is_extend():
                 return self.forward_normal(positions, hidden_states, forward_batch)
@@ -519,6 +520,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
                 forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
                 and forward_batch.extend_prefix_lens.sum() == 0
             ):
                 return self.forward_normal(positions, hidden_states, forward_batch)
