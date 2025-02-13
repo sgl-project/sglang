@@ -10,18 +10,26 @@ on:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: docker-builder-amd
+    runs-on: amd-docker
     environment: 'prod'
     strategy:
       matrix:
-        rocm_version: ['6.2.0']
+        rocm_version: ['6.3.0']
         build_type: ['all', 'srt']
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
-
       - name: Checkout repository
         uses: actions/checkout@v3
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -33,8 +41,8 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
 
-          if [ "${{ matrix.rocm_version }}" = "6.2.0" ]; then
-            rocm_tag="rocm620"
+          if [ "${{ matrix.rocm_version }}" = "6.3.0" ]; then
+            rocm_tag="rocm630"
           else
             echo "Unsupported ROCm version"
             exit 1

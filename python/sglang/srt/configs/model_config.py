@@ -223,7 +223,11 @@ class ModelConfig:
             "compressed_tensors",
             "compressed-tensors",
             "experts_int8",
+            "w8a8_int8",
         ]
+        compatible_quantization_methods = {
+            "w8a8_int8": ["compressed-tensors", "compressed_tensors"]
+        }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
@@ -247,12 +251,17 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                raise ValueError(
-                    "Quantization method specified in the model config "
-                    f"({quant_method}) does not match the quantization "
-                    f"method specified in the `quantization` argument "
-                    f"({self.quantization})."
-                )
+                if (
+                    self.quantization not in compatible_quantization_methods
+                    or quant_method
+                    not in compatible_quantization_methods[self.quantization]
+                ):
+                    raise ValueError(
+                        "Quantization method specified in the model config "
+                        f"({quant_method}) does not match the quantization "
+                        f"method specified in the `quantization` argument "
+                        f"({self.quantization})."
+                    )
 
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
@@ -393,6 +402,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaVidForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
+        or "MiniCPMV" in model_architectures
     ):
         return True
     else:

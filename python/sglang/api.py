@@ -1,6 +1,5 @@
 """Public APIs of the language."""
 
-import os
 import re
 from typing import Callable, List, Optional, Union
 
@@ -33,19 +32,15 @@ def function(
 
 
 def Runtime(*args, **kwargs):
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
     # Avoid importing unnecessary dependency
-    from sglang.srt.server import Runtime
+    from sglang.lang.backend.runtime_endpoint import Runtime
 
     return Runtime(*args, **kwargs)
 
 
 def Engine(*args, **kwargs):
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
     # Avoid importing unnecessary dependency
-    from sglang.srt.server import Engine
+    from sglang.srt.entrypoints.engine import Engine
 
     return Engine(*args, **kwargs)
 

@@ -29,6 +29,8 @@ The core features include:
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
    backend/structured_outputs.ipynb
+   backend/speculative_decoding.ipynb
+   backend/function_calling.ipynb
    backend/server_arguments.md
 
 
@@ -55,11 +57,15 @@ The core features include:
    references/sampling_params.md
    references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
+   references/accuracy_evaluation.md
    references/custom_chat_template.md
+   references/amd_configure.md
    references/deepseek.md
-   references/llama_405B.md
+   references/multi_node.md
    references/modelscope.md
+   references/quantization.md
    references/contribution_guide.md
    references/troubleshooting.md
+   references/nvidia_jetson.md
    references/faq.md
    references/learn_more.md

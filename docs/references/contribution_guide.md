@@ -14,7 +14,7 @@ git clone https://github.com/<your_user_name>/sglang.git
 
 ### Install Dependencies & Build
 
-Refer to [Install SGLang from Source](https://sgl-project.github.io/start/install.html#method-2-from-source) documentation for more details on setting up the necessary dependencies.
+Refer to [Install SGLang from Source](https://docs.sglang.ai/start/install.html#method-2-from-source) documentation for more details on setting up the necessary dependencies.
 
 ## Code Formatting with Pre-Commit
 
@@ -22,6 +22,7 @@ We use [pre-commit](https://pre-commit.com/) to maintain consistent code style c
 
 ```bash
 pip3 install pre-commit
+pre-commit install
 pre-commit run --all-files
 ```
 

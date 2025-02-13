@@ -3,6 +3,16 @@ from typing import List
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer, _TokenIDs
+from sglang.srt.utils import get_compiler_backend
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def apply_scaling_penalties(logits, scaling_penalties):
+    logits[:] = torch.where(
+        logits > 0,
+        logits / scaling_penalties,
+        logits * scaling_penalties,
+    )
 
 
 class BatchedRepetitionPenalizer(_BatchedPenalizer):
@@ -56,11 +66,8 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
         self.cumulated_repetition_penalties[mask] = self.repetition_penalties[mask]
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        return torch.where(
-            logits > 0,
-            logits / self.cumulated_repetition_penalties,
-            logits * self.cumulated_repetition_penalties,
-        )
+        apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
+        return logits
 
     def _filter(self, indices_to_keep: List[int], indices_tensor_to_keep: torch.Tensor):
         self.repetition_penalties = self.repetition_penalties[indices_tensor_to_keep]

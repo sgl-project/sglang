@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - sgl-kernel/pyproject.toml
+      - sgl-kernel/src/sgl-kernel/version.py
   workflow_dispatch:
 
 concurrency:
@@ -14,11 +14,12 @@ concurrency:
 
 jobs:
   build-wheels:
+    if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
-        cuda-version: ['12.1']
+        python-version: ['3.9']
+        cuda-version: ['12.4']
 
     steps:
     - uses: actions/checkout@v4

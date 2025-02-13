@@ -8,15 +8,16 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers.models.mllama.configuration_mllama as config_mllama
-import vllm.distributed.parallel_state as ps
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
 from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
 
+import sglang.srt.distributed.parallel_state as ps
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -145,61 +146,6 @@ class MllamaPrecomputedPositionEmbedding(nn.Module):
         return hidden_state
 
 
-class MllamaVisionSdpaAttention(nn.Module):
-    def __init__(self, config: config_mllama.MllamaVisionConfig):
-        super().__init__()
-
-        model_parallel_size = get_tensor_model_parallel_world_size()
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.attention_heads
-        self.head_dim = config.hidden_size // config.attention_heads
-        self.num_local_heads = self.num_heads // model_parallel_size
-        self.q_size = self.num_local_heads * self.head_dim
-        self.kv_size = self.num_local_heads * self.head_dim
-
-        self.qkv_proj = QKVParallelLinear(
-            self.embed_dim,
-            self.head_dim,
-            self.num_heads,
-            bias=False,
-        )
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.head_dim,
-            self.embed_dim,
-            bias=False,
-            input_is_parallel=True,
-        )
-
-    def forward(
-        self,
-        hidden_state: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_state)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(
-            q.shape[0], q.shape[1], self.num_local_heads, self.head_dim
-        ).transpose(1, 2)
-        k = k.view(
-            k.shape[0], k.shape[1], self.num_local_heads, self.head_dim
-        ).transpose(1, 2)
-        v = v.view(
-            v.shape[0], v.shape[1], self.num_local_heads, self.head_dim
-        ).transpose(1, 2)
-
-        # TODO: remove padding in image encoder
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, dropout_p=0.0
-        )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(
-            attn_output.shape[0], attn_output.shape[1], -1
-        )
-        output, _ = self.o_proj(attn_output)
-        return output
-
-
 class MllamaVisionMLP(nn.Module):
     def __init__(self, config, quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
@@ -237,7 +183,17 @@ class MllamaVisionEncoderLayer(nn.Module):
         self.is_gated = is_gated
         self.intermediate_size = config.intermediate_size
 
-        self.self_attn = MllamaVisionSdpaAttention(config)
+        self.self_attn = VisionAttention(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.hidden_size,
+            use_qkv_parallel=True,
+            quant_config=None,
+            dropout=0.0,
+            use_context_forward=False,
+            use_full_precision_softmax=False,
+            flatten_batch=False,
+        )
         self.mlp = MllamaVisionMLP(config)
 
         self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
@@ -992,6 +948,10 @@ class MllamaForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if "vision_model" in name:
+                    # adapt to VisionAttention
+                    name = name.replace("self_attn.o_proj", "self_attn.proj")
+
                 param = params_dict.pop(name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

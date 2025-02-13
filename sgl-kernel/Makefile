@@ -1,22 +1,67 @@
-.PHONY: tree ln install build clean test format
+.PHONY: help check-deps install-deps tree ln submodule install build clean rebuild test format update
 
-tree:
-	@tree --prune -I "__pycache__|*.egg-info|*.so|build"
+# Show help for each target
+help: ## Show this help message
+	@echo "Available targets:"
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-ln:
-	@rm -rf build && cmake . -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_CUDA_COMPILER=nvcc -B build && rm -rf compile_commands.json && ln -s build/compile_commands.json compile_commands.json
+check-deps: ## Check and install required Python formatting dependencies
+	@command -v isort >/dev/null 2>&1 || (echo "Installing isort..." && pip install isort)
+	@command -v black >/dev/null 2>&1 || (echo "Installing black..." && pip install black)
 
-install:
+install-deps: ## Install Python formatting tools (isort and black)
+	pip install isort black
+
+tree: ## Show project directory structure
+	@tree --prune -I "__pycache__|*.egg-info|*.so|build|3rdparty|dist"
+
+submodule: ## Initialize and update git submodules
+	@git submodule update --init --recursive
+
+ln: submodule ## Create compilation database
+	@rm -rf build && bear python3 setup.py build
+
+install: submodule ## Install package in development mode
 	@pip install -e .
 
-build:
-	@export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel
+build: submodule ## Build and install wheel package
+	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel && pip3 install dist/*whl --force-reinstall --no-deps
 
-clean:
+clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info
 
-test:
-	@pytest tests/
+rebuild: clean submodule build ## Clean and rebuild the project
+	@echo "Succeed to rebuild"
 
-format:
-	@find src tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i && find src tests -name '*.py' | xargs isort && find src tests -name '*.py' | xargs black
+test: ## Run all tests
+	@find tests -name "test_*.py" | xargs -n 1 python3
+
+format: check-deps ## Format all source files
+	@echo "Formatting source files..."
+	@find src tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i
+	@find src tests -name '*.py' | xargs isort
+	@find src tests -name '*.py' | xargs black
+	@pre-commit run --all-files
+
+FILES_TO_UPDATE = src/sgl-kernel/version.py \
+                 pyproject.toml
+
+update: ## Update version numbers across project files. Usage: make update <new_version>
+	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \
+		echo "Version required. Usage: make update <new_version>"; \
+		exit 1; \
+	fi
+	@OLD_VERSION=$$(grep "version" src/sgl-kernel/version.py | cut -d '"' -f2); \
+	NEW_VERSION=$(filter-out $@,$(MAKECMDGOALS)); \
+	echo "Updating version from $$OLD_VERSION to $$NEW_VERSION"; \
+	for file in $(FILES_TO_UPDATE); do \
+		if [ "$(shell uname)" = "Darwin" ]; then \
+			sed -i '' -e "s/$$OLD_VERSION/$$NEW_VERSION/g" $$file; \
+		else \
+			sed -i -e "s/$$OLD_VERSION/$$NEW_VERSION/g" $$file; \
+		fi \
+	done; \
+	echo "Version update complete"
+
+%:
+	@:

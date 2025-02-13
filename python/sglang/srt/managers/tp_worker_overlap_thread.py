@@ -82,6 +82,8 @@ class TpModelWorkerClient:
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
+        if self.device == "cpu":
+            self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -91,6 +93,9 @@ class TpModelWorkerClient:
 
     def get_tp_cpu_group(self):
         return self.worker.get_tp_cpu_group()
+
+    def get_attention_tp_cpu_group(self):
+        return self.worker.get_attention_tp_cpu_group()
 
     def get_memory_pool(self):
         return (
@@ -151,11 +156,10 @@ class TpModelWorkerClient:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                     )
-                    logits_output.normalized_prompt_logprobs = (
-                        logits_output.normalized_prompt_logprobs.to(
-                            "cpu", non_blocking=True
-                        )
-                    )
+            if logits_output.hidden_states is not None:
+                logits_output.hidden_states = logits_output.hidden_states.to(
+                    "cpu", non_blocking=True
+                )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
@@ -173,9 +177,6 @@ class TpModelWorkerClient:
             if logits_output.input_token_logprobs is not None:
                 logits_output.input_token_logprobs = (
                     logits_output.input_token_logprobs.tolist()
-                )
-                logits_output.normalized_prompt_logprobs = (
-                    logits_output.normalized_prompt_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids
