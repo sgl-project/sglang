@@ -1281,9 +1281,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     if is_first:
                         # First chunk with role
                         is_first = False
+                        if request.separate_reasoning and is_reasoning_model(request.model):
+                            delta = DeltaMessage(role="assistant", reasoning_content="")
+                        else:
+                            delta = DeltaMessage(role="assistant", content="")
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant", content=""),
+                            delta=delta,
                             finish_reason=None if finish_reason_type and len(finish_reason_type) == 0 else finish_reason_type,
                             matched_stop=(
                                 finish_reason["matched"]
