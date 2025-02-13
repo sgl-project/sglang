@@ -115,6 +115,9 @@ class Engine:
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        # The image input. It can be a file name, a url, or base64 encoded string.
+        # See also python/sglang/srt/utils.py:load_image.
+        image_data: Optional[Union[List[str], str]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -126,14 +129,20 @@ class Engine:
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+        modalities_list = []
+        if image_data is not None:
+            modalities_list.append("image")
+
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
+            image_data=image_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             lora_path=lora_path,
+            modalities=modalities_list,
             custom_logit_processor=custom_logit_processor,
             stream=stream,
         )
@@ -162,6 +171,9 @@ class Engine:
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        # The image input. It can be a file name, a url, or base64 encoded string.
+        # See also python/sglang/srt/utils.py:load_image.
+        image_data: Optional[Union[List[str], str]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -177,6 +189,7 @@ class Engine:
             text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
+            image_data=image_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
