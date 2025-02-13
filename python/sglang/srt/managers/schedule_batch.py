@@ -626,7 +626,7 @@ class ScheduleBatch:
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
         return_hidden_states: bool = False,
-        hip_attention_config: Optional[HiPAttentionConfig],
+        hip_attention_config: Optional[HiPAttentionConfig] = None,
     ):
         hip_mask_refresh_state = None
         if hip_attention_config is not None:
