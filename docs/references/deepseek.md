@@ -20,6 +20,8 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 - [Serving with two H200*8 nodes and docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h2008-nodes-and-docker).
 
+- [Serving with four A100*8 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes).
+
 ## Optimizations
 
 ### Multi-head Latent Attention (MLA) Throughput Optimizations
@@ -40,7 +42,7 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
   <img src="https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg" alt="Multi-head Latent Attention for DeepSeek Series Models">
 </p>
 
-**Usage**: MLA optimization is enabled by defalut, to disable, use `--disable-mla`.
+**Usage**: MLA optimization is enabled by default, to disable, use `--disable-mla`.
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [Slides](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/lmsys_1st_meetup_deepseek_mla.pdf) for more details.
 
@@ -52,7 +54,7 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
   <img src="https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg" alt="Data Parallelism Attention for DeepSeek Series Models">
 </p>
 
-**Usage**: This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). Data Parallelism Attention optimization can be enabeld by `--enable-dp-attention` for DeepSeek Series Models.
+**Usage**: This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). Data Parallelism Attention optimization can be enabled by `--enable-dp-attention` for DeepSeek Series Models.
 
 <p align="center">
   <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison">
