@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
 is_hip_flag = is_hip()
-from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
@@ -26,6 +26,19 @@ padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
+
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
+_is_rocm = torch.cuda.is_available() and torch.version.hip
+
+if _is_cuda:
+    from sgl_kernel import gelu_and_mul, silu_and_mul
+
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+if _is_cuda or _is_rocm:
+    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
 
 @triton.jit
@@ -417,12 +430,12 @@ def moe_align_block_size(
                 num_tokens_post_pad,
             )
         else:
-            token_cnts_buffer = torch.empty(
+            token_cnts_buffer = torch.zeros(
                 (num_experts + 1) * num_experts,
                 dtype=torch.int32,
                 device=topk_ids.device,
             )
-            cumsum_buffer = torch.empty(
+            cumsum_buffer = torch.zeros(
                 num_experts + 1, dtype=torch.int32, device=topk_ids.device
             )
 
@@ -479,7 +492,10 @@ def invoke_fused_moe_kernel(
         else:
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            A, A_scale = per_token_group_quant_fp8(A, block_k)
+            if _is_cuda:
+                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+            else:
+                A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
@@ -989,9 +1005,15 @@ def fused_experts_impl(
         )
 
         if activation == "silu":
-            ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+            if _is_cuda:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            else:
+                ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
         elif activation == "gelu":
-            ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+            if _is_cuda:
+                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            else:
+                ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
@@ -1079,7 +1101,7 @@ def fused_moe(
     - num_expert_group: Optional[int]: additional parameter for grouped_topk
     - topk_group: Optional[int]: additional parameter for grouped_topk
     - use_grouped_topk: If True, use grouped_topk instead of fused_topk
-        note: Deepseekv2 model uses grouped_topk
+        note: Deepseek V2/V3/R1 series models use grouped_topk
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_int8_w8a16 (bool): If True, use fp8 arithmetic to compute the inner
