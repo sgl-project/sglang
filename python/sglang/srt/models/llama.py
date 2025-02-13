@@ -16,7 +16,9 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import hashlib
 import logging
+import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -54,6 +56,15 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+USE_PRESHARDED_WEIGHTS = (os.getenv("USE_PRESHARDED_WEIGHTS") or "0") == "1"
+DEBUG_WEIGHT_HASH = (os.getenv("DEBUG_WEIGHT_HASH") or "0") == "1"
+
+
+def hash_tensor(t: torch.Tensor):
+    b = t.cpu().view(torch.uint8).view(-1).numpy().tobytes()
+    return hashlib.md5(b).hexdigest()
+
+
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -70,6 +81,7 @@ class LlamaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            use_presharded_weights=USE_PRESHARDED_WEIGHTS,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -77,6 +89,7 @@ class LlamaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            use_presharded_weights=USE_PRESHARDED_WEIGHTS,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -107,6 +120,7 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        use_presharded_weights: bool = USE_PRESHARDED_WEIGHTS,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -142,6 +156,7 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            load_presharded_attn=use_presharded_weights,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -149,6 +164,7 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            use_presharded_weights=use_presharded_weights,
         )
 
         self.rotary_emb = get_rope(
@@ -271,6 +287,7 @@ class LlamaModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
+            use_presharded_weights=USE_PRESHARDED_WEIGHTS,
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -368,7 +385,10 @@ class LlamaForCausalLM(nn.Module):
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                use_presharded_weights=USE_PRESHARDED_WEIGHTS,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -476,14 +496,15 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading kv_scale from ckpts towards new design.
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+                if DEBUG_WEIGHT_HASH:
+                    hhh = hash_tensor(param.data)
+                    logger.info(
+                        f"[{get_tensor_model_parallel_rank()}] Loaded {name}, hash={hhh}, {loaded_weight.shape=}, {param.data.shape=}"
                     )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
