@@ -1083,7 +1083,7 @@ def v1_chat_generate_response(
             try:
                 parser = ReasoningParser(model, True)
                 parse_result = parser.parse_non_stream(text)
-                ret_item["text"] = parse_result.normal_text
+                ret_item["text"] = None if parse_result.normal_text and len(parse_result.normal_text) == 0 else parse_result.normal_text
                 reasoning_text = parse_result.reasoning_text
             except Exception as e:
                 logger.error(f"Exception: {e}")
