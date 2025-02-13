@@ -1287,6 +1287,7 @@ def fast_decode_plan(
         window_left,
         logits_soft_cap,
         head_dim,
+        head_dim,
         empty_q_data,
         empty_kv_cache,
         stream.cuda_stream,
