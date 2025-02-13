@@ -14,7 +14,8 @@ pip uninstall flashinfer -y
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
 
 # Force reinstall flashinfer and torch_memory_saver
-pip install flashinfer_python==0.2.0.post2 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
+pip install https://github.com/flashinfer-ai/flashinfer-nightly/releases/download/0.2.1%2Bdbb1e4e/flashinfer_python-0.2.1+dbb1e4e.cu124torch2.5-cp310-cp310-linux_x86_64.whl --force-reinstall --no-deps
+
 pip install torch_memory_saver --force-reinstall
 
 pip install transformers==4.45.2 sentence_transformers accelerate peft
