@@ -51,10 +51,6 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
         self._in_reasoning = True
         self.stripped_think_start = False
-        self.reasoning_regex = re.compile(
-            rf"{self.think_start_token}(.*?){self.think_end_token}", 
-            re.DOTALL
-        )
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
