@@ -71,10 +71,11 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
-
+    
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
-
+    stop_token_ids: Optional[int] = None
+    
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
         system_prompt = self.system_template.format(

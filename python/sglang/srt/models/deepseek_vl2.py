@@ -711,7 +711,7 @@ class DeepseekVL2VisionTransformer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
 
-        super.__init__()
+        super().__init__()
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
         act_layer = partial(nn.GELU, approximate="tanh")
 

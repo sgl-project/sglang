@@ -556,7 +556,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
 
 class DeepseekVL2ImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
-        super.__init__(hf_config, server_args, _processor)
+        super().__init__(hf_config, server_args, _processor)
 
     @staticmethod
     def _process_single_image_task(image, input_text):
