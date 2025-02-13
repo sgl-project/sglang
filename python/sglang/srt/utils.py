@@ -1423,19 +1423,10 @@ def rank0_print(msg: str):
         print(msg, flush=True)
 
 
-def get_nvcc_cuda_version() -> Version:
-    """Get the CUDA version from nvcc.
-
-    Adapted from https://github.com/NVIDIA/apex/blob/8b7a1ff183741dd8f9b87e7bafd04cfde99cea28/setup.py
-    """
-    assert CUDA_HOME is not None, "CUDA_HOME is not set"
-    nvcc_output = subprocess.check_output(
-        [CUDA_HOME + "/bin/nvcc", "-V"], universal_newlines=True
-    )
-    output = nvcc_output.split()
-    release_idx = output.index("release") + 1
-    nvcc_cuda_version = parse(output[release_idx].split(",")[0])
-    return nvcc_cuda_version
+def get_cuda_version():
+    if torch.version.cuda:
+        return tuple(map(int, torch.version.cuda.split(".")))
+    return (0, 0)
 
 
 def launch_dummy_health_check_server(host, port):

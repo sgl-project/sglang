@@ -9,37 +9,31 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.srt.utils import (
-    get_device_capability,
-    get_nvcc_cuda_version,
-    is_cuda,
-    is_hip,
-)
+from sglang.srt.utils import get_cuda_version, get_device_capability, is_hip
 
 use_vllm_cutlass_w8a8_fp8_kernel = os.environ.get(
     "USE_VLLM_CUTLASS_W8A8_FP8_KERNEL", default=False
 )
-if is_cuda():
+_is_hip = is_hip()
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
+if _is_cuda:
+    from sgl_kernel import fp8_blockwise_scaled_mm
+
     if use_vllm_cutlass_w8a8_fp8_kernel:
         from vllm import _custom_ops as ops
     else:
         from sgl_kernel import fp8_scaled_mm
 
-is_hip_ = is_hip()
-_is_cuda = torch.cuda.is_available() and torch.version.cuda
-if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm
-
 
 def cutlass_fp8_supported():
-    if not is_cuda():
+    if not _is_cuda:
         return False
     major, minor = get_device_capability()
-    cuda_version = get_nvcc_cuda_version()
+    cuda_version = get_cuda_version()
     if major >= 9:
-        return cuda_version >= Version("12.0")
+        return cuda_version >= (12, 0)
     elif major == 8 and minor == 9:
-        return cuda_version >= Version("12.4")
+        return cuda_version >= (12, 4)
     return False
 
 
@@ -124,7 +118,7 @@ def input_to_float8(
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
     fp8_max = finfo.max
-    if is_hip_:
+    if _is_hip:
         fp8_max = 224.0
     scale = fp8_max / amax
     x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)
