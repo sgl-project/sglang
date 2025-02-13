@@ -974,9 +974,16 @@ def v1_chat_generate_request(
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
         }
+
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
+            )
+        elif (
+            request.response_format and request.response_format.type == "structural_tag"
+        ):
+            sampling_params["structural_tag"] = convert_json_schema_to_str(
+                request.response_format.model_dump(by_alias=True)
             )
         sampling_params_list.append(sampling_params)
 

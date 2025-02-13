@@ -45,6 +45,7 @@ class SamplingParams:
         json_schema: Optional[str] = None,
         regex: Optional[str] = None,
         ebnf: Optional[str] = None,
+        structural_tag: Optional[str] = None,
         no_stop_trim: bool = False,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
@@ -71,6 +72,7 @@ class SamplingParams:
         self.n = n
         self.json_schema = json_schema
         self.ebnf = ebnf
+        self.structural_tag = structural_tag
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
 
