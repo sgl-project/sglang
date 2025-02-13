@@ -4,12 +4,14 @@ on:
   push:
     branches: [ main ]
     paths:
+      - "python/pyproject.toml"
       - "python/sglang/**"
       - "test/**"
       - "docs/**"
   pull_request:
     branches: [ main ]
     paths:
+      - "python/pyproject.toml"
       - "python/sglang/**"
       - "test/**"
       - "docs/**"
@@ -47,10 +49,12 @@ jobs:
               - 'python/sglang/**'
             test:
               - 'test/**'
+            pyproject:
+              - 'python/pyproject.toml'
       - name: Set run_tests output
         id: set_run_tests
         run: |
-          if [ "${{ steps.filter.outputs.sglang }}" == "true" ] || [ "${{ steps.filter.outputs.test }}" == "true" ]; then
+          if [ "${{ steps.filter.outputs.sglang }}" == "true" ] || [ "${{ steps.filter.outputs.test }}" == "true" ] || [ "${{ steps.filter.outputs.pyproject }}" == "true" ]; then
             echo "run_tests=true" >> $GITHUB_OUTPUT
           else
             echo "run_tests=false" >> $GITHUB_OUTPUT
@@ -99,7 +103,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 25
+        timeout-minutes: 30
         run: |
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
