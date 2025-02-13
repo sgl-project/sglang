@@ -67,7 +67,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             return StreamingParseResult(reasoning_text=text)
 
         # Extract reasoning content
-        splits = text.split(self.think_end_token, splits=1)
+        splits = text.split(self.think_end_token, maxsplits=1)
         reasoning_text = splits[0]
         text = splits[1].strip()
 
