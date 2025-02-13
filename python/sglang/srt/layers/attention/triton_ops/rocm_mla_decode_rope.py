@@ -170,12 +170,6 @@ def _fwd_grouped_kernel_stage1_rope(
             offs_buf_kv = (kv_loc[None, :] * stride_buf_kbs + offs_c[:, None])
             offs_buf_k_pe = (kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None])
 
-            kv = tl.load(
-                K_Buffer + offs_buf_kv,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
-                other=0.0,
-            )  # the shared latent tensor for keys and values
-
             k_pe = tl.load(
                 K_Buffer + offs_buf_k_pe,
                 mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
@@ -188,6 +182,13 @@ def _fwd_grouped_kernel_stage1_rope(
             # (16, 64) x (64, 32)
             # dot product of rope parts
             qk = tl.dot(q_pe, k_pe.to(q_pe.dtype))
+
+            kv = tl.load(
+                K_Buffer + offs_buf_kv,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
+                other=0.0,
+            )  # the shared latent tensor for keys and values
+
             # (16, 512) x (512, 32)
             # dot product of nope parts
             qk += tl.dot(q, kv)
