@@ -8,21 +8,14 @@ If you want a high-level endpoint that can automatically handle chat templates, 
 
 The `/generate` endpoint accepts the following parameters in JSON format. For in detail usage see the [native api doc](https://docs.sglang.ai/backend/native_api.html).
 
-* `text`: The input prompt. Can be a single prompt or a batch of prompts.
+* `prompt`: The input prompt. Can be a single prompt or a batch of prompts.
 * `input_ids`: Alternative to `text`. Specify the input as token IDs instead of text.
-* `input_embeds`: Alternative to `text` and `input_ids`. Specify the input as embeddings.
-* `image_data`: Image input as a file path, URL, base64 string, raw bytes, or video frame.
 * `sampling_params`: The sampling parameters as described in the sections below.
-* `rid`: Request identifier.
 * `return_logprob`: Whether to return log probabilities for tokens.
 * `logprob_start_len`: If returning log probabilities, specifies the start position in the prompt. Default is "-1" which returns logprobs only for output tokens.
 * `top_logprobs_num`: If returning log probabilities, specifies the number of top logprobs to return at each position.
-* `return_text_in_logprobs`: Whether to include decoded text alongside token IDs in logprob outputs.
 * `stream`: Whether to stream the output.
-* `log_metrics`: Whether to log metrics for this request.
-* `modalities`: The modalities of the image data. Can be `image`, `multi-images`, or `video`.
 * `lora_path`: Path to LoRA weights.
-* `session_params`: Session information, controls multi-turn conversation state.
 * `custom_logit_processor`: Custom logit processor for advanced sampling control. For usage see below.
 
 ## Sampling params
