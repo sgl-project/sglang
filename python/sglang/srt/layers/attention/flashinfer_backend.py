@@ -186,9 +186,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        print(
-            f"mode={forward_batch.forward_mode},batch_size={forward_batch.batch_size}, req_pool_indices={forward_batch.req_pool_indices}, seq_lens={forward_batch.seq_lens}，decode_start_idx={forward_batch.decode_start_idx}"
-        )
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -433,9 +430,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        print(
-            f"init_forward_metadata_replay_cuda_graph for bs={bs}, forward mode = {forward_mode}"
-        )
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -547,10 +541,6 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_running_bs = forward_batch.batch_size - forward_batch.decode_start_idx
         # each decode request only use one token
         extend_tokens = forward_batch.extend_num_tokens - decode_running_bs
-
-        print(
-            f"mixed forward: q={q.shape}, k={k.shape}, extend_tokens={extend_tokens}, decode_running_bs={decode_running_bs}"
-        )
 
         q_extend, q_decode = q[:extend_tokens], q[extend_tokens:]
         k_extend, k_decode = k[:extend_tokens], k[extend_tokens:]
@@ -832,12 +822,6 @@ class FlashInferIndicesUpdaterDecode:
         if shift_pos > 0:
             if spec_info is None:
                 bs = len(req_pool_indices)
-                print("====Decode call_begin_forward====")
-                print(
-                    f"req_pool_indices={req_pool_indices}, paged_kernel_lens={paged_kernel_lens}, shift_pos = {shift_pos}"
-                )
-                print(f"kv_indptr init :, {kv_indptr[:20]}")
-
                 kv_indptr[1 + shift_pos] = 0
                 kv_indptr[2 + shift_pos : 2 + shift_pos + bs] = torch.cumsum(
                     paged_kernel_lens, dim=0
@@ -847,7 +831,6 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices = torch.empty(
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
-                print(f"kv_indptr before modification:, {kv_indptr[:20]}")
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     req_pool_indices,
@@ -857,8 +840,6 @@ class FlashInferIndicesUpdaterDecode:
                     kv_indices,
                     self.req_to_token.shape[1],
                 )
-                print(f"kv_indptr after modification:, {kv_indptr[:20]}")
-                print(f"kv_indices={kv_indices}")
             else:
                 bs, kv_indices, kv_indptr_decode = spec_info.generate_attn_arg_decode(
                     req_pool_indices,
@@ -1093,11 +1074,6 @@ class FlashInferIndicesUpdaterPrefill:
         bs = len(req_pool_indices)
         if spec_info is None:
             # Normal extend
-            print("****Prefill call_begin_forward****")
-            print(
-                f"req_pool_indices={req_pool_indices}, paged_kernel_lens={paged_kernel_lens}"
-            )
-            print(f"kv_indptr init :, {kv_indptr[:20]}")
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             assert kv_indptr[0] == 0, "the first element should be zero"
@@ -1106,7 +1082,6 @@ class FlashInferIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            print(f"kv_indptr before modification:, {kv_indptr[:20]}")
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
@@ -1120,10 +1095,6 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
-            print(f"kv_indptr after modification:, {kv_indptr[:20]}")
-            print(f"kv_indices={kv_indices}")
-            print(f"qo_indptr={qo_indptr}")
-            print("========")
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
