@@ -1042,16 +1042,22 @@ class DeepseekVL2ForCausalLM(nn.Module):
         **kwargs: object,
     ):
 
-        if forward_batch.forward_mode.is_extend() and forward_batch.image_inputs[0] is not None:
-            pixel_values = forward_batch.image_inputs[0].pixel_values.to(
-                device="cuda", dtype=torch.bfloat16)
-            images_seq_mask = forward_batch.image_inputs[0].images_seq_mask.to(
-                device="cuda")
-            images_spatial_crop = forward_batch.image_inputs[0].images_spatial_crop
-            input_embeds = self.prepare_inputs_embeds(
-                pixel_values, images_seq_mask, images_spatial_crop, input_ids)
-        else:
-            input_embeds = self.language_model.model.embed_tokens(input_ids)
+        input_embeds = self.language_model.model.embed_tokens(input_ids)
+        if forward_batch.forward_mode.is_extend() and forward_batch.image_inputs != [None]:
+            extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens.cpu().numpy()
+            for idx, image in enumerate(forward_batch.image_inputs):
+                if image is None:
+                    continue
+                start_idx = extend_start_loc_cpu[idx]
+                end_idx = start_idx+extend_seq_lens_cpu[idx]
+                pixel_values = image.pixel_values.to(
+                    device="cuda", dtype=torch.bfloat16)
+                image_seq_mask = image.images_seq_mask.to(
+                    device="cuda")
+                image_spatial_crop = image.images_spatial_crop
+                input_embeds[start_idx:end_idx] = self.prepare_inputs_embeds(
+                    pixel_values, image_seq_mask, image_spatial_crop, input_embeds[start_idx:end_idx])
 
         outputs = self.language.forward(
             input_ids=input_ids,
@@ -1091,7 +1097,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         pixel_values,
         images_seq_mask,
         images_spatial_crop,
-        input_ids,
+        input_embeds,
     ):
         image_feature = self.vision.forward_features(pixel_values)
         images_embeds = self.projector(image_feature)
@@ -1099,7 +1105,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
         h = w = int(hw**0.5)
 
         tile_index = 0
-        input_embeds = self.language_model.model.embed_tokens(input_ids)
         images_in_this_batch = []
         for jdx in range(images_spatial_crop.shape[1]):
             num_width_tiles, num_height_tiles = images_spatial_crop[0, jdx]

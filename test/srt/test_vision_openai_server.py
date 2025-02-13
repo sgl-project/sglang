@@ -466,7 +466,7 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
 class TestDeepseekVL2Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "deepseek-ai/deepseek-vl2"
+        cls.model = "deepseek-ai/deepseek-vl2-small"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -482,37 +482,6 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
-        
-    def test_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        with self.assertRaises(openai.BadRequestError) as cm:
-            client.chat.completions.create(
-                model="default",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": "<image>\n Give a lengthy description of this picture.",
-                            },
-                        ],
-                    },
-                ],
-                temperature=0,
-            )
-
-        self.assertIn(
-            "Multimodal prompt is too long after expanding multimodal tokens.",
-            str(cm.exception),
-        )
         
 if __name__ == "__main__":
     unittest.main()

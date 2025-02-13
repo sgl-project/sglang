@@ -347,7 +347,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         """Tokenize text with <image> tags."""
         images_list, images_seq_mask, images_spatial_crop = [], [], []
         tokenized_str = []
-        split_idx = self.find_all_indices(conversation, 100003)
+        split_idx = self.find_all_indices(conversation, self.image_token_id)
         for idx, image in enumerate(images):
             """encode text_sep"""
             if idx == 0:
@@ -399,7 +399,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         """process the last text split"""
         # tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
-        tokenized_sep = conversation[split_idx[idx-1]+1:]
+        tokenized_sep = conversation[split_idx[-1]+1:]
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
 
