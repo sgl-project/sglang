@@ -497,7 +497,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
     """
 
     def __init__(self, quant_config: Fp8Config):
-        self.quant_config = quant_config
+        super().__init__(quant_config)
 
     def create_weights(
         self,
@@ -508,9 +508,30 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
+
+        if self.block_quant:
+            block_n, block_k = (
+                self.quant_config.weight_block_size[0],
+                self.quant_config.weight_block_size[1],
+            )
+            # TODO(lukec) Currently, the combination of TP+EP is not supported.
+            # Further investigation is needed to determine if implementation is necessary in the future.
+            if intermediate_size % block_n != 0:
+                raise ValueError(
+                    f"The output_size of gate's and up's weight = "
+                    f"{intermediate_size} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
+            if intermediate_size % block_k != 0:
+                raise ValueError(
+                    f"The input_size of down's weight = "
+                    f"{intermediate_size} is not divisible by "
+                    f"weight quantization block_k = {block_k}."
+                )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -538,21 +559,49 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        # Allocate 2 scales for w1 and w3 respectively.
-        w13_weight_scale = torch.nn.Parameter(
-            torch.ones(num_experts_per_partition, 2, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        if self.block_quant:
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    2 * ((intermediate_size + block_n - 1) // block_n),
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    (hidden_size + block_n - 1) // block_n,
+                    (intermediate_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+            assert self.quant_config.activation_scheme == "dynamic"
+        else:
+            # WEIGHT_SCALES
+            # Allocate 2 scales for w1 and w3 respectively.
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, 2, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        w2_weight_scale = torch.nn.Parameter(
-            torch.ones(num_experts_per_partition, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update({"quant_method": "tensor"})
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+            if self.block_quant
+            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
