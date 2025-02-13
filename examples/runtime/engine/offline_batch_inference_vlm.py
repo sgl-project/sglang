@@ -1,6 +1,6 @@
 """
 Usage:
-python3 offline_batch_inference.py  --model meta-llama/Llama-3.1-8B-Instruct
+python offline_batch_inference_vlm.py  --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template=qwen2-vl
 """
 
 import argparse
@@ -35,14 +35,14 @@ def main(
             ],
         }
     ]
-    request = ChatCompletionRequest(
+    chat_request = ChatCompletionRequest(
         messages=messages,
         model="Qwen/Qwen2-VL-7B-Instruct",
         temperature=0.8,
         top_p=0.95,
     )
     gen_request, _ = v1_chat_generate_request(
-        [request],
+        [chat_request],
         vlm.tokenizer_manager,
     )
 
