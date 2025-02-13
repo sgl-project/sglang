@@ -20,6 +20,8 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 - [Serving with two H200*8 nodes and docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h2008-nodes-and-docker).
 
+- [Serving with four A100*8 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes).
+
 ## Optimizations
 
 ### Multi-head Latent Attention (MLA) Throughput Optimizations
