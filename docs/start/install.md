@@ -11,6 +11,11 @@ pip install "sglang[all]>=0.4.2.post4" --find-links https://flashinfer.ai/whl/cu
 
 Note: SGLang currently uses torch 2.5, so you need to install the flashinfer version for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html).
 
+If you experience an error like `OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root`， please try either of the following solutions:
+
+- Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
+- Follow the procedure described in [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) first, then install SGLang as described above.
+
 ## Method 2: From source
 ```
 # Use the last release branch
