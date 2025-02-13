@@ -59,7 +59,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
 #from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
+#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
+from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import decode_attention_fwd_grouped_rope
 
 is_hip_ = is_hip()
 
@@ -696,26 +697,44 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
         latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
 
-        decode_attention_fwd_normal(
-                        q,
-                        latent_cache_buf,
-                        w_kc,
-                        w_vc,
-                        self.w_scale.item(),
-                        cos_sin_cache,
-                        positions,
-                        self.qk_rope_head_dim,
-                        self.v_head_dim,
-                        attn_out,
-                        req_to_token,
-                        b_req_idx,
-                        b_seq_len,
-                        attn_logits,
-                        num_kv_split,
-                        sm_scale,
-                        logit_cap=0.0)
-                        #fuse_rope=False,
-                        #use_fp8=use_fp8)
+        decode_attention_fwd_grouped_rope(
+            q,
+            latent_cache_buf,
+            latent_cache_buf[..., : self.kv_lora_rank],
+            attn_out,
+            req_to_token,
+            b_req_idx,
+            b_seq_len,
+            k_pe,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            cos_sin_cache,
+            positions,
+            attn_logits,
+            num_kv_split,
+            sm_scale) ## logit_cap, use_rope, is_neox_styel
+
+
+        #decode_attention_fwd_normal(
+        #                q,
+        #                latent_cache_buf,
+        #                w_kc,
+        #                w_vc,
+        #                self.w_scale.item(),
+        #                cos_sin_cache,
+        #                positions,
+        #                self.qk_rope_head_dim,
+        #                self.v_head_dim,
+        #                attn_out,
+        #                req_to_token,
+        #                b_req_idx,
+        #                b_seq_len,
+        #                attn_logits,
+        #                num_kv_split,
+        #                sm_scale,
+        #                logit_cap=0.0)
+        #                #fuse_rope=False,
+        #                #use_fp8=use_fp8)
 
         attn_out = attn_out.flatten(1, 2)
         output, _ = self.o_proj(attn_out)
