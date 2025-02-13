@@ -89,6 +89,9 @@ class TestTritonAttention(unittest.TestCase):
             ).normal_(mean=0.1, std=0.2)
 
         o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
+        o_extend_mask = torch.empty(
+            (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
+        )
         o_redundant = torch.empty(
             (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
         )
@@ -97,6 +100,9 @@ class TestTritonAttention(unittest.TestCase):
         max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
         qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1 : B + 1] = torch.cumsum(b_seq_len_extend[:B], dim=0)
+
+        custom_mask = None
+        mask_indptr = None
 
         extend_attention_fwd(
             q_extend,
@@ -108,6 +114,42 @@ class TestTritonAttention(unittest.TestCase):
             qo_indptr,
             kv_indptr,
             kv_indices,
+            custom_mask,
+            mask_indptr,
+            max_len_extend,
+        )
+
+        b_seq_mask_len = b_seq_len_extend * b_seq_len
+        custom_mask = torch.ones(
+            (b_seq_mask_len.sum().item(),), dtype=torch.bool, device="cuda"
+        )
+        mask_indptr = torch.zeros((B + 1,), dtype=torch.int64, device="cuda")
+        mask_indptr[1 : B + 1] = torch.cumsum(b_seq_mask_len[:B], dim=0)
+        for i in range(B):
+            causal_mask = (
+                torch.tril(
+                    torch.ones(b_seq_len_extend[i], b_seq_len_extend[i]), diagonal=0
+                )
+                == 1
+            )
+            prefix_mask = torch.ones(
+                b_seq_len_extend[i], b_seq_len_prefix[i], dtype=torch.bool
+            )
+            mask_flatten = torch.cat([prefix_mask, causal_mask], dim=1).flatten()
+            custom_mask[mask_indptr[i] : mask_indptr[i + 1]] = mask_flatten
+
+        extend_attention_fwd(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend_mask,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            mask_indptr,
             max_len_extend,
         )
 
@@ -124,6 +166,7 @@ class TestTritonAttention(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2))
+        self.assertTrue(torch.allclose(o_extend_mask, o_redundant, rtol=1e-2))
 
     def test_extend_attention(self):
 

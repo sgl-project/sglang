@@ -125,6 +125,16 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
+def fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype):
+    return torch.ops.sgl_kernels.fp8_blockwise_scaled_mm(
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        out_dtype,
+    )
+
+
 def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernels.fp8_scaled_mm(
         mat_a,
@@ -494,4 +504,102 @@ def min_p_sampling_from_probs(
             raise ValueError("Input probs contains NaN.")
     return _min_p_sampling_from_probs_internal(
         probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
+    )
+
+
+def tree_speculative_sampling_target_only(
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
+    accept_token_num: torch.Tensor,  # mutable
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    deterministic: bool = True,
+) -> None:
+    with predicts.device as device:
+        torch.ops.sgl_kernels.tree_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            uniform_samples,
+            target_probs,
+            draft_probs,
+            deterministic,
+            _get_cuda_stream(device),
+        )
+
+
+def build_tree_kernel_efficient(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+) -> None:
+    with parent_list.device as device:
+        torch.ops.sgl_kernels.build_tree_kernel_efficient(
+            parent_list,
+            selected_index,
+            verified_seq_len,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            topk,
+            depth,
+            draft_token_num,
+        )
+
+
+def build_tree_kernel(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+) -> None:
+    with parent_list.device as device:
+        torch.ops.sgl_kernels.build_tree_kernel(
+            parent_list,
+            selected_index,
+            verified_seq_len,
+            tree_mask,
+            positions,
+            retrive_index,
+            topk,
+            depth,
+            draft_token_num,
+        )
+
+
+def sgl_per_token_group_quant_fp8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
+) -> None:
+    torch.ops.sgl_kernels.sgl_per_token_group_quant_fp8(
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max
     )

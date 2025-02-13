@@ -317,6 +317,7 @@ class Req:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
                 self.output_top_logprobs_val
             ) = self.output_top_logprobs_idx = None
+        self.hidden_states = []
 
         # Logprobs (internal values)
         # The tokens is prefilled but need to be considered as decode tokens
@@ -606,6 +607,9 @@ class ScheduleBatch:
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
 
+    # Return hidden states
+    return_hidden_states: bool = False
+
     # For HiP Attention
     hip_mask_refresh_state: Optional[HiPMaskRefreshState] = None
     hip_metadata_cached_stages: Optional[int] = None
@@ -621,6 +625,7 @@ class ScheduleBatch:
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
+        return_hidden_states: bool = False,
         hip_attention_config: Optional[HiPAttentionConfig],
     ):
         hip_mask_refresh_state = None
@@ -643,6 +648,7 @@ class ScheduleBatch:
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
+            return_hidden_states=return_hidden_states,
             hip_mask_refresh_state=hip_mask_refresh_state,
         )
 
@@ -1214,9 +1220,15 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             capture_hidden_mode=(
-                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
-                if self.spec_info
-                else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL
+                if self.return_hidden_states
+                else (
+                    getattr(
+                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                    )
+                    if self.spec_info
+                    else CaptureHiddenMode.NULL
+                )
             ),
             hip_metadata_cached_stages=self.hip_metadata_cached_stages,
         )
