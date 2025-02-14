@@ -11,7 +11,6 @@ from typing import List, Optional, Union
 
 import numpy as np
 import PIL
-import torch
 import transformers
 from decord import VideoReader, cpu
 from PIL import Image
@@ -136,11 +135,13 @@ class BaseImageProcessor(ABC):
             text_parts = input_text.split(image_token)
 
         # roughly calculate the max number of frames under the max_req_input_len limit
-        def calculate_max_num_frames() -> int:
+        def calculate_max_num_frames(max_req_input_len) -> int:
+            if not isinstance(max_req_input_len, int):
+                max_req_input_len = 65536
             ret = (max_req_input_len - len(input_ids)) // self.NUM_TOKEN_PER_FRAME
             return min(ret, 100)
 
-        MAX_NUM_FRAMES = calculate_max_num_frames()
+        MAX_NUM_FRAMES = calculate_max_num_frames(max_req_input_len)
         estimated_frames_list = self.get_estimated_frames_list(image_data=image_data)
         total_frame_count = sum(estimated_frames_list)
         # a heuristic value, suggesting the maximum fraction of frames to embed from all visual inputs.

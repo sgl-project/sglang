@@ -268,7 +268,6 @@ class TestOpenAIVisionServer(unittest.TestCase):
         print("-" * 30)
 
         # Add assertions to validate the video response
-        # assert "iPod" in video_response or "device" in video_response, video_response
         assert (
             "man" in video_response
             or "person" in video_response

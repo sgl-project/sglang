@@ -218,56 +218,25 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
 
 
 class Qwen2_5_VisionRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        print(f"dim: {dim}")
-        print(f"theta: {theta}")
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim = dim
+        self.theta = theta
+        self.inv_freq = 1.0 / (
+            theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim)
+        )
 
     def forward(self, seqlen: int) -> torch.Tensor:
-        print(f"seqlen: {seqlen}")
+        self.inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim)
+        )
+        self.inv_freq = self.inv_freq.to("cuda")
         seq = torch.arange(
             seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
         )
         freqs = torch.outer(seq, self.inv_freq)
+
         return freqs
-
-
-first = True
-
-
-# 另一个版本：返回更短的hash值
-def tensor_hash_short(tensor, bits=32):
-    """
-    计算tensor的简单hash值，返回较短的结果
-
-    参数:
-    tensor: torch.Tensor - 输入张量
-    bits: int - 结果的位数
-
-    返回:
-    int - hash值
-    """
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
-
-    tensor = tensor.float()
-
-    # 使用张量操作计算hash
-    hash_value = torch.sum(tensor).item()
-    hash_value = hash_value * torch.prod(torch.tensor(tensor.shape)).item()
-
-    # 加入一些张量特征
-    std_value = torch.std(tensor).item()
-    mean_value = torch.mean(tensor).item()
-
-    # 组合所有特征
-    final_hash = int((hash_value + std_value * 1e6 + mean_value * 1e4) * 1e6)
-
-    # 取模以限制位数
-    return final_hash % (2**bits)
 
 
 class Qwen2_5_VisionTransformer(nn.Module):
@@ -302,7 +271,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = hidden_size // num_heads
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(int(head_dim // 2))
         self.blocks = nn.ModuleList(
             [
                 Qwen2_5_VisionBlock(
@@ -383,33 +352,31 @@ class Qwen2_5_VisionTransformer(nn.Module):
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-            hpos_ids = hpos_ids.flatten()
-
             wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
+            hpos_ids = (
+                hpos_ids.reshape(
+                    h // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                    w // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                )
+                .permute(0, 2, 1, 3)
+                .flatten()
             )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-            wpos_ids = wpos_ids.flatten()
+            wpos_ids = (
+                wpos_ids.reshape(
+                    h // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                    w // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                )
+                .permute(0, 2, 1, 3)
+                .flatten()
+            )
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = grid_thw[:, 1:].max()
-        if first:
-            print(f"spatial_merge_size {self.spatial_merge_size}")
-            save_tensor(max_grid_size, "max_grid_size")
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        if first:
-            save_tensor(rotary_pos_emb_full, "rotary_pos_emb_full")
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
@@ -421,13 +388,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
-        global first
-        if first:
-            save_tensor(grid_thw, "grid_thw")
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        if first:
-            save_tensor(rotary_pos_emb, "rotary_pos_emb_0")
 
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
@@ -449,9 +411,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
-        if first:
-            save_tensor(emb, "emb")
-            print(f"emb hash {tensor_hash_short(emb)}")
 
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(
@@ -473,23 +432,14 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         # adapter
         x = self.merger(x)
+
         reverse_indices = torch.argsort(window_index)
         x = x[reverse_indices, :]
 
-        first = False
         return x
 
 
 cached_get_processor = lru_cache(get_processor)
-
-
-def save_tensor(tensor, filename):
-    import os
-
-    # 将 tensor 转换为 ndarray
-    if os.path.exists(filename):
-        return
-    torch.save(tensor, filename)
 
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
@@ -655,13 +605,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 image_input = Qwen2VLImageInputs(
                     pixel_values=pixel_values, image_grid_thw=image_grid_thws
                 )
-                save_tensor(pixel_values, "pixel_values_sglang")
-
                 image_embeds = self._process_image_input(image_input)
-                save_tensor(image_embeds, "image_embeds_0_sglang")
 
                 image_embeds_offset = 0
-                print(f"input_ids: {input_ids}")
                 for idx, image_offset in enumerate(image_offsets):
                     if image_offset < prefix_len:
                         continue
@@ -694,8 +640,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                         ]
                     )
                     image_embeds_offset += num_image_tokens
-
-                save_tensor(inputs_embeds, "qwen2_5_input_embeds")
 
         input_ids = None
         hidden_states = self.model(
@@ -776,4 +720,3 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]
-# AutoModel.register(Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration)
