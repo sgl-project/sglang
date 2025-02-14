@@ -1,4 +1,5 @@
 import collections
+import itertools
 import math
 import warnings
 from enum import Enum
@@ -80,16 +81,10 @@ def init_weights_vit_timm(
 
 
 # Imported multimodal helpers from timm
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
-            return tuple(x)
-        return tuple(repeat(x, n))
-
-    return parse
-
-
-to_2tuple = _ntuple(2)
+def to_2tuple(x):
+    if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
+        return tuple(x)
+    return tuple(itertools.repeat(x, 2))
 
 
 class Format(str, Enum):
@@ -521,8 +516,8 @@ class Block(nn.Module):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = DeepseekVL2Attention(
+            dim=dim,
             num_heads=num_heads,
-            head_dim=dim,
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,
             attn_drop=attn_drop,
@@ -727,7 +722,7 @@ class DeepseekVL2VisionTransformer(nn.Module):
         self.ignore_head = ignore_head  # always false
 
         embed_args = {}
-        self.patch_embed = PatchEmbed(
+        self.patch_embed = embed_layer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
@@ -870,17 +865,15 @@ class DeepseekVL2MlpProjector(nn.Module):
                 config.input_dim,
                 config.n_embed,
                 quant_config=quant_config,
-                gather_output=True,
             )
 
         elif config.projector_type == "mlp_gelu":
             mlp_depth = config.depth
-            modules = ReplicatedLinear(
+            modules = [ReplicatedLinear(
                 config.input_dim,
                 config.n_embed,
                 quant_config=quant_config,
-                gather_output=True,
-            )
+            )]
             for _ in range(1, mlp_depth):
                 modules.append(nn.GELU())
                 modules.append(
@@ -888,7 +881,6 @@ class DeepseekVL2MlpProjector(nn.Module):
                         config.n_embed,
                         config.n_embed,
                         quant_config=quant_config,
-                        gather_output=True,
                     )
                 )
             modules = nn.Sequential(*modules)
@@ -896,12 +888,11 @@ class DeepseekVL2MlpProjector(nn.Module):
         elif config.projector_type == "downsample_mlp_gelu":
             mlp_depth = config.depth
             mlp_ratio = config.mlp_ratio
-            modules = ReplicatedLinear(
+            modules = [ReplicatedLinear(
                 config.input_dim * config.downsample_ratio * config.downsample_ratio,
                 config.n_embed * mlp_ratio,
                 quant_config=quant_config,
-                gather_output=True,
-            )
+            )]
             for _ in range(1, mlp_depth - 1):
                 modules.append(nn.GELU())
                 modules.append(
@@ -909,7 +900,6 @@ class DeepseekVL2MlpProjector(nn.Module):
                         config.n_embed * mlp_ratio,
                         config.n_embed * mlp_ratio,
                         quant_config=quant_config,
-                        gather_output=True,
                     )
                 )
             modules.append(nn.GELU())
@@ -918,7 +908,6 @@ class DeepseekVL2MlpProjector(nn.Module):
                     config.n_embed * mlp_ratio,
                     config.n_embed,
                     quant_config=quant_config,
-                    gather_output=True,
                 )
             )
             modules = nn.Sequential(*modules)
@@ -1059,7 +1048,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 input_embeds[start_idx:end_idx] = self.prepare_inputs_embeds(
                     pixel_values, image_seq_mask, image_spatial_crop, input_embeds[start_idx:end_idx])
 
-        outputs = self.language.forward(
+        outputs = self.language_model.forward(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
