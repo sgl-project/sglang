@@ -7,6 +7,7 @@ Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model
 For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.ai/references/deepseek.html).
 
 ## Hardware Recommendation
+
 - 8 x NVIDIA H200 GPUs
 
 If you do not have GPUs with large enough memory, please try multi-node tensor parallelism. There is an example serving with [2 H20 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) below.
@@ -18,19 +19,26 @@ For running on AMD MI300X, use this as a reference. [Running DeepSeek-R1 on a si
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded.
 
 ### Using Docker (Recommended)
+
 ```bash
 # Pull latest image
 # https://hub.docker.com/r/lmsysorg/sglang/tags
 docker pull lmsysorg/sglang:latest
 
 # Launch
-docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host lmsysorg/sglang:latest \
+docker run --gpus all --shm-size 32g -p 30000:30000 -v ~/.cache/huggingface:/root/.cache/huggingface --ipc=host --network --privileged lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code --port 30000
 ```
+
+If you are using RDMA, please note that:
+
+1. `--network host` and `--privileged` are required by RDMA. If you don't need RDMA, you can remove them.
+2. You may need to set `NCCL_IB_GID_INDEX` if you are using RoCE, for example: `export NCCL_IB_GID_INDEX=3`.
 
 Add [performance optimization options](#performance-optimization-options) as needed.
 
 ### Using pip
+
 ```bash
 # Installation
 pip install "sglang[all]>=0.4.3" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
@@ -42,7 +50,9 @@ python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-r
 Add [performance optimization options](#performance-optimization-options) as needed.
 
 <a id="option_args"></a>
+
 ### Performance Optimization Options
+
 [MLA optimizations](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) are enabled by default. Here are some optional optimizations can be enabled as needed.
 
 - [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models): For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
@@ -68,7 +78,8 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-### Example: Serving with two H20*8 nodes
+### Example: Serving with two H20\*8 nodes
+
 For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`. Please **use the first node's IP** for both commands.
 
 If the command fails, try setting the `GLOO_SOCKET_IFNAME` parameter. For more information, see [Common Environment Variables](https://pytorch.org/docs/stable/distributed.html#common-environment-variables).
@@ -85,7 +96,8 @@ If you have two H100 nodes, the usage is similar to the aforementioned H20.
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
 
-### Example: Serving with two H200*8 nodes and docker
+### Example: Serving with two H200\*8 nodes and docker
+
 There are two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 192.168.114.10:20000`.
 A single H200 with 8 devices can run DeepSeek V3, the dual H200 setup is just to demonstrate multi-node usage.
 
@@ -120,6 +132,7 @@ docker run --gpus all \
 ```
 
 To ensure functionality, we include a test from a client Docker container.
+
 ```bash
 docker run --gpus all \
     --shm-size 32g \
@@ -136,7 +149,8 @@ docker run --gpus all \
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
 
-### Example: Serving with four A100*8 nodes
+### Example: Serving with four A100\*8 nodes
+
 To serve DeepSeek-V3 with A100 GPUs, we need to convert the [FP8 model checkpoints](https://huggingface.co/deepseek-ai/DeepSeek-V3) to BF16 with [script](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) mentioned [here](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) first.
 
 Since the BF16 model is over 1.3 TB, we need to prepare four A100 nodes, each with 8 80GB GPUs. Assume the first node's IP is `10.0.0.1`, and the converted model path is `/path/to/DeepSeek-V3-BF16`, we can have following commands to launch the server.

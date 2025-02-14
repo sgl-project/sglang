@@ -63,12 +63,17 @@ docker build -t sglang_image -f Dockerfile.rocm .
 2. Create a convenient alias.
 
 ```bash
-alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/dri \
+alias drun='docker run -it --rm --network --privileged --device=/dev/kfd --device=/dev/dri \
     --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE \
     --security-opt seccomp=unconfined \
     -v $HOME/dockerx:/dockerx \
     -v /data:/data'
 ```
+
+If you are using RDMA, please note that:
+
+1. `--network host` and `--privileged` are required by RDMA. If you don't need RDMA, you can remove them.
+2. You may need to set `NCCL_IB_GID_INDEX` if you are using RoCE, for example: `export NCCL_IB_GID_INDEX=3`.
 
 3. Launch the server.
 
