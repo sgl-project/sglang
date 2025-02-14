@@ -53,6 +53,8 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
     }
   }
 
+  __syncthreads();
+
   const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
   const size_t start_idx = threadIdx.x * tokens_per_thread;
 

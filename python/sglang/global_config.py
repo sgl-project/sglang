@@ -38,5 +38,7 @@ class GlobalConfig:
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
 
+        self.enable_flashinfer_mla = False
+
 
 global_config = GlobalConfig()

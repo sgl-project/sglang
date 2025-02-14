@@ -46,6 +46,7 @@ suites = {
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",
+        "test_hidden_states.py",
         "test_update_weights_from_disk.py",
         "test_update_weights_from_tensor.py",
         "test_vision_chunked_prefill.py",

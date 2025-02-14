@@ -28,6 +28,7 @@ class TestEAGLEEngine(unittest.TestCase):
         "speculative_eagle_topk": 8,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
+        "cuda_graph_max_bs": 32,
     }
 
     def setUp(self):
@@ -124,6 +125,8 @@ class TestEAGLEServer(unittest.TestCase):
                 "64",
                 "--mem-fraction-static",
                 "0.7",
+                "--cuda-graph-max-bs",
+                "32",
             ],
         )
 
@@ -191,6 +194,35 @@ class TestEAGLEServer(unittest.TestCase):
         print(f"{metrics=}")
 
         self.assertGreater(metrics["accuracy"], 0.20)
+
+
+class TestEAGLEServerTriton(TestEAGLEServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                "5",
+                "--speculative-eagle-topk",
+                "8",
+                "--speculative-num-draft-tokens",
+                "64",
+                "--mem-fraction-static",
+                "0.7",
+                "--attention-backend",
+                "triton",
+                "--cuda-graph-max-bs",
+                "32",
+            ],
+        )
 
 
 if __name__ == "__main__":
