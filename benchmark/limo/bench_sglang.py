@@ -26,15 +26,16 @@ def reasoning_gen(s, question: str):
     )
 
 
-def convert_dataset(path: str):
+def convert_dataset(path: str, question_key: str, answer_key: str, num_tries: int):
     raw_dataset = load_dataset(path)
     questions = []
     answers = []
     for data in raw_dataset["train"]:
-        question = data["question"]
-        answer = data["answer"]
-        questions.append({"question": question})
-        answers.append({"answer": answer})
+        question = data[question_key]
+        answer = data[answer_key]
+        for _ in range(num_tries):
+            questions.append({"question": question})
+            answers.append({"answer": answer})
     return questions, answers
 
 
@@ -54,7 +55,9 @@ def main(args):
     sgl.set_default_backend(select_sglang_backend(args))
 
     # Get dataset
-    questions, answers = convert_dataset(args.data_path)
+    questions, answers = convert_dataset(
+        args.data_path, args.question_key, args.answer_key, args.num_tries
+    )
 
     # Run requests
     tic = time.time()
@@ -63,7 +66,8 @@ def main(args):
         num_threads=args.parallel,
         progress_bar=True,
         temperature=0.6,
-        max_new_tokens=16384,
+        max_new_tokens=32768,
+        top_p=0.95
     )
     latency = time.time() - tic
 
@@ -71,9 +75,10 @@ def main(args):
     correct = 0
     for i, state in enumerate(states):
         try:
-            correct += 1 if state["answer"] == str(answers[i]["answer"]) else 0
+            correct += 1 if extract_boxed_text(state["answer"]) == str(answers[i]["answer"]) else 0
         except Exception as e:
             print(f"Error extracting answer: {e}")
+            pass
 
     # Calculate accuracy
     accuracy = correct / len(questions)
@@ -107,7 +112,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    add_common_sglang_args_and_parse(parser)
     parser.add_argument("--data-path", type=str, default="GAIR/LIMO")
+    parser.add_argument("--question-key", type=str, default="question")
+    parser.add_argument("--answer-key", type=str, default="answer")
+    parser.add_argument("--num-tries", type=int, default=1)
+    add_common_sglang_args_and_parse(parser)
     args = parser.parse_args()
     main(args)
