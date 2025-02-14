@@ -1,3 +1,10 @@
+"""
+Export NextN layer for DeepSeek-V3/R1 model. The exported model can be used for speculative decoding.
+
+Usage:
+python3 export_deepseek_nextn.py --input-dir /path/to/DeepSeek-V3 --output-dir /path/to/DeepSeek-V3-NextN
+"""
+
 import argparse
 import json
 import os
