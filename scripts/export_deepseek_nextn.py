@@ -105,6 +105,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config = AutoConfig.from_pretrained(args.input_dir, trust_remote_code=True)
+    assert config.num_nextn_predict_layers == 1, "Only 1 nextn layer is supported."
     nextn_layer_id = get_nexn_layer_id(config)
     os.makedirs(args.output_dir, exist_ok=True)
     copy_non_safetensors_files(args.input_dir, args.output_dir)

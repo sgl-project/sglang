@@ -146,6 +146,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         if hasattr(self.config, "num_nextn_predict_layers"):
             num_nextn_layers = self.config.num_nextn_predict_layers
             assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
+            assert num_nextn_layers == self.config.num_hidden_layers
         else:
             raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -165,8 +166,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             num_experts=self.config.n_routed_experts,
         )
 
-        nextn_layer_id = self.config.num_hidden_layers
-        nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+        nextn_layer_prefix = "model.layers.0"
         nextn_spec_weight_names = [
             "shared_head.head",
             "shared_head.norm",
