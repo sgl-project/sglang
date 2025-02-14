@@ -707,13 +707,17 @@ class DeepseekVL2VisionTransformer(nn.Module):
     ):
 
         super().__init__()
+        assert global_pool in ('', 'avg', 'token', 'map')
+        assert class_token or global_pool != 'token'
+        use_fc_norm = global_pool == 'avg' if fc_norm is None else fc_norm
+
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
         act_layer = partial(nn.GELU, approximate="tanh")
 
         self.num_classes = num_classes  # always 0
         self.global_pool = global_pool  # always map
         self.num_features = self.embed_dim = embed_dim  # diff
-        self.num_prefix_tokens = 1
+        self.num_prefix_tokens = 1 if class_token else 0
         self.num_prefix_tokens += reg_tokens  # always 0
         self.has_class_token = class_token  # always true
         self.no_embed_class = no_embed_class  # always false
@@ -777,7 +781,7 @@ class DeepseekVL2VisionTransformer(nn.Module):
             ]
         )
 
-        self.norm = norm_layer(embed_dim)
+        self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
         if global_pool == "map":
             AttentionPoolLatent.init_weights = init_weights
             self.attn_pool = AttentionPoolLatent(
@@ -787,6 +791,10 @@ class DeepseekVL2VisionTransformer(nn.Module):
                 norm_layer=norm_layer,
                 quant_config=quant_config,
             )
+        else:
+            self.attn_pool = None
+
+        self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
         self.head_drop = nn.Dropout(drop_rate)
         self.head = (
             ReplicatedLinear(self.embed_dim, num_classes,
@@ -832,7 +840,22 @@ class DeepseekVL2VisionTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.forward_features(x)
+        if not self.ignore_head:
+            x = self.forward_head(x)
         return x
+
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        if not getattr(self, "is_last_stage", True):
+            return x
+        if self.attn_pool is not None:
+            x = self.attn_pool(x)
+        elif self.global_pool == 'avg':
+            x = x[:, self.num_prefix_tokens:].mean(dim=1)
+        elif self.global_pool:
+            x = x[:, 0]  # class token
+        x = self.fc_norm(x)
+        x = self.head_drop(x)
+        return x if pre_logits else self.head(x)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         if getattr(self, "is_first_stage", True):
