@@ -25,8 +25,9 @@ limitations under the License.
 #define WARP_SIZE 32
 
 template <typename scalar_t>
-__global__ void count_and_sort_expert_tokens_kernel(const scalar_t* __restrict__ topk_ids, int32_t* __restrict__ sorted_token_ids,
-                                      int32_t* __restrict__ cumsum_buffer, size_t numel) {
+__global__ void count_and_sort_expert_tokens_kernel(const scalar_t* __restrict__ topk_ids,
+                                                    int32_t* __restrict__ sorted_token_ids,
+                                                    int32_t* __restrict__ cumsum_buffer, size_t numel) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
@@ -38,8 +39,9 @@ __global__ void count_and_sort_expert_tokens_kernel(const scalar_t* __restrict__
 }
 
 template <typename scalar_t>
-__global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_ids, int32_t* __restrict__ sorted_token_ids,
-                                            int32_t* __restrict__ expert_ids, int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
+__global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_ids,
+                                            int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
+                                            int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
                                             int32_t block_size, size_t numel, int32_t* __restrict__ cumsum) {
   __shared__ int32_t shared_counts[WARP_SIZE][8];
 
