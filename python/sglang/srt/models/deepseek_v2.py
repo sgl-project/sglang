@@ -61,6 +61,7 @@ from sglang.srt.utils import is_cuda_available, is_hip
 #from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
 #from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
 from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import decode_attention_fwd_grouped_rope
+from sglang.srt.layers.attention.triton_ops.sgalng_ref import decode_attention_fwd_grouped
 
 is_hip_ = is_hip()
 
@@ -710,12 +711,41 @@ class DeepseekV2AttentionMLA(nn.Module):
                              ), dtype=torch.float32, device=q.device)
 
         # save current latent cache.
+        #print ("------------------------------")
+        #print ("CHAI: forward_absorb_fused_rope")
+        #print ("forward_batch.out_cache_loc={}:{}".format(forward_batch.out_cache_loc.size(), forward_batch.out_cache_loc.dtype))
         forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
         key_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
         val_cache_buf = forward_batch.token_to_kv_pool.get_value_buffer(self.attn_mqa.layer_id)
         k_pe_output = k_pe
 
-        decode_attention_fwd_grouped_rope(
+        #print (f"q_input={q_input.size()}:{q_input.dtype}, key_cache_buf={key_cache_buf.size()}:{key_cache_buf.dtype}, value_cache_buf={val_cache_buf.size()}:{val_cache_buf.dtype}")
+        #print (f"attn_output={attn_output.size()}:{attn_output.dtype}, req_to_token={req_to_token.size()}:{req_to_token.dtype}")
+        #print (f"b_req_idx={b_req_idx.size()}:{b_req_idx.dtype}, b_seq_len={b_seq_len.size()}:{b_seq_len.dtype}")
+        #print ("self.kv_lora_rank={}, rotary_dim={}, cos_sin_cache={}:{} ".format(self.kv_lora_rank, self.rotary_emb.rotary_dim, cos_sin_cache.size(), cos_sin_cache.dtype))
+        #print ("positions={}:{}, attn_logits={}:{}, num_kv_split={}, sm_scale={}, logit_cap={}, use_rope={}, is_neox_style={}".format(positions.size(), positions.dtype, attn_logits.size(), attn_logits.dtype, num_kv_split, sm_scale, 0.0, False, self.rotary_emb.is_neox_style))
+        #print ("forward_batch.out_cache_loc={}:{}".format(forward_batch.out_cache_loc.size(), forward_batch.out_cache_loc.dtype))
+
+        #decode_attention_fwd_grouped_rope(
+        #    q_input,
+        #    key_cache_buf,
+        #    val_cache_buf,
+        #    attn_output,
+        #    req_to_token,
+        #    b_req_idx,
+        #    b_seq_len,
+        #    k_pe_output,
+        #    self.kv_lora_rank,
+        #    self.qk_rope_head_dim,
+        #    cos_sin_cache,
+        #    positions,
+        #    attn_logits,
+        #    num_kv_split,
+        #    sm_scale,
+        #    logit_cap=0.0,
+        #    use_rope=False)
+
+        decode_attention_fwd_grouped(
             q_input,
             key_cache_buf,
             val_cache_buf,
@@ -723,16 +753,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             req_to_token,
             b_req_idx,
             b_seq_len,
-            k_pe_output,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-            cos_sin_cache,
-            positions,
             attn_logits,
             num_kv_split,
             sm_scale,
-            logit_cap=0.0,
-            use_rope=False)
+            logit_cap=0.0)
+
+
+        #torch.cuda.synchronize() 
+        #print ("---- done ----")
 
         #decode_attention_
         #attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
