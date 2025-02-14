@@ -33,7 +33,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]>=0.4.2.post4" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer
+pip install "sglang[all]>=0.4.3" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -166,6 +166,27 @@ python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
 ```
+
+#### Troubleshooting
+
+If you encounter the following error with fp16/bf16 checkpoint:
+
+```bash
+ValueError: Weight output_partition_size = 576 is not divisible by weight quantization block_n = 128.
+```
+
+edit your `config.json` and remove the `quantization_config` block. For example:
+
+```json
+"quantization_config": {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": [128, 128]
+},
+```
+
+Removing this block typically resolves the error. For more details, see the discussion in [sgl-project/sglang#3491](https://github.com/sgl-project/sglang/issues/3491#issuecomment-2650779851).
 
 ## DeepSeek V3 Optimization Plan
 
