@@ -510,7 +510,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         if global_server_args_dict["enable_flashinfer_mla"]:
             if forward_batch.forward_mode.is_extend():
                 return self.forward_normal(positions, hidden_states, forward_batch)
