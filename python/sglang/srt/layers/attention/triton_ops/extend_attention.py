@@ -319,8 +319,8 @@ def extend_attention_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     if is_hip_:
-        BLOCK_M, BLOCK_N = (64, 64)
-        num_warps = 4
+        BLOCK_M, BLOCK_N = (32, 32)
+        num_warps = 2
 
     else:
         if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
