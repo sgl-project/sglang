@@ -28,6 +28,7 @@ class TestEAGLEEngine(unittest.TestCase):
         "speculative_eagle_topk": 8,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
+        "cuda_graph_max_bs": 32,
     }
 
     def setUp(self):
@@ -124,6 +125,8 @@ class TestEAGLEServer(unittest.TestCase):
                 "64",
                 "--mem-fraction-static",
                 "0.7",
+                "--cuda-graph-max-bs",
+                "32",
             ],
         )
 
