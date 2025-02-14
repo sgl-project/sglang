@@ -18,6 +18,7 @@ def update_and_save_config(config, output_dir):
     new_config = config.to_dict()
     new_config.update(
         {
+            "num_hidden_layers": 0,
             "architectures": ["DeepseekV3ForCausalLMNextN"],
         }
     )
@@ -36,7 +37,7 @@ def copy_non_safetensors_files(input_dir, output_dir):
 
 def export_nextn_layer_parameters(input_dir, output_dir, nexn_layer_id):
     prefix = f"model.layers.{nexn_layer_id}"
-    output_path = os.path.join(output_dir, "./nextn_layer_parameters.safetensors")
+    output_path = os.path.join(output_dir, "nextn_layer_parameters.safetensors")
     params = {}
     for filename in os.listdir(input_dir):
         if not filename.endswith(".safetensors"):
@@ -54,19 +55,28 @@ def export_nextn_layer_parameters(input_dir, output_dir, nexn_layer_id):
                     continue
 
                 for key in matching_keys:
-                    params[key] = f.get_tensor(key)
-
-                save_file(params, output_path)
-                print(f"  Saved {len(matching_keys)} parameters to {output_path}")
+                    new_key = key.replace(prefix, "model.layers.0")
+                    params[new_key] = f.get_tensor(key)
 
         except Exception as e:
             print(f"  Error processing {filename}: {str(e)}")
 
     if params:
+        print(f"Saving {len(params)} parameters to {output_path}")
         save_file(params, output_path)
-        print(f"Saved {len(params)} parameters to {output_path}")
     else:
         print("No matching parameters found.")
+
+    # Update safetensors index
+    index_path = os.path.join(output_dir, "model.safetensors.index.json")
+    print(f"Updating safetensors index to {index_path}")
+    index_data = {"weight_map": {}}
+    for key in params:
+        index_data["weight_map"][key] = "nextn_layer_parameters.safetensors"
+    with open(index_path, "w") as f:
+        json.dump(index_data, f, indent=4)
+
+    print("All done.")
 
 
 if __name__ == "__main__":
@@ -74,13 +84,13 @@ if __name__ == "__main__":
         description="Export NextN layer paramerters for DeepSeek-V3/R1"
     )
     parser.add_argument(
-        "--input_dir",
+        "--input-dir",
         type=str,
         required=True,
         help="Input HF model directory.",
     )
     parser.add_argument(
-        "--output_dir",
+        "--output-dir",
         type=str,
         required=True,
         help="Output nextn model directory.",
