@@ -467,7 +467,7 @@ class CudaGraphRunner:
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
-            and self.model_runner.spec_algorithm.is_nextn()
+            or self.model_runner.spec_algorithm.is_nextn()
         ):
             from sglang.srt.speculative.eagle_utils import EagleVerifyInput
 
