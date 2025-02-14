@@ -11,7 +11,10 @@ import sglang as sgl
 def multi_turn_question(s, question_1, question_2):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user(question_1)
-    s += sgl.assistant(sgl.gen("answer_1", max_tokens=100))
+    s += sgl.assistant(sgl.gen("answer_1", max_tokens=1024, n=2))
+    print("answer_1===============")
+    print(s["answer_1"])
+    print("/////////answer_1===============")
     s += sgl.user(question_2)
     s += sgl.assistant(sgl.gen("answer_2"))
 
@@ -53,4 +56,4 @@ if __name__ == "__main__":
     print("\n========== single ==========\n")
     single()
     # Run a batch of requests
-    print("\n========== batch ==========\n")
+    # print("\n========== batch ==========\n")

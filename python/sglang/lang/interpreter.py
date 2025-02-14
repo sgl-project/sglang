@@ -566,13 +566,14 @@ class StreamExecutor:
     def _execute_gen(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
-
         if not self.stream:
             if self.num_api_spec_tokens is None:
                 comp, meta_info = self.backend.generate(
                     self,
                     sampling_params=sampling_params,
                 )
+                if isinstance(comp, list):
+                    comp = comp[0]
             else:
                 if self.backend.is_chat_model:
                     # Speculative execution on models with only chat interface.
