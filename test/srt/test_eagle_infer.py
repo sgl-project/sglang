@@ -219,6 +219,8 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "0.7",
                 "--attention-backend",
                 "triton",
+                "--cuda-graph-max-bs",
+                "32",
             ],
         )
 
