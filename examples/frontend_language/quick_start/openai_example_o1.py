@@ -54,3 +54,4 @@ if __name__ == "__main__":
     single()
     # Run a batch of requests
     print("\n========== batch ==========\n")
+    batch()
