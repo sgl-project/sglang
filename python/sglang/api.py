@@ -139,7 +139,6 @@ def gen(
 def gen_int(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
-    max_completion_tokens: Optional[int] = None,
     n: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
@@ -158,7 +157,6 @@ def gen_int(
     return SglGen(
         name,
         max_tokens,
-        max_completion_tokens,
         n,
         None,
         stop,
@@ -182,7 +180,6 @@ def gen_int(
 def gen_string(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
-    max_completion_tokens: Optional[int] = None,
     n: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
@@ -201,7 +198,6 @@ def gen_string(
     return SglGen(
         name,
         max_tokens,
-        max_completion_tokens,
         n,
         None,
         stop,
