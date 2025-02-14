@@ -520,7 +520,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             if is_hip_:
                 if os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1":
-                    #return self.forward_absorb_fused_mla(positions, hidden_states, forward_batch)
                     return self.forward_absorb_fused_mla_rope(positions, hidden_states, forward_batch)
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
@@ -651,6 +650,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        enable_rope_fusion = os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
@@ -687,11 +687,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
         k_input[..., : self.kv_lora_rank] = v_input
-        k_pe = k_input[..., self.kv_lora_rank :]
 
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if not enable_rope_fusion:
+            k_pe = k_input[..., self.kv_lora_rank :]
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            q_input[..., self.kv_lora_rank :] = q_pe
+            k_input[..., self.kv_lora_rank :] = k_pe
+            k_pe_output = None
+        else:
+            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank :])
+
         q_input[..., self.kv_lora_rank :] = q_pe
-        k_input[..., self.kv_lora_rank :] = k_pe
 
         #attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         # Use Fused ROPE with use_rope=OFF.
@@ -711,41 +717,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                              ), dtype=torch.float32, device=q.device)
 
         # save current latent cache.
-        #print ("------------------------------")
-        #print ("CHAI: forward_absorb_fused_rope")
-        #print ("forward_batch.out_cache_loc={}:{}".format(forward_batch.out_cache_loc.size(), forward_batch.out_cache_loc.dtype))
         forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
         key_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
-        val_cache_buf = forward_batch.token_to_kv_pool.get_value_buffer(self.attn_mqa.layer_id)
-        k_pe_output = k_pe
+        val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
-        #print (f"q_input={q_input.size()}:{q_input.dtype}, key_cache_buf={key_cache_buf.size()}:{key_cache_buf.dtype}, value_cache_buf={val_cache_buf.size()}:{val_cache_buf.dtype}")
-        #print (f"attn_output={attn_output.size()}:{attn_output.dtype}, req_to_token={req_to_token.size()}:{req_to_token.dtype}")
-        #print (f"b_req_idx={b_req_idx.size()}:{b_req_idx.dtype}, b_seq_len={b_seq_len.size()}:{b_seq_len.dtype}")
-        #print ("self.kv_lora_rank={}, rotary_dim={}, cos_sin_cache={}:{} ".format(self.kv_lora_rank, self.rotary_emb.rotary_dim, cos_sin_cache.size(), cos_sin_cache.dtype))
-        #print ("positions={}:{}, attn_logits={}:{}, num_kv_split={}, sm_scale={}, logit_cap={}, use_rope={}, is_neox_style={}".format(positions.size(), positions.dtype, attn_logits.size(), attn_logits.dtype, num_kv_split, sm_scale, 0.0, False, self.rotary_emb.is_neox_style))
-        #print ("forward_batch.out_cache_loc={}:{}".format(forward_batch.out_cache_loc.size(), forward_batch.out_cache_loc.dtype))
-
-        #decode_attention_fwd_grouped_rope(
-        #    q_input,
-        #    key_cache_buf,
-        #    val_cache_buf,
-        #    attn_output,
-        #    req_to_token,
-        #    b_req_idx,
-        #    b_seq_len,
-        #    k_pe_output,
-        #    self.kv_lora_rank,
-        #    self.qk_rope_head_dim,
-        #    cos_sin_cache,
-        #    positions,
-        #    attn_logits,
-        #    num_kv_split,
-        #    sm_scale,
-        #    logit_cap=0.0,
-        #    use_rope=False)
-
-        decode_attention_fwd_grouped(
+        decode_attention_fwd_grouped_rope(
             q_input,
             key_cache_buf,
             val_cache_buf,
@@ -753,17 +729,40 @@ class DeepseekV2AttentionMLA(nn.Module):
             req_to_token,
             b_req_idx,
             b_seq_len,
+            k_pe_output,
+            self.kv_lora_rank,
+            self.rotary_emb.rotary_dim,
+            cos_sin_cache,
+            positions,
             attn_logits,
             num_kv_split,
             sm_scale,
-            logit_cap=0.0)
+            logit_cap=0.0,
+            use_rope=enable_rope_fusion,
+            is_neox_style=self.rotary_emb.is_neox_style)
+
+        if enable_rope_fusion:
+            k_input[..., self.kv_lora_rank :] = k_pe_output
+            forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
+
+        #decode_attention_fwd_grouped(
+        #    q_input,
+        #    key_cache_buf,
+        #    val_cache_buf,
+        #    attn_output,
+        #    req_to_token,
+        #    b_req_idx,
+        #    b_seq_len,
+        #    attn_logits,
+        #    num_kv_split,
+        #    sm_scale,
+        #    logit_cap=0.0)
 
 
         #torch.cuda.synchronize() 
         #print ("---- done ----")
 
-        #decode_attention_
-        #attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.w_vc.dtype == torch.float8_e4m3fnuz:
             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
@@ -789,125 +788,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
-    #def forward_absorb_fused_mla(
-    #    self,
-    #    positions: torch.Tensor,
-    #    hidden_states: torch.Tensor,
-    #    forward_batch: ForwardBatch,
-    #) -> torch.Tensor:
-    #    q_len = hidden_states.shape[0]
-    #    q_input = hidden_states.new_empty(
-    #        q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
-    #    )
-    #    if self.q_lora_rank is not None:
-    #        q = self.q_a_proj(hidden_states)[0]
-    #        q = self.q_a_layernorm(q)
-    #        q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-    #    else:
-    #        q = self.q_proj(hidden_states)[0].view(
-    #            -1, self.num_local_heads, self.qk_head_dim
-    #        )
-
-    #    enable_rope_fusion = os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
-
-    #    #if False:
-    #    #    q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-    #    #    latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-    #    #    v_input = latent_cache[..., : self.kv_lora_rank]
-    #    #    v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
-    #    #    k_input = latent_cache.unsqueeze(1)
-    #    #    k_input[..., : self.kv_lora_rank] = v_input
-    #    #    k_pe = k_input[..., self.kv_lora_rank :]
-
-    #    #    q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-    #    #    q_input[..., self.kv_lora_rank :] = q_pe
-    #    #    k_input[..., self.kv_lora_rank :] = k_pe
-    #    latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-    #    v_input = latent_cache[..., : self.kv_lora_rank]
-    #    v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
-    #    k_input = latent_cache.unsqueeze(1)
-    #    k_input[..., : self.kv_lora_rank] = v_input
-
-    #    if not enable_rope_fusion:
-    #        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-    #        k_pe = k_input[..., self.kv_lora_rank :]
-    #        q_pe, k_pe_output = self.rotary_emb(positions, q_pe, k_pe)
-    #    else:
-    #        k_pe_output = torch.empty((q_len, self.qk_rope_head_dim), dtype=latent_cache.dtype, device=latent_cache.device)
-
-    #    attn_out = torch.empty((q_len, self.num_local_heads, self.qk_nope_head_dim), dtype=q.dtype, device=q.device) #torch.empty_like(hidden_states)
-    #    req_to_token = forward_batch.req_to_token_pool.req_to_token
-    #    b_req_idx = forward_batch.req_pool_indices
-    #    b_seq_len = forward_batch.seq_lens
-    #    cos_sin_cache = self.rotary_emb.cos_sin_cache
-    #    #w = self.kv_b_proj.weight
-    #    #w_kc, w_vc = w.unflatten(
-    #    #            0, (-1, self.qk_nope_head_dim + self.v_head_dim)
-    #    #        ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
-    #    num_kv_split = 8 ## Took from Triton backend default value.
-    #    sm_scale = self.scaling
-    #    attn_logits = torch.empty(
-    #                         (
-    #                            forward_batch.batch_size,
-    #                            self.num_local_heads,
-    #                            num_kv_split,
-    #                            self.kv_lora_rank + 1,
-    #                         ), dtype=torch.float32, device=q.device)
-
-    #    ## get previous latent cached_buffer.
-    #    #forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
-    #    latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
-
-    #    decode_attention_fwd_grouped_rope(
-    #        q,
-    #        latent_cache_buf,
-    #        latent_cache_buf[..., : self.kv_lora_rank],
-    #        attn_out,
-    #        req_to_token,
-    #        b_req_idx,
-    #        b_seq_len,
-    #        k_pe_output,
-    #        self.kv_lora_rank,
-    #        self.qk_rope_head_dim,
-    #        cos_sin_cache,
-    #        positions,
-    #        attn_logits,
-    #        num_kv_split,
-    #        sm_scale,
-    #        logit_cap=0.0,
-    #        use_rope=enable_rope_fusion) ## logit_cap, use_rope, is_neox_styel
-
-    #    if enable_rope_fusion:
-    #        k_pe_output = k_pe_output.unsqueeze(1)
-    #    k_input[..., self.kv_lora_rank :] = k_pe_output
-    #    forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
-
-    #    #decode_attention_fwd_normal(
-    #    #                q,
-    #    #                latent_cache_buf,
-    #    #                w_kc,
-    #    #                w_vc,
-    #    #                self.w_scale.item(),
-    #    #                cos_sin_cache,
-    #    #                positions,
-    #    #                self.qk_rope_head_dim,
-    #    #                self.v_head_dim,
-    #    #                attn_out,
-    #    #                req_to_token,
-    #    #                b_req_idx,
-    #    #                b_seq_len,
-    #    #                attn_logits,
-    #    #                num_kv_split,
-    #    #                sm_scale,
-    #    #                logit_cap=0.0)
-    #    #                #fuse_rope=False,
-    #    #                #use_fp8=use_fp8)
-
-    #    attn_out = attn_out.flatten(1, 2)
-    #    output, _ = self.o_proj(attn_out)
-    #    return output #attn_out
-        
 def all_gather(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
 ):
