@@ -33,7 +33,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 ### Using pip
 ```bash
 # Installation
-pip install "sglang[all]>=0.4.2.post4" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer
+pip install "sglang[all]>=0.4.3" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
