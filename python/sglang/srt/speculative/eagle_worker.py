@@ -58,12 +58,13 @@ class EAGLEWorker(TpModelWorker):
         # Parse arguments
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
         self.server_args = server_args
 
         # Share the embedding and lm_head
-        if SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        ).is_eagle():
+        if not self.speculative_algorithm.is_nextn():
             embed, head = self.target_worker.model_runner.model.get_embed_and_head()
             self.model_runner.model.set_embed_and_head(embed, head)
         self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph

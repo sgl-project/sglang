@@ -1048,7 +1048,7 @@ class ScheduleBatch:
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_nextn():
+        if self.spec_algorithm.is_eagle():
             return
 
         self.input_ids = self.output_ids

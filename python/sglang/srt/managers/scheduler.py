@@ -246,7 +246,7 @@ class Scheduler:
         )
 
         # Launch a worker for speculative decoding if needed
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_nextn():
+        if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
