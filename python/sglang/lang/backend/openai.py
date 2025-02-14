@@ -381,8 +381,6 @@ def openai_completion(
             if is_chat:
                 kwargs.pop("stop", None)
                 ret = client.chat.completions.create(messages=prompt, **kwargs)
-                print("ret===============")
-                print(ret)
                 if len(ret.choices) == 1:
                     comp = ret.choices[0].message.content
                 else:
@@ -393,7 +391,6 @@ def openai_completion(
                     comp = [c.text for c in ret.choices]
                 else:
                     comp = ret.choices[0].text
-                
 
             token_usage.prompt_tokens += ret.usage.prompt_tokens
             token_usage.completion_tokens += ret.usage.completion_tokens

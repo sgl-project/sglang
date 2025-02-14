@@ -572,8 +572,7 @@ class StreamExecutor:
                     self,
                     sampling_params=sampling_params,
                 )
-                if isinstance(comp, list):
-                    comp = comp[0]
+
             else:
                 if self.backend.is_chat_model:
                     # Speculative execution on models with only chat interface.
@@ -589,7 +588,8 @@ class StreamExecutor:
                 else:  # Speculative execution on models with completion interface
                     comp, meta_info = self._spec_gen(sampling_params)
 
-            self.text_ += comp
+            if isinstance(comp, list):
+                self.text_ += comp[0]
 
             self.variables[name] = comp
             self.meta_info[name] = meta_info
