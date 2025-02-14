@@ -61,7 +61,7 @@ from sglang.srt.utils import is_cuda_available, is_hip
 #from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
 #from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
 from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import decode_attention_fwd_grouped_rope
-from sglang.srt.layers.attention.triton_ops.sgalng_ref import decode_attention_fwd_grouped
+from sglang.srt.layers.attention.triton_ops.sglang_ref import decode_attention_fwd_grouped
 
 is_hip_ = is_hip()
 
