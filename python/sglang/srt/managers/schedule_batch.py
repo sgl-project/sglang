@@ -65,6 +65,7 @@ global_server_args_dict = {
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "device": ServerArgs.device,
+    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
 }
 
 logger = logging.getLogger(__name__)

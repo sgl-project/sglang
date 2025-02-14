@@ -168,6 +168,8 @@ class ServerArgs:
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
 
+    enable_flashinfer_mla: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -693,6 +695,11 @@ class ServerArgs:
             choices=["xgrammar", "outlines"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mla",
+            action="store_true",
+            help="Enable FlashInfer MLA optimization",
         )
 
         # Speculative decoding
