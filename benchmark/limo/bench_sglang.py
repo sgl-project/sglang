@@ -67,7 +67,7 @@ def main(args):
         progress_bar=True,
         temperature=0.6,
         max_new_tokens=32768,
-        top_p=0.95
+        top_p=0.95,
     )
     latency = time.time() - tic
 
@@ -75,7 +75,11 @@ def main(args):
     correct = 0
     for i, state in enumerate(states):
         try:
-            correct += 1 if extract_boxed_text(state["answer"]) == str(answers[i]["answer"]) else 0
+            correct += (
+                1
+                if extract_boxed_text(state["answer"]) == str(answers[i]["answer"])
+                else 0
+            )
         except Exception as e:
             print(f"Error extracting answer: {e}")
             pass
