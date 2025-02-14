@@ -13,8 +13,8 @@ ARG SGL_REPO="https://github.com/sgl-project/sglang"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
-ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="845d75a"
+ARG TRITON_REPO="https://github.com/ROCm/triton.git"
+ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 
 ARG ATER_REPO="https://github.com/HaiShaw/ater"
