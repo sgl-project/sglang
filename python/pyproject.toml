@@ -21,7 +21,7 @@ runtime_common = [
     "hf_transfer", "huggingface_hub", "interegular", "modelscope",
     "orjson", "packaging", "pillow", "prometheus-client>=0.20.0",
     "psutil", "pydantic", "python-multipart", "pyzmq>=25.1.2",
-    "torchao>=0.7.0", "uvicorn", "uvloop", "xgrammar>=0.1.10", "ninja"
+    "torchao>=0.7.0", "uvicorn", "uvloop", "xgrammar>=0.1.13", "ninja"
 ]
 srt = [
     "sglang[runtime_common]", "cuda-python",
