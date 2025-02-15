@@ -438,7 +438,9 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
     if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+        load_chat_template_for_openai_api(
+            tokenizer_manager, server_args.chat_template, server_args.model_path
+        )
 
     # Wait for the model to finish loading
     scheduler_infos = []
