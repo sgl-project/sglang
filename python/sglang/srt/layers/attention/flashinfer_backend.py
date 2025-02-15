@@ -237,7 +237,10 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
+            if self.is_multimodal or (
+                self.enable_flashinfer_mla
+                and not global_server_args_dict["disable_radix_cache"]
+            ):
                 use_ragged = False
                 extend_no_prefix = False
             else:
