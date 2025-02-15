@@ -57,7 +57,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
 > [!IMPORTANT]
-> Make sure the correct `chat_template` is passed, or performance degradation may occur
+> **Make sure the correct `chat_template` is passed, or performance degradation may occur.**
 
 ## Serving: HTTP & API
 
