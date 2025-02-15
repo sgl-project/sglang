@@ -1,7 +1,6 @@
 import os
 
-from sglang.utils import execute_shell_command
-from sglang.utils.port_utils import reserve_port
+from sglang.utils import execute_shell_command, reserve_port
 
 DEFAULT_MAX_RUNNING_REQUESTS = 200
 DEFAULT_MAX_TOTAL_TOKENS = 20480
