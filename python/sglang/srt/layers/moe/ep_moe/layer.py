@@ -36,7 +36,6 @@ class GroupedGemmRunner(torch.nn.Module):
     def __init__(self, device, is_block_quant, use_flashinfer: bool = False):
         super().__init__()
         self.device = device
-        self.is_block_quant = is_block_quant
         self.use_flashinfer = use_flashinfer
         if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
@@ -77,22 +76,20 @@ class GroupedGemmRunner(torch.nn.Module):
                 weight_indices=weight_indices,
             )
         else:
-            if self.is_block_quant:
-                pass
-            else:
-                assert weight_column_major == True
-                c = grouped_gemm_triton(
-                    a,
-                    b,
-                    c,
-                    batch_size,
-                    weight_column_major,
-                    seg_indptr,
-                    weight_indices,
-                    use_fp8_w8a8,
-                    scale_a,
-                    scale_b,
-                )
+            assert weight_column_major == True
+            c = grouped_gemm_triton(
+                a,
+                b,
+                c,
+                batch_size,
+                weight_column_major,
+                seg_indptr,
+                weight_indices,
+                use_fp8_w8a8,
+                scale_a,
+                scale_b,
+                block_shape=self.quant_method.weight_block_size,
+            )
         return c
 
 
