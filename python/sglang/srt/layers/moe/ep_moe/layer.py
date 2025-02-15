@@ -33,10 +33,11 @@ logger = logging.getLogger(__name__)
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
 
-    def __init__(self, device, is_block_quant, use_flashinfer: bool = False):
+    def __init__(self, device, quant_method, use_flashinfer: bool = False):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
+        self.quant_method = quant_method
         if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
 
@@ -176,7 +177,7 @@ class EPMoE(torch.nn.Module):
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
-                self.quant_method.block_quant,
+                self.quant_method,
                 use_flashinfer=False,  # TODO: use flashinfer
             )
 
@@ -246,8 +247,12 @@ class EPMoE(torch.nn.Module):
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w13_input_scale,
-            scale_b=self.w13_weight_scale,
+            scale_a=(None if self.quant_method.block_quant else self.w13_weight_scale),
+            scale_b=(
+                self.w13_weight_scale_inv
+                if self.quant_method.block_quant
+                else self.w13_weight_scale
+            ),
         )
 
         # Act
@@ -294,8 +299,12 @@ class EPMoE(torch.nn.Module):
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w2_input_scale,
-            scale_b=self.w2_weight_scale,
+            scale_a=(None if self.quant_method.block_quant else self.w2_input_scale),
+            scale_b=(
+                self.w2_weight_scale_inv
+                if self.quant_method.block_quant
+                else self.w2_weight_scale
+            ),
         )
 
         # PostReorder
@@ -362,7 +371,12 @@ class EPMoE(torch.nn.Module):
         # Special case for fp8 scales.
         if "scale" in weight_name:
             self._load_fp8_scale(
-                param.data, loaded_weight, weight_name, shard_id, expert_id
+                param.data,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                self.quant_method.block_quant,
             )
             return
 
@@ -382,6 +396,7 @@ class EPMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
         expert_id: int,
+        block_quant: int,
     ) -> None:
         param_data = param.data
 
@@ -399,15 +414,24 @@ class EPMoE(torch.nn.Module):
             param_data[expert_id] = loaded_weight
         # Weight scales
         elif "weight_scale" in weight_name:
+            if block_quant:
+                if shard_id == "w1":
+                    param_data[expert_id][:16, :] = loaded_weight
+                elif shard_id == "w3":
+                    param_data[expert_id][16:32, :] = loaded_weight
+                else:  # w2
+                    param_data[expert_id] = loaded_weight
             # If we are in merged column case (gate_up_proj)
-            if shard_id in ("w1", "w3"):
-                # We have to keep the weight scales of w1 and w3 because
-                # we need to re-quantize w1/w3 weights after weight loading.
-                idx = 0 if shard_id == "w1" else 1
-                param_data[expert_id][idx] = loaded_weight
-            # If we are in the row parallel case (down_proj)
             else:
-                param_data[expert_id] = loaded_weight
+                if shard_id in ("w1", "w3"):
+                    # We have to keep the weight scales of w1 and w3 because
+                    # we need to re-quantize w1/w3 weights after weight loading.
+                    idx = 0 if shard_id == "w1" else 1
+                    param_data[expert_id][idx] = loaded_weight
+
+                # If we are in the row parallel case (down_proj)
+                else:
+                    param_data[expert_id] = loaded_weight
 
 
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -501,7 +525,8 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
     """
 
     def __init__(self, quant_config: Fp8Config):
-        super().__init__(quant_config)
+        self.quant_config = quant_config
+        self.block_quant = self.quant_config.weight_block_size is not None
 
     def create_weights(
         self,

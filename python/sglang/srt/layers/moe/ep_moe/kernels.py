@@ -287,12 +287,11 @@ def grouped_gemm_triton_kernel(
         if group_k > 0 and group_n > 0:
             k_start = k * BLOCK_SIZE_K
             offs_ks = k_start // group_k
-            a_scale = tl.load(a_scale_ptrs + offs_ks * as_stride_1, other=0.0)
+            a_scale = tl.load(a_scale_ptrs + offs_ks * as_stride_1)
             b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2)
-
-            accumulator += (
-                tl.dot(a_tile, b_tile.T) * a_scale[:, None] * b_scale[None, :]
-            )
+            accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
+        else:
+            accumulator = tl.dot(a_tile, b_tile.T, accumulator)
         a_ptr += BLOCK_SIZE_K
         b_ptr += BLOCK_SIZE_K
 
@@ -337,21 +336,21 @@ def grouped_gemm_triton(
     block_shape: Optional[List[int]] = None,
 ):
     assert weight_column_major == True  # TODO: more
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 and block_shape is None:
         assert scale_a is not None and scale_b is not None
 
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
-        a, a_scale = per_token_group_quant_fp8(a, block_k)
+        a, scale_a = per_token_group_quant_fp8(a, block_k)
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
 
     config = {
-        "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
     }
 
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
@@ -377,13 +376,16 @@ def grouped_gemm_triton(
         use_fp8_w8a8,
         scale_a,
         scale_b,
+        0 if block_shape is None else block_shape[0],
+        0 if block_shape is None else block_shape[1],
+        a.stride(0),
+        b.stride(0),
+        b.stride(1),
         scale_a.stride(0) if scale_a is not None and scale_a.ndim == 2 else 0,
         scale_a.stride(1) if scale_a is not None and scale_a.ndim == 2 else 0,
         scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
         scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
         scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
-        0 if block_shape is None else block_shape[0],
-        0 if block_shape is None else block_shape[1],
         **config,
     )
     return c
