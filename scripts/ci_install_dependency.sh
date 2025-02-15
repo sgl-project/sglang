@@ -3,6 +3,7 @@ set -euxo pipefail
 
 # Install the dependency in CI.
 
+
 # Use repo from environment variable, passed from GitHub Actions
 FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python}"
 
