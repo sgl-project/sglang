@@ -28,9 +28,9 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     mixtral_supported = ["fp8", "compressed-tensors", "gptq_marlin", "awq_marlin"]
 
     if (
-            model_config.quantization is not None
-            and model_config.quantization not in mixtral_supported
-            and "MixtralForCausalLM" in architectures
+        model_config.quantization is not None
+        and model_config.quantization not in mixtral_supported
+        and "MixtralForCausalLM" in architectures
     ):
         architectures = ["QuantMixtralForCausalLM"]
 

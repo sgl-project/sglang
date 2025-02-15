@@ -544,7 +544,7 @@ register_conv_template(
 # Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
 register_conv_template(
     Conversation(
-        name= "qwen2-vl",
+        name="qwen2-vl",
         system_message="You are a helpful assistant.",
         system_template="<|im_start|>system\n{system_message}",
         roles=("<|im_start|>user", "<|im_start|>assistant"),

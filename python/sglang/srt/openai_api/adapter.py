@@ -99,18 +99,18 @@ storage_dir = None
 
 
 def create_error_response(
-        message: str,
-        err_type: str = "BadRequestError",
-        status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+    message: str,
+    err_type: str = "BadRequestError",
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ):
     error = ErrorResponse(message=message, type=err_type, code=status_code.value)
     return ORJSONResponse(content=error.model_dump(), status_code=error.code)
 
 
 def create_streaming_error_response(
-        message: str,
-        err_type: str = "BadRequestError",
-        status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+    message: str,
+    err_type: str = "BadRequestError",
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ) -> str:
     error = ErrorResponse(message=message, type=err_type, code=status_code.value)
     json_str = json.dumps({"error": error.model_dump()})
@@ -165,6 +165,7 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
     else:
         chat_template_name = chat_template_arg
 
+    # check chat-template
     chat_template = get_chat_template_by_model_path(model_path)
     if chat_template is not None:
         official_chat_template = chat_template.name
@@ -173,7 +174,7 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
             logger.warning(
                 f"Using a chat_template: '{used_chat_template}', "
                 f"which is different from official chat template: '{official_chat_template}', "
-                f"performance degradation may occur"
+                f"This discrepancy may lead to performance degradation"
             )
 
 
@@ -485,13 +486,13 @@ async def v1_retrieve_file_content(file_id: str):
 
 
 def v1_generate_request(
-        all_requests: List[CompletionRequest], request_ids: List[str] = None
+    all_requests: List[CompletionRequest], request_ids: List[str] = None
 ):
     if len(all_requests) > 1:
         first_prompt_type = type(all_requests[0].prompt)
         for request in all_requests:
             assert (
-                    type(request.prompt) is first_prompt_type
+                type(request.prompt) is first_prompt_type
             ), "All prompts must be of the same type in file input settings"
             if request.n > 1:
                 raise ValueError(
@@ -683,7 +684,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                         "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
                         "completion_tokens": ret[i]["meta_info"]["completion_tokens"],
                         "total_tokens": ret[i]["meta_info"]["prompt_tokens"]
-                                        + ret[i]["meta_info"]["completion_tokens"],
+                        + ret[i]["meta_info"]["completion_tokens"],
                     },
                     "system_fingerprint": None,
                 },
@@ -722,7 +723,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             completion_tokens = {}
             try:
                 async for content in tokenizer_manager.generate_request(
-                        adapted_request, raw_request
+                    adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
 
@@ -748,7 +749,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                                         request.prompt, skip_special_tokens=True
                                     )
                                 elif isinstance(request.prompt[0], list) and isinstance(
-                                        request.prompt[0][0], int
+                                    request.prompt[0][0], int
                                 ):
                                     # for the case of multiple token ids prompts
                                     prompts = tokenizer_manager.tokenizer.decode(
@@ -776,11 +777,11 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             input_token_logprobs=input_token_logprobs,
                             input_top_logprobs=input_top_logprobs,
                             output_token_logprobs=content["meta_info"][
-                                                      "output_token_logprobs"
-                                                  ][n_prev_token:],
+                                "output_token_logprobs"
+                            ][n_prev_token:],
                             output_top_logprobs=content["meta_info"][
-                                                    "output_top_logprobs"
-                                                ][n_prev_token:],
+                                "output_top_logprobs"
+                            ][n_prev_token:],
                         )
                         n_prev_token = len(
                             content["meta_info"]["output_token_logprobs"]
@@ -788,7 +789,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     else:
                         logprobs = None
 
-                    delta = text[len(stream_buffer):]
+                    delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
                     finish_reason = content["meta_info"]["finish_reason"]
                     choice_data = CompletionResponseStreamChoice(
@@ -865,9 +866,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
 
 def v1_chat_generate_request(
-        all_requests: List[ChatCompletionRequest],
-        tokenizer_manager,
-        request_ids: List[str] = None,
+    all_requests: List[ChatCompletionRequest],
+    tokenizer_manager,
+    request_ids: List[str] = None,
 ):
     input_ids = []
     sampling_params_list = []
@@ -1031,7 +1032,7 @@ def v1_chat_generate_request(
 
 
 def v1_chat_generate_response(
-        request, ret, to_file=False, cache_report=False, tool_call_parser=None
+    request, ret, to_file=False, cache_report=False, tool_call_parser=None
 ):
     choices = []
 
@@ -1048,7 +1049,7 @@ def v1_chat_generate_response(
             )
             token_logprobs = []
             for token_idx, (token, logprob) in enumerate(
-                    zip(logprobs.tokens, logprobs.token_logprobs)
+                zip(logprobs.tokens, logprobs.token_logprobs)
             ):
                 token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
@@ -1165,7 +1166,7 @@ def v1_chat_generate_response(
                         "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
                         "completion_tokens": ret[i]["meta_info"]["completion_tokens"],
                         "total_tokens": ret[i]["meta_info"]["prompt_tokens"]
-                                        + ret[i]["meta_info"]["completion_tokens"],
+                        + ret[i]["meta_info"]["completion_tokens"],
                     },
                     "system_fingerprint": None,
                 },
@@ -1210,7 +1211,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             completion_tokens = {}
             try:
                 async for content in tokenizer_manager.generate_request(
-                        adapted_request, raw_request
+                    adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
                     text = content["text"]
@@ -1224,11 +1225,11 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     if request.logprobs:
                         logprobs = to_openai_style_logprobs(
                             output_token_logprobs=content["meta_info"][
-                                                      "output_token_logprobs"
-                                                  ][n_prev_token:],
+                                "output_token_logprobs"
+                            ][n_prev_token:],
                             output_top_logprobs=content["meta_info"][
-                                                    "output_top_logprobs"
-                                                ][n_prev_token:],
+                                "output_top_logprobs"
+                            ][n_prev_token:],
                         )
 
                         n_prev_token = len(
@@ -1236,7 +1237,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         )
                         token_logprobs = []
                         for token, logprob in zip(
-                                logprobs.tokens, logprobs.token_logprobs
+                            logprobs.tokens, logprobs.token_logprobs
                         ):
                             token_bytes = list(token.encode("utf-8"))
                             top_logprobs = []
@@ -1292,7 +1293,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                     text = content["text"]
-                    delta = text[len(stream_buffer):]
+                    delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
                     if request.tool_choice != "none" and request.tools:
@@ -1327,9 +1328,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             # transform call_item -> FunctionResponse + ToolCall
 
                             if (
-                                    content["meta_info"]["finish_reason"]
-                                    and content["meta_info"]["finish_reason"]["type"]
-                                    == "stop"
+                                content["meta_info"]["finish_reason"]
+                                and content["meta_info"]["finish_reason"]["type"]
+                                == "stop"
                             ):
                                 latest_delta_len = 0
                                 if isinstance(call_item.parameters, str):
@@ -1462,7 +1463,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     for request in all_requests:
         prompt = request.input
         assert (
-                type(prompt) is first_prompt_type
+            type(prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
         prompts.append(prompt)
 
@@ -1530,10 +1531,10 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
 
 
 def to_openai_style_logprobs(
-        input_token_logprobs=None,
-        output_token_logprobs=None,
-        input_top_logprobs=None,
-        output_top_logprobs=None,
+    input_token_logprobs=None,
+    output_token_logprobs=None,
+    input_top_logprobs=None,
+    output_top_logprobs=None,
 ):
     ret_logprobs = LogProbs()
 

@@ -41,8 +41,8 @@ class _ModelRegistry:
         return self.models[model_arch]
 
     def _normalize_archs(
-            self,
-            architectures: Union[str, List[str]],
+        self,
+        architectures: Union[str, List[str]],
     ) -> List[str]:
         if isinstance(architectures, str):
             architectures = [architectures]
@@ -52,8 +52,8 @@ class _ModelRegistry:
         return architectures
 
     def resolve_model_cls(
-            self,
-            architectures: Union[str, List[str]],
+        self,
+        architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
         architectures = self._normalize_archs(architectures)
 
@@ -80,16 +80,16 @@ def import_model_classes():
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(
-                        entry, list
+                    entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
                         assert (
-                                tmp.__name__ not in model_arch_name_to_cls
+                            tmp.__name__ not in model_arch_name_to_cls
                         ), f"Duplicated model implementation for {tmp.__name__}"
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
                     assert (
-                            entry.__name__ not in model_arch_name_to_cls
+                        entry.__name__ not in model_arch_name_to_cls
                     ), f"Duplicated model implementation for {entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
 

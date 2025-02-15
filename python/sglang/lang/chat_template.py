@@ -18,7 +18,7 @@ class ChatTemplate:
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
 
     def get_prefix_and_suffix(
-            self, role: str, hist_messages: List[Dict]
+        self, role: str, hist_messages: List[Dict]
     ) -> Tuple[str, str]:
         prefix, suffix = self.role_prefix_and_suffix.get(role, ("", ""))
 
@@ -30,9 +30,9 @@ class ChatTemplate:
                 )
                 return (user_prefix + system_prefix, system_suffix)
             elif (
-                    role == "user"
-                    and len(hist_messages) == 1
-                    and hist_messages[0]["content"] is not None
+                role == "user"
+                and len(hist_messages) == 1
+                and hist_messages[0]["content"] is not None
             ):
                 return ("", suffix)
 
@@ -379,7 +379,7 @@ register_chat_template(
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
     if (
-            "deepseek-v3" in model_path.lower() or "deepseek-r1" in model_path.lower()
+        "deepseek-v3" in model_path.lower() or "deepseek-r1" in model_path.lower()
     ) and "base" not in model_path.lower():
         return get_chat_template("deepseek-v3")
 
@@ -406,7 +406,7 @@ def match_llama2_chat(model_path: str):
     if "llama-2" in model_path and "chat" in model_path:
         return get_chat_template("llama-2-chat")
     if (
-            "mistral" in model_path or "mixtral" in model_path
+        "mistral" in model_path or "mixtral" in model_path
     ) and "instruct" in model_path:
         return get_chat_template("llama-2-chat")
     if "codellama" in model_path and "instruct" in model_path:
@@ -427,19 +427,18 @@ def match_chat_ml(model_path: str):
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     # Now the suffix for qwen2 chat model is "instruct"
-    if (
-            "qwen" in model_path
-
-    ):
+    if "qwen" in model_path:
         if "vl" in model_path:
             return get_chat_template("qwen2-vl")
-        if ("chat" in model_path or "instruct" in model_path) and ("llava" not in model_path):
+        if ("chat" in model_path or "instruct" in model_path) and (
+            "llava" not in model_path
+        ):
             return get_chat_template("qwen")
     if (
-            "llava-v1.6-34b" in model_path
-            or "llava-v1.6-yi-34b" in model_path
-            or "llava-next-video-34b" in model_path
-            or "llava-onevision-qwen2" in model_path
+        "llava-v1.6-34b" in model_path
+        or "llava-v1.6-yi-34b" in model_path
+        or "llava-next-video-34b" in model_path
+        or "llava-onevision-qwen2" in model_path
     ):
         return get_chat_template("chatml-llava")
 
