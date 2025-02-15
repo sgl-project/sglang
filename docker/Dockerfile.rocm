@@ -13,8 +13,8 @@ ARG SGL_REPO="https://github.com/sgl-project/sglang"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
-ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="845d75a"
+ARG TRITON_REPO="https://github.com/ROCm/triton.git"
+ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 
 ARG ATER_REPO="https://github.com/HaiShaw/ater"
@@ -57,6 +57,11 @@ RUN git clone ${ATER_REPO} \
     && cd ater \
     && git submodule update --init --recursive \
     && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py develop
+
+# Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
+RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
+         /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
+         -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
 # Performance environment variable.
 
