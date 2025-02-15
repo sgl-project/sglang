@@ -444,7 +444,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             logits_soft_cap = layer.logit_cap
 
-            o1, _ = self.prefill_wrapper_ragged.forward_return_lse(
+            o, _ = self.prefill_wrapper_ragged.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -452,8 +452,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
-
-            o = o1
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
