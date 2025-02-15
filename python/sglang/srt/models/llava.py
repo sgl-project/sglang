@@ -50,8 +50,8 @@ class LlavaBaseForCausalLM(nn.Module):
 
         # hardcode for spatial_unpad + anyres
         if image_inputs.modalities is not None and (
-            "multi-images" in image_inputs.modalities
-            or "video" in image_inputs.modalities
+                "multi-images" in image_inputs.modalities
+                or "video" in image_inputs.modalities
         ):
             image_aspect_ratio = "pad"
         else:
@@ -62,7 +62,7 @@ class LlavaBaseForCausalLM(nn.Module):
             if len(image_sizes) > 16:
                 # 2x2 pooling with stride 2
                 new_image_feature_len = (
-                    math.ceil(self.image_size / self.patch_size / 2) ** 2
+                        math.ceil(self.image_size / self.patch_size / 2) ** 2
                 )
             else:
                 new_image_feature_len = self.image_feature_len  # multiimage
@@ -99,9 +99,9 @@ class LlavaBaseForCausalLM(nn.Module):
                 offset = 0
             # old_len + pad_len - 1, because we need to remove image_token_id
             input_ids = (
-                input_ids[:offset]
-                + [pad_values[image_idx]] * new_image_feature_len
-                + input_ids[offset + 1 :]
+                    input_ids[:offset]
+                    + [pad_values[image_idx]] * new_image_feature_len
+                    + input_ids[offset + 1:]
             )
             offset_list.append(offset)
             image_inputs.image_pad_len.append(new_image_feature_len)
@@ -128,10 +128,10 @@ class LlavaBaseForCausalLM(nn.Module):
 
     @torch.no_grad()
     def forward(
-        self,
-        input_ids: torch.LongTensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
+            self,
+            input_ids: torch.LongTensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         image_inputs = forward_batch.image_inputs
 
@@ -201,17 +201,17 @@ class LlavaBaseForCausalLM(nn.Module):
                                 self.config.image_aspect_ratio
                             )  # single image
                         elif (
-                            modalities_list[image_idx] == "multi-images"
-                            or modalities_list[image_idx] == "video"
+                                modalities_list[image_idx] == "multi-images"
+                                or modalities_list[image_idx] == "video"
                         ):
                             image_aspect_ratio = "pad"  # multi image
                         # image_aspect_ratio = (
                         #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
                         # )
                         if (
-                            image_feature.shape[0] > 1
-                            and "anyres" in image_aspect_ratio
-                            and modalities_list[image_idx] == "image"
+                                image_feature.shape[0] > 1
+                                and "anyres" in image_aspect_ratio
+                                and modalities_list[image_idx] == "image"
                         ):
                             base_image_feature = image_feature[0]
                             image_feature = image_feature[1:]
@@ -227,8 +227,8 @@ class LlavaBaseForCausalLM(nn.Module):
                                     )
 
                             if (
-                                image_aspect_ratio == "anyres"
-                                or "anyres_max" in image_aspect_ratio
+                                    image_aspect_ratio == "anyres"
+                                    or "anyres_max" in image_aspect_ratio
                             ):
                                 vision_tower_image_size = self.image_size
                                 try:
@@ -275,12 +275,12 @@ class LlavaBaseForCausalLM(nn.Module):
                                     image_feature, image_sizes[image_idx][0]
                                 )
                                 if (
-                                    "anyres_max" in image_aspect_ratio
-                                    and matched_anyres_max_num_patches
+                                        "anyres_max" in image_aspect_ratio
+                                        and matched_anyres_max_num_patches
                                 ):
                                     c, h, w = image_feature.shape
                                     times = math.sqrt(
-                                        h * w / (max_num_patches * unit**2)
+                                        h * w / (max_num_patches * unit ** 2)
                                     )
                                     if times > 1.1:
                                         image_feature = image_feature[None]
@@ -293,7 +293,7 @@ class LlavaBaseForCausalLM(nn.Module):
                                     (
                                         image_feature,
                                         self.language_model.model.image_newline[
-                                            :, None, None
+                                        :, None, None
                                         ].expand(*image_feature.shape[:-1], 1),
                                     ),
                                     dim=-1,
@@ -367,11 +367,11 @@ class LlavaBaseForCausalLM(nn.Module):
 
                     # Multiple images
                     for image_idx, image_offset in enumerate(
-                        image_inputs[i].image_offsets
+                            image_inputs[i].image_offsets
                     ):
                         if (
-                            image_offset + image_inputs[i].image_pad_len[image_idx]
-                            <= prefix_len
+                                image_offset + image_inputs[i].image_pad_len[image_idx]
+                                <= prefix_len
                         ):
                             continue
                         if image_offset >= prefix_len + seq_len:
@@ -389,8 +389,8 @@ class LlavaBaseForCausalLM(nn.Module):
                             tmp_image_feature = tmp_image_feature[-input_offset:]
                         if right_idx > start_idx + seq_len:
                             tmp_image_feature = tmp_image_feature[
-                                : start_idx + seq_len - right_idx
-                            ]
+                                                : start_idx + seq_len - right_idx
+                                                ]
                             right_idx = start_idx + seq_len
                         try:
                             input_embeds[left_idx:right_idx] = tmp_image_feature
@@ -436,8 +436,8 @@ class LlavaBaseForCausalLM(nn.Module):
 
         self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
         if (
-            self.vision_feature_select_strategy == "patch"
-            or self.vision_feature_select_strategy == "full"
+                self.vision_feature_select_strategy == "patch"
+                or self.vision_feature_select_strategy == "full"
         ):
             pass
         elif self.vision_feature_select_strategy == "cls_patch":
@@ -449,7 +449,8 @@ class LlavaBaseForCausalLM(nn.Module):
         projector_weights = {
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
-            "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            "model.vision_tower.vision_tower": "vision_tower",
+            # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }
         params_dict = dict(self.named_parameters())
@@ -471,9 +472,9 @@ class LlavaBaseForCausalLM(nn.Module):
 
 class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
     def __init__(
-        self,
-        config: LlavaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: LlavaConfig,
+            quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 
@@ -492,9 +493,9 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
 
 class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
     def __init__(
-        self,
-        config: LlavaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: LlavaConfig,
+            quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 
@@ -524,9 +525,9 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
 
 class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
     def __init__(
-        self,
-        config: LlavaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: LlavaConfig,
+            quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 

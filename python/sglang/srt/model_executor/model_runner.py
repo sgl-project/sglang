@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -77,15 +78,15 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
-        self,
-        model_config: ModelConfig,
-        mem_fraction_static: float,
-        gpu_id: int,
-        tp_rank: int,
-        tp_size: int,
-        nccl_port: int,
-        server_args: ServerArgs,
-        is_draft_worker: bool = False,
+            self,
+            model_config: ModelConfig,
+            mem_fraction_static: float,
+            gpu_id: int,
+            tp_rank: int,
+            tp_size: int,
+            nccl_port: int,
+            server_args: ServerArgs,
+            is_draft_worker: bool = False,
     ):
         # Parse args
         self.model_config = model_config
@@ -106,8 +107,8 @@ class ModelRunner:
 
         # Model-specific adjustment
         if (
-            self.model_config.attention_arch == AttentionArch.MLA
-            and not self.server_args.disable_mla
+                self.model_config.attention_arch == AttentionArch.MLA
+                and not self.server_args.disable_mla
         ):
             # TODO: add MLA optimization on CPU
             if self.server_args.device != "cpu":
@@ -180,7 +181,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -192,6 +193,8 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -360,7 +363,7 @@ class ModelRunner:
         )
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+            self, model_path: str, load_format: str
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         from sglang.srt.model_loader.loader import (
@@ -433,13 +436,13 @@ class ModelRunner:
         return True, "Succeeded to update model weights."
 
     def init_weights_update_group(
-        self,
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
+            self,
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name,
+            backend="nccl",
     ):
         """Initialize the Torch process group for model parameter updates.
 
@@ -493,7 +496,7 @@ class ModelRunner:
         )
 
         assert (
-            self._model_update_group is not None
+                self._model_update_group is not None
         ), "model update group must be initialized"
 
         try:
@@ -516,7 +519,7 @@ class ModelRunner:
         return True, "Success"
 
     def get_weights_by_name(
-        self, name: str, truncate_size: int = 100
+            self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
 
@@ -549,33 +552,33 @@ class ModelRunner:
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         if (
-            self.model_config.attention_arch == AttentionArch.MLA
-            and not self.server_args.disable_mla
+                self.model_config.attention_arch == AttentionArch.MLA
+                and not self.server_args.disable_mla
         ):
             cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * self.model_config.num_hidden_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
+                    (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                    * self.model_config.num_hidden_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
             cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
-                * self.model_config.num_hidden_layers
-                * 2
-                * torch._utils._element_size(self.kv_cache_dtype)
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * self.model_config.head_dim
+                    * self.model_config.num_hidden_layers
+                    * 2
+                    * torch._utils._element_size(self.kv_cache_dtype)
             )
         rest_memory = available_gpu_memory - total_gpu_memory * (
-            1 - self.mem_fraction_static
+                1 - self.mem_fraction_static
         )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
     def init_memory_pool(
-        self,
-        total_gpu_memory: int,
-        max_num_reqs: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
+            self,
+            total_gpu_memory: int,
+            max_num_reqs: Optional[int] = None,
+            max_total_tokens: Optional[int] = None,
     ):
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
@@ -610,9 +613,9 @@ class ModelRunner:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
             else:
                 self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
-                    + max_num_reqs * self.server_args.speculative_num_steps
-                    + 100
+                        self.max_total_num_tokens
+                        + max_num_reqs * self.server_args.speculative_num_steps
+                        + 100
                 )
 
         if max_total_tokens is not None:
@@ -636,8 +639,8 @@ class ModelRunner:
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
         if (
-            self.model_config.attention_arch == AttentionArch.MLA
-            and not self.server_args.disable_mla
+                self.model_config.attention_arch == AttentionArch.MLA
+                and not self.server_args.disable_mla
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
@@ -718,7 +721,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -783,9 +786,9 @@ class ModelRunner:
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if (
-            forward_batch.forward_mode.is_cuda_graph()
-            and self.cuda_graph_runner
-            and self.cuda_graph_runner.can_run(forward_batch)
+                forward_batch.forward_mode.is_cuda_graph()
+                and self.cuda_graph_runner
+                and self.cuda_graph_runner.can_run(forward_batch)
         ):
             return self.cuda_graph_runner.replay(forward_batch)
 
@@ -799,7 +802,7 @@ class ModelRunner:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     def sample(
-        self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
+            self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         # Apply logit bias
         sampling_info = forward_batch.sampling_info
