@@ -65,7 +65,6 @@ class DictOutput(object):
 
 @dataclass
 class VLChatProcessorOutput(DictOutput):
-    sft_format: str
     input_ids: torch.LongTensor
     target_ids: torch.LongTensor
     images: torch.Tensor
@@ -297,7 +296,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 images_spatial_crop, dtype=torch.long)
 
         prepare = VLChatProcessorOutput(
-            sft_format=sft_format,
             input_ids=input_ids,
             target_ids=target_ids,
             images=images,

@@ -1065,9 +1065,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 end_idx = start_idx+extend_seq_lens_cpu[idx]
                 pixel_values = image.pixel_values.to(
                     device="cuda", dtype=torch.bfloat16)
-                image_seq_mask = image.images_seq_mask.to(
+                image_seq_mask = image.image_seq_mask.to(
                     device="cuda")
-                image_spatial_crop = image.images_spatial_crop
+                image_spatial_crop = image.image_spatial_crop
                 input_embeds[start_idx:end_idx] = self.prepare_inputs_embeds(
                     pixel_values, image_seq_mask, image_spatial_crop, input_embeds[start_idx:end_idx])
 

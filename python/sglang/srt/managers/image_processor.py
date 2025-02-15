@@ -577,7 +577,8 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
 
         return image_inputs
 
-    async def process_images_async(self, image_data, input_text, request_obj):
+    async def process_images_async(self, image_data, input_text, request_obj,*args,
+        **kwargs):
         if not image_data:
             return None
 
@@ -595,7 +596,7 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
         res = await self._process_single_image(images, input_text)
         pixel_values = res["images"]
         input_ids = res["input_ids"]
-        images_seq_mask = res["image_seq_mask"]
+        images_seq_mask = res["images_seq_mask"]
         images_spatial_crop = res["images_spatial_crop"]
         batched_images_spatial_crop = []
         batched_images_spatial_crop.append(images_spatial_crop)
@@ -608,7 +609,7 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
             "image_hashes": image_hashes,
             "image_sizes": image_sizes,
             "image_seq_mask": images_seq_mask,
-            "images_spatial_crop": batched_images_spatial_crop,
+            "image_spatial_crop": batched_images_spatial_crop,
             "modalities": request_obj.modalities or ["image"],
         }
 

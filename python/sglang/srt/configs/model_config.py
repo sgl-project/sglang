@@ -108,11 +108,11 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-        elif "DeepseekVL2ForCausalLM" in self.hf_text_config.architectures:
+        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
