@@ -54,7 +54,9 @@ class DecodeMetadata:
 
 @dataclass
 class PrefillMetadata:
-    prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
+    prefill_wrappers: List[
+        Union[BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper]
+    ]
     use_ragged: bool
     extend_no_prefix: bool
 
@@ -160,16 +162,36 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
-                self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend="fa2",
+                if (
+                    self.enable_flashinfer_mla
+                    and not global_server_args_dict["disable_radix_cache"]
+                ):
+                    # use mla paged prefill
+                    self.prefill_wrappers_paged.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            backend="fa2",
+                        )
                     )
-                )
-                self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-                )
+                    self.prefill_wrappers_verify.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            backend="fa2",
+                        )
+                    )
+                else:
+                    self.prefill_wrappers_paged.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend="fa2",
+                        )
+                    )
+                    self.prefill_wrappers_verify.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer, "NHD"
+                        )
+                    )
             if self.enable_flashinfer_mla:
                 self.decode_wrappers.append(
                     BatchMLAPagedAttentionWrapper(self.workspace_buffer, backend="fa2")
@@ -803,7 +825,9 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefill_wrappers: List[
+            Union[BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper]
+        ],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
@@ -817,7 +841,9 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefill_wrappers: List[
+            Union[BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper]
+        ],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
@@ -926,7 +952,9 @@ class FlashInferIndicesUpdaterPrefill:
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
-        wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
+        wrapper_paged: Union[
+            BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper
+        ],
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
