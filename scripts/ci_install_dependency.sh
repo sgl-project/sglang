@@ -3,8 +3,6 @@ set -euxo pipefail
 
 # Install the dependency in CI.
 
-# parallel is used to run the notebooks.
-sudo apt-get update && sudo apt-get install -y parallel
 
 # Use repo from environment variable, passed from GitHub Actions
 FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python}"
