@@ -263,7 +263,10 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend != "torch_native":
+            if (
+                model_runner.server_args.attention_backend != "torch_native"
+                and model_runner.server_args.speculative_algorithm != "NEXTN"
+            ):
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
