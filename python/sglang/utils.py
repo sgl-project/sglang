@@ -415,6 +415,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
