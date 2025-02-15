@@ -444,21 +444,43 @@ class FlashInferAttnBackend(AttentionBackend):
 
             logits_soft_cap = layer.logit_cap
 
-            o, _ = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
+            if global_server_args_dict["disable_radix_cache"]:
+                # use mla ragged prefill
+                o, _ = self.prefill_wrapper_ragged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
 
-            if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
+            else:
+                # use mla paged prefill
+                prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+                    self._get_wrapper_idx(layer)
+                ]
+                if k is not None:
+                    assert v is not None
+                    if save_kv_cache:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v
+                        )
+                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+                o = prefill_wrapper_paged.run(
+                    qall[:, :, : layer.v_head_dim],
+                    qall[:, :, layer.v_head_dim :],
+                    k_buf[:, :, : layer.v_head_dim],
+                    k_buf[:, :, layer.v_head_dim :],
                 )
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -1032,6 +1054,26 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
                 custom_mask=custom_mask,
                 non_blocking=True,
+            )
+        elif (
+            global_config.enable_flashinfer_mla
+            and not global_server_args_dict["disable_radix_cache"]
+        ):
+            # mla paged prefill
+            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+            wrapper_paged.plan(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_len_arr,
+                self.num_qo_heads,
+                512,
+                64,
+                1,
+                True,
+                1 / math.sqrt(192),
+                self.data_type,
+                self.data_type,
             )
 
 
