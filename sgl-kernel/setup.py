@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -168,10 +167,6 @@ setup(
     packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
-    cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=True, max_jobs=multiprocessing.cpu_count()
-        )
-    },
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
