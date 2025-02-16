@@ -318,6 +318,14 @@ def is_in_ci():
 LOCKFILE = os.path.expanduser("~/.sglang_port_lock")
 PORT_REGISTRY = os.path.expanduser("~/.sglang_port_registry.json")
 
+if not os.path.exists(LOCKFILE):
+    with open(LOCKFILE, "w") as f:
+        pass
+
+if not os.path.exists(PORT_REGISTRY):
+    with open(PORT_REGISTRY, "w") as f:
+        json.dump([], f)
+
 
 def print_highlight(html_content: str):
     if is_in_ci():
@@ -330,7 +338,7 @@ def print_highlight(html_content: str):
 def init_port_registry():
     """Initialize the port registry file if it doesn't exist."""
     if not os.path.exists(PORT_REGISTRY):
-        with open(PORT_REGISTRY, "a") as f:
+        with open(PORT_REGISTRY, "w") as f:
             json.dump([], f)
 
 
@@ -340,17 +348,17 @@ def reserve_port(start=30000, end=40000):
     Returns the allocated port.
     """
     init_port_registry()
-    with open(LOCKFILE, "a") as lock:
+    with open(LOCKFILE, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            with open(PORT_REGISTRY, "a") as f:
+            with open(PORT_REGISTRY, "r") as f:
                 used = json.load(f)
         except Exception:
             used = []
         for port in range(start, end):
             if port not in used:
                 used.append(port)
-                with open(PORT_REGISTRY, "a") as f:
+                with open(PORT_REGISTRY, "w") as f:
                     json.dump(used, f)
                 return port
     raise RuntimeError("No free port available")
@@ -358,16 +366,16 @@ def reserve_port(start=30000, end=40000):
 
 def release_port(port):
     """Release the reserved port by removing it from the registry."""
-    with open(LOCKFILE, "a") as lock:
+    with open(LOCKFILE, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            with open(PORT_REGISTRY, "a") as f:
+            with open(PORT_REGISTRY, "r") as f:
                 used = json.load(f)
         except Exception:
             used = []
         if port in used:
             used.remove(port)
-        with open(PORT_REGISTRY, "a") as f:
+        with open(PORT_REGISTRY, "w") as f:
             json.dump(used, f)
 
 
