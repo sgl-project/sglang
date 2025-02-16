@@ -17,25 +17,30 @@
 import dataclasses
 import logging
 from enum import auto
+
 from python.sglang.srt.openai_api.protocol import ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
 
+
 class FimPosition:
     """Postion of fim middle token."""
+
     MIDDLE = auto()
     END = auto()
+
 
 @dataclasses.dataclass
 class CompletionTemplate:
     """A class that manages completion prompt templates. only for code completion currently."""
+
     # The name of this template
     name: str
 
     # the fim begin token
     fim_begin_token: str
 
-    # The fim middle token 
+    # The fim middle token
     fim_middle_token: str
 
     # The fim end token
@@ -47,7 +52,6 @@ class CompletionTemplate:
 
 # A global registry for all completion templates
 completion_templates: dict[str, CompletionTemplate] = {}
-
 
 
 def register_completion_template(template: CompletionTemplate, override: bool = False):
@@ -62,6 +66,7 @@ def register_completion_template(template: CompletionTemplate, override: bool = 
 
 def completion_template_exists(template_name: str) -> bool:
     return template_name in completion_templates
+
 
 def generate_completion_prompt(
     request: ChatCompletionRequest, template_name: str
@@ -78,11 +83,9 @@ def generate_completion_prompt(
     if fim_position == FimPosition.MIDDLE:
         prompt = f"{fim_begin_token}{request.prompt}{fim_middle_token}{request.suffix}{fim_end_token}"
     elif fim_position == FimPosition.END:
-        prompt = f"{fim_begin_token}{request.prompt}{fim_end_token}{request.suffix}{fim_middle_token}" 
-    
+        prompt = f"{fim_begin_token}{request.prompt}{fim_end_token}{request.suffix}{fim_middle_token}"
+
     return prompt
-
-
 
 
 register_completion_template(
@@ -115,9 +118,3 @@ register_completion_template(
         fim_position=FimPosition.END,
     )
 )
-
-
-
-
-
-
