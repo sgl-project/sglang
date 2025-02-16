@@ -315,16 +315,8 @@ def is_in_ci():
     return is_in_ci()
 
 
-LOCKFILE = os.path.expanduser("~/.sglang_port_lock")
-PORT_REGISTRY = os.path.expanduser("~/.sglang_port_registry.json")
-
-if not os.path.exists(LOCKFILE):
-    with open(LOCKFILE, "w") as f:
-        pass
-
-if not os.path.exists(PORT_REGISTRY):
-    with open(PORT_REGISTRY, "w") as f:
-        json.dump([], f)
+LOCKFILE = "/dev/shm/sglang_port_lock"
+PORT_REGISTRY = "/dev/shm/sglang_port_registry.json"
 
 
 def print_highlight(html_content: str):
