@@ -89,7 +89,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 use_fp8_w8a8,
                 scale_a,
                 scale_b,
-                block_shape=self.quant_method.weight_block_size,
+                block_shape=self.quant_method.block_quant,
             )
         return c
 
