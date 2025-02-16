@@ -36,6 +36,9 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
           pip install -r docs/requirements.txt
+          apt-get update
+          apt-get install -y pandoc
+          apt-get update && apt-get install -y parallel
 
       - name: Setup Jupyter Kernel
         run: |
