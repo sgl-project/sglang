@@ -273,7 +273,11 @@ def grouped_gemm_triton_kernel(
     if group_k > 0 and group_n > 0:
         a_scale_ptrs = scale_a + (m_range_start + offs_am[:, None]) * as_stride_0
         offs_bsn = offs_bn // group_n
-        b_scale_ptrs = scale_b + (expert_id * bs_stride_0) + offs_bsn * bs_stride_1
+        b_scale_ptrs = (
+            scale_b
+            + (expert_id * bs_stride_0)
+            + (n_range_start + offs_bsn) * bs_stride_1
+        )
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):

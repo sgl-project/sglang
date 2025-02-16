@@ -89,7 +89,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 use_fp8_w8a8,
                 scale_a,
                 scale_b,
-                block_shape=self.quant_method.block_quant,
+                block_shape=self.quant_method.quant_config.weight_block_size,
             )
         return c
 
@@ -435,6 +435,9 @@ class EPMoE(torch.nn.Module):
 
 
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
+    def __init__(self):
+        self.block_quant = False
+
     def create_weights(
         self,
         layer: torch.nn.Module,
