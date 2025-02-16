@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "torch"]
+requires = ["setuptools>=61.0", "wheel", "torch<=2.5.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgl-kernel"
-version = "0.0.3.post6"
+version = "0.0.3.post7"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.9"

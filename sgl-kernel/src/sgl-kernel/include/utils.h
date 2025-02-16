@@ -49,6 +49,19 @@ struct cuda_error : public std::runtime_error {
     }                                                                   \
   } while (0)
 
+#define checkCudaErrors(val) check ( (val), #val, __FILE__, __LINE__ )
+template< typename T >
+void check(T result, char const *const func, const char *const file, int const line)
+{
+    if (result)
+    {
+        fprintf(stderr, "CUDA error at %s:%d code=%d(%s) \"%s\" \n", file, line, static_cast<unsigned int>(result), cudaGetErrorString(result), func);
+        cudaDeviceReset();
+        exit(EXIT_FAILURE);
+    }
+}
+
+
 #define CHECK_IS_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_IS_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_CUDA_INPUT(x) \
@@ -95,3 +108,4 @@ inline int getSMVersion() {
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
 #define CEILDIV(x, y) (((x) + (y)-1) / (y))
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
