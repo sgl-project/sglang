@@ -295,12 +295,10 @@ def grouped_gemm_triton_kernel(
         a_ptr += BLOCK_SIZE_K
         b_ptr += BLOCK_SIZE_K
 
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
         scale_a_value = tl.load(scale_a + expert_id)
         scale_b_value = tl.load(scale_b + expert_id)
         accumulator *= scale_a_value * scale_b_value
-    elif not (group_k > 0 and group_n > 0):
-        accumulator *= a_scale * b_scale
 
     c_tile = accumulator.to(c_dtype)
 
