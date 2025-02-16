@@ -60,7 +60,6 @@ void check(T result, char const* const func, const char* const file, int const l
   }
 }
 
-
 #define CHECK_IS_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_IS_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_CUDA_INPUT(x) \
