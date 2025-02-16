@@ -328,15 +328,20 @@ class ForwardBatch:
                     ] * 3
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
+                    image_grid_thw = getattr(image_inputs, "image_grid_thws", None)
+                    video_grid_thw = getattr(image_inputs, "video_grid_thws", None)
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
                                 extend_start_loc : extend_start_loc + extend_seq_len
-                            ],
-                            image_grid_thw=image_inputs.image_grid_thws,
+                            ].tolist(),
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            image_token_id=image_inputs.pad_values[0],
+                            video_token_id=hf_config.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
-                            context_len=0,
+                            context_len=0
                         )
                     )
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta
