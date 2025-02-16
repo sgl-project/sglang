@@ -53,6 +53,7 @@ class ServerArgs:
     device: str = "cuda"
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
+    completion_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
     skip_tokenizer_init: bool = False
@@ -425,6 +426,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.chat_template,
             help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        )
+        parser.add_argument(
+            "--completion-template",
+            type=str,
+            default=ServerArgs.completion_template,
+            help="The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
         )
         parser.add_argument(
             "--is-embedding",

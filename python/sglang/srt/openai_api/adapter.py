@@ -33,6 +33,7 @@ except ImportError:
     # outlines.integrations.utils
     from outlines.integrations.utils import convert_json_schema_to_str
 
+from python.sglang.srt.completion_template import CompletionTemplate, FimPosition, completion_template_exists, generate_completion_prompt, register_completion_template
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -77,6 +78,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 chat_template_name = None
+completion_template_name = None
 
 
 class FileMetadata:
@@ -162,6 +164,45 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
             chat_template_name = template["name"]
     else:
         chat_template_name = chat_template_arg
+
+def load_completion_template_for_openai_api(tokenizer_manager, completion_template_arg):
+    global completion_template_name
+
+    logger.info(
+        f"Use completion template for the OpenAI-compatible API server: {completion_template_arg}"
+    )
+
+    if not completion_template_exists(completion_template_arg):
+        if not os.path.exists(completion_template_arg):
+            raise RuntimeError(
+                f"Completion template {completion_template_arg} is not a built-in template name "
+                "or a valid completion template file path."
+            )
+        
+        assert completion_template_arg.endswith(
+            ".json"
+        ), "unrecognized format of completion template file"
+        with open(completion_template_arg, "r") as filep:
+            template = json.load(filep)
+            try:
+                fim_position = FimPosition[template["fim_position"]]
+            except KeyError:
+                raise ValueError(
+                    f"Unknown fim position: {template['fim_position']}"
+                ) from None
+            register_completion_template(
+                CompletionTemplate(
+                    name=template["name"],
+                    fim_begin_token=template["fim_begin_token"],
+                    fim_middle_token=template["fim_middle_token"],
+                    fim_end_token=template["fim_end_token"],
+                    fim_position=fim_position,
+                ),
+                override=True,
+            )
+        completion_template_name = template["name"]
+    else:
+        completion_template_name = completion_template_arg
 
 
 async def v1_files_create(file: UploadFile, purpose: str, file_storage_pth: str = None):
@@ -499,8 +540,16 @@ def v1_generate_request(
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use the native /generate API."
             )
+        
+        
 
-        prompts.append(request.prompt)
+
+        if (completion_template_name is None):
+            prompts.append(request.prompt)
+        else:
+            prompt = generate_completion_prompt(request, completion_template_name)            
+            prompts.append(prompt)
+        
         lora_paths.append(request.lora_path)
         if request.echo and request.logprobs:
             current_logprob_start_len = 0

@@ -49,7 +49,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api, load_completion_template_for_openai_api
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -426,6 +426,8 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
     tokenizer_manager = TokenizerManager(server_args, port_args)
     if server_args.chat_template:
         load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+    if server_args.completion_template:
+        load_completion_template_for_openai_api(tokenizer_manager, server_args.completion_template)
 
     # Wait for the model to finish loading
     scheduler_infos = []
