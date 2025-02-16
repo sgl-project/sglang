@@ -10,7 +10,7 @@ for `parse_latex` which we use for symbolic equality check.
 
 ## Benchmark sglang
 
-### Launch server
+1. Launch the Server
 
 ```bash
 python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000
@@ -22,7 +22,7 @@ Note that depending on the GPU this benchmark will take quiet some time. To empl
 python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 4
 ```
 
-### Benchmarking
+2. Benchmarking
 
 We use [suggested](https://github.com/deepseek-ai/DeepSeek-R1) parameters of `temperature=0.6`, `top_p=.95`, `max_new_tokens=32768`. The command line argument `num-tries` can be used to evaluate the model multiple times on the same question. We use the suggested `64` from the repo for AIME 2024. For LIMO, we use `8` as the number of tries due to the size of the dataset.
 
