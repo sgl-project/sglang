@@ -8,7 +8,6 @@ __all__ = [
     "ExaoneConfig",
     "Qwen2VLConfig",
     "Qwen2VLVisionConfig",
-    "DeepseekVL2Config",
     "ChatGLMConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
