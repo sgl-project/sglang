@@ -33,7 +33,13 @@ except ImportError:
     # outlines.integrations.utils
     from outlines.integrations.utils import convert_json_schema_to_str
 
-from python.sglang.srt.completion_template import CompletionTemplate, FimPosition, completion_template_exists, generate_completion_prompt, register_completion_template
+from python.sglang.srt.completion_template import (
+    CompletionTemplate,
+    FimPosition,
+    completion_template_exists,
+    generate_completion_prompt,
+    register_completion_template,
+)
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -165,6 +171,7 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
     else:
         chat_template_name = chat_template_arg
 
+
 def load_completion_template_for_openai_api(tokenizer_manager, completion_template_arg):
     global completion_template_name
 
@@ -178,7 +185,7 @@ def load_completion_template_for_openai_api(tokenizer_manager, completion_templa
                 f"Completion template {completion_template_arg} is not a built-in template name "
                 "or a valid completion template file path."
             )
-        
+
         assert completion_template_arg.endswith(
             ".json"
         ), "unrecognized format of completion template file"
@@ -540,16 +547,13 @@ def v1_generate_request(
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use the native /generate API."
             )
-        
-        
 
-
-        if (completion_template_name is None):
+        if completion_template_name is None:
             prompts.append(request.prompt)
         else:
-            prompt = generate_completion_prompt(request, completion_template_name)            
+            prompt = generate_completion_prompt(request, completion_template_name)
             prompts.append(prompt)
-        
+
         lora_paths.append(request.lora_path)
         if request.echo and request.logprobs:
             current_logprob_start_len = 0
