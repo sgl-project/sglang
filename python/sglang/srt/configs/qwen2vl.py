@@ -123,8 +123,8 @@ class Qwen2VLConfig(PretrainedConfig):
 
         # NOTE(HandH1998): This is necessary for configuring the `rope_type`` of qwen2vl models after removing dependencies on vllm.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
-            if self.rope_scaling["type"] == "mrope":
-                self.rope_scaling["type"] = "default"
+            # if self.rope_scaling["type"] == "mrope":
+            #     self.rope_scaling["type"] = "default"
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)

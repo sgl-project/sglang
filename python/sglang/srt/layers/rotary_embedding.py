@@ -874,7 +874,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         image_token_id: int,
         video_token_id: int,
         vision_start_token_id: int,
-        vision_end_token_id: int,
         spatial_merge_size: int,
         context_len: int = 0,
         seq_len: Optional[int] = None,
@@ -1056,7 +1055,7 @@ def get_rope(
                 high_freq_factor,
                 original_max_position,
             )
-        elif scaling_type == "default":
+        elif scaling_type == "default" or scaling_type == "mrope":
             if "mrope_section" in rope_scaling:
                 rotary_emb = MRotaryEmbedding(
                     head_size,

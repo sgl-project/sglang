@@ -118,6 +118,7 @@ class Engine:
         # The image input. It can be a file name, a url, or base64 encoded string.
         # See also python/sglang/srt/utils.py:load_image.
         image_data: Optional[Union[List[str], str]] = None,
+        modalities: Optional[Union[List[str], str]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -129,9 +130,6 @@ class Engine:
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        modalities_list = []
-        if image_data is not None:
-            modalities_list.append("image")
 
         obj = GenerateReqInput(
             text=prompt,
@@ -142,7 +140,7 @@ class Engine:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             lora_path=lora_path,
-            modalities=modalities_list,
+            modalities=modalities,
             custom_logit_processor=custom_logit_processor,
             stream=stream,
         )
