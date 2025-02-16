@@ -158,6 +158,13 @@ class ModelRunner:
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
+        # Init OpenMP threads binding
+        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        if omp_cpuids == "all":
+            self.local_omp_cpuid = "all"
+        else:
+            self.local_omp_cpuid = omp_cpuids.split("|")[tp_rank]
+
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
@@ -285,6 +292,10 @@ class ModelRunner:
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
         if not self.is_draft_worker:
+            # Bind OpenMP threads to CPU cores
+            if self.device == "cpu" and self.local_omp_cpuid != "all":
+                torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
+
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
