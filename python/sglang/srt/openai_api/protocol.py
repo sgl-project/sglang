@@ -227,14 +227,25 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+class ChatCompletionMessageContentAudioURL(BaseModel):
+    url: str
+
+
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentAudioPart(BaseModel):
+    type: Literal["audio_url"]
+    audio_url: ChatCompletionMessageContentAudioURL
+
+
 ChatCompletionMessageContentPart = Union[
-    ChatCompletionMessageContentTextPart, ChatCompletionMessageContentImagePart
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentAudioPart,
 ]
 
 
@@ -296,6 +307,7 @@ class ChatCompletionRequest(BaseModel):
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: float = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -324,6 +336,14 @@ class ChatCompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+
+    def get_max_output_tokens(self) -> int:
+        if self.max_completion_tokens:
+            return self.max_completion_tokens
+        elif self.max_tokens:
+            return self.max_tokens
+        else:
+            return None
 
 
 class FunctionResponse(BaseModel):

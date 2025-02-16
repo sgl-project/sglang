@@ -103,7 +103,6 @@ class VisionAttention(nn.Module):
         self.num_attention_heads_per_partition = dist_utils.divide(
             num_heads, world_size
         )
-
         if self.use_context_forward:
             self.qkv_backend = VisionTritonAttention()
         else:

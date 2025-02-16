@@ -65,7 +65,7 @@ def run_eval(args):
 
     sampler = ChatCompletionSampler(
         model=args.model,
-        max_tokens=2048,
+        max_completion_tokens=2048,
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
     )

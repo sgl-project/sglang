@@ -788,7 +788,6 @@ class ModelRunner:
             and self.cuda_graph_runner.can_run(forward_batch)
         ):
             return self.cuda_graph_runner.replay(forward_batch)
-
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():

@@ -404,6 +404,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
         or "MiniCPMV" in model_architectures
+        or "MiniCPMO" in model_architectures
     ):
         return True
     else:
