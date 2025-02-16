@@ -437,6 +437,7 @@ class EPMoE(torch.nn.Module):
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
     def __init__(self):
         super().__init__()
+        self.quant_config = None
         self.block_quant = False
 
     def create_weights(
