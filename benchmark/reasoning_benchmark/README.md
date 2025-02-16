@@ -1,6 +1,11 @@
 ## Run benchmark
 
 This benchmark is primarily intended to be used with reasoning models like `DeepSeek-R1-Distill-Qwen-1.5B`.
+Please use
+```bash
+pip install antlr4-python3-runtime
+```
+for `parse_latex` which we use for symbolic equality check.
 
 ### Benchmark sglang
 
@@ -35,4 +40,4 @@ python3 bench_sglang.py --parallel 256 --port 30000 --data-path Maxwell-Jia/AIME
 | Dataset    | Num Tries | Accuracy | Reference |
 |------------|-----------|----------|-----------|
 | LIMO       | 8         | 47.7%    | ?         |
-| AIME 2024  | 64        | 32.2%    | 28.9%     |
+| AIME 2024  | 64        | 33.2%    | 28.9%     |

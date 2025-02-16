@@ -1,8 +1,9 @@
 import argparse
 import json
-import re
 import time
 
+import answer_extraction
+import eval_utils
 from datasets import load_dataset
 
 import sglang as sgl
@@ -39,17 +40,6 @@ def convert_dataset(path: str, question_key: str, answer_key: str, num_tries: in
     return questions, answers
 
 
-def extract_boxed_text(text: str):
-    pattern = r"oxed{(.*?)}"
-    matches = re.findall(pattern, text)
-    if not matches:
-        return ""
-    for match in matches[::-1]:
-        if match != "":
-            return match
-    return ""
-
-
 def main(args):
     # Select backend
     sgl.set_default_backend(select_sglang_backend(args))
@@ -75,11 +65,15 @@ def main(args):
     correct = 0
     for i, state in enumerate(states):
         try:
-            correct += (
-                1
-                if extract_boxed_text(state["answer"]) == str(answers[i]["answer"])
-                else 0
+            pred_answer = answer_extraction.extract_math_answer(
+                questions[i]["question"], state["answer"], "limo"
             )
+            gt_answer = str(answers[i]["answer"])
+            # Use last answer if multiple were extracted
+            pred_answer = (
+                pred_answer[-1] if isinstance(pred_answer, list) else pred_answer
+            )
+            correct += 1 if eval_utils.math_equal(pred_answer, gt_answer) else 0
         except Exception as e:
             print(f"Error extracting answer: {e}")
             pass
