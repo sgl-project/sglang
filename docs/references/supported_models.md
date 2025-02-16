@@ -4,7 +4,7 @@
 - Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2
 - Mistral / Mixtral / Mistral NeMo / Mistral Small 3
 - Gemma / Gemma 2
-- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL
+- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL
 - DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
 - OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
@@ -54,7 +54,7 @@ To support a new model in SGLang, you only need to add a single file under [SGLa
 You can learn from existing model implementations and create new files for the new models.
 For most models, you should be able to find a similar model to start with (e.g., starting from Llama).
 
-## How to Support a New vision LLM
+## How to Support a New vLM
 
 To support a new vision-language model (vLM) in SGLang, there are several key components in addition to the standard LLM.
 

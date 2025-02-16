@@ -100,6 +100,7 @@ pygments_style = "sphinx"
 
 html_theme = "sphinx_book_theme"
 html_logo = "_static/image/logo.png"
+html_favicon = "_static/image/logo.ico"
 html_title = project
 html_copy_source = True
 html_last_updated_fmt = ""
