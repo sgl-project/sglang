@@ -273,7 +273,7 @@ def _fwd_kernel(
         + offs_dv[None, :]
     )
     tl.store(
-        O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
+        O_Extend + offs_o.T, (acc / deno[:, None]).T, mask=(mask_m[:, None] & mask_dv[None, :]).T
     )
 
 
@@ -319,8 +319,8 @@ def extend_attention_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     if is_hip_:
-        BLOCK_M, BLOCK_N = (64, 64)
-        num_warps = 4
+        BLOCK_M, BLOCK_N = (32, 32)
+        num_warps = 2
 
     else:
         if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
