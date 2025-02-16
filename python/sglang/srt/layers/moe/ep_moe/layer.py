@@ -78,6 +78,10 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         else:
             assert weight_column_major == True
+            if self.quant_method.quant_config == None:
+                block_size = None
+            else:
+                block_size = (self.quant_method.quant_config.weight_block_size,)
             c = grouped_gemm_triton(
                 a,
                 b,
@@ -89,7 +93,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 use_fp8_w8a8,
                 scale_a,
                 scale_b,
-                block_shape=self.quant_method.quant_config.weight_block_size,
+                block_shape=block_size,
             )
         return c
 
