@@ -236,7 +236,7 @@ def calculate_diff(batch_size, seq_len, num_experts):
 
 
 batch_size_range = [2**i for i in range(0, 8)]
-seq_length_range = [2**i for i in range(14, 16)]
+seq_length_range = [2**i for i in range(0, 16)]
 configs = list(itertools.product(batch_size_range, seq_length_range))
 
 
