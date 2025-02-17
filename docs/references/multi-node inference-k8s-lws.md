@@ -10,25 +10,23 @@ Here we take the deployment of deepseekR1 as an example.
 
 ## Prerequisites
 
-1. At least 2* H20 *8 GPU k8s node
-2. K8S cluster with LWS correctly installed, if not , please follow  [this doc](https://github.com/kubernetes-sigs/lws/blob/main/docs/setup/install.md)
+1. At least two Kubernetes nodes, each with 2 H20 systems and 8 GPUs, are required.
+
+2. Make sure your K8S cluster has LWS correctly installed. If it hasn't been set up yet, please follow the instructions in this [document](https://github.com/kubernetes-sigs/lws/blob/main/docs/setup/install.md)
 
 
 ## Basic Example
 
-Basic Example Doc has been introduced  here. please [visit this guide](https://github.com/kubernetes-sigs/lws/tree/main/docs/examples/sglang)
+The Basic Example documentation is introduced here: [visit this guide](https://github.com/kubernetes-sigs/lws/tree/main/docs/examples/sglang)
 
-However,that document only describes the basic NCCL socket mode.
+However, that document only covers the basic NCCL socket mode.
 
-Here , we make some simple modifications to adapt to the `RDMA` scenario
+In this section, we’ll make some simple modifications to adapt the setup to the RDMA scenario.
+
 
 ## RDMA ROCE case
 
-hardware:
-
-* 4* 200Gb cx7 X 2 nodes
-* 8*H20 per node
-
+* Check your env:
 
 ```bash
 [root@node1 ~]# ibstatus
@@ -69,7 +67,7 @@ Infiniband device 'mlx5_bond_3' port 1 status:
         link_layer:      Ethernet
 ```
 
-lws.yaml is
+* Prepare the `lws.yaml` file for deploying on k8s.
 
 ```yaml
 apiVersion: leaderworkerset.x-k8s.io/v1
@@ -94,21 +92,7 @@ spec:
             image: sglang:latest
             securityContext:
               privileged: true
-              capabilities:
-                add: [ "IPC_LOCK" ]
             env:
-             # - name: NCCL_DEBUG
-             #   value: TRACE
-             # - name: NCCL_SOCKET_IFNAME
-             #   value: eth0,bond
-             # - name: NCCL_IB_HCA
-             #   value: mlx5
-             # - name: NCCL_SOCKET_NTHREADS
-             #   value: "16"
-             # - name: NCCL_NSOCKS_PERTHREAD
-             #   value: "4"
-             # - name: NCCL_IB_DISABLE
-             #   value: "0"
               - name: NCCL_IB_GID_INDEX
                 value: "3"
               - name: LWS_WORKER_INDEX
@@ -121,14 +105,12 @@ spec:
               - sglang.launch_server
               - --model-path
               - /work/models
-             # - --enable-flashinfer-mla
-             # - --disable-radix-cache
               - --mem-fraction-static
               -  "0.93"
               - --torch-compile-max-bs
               - "8"
               - --max-running-requests
-              - "50"
+              - "20"
               - --tp
               - "16" # Size of Tensor Parallelism
               - --dist-init-addr
@@ -145,7 +127,6 @@ spec:
             resources:
               limits:
                 nvidia.com/gpu: "8"
-#                rdma/hca: "8"
             ports:
               - containerPort: 40000
             readinessProbe:
@@ -166,7 +147,7 @@ spec:
               medium: Memory
           - name: model
             hostPath:
-              path: /data1/maas_hosted_models/models/deepseek_v3_moe
+              path: '< your models dir >' # modify it according your models dir
           - name: ib
             hostPath:
               path: /dev/infiniband
@@ -180,23 +161,9 @@ spec:
             image: sglang:latest
             securityContext:
               privileged: true
-              capabilities:
-                add: [ "IPC_LOCK" ]
             env:
-            #- name: NCCL_SOCKET_NTHREADS
-            #  value: "16"
-            #- name: NCCL_NSOCKS_PERTHREAD
-            #  value: "4"
-            #- name: NCCL_IB_DISABLE
-            #  value: "0"
             - name: NCCL_IB_GID_INDEX
               value: "3"
-            # - name: NCCL_DEBUG
-            #  value: TRACE
-            #- name: NCCL_SOCKET_IFNAME
-            #  value: eth0,bond
-            #- name: NCCL_IB_HCA
-            #  value: mlx5
             - name: LWS_WORKER_INDEX
               valueFrom:
                 fieldRef:
@@ -212,7 +179,7 @@ spec:
               - --torch-compile-max-bs
               - "8"
               - --max-running-requests
-              - "50"
+              - "20"
               - --tp
               - "16" # Size of Tensor Parallelism
               - --dist-init-addr
@@ -225,7 +192,6 @@ spec:
             resources:
               limits:
                 nvidia.com/gpu: "8"
-#                rdma/hca: "8"
             volumeMounts:
               - mountPath: /dev/shm
                 name: dshm
@@ -259,7 +225,7 @@ spec:
 
 ```
 
-Then use  `kubectl apply -f lws.yaml` you will get this output.
+* Then use  `kubectl apply -f lws.yaml` you will get this output.
 
 ```text
 NAME           READY   STATUS    RESTARTS       AGE
@@ -267,11 +233,11 @@ sglang-0       0/1     Running   0              9s
 sglang-0-1     1/1     Running   0              9s
 ```
 
-Waiting  for sglang leader `sglang-0` 's status becoming `1/1` which means Ready...
+Wait for the sglang leader (`sglang-0`) status to change to 1/1, which indicates it is `Ready`.
 
-Now if successfully , you will get output  like this.
+Once successful, you should see output like this:
 
-using command `kubectl logs sglang-0` to view the leader node's log.
+You can use the command `kubectl logs -f sglang-0` to view the logs of the leader node.
 
 ```text
 
@@ -301,10 +267,11 @@ if not successfully startup, please follow this steps to check or see the remain
 
 * Set `NCCL_DEBUG=TRACE` to check if it is a nccl communication problem
 
+This should resolve most NCCL-related issues.
 
-This will solve most NCCL problems.
+***Noticed: If you find that NCCL_DEBUG=TRACE is not effective in the container environment, but the process is stuck or you encounter hard-to-diagnose issues, try switching to a different container image. Some images may not handle standard error output properly.***
 
-#### ROCE env
+#### ROCE scenario
 
 * Please make sure that RDMA devices are available in the cluster environment.
 * Please make sure that the nodes in the cluster have mellanox NICs with RoCE. In this example, we use mellanox ConnectX 5 model NICs, and the proper OFED driver has been installed, if not, please refer to the document Install OFED Driver to install the driver.
@@ -356,16 +323,17 @@ This will solve most NCCL problems.
 
 ## Keys to Success
 
-*  NCCL's env in the above yaml. for some low version nccl. you should check env `NCCL_IB_GID_INDEX`
-* `NCCL_SOCKET_IFNAME` is also important but in container env, it's not a problem
-* `NCCL_DEBUG` is the most important..... but i find some times it will not show the error log in container.. maybe  problems of the image. you can switch your docker images
-*  Don't use ubuntu 18.04'based docker images...
+* In the YAML configuration above, pay attention to the NCCL environment variable. For older versions of NCCL, you should check the NCCL_IB_GID_INDEX environment setting.
+* NCCL_SOCKET_IFNAME is also crucial, but in a containerized environment, this typically isn’t an issue.
+* In some cases, it’s necessary to configure GLOO_SOCKET_IFNAME correctly.
+* NCCL_DEBUG is essential for troubleshooting, but I've found that sometimes it doesn't show error logs within containers. This could be related to the Docker image you're using. You may want to try switching images if needed.
+* Avoid using Docker images based on Ubuntu 18.04, as they tend to have compatibility issues.
 
 ## Remaining issues
 
-* In K8s/Docker/Containerd Case, we just use `hostnetwork`  to avoid performance loss
-* We use the `privileged` mode... it's not safe and in container, we can't isolate the gpu
+* In Kubernetes, Docker, or Containerd environments, we use hostNetwork to prevent performance degradation.
+* We utilize privileged mode, which  isn’t secure. Additionally, in containerized environments, GPU isolation cannot be fully achieved.
 
 ## Todo
 
-* integrated with [k8s rdma share plugin](https://github.com/Mellanox/k8s-rdma-shared-dev-plugin).
+* Integrated with [k8s rdma share plugin](https://github.com/Mellanox/k8s-rdma-shared-dev-plugin).
