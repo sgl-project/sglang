@@ -74,7 +74,7 @@ class TestDeepseekV3(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mmlu(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -129,7 +129,7 @@ class TestDeepseekV3MTP(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mmlu(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
