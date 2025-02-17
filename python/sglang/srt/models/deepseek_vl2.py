@@ -219,7 +219,8 @@ class PatchEmbed(nn.Module):
     ):
         super().__init__()
         self.patch_size = to_2tuple(patch_size)
-        self.img_size, self.grid_size, self.num_patches = self._init_img_size(img_size)
+        self.img_size, self.grid_size, self.num_patches = self._init_img_size(
+            img_size)
 
         if output_fmt is not None:
             self.flatten = False
@@ -263,7 +264,8 @@ class PatchEmbed(nn.Module):
                     bias=self.proj.bias is not None,
                 )
                 new_proj.weight.copy_(
-                    resample_patch_embed(self.proj.weight, new_patch_size, verbose=True)
+                    resample_patch_embed(
+                        self.proj.weight, new_patch_size, verbose=True)
                 )
                 if self.proj.bias is not None:
                     new_proj.bias.copy_(self.proj.bias)
@@ -311,8 +313,10 @@ class PatchEmbed(nn.Module):
                     W % self.patch_size[1] == 0
                 ), f"Input width ({W}) should be divisible by patch size ({self.patch_size[1]})."
         if self.dynamic_img_pad:
-            pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
-            pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
+            pad_h = (self.patch_size[0] - H %
+                     self.patch_size[0]) % self.patch_size[0]
+            pad_w = (self.patch_size[1] - W %
+                     self.patch_size[1]) % self.patch_size[1]
             x = F.pad(x, (0, pad_w, 0, pad_h))
         x = self.proj(x)
         if self.flatten:
@@ -359,7 +363,8 @@ class Mlp(nn.Module):
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
         self.norm = (
-            norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
+            norm_layer(
+                hidden_features) if norm_layer is not None else nn.Identity()
         )
 
         if self.use_conv:
@@ -468,7 +473,8 @@ class DeepseekVL2Attention(nn.Module):
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = RowParallelLinear(dim, dim, quant_config=quant_config)
-        self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
+        self.proj_drop = nn.Dropout(
+            proj_drop) if proj_drop > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -526,9 +532,11 @@ class Block(nn.Module):
             quant_config=quant_config,
         )
         self.ls1 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+            LayerScale(
+                dim, init_values=init_values) if init_values else nn.Identity()
         )
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
@@ -539,9 +547,11 @@ class Block(nn.Module):
             quant_config=quant_config,
         )
         self.ls2 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+            LayerScale(
+                dim, init_values=init_values) if init_values else nn.Identity()
         )
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path2 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
@@ -600,12 +610,15 @@ class AttentionPoolLatent(nn.Module):
         )
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.proj = RowParallelLinear(embed_dim, embed_dim, quant_config=quant_config)
+        self.proj = RowParallelLinear(
+            embed_dim, embed_dim, quant_config=quant_config)
         self.proj_drop = nn.Dropout(drop)
         self.norm = (
-            norm_layer(out_features) if norm_layer is not None else nn.Identity()
+            norm_layer(
+                out_features) if norm_layer is not None else nn.Identity()
         )
-        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio), quant_config=quant_config)
+        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio),
+                       quant_config=quant_config)
 
         self.init_weights()
 
@@ -639,7 +652,8 @@ class AttentionPoolLatent(nn.Module):
 
         q, k = self.q_norm(q), self.k_norm(k)
 
-        x = F.scaled_dot_product_attention(q, k, v)  # Cannot use radix attn here
+        x = F.scaled_dot_product_attention(
+            q, k, v)  # Cannot use radix attn here
         x = x.transpose(1, 2).reshape(B, self.latent_len, C)
         x = self.proj(x)[0]
         x = self.proj_drop(x)
@@ -732,12 +746,14 @@ class DeepseekVL2VisionTransformer(nn.Module):
             nn.Parameter(torch.zeros(1, 1, embed_dim)) if class_token else None
         )
         self.reg_token = (
-            nn.Parameter(torch.zeros(1, reg_tokens, embed_dim)) if reg_tokens else None
+            nn.Parameter(torch.zeros(1, reg_tokens, embed_dim)
+                         ) if reg_tokens else None
         )
         embed_len = (
             num_patches if no_embed_class else num_patches + self.num_prefix_tokens
         )
-        self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * 0.02)
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, embed_len, embed_dim) * 0.02)
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
 
         self.patch_drop = nn.Identity()
@@ -786,7 +802,8 @@ class DeepseekVL2VisionTransformer(nn.Module):
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
         self.head_drop = nn.Dropout(drop_rate)
         self.head = (
-            ReplicatedLinear(self.embed_dim, num_classes, quant_config=quant_config)
+            ReplicatedLinear(self.embed_dim, num_classes,
+                             quant_config=quant_config)
             if num_classes > 0
             else nn.Identity()
         )
@@ -838,7 +855,7 @@ class DeepseekVL2VisionTransformer(nn.Module):
         if self.attn_pool is not None:
             x = self.attn_pool(x)
         elif self.global_pool == "avg":
-            x = x[:, self.num_prefix_tokens :].mean(dim=1)
+            x = x[:, self.num_prefix_tokens:].mean(dim=1)
         elif self.global_pool:
             x = x[:, 0]  # class token
         x = self.fc_norm(x)
@@ -872,36 +889,37 @@ class DeepseekVL2MlpProjector(nn.Module):
             modules = nn.Identity()
 
         elif config.projector_type == "linear":
-            modules = ReplicatedLinear(
-                config.input_dim,
-                config.n_embed,
-                quant_config=quant_config,
-            )
-
-        elif config.projector_type == "mlp_gelu":
-            mlp_depth = config.depth
-            modules = [
+            self.layers = nn.ModuleList([
                 ReplicatedLinear(
                     config.input_dim,
                     config.n_embed,
                     quant_config=quant_config,
                 )
-            ]
+            ])
+
+        elif config.projector_type == "mlp_gelu":
+            mlp_depth = config.depth
+            self.layers = nn.ModuleList([
+                ReplicatedLinear(
+                    config.input_dim,
+                    config.n_embed,
+                    quant_config=quant_config,
+                )
+            ])
             for _ in range(1, mlp_depth):
-                modules.append(nn.GELU())
-                modules.append(
+                self.layers.append(nn.GELU())
+                self.layers.append(
                     ReplicatedLinear(
                         config.n_embed,
                         config.n_embed,
                         quant_config=quant_config,
                     )
                 )
-            modules = nn.Sequential(*modules)
 
         elif config.projector_type == "downsample_mlp_gelu":
             mlp_depth = config.depth
             mlp_ratio = config.mlp_ratio
-            modules = [
+            self.layers = nn.ModuleList([
                 ReplicatedLinear(
                     config.input_dim
                     * config.downsample_ratio
@@ -909,35 +927,33 @@ class DeepseekVL2MlpProjector(nn.Module):
                     config.n_embed * mlp_ratio,
                     quant_config=quant_config,
                 )
-            ]
+            ])
             for _ in range(1, mlp_depth - 1):
-                modules.append(nn.GELU())
-                modules.append(
+                self.layers.append(nn.GELU())
+                self.layers.append(
                     ReplicatedLinear(
                         config.n_embed * mlp_ratio,
                         config.n_embed * mlp_ratio,
                         quant_config=quant_config,
                     )
                 )
-            modules.append(nn.GELU())
-            modules.append(
+            self.layers.append(nn.GELU())
+            self.layers.append(
                 ReplicatedLinear(
                     config.n_embed * mlp_ratio,
                     config.n_embed,
                     quant_config=quant_config,
                 )
             )
-            modules = nn.Sequential(*modules)
 
         else:
-            raise ValueError(f"Unknown projector type: {config.projector_type}")
+            raise ValueError(
+                f"Unknown projector type: {config.projector_type}")
 
         if config.token_pooling:
             self.token_pooling_layer = ReplicatedLinear(
                 config.input_dim * 4, config.input_dim, quant_config=quant_config
             )
-
-        self.layers = modules
 
     def forward(self, x):
         if self.config.token_pooling:
@@ -952,9 +968,10 @@ class DeepseekVL2MlpProjector(nn.Module):
                 batch_size, channels, h_patches * w_patches, -1
             )
             patches = patches.permute(0, 2, 1, 3).contiguous()
-            patches = patches.view(batch_size, h_patches * w_patches, channels * 4)
+            patches = patches.view(
+                batch_size, h_patches * w_patches, channels * 4)
 
-            x = self.token_pooling_layer(patches)
+            x = self.token_pooling_layer(patches)[0]
 
         elif self.config.projector_type == "downsample_mlp_gelu":
             bs, hw, input_dim = x.shape
@@ -979,7 +996,11 @@ class DeepseekVL2MlpProjector(nn.Module):
             )  # B, C*4, HW // 4
             x = x.permute(0, 2, 1)
 
-        return self.layers(x)
+        for layer in self.layers:
+            x = layer(x)
+            if isinstance(x, tuple):
+                x = x[0]
+        return x
 
 
 # todo
@@ -1014,7 +1035,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         # ----------- vl projector ------------
         projector_config = config.projector_config
-        self.projector = DeepseekVL2MlpProjector(projector_config, quant_config)
+        self.projector = DeepseekVL2MlpProjector(
+            projector_config, quant_config)
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
@@ -1093,7 +1115,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 self.language_model.load_weights([(name, loaded_weight)])
             else:
                 param = params_dict[name]
-                weights_loader = getattr(param, "weight_loader", default_weight_loader)
+                weights_loader = getattr(
+                    param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
@@ -1124,7 +1147,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
             # [num_height_tiles * num_width_tiles, hw, D]
             local_features = images_embeds[
-                tile_index + 1 : tile_index + 1 + num_tiles_in_image
+                tile_index + 1: tile_index + 1 + num_tiles_in_image
             ]
             tile_index += num_tiles_in_image + 1
 
@@ -1137,7 +1160,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
             new_lines_in_global = repeat(self.image_newline, "d -> h 1 d", h=h)
 
             # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
-            global_features = torch.cat([global_features, new_lines_in_global], dim=1)
+            global_features = torch.cat(
+                [global_features, new_lines_in_global], dim=1)
 
             # [h, w + 1, D] -> [h * (w + 1), D]
             global_features = global_features.view(-1, n_dim)
@@ -1163,7 +1187,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
             )
 
             # [num_height_tiles * h, num_width_tiles * w + 1, D]
-            local_features = torch.cat([local_features, new_lines_in_local], dim=1)
+            local_features = torch.cat(
+                [local_features, new_lines_in_local], dim=1)
 
             # [num_height_tiles * h, num_width_tiles * w + 1, D]
             #   --> [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
