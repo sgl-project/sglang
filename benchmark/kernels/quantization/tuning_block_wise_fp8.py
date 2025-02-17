@@ -14,6 +14,7 @@
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import time
 from datetime import datetime
@@ -22,6 +23,8 @@ from typing import Any, Dict, List
 import torch
 import triton
 from tqdm import tqdm
+
+mp.set_start_method("spawn", force=True)
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     _w8a8_block_fp8_matmul,
@@ -303,14 +306,23 @@ def save_configs(
         f.write("\n")
 
 
-def main(args):
-    print(args)
+def get_available_gpu_count():
+    """Get the number of available GPUs."""
+    return torch.cuda.device_count()
+
+
+def tune_on_gpu(args_dict):
+    """Run tuning on a specific GPU."""
+    gpu_id = args_dict["gpu_id"]
+    batch_sizes = args_dict["batch_sizes"]
+    weight_shapes = args_dict["weight_shapes"]
+    args = args_dict["args"]
+
+    torch.cuda.set_device(gpu_id)
+    print(f"Starting tuning on GPU {gpu_id} with batch sizes {batch_sizes}")
 
     block_n = args.block_n
     block_k = args.block_k
-
-    tp_size = args.tp_size
-    assert args.out_dtype in ["float32", "float16", "bfloat16", "half"]
     out_dtype = DTYPE_MAP[args.out_dtype]
     save_path = args.save_path
 
@@ -318,6 +330,42 @@ def main(args):
     search_space = [
         config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
     ]
+
+    start = time.time()
+    results = {}
+    for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
+        N, K = shape[0], shape[1]
+        print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")
+        benchmark_results = [
+            tune(batch_size, N, K, [block_n, block_k], out_dtype, search_space)
+            for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
+        ]
+        best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
+        save_configs(N, K, block_n, block_k, best_configs, save_path)
+
+    end = time.time()
+    print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
+
+
+def distribute_batch_sizes(batch_sizes, num_gpus):
+    """Distribute batch sizes across available GPUs."""
+    batches_per_gpu = []
+    for i in range(num_gpus):
+        start_idx = i * len(batch_sizes) // num_gpus
+        end_idx = (i + 1) * len(batch_sizes) // num_gpus
+        batches_per_gpu.append(batch_sizes[start_idx:end_idx])
+    return batches_per_gpu
+
+
+def main(args):
+    print(args)
+
+    num_gpus = get_available_gpu_count()
+    if num_gpus == 0:
+        raise RuntimeError("No GPU available for tuning")
+    print(f"Found {num_gpus} GPUs for parallel tuning")
+
+    torch.cuda.init()
 
     if args.batch_size is None:
         batch_sizes = [
@@ -342,23 +390,28 @@ def main(args):
         ]
     else:
         batch_sizes = [args.batch_size]
+        num_gpus = 1  # If only one batch size, use only one GPU
 
-    print(f"Start tuning over {len(search_space)} configurations...")
+    weight_shapes = get_weight_shapes(args.tp_size)
 
-    weight_shapes = get_weight_shapes(tp_size)
-    start = time.time()
-    for shape in tqdm(weight_shapes):
-        N, K = shape[0], shape[1]
-        print(f"Tune for weight shape of `N: {N}, K: {K}`")
-        benchmark_results = [
-            tune(batch_size, N, K, [block_n, block_k], out_dtype, search_space)
-            for batch_size in batch_sizes
-        ]
-        best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
-        save_configs(N, K, block_n, block_k, best_configs, save_path)
+    batches_per_gpu = distribute_batch_sizes(batch_sizes, num_gpus)
 
-    end = time.time()
-    print(f"Tuning took {end - start:.2f} seconds")
+    process_args = []
+    for gpu_id in range(num_gpus):
+        process_args.append(
+            {
+                "gpu_id": gpu_id,
+                "batch_sizes": batches_per_gpu[gpu_id],
+                "weight_shapes": weight_shapes,  # Each GPU processes all weight shapes
+                "args": args,
+            }
+        )
+
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(num_gpus) as pool:
+        pool.map(tune_on_gpu, process_args)
+
+    print("Multi-GPU tuning completed")
 
 
 if __name__ == "__main__":

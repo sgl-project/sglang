@@ -1447,3 +1447,10 @@ def launch_dummy_health_check_server(host, port):
         timeout_keep_alive=5,
         loop="uvloop",
     )
+
+
+def set_cuda_arch():
+    if is_flashinfer_available():
+        capability = torch.cuda.get_device_capability()
+        arch = f"{capability[0]}.{capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
