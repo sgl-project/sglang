@@ -35,7 +35,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: List[int],
         extend_seq_lens: torch.Tensor,
@@ -81,7 +80,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             prefix_seq_len = extend_prefix_lens_cpu[seq_idx]
             is_prefill = prefix_seq_len == 0
 
-            seq_len = seq_lens_cpu[seq_idx]
+            seq_len = seq_lens[seq_idx].item()
             end_extend = start_extend + extend_seq_len
 
             per_req_extend_query = query[:, start_extend:end_extend, :]
@@ -166,7 +165,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -198,15 +196,14 @@ class TorchNativeAttnBackend(AttentionBackend):
             # Need optimize the performance later.
 
             seq_len_q = 1
-            seq_len_kv = seq_lens_cpu[seq_idx]  # get a scalar
-            end_q = start_q + seq_len_q  # pure python scalar add
-            end_kv = start_kv + seq_len_kv  # tensor add
+            seq_len_kv = seq_lens[seq_idx].item()
+            end_q = start_q + seq_len_q
+            end_kv = start_kv + seq_len_kv
 
-            per_req_query = query[:, start_q:end_q, :]  # slice
+            per_req_query = query[:, start_q:end_q, :]
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
-            # select, get a scalar tensor
             req_pool_idx = req_pool_indices[seq_idx]
             curr_req_to_tokens = torch.index_select(
                 req_to_token, 0, req_pool_idx
@@ -272,7 +269,6 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
-            forward_batch.seq_lens_cpu,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_prefix_lens_cpu,
             forward_batch.extend_seq_lens,
@@ -319,7 +315,6 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
-            forward_batch.seq_lens_cpu,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=False,
