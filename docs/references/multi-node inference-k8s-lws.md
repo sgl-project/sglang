@@ -1,12 +1,12 @@
-# Deploy multi-node inference (LWS method) using sglang in a K8s cluster
+# Deploying a RoCE Network-Based SGLANG Two-Node Inference Service on a Kubernetes (K8S) Cluster
 
 LeaderWorkerSet (LWS) is a Kubernetes API that aims to address common deployment patterns of AI/ML inference workloads. A major use case is for multi-host/multi-node distributed inference.
 
-Sglang can also  be deployed with LWS on Kubernetes for distributed model serving.
+Sglang can also be deployed with LWS on Kubernetes for distributed model serving.
 
 Please see this guide for more details on deploying SGLang on Kubernetes using LWS.
 
-Here we take the deployment of deepseekR1 as an example
+Here we take the deployment of deepseekR1 as an example.
 
 ## Prerequisites
 
@@ -364,7 +364,7 @@ This will solve most NCCL problems.
 ## Remaining issues
 
 * In K8s/Docker/Containerd Case, we just use `hostnetwork`  to avoid performance loss
-* We use thi `privileged` mode... it's not safe and in container, we can't isolate the gpu
+* We use the `privileged` mode... it's not safe and in container, we can't isolate the gpu
 
 ## Todo
 
