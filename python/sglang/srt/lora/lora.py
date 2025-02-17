@@ -169,13 +169,9 @@ class LoRAAdapter(nn.Module):
                         f"or consider implementing custom initialization logic for other backends."
                     )
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = torch.cat(
-                        (weights[weight_name], weights[up_name]), 0
-                    )
+                    weights[gate_up_name] = torch.cat((weights[weight_name], weights[up_name]), 0)
                 else:
-                    weights[gate_up_name] = torch.stack(
-                        [weights[weight_name], weights[up_name]], dim=0
-                    )
+                    weights[gate_up_name] = torch.stack([weights[weight_name], weights[up_name]], dim=0)
                 weights.pop(weight_name)
                 if up_name in weights:
                     weights.pop(up_name)
