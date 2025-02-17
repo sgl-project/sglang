@@ -7,12 +7,12 @@
 
 using FP8_TYPE = c10::Float8_e4m3fn;
 
-__device__ __forceinline__ float GroupReduce(volatile float* smem, const int tid) {
-  smem[tid] = fmaxf(smem[tid], smem[tid + 8]);
-  if (tid < 4) smem[tid] = fmaxf(smem[tid], smem[tid + 4]);
-  if (tid < 2) smem[tid] = fmaxf(smem[tid], smem[tid + 2]);
-  if (tid < 1) smem[tid] = fmaxf(smem[tid], smem[tid + 1]);
-  return smem[0];
+__device__ __forceinline__ float GroupReduce(float val, const int tid) {
+  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 1));
+  return val;
 }
 
 template <typename T>
@@ -26,7 +26,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
   const int local_group_id = tid / 16;  // Each 16 threads handle one group
   const int local_tid = tid % 16;       // Thread ID within the group
 
-  __shared__ float s_absmax[16][17];  // Use 17 instead of 16 to avoid bank conflicts
+  __shared__ float s_absmax[16];  // Only need one value per group to store the final result
 
   // Local maximum value for each thread
   float local_absmax = eps;
@@ -45,18 +45,17 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
       local_absmax = fmaxf(local_absmax, abs_val);
     }
 
-    // Store in shared memory
-    s_absmax[local_group_id][local_tid] = local_absmax;
-    __syncthreads();
+    // Perform reduction using warp shuffle
+    local_absmax = GroupReduce(local_absmax, local_tid);
 
-    // Perform reduction within each group
-    if (local_tid < 8) {
-      GroupReduce(&s_absmax[local_group_id][0], local_tid);
+    // Only the first thread needs to write to shared memory
+    if (local_tid == 0) {
+      s_absmax[local_group_id] = local_absmax;
     }
     __syncthreads();
 
     // Get the maximum value for this group
-    const float group_absmax = s_absmax[local_group_id][0];
+    const float group_absmax = s_absmax[local_group_id];
     const float y_s = group_absmax / fp8_max;
 
     // Only the first thread in each group writes the scale
