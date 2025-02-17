@@ -308,13 +308,31 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
 import fcntl
 
-LOCKFILE = "/tmp/port_lock"
-PORT_REGISTRY = "/tmp/port_registry.json"
+
+def is_in_ci():
+    from sglang.test.test_utils import is_in_ci
+
+    return is_in_ci()
+
+
+LOCKFILE = os.path.expanduser("~/.sglang_port_lock")
+PORT_REGISTRY = os.path.expanduser("~/.sglang_port_registry.json")
+
+if not os.path.exists(LOCKFILE):
+    with open(LOCKFILE, "w") as f:
+        pass
+
+if not os.path.exists(PORT_REGISTRY):
+    with open(PORT_REGISTRY, "w") as f:
+        json.dump([], f)
 
 
 def print_highlight(html_content: str):
-    html_content = str(html_content).replace("\n", "<br>")
-    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
+    if is_in_ci():
+        html_content = str(html_content).replace("\n", "<br>")
+        display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
+    else:
+        print(html_content)
 
 
 def init_port_registry():
