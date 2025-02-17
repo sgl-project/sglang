@@ -107,6 +107,8 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         timeout-minutes: 30
         run: |
           RANGE=${{ matrix.range }}

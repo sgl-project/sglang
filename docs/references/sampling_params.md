@@ -49,7 +49,7 @@ Please refer to our dedicated guide on [constrained decoding](https://docs.sglan
 
 ### Other options
 
-* `n`: ?
+* `n`: Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; separate requests offer better control and efficiency.)
 * `spaces_between_special_tokens`: Whether or not to add spaces between special tokens during detokenization.
 * `no_stop_trim`: Don't trim stop words or EOS token from the generated text.
 * `ignore_eos`: Don't stop generation when EOS token is sampled.
