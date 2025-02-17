@@ -40,7 +40,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     DeepseekVL2Config.model_type: DeepseekVL2Config,
 }
 
-
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)

@@ -16,13 +16,12 @@ The core features include:
    :caption: Getting Started
 
    start/install.md
-   start/send_request.ipynb
-
 
 .. toctree::
    :maxdepth: 1
    :caption: Backend Tutorial
 
+   backend/send_request.ipynb
    backend/openai_api_completions.ipynb
    backend/openai_api_vision.ipynb
    backend/openai_api_embeddings.ipynb
@@ -32,7 +31,6 @@ The core features include:
    backend/speculative_decoding.ipynb
    backend/function_calling.ipynb
    backend/server_arguments.md
-
 
 .. toctree::
    :maxdepth: 1
