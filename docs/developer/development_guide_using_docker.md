@@ -25,14 +25,14 @@ The following startup command is an example for internal development by the SGLa
 
 ```bash
 # Change the name to yours
-docker run -itd --shm-size 32g --gpus all -v /opt/dlami/nvme/.cache:/root/.cache --ipc=host --network --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
+docker run -itd --shm-size 32g --gpus all -v /opt/dlami/nvme/.cache:/root/.cache --ipc=host --network=host --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
 docker exec -it sglang_zhyncs /bin/zsh
 ```
 
 ### H200
 
 ```bash
-docker run -itd --shm-size 32g --gpus all -v /mnt/co-research/shared-models:/root/.cache/huggingface --ipc=host --network --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
+docker run -itd --shm-size 32g --gpus all -v /mnt/co-research/shared-models:/root/.cache/huggingface --ipc=host --network=host --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
 docker exec -it sglang_zhyncs /bin/zsh
 ```
 

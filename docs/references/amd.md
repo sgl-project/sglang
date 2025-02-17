@@ -63,7 +63,7 @@ docker build -t sglang_image -f Dockerfile.rocm .
 2. Create a convenient alias.
 
 ```bash
-alias drun='docker run -it --rm --network host --privileged --device=/dev/kfd --device=/dev/dri \
+alias drun='docker run -it --rm --network=host --privileged --device=/dev/kfd --device=/dev/dri \
     --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE \
     --security-opt seccomp=unconfined \
     -v $HOME/dockerx:/dockerx \
