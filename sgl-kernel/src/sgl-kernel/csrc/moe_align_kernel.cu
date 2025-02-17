@@ -32,7 +32,12 @@ limitations under the License.
 #define FRAG_SIZE_M 16
 #define FRAG_SIZE_N 16
 
+#ifndef USE_ROCM
 #define kWarpsToLoad 2
+#else
+#define kWarpsToLoad 1
+#endif
+
 #define kElementsPerAccess 4
 #define kElementsPerThr 16
 
