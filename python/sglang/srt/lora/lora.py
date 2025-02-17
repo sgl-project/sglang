@@ -18,6 +18,7 @@
 # LoRA layers class inheritance adapted from:
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
+import logging 
 import re
 from typing import Dict, List
 
@@ -30,6 +31,7 @@ from sglang.srt.lora.backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
+logger = logging.getLogger(__name__)
 
 class LoRALayer(nn.Module):
     def __init__(self, config: LoRAConfig, base_hf_config: AutoConfig):
@@ -173,13 +175,22 @@ class LoRAAdapter(nn.Module):
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
+                if up_name not in weights:
+                    logger.warning(
+                        f"Gate projection {weight_name} does not have a corresponding up projection {up_name}. "
+                        f"Initializing up projection to zero."
+                    )
+                    weights[up_name] = torch.zeros_like(weights[weight_name])
+                    # FIXME: Add gate-only support for flashinfer in future implementations
+                    assert self.lora_backend.name == "triton", (
+                            f"LoRA weight initialization currently only supported for 'triton' backend. "
+                            f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
+                            f"or consider implementing custom initialization logic for other backends."
+                        )
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = torch.cat(
-                        (weights[weight_name], weights[up_name]), 0
-                    )
+                    weights[gate_up_name] = torch.cat((weights[weight_name], weights[up_name]), 0)
                 else:
-                    weights[gate_up_name] = torch.stack(
-                        [weights[weight_name], weights[up_name]], dim=0
-                    )
+                    weights[gate_up_name] = torch.stack([weights[weight_name], weights[up_name]], dim=0)
                 weights.pop(weight_name)
-                weights.pop(up_name)
+                if up_name in weights:
+                    weights.pop(up_name)
