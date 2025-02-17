@@ -20,8 +20,6 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 ARG ATER_REPO="https://github.com/HaiShaw/ater"
 ARG CK_COMMITS="fa05ae"
 
-RUN apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
-
 RUN git clone ${SGL_REPO} \
     && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
