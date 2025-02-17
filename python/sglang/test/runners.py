@@ -275,6 +275,7 @@ class SRTRunner:
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
+        mem_fraction_static: float = 0.88,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -283,7 +284,7 @@ class SRTRunner:
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
             port=port,
-            mem_fraction_static=0.65,
+            mem_fraction_static=mem_fraction_static,
             trust_remote_code=False,
             is_embedding=not self.is_generation,
             lora_paths=lora_paths,
