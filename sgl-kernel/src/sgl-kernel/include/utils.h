@@ -107,3 +107,13 @@ inline int getSMVersion() {
 
 #define CEILDIV(x, y) (((x) + (y)-1) / (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
+
+#if defined(__HIP_PLATFORM_AMD__)
+
+#define WARP_SIZE warpSize  // 64
+
+#define cudaLaunchCooperativeKernel(kernel, num_blocks, block_threads, kernelArgs)      \
+  hipLaunchCooperativeKernel((void*)(kernel), num_blocks, block_threads, kernelArgs, 0, \
+                             at::cuda::getCurrentCUDAStream())
+
+#endif

@@ -99,7 +99,7 @@ def moe_align_block_size(
     cumsum_buffer,
 ):
     if hasattr(torch.ops.sgl_kernels, "moe_align_block_size"):
-        _impl = torch.ops.sgl_kernels.sgl_kernels.moe_align_block_size
+        _impl = torch.ops.sgl_kernels.moe_align_block_size
     else:
         _impl = sgl_kernel.ops._kernels.moe_align_block_size
     _impl(
