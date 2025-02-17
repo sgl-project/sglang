@@ -66,6 +66,7 @@ global_server_args_dict = {
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "device": ServerArgs.device,
     "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
+    "disable_radix_cache": ServerArgs.disable_radix_cache,
 }
 
 logger = logging.getLogger(__name__)
