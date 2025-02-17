@@ -42,7 +42,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     }
 
     local_absmax = GroupReduce(local_absmax, local_tid);
-  
+
     if (local_tid == 0) {
       s_absmax[local_group_id] = local_absmax;
     }
