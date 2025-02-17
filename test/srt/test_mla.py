@@ -58,7 +58,7 @@ class TestMLA(unittest.TestCase):
 class TestDeepseekV3(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmzheng/sglang-ci-dsv3-test"
+        cls.model = "sgl-project/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -93,13 +93,12 @@ class TestDeepseekV3(unittest.TestCase):
 class TestDeepseekV3MTP(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmzheng/sglang-ci-dsv3-test"
+        cls.model = "sgl-project/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--enable-torch-compile",
                     "--cuda-graph-max-bs",
                     "2",
                     "--disable-radix",
@@ -109,7 +108,7 @@ class TestDeepseekV3MTP(unittest.TestCase):
                     "--speculative-algorithm",
                     "NEXTN",
                     "--speculative-draft",
-                    "SGLang/sglang-ci-dsv3-test-NextN",
+                    "sgl-project/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
                     "2",
                     "--speculative-eagle-topk",
