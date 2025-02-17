@@ -91,7 +91,21 @@ drun v0.4.3.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --in
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
-## Method 5: Run on Kubernetes or Clouds with SkyPilot
+## Method 5: Using Kubernetes
+
+<details>
+<summary>More</summary>
+
+1. Option 1: For single node serving (typically when the model size fits into GPUs on one node)
+   Execute command `kubectl apply -f docker/k8s-sglang-service.yaml`, to create k8s deployment and service, with llama-31-8b as example.
+
+2. Option 2: For multi-node serving (usually when a large model requires more than one GPU node, such as `DeepSeek-R1`)
+   Modify the LLM model path and arguments as necessary, then execute command `kubectl apply -f docker/k8s-sglang-distributed-sts.yaml`, to create two nodes k8s statefulset and serving service.
+</details>
+
+
+
+## Method 6: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
 <summary>More</summary>
