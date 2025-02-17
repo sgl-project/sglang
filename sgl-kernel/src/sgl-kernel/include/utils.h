@@ -110,10 +110,14 @@ inline int getSMVersion() {
 
 #if defined(__HIP_PLATFORM_AMD__)
 
+#include <hip/hip_cooperative_groups.h>
+#include <hip/hip_runtime.h>
+
 #define WARP_SIZE warpSize  // 64
 
-#define cudaLaunchCooperativeKernel(kernel, num_blocks, block_threads, kernelArgs)      \
-  hipLaunchCooperativeKernel((void*)(kernel), num_blocks, block_threads, kernelArgs, 0, \
-                             at::cuda::getCurrentCUDAStream())
+static __inline__ __host__ __device__ hipError_t cudaLaunchCooperativeKernel(const void* f, dim3 gridDim,
+                                                                             dim3 blockDimX, void** kernelParams) {
+  return hipLaunchCooperativeKernel(f, gridDim, blockDimX, kernelParams, 0, hipStreamDefault);
+}
 
 #endif

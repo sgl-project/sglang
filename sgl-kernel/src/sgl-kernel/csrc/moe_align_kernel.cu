@@ -297,8 +297,6 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
 
     const int num_blocks = MIN(CEILDIV(topk_ids.sizes()[0], block_threads), num_experts);
 
-    // printf("[kernel] %d blocks used\n", num_blocks);
-
     scalar_t* topk_ids_ptr = topk_ids.data_ptr<scalar_t>();
     int32_t* sorted_token_ids_ptr = sorted_token_ids.data_ptr<int32_t>();
     int32_t* experts_ids_ptr = experts_ids.data_ptr<int32_t>();
