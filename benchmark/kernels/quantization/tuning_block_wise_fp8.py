@@ -24,7 +24,6 @@ import torch
 import triton
 from tqdm import tqdm
 
-# Set multiprocessing start method to 'spawn'
 mp.set_start_method("spawn", force=True)
 
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -366,10 +365,8 @@ def main(args):
         raise RuntimeError("No GPU available for tuning")
     print(f"Found {num_gpus} GPUs for parallel tuning")
 
-    # Ensure CUDA is initialized in the main process
     torch.cuda.init()
 
-    # Get all batch sizes
     if args.batch_size is None:
         batch_sizes = [
             1,
@@ -395,13 +392,10 @@ def main(args):
         batch_sizes = [args.batch_size]
         num_gpus = 1  # If only one batch size, use only one GPU
 
-    # Get all weight shapes
     weight_shapes = get_weight_shapes(args.tp_size)
 
-    # Distribute batch sizes across GPUs
     batches_per_gpu = distribute_batch_sizes(batch_sizes, num_gpus)
 
-    # Prepare arguments for each GPU process
     process_args = []
     for gpu_id in range(num_gpus):
         process_args.append(
@@ -413,7 +407,6 @@ def main(args):
             }
         )
 
-    # Run tuning in parallel across GPUs using spawn method
     ctx = mp.get_context("spawn")
     with ctx.Pool(num_gpus) as pool:
         pool.map(tune_on_gpu, process_args)
