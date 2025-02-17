@@ -45,7 +45,31 @@ cd ..
 pip install -e "python[all_hip]"
 ```
 
-## Method 3: Using docker
+## Method 3: Using uv
+
+In the folder where you want to use your virtual environment create a `pyproject.toml` file with the following content:
+
+```toml
+[project]
+name = "my-sgl-project"
+version = "0.1.0"
+description = "my-awesome-sgl-project"
+requires-python = ">=3.10"
+dependencies = [
+    "flashinfer-python>=0.2.1.post1",
+    "setuptools>=75.8.0",
+    "sgl-kernel>=0.0.3.post6",
+    "sglang[all]>=0.4.3.post1",
+    "transformers==4.48",
+]
+[[tool.uv.index]]
+name = "flashinfer-python"
+url = "https://flashinfer.ai/whl/cu124/torch2.5/"
+```
+
+Then run `uv sync` to install the dependencies and create the virtual environment.
+
+## Method 4: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
@@ -79,7 +103,7 @@ drun -p 30000:30000 \
 drun v0.4.3.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
-## Method 4: Using docker compose
+## Method 5: Using docker compose
 
 <details>
 <summary>More</summary>
@@ -91,7 +115,7 @@ drun v0.4.3.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --in
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
-## Method 5: Run on Kubernetes or Clouds with SkyPilot
+## Method 6: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
 <summary>More</summary>
