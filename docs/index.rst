@@ -31,6 +31,8 @@ The core features include:
    backend/speculative_decoding.ipynb
    backend/function_calling.ipynb
    backend/server_arguments.md
+   backend/sampling_params.md
+   backend/quantization.md
 
 .. toctree::
    :maxdepth: 1
@@ -52,7 +54,6 @@ The core features include:
    :caption: References
 
    references/supported_models.md
-   references/sampling_params.md
    references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
    references/accuracy_evaluation.md
@@ -61,7 +62,6 @@ The core features include:
    references/deepseek.md
    references/multi_node.md
    references/modelscope.md
-   references/quantization.md
    references/contribution_guide.md
    references/troubleshooting.md
    references/nvidia_jetson.md
