@@ -189,9 +189,13 @@ class HFRunner:
                             return_dict_in_generate=True,
                             output_scores=(not self.output_str_only),
                         )
-                        output_strs.append(
-                            self.tokenizer.decode(outputs[0][0][len(input_ids[0]) :])
-                        )
+
+                        text = self.tokenizer.decode(outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True)
+                        # Check if the text is empty or only whitespace.
+                        if not text.strip():
+                            raise ValueError("Received an empty text response. Please verify your input or model configuration.")
+                        output_strs.append(text)
+
                         if not self.output_str_only:
                             # outputs.scores: (num_token, 1, vocab_size)
                             top_output_logprobs.append(
@@ -316,7 +320,13 @@ class SRTRunner:
                     logprob_start_len=0,
                     top_logprobs_num=NUM_TOP_LOGPROBS,
                 )
-                output_strs.append(response["text"])
+                text = response["text"]
+                
+                # Check if the text is empty or only whitespace.
+                if not text.strip():
+                    raise ValueError("Received an empty text response. Please verify your input or model configuration.")
+                output_strs.append(text)
+
                 top_input_logprobs.append(
                     [
                         [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
