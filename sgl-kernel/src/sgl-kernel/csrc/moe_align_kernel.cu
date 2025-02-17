@@ -127,7 +127,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_pt
 
       if (warp_id * fragments_per_warp < kWarpsToLoad * fragments_per_block) {
         if (warp_id % kWarpsToLoad == 0) {
-          for (int k = 0; k < FRAG_SIZE_N; k += 2) {
+          for (int k = 0; k < FRAG_SIZE_N; k += (WARP_SIZE / FRAG_SIZE_N)) {
             int sRow = lane_id / FRAG_SIZE_N + k;
             int sThrColOff = lane_id % FRAG_SIZE_N;
             int sCol = sThrColOff + (warp_id / kWarpsToLoad) * FRAG_SIZE_N;

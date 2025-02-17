@@ -108,12 +108,16 @@ inline int getSMVersion() {
 #define CEILDIV(x, y) (((x) + (y)-1) / (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
+#ifndef USE_ROCM
+#define WARP_SIZE 32
+#else
+#define WARP_SIZE warpSize  // 64
+#endif
+
 #if defined(__HIP_PLATFORM_AMD__)
 
 #include <hip/hip_cooperative_groups.h>
 #include <hip/hip_runtime.h>
-
-#define WARP_SIZE warpSize  // 64
 
 static __inline__ __host__ __device__ hipError_t cudaLaunchCooperativeKernel(const void* f, dim3 gridDim,
                                                                              dim3 blockDimX, void** kernelParams) {
