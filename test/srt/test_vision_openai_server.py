@@ -463,6 +463,7 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+
 class TestDeepseekVL2Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -480,6 +481,7 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
-        
+
+
 if __name__ == "__main__":
     unittest.main()
