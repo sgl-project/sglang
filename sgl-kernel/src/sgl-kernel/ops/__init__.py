@@ -600,8 +600,6 @@ def sgl_per_token_group_quant_fp8(
     fp8_min: float,
     fp8_max: float,
 ) -> None:
-    if hasattr(torch.ops.sgl_kernels, "sgl_per_token_group_quant_fp8"):
-        _impl = torch.ops.sgl_kernels.sgl_per_token_group_quant_fp8
-    else:
-        _impl = sgl_kernel.ops._kernels.sgl_per_token_group_quant_fp8
-    _impl(input, output_q, output_s, group_size, eps, fp8_min, fp8_max)
+    torch.ops.sgl_kernels.sgl_per_token_group_quant_fp8(
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max
+    )
