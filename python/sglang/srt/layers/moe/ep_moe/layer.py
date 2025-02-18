@@ -33,10 +33,11 @@ logger = logging.getLogger(__name__)
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
 
-    def __init__(self, device, is_block_quant, use_flashinfer: bool = False):
+    def __init__(self, device, quant_method, use_flashinfer: bool = False):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
+        self.quant_method = quant_method
         if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
 
@@ -77,6 +78,10 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         else:
             assert weight_column_major == True
+            if self.quant_method.quant_config == None:
+                block_size = None
+            else:
+                block_size = (self.quant_method.quant_config.weight_block_size,)
             c = grouped_gemm_triton(
                 a,
                 b,
@@ -88,7 +93,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 use_fp8_w8a8,
                 scale_a,
                 scale_b,
-                block_shape=[128, 128],
+                block_shape=block_size,
             )
         return c
 
@@ -176,7 +181,7 @@ class EPMoE(torch.nn.Module):
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
-                self.quant_method.block_quant,
+                self.quant_method,
                 use_flashinfer=False,  # TODO: use flashinfer
             )
 
@@ -437,6 +442,11 @@ class EPMoE(torch.nn.Module):
 
 
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
+    def __init__(self):
+        super().__init__()
+        self.quant_config = None
+        self.block_quant = False
+
     def create_weights(
         self,
         layer: torch.nn.Module,

@@ -273,7 +273,7 @@ def grouped_gemm_triton_kernel(
     if group_k > 0 and group_n > 0:
         a_scale_ptrs = scale_a + (m_range_start + offs_am[:, None]) * as_stride_0
         offs_bsn = (n_range_start + offs_bn) // group_n
-        b_scale_ptrs = scale_b + (expert_id * bs_stride_0) + (n_range_start + offs_bsn) * bs_stride_1
+        b_scale_ptrs = scale_b + (expert_id * bs_stride_0) + offs_bsn * bs_stride_1
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -289,7 +289,6 @@ def grouped_gemm_triton_kernel(
             offs_ks = k_start // group_k
             a_scale = tl.load(a_scale_ptrs + offs_ks * as_stride_1)
             b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2)
-
             accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
         else:
             accumulator = tl.dot(a_tile, b_tile.T, accumulator)
@@ -342,16 +341,16 @@ def grouped_gemm_triton(
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
         a, scale_a = per_token_group_quant_fp8(a, block_k)
-       
+
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
 
     # Reduce block size to prevent L40 shared memory overflow.
     config = {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 16,
-        "BLOCK_SIZE_K": 16,
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
     }
 
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
