@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
 import multiprocessing as mp
 import os
 import unittest
@@ -23,33 +22,7 @@ import torch
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
 
-
-@dataclasses.dataclass
-class LoRAAdaptor:
-    name: str
-    # Each adapter can have its own tolerance settings (if not set, use model defaults)
-    prefill_tolerance: float = None
-    decode_tolerance: float = None
-    rouge_l_tolerance: float = None
-
-
-@dataclasses.dataclass
-class LoRAModelCase:
-    base: str
-    adaptors: List[LoRAAdaptor]
-    tp_size: int = 1
-    prefill_tolerance: float = 5e-1
-    decode_tolerance: float = 5e-1
-    rouge_l_tolerance: float = 1.0
-    max_loras_per_batch: int = 1
-    skip_long_prompt: bool = False
-
-    def __post_init__(self):
-        if len(self.adaptors) > self.max_loras_per_batch:
-            raise ValueError(
-                f"For base '{self.base}', number of adaptors ({len(self.adaptors)}) "
-                f"must be <= max_loras_per_batch ({self.max_loras_per_batch})"
-            )
+from utils import *
 
 CI_LORA_MODELS = [
     LoRAModelCase(
@@ -89,8 +62,6 @@ ALL_OTHER_LORA_MODELS = [
     ),
 ]
 
-TORCH_DTYPES = [torch.float16]
-
 PROMPTS = [
     "AI is a field of computer science focused on",
     """
@@ -103,8 +74,6 @@ PROMPTS = [
     ### Answer:
     """,
 ]
-
-BACKENDS = ["triton"]
 
 
 class TestLoRABackend(unittest.TestCase):
@@ -242,11 +211,8 @@ class TestLoRABackend(unittest.TestCase):
             prompts = PROMPTS if not model_case.skip_long_prompt else [p for p in PROMPTS if len(p) < 1000]
             for torch_dtype in TORCH_DTYPES:
                 for backend in BACKENDS:
-                    if len(model_case.adaptors) == 1:
-                        for prompt in prompts:
-                            self.run_backend(prompt, model_case, torch_dtype, max_new_tokens=32, backend=backend)
-                    else:
-                        self.run_backend_batch(prompts, model_case, torch_dtype, max_new_tokens=32, backend=backend)
+                    for prompt in prompts:
+                        self.run_backend(prompt, model_case, torch_dtype, max_new_tokens=32, backend=backend)
 
     def test_ci_lora_models(self):
         self._run_backend_on_model_cases(CI_LORA_MODELS)
