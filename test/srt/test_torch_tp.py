@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import is_in_ci, run_bench_one_batch
 
 
@@ -13,6 +14,8 @@ class TestTorchTP(unittest.TestCase):
                 "--json-model-override-args",
                 '{"architectures": ["TorchNativeLlamaForCausalLM"]}',
                 "--disable-cuda-graph",
+                "--device",
+                get_device(),
             ],
         )
 

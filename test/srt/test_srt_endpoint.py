@@ -14,7 +14,7 @@ import numpy as np
 import requests
 
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -36,6 +36,8 @@ class TestSRTEndpoint(unittest.TestCase):
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",
                 "0.8",
+                "--device",
+                get_device(),
             ),
         )
 

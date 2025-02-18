@@ -13,11 +13,13 @@
 # ==============================================================================
 
 import multiprocessing as mp
+import time
 import unittest
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
+from sglang.srt.utils import get_device
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import get_similarities
 
@@ -67,14 +69,16 @@ class TestEmbeddingModels(unittest.TestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="embedding",
+            device=get_device(),
         ) as hf_runner:
             hf_outputs = hf_runner.forward(truncated_prompts)
-
+        time.sleep(60)
         with SRTRunner(
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="embedding",
+            device=get_device(),
         ) as srt_runner:
             srt_outputs = srt_runner.forward(truncated_prompts)
 

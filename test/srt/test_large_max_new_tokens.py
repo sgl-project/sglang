@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -43,6 +43,8 @@ class TestLargeMaxNewTokens(unittest.TestCase):
                 "8192",
                 "--decode-log-interval",
                 "2",
+                "--device",
+                get_device(),
             ),
             env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
             return_stdout_stderr=(cls.stdout, cls.stderr),

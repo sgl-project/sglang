@@ -17,6 +17,7 @@ import unittest
 
 import torch
 
+from sglang.srt.utils import get_device
 from sglang.test.runners import HFRunner, SRTRunner
 
 LORA_SETS = [
@@ -91,32 +92,40 @@ class TestLoRA(unittest.TestCase):
             max_loras_per_batch=3,
             disable_cuda_graph=True,
             disable_radix_cache=True,
+            device=get_device(),
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
             )
-
+        sleep(60)
         with HFRunner(
-            base_path, torch_dtype=torch_dtype, model_type="generation"
+            base_path,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            device=get_device(),
         ) as hf_runner:
             hf_outputs = hf_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
             )
 
+        sleep(60)
         with HFRunner(
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
+            device=get_device(),
         ) as hf_runner:
             hf_no_lora_outputs = hf_runner.forward(
                 prompts, max_new_tokens=max_new_tokens
             )
 
+        sleep(60)
         with SRTRunner(
             base_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",
+            device=get_device(),
         ) as srt_runner:
             srt_no_lora_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens
@@ -201,16 +210,19 @@ class TestLoRA(unittest.TestCase):
             max_loras_per_batch=3,
             disable_cuda_graph=True,
             disable_radix_cache=True,
+            device=get_device(),
         ) as srt_runner:
             srt_outputs = srt_runner.batch_forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
             )
+        sleep(60)
 
         with HFRunner(
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
             output_str_only=True,
+            device=get_device(),
         ) as hf_runner:
             hf_outputs = hf_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
@@ -236,10 +248,12 @@ class TestLoRA(unittest.TestCase):
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",
+            device=get_device(),
         ) as srt_runner:
             srt_no_lora_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens
             )
+        sleep(60)
 
         with SRTRunner(
             base_path,
@@ -247,6 +261,7 @@ class TestLoRA(unittest.TestCase):
             torch_dtype=torch_dtype,
             model_type="generation",
             lora_paths=all_lora_paths,
+            device=get_device(),
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths

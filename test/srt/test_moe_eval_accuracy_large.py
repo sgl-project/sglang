@@ -6,7 +6,7 @@ python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mm
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -30,6 +30,8 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
                 "warning",
                 "--tp",
                 "2",
+                "--device",
+                get_device(),
             ],
         )
 

@@ -5,7 +5,7 @@ import unittest
 import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -32,6 +32,8 @@ class TestOpenAIServerFunctionCalling(unittest.TestCase):
                 # If your server needs extra parameters to test function calling, please add them here.
                 "--tool-call-parser",
                 "llama3",
+                "--device",
+                get_device(),
             ],
         )
         cls.base_url += "/v1"
@@ -238,11 +240,11 @@ class TestOpenAIServerFunctionCalling(unittest.TestCase):
         self.assertIn("a", args_obj, "Missing parameter 'a'")
         self.assertIn("b", args_obj, "Missing parameter 'b'")
         self.assertEqual(
-            args_obj["a"],
+            int(args_obj["a"]),
             5,
             "Parameter a should be 5",
         )
-        self.assertEqual(args_obj["b"], 7, "Parameter b should be 7")
+        self.assertEqual(int(args_obj["b"]), 7, "Parameter b should be 7")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import requests
 from decord import VideoReader, cpu
 from PIL import Image
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -134,6 +134,8 @@ class TestVisionChunkedPrefill(unittest.TestCase):
             other_args=[
                 "--chunked-prefill-size",
                 f"{chunked_prefill_size}",
+                "--device",
+                get_device(),
             ],
         )
         try:

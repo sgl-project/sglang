@@ -14,6 +14,7 @@ import sglang as sgl
 from sglang.bench_offline_throughput import BenchArgs, throughput_test
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_device
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
@@ -29,11 +30,13 @@ class TestSRTEngine(unittest.TestCase):
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42)
+        engine = sgl.Engine(model_path=model_path, random_seed=42, device=get_device())
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
-        runtime = sgl.Runtime(model_path=model_path, random_seed=42)
+        runtime = sgl.Runtime(
+            model_path=model_path, random_seed=42, device=get_device()
+        )
         out2 = json.loads(runtime.generate(prompt, sampling_params))["text"]
         runtime.shutdown()
 
@@ -48,11 +51,21 @@ class TestSRTEngine(unittest.TestCase):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
 
-        engine = sgl.Engine(model_path=model_path, is_embedding=True, random_seed=42)
+        engine = sgl.Engine(
+            model_path=model_path,
+            is_embedding=True,
+            random_seed=42,
+            device=get_device(),
+        )
         out1 = torch.tensor(engine.encode(prompt)["embedding"])
         engine.shutdown()
 
-        runtime = sgl.Runtime(model_path=model_path, is_embedding=True, random_seed=42)
+        runtime = sgl.Runtime(
+            model_path=model_path,
+            is_embedding=True,
+            random_seed=42,
+            device=get_device(),
+        )
         out2 = torch.tensor(json.loads(runtime.encode(prompt))["embedding"])
         runtime.shutdown()
 
@@ -65,7 +78,10 @@ class TestSRTEngine(unittest.TestCase):
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
         engine = sgl.Engine(
-            model_path=model_path, random_seed=42, disable_radix_cache=True
+            model_path=model_path,
+            random_seed=42,
+            disable_radix_cache=True,
+            device=get_device(),
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
 
@@ -90,7 +106,7 @@ class TestSRTEngine(unittest.TestCase):
 
         # Create an LLM.
         llm = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, device=get_device()
         )
 
         if True:
@@ -156,6 +172,7 @@ class TestSRTEngine(unittest.TestCase):
             model_path=model_path,
             random_seed=42,
             max_total_tokens=128,
+            device=get_device(),
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
@@ -165,6 +182,7 @@ class TestSRTEngine(unittest.TestCase):
             random_seed=42,
             max_total_tokens=128,
             cpu_offload_gb=3,
+            device=get_device(),
         )
         out2 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
@@ -179,6 +197,7 @@ class TestSRTEngine(unittest.TestCase):
     def test_7_engine_offline_throughput(self):
         server_args = ServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            device=get_device(),
         )
         bench_args = BenchArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)

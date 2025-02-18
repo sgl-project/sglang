@@ -10,6 +10,7 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
     _BatchedPenalizer,
     _BatchLike,
 )
+from sglang.srt.utils import get_device
 
 
 @dataclasses.dataclass
@@ -96,7 +97,7 @@ class Case:
 
 class BaseBatchedPenalizerTest(unittest.TestCase):
     Penalizer: Type[_BatchedPenalizer]
-    device = "cuda"
+    device = get_device()
     vocab_size = 5
 
     enabled: Subject = None

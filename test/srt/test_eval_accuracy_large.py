@@ -6,7 +6,7 @@ python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -25,7 +25,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--log-level-http", "warning"],
+            other_args=["--log-level-http", "warning", "--device", get_device()],
         )
 
     @classmethod

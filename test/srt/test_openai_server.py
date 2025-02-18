@@ -12,7 +12,7 @@ import unittest
 import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -33,6 +33,7 @@ class TestOpenAIServer(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
+            other_args=["--device", get_device()],
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -549,7 +550,7 @@ class TestOpenAIServerEBNF(unittest.TestCase):
         cls.api_key = "sk-123456"
 
         # passing xgrammar specifically
-        other_args = ["--grammar-backend", "xgrammar"]
+        other_args = ["--grammar-backend", "xgrammar", "--device", get_device()]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -632,7 +633,7 @@ class TestOpenAIEmbedding(unittest.TestCase):
         cls.api_key = "sk-123456"
 
         # Configure embedding-specific args
-        other_args = ["--is-embedding", "--enable-metrics"]
+        other_args = ["--is-embedding", "--enable-metrics", "--device", get_device()]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

@@ -4,7 +4,7 @@ import unittest
 import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,7 +24,7 @@ class TestInputEmbeds(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--disable-radix"],
+            other_args=["--disable-radix", "--device", get_device()],
         )
         cls.texts = [
             "The capital of France is",

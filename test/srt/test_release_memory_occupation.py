@@ -5,6 +5,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
@@ -22,6 +23,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             model_path=model_name,
             random_seed=42,
             enable_memory_saver=True,
+            device=get_device(),
             # disable_cuda_graph=True,  # for debugging only
         )
         hf_model_new = AutoModelForCausalLM.from_pretrained(
@@ -87,8 +89,9 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
 def _try_allocate_big_tensor(size: int = 20_000_000_000):
     try:
-        torch.empty((size,), dtype=torch.uint8, device="cuda")
-        torch.cuda.empty_cache()
+        torch.empty((size,), dtype=torch.uint8, device=get_device())
+        if "cuda" in get_device():
+            torch.cuda.empty_cache()
         return True
     except torch.cuda.OutOfMemoryError:
         return False

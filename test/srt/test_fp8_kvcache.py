@@ -2,7 +2,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -35,6 +35,8 @@ class TestFp8KvcacheBase(unittest.TestCase):
                 "fp8_e4m3",
                 "--quantization-param-path",
                 config_file,
+                "--device",
+                get_device(),
             ],
         )
 

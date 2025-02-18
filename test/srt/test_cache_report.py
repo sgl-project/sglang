@@ -4,7 +4,7 @@ import unittest
 import openai
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
@@ -25,6 +25,8 @@ class TestCacheReport(unittest.TestCase):
             other_args=[
                 "--chunked-prefill-size=40",
                 "--enable-cache-report",
+                "--device",
+                get_device(),
             ],
         )
         cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")

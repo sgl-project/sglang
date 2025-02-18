@@ -3,6 +3,7 @@ import unittest
 from huggingface_hub import hf_hub_download
 
 import sglang as sgl
+from sglang.srt.utils import get_device
 
 
 class TestGGUF(unittest.TestCase):
@@ -15,7 +16,7 @@ class TestGGUF(unittest.TestCase):
             filename="qwen2-1_5b-instruct-q4_k_m.gguf",
         )
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42)
+        engine = sgl.Engine(model_path=model_path, random_seed=42, device=get_device())
         outputs = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 

@@ -36,6 +36,7 @@ import time
 import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
@@ -1046,6 +1047,56 @@ def get_device_name(device_id: int = 0) -> str:
         return torch.hpu.get_device_name(device_id)
 
 
+def is_habana_available() -> bool:
+    return find_spec("habana_frameworks") is not None
+
+
+def get_device(device_id: Optional[int] = None) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        if device_index is None:
+            return "cuda"
+        return "cuda:{}".format(device_index)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        if device_index == None:
+            return "xpu"
+        return "xpu:{}".format(device_index)
+
+    if is_habana_available():
+        try:
+            import habana_frameworks.torch.hpu
+
+            if torch.hpu.is_available():
+                return "hpu"
+        except ImportError:
+            pass
+
+
+def get_device_count() -> int:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        try:
+            return torch.cuda.device_count()
+        except RuntimeError:
+            return 0
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        try:
+            return torch.xpu.device_count()
+        except RuntimeError:
+            return 0
+
+    if is_habana_available():
+        try:
+            import habana_frameworks.torch.hpu
+
+            if torch.hpu.is_available():
+                return torch.hpu.device_count()
+        except (ImportError, RuntimeError):
+            return 0
+
+    return 0  # No accelerators available
+
+
 def get_device_core_count(device_id: int = 0) -> int:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
@@ -1068,6 +1119,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     # Update this once the support is available.
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         try:
+            return None, None
             major, minor = torch.hpu.get_device_capability(device_id)
         except Exception as e:
             raise RuntimeError(

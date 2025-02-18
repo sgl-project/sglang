@@ -56,7 +56,7 @@ def get_top_logprobs(logits, k):
     return logprobs
 
 
-def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
+def _get_sentence_transformer_embedding_model(model_path, torch_dtype, device):
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
@@ -75,7 +75,7 @@ def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
         )
         model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
 
-    return model.cuda()
+    return model.to(device)
 
 
 @dataclass
@@ -95,10 +95,11 @@ class HFRunner:
         torch_dtype: torch.dtype,
         model_type: str = "generation",
         output_str_only: bool = False,
+        device: str = "cuda",
     ):
         self.model_type = model_type
         self.output_str_only = output_str_only
-
+        self.device = device
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
 
@@ -132,10 +133,10 @@ class HFRunner:
                 torch_dtype=torch_dtype,
                 trust_remote_code=False,
                 low_cpu_mem_usage=True,
-            ).cuda()
+            ).to(self.device)
         elif self.model_type == "embedding":
             self.model = _get_sentence_transformer_embedding_model(
-                model_path, torch_dtype
+                model_path, torch_dtype, self.device
             )
         elif self.model_type == "reward":
             from transformers import AutoModelForSequenceClassification
@@ -144,7 +145,7 @@ class HFRunner:
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.needs_trust_remote_code(model_path),
-            ).cuda()
+            ).to(self.device)
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
         self.tokenizer = get_tokenizer(model_path, torch_dtype=torch.dtype)
@@ -164,9 +165,9 @@ class HFRunner:
                         if isinstance(p, str):
                             input_ids = self.tokenizer.encode(
                                 p, return_tensors="pt"
-                            ).cuda()
+                            ).to(self.device)
                         else:
-                            input_ids = torch.tensor([p], device="cuda")
+                            input_ids = torch.tensor([p], device=self.device)
 
                         if lora_paths is not None and lora_paths[i] is not None:
                             from peft import PeftModel
@@ -233,7 +234,7 @@ class HFRunner:
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
-                        ).to("cuda")
+                        ).to(self.device)
                         scores.append(
                             float(self.model(**conv_tokenized).logits[0][0].item())
                         )
@@ -275,6 +276,7 @@ class SRTRunner:
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
+        device: str = "cuda",
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -291,6 +293,7 @@ class SRTRunner:
             lora_backend=lora_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
+            device=device,
         )
         self.tokenizer = get_tokenizer(model_path)
 

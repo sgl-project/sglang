@@ -2,7 +2,7 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,7 +23,14 @@ class TestRequestLengthValidation(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=("--max-total-tokens", "1000", "--context-length", "100"),
+            other_args=(
+                "--max-total-tokens",
+                "1000",
+                "--context-length",
+                "100",
+                "--device",
+                get_device(),
+            ),
         )
 
     @classmethod

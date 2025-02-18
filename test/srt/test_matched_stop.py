@@ -3,7 +3,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
@@ -27,7 +27,7 @@ class TestMatchedStop(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=300,
-            other_args=["--max-running-requests", "10"],
+            other_args=["--max-running-requests", "10", "--device", get_device()],
         )
 
     @classmethod

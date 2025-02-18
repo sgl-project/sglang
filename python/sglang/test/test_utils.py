@@ -22,7 +22,7 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree
+from sglang.srt.utils import get_bool_env_var, get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
@@ -750,6 +750,8 @@ def run_and_check_memory_leak(
         str(chunked_prefill_size),
         "--log-level",
         "debug",
+        "--device",
+        get_device(),
     ]
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]

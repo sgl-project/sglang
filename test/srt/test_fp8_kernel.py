@@ -6,6 +6,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+from sglang.srt.utils import get_device
 
 
 class TestFP8Base(unittest.TestCase):
@@ -22,7 +23,7 @@ class TestFP8Base(unittest.TestCase):
     @staticmethod
     def _make_A(M, K, group_size, out_dtype):
         quant_A = torch.rand(
-            M, K // group_size, group_size, dtype=torch.float32, device="cuda"
+            M, K // group_size, group_size, dtype=torch.float32, device=get_device()
         )
         # -1 ~ 1
         quant_A = quant_A * 2 - 1
@@ -34,7 +35,7 @@ class TestFP8Base(unittest.TestCase):
         quant_A = quant_A.to(out_dtype).to(torch.float32)
 
         # create scale and A
-        scale = torch.rand(M, K // group_size, dtype=torch.float32, device="cuda")
+        scale = torch.rand(M, K // group_size, dtype=torch.float32, device=get_device())
         scale /= fmax
         A = quant_A * scale[..., None]
 
@@ -56,7 +57,7 @@ class TestFP8Base(unittest.TestCase):
             N_aligned // group_size,
             group_size,
             dtype=torch.float32,
-            device="cuda",
+            device=get_device(),
         )
         quant_B = quant_B * 2 - 1
 
@@ -73,7 +74,7 @@ class TestFP8Base(unittest.TestCase):
             N_aligned // group_size,
             1,
             dtype=torch.float32,
-            device="cuda",
+            device=get_device(),
         )
         scale /= fmax
 
@@ -87,8 +88,9 @@ class TestFP8Base(unittest.TestCase):
 
 class TestPerTokenGroupQuantFP8(TestFP8Base):
     def test_per_token_group_quant_fp8(self):
-        if torch.cuda.get_device_capability()[0] < 9:
-            return
+        if "cuda" in get_device():
+            if torch.cuda.get_device_capability()[0] < 9:
+                return
         A, A_quant_gt, scale_gt = self._make_A(
             M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
         )
@@ -103,8 +105,9 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
 
 class TestW8A8BlockFP8Matmul(TestFP8Base):
     def test_w8a8_block_fp8_matmul(self):
-        if torch.cuda.get_device_capability()[0] < 9:
-            return
+        if "cuda" in get_device():
+            if torch.cuda.get_device_capability()[0] < 9:
+                return
         A, A_quant_gt, A_scale_gt = self._make_A(
             M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
         )

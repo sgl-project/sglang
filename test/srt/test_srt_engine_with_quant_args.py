@@ -1,6 +1,7 @@
 import unittest
 
 import sglang as sgl
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
@@ -27,7 +28,10 @@ class TestSRTEngineWithQuantArgs(unittest.TestCase):
 
         for quantization_args in quantization_args_list:
             engine = sgl.Engine(
-                model_path=model_path, random_seed=42, quantization=quantization_args
+                model_path=model_path,
+                random_seed=42,
+                quantization=quantization_args,
+                device=get_device(),
             )
             engine.generate(prompt, sampling_params)
             engine.shutdown()
@@ -50,7 +54,10 @@ class TestSRTEngineWithQuantArgs(unittest.TestCase):
 
         for torchao_config in torchao_args_list:
             engine = sgl.Engine(
-                model_path=model_path, random_seed=42, torchao_config=torchao_config
+                model_path=model_path,
+                random_seed=42,
+                torchao_config=torchao_config,
+                device=get_device(),
             )
             engine.generate(prompt, sampling_params)
             engine.shutdown()

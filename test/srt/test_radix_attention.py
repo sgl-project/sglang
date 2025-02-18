@@ -4,6 +4,7 @@ import unittest
 
 import requests
 
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -75,6 +76,8 @@ class TestRadixCacheFCFS(unittest.TestCase):
                 "20000",
                 "--schedule-policy",
                 "fcfs",
+                "--device",
+                get_device(),
             ],
         )
 
@@ -103,6 +106,8 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
                 "20000",
                 "--schedule-policy",
                 "lpm",
+                "--device",
+                get_device(),
             ],
         )
 
@@ -124,6 +129,8 @@ class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
                 "20000",
                 "--schedule-policy",
                 "lpm",
+                "--device",
+                get_device(),
             ],
         )
 

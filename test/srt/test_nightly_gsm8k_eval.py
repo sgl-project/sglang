@@ -5,7 +5,7 @@ import warnings
 from datetime import datetime
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
@@ -46,7 +46,13 @@ def parse_models(model_string):
 
 
 def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
-    other_args = ["--log-level-http", "warning", "--trust-remote-code"]
+    other_args = [
+        "--log-level-http",
+        "warning",
+        "--trust-remote-code",
+        "--device",
+        get_device(),
+    ]
     if is_fp8:
         if "Llama-3" in model or "gemma-2" in model:
             other_args.extend(["--kv-cache-dtype", "fp8_e5m2"])

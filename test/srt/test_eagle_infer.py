@@ -8,7 +8,7 @@ import requests
 
 import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
@@ -29,13 +29,16 @@ class TestEAGLEEngine(unittest.TestCase):
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
         "cuda_graph_max_bs": 32,
+        "other_args": ["--device", get_device()],
     }
 
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"
         self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        ref_engine = sgl.Engine(model_path=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST)
+        ref_engine = sgl.Engine(
+            model_path=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST, device=get_device()
+        )
         self.ref_output = ref_engine.generate(self.prompt, self.sampling_params)["text"]
         ref_engine.shutdown()
 
@@ -44,7 +47,6 @@ class TestEAGLEEngine(unittest.TestCase):
             self.BASE_CONFIG,
             {**self.BASE_CONFIG, "disable_cuda_graph": True},
         ]
-
         for config in configs:
             with self.subTest(
                 cuda_graph=(
@@ -127,6 +129,8 @@ class TestEAGLEServer(unittest.TestCase):
                 "0.7",
                 "--cuda-graph-max-bs",
                 "32",
+                "--device",
+                get_device(),
             ],
         )
 
@@ -221,6 +225,8 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "triton",
                 "--cuda-graph-max-bs",
                 "32",
+                "--device",
+                get_device(),
             ],
         )
 

@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -19,7 +20,7 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=500,
             request_rate=float("inf"),
-            other_server_args=[],
+            other_server_args=["--device", get_device()],
         )
 
         if is_in_ci():
@@ -34,7 +35,12 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=200,
             request_rate=float("inf"),
-            other_server_args=["--max-running-requests", "10"],
+            other_server_args=[
+                "--max-running-requests",
+                "10",
+                "--device",
+                get_device(),
+            ],
             dataset_name="sharegpt",
             random_input_len=None,
             random_output_len=None,
@@ -56,7 +62,7 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=500,
             request_rate=float("inf"),
-            other_server_args=["--disable-radix-cache"],
+            other_server_args=["--disable-radix-cache", "--device", get_device()],
         )
 
         if is_in_ci():
@@ -71,7 +77,12 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=500,
             request_rate=float("inf"),
-            other_server_args=["--chunked-prefill-size", "-1"],
+            other_server_args=[
+                "--chunked-prefill-size",
+                "-1",
+                "--device",
+                get_device(),
+            ],
         )
 
         if is_in_ci():
@@ -91,6 +102,8 @@ class TestBenchServing(unittest.TestCase):
                 "triton",
                 "--context-length",
                 "8192",
+                "--device",
+                get_device(),
             ],
         )
 
@@ -106,7 +119,7 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_FP8_MODEL_NAME_FOR_TEST,
             num_prompts=500,
             request_rate=float("inf"),
-            other_server_args=[],
+            other_server_args=["--device", get_device()],
         )
 
         if is_in_ci():
@@ -121,7 +134,7 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=100,
             request_rate=1,
-            other_server_args=[],
+            other_server_args=["--device", get_device()],
         )
 
         if is_in_ci():
@@ -155,6 +168,8 @@ class TestBenchServing(unittest.TestCase):
                 "0.7",
                 "--cuda-graph-max-bs",
                 "32",
+                "--device",
+                get_device(),
             ],
         )
 
@@ -170,7 +185,7 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
             num_prompts=300,
             request_rate=float("inf"),
-            other_server_args=["--tp", "2"],
+            other_server_args=["--tp", "2", "--device", get_device()],
         )
 
         if is_in_ci():
@@ -185,7 +200,13 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
             num_prompts=300,
             request_rate=float("inf"),
-            other_server_args=["--tp", "2", "--disable-radix-cache"],
+            other_server_args=[
+                "--tp",
+                "2",
+                "--disable-radix-cache",
+                "--device",
+                get_device(),
+            ],
         )
 
         if is_in_ci():

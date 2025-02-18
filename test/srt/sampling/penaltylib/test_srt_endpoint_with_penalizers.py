@@ -4,7 +4,7 @@ from multiprocessing import Process
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,6 +26,8 @@ class TestBatchPenalizerE2E(unittest.TestCase):
             other_args=(
                 "--random-seed",
                 "0",
+                "--device",
+                get_device(),
             ),
         )
 

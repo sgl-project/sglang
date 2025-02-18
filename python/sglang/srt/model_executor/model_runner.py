@@ -131,7 +131,7 @@ class ModelRunner:
                     "Please specify the heavy channel type for double sparsity optimization."
                 )
             self.init_double_sparsity_channel_config(
-                self.server_args.ds_heavy_channel_type
+                self.server_args.ds_heavy_channel_type, self.device
             )
 
         if self.is_multimodal:
@@ -708,7 +708,7 @@ class ModelRunner:
                 f"Invalid attention backend: {self.server_args.attention_backend}"
             )
 
-    def init_double_sparsity_channel_config(self, selected_channel):
+    def init_double_sparsity_channel_config(self, selected_channel, device):
         selected_channel = "." + selected_channel + "_proj"
         self.sorted_channels = []
         # load channel config
@@ -722,7 +722,7 @@ class ModelRunner:
                     :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
-                .cuda()
+                .to(device)
             )
 
     def init_cuda_graphs(self):

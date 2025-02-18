@@ -14,7 +14,7 @@ import aiohttp
 import requests
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -33,7 +33,10 @@ class TestSessionControl(unittest.TestCase):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args={"--device", get_device()},
         )
 
     @classmethod
@@ -503,6 +506,7 @@ class TestSessionControlVision(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args={"--device", get_device()},
             # other_args={"--disable-radix"},
         )
 

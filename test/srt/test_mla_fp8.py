@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST,
@@ -24,6 +24,8 @@ class TestMLA(unittest.TestCase):
                 "--trust-remote-code",
                 "--kv-cache-dtype",
                 "fp8_e5m2",
+                "--device",
+                get_device(),
             ],
         )
 

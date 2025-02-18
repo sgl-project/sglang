@@ -17,6 +17,7 @@ import unittest
 
 import torch
 
+from sglang.srt.utils import get_device
 from sglang.test.runners import HFRunner, SRTRunner
 
 MODELS = [
@@ -59,6 +60,7 @@ class TestRewardModels(unittest.TestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="reward",
+            device=get_device(),
         ) as hf_runner:
             hf_outputs = hf_runner.forward(convs)
 
@@ -66,6 +68,7 @@ class TestRewardModels(unittest.TestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="reward",
+            device=get_device(),
         ) as srt_runner:
             prompts = srt_runner.tokenizer.apply_chat_template(convs, tokenize=False)
             srt_outputs = srt_runner.forward(prompts)

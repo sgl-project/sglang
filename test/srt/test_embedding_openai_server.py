@@ -3,7 +3,7 @@ import unittest
 import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,6 +22,7 @@ class TestOpenAIServer(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
+            other_args=["--device", get_device()],
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)

@@ -48,7 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import get_device, make_layers
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -566,8 +566,11 @@ class LlamaForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if "cuda" in get_device():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        elif "hpu" in get_device():
+            torch.hpu.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

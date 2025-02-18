@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -23,7 +23,7 @@ class TestMLA(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code"],
+            other_args=["--trust-remote-code", "--device", get_device()],
         )
 
     @classmethod
@@ -62,7 +62,15 @@ class TestDeepseekV3(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
-            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+            other_args.extend(
+                [
+                    "--enable-torch-compile",
+                    "--cuda-graph-max-bs",
+                    "2",
+                    "--device",
+                    get_device(),
+                ]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -115,6 +123,8 @@ class TestDeepseekV3MTP(unittest.TestCase):
                     "4",
                     "--speculative-num-draft-tokens",
                     "4",
+                    "--device",
+                    get_device(),
                 ]
             )
         cls.process = popen_launch_server(

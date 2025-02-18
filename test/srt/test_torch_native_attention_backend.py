@@ -6,7 +6,7 @@ python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mml
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -22,7 +22,7 @@ class TestTorchNativeAttnBackend(unittest.TestCase):
     def test_latency(self):
         output_throughput = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST,
-            ["--attention-backend", "torch_native"],
+            ["--attention-backend", "torch_native", "--device", get_device()],
         )
 
         if is_in_ci():
@@ -36,7 +36,12 @@ class TestTorchNativeAttnBackend(unittest.TestCase):
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend", "torch_native"],
+            other_args=[
+                "--attention-backend",
+                "torch_native",
+                "--device",
+                get_device(),
+            ],
         )
 
         try:

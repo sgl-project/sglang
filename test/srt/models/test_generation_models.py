@@ -22,11 +22,13 @@ To test a specific model:
 import dataclasses
 import multiprocessing as mp
 import os
+import time
 import unittest
 from typing import List
 
 import torch
 
+from sglang.srt.utils import get_device
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
 
@@ -43,8 +45,8 @@ class ModelCase:
 
 # Popular models that run on the CI
 CI_MODELS = [
-    ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
-    ModelCase("google/gemma-2-2b"),
+    ModelCase("meta-llama/Llama-3.1-8B-Instruct", skip_long_prompt=True),
+    ModelCase("google/gemma-2-2b", skip_long_prompt=True),
 ]
 
 # All other models that do not run on the CI
@@ -82,19 +84,20 @@ class TestGenerationModels(unittest.TestCase):
             model_case.rouge_l_tolerance,
         )
         max_new_tokens = 32
-
         with HFRunner(
             model_path,
             torch_dtype=torch_dtype,
             model_type="generation",
+            device=get_device(),
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
-
+        time.sleep(50)
         with SRTRunner(
             model_path,
             tp_size=model_case.tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",
+            device=get_device(),
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 

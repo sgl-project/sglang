@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -23,7 +23,13 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--cuda-graph-max-bs", "4"],
+            other_args=[
+                "--enable-torch-compile",
+                "--cuda-graph-max-bs",
+                "4",
+                "--device",
+                get_device(),
+            ],
         )
 
     @classmethod

@@ -4,7 +4,7 @@ import unittest
 import requests
 from transformers import AutoTokenizer
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,7 +26,7 @@ def setUpModule():
         DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=["--skip-tokenizer-init"],
+        other_args=["--skip-tokenizer-init", "--device", get_device()],
     )
     _base_url = DEFAULT_URL_FOR_TEST
 

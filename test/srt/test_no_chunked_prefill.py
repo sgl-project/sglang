@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     run_bench_serving,
@@ -19,7 +20,13 @@ class TestNoChunkedPrefill(unittest.TestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=10,
             request_rate=float("inf"),
-            other_server_args=["--disable-radix-cache", "--chunked-prefill-size", "-1"],
+            other_server_args=[
+                "--disable-radix-cache",
+                "--chunked-prefill-size",
+                "-1",
+                "--device",
+                get_device(),
+            ],
         )
 
         assert res["completed"] == 10

@@ -42,6 +42,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.utils import get_device
 
 
 class LlavaBaseForCausalLM(nn.Module):
@@ -416,11 +417,11 @@ class LlavaBaseForCausalLM(nn.Module):
         if "clip" in vision_path:
             self.vision_tower = CLIPVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(get_device())
         elif "siglip" in vision_path:
             self.vision_tower = SiglipVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(get_device())
             # Siglip needs all feature tokens
             self.config.mm_vision_select_feature = "full"
         self.vision_tower.eval()

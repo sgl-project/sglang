@@ -4,6 +4,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import is_in_ci
 
 
@@ -21,6 +22,7 @@ class TestHiddenState(unittest.TestCase):
             random_seed=42,
             return_hidden_states=True,
             skip_tokenizer_init=True,
+            device=get_device(),
         )
         outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
         engine.shutdown()
@@ -36,7 +38,7 @@ class TestHiddenState(unittest.TestCase):
         )
 
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="cuda"
+            model_path, torch_dtype=torch.bfloat16, device_map=get_device()
         )
 
         for input_id, output in zip(input_ids, outputs):
@@ -54,7 +56,7 @@ class TestHiddenState(unittest.TestCase):
                     i.unsqueeze(0) if len(i.shape) == 1 else i
                     for i in output["meta_info"]["hidden_states"]
                 ]
-            ).to("cuda")
+            ).to(get_device())
             print("=== SRT Hiddens ===")
             print(sg_hidden_states)
 

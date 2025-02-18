@@ -8,7 +8,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,6 +26,8 @@ def setup_class(cls, disable_overlap: bool):
         "10",
         "--grammar-backend",
         "xgrammar",
+        "--device",
+        get_device(),
     ]
 
     if disable_overlap:
