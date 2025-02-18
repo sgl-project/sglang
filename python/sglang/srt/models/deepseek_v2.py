@@ -56,7 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_cuda_available, is_hip
+from sglang.srt.utils import is_cuda_available, is_hip, make_layers
 
 is_hip_ = is_hip()
 
@@ -810,16 +810,15 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
-        )
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: DeepseekV2DecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+            ),
+            prefix="",
+        )        
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
