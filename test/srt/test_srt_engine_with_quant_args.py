@@ -41,7 +41,13 @@ class TestSRTEngineWithQuantArgs(unittest.TestCase):
             "fp8wo",
             "fp8dq-per_tensor",
             "fp8dq-per_row",
-        ] + [f"int4wo-{group_size}" for group_size in [32, 64, 128, 256]]
+        ] + [f"int4wo-{group_size}" for group_size in [32, 64, 128, 256]] + [
+            "gemlite-32-8-None",
+            "gemlite-8-8-None",
+        ]
+        # gemlite-<packing_bitwidth>-<bit_width>-<group_size> or
+        # gemlite-<bit_width>-<group_size> (packing_bitwidth defaults to 32)
+        # We don't exhausted all combinations, only test the main logic
 
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
