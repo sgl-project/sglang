@@ -168,6 +168,8 @@ class ServerArgs:
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
 
+    enable_flashinfer_mla: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -260,14 +262,17 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        if self.speculative_algorithm == "EAGLE":
+        if (
+            self.speculative_algorithm == "EAGLE"
+            or self.speculative_algorithm == "NEXTN"
+        ):
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
             self.disable_overlap_schedule = True
             self.chunked_prefill_size = -1
             logger.info(
-                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
+                f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
             )
 
         # GGUF
@@ -693,12 +698,17 @@ class ServerArgs:
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
+        parser.add_argument(
+            "--enable-flashinfer-mla",
+            action="store_true",
+            help="Enable FlashInfer MLA optimization",
+        )
 
         # Speculative decoding
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE"],
+            choices=["EAGLE", "NEXTN"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
