@@ -2,19 +2,29 @@
 
 You can install SGLang using any of the methods below. For running DeepSeek V3/R1 with SGLang, refer to [DeepSeek V3 Support](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). It is always recommended to use the [latest release version](https://pypi.org/project/sglang/#history) and deploy it with [Docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended) to avoid fixed issues and environment-related problems.
 
-## Method 1: With pip
+## Method 1: With uv
+
+We recommend to use uv to install the dependencies for higher installation speed.
+Please [install uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't done so.
+For better developing experience, we recommend to initialize a new virtual environment.
+```bash
+uv venv
 ```
-pip install --upgrade pip
-pip install sgl-kernel --force-reinstall --no-deps
-pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+
+Then install the dependencies as follows:
+```bash
+uv pip install setuptools
+uv pip install sgl-kernel
+uv pip install torch==2.5.1
+uv pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
+uv pip install "sglang[all]"
+uv pip install transformers==4.48.3
 ```
 
-Note: SGLang currently uses torch 2.5, so you need to install the flashinfer version for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the package currently used by FlashInfer is named `flashinfer-python`, not `flashinfer`.
-
-If you experience an error like `OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root`， please try either of the following solutions:
-
-- Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
-- Follow the procedure described in [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) first, then install SGLang as described above.
+Activate the venv to use SGLang:
+```bash
+source .venv/bin/activate
+```
 
 ## Method 2: From source
 ```
@@ -45,31 +55,7 @@ cd ..
 pip install -e "python[all_hip]"
 ```
 
-## Method 3: Using uv
-
-In the folder where you want to use your virtual environment create a `pyproject.toml` file with the following content:
-
-```toml
-[project]
-name = "my-sgl-project"
-version = "0.1.0"
-description = "my-awesome-sgl-project"
-requires-python = ">=3.10"
-dependencies = [
-    "flashinfer-python>=0.2.1.post1",
-    "setuptools>=75.8.0",
-    "sgl-kernel>=0.0.3.post6",
-    "sglang[all]>=0.4.3.post1",
-    "transformers==4.48",
-]
-[[tool.uv.index]]
-name = "flashinfer-python"
-url = "https://flashinfer.ai/whl/cu124/torch2.5/"
-```
-
-Then run `uv sync` to install the dependencies and create the virtual environment.
-
-## Method 4: Using docker
+## Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
@@ -103,7 +89,7 @@ drun -p 30000:30000 \
 drun v0.4.3.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
-## Method 5: Using docker compose
+## Method 4: Using docker compose
 
 <details>
 <summary>More</summary>
@@ -115,7 +101,7 @@ drun v0.4.3.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --in
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
-## Method 6: Run on Kubernetes or Clouds with SkyPilot
+## Method 5: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
 <summary>More</summary>
