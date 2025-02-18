@@ -5,13 +5,19 @@
 
 #include "utils.h"
 
+#ifndef USE_ROCM
+#define FULL_MASK 0xffff
+#else
+#define FULL_MASK 0xffffffff
+#endif
+
 using FP8_TYPE = c10::Float8_e4m3fn;
 
 __device__ __forceinline__ float GroupReduce(float val, const int tid) {
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 8));
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 4));
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 2));
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 1));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 1));
   return val;
 }
 
@@ -32,11 +38,13 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
 
   if (block_group_id + local_group_id < num_groups) {
     const T* group_input = input + (block_group_id + local_group_id) * group_size;
+
     FP8_TYPE* group_output = static_cast<FP8_TYPE*>(output_q) + (block_group_id + local_group_id) * group_size;
     float* scale_output = output_s + block_group_id + local_group_id;
 
     for (int i = local_tid; i < group_size; i += 16) {
-      float val = static_cast<float>(group_input[i]);
+      float val = static_cast<float>(castToFloat(group_input[i]));
+
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
     }
@@ -56,7 +64,8 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     }
 
     for (int i = local_tid; i < group_size; i += 16) {
-      float val = static_cast<float>(group_input[i]);
+      float val = static_cast<float>(castToFloat(group_input[i]));
+
       float q_val = fminf(fmaxf(val / y_s, fp8_min), fp8_max);
       group_output[i] = FP8_TYPE(q_val);
     }
@@ -73,7 +82,7 @@ void sgl_per_token_group_quant_fp8(torch::Tensor input, torch::Tensor output_q, 
 
   CHECK_EQ(input.numel() % group_size, 0);
 
-  dim3 grid((num_groups + 15) / 16);
+  dim3 grid(CEILDIV(num_groups, 16));
   dim3 block(256);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
