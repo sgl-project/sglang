@@ -275,11 +275,15 @@ def _fwd_kernel(
     )
     if STORE_TRANSPOSE:
         tl.store(
-            O_Extend + offs_o.T, (acc / deno[:, None]).T, mask=(mask_m[:, None] & mask_dv[None, :]).T
+            O_Extend + offs_o.T,
+            (acc / deno[:, None]).T,
+            mask=(mask_m[:, None] & mask_dv[None, :]).T,
         )
     else:
         tl.store(
-            O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
+            O_Extend + offs_o,
+            acc / deno[:, None],
+            mask=mask_m[:, None] & mask_dv[None, :],
         )
 
 
@@ -394,7 +398,7 @@ def extend_attention_fwd(
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        STORE_TRANSPOSE=True,
+        STORE_TRANSPOSE=is_hip_,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
