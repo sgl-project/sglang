@@ -27,6 +27,7 @@ from typing import List
 
 import torch
 
+from sglang.srt.utils import device_name
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
 
@@ -82,11 +83,11 @@ class TestGenerationModels(unittest.TestCase):
             model_case.rouge_l_tolerance,
         )
         max_new_tokens = 32
-
         with HFRunner(
             model_path,
             torch_dtype=torch_dtype,
             model_type="generation",
+            device=device_name(),
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -95,6 +96,7 @@ class TestGenerationModels(unittest.TestCase):
             tp_size=model_case.tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",
+            device=device_name(),
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 

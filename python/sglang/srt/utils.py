@@ -1046,6 +1046,21 @@ def get_device_name(device_id: int = 0) -> str:
         return torch.hpu.get_device_name(device_id)
 
 
+def device_name(device_id: Optional[int] = None) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        if device_index is None:
+            return "cuda"
+        return "cuda:{}".format(device_index)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        if device_index == None:
+            return "xpu"
+        return "xpu:{}".format(device_index)
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return "hpu"
+
+
 def get_device_core_count(device_id: int = 0) -> int:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_properties(device_id).multi_processor_count

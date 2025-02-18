@@ -18,6 +18,7 @@ import unittest
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
+from sglang.srt.utils import device_name
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import get_similarities
 
@@ -67,6 +68,7 @@ class TestEmbeddingModels(unittest.TestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="embedding",
+            device=device_name(),
         ) as hf_runner:
             hf_outputs = hf_runner.forward(truncated_prompts)
 
@@ -75,6 +77,7 @@ class TestEmbeddingModels(unittest.TestCase):
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="embedding",
+            device=device_name(),
         ) as srt_runner:
             srt_outputs = srt_runner.forward(truncated_prompts)
 
