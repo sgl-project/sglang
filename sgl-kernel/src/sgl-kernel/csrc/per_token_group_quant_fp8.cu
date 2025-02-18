@@ -7,13 +7,11 @@
 
 using FP8_TYPE = c10::Float8_e4m3fn;
 
-__device__ __forceinline__ float WarpReduce(volatile float* smem, const int tid) {
-  if (tid < 8) {
-    smem[tid] = fmaxf(smem[tid], smem[tid + 8]);
-    if (tid < 4) smem[tid] = fmaxf(smem[tid], smem[tid + 4]);
-    if (tid < 2) smem[tid] = fmaxf(smem[tid], smem[tid + 2]);
-    if (tid < 1) smem[tid] = fmaxf(smem[tid], smem[tid + 1]);
-  }
+__device__ __forceinline__ float GroupReduce(volatile float* smem, const int tid) {
+  smem[tid] = fmaxf(smem[tid], smem[tid + 8]);
+  if (tid < 4) smem[tid] = fmaxf(smem[tid], smem[tid + 4]);
+  if (tid < 2) smem[tid] = fmaxf(smem[tid], smem[tid + 2]);
+  if (tid < 1) smem[tid] = fmaxf(smem[tid], smem[tid + 1]);
   return smem[0];
 }
 
@@ -53,7 +51,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
 
     // Perform reduction within each group
     if (local_tid < 8) {
-      WarpReduce(&s_absmax[local_group_id][0], local_tid);
+      GroupReduce(&s_absmax[local_group_id][0], local_tid);
     }
     __syncthreads();
 
