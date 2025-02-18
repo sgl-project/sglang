@@ -520,6 +520,41 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+    def prepare_video_messages(self, video_path):
+        # limit context length  for deepseek
+        max_frames_num = 6
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frame_num = len(vr)
+        uniform_sampled_frames = np.linspace(
+            0, total_frame_num - 1, max_frames_num, dtype=int
+        )
+        frame_idx = uniform_sampled_frames.tolist()
+        frames = vr.get_batch(frame_idx).asnumpy()
+
+        base64_frames = []
+        for frame in frames:
+            pil_img = Image.fromarray(frame)
+            buff = io.BytesIO()
+            pil_img.save(buff, format="JPEG")
+            base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
+            base64_frames.append(base64_str)
+
+        messages = [{"role": "user", "content": []}]
+        frame_format = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,{}"},
+            "modalities": "video",
+        }
+
+        for base64_frame in base64_frames:
+            frame_format["image_url"]["url"] = "data:image/jpeg;base64,{}".format(
+                base64_frame
+            )
+            messages[0]["content"].append(frame_format.copy())
+
+        prompt = {"type": "text", "text": "Please describe the video in detail."}
+        messages[0]["content"].append(prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
