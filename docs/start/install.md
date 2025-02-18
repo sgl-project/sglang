@@ -16,9 +16,10 @@ pip install "sglang[all]"
 pip install transformers==4.48.3
 ```
 
-We recommend to use uv to install the dependencies for higher installation speed.
+We recommend to use uv to install the dependencies with higher installation speed.
 Please [install uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't done so.
-For better developing experience, we recommend to initialize a new virtual environment.
+
+Initialize new virtual environment:
 ```bash
 uv venv
 ```
