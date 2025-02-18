@@ -60,6 +60,7 @@ The core features include:
    references/amd_configure.md
    references/deepseek.md
    references/multi_node.md
+   references/multi_node_inference_k8s_lws.md
    references/modelscope.md
    references/quantization.md
    references/contribution_guide.md
