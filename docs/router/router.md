@@ -2,7 +2,7 @@
 
 Given multiple GPUs running multiple SGLang Runtimes, SGLang Router distributes the requests to different Runtimes with its unique cache-aware load-balancing algorithm.
 
-The router is a independent Python package, and it can be used as a drop-in replacement for the OpenAI API.
+The router is an independent Python package, and it can be used as a drop-in replacement for the OpenAI API.
 
 ## Installation
 
@@ -24,7 +24,7 @@ The router supports two working modes:
 
 ## Co-launch Router and Runtimes
 
-This will be a drop-in replacement for the existing `--dp-size` arguement of SGLang Runtime. Under the hood, it uses multi-processes to launch multiple workers, wait for them to be ready, then connect the router to all workers.
+This will be a drop-in replacement for the existing `--dp-size` argument of SGLang Runtime. Under the hood, it uses multi-processes to launch multiple workers, wait for them to be ready, then connect the router to all workers.
 
 ```bash
 $ python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dp-size 1

@@ -50,7 +50,7 @@ def _fwd_kernel(
     kv_indptr,
     kv_indices,
     mask_ptr,
-    mask_offsets,
+    mask_indptr,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -88,7 +88,7 @@ def _fwd_kernel(
     cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
 
     if USE_CUSTOM_MASK:
-        cur_seq_mask_start_idx = tl.load(mask_offsets + cur_seq)
+        cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -294,7 +294,7 @@ def extend_attention_fwd(
     kv_indptr,
     kv_indices,
     custom_mask,
-    mask_offsets,
+    mask_indptr,
     max_len_extend,
     sm_scale=None,
     logit_cap=0.0,
@@ -370,7 +370,7 @@ def extend_attention_fwd(
         kv_indptr,
         kv_indices,
         custom_mask,
-        mask_offsets,
+        mask_indptr,
         sm_scale,
         kv_group_num,
         q_extend.stride(0),
