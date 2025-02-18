@@ -43,7 +43,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     float* scale_output = output_s + block_group_id + local_group_id;
 
     for (int i = local_tid; i < group_size; i += 16) {
-      float val = static_cast<float>(castToFloat(group_input[i]));
+      float val = castToFloat(group_input[i]);
 
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
@@ -64,7 +64,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     }
 
     for (int i = local_tid; i < group_size; i += 16) {
-      float val = static_cast<float>(castToFloat(group_input[i]));
+      float val = castToFloat(group_input[i]);
 
       float q_val = fminf(fmaxf(val / y_s, fp8_min), fp8_max);
       group_output[i] = FP8_TYPE(q_val);
