@@ -7,7 +7,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
 
-// this is adoption from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
+// Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 
 namespace amdgpu {
 
