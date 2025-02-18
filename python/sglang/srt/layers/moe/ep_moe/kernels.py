@@ -291,14 +291,15 @@ def grouped_gemm_triton_kernel(
             b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2)
             accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
         else:
+            tl.static_print(a_tile.dtype, b_tile.dtype)
             accumulator = tl.dot(a_tile, b_tile.T, accumulator)
         a_ptr += BLOCK_SIZE_K
         b_ptr += BLOCK_SIZE_K
 
-    if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
-        scale_a_value = tl.load(scale_a + expert_id)
-        scale_b_value = tl.load(scale_b + expert_id)
-        accumulator *= scale_a_value * scale_b_value
+    # if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
+    #     scale_a_value = tl.load(scale_a + expert_id)
+    #     scale_b_value = tl.load(scale_b + expert_id)
+    #     accumulator *= scale_a_value * scale_b_value
 
     c_tile = accumulator.to(c_dtype)
 
@@ -364,7 +365,6 @@ def grouped_gemm_triton(
     )
 
 
-    # print("fdsafoapsdjfio ",a,scale_a)
     grouped_gemm_triton_kernel[grid](
         a,
         b,

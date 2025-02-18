@@ -197,9 +197,6 @@ class EPMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
-        print("##########")
-        print(topk_ids, self.num_experts)
-        print("##########")
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
