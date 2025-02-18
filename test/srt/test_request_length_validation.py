@@ -23,17 +23,33 @@ class TestRequestLengthValidation(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=("--max-total-tokens", "1000", "--context-length", "100"),
+            other_args=("--max-total-tokens", "1000", "--context-length", "1000"),
         )
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_input_length_validation(self):
+    def test_input_length_longer_than_context_length(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
 
-        long_text = "hello " * 100  # Will tokenize to more than context length
+        long_text = "hello " * 1200  # Will tokenize to more than context length
+
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.chat.completions.create(
+                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                messages=[
+                    {"role": "user", "content": long_text},
+                ],
+                temperature=0,
+            )
+
+        self.assertIn("is longer than the model's context length", str(cm.exception))
+
+    def test_input_length_longer_than_maximum_allowed_length(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+
+        long_text = "hello " * 999  # the maximum allowed length is 994 tokens
 
         with self.assertRaises(openai.BadRequestError) as cm:
             client.chat.completions.create(
@@ -58,7 +74,7 @@ class TestRequestLengthValidation(unittest.TestCase):
                     {"role": "user", "content": long_text},
                 ],
                 temperature=0,
-                max_tokens=500,
+                max_tokens=1200,
             )
 
         self.assertIn(
