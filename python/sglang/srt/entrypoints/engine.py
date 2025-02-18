@@ -330,7 +330,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.1.post1",
+            "0.2.1.post2",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -438,7 +438,9 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
     if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
+        load_chat_template_for_openai_api(
+            tokenizer_manager, server_args.chat_template, server_args.model_path
+        )
 
     # Wait for the model to finish loading
     scheduler_infos = []
