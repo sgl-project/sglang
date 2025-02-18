@@ -20,7 +20,7 @@ limitations under the License.
 #include <pytorch_extension_utils.h>
 #else
 
-// adding dispatch utils adpated from flashinfer
+// Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
     using c_type = __half;              \
@@ -84,13 +84,9 @@ inline int getSMVersion() {
 
 #ifdef USE_ROCM
 
-#define CHECK_INPUT(x) \
-  \
-  CHECK_CUDA_INPUT(x);
+#define CHECK_INPUT(x) CHECK_CUDA_INPUT(x);
 
-#define CHECK_EQ(x, y) \
-  \
-  CHECK_CUDA_EQ(x, y);
+#define CHECK_EQ(x, y) CHECK_CUDA_EQ(x, y);
 
 #endif
 
@@ -132,5 +128,12 @@ inline int getSMVersion() {
 #if defined(__HIP_PLATFORM_AMD__)
 
 #include "hip_math_def.h"
+
+#else
+
+template <typename srcDtype>
+__device__ __forceinline__ float castToFloat(srcDtype val) {
+  return static_cast<srcDtype>(val);
+}
 
 #endif
