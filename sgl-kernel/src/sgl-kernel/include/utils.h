@@ -18,6 +18,21 @@ limitations under the License.
 #include <cuda_runtime.h>
 #ifndef USE_ROCM
 #include <pytorch_extension_utils.h>
+#else
+
+// adding dispatch utils adpated from flashinfer
+#define _DISPATCH_CASE_F16(c_type, ...) \
+  case at::ScalarType::Half: {          \
+    using c_type = __half;              \
+    return __VA_ARGS__();               \
+  }
+
+#define _DISPATCH_CASE_BF16(c_type, ...) \
+  case at::ScalarType::BFloat16: {       \
+    using c_type = __hip_bfloat16;       \
+    return __VA_ARGS__();                \
+  }
+
 #endif
 #include <torch/extension.h>
 
@@ -55,6 +70,8 @@ struct cuda_error : public std::runtime_error {
   CHECK_IS_CUDA(x);         \
   CHECK_IS_CONTIGUOUS(x)
 
+#define CHECK_CUDA_EQ(x, y) TORCH_CHECK(x == y, #x " must be" #y)
+
 inline int getSMVersion() {
   int device{-1};
   CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
@@ -65,7 +82,18 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+
+#define CHECK_INPUT(x) \
+  \
+  CHECK_CUDA_INPUT(x);
+
+#define CHECK_EQ(x, y) \
+  \
+  CHECK_CUDA_EQ(x, y);
+
+#endif
+
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, ...)           \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
@@ -82,7 +110,6 @@ inline int getSMVersion() {
         return false;                                                                    \
     }                                                                                    \
   }()
-#endif
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
   AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
@@ -95,3 +122,15 @@ inline int getSMVersion() {
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
 #define CEILDIV(x, y) (((x) + (y)-1) / (y))
+
+#ifndef USE_ROCM
+#define WARP_SIZE 32
+#else
+#define WARP_SIZE warpSize  // 64
+#endif
+
+#if defined(__HIP_PLATFORM_AMD__)
+
+#include "hip_math_def.h"
+
+#endif

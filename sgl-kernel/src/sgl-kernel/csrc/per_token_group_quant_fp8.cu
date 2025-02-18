@@ -6,13 +6,19 @@
 
 #include "utils.h"
 
+#ifndef USE_ROCM
+#define FULL_MASK 0xffff
+#else
+#define FULL_MASK 0xffffffff
+#endif
+
 using FP8_TYPE = c10::Float8_e4m3fn;
 
 __device__ __forceinline__ float GroupReduce(float val, const int tid) {
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 8));
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 4));
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 2));
-  val = fmaxf(val, __shfl_xor_sync(0xffff, val, 1));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 1));
   return val;
 }
 
@@ -90,7 +96,7 @@ void sgl_per_token_group_quant_fp8(torch::Tensor input, torch::Tensor output_q, 
 
   CHECK_EQ(input.numel() % group_size, 0);
 
-  dim3 grid((num_groups + 15) / 16);
+  dim3 grid(CEILDIV(num_groups, 16));
   dim3 block(256);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();

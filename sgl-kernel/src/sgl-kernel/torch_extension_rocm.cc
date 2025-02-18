@@ -24,6 +24,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+
+  // per_token_group_quant_fp8
+  m.def(
+      "sgl_per_token_group_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, float fp8_min, float fp8_max) -> ()");
+  m.impl("sgl_per_token_group_quant_fp8", torch::kCUDA, &sgl_per_token_group_quant_fp8);
 }
 
 REGISTER_EXTENSION(_kernels)
