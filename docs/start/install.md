@@ -2,7 +2,19 @@
 
 You can install SGLang using any of the methods below. For running DeepSeek V3/R1 with SGLang, refer to [DeepSeek V3 Support](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). It is always recommended to use the [latest release version](https://pypi.org/project/sglang/#history) and deploy it with [Docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended) to avoid fixed issues and environment-related problems.
 
-## Method 1: With uv
+## Method 1: With pip or uv
+
+You may use pip to install SGLang in your environment by running the following commands:
+```bash
+pip install --upgrade pip
+
+pip install setuptools
+pip install sgl-kernel
+pip install torch==2.5.1
+pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
+pip install "sglang[all]"
+pip install transformers==4.48.3
+```
 
 We recommend to use uv to install the dependencies for higher installation speed.
 Please [install uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't done so.
