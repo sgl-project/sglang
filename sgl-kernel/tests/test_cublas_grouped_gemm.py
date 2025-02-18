@@ -41,4 +41,9 @@ class TestGroupedGemm(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if torch.cuda.is_available():
+        cuda_version = tuple(map(int, torch.version.cuda.split(".")))
+        if cuda_version >= (12, 5):
+            unittest.main()
+        else:
+            print(f"Cuda version {cuda_version} lower than 12.5, not executing tests.")
