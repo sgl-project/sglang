@@ -1,6 +1,5 @@
 import argparse
 import json
-import statistics
 import time
 
 import answer_extraction
