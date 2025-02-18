@@ -514,6 +514,8 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "deepseek-vl2",
+                "--context-length",
+                "4096",
             ],
         )
         cls.base_url += "/v1"
