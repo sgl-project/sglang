@@ -559,7 +559,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     ]
                     image_embeds_offset += num_image_tokens
 
-        input_ids = None
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
