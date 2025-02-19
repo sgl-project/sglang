@@ -2,8 +2,8 @@
 
 #if USE_ROCM
 
-#include <hip/hip_common.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_common.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
 
@@ -33,11 +33,11 @@ struct vec_t {
   FLASHINFER_INLINE void cast_load(const T* ptr);
 };
 
-} // namespace flashinfer
+}  // namespace flashinfer
 
 // **** impl *****
 
-namespace flashinfer  {
+namespace flashinfer {
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
 FLASHINFER_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src_ptr) {
@@ -56,9 +56,9 @@ FLASHINFER_INLINE void vec_t<float_t, vec_size>::cast_load(const T* ptr) {
   cast_load_impl(*this, ptr);
 }
 
-} // namespace flashinfer
+}  // namespace flashinfer
 
 #include "impl/hip_vec_bf16_impl.h"
-#include "impl/hip_vec_half_impl.h"
 #include "impl/hip_vec_fp32_impl.h"
+#include "impl/hip_vec_half_impl.h"
 #endif
