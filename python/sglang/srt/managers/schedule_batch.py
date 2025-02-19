@@ -150,6 +150,14 @@ class ImageInputs:
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
+    # The id of the single-image placeholder token
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+    tgt_sizes: Optional[list] = None
+
     # Llava related
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
@@ -157,16 +165,10 @@ class ImageInputs:
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
-
-    # The id of the single-image placeholder token
-    im_token_id: Optional[torch.Tensor] = None
-    # All the images in the batch should share the same special image
-    # bound token ids.
-    im_start_id: Optional[int] = None
-    im_end_id: Optional[int] = None
-    slice_start_id: Optional[int] = None
-    slice_end_id: Optional[int] = None
-    tgt_sizes: Optional[list] = None
+    # Qwen2-VL video related
+    video_token_id: Optional[int] = None
+    video_grid_thws: List[Tuple[int, int, int]] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
     # denotes the number of valid image tokens in each image
     images_emb_mask: Optional[torch.BoolTensor] = None

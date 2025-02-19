@@ -17,8 +17,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
 
-MiniCPMV = "openbmb/MiniCPM-V-2_6"
-
 
 # Test the logits output between HF and SGLang
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
@@ -155,7 +153,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model_path = MiniCPMV
+        cls.model_path = "openbmb/MiniCPM-V-2_6"
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
