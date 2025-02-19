@@ -27,16 +27,17 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
 
   // build_tree_kernel_efficient
   m.def(
-    "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-    "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! retrive_next_sibling, "
-    "int topk, int depth, int draft_token_num) -> ()");
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, "
+      "int topk, int depth, int draft_token_num) -> ()");
   m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
 
   // build_tree_kernel
   m.def(
-    "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-    "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
-    "int topk, int depth, int draft_token_num) -> ()");
+      "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
+      "int topk, int depth, int draft_token_num) -> ()");
   m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
 }
 
