@@ -875,6 +875,7 @@ def v1_chat_generate_request(
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
+    openai_compatible_messages_list = []
     for request in all_requests:
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
@@ -914,7 +915,7 @@ def v1_chat_generate_request(
                     openai_compatible_messages = openai_compatible_messages[:-1]
                 else:
                     assistant_prefix = None
-
+                openai_compatible_messages_list.append(openai_compatible_messages)
                 try:
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
@@ -1003,11 +1004,17 @@ def v1_chat_generate_request(
 
         image_data_list.append(image_data)
         modalities_list.append(modalities)
+
     if len(all_requests) == 1:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids[0]}
-        else:
+        if (
+            len(openai_compatible_messages_list) > 0
+            and len(openai_compatible_messages_list[0]) > 0
+        ):
+            prompt_kwargs = {"text": str(openai_compatible_messages_list[0])}
+        elif not isinstance(input_ids[0], str):
             prompt_kwargs = {"input_ids": input_ids[0]}
+        else:
+            prompt_kwargs = {"text": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
         return_logprobs = return_logprobs[0]
@@ -1016,10 +1023,17 @@ def v1_chat_generate_request(
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
     else:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids}
-        else:
+        if len(openai_compatible_messages_list) > 0:
+            prompt_kwargs = {
+                "text": [
+                    " ".join(f"{item['role']}: {item['content']}" for item in sublist)
+                    for sublist in openai_compatible_messages_list
+                ]
+            }
+        elif not isinstance(input_ids[0], str):
             prompt_kwargs = {"input_ids": input_ids}
+        else:
+            prompt_kwargs = {"text": input_ids}
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
@@ -1034,7 +1048,6 @@ def v1_chat_generate_request(
         modalities=modalities_list,
         lora_path=lora_paths,
     )
-
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
@@ -1596,6 +1609,7 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
+
     request_json = await raw_request.json()
     all_requests = [EmbeddingRequest(**request_json)]
     adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
