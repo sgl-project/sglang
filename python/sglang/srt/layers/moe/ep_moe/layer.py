@@ -33,11 +33,10 @@ logger = logging.getLogger(__name__)
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
 
-    def __init__(self, device, quant_method, use_flashinfer: bool = False):
+    def __init__(self, device, use_flashinfer: bool = False):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
-        self.quant_method = quant_method
         if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
 
@@ -63,6 +62,7 @@ class GroupedGemmRunner(torch.nn.Module):
         use_fp8_w8a8: bool = False,
         scale_a: torch.Tensor = None,
         scale_b: torch.Tensor = None,
+        block_shape: Optional[List[int]] = None,
     ):
         if self.use_flashinfer:
             # TODO: flashinfer
@@ -78,10 +78,6 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         else:
             assert weight_column_major == True
-            if self.quant_method.quant_config == None:
-                block_size = None
-            else:
-                block_size = (self.quant_method.quant_config.weight_block_size,)
             c = grouped_gemm_triton(
                 a,
                 b,
@@ -93,7 +89,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 use_fp8_w8a8,
                 scale_a,
                 scale_b,
-                block_shape=block_size,
+                block_shape=block_shape,
             )
         return c
 
@@ -160,6 +156,10 @@ class EPMoE(torch.nn.Module):
                 quant_config
             )
             self.use_fp8_w8a8 = True
+            self.use_block_quant = getattr(self.quant_method, "block_quant", False)
+            self.block_shape = (
+                self.quant_config.weight_block_size if self.use_block_quant else None
+            )
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
 
@@ -181,7 +181,6 @@ class EPMoE(torch.nn.Module):
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
-                self.quant_method,
                 use_flashinfer=False,  # TODO: use flashinfer
             )
 
@@ -204,9 +203,13 @@ class EPMoE(torch.nn.Module):
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
             device=hidden_states.device,
-            dtype=self.fp8_dtype if self.use_fp8_w8a8 else hidden_states.dtype,
+            dtype=(
+                self.fp8_dtype
+                if (self.use_fp8_w8a8 and not self.use_block_quant)
+                else hidden_states.dtype
+            ),
         )
-        if self.activation_scheme == "dynamic":
+        if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
                 torch.max(hidden_states)
                 .repeat(self.num_experts_per_partition)
@@ -251,12 +254,13 @@ class EPMoE(torch.nn.Module):
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=(None if self.quant_method.block_quant else self.w13_weight_scale),
+            scale_a=self.w13_input_scale,
             scale_b=(
                 self.w13_weight_scale_inv
-                if self.quant_method.block_quant
+                if self.use_block_quant
                 else self.w13_weight_scale
             ),
+            block_shape=self.block_shape,
         )
 
         # Act
@@ -264,9 +268,13 @@ class EPMoE(torch.nn.Module):
             gateup_output.shape[0],
             gateup_output.shape[1] // 2,
             device=gateup_output.device,
-            dtype=self.fp8_dtype if self.use_fp8_w8a8 else hidden_states.dtype,
+            dtype=(
+                self.fp8_dtype
+                if (self.use_fp8_w8a8 and not self.use_block_quant)
+                else hidden_states.dtype
+            ),
         )
-        if self.w2_input_scale is None:
+        if self.w2_input_scale is None and not self.use_block_quant:
             self.w2_input_scale = torch.ones(
                 self.num_experts_per_partition,
                 dtype=torch.float32,
@@ -303,12 +311,13 @@ class EPMoE(torch.nn.Module):
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=(None if self.quant_method.block_quant else self.w2_input_scale),
+            scale_a=self.w2_input_scale,
             scale_b=(
                 self.w2_weight_scale_inv
-                if self.quant_method.block_quant
+                if self.use_block_quant
                 else self.w2_weight_scale
             ),
+            block_shape=self.block_shape,
         )
 
         # PostReorder
@@ -400,7 +409,6 @@ class EPMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
         expert_id: int,
-        block_quant: int,
     ) -> None:
         param_data = param.data
 
@@ -418,11 +426,16 @@ class EPMoE(torch.nn.Module):
             param_data[expert_id] = loaded_weight
         # Weight scales
         elif "weight_scale" in weight_name:
-            if block_quant:
+            if self.use_block_quant:
+                block_n, block_k = self.block_shape[0], self.block_shape[1]
                 if shard_id == "w1":
-                    param_data[expert_id][:16, :] = loaded_weight
+                    param_data[expert_id][
+                        : (self.intermediate_size + block_n - 1) // block_n, :
+                    ] = loaded_weight
                 elif shard_id == "w3":
-                    param_data[expert_id][16:32, :] = loaded_weight
+                    param_data[expert_id][
+                        (self.intermediate_size + block_n - 1) // block_n :, :
+                    ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
             # If we are in merged column case (gate_up_proj)
@@ -439,10 +452,6 @@ class EPMoE(torch.nn.Module):
 
 
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
-    def __init__(self):
-        super().__init__()
-        self.quant_config = None
-        self.block_quant = False
 
     def create_weights(
         self,
@@ -546,28 +555,32 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
+        tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # TODO(lukec) Currently, the combination of TP+EP is not supported.
-            # Further investigation is needed to determine if implementation is necessary in the future.
+            # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+            # Required by collum parallel or enabling merged weights
             if intermediate_size % block_n != 0:
                 raise ValueError(
                     f"The output_size of gate's and up's weight = "
                     f"{intermediate_size} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
-            if intermediate_size % block_k != 0:
-                raise ValueError(
-                    f"The input_size of down's weight = "
-                    f"{intermediate_size} is not divisible by "
-                    f"weight quantization block_k = {block_k}."
-                )
+            if tp_size > 1:
+                # Required by row parallel
+                if intermediate_size % block_k != 0:
+                    raise ValueError(
+                        f"The input_size of down's weight = "
+                        f"{intermediate_size} is not divisible by "
+                        f"weight quantization block_k = {block_k}."
+                    )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
