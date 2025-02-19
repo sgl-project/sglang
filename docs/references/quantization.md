@@ -85,6 +85,8 @@ python3 -m sglang.launch_server \
 
 We support the following quantization methods based on torchao `["int8dq", "int8wo", "fp8wo", "fp8dq-per_tensor", "fp8dq-per_row", "int4wo-32", "int4wo-64", "int4wo-128", "int4wo-256"]`.
 
+We also support [gemlite](https://github.com/mobiusml/gemlite) quantization method based on torchao `["gemlite-<packing_bitwidth>-<bit_width>-<group_size>", "gemlite-<bit_width>-<group_size>"]`.
+
 Note: According to [this issue](https://github.com/sgl-project/sglang/issues/2219#issuecomment-2561890230), `"int8dq"` method currently has some bugs when using together with cuda graph capture. So we suggest to disable cuda graph capture when using `"int8dq"` method. Namely, please use the following command:
 
 ```bash
