@@ -206,7 +206,7 @@ def fused_moe_kernel(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-                tl.static_print(a.shape, b.shape, a_scale.shape, b_scale.shape)
+
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 accumulator = tl.dot(a, b, acc=accumulator)
@@ -984,9 +984,6 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        print("#########")
-        print(curr_hidden_states.shape, w1.shape, intermediate_cache1.shape)
-        print("#########")
         invoke_fused_moe_kernel(
             curr_hidden_states,
             w1,
