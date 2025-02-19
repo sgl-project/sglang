@@ -11,5 +11,5 @@
 - `check_env.py`: Check the environment variables.
 - `global_config.py`: The global configs and constants.
 - `launch_server.py`: The entry point for launching the local server.
-- `llama3_eval.py`: Evaluation of Llama 3.1 using the Meta Llama dataset.
+- `llama3_eval.py`: Evaluation of Llama 3 using the Meta Llama dataset.
 - `utils.py`: Common utilities.
