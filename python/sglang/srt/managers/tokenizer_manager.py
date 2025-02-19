@@ -326,13 +326,12 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
+        image_inputs: Dict = await self.image_processor.process_images_async(
+            obj.image_data, input_text or input_ids, obj, self.max_req_input_len
+        )
+        if image_inputs and "input_ids" in image_inputs:
+            input_ids = image_inputs["input_ids"]
         if self.is_generation:
-            # TODO: also support getting embeddings for multimodal models
-            image_inputs: Dict = await self.image_processor.process_images_async(
-                obj.image_data, input_text or input_ids, obj, self.max_req_input_len
-            )
-            if image_inputs and "input_ids" in image_inputs:
-                input_ids = image_inputs["input_ids"]
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
@@ -389,6 +388,7 @@ class TokenizerManager:
                 obj.rid,
                 input_text,
                 input_ids,
+                image_inputs,
                 sampling_params,
             )
 

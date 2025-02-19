@@ -387,10 +387,17 @@ class ChatCompletionStreamResponse(BaseModel):
     usage: Optional[UsageInfo] = None
 
 
+class MultimodalEmbeddingInput(BaseModel):
+    text: Optional[str] = None
+    image: Optional[str] = None
+
+
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: Union[List[int], List[List[int]], str, List[str]]
+    input: Union[
+        List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
+    ]
     model: str
     encoding_format: str = "float"
     dimensions: int = None

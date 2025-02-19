@@ -730,6 +730,30 @@ class Scheduler:
         )
         req.tokenizer = self.tokenizer
 
+        # Handle multimodal inputs
+        if recv_req.image_inputs is not None:
+            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            # Expand a single image token into multiple dummy tokens for receiving image embeddings
+            req.origin_input_ids = self.pad_input_ids_func(
+                req.origin_input_ids, image_inputs
+            )
+            req.extend_image_inputs(image_inputs)
+
+            if len(req.origin_input_ids) >= self.max_req_input_len:
+                error_msg = (
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                )
+                logger.error(error_msg)
+                req.origin_input_ids = [0]
+                req.image_inputs = None
+                req.sampling_params.max_new_tokens = 0
+                req.finished_reason = FINISH_ABORT(
+                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                )
+                self.waiting_queue.append(req)
+                return
+                
         # Validate prompts length
         error_msg = validate_input_length(
             req,

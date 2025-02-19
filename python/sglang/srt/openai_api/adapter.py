@@ -40,6 +40,7 @@ from sglang.srt.conversation import (
     SeparatorStyle,
     chat_template_exists,
     generate_chat_conv,
+    generate_embedding_convs,
     register_conv_template,
 )
 from sglang.srt.function_call_parser import TOOLS_TAG_LIST, FunctionCallParser
@@ -61,6 +62,7 @@ from sglang.srt.openai_api.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     DeltaMessage,
+    MultimodalEmbeddingInput,
     EmbeddingObject,
     EmbeddingRequest,
     EmbeddingResponse,
@@ -1471,11 +1473,35 @@ def v1_embedding_request(all_requests, tokenizer_manager):
         prompt = prompts[0]
         if isinstance(prompt, str) or isinstance(prompt[0], str):
             prompt_kwargs = {"text": prompt}
+        elif isinstance(prompt, list) and isinstance(
+            prompt[0], MultimodalEmbeddingInput
+        ):
+            assert (
+                chat_template_name is not None
+            ), "chat_template_name is required for multimodal inputs"
+            texts = []
+            images = []
+            for item in prompt:
+                texts.append(item.text if item.text is not None else None)
+                images.append(item.image if item.image is not None else None)
+            convs = generate_embedding_convs(texts, images, chat_template_name)
+            generate_prompts = []
+            for conv in convs:
+                generate_prompts.append(conv.get_prompt())
+            if len(generate_prompts) == 1:
+                prompt_kwargs = {"text": generate_prompts[0], "image_data": images[0]}
+            else:
+                prompt_kwargs = {"text": generate_prompts, "image_data": images}
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
+        elif isinstance(prompts[0], list) and isinstance(
+            prompts[0][0], MultimodalEmbeddingInput
+        ):
+            #TODO: multiple requests 
+            raise NotImplementedError("Multiple requests with multimodal inputs are not supported yet")
         else:
             prompt_kwargs = {"input_ids": prompts}
 
