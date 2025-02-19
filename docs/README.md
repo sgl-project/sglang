@@ -40,7 +40,7 @@ pre-commit run --all-files
 
 ### **Port Allocation and CI Efficiency**
 
-When launching the server, we use:
+**To launch and kill the server:**
 
 ```python
 from sglang.test.test_utils import is_in_ci
@@ -63,7 +63,8 @@ wait_for_server(f"http://localhost:{port}")
 # Terminate Server
 terminate_process(server_process)
 ```
-Launch Engine and close Engine
+
+**To launch and kill the engine:**
 
 ```python
 # Launch Engine
@@ -80,15 +81,18 @@ llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
 llm.shutdown()
 ```
 
-#### **Why this approach?**
+### **Why this approach?**
+
 - **Dynamic Port Allocation**: Avoids port conflicts by selecting an available port at runtime, enabling multiple server instances to run in parallel.
 - **Optimized for CI**: The `patch` version of `launch_server_cmd` and `sgl.Engine()` in CI environments helps manage GPU memory dynamically, preventing conflicts and improving test parallelism.
 - **Better Parallel Execution**: Ensures smooth concurrent tests by avoiding fixed port collisions and optimizing memory usage.
 
-#### **Model Selection**
+### **Model Selection**
+
 For demonstrations in the docs, **prefer smaller models** to reduce memory consumption and speed up inference. Running larger models in CI can lead to instability due to memory constraints.
 
-#### **Prompt Alignment Example**
+### **Prompt Alignment Example**
+
 When designing prompts, ensure they align with SGLang’s structured formatting. For example:
 
 ```python
@@ -99,5 +103,3 @@ Assistant: The capital of France is Paris."""
 ```
 
 This keeps responses aligned with expected behavior and improves reliability across different files.
-
----
