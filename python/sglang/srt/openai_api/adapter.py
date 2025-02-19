@@ -996,11 +996,19 @@ def v1_chat_generate_request(
 
         image_data_list.append(image_data)
         modalities_list.append(modalities)
+
+    # User input context for logging
+    user_text = (
+        " ".join([msg.content for msg in request.messages if msg.role == "user"])
+        if request.messages
+        else ""
+    )
     if len(all_requests) == 1:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids[0]}
         else:
-            prompt_kwargs = {"input_ids": input_ids[0]}
+            prompt_kwargs = {"input_ids": input_ids[0], "text": user_text}
+
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
         return_logprobs = return_logprobs[0]
@@ -1011,8 +1019,9 @@ def v1_chat_generate_request(
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
+
         else:
-            prompt_kwargs = {"input_ids": input_ids}
+            prompt_kwargs = {"input_ids": input_ids[0], "text": user_text}
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
