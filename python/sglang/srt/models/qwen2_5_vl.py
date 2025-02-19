@@ -31,11 +31,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import AutoModel, Qwen2VLConfig
+from transformers import Qwen2VLConfig
 from transformers.activations import ACT2FN
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
-from sglang.srt.configs import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
+from sglang.srt.configs import Qwen2_5_VLVisionConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -107,12 +107,15 @@ class Qwen2_5_VisionBlock(nn.Module):
         if attn_implementation == "sdpa":
             use_context_forward = False
             use_full_precision_softmax = False
+            flatten_batch = True
         elif attn_implementation == "flash_attention_2":
             use_full_precision_softmax = False
             use_context_forward = True
+            flatten_batch = True
         elif attn_implementation == "eager":
             use_full_precision_softmax = True
             use_context_forward = False
+            flatten_batch = True
 
         self.attn = VisionAttention(
             embed_dim=dim,
@@ -121,7 +124,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             use_qkv_parallel=False,
             use_context_forward=use_context_forward,
             use_full_precision_softmax=use_full_precision_softmax,
-            flatten_batch=True,
+            flatten_batch=flatten_batch,
             quant_config=quant_config,
         )
         self.mlp = Qwen2_5_VLMLP(
@@ -129,12 +132,17 @@ class Qwen2_5_VisionBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, cu_seqlens: torch.Tensor, rotary_pos_emb: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
         attn = self.attn(
-            hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -164,9 +172,10 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        target_dtype = self.proj.weight.dtype
         L, C = x.shape
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.embed_dim)
+        x = self.proj(x.to(dtype=target_dtype)).view(L, self.embed_dim)
         return x
 
 
@@ -212,35 +221,53 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        self.dim = dim
-        self.theta = theta
+        print(f"dim: {dim}")
+        print(f"theta: {theta}")
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._freqs_cached = None
-
-    def update_freqs_cache(self, seqlen: int) -> None:
-        if seqlen > self._seq_len_cached:
-            seqlen *= 2
-            self._seq_len_cached = seqlen
-            self.inv_freq = 1.0 / (
-                self.theta
-                ** (
-                    torch.arange(
-                        0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device
-                    )
-                    / self.dim
-                )
-            )
-            seq = torch.arange(
-                seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-            )
-            freqs = torch.outer(seq, self.inv_freq)
-            self._freqs_cached = freqs
 
     def forward(self, seqlen: int) -> torch.Tensor:
-        self.update_freqs_cache(seqlen)
-        return self._freqs_cached[:seqlen]
+        print(f"seqlen: {seqlen}")
+        seq = torch.arange(
+            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(seq, self.inv_freq)
+        return freqs
+
+
+first = True
+
+
+# 另一个版本：返回更短的hash值
+def tensor_hash_short(tensor, bits=32):
+    """
+    计算tensor的简单hash值，返回较短的结果
+
+    参数:
+    tensor: torch.Tensor - 输入张量
+    bits: int - 结果的位数
+
+    返回:
+    int - hash值
+    """
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+
+    tensor = tensor.float()
+
+    # 使用张量操作计算hash
+    hash_value = torch.sum(tensor).item()
+    hash_value = hash_value * torch.prod(torch.tensor(tensor.shape)).item()
+
+    # 加入一些张量特征
+    std_value = torch.std(tensor).item()
+    mean_value = torch.mean(tensor).item()
+
+    # 组合所有特征
+    final_hash = int((hash_value + std_value * 1e6 + mean_value * 1e4) * 1e6)
+
+    # 取模以限制位数
+    return final_hash % (2**bits)
 
 
 class Qwen2_5_VisionTransformer(nn.Module):
@@ -258,7 +285,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         spatial_merge_size: int = vision_config.spatial_merge_size
         self.spatial_merge_size = spatial_merge_size
         self.spatial_merge_unit: int = spatial_merge_size * spatial_merge_size
-        in_chans: int = vision_config.in_chans
+        in_chans: int = vision_config.in_channels
         hidden_size: int = vision_config.hidden_size
         depth: int = vision_config.depth
         num_heads: int = vision_config.num_heads
@@ -356,31 +383,33 @@ class Qwen2_5_VisionTransformer(nn.Module):
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+            hpos_ids = hpos_ids.flatten()
+
             wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            hpos_ids = (
-                hpos_ids.reshape(
-                    h // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                    w // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                )
-                .permute(0, 2, 1, 3)
-                .flatten()
+            wpos_ids = wpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
             )
-            wpos_ids = (
-                wpos_ids.reshape(
-                    h // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                    w // self.spatial_merge_size,
-                    self.spatial_merge_size,
-                )
-                .permute(0, 2, 1, 3)
-                .flatten()
-            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+            wpos_ids = wpos_ids.flatten()
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = grid_thw[:, 1:].max()
+        if first:
+            print(f"spatial_merge_size {self.spatial_merge_size}")
+            save_tensor(max_grid_size, "max_grid_size")
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        if first:
+            save_tensor(rotary_pos_emb_full, "rotary_pos_emb_full")
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
@@ -392,9 +421,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
-
+        global first
+        if first:
+            save_tensor(grid_thw, "grid_thw")
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        if first:
+            save_tensor(rotary_pos_emb, "rotary_pos_emb_0")
 
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
@@ -414,12 +447,18 @@ class Qwen2_5_VisionTransformer(nn.Module):
         )
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        if first:
+            save_tensor(emb, "emb")
+            print(f"emb hash {tensor_hash_short(emb)}")
 
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        ).cumsum(dim=0, dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32)
+
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         # transformers
         x = x.unsqueeze(1)
@@ -428,18 +467,29 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
-            x = blk(x, cu_seqlens=cu_seqlens_now, rotary_pos_emb=rotary_pos_emb)
+            x = blk(
+                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+            )
 
         # adapter
         x = self.merger(x)
-
         reverse_indices = torch.argsort(window_index)
         x = x[reverse_indices, :]
 
+        first = False
         return x
 
 
 cached_get_processor = lru_cache(get_processor)
+
+
+def save_tensor(tensor, filename):
+    import os
+
+    # 将 tensor 转换为 ndarray
+    if os.path.exists(filename):
+        return
+    torch.save(tensor, filename)
 
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
@@ -596,7 +646,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 start_idx = extend_start_loc_cpu[i]
                 prefix_len = prefix_lens_cpu[i]
 
-                pixel_values = image.pixel_values.clone().detach().requires_grad_(False)
+                pixel_values = image.pixel_values.to(device="cuda")
+
                 image_grid_thws = torch.tensor(
                     np.array(image.image_grid_thws), device="cuda"
                 )
@@ -604,9 +655,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 image_input = Qwen2VLImageInputs(
                     pixel_values=pixel_values, image_grid_thw=image_grid_thws
                 )
+                save_tensor(pixel_values, "pixel_values_sglang")
+
                 image_embeds = self._process_image_input(image_input)
+                save_tensor(image_embeds, "image_embeds_0_sglang")
 
                 image_embeds_offset = 0
+                print(f"input_ids: {input_ids}")
                 for idx, image_offset in enumerate(image_offsets):
                     if image_offset < prefix_len:
                         continue
@@ -639,6 +694,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                         ]
                     )
                     image_embeds_offset += num_image_tokens
+
+                save_tensor(inputs_embeds, "qwen2_5_input_embeds")
 
         input_ids = None
         hidden_states = self.model(
@@ -719,4 +776,4 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]
-AutoModel.register(Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration)
+# AutoModel.register(Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration)

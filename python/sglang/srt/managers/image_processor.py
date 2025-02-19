@@ -3,6 +3,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import math
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
@@ -10,6 +11,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 import PIL
+import torch
 import transformers
 from decord import VideoReader, cpu
 from PIL import Image
@@ -85,7 +87,8 @@ class BaseImageProcessor(ABC):
 
         return estimated_frames_list
 
-    def encode_video(self, video_path, frame_count_limit=None):
+    @staticmethod
+    def encode_video(video_path, frame_count_limit=None):
         if not os.path.exists(video_path):
             logger.error(f"Video {video_path} does not exist")
             return []
@@ -100,19 +103,21 @@ class BaseImageProcessor(ABC):
 
         vr = VideoReader(video_path, ctx=cpu(0))
         sample_fps = round(vr.get_avg_fps() / 1)  # FPS
-        frame_idx = [i for i in range(0, len(vr), sample_fps)]
-        if frame_count_limit is not None and len(frame_idx) > frame_count_limit:
-            frame_idx = uniform_sample(frame_idx, frame_count_limit)
-        frames = vr.get_batch(frame_idx).asnumpy()
+        frame_indices = [i for i in range(0, len(vr), sample_fps)]
+        if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+            frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+        frames = vr.get_batch(frame_indices).asnumpy()
         frames = [Image.fromarray(v.astype("uint8")) for v in frames]
         return frames
 
     def load_images(
         self,
-        max_req_input_len: int,
         input_ids: list,
         image_data,
         image_token: str,
+        max_req_input_len: int,
+        return_text: Optional[bool] = True,
     ) -> BaseImageProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -121,13 +126,14 @@ class BaseImageProcessor(ABC):
         all_frames = []
         new_text_parts = []
 
-        if isinstance(input_ids, list):
+        if isinstance(input_ids, list) and return_text:
             assert len(input_ids) and isinstance(input_ids[0], int)
             input_text = self._processor.tokenizer.decode(input_ids)
         else:
             input_text = input_ids
 
-        text_parts = input_text.split(image_token)
+        if return_text:
+            text_parts = input_text.split(image_token)
 
         # roughly calculate the max number of frames under the max_req_input_len limit
         def calculate_max_num_frames() -> int:
@@ -146,21 +152,22 @@ class BaseImageProcessor(ABC):
             zip(image_data, estimated_frames_list)
         ):
             if len(all_frames) >= MAX_NUM_FRAMES:
-                frames_to_process = 0
+                max_frames_to_process = 0
             else:
-                frames_to_process = max(1, int(estimated_frames * scaling_factor))
+                max_frames_to_process = max(1, int(estimated_frames * scaling_factor))
 
-            if frames_to_process == 0:
+            if max_frames_to_process == 0:
                 frames = []
             else:
                 try:
                     if isinstance(image, str) and image.startswith("video:"):
                         path = image[len("video:") :]
-                        frames = self.encode_video(
-                            path, frame_count_limit=frames_to_process
+                        frames = BaseImageProcessor.encode_video(
+                            path, frame_count_limit=max_frames_to_process
                         )
                     else:
                         raw_image, _size = load_image(image)
+                        raw_image = raw_image.convert("RGB")
                         frames = [raw_image]
                     if len(frames) == 0:
                         continue
@@ -171,12 +178,13 @@ class BaseImageProcessor(ABC):
                 image_hashes += [hash(image)] * len(frames)
                 all_frames += frames
 
-            new_text_parts.append(text_parts[image_index])
-            if frames_to_process != 0:
+            if return_text:
+                new_text_parts.append(text_parts[image_index])
+            if max_frames_to_process != 0:
                 new_text_parts.append(image_token * len(frames))
-            assert frames_to_process == len(frames)
-
-        new_text_parts.append(text_parts[-1])
+            assert max_frames_to_process >= len(frames)
+        if return_text:
+            new_text_parts.append(text_parts[-1])
 
         input_text = "".join(new_text_parts)
         return BaseImageProcessorOutput(
@@ -195,6 +203,7 @@ class DummyImageProcessor(BaseImageProcessor):
 class LlavaImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
+        self.IMAGE_TOKEN = "<image>"
 
     @staticmethod
     def _process_single_image_task(
@@ -209,15 +218,13 @@ class LlavaImageProcessor(BaseImageProcessor):
             image, image_size = load_image(image_data)
             if image_size is not None:
                 # It is a video with multiple images
-                image_hash = hash(image_data)
                 pixel_values = image_processor(image)["pixel_values"]
                 for _ in range(len(pixel_values)):
                     pixel_values[_] = pixel_values[_].astype(np.float16)
                 pixel_values = np.stack(pixel_values, axis=0)
-                return pixel_values, image_hash, image_size
+                return {"pixel_values": pixel_values}
             else:
                 # It is an image
-                image_hash = hash(image_data)
                 if image_aspect_ratio == "pad":
                     image = expand2square(
                         image,
@@ -239,13 +246,13 @@ class LlavaImageProcessor(BaseImageProcessor):
                 if isinstance(pixel_values, np.ndarray):
                     pixel_values = pixel_values.astype(np.float16)
 
-                return pixel_values, image_hash, image.size
+                return {"pixel_values": pixel_values}
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
 
     async def _process_single_image(
         self, image_data: Union[bytes, str], aspect_ratio: str, grid_pinpoints: str
-    ):
+    ) -> dict:
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -263,15 +270,25 @@ class LlavaImageProcessor(BaseImageProcessor):
     async def process_images_async(
         self,
         image_data: List[Union[str, bytes]],
-        input_text,
+        input_ids,
         request_obj,
+        max_req_input_len,
         *args,
         **kwargs,
     ):
         if not image_data:
             return None
+        if isinstance(image_data, str):
+            image_data = [image_data]
 
-        modalities = request_obj.modalities or ["image"]
+        base_output = self.load_images(
+            input_ids,
+            image_data,
+            self.IMAGE_TOKEN,
+            max_req_input_len,
+            return_text=False,
+        )
+
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
             self.hf_config.image_grid_pinpoints
@@ -280,43 +297,19 @@ class LlavaImageProcessor(BaseImageProcessor):
             else None
         )
 
-        if isinstance(image_data, str):
-            image_data = [image_data]
+        res = []
+        for img_data in image_data:
+            res.append(
+                self._process_single_image(img_data, aspect_ratio, grid_pinpoints)
+            )
 
-        if isinstance(image_data, list) and len(image_data) > 0:
-            if "multi-images" in modalities or "video" in modalities:
-                # Multiple images
-                aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
-                pixel_values, image_hashes, image_sizes = [], [], []
-                res = []
-                for img_data in image_data:
-                    res.append(
-                        self._process_single_image(
-                            img_data, aspect_ratio, grid_pinpoints
-                        )
-                    )
-                res = await asyncio.gather(*res)
-                for pixel_v, image_h, image_s in res:
-                    pixel_values.append(pixel_v)
-                    image_hashes.append(image_h)
-                    image_sizes.append(image_s)
-
-                if isinstance(pixel_values[0], np.ndarray):
-                    pixel_values = np.stack(pixel_values, axis=0)
-            else:
-                # A single image
-                pixel_values, image_hash, image_size = await self._process_single_image(
-                    image_data[0], aspect_ratio, grid_pinpoints
-                )
-                image_hashes = [image_hash]
-                image_sizes = [image_size]
-        else:
-            raise ValueError(f"Invalid image data: {image_data}")
-
+        res = await asyncio.gather(*res)
+        pixel_values = [r["pixel_values"] for r in res]
+        pixel_values = np.stack(pixel_values, axis=0)
         return {
             "pixel_values": pixel_values,
-            "image_hashes": image_hashes,
-            "image_sizes": image_sizes,
+            "image_hashes": base_output.image_hashes,
+            "image_sizes": base_output.image_sizes,
             "modalities": request_obj.modalities or ["image"],
         }
 
@@ -414,7 +407,10 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
             image_data = [image_data]
 
         base_output = self.load_images(
-            max_req_input_len, input_ids, image_data, self.IMAGE_TOKEN
+            input_ids,
+            image_data,
+            self.IMAGE_TOKEN,
+            max_req_input_len,
         )
         if base_output is None:
             return None
@@ -445,142 +441,42 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         }
 
 
-class Qwen2VLImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _image_processor):
-        self.hf_config = hf_config
-        self._image_processor = _image_processor
-        self.executor = concurrent.futures.ProcessPoolExecutor(
-            initializer=init_global_processor,
-            mp_context=mp.get_context("fork"),
-            initargs=(server_args,),
-            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
-        )
-
-    @staticmethod
-    def _process_single_image_task(
-        image_data: Union[str, bytes],
-        image_processor=None,
-    ):
-        image_processor = image_processor or global_processor.image_processor
-
-        try:
-            image, image_size = load_image(image_data)
-            if image_size is not None:
-                # It is a video with multiple images
-                image_hash = hash(image_data)
-                process_result = image_processor(image)
-                pixel_values, image_grid_thws = (
-                    process_result["pixel_values"],
-                    process_result["image_grid_thw"][0],
-                )
-                for _ in range(len(pixel_values)):
-                    pixel_values[_] = pixel_values[_].astype(np.float16)
-                pixel_values = np.stack(pixel_values, axis=0)
-                image_grid_thws = np.stack(image_grid_thws, axis=0)
-                return pixel_values, image_hash, image_size, image_grid_thws
-            else:
-                # It is an image
-                image_hash = hash(image_data)
-                process_result = image_processor(image)
-                pixel_values, image_grid_thws = (
-                    process_result["pixel_values"],
-                    process_result["image_grid_thw"][0],
-                )
-                if isinstance(pixel_values, np.ndarray):
-                    pixel_values = pixel_values.astype(np.float16)
-
-                return pixel_values, image_hash, image.size, image_grid_thws
-        except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
-
-    async def _process_single_image(self, image_data: Union[bytes, str]):
-        if self.executor is not None:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                self.executor,
-                Qwen2VLImageProcessor._process_single_image_task,
-                image_data,
-            )
-        else:
-            return self._process_single_image_task(image_data)
-
-    async def process_images_async(
-        self,
-        image_data: List[Union[str, bytes]],
-        input_text,
-        request_obj,
-        *args,
-        **kwargs,
-    ):
-        if not image_data:
-            return None
-
-        if isinstance(image_data, list) and len(image_data) > 0:
-            # Multiple images
-            if len(image_data) > 1:
-                pixel_values, image_hashes, image_sizes, image_grid_thws = (
-                    [],
-                    [],
-                    [],
-                    [],
-                )
-                res = []
-                for img_data in image_data:
-                    res.append(self._process_single_image(img_data))
-                res = await asyncio.gather(*res)
-                for pixel_v, image_h, image_s, image_thw in res:
-                    pixel_values.append(pixel_v)
-                    image_hashes.append(image_h)
-                    image_sizes.append(image_s)
-                    image_grid_thws.append(image_thw)
-
-                if isinstance(pixel_values[0], np.ndarray):
-                    pixel_values = np.concatenate(pixel_values, axis=0)
-            else:
-                # A single image
-                pixel_values, image_hash, image_size, image_grid_thw = (
-                    await self._process_single_image(image_data[0])
-                )
-                image_hashes = [image_hash]
-                image_sizes = [image_size]
-                image_grid_thws = [image_grid_thw]
-        elif isinstance(image_data, str):
-            # A single image
-            pixel_values, image_hash, image_size, image_grid_thw = (
-                await self._process_single_image(image_data)
-            )
-            image_hashes = [image_hash]
-            image_sizes = [image_size]
-            image_grid_thws = [image_grid_thw]
-        else:
-            raise ValueError(f"Invalid image data: {image_data}")
-
-        return {
-            "pixel_values": pixel_values,
-            "image_hashes": image_hashes,
-            "image_sizes": image_sizes,
-            "modalities": request_obj.modalities or ["image"],
-            "image_grid_thws": image_grid_thws,
-        }
-
-
+# Compatible with Qwen2VL and Qwen2_5VL
 class Qwen2_5VLImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
+        self.image_token_id = hf_config.image_token_id
+        self.video_token_id = hf_config.video_token_id
         self.NUM_TOKEN_PER_FRAME = 770
+        self.IMAGE_FACTOR = 28
+        self.MIN_PIXELS = 4 * 28 * 28
+        self.MAX_PIXELS = 16384 * 28 * 28
+        self.MAX_PIXELS = 16384 * 28 * 28
+        self.MAX_RATIO = 200
 
     @staticmethod
-    def _process_images_task(images, input_text):
+    def _process_images_task(images, input_text, hf_config):
+
         result = global_processor.__call__(
-            text=input_text, images=images, return_tensors="pt"
+            text=[input_text], images=images, padding=True, return_tensors="pt"
         )
+
+        image_grid_thw = result.image_grid_thw if "image_grid_thw" in result else None
+        pixel_values = result.pixel_values
+
         return {
             "input_ids": result.input_ids,
-            "pixel_values": result.pixel_values,
-            "image_grid_thws": result.image_grid_thw,
+            "pixel_values": pixel_values,
+            "image_grid_thws": image_grid_thw,
+            "second_per_grid_ts": (
+                result.second_per_grid_ts if "second_per_grid_ts" in result else None
+            ),
+            "video_grid_thws": (
+                result.video_grid_thws if "video_grid_thws" in result else None
+            ),
         }
 
     async def _process_images(self, images, input_text) -> dict:
@@ -591,9 +487,10 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
                 Qwen2_5VLImageProcessor._process_images_task,
                 images,
                 input_text,
+                self.hf_config,
             )
         else:
-            return self._process_images_task(images, input_text)
+            return self._process_images_task(images, input_text, self.hf_config)
 
     async def process_images_async(
         self,
@@ -611,10 +508,75 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_images(
-            max_req_input_len, input_ids, image_data, image_token
+            input_ids,
+            image_data,
+            image_token,
+            max_req_input_len,
         )
 
-        ret = await self._process_images(base_output.all_frames, base_output.input_text)
+        def resize_image(image, size_factor: int = self.IMAGE_FACTOR) -> Image.Image:
+            width, height = image.size
+            min_pixels = self.MIN_PIXELS
+            max_pixels = self.MAX_PIXELS
+            resized_height, resized_width = smart_resize(
+                height,
+                width,
+                factor=size_factor,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+            image = image.resize((resized_width, resized_height))
+            return image
+
+        def round_by_factor(number: int, factor: int) -> int:
+            """Returns the closest integer to 'number' that is divisible by 'factor'."""
+            return round(number / factor) * factor
+
+        def ceil_by_factor(number: int, factor: int) -> int:
+            """Returns the smallest integer greater than or equal to 'number' that is divisible by 'factor'."""
+            return math.ceil(number / factor) * factor
+
+        def floor_by_factor(number: int, factor: int) -> int:
+            """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
+            return math.floor(number / factor) * factor
+
+        def smart_resize(
+            height: int,
+            width: int,
+            factor: int = self.IMAGE_FACTOR,
+            min_pixels: int = self.MIN_PIXELS,
+            max_pixels: int = self.MAX_PIXELS,
+        ) -> tuple[int, int]:
+            """
+            Rescales the image so that the following conditions are met:
+
+            1. Both dimensions (height and width) are divisible by 'factor'.
+
+            2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
+
+            3. The aspect ratio of the image is maintained as closely as possible.
+            """
+            if max(height, width) / min(height, width) > self.MAX_RATIO:
+                raise ValueError(
+                    f"absolute aspect ratio must be smaller than {self.MAX_RATIO}, got {max(height, width) / min(height, width)}"
+                )
+            h_bar = max(factor, round_by_factor(height, factor))
+            w_bar = max(factor, round_by_factor(width, factor))
+            if h_bar * w_bar > max_pixels:
+                beta = math.sqrt((height * width) / max_pixels)
+                h_bar = floor_by_factor(height / beta, factor)
+                w_bar = floor_by_factor(width / beta, factor)
+            elif h_bar * w_bar < min_pixels:
+                beta = math.sqrt(min_pixels / (height * width))
+                h_bar = ceil_by_factor(height * beta, factor)
+                w_bar = ceil_by_factor(width * beta, factor)
+            return h_bar, w_bar
+
+        images = [resize_image(image) for image in base_output.all_frames]
+
+        print(f"text:{base_output.input_text}")
+
+        ret = await self._process_images(images, base_output.input_text)
 
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
@@ -622,8 +584,12 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
             "image_hashes": base_output.image_hashes,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": ret["image_grid_thws"],
+            "video_grid_thws": ret["video_grid_thws"],
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
+            "im_token_id": self.image_token_id,
+            "video_token_id": self.video_token_id,
+            "second_per_grid_ts": ret["second_per_grid_ts"],
         }
 
 
@@ -633,11 +599,9 @@ def get_image_processor(
     if "MllamaForConditionalGeneration" in hf_config.architectures:
         return MllamaImageProcessor(hf_config, server_args, processor)
     elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
-
-        return Qwen2VLImageProcessor(hf_config, server_args, processor)
+        return Qwen2_5VLImageProcessor(hf_config, server_args, processor)
     elif "Qwen2_5_VLForConditionalGeneration" in hf_config.architectures:
         return Qwen2_5VLImageProcessor(hf_config, server_args, processor)
-
     elif "MiniCPMV" in hf_config.architectures:
         return MiniCPMVImageProcessor(hf_config, server_args, processor)
     else:

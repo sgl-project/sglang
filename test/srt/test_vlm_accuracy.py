@@ -9,7 +9,12 @@ import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoModel,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.conversation import generate_chat_conv
@@ -17,7 +22,73 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
 
-MiniCPMV = "openbmb/MiniCPM-V-2_6"
+
+def vlm_text_with_image(args):
+    max_new_tokens = 100
+    # Load the processor and model for ImageTextToText tasks
+    processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.model_path,
+        torch_dtype=args.dtype,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    torch.cuda.set_device(0)
+
+    # List of image URLs to process
+    image_urls = [
+        "https://github.com/haotian-liu/LLaVA/blob/1a91fc274d7c35a9b50b3cb29c4247ae5837ce39/images/llava_v1_5_radar.jpg?raw=true"
+    ]
+
+    # Conversation template for the processor
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+
+    for i, url in enumerate(image_urls):
+        # Load the image from the URL
+        image = Image.open(requests.get(url, stream=True).raw)
+
+        # Apply the chat template to the text prompt
+        # Notice that not all processors support chat templates.
+        # LLaVA and QWen are two processors that support chat templates.
+        if not hasattr(processor, "apply_chat_template"):
+            raise ValueError("The processor does not support chat templates.")
+        text_prompt = processor.apply_chat_template(
+            conversation, add_generation_prompt=True
+        )
+
+        # Prepare inputs for the model
+        inputs = processor(text=[text_prompt], images=[image], return_tensors="pt").to(
+            "cuda:0"
+        )
+
+        # Generate output from the model
+        output_ids = model.generate(
+            **inputs, do_sample=False, max_new_tokens=max_new_tokens
+        )
+        output_str = processor.decode(output_ids[0])
+
+        # Get the logits from the model's forward pass
+        outputs = model.forward(**inputs)
+        logits = outputs.logits[0, -1, :]
+
+        print(f"\n========== Image {i} ==========")
+        print("prefill logits (final)", logits)
+        # TODO(gaocegege): The output contains numerous <|image_pad|> tokens,
+        # making it cluttered and difficult to read.
+        # These tokens should be removed or cleaned up for better readability.
+        print(output_str)
 
 
 # Test the logits output between HF and SGLang
@@ -155,7 +226,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model_path = MiniCPMV
+        cls.model_path = "openbmb/MiniCPM-V-2_6"
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
@@ -204,6 +275,56 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
             )
 
         self.compare_outputs(sglang_output, hf_output)
+
+
+class TestQwen2_5VLLogits(VisionLLMLogitsBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = MiniCPMV
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.chat_template = "minicpmv"
+
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.model = AutoModel.from_pretrained(
+            cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+        ).eval()
+        cls.model.to(cls.device)
+
+    async def test_output_ids(self):
+        max_new_tokens = 128
+        inputs = self.get_processor_output()
+
+        with torch.no_grad():
+            model_inputs = {
+                "input_ids": inputs.input_ids,
+                "image_bound": inputs.image_bound,
+                "pixel_values": inputs.pixel_values,
+                "tgt_sizes": inputs.tgt_sizes,
+            }
+            hf_outputs = self.model.forward(**inputs)
+            hf_logits = hf_outputs.logits[0, -1, :]
+
+        # with torch.no_grad():
+        #     model = self.get_sglang_model()
+        #     input_ids = inputs["input_ids"].to(self.device).flatten()
+        #     positions = compute_position_triton()
+        #     forward_batch =
+        #     image_inputs = model.forward(
+        #         input_ids,
+        #         positions,
+        #         for
+        #     )
+        #     (sglang_output, _) = model.get_embedding(
+        #         input_ids=input_ids, image_inputs=image_inputs
+        #     )
+        #
+        # self.compare_outputs(sglang_output, hf_output)
 
 
 if __name__ == "__main__":

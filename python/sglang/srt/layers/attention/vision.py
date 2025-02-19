@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed import utils as dist_utils
@@ -20,63 +20,139 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 
+# def rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
+#     if not interleaved:
+#         x1, x2 = x.chunk(2, dim=-1)
+#         return torch.cat((-x2, x1), dim=-1)
+#     else:
+#         x1, x2 = x[..., ::2], x[..., 1::2]
+#         return rearrange(
+#             torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2
+#         )
 
-def rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
-    if not interleaved:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return rearrange(
-            torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2
-        )
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_emb_torch(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
-) -> torch.Tensor:
+# def apply_rotary_emb_torch(
+#     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
+# ) -> torch.Tensor:
+#     """
+#     x: (batch_size, seqlen, nheads, headdim)
+#     cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
+#     """
+#     ro_dim = cos.shape[-1] * 2
+#     assert ro_dim <= x.shape[-1]
+#     cos = repeat(
+#         cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
+#     )
+#     sin = repeat(
+#         sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
+#     )
+#     return torch.cat(
+#         [
+#             x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
+#             x[..., ro_dim:],
+#         ],
+#         dim=-1,
+#     )
+
+
+# 另一个版本：返回更短的hash值
+def tensor_hash_short(tensor, bits=32):
     """
-    x: (batch_size, seqlen, nheads, headdim)
-    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
+    计算tensor的简单hash值，返回较短的结果
+
+    参数:
+    tensor: torch.Tensor - 输入张量
+    bits: int - 结果的位数
+
+    返回:
+    int - hash值
     """
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    cos = repeat(
-        cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
-    )
-    sin = repeat(
-        sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
-    )
-    return torch.cat(
-        [
-            x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
-            x[..., ro_dim:],
-        ],
-        dim=-1,
-    )
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+
+    tensor = tensor.float()
+
+    # 使用张量操作计算hash
+    hash_value = torch.sum(tensor).item()
+    hash_value = hash_value * torch.prod(torch.tensor(tensor.shape)).item()
+
+    # 加入一些张量特征
+    std_value = torch.std(tensor).item()
+    mean_value = torch.mean(tensor).item()
+
+    # 组合所有特征
+    final_hash = int((hash_value + std_value * 1e6 + mean_value * 1e4) * 1e6)
+
+    # 取模以限制位数
+    return final_hash % (2**bits)
 
 
-def apply_rotary_pos_emb_vision(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    t_ = t.float()
-    cos = freqs.cos()
-    sin = freqs.sin()
-    output = apply_rotary_emb_torch(t_, cos, sin).type_as(t)
-    return output
+# def apply_rotary_pos_emb_vision(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+#     t_ = t.float()
+#     cos = freqs.cos()
+#     sin = freqs.sin()
+#     output = apply_rotary_emb_torch(t_, cos, sin).type_as(t)
+#     return output
+
+
+def apply_rotary_pos_emb_vision(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if firstVA:
+        print(f"q shape {q.shape}")
+        print(f"k shape {k.shape}")
+        print(f"cos shape {cos.shape}")
+        print(f"sin shape {sin.shape}")
+        print(f"q {tensor_hash_short(q)}")
+        print(f"k {tensor_hash_short(k)}")
+        print(f"cos {tensor_hash_short(cos)}")
+        print(f"sin {tensor_hash_short(sin)}")
+        torch.save(q, "q_torch")
+        torch.save(k, "k_torch")
+        torch.save(cos, "cos_torch")
+        torch.save(sin, "sin_torch")
+
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    if firstVA:
+        print(f"q {tensor_hash_short(q)}")
+        print(f"k {tensor_hash_short(k)}")
+
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    if firstVA:
+        print(f"q {tensor_hash_short(q_embed)}")
+        print(f"k {tensor_hash_short(k_embed)}")
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    if firstVA:
+        print(f"q {tensor_hash_short(q_embed)}")
+        print(f"k {tensor_hash_short(k_embed)}")
+    return q_embed, k_embed
 
 
 class VisionAttention(nn.Module):
-    r"""
+    """
         Multi-headed attention without any cache, mostly used for ViT.
 
-
     Args:
-        use_qkv_parallel (bool, optional): If True, use QKV-parallel attention.
+        use_qkv_parallel (bool, optional):
+            If ``True``, use QKV-parallel attention.
         use_context_forward (bool, default to True):
             if ``True``, a flash_attn style attention will be applied
             Otherwise, a full-sequence attention will be applied.
         use_full_precision_softmax (bool, default to False):
-            if ``True``, the softmax will be performed in full-precision
-            Otherwise, it will be performed in half-precision
+            if ``True``, the softmax will be performed in full-precision (float32)
+            Otherwise, it will be performed in the same precision with qkv
 
     """
 
@@ -142,7 +218,7 @@ class VisionAttention(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor] = None,
-        rotary_pos_emb: torch.Tensor = None,
+        position_embeddings: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""
@@ -150,21 +226,17 @@ class VisionAttention(nn.Module):
             x: [b, s, embed_dim]
             cu_seqlens: [b]
         Returns:
-             [s, b, num_heads * head]
+             [s, b, head * head_size]
         """
         bsz, s, _ = x.shape
+        head = self.num_attention_heads_per_partition
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
             q, k, v = qkv.chunk(3, dim=-1)
 
-            # [b, s, embed_dim] --> [b * s, num_heads, head_size]
-            q, k, v = [
-                x.reshape(
-                    bsz * s, self.num_attention_heads_per_partition, -1
-                ).contiguous()
-                for x in (q, k, v)
-            ]
+            # [b, s, embed_dim] --> [b * s, head, head_size]
+            q, k, v = [x.reshape(bsz * s, head, -1).contiguous() for x in (q, k, v)]
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
             x = rearrange(x, "b s ... -> s b ...")
@@ -172,7 +244,7 @@ class VisionAttention(nn.Module):
             qkv, _ = self.qkv_proj(x)
             # [s, b, head * 3 * head_size] --> [s, b, head, 3 * head_size]
             new_x_shape = qkv.size()[:-1] + (
-                self.num_attention_heads_per_partition,
+                head,
                 3 * self.hidden_size_per_attention_head,
             )
             qkv = qkv.view(*new_x_shape)
@@ -185,9 +257,29 @@ class VisionAttention(nn.Module):
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
             ]
 
-        if rotary_pos_emb is not None:
-            q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
-            k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
+        global firstVA
+        if firstVA:
+            save_tensor(q, "q_before")
+            save_tensor(k, "k_before")
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            # rotary position embedding has to
+            original_shape = q.shape
+            q, k = q.view(s, head, -1), k.view(s, head, -1)
+            if firstVA:
+                save_tensor(cos, "cos")
+                save_tensor(sin, "sin")
+                print(f"q rotary shape: {q.shape}")
+                print(f"{q.dtype} {k.dtype} {cos.dtype} {sin.dtype}")
+            q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+            if firstVA:
+                save_tensor(q, "q_after")
+            q, k = q.reshape(original_shape), k.reshape(original_shape)
+
+        # if rotary_pos_emb is not None:
+        #     q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
+        #     k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
         if self.use_qkv_parallel:
             pass
@@ -215,7 +307,22 @@ class VisionAttention(nn.Module):
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)
 
+        firstVA = False
+
         return output
+
+
+def save_tensor(tensor, filename):
+    import os
+
+    # 将 tensor 转换为 ndarray
+    if os.path.exists(filename):
+        return
+    torch.save(tensor, filename)
+
+
+first = True
+firstVA = True
 
 
 class VisionSdpaAttention(nn.Module):
@@ -247,7 +354,7 @@ class VisionSdpaAttention(nn.Module):
         Args:
             s: sequence length
             flatten_batch: whether to flatten batch dimension
-            cu_seqlens: tuple of cumulative sequence lengths
+            cu_seqlens: tuple of cumulative sequencelengths
         Returns:
             attention mask tensor
         """
@@ -325,11 +432,15 @@ class VisionSdpaAttention(nn.Module):
 
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
 
+        global first
+
+        # [b, 1, s]
         if self.use_full_precision_softmax:
             scale = self.head_size**-0.5
             k_transposed = rearrange(k, "b h s d -> b h d s")
             attn_weights = torch.matmul(q, k_transposed) * scale
             del k, k_transposed
+            # invert and multiply with min
             attention_mask = (~attention_mask) * torch.finfo(q.dtype).min
             attn_weights = attn_weights + attention_mask
             del attention_mask
@@ -345,6 +456,10 @@ class VisionSdpaAttention(nn.Module):
         else:
             # SDPA
             # [b, h, s, head_size]
+            if first:
+                save_tensor(q, "q")
+                save_tensor(k, "k")
+                save_tensor(attention_mask, "attention_mask")
             output = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -356,7 +471,7 @@ class VisionSdpaAttention(nn.Module):
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
         output = rearrange(output, "b h s d -> (b s) h d")
-
+        first = False
         return output
 
 
