@@ -413,6 +413,15 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_gather(output, input)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output, input, group=self.device_group
+            )
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -440,9 +449,7 @@ class GroupCoordinator:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        self.all_gather_into_tensor(output_tensor, input_)
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
