@@ -183,13 +183,18 @@ python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
 ```
 
-### Example: Launch on any cloud or Kubernetes with SkyPilot and SGLang
+### Example: Serving on any cloud or Kubernetes with 
 
-SkyPilot helps finding cheapest available GPUs across any cloud or existing Kubernetes clusters. You can launch the DeepSeek SGLang serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1):
+SkyPilot helps finding cheapest available GPUs across any cloud or existing Kubernetes clusters and launch distributed serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1).
+
+To serve on multiple nodes:
 
 ```bash
 git clone https://github.com/skypilot-org/skypilot.git
+# Serve on 2 H100/H200x8 nodes
 sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B.yaml --retry-until-up
+# Serve on 4 A100x8 nodes
+sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B-A100.yaml --retry-until-up
 ```
 
 #### Troubleshooting
