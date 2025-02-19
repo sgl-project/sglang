@@ -30,12 +30,17 @@ if is_cuda():
 
 if is_hip():
     try:
-        from amdsmi import (AmdSmiException, amdsmi_get_gpu_board_info,
-                    amdsmi_get_processor_handles, amdsmi_init,
-                    amdsmi_shut_down, amdsmi_topo_get_link_type)
+        from amdsmi import (
+            AmdSmiException,
+            amdsmi_get_gpu_board_info,
+            amdsmi_get_processor_handles,
+            amdsmi_init,
+            amdsmi_shut_down,
+            amdsmi_topo_get_link_type,
+        )
     except ImportError as e:
         logger.warning("Failed to import amdsmi with %r", e)
-    
+
 try:
     if ops.use_vllm_custom_allreduce and not is_hip():
         ops.meta_size()
@@ -67,7 +72,9 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
                 return fn(*args, **kwargs)
             finally:
                 pynvml.nvmlShutdown()
+
     return wrapper
+
 
 @with_nvml_context
 def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
@@ -75,21 +82,17 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         """
         query if the set of gpus are fully connected by xgmi (1 hop)
         """
-        handles = [
-            amdsmi_get_processor_handles()[i] for i in physical_device_ids
-        ]
+        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:
                     try:
-                        link_type = amdsmi_topo_get_link_type(
-                            handle, peer_handle)
+                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
                         # type is 2 for XGMI
                         if link_type["hops"] != 1 or link_type["type"] != 2:
                             return False
                     except AmdSmiException as error:
-                        logger.error("AMD 1 hop XGMI detection failed.",
-                                     exc_info=error)
+                        logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
                         return False
         return True
     else:
@@ -273,20 +276,21 @@ class CustomAllreduce:
             if is_hip():
                 # meta data buffers need to be "uncached" for signal on MI200
                 self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-                self.buffer = torch.empty(max_size,
-                                  dtype=torch.uint8,
-                                  device=self.device)
+                self.buffer = torch.empty(
+                    max_size, dtype=torch.uint8, device=self.device
+                )
                 handle = ops.get_meta_buffer_ipc_handle(self.meta)
                 shard_data = (
                     bytes(handle),  # ipc handle to base ptr
                     0,  # offset of base ptr
                 )
                 handles, offsets = self._gather_ipc_meta(shard_data)
-                self.rank_data = torch.empty(8 * 1024 * 1024,
-                                     dtype=torch.uint8,
-                                     device=self.device)
-                self._ptr = ops.init_custom_ar(self.meta, self.rank_data, handles,
-                                               offsets, rank, self.full_nvlink)
+                self.rank_data = torch.empty(
+                    8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                )
+                self._ptr = ops.init_custom_ar(
+                    self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
+                )
                 self.register_buffer(self.buffer)
             else:
                 # From TensorRT-LLM getMaxRequiredWorkspaceSize
@@ -383,17 +387,15 @@ class CustomAllreduce:
     def _gather_ipc_meta(self, shard_data):
         # Note: don't use `[[None]] * self.world_size` here
         # because it will create a list of the same reference
-        all_data: List[Optional[Any]] = [[None]
-                                         for i in range(self.world_size)]
+        all_data: List[Optional[Any]] = [[None] for i in range(self.world_size)]
         all_data[self.rank][0] = shard_data
 
         ranks = dist.get_process_group_ranks(group=self.group)
         ranks.sort()
         for i, rank in enumerate(ranks):
-            dist.broadcast_object_list(all_data[i],
-                                       src=rank,
-                                       group=self.group,
-                                       device="cpu")
+            dist.broadcast_object_list(
+                all_data[i], src=rank, group=self.group, device="cpu"
+            )
 
         # we cannot directly use `dist.all_gather_object` here
         # because it is incompatible with `gloo` backend under inference mode.
@@ -418,13 +420,15 @@ class CustomAllreduce:
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
             logger.info("Registering %d cuda graph addresses", len(offset))
             ops.register_graph_buffers(self._ptr, handles, offsets)
-        else:    
+        else:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             logger.info("Registering %d cuda graph addresses", len(offset))
             # We cannot directly use `dist.all_gather_object` here
             # because it is incompatible with `gloo` backend under inference mode.
             # see https://github.com/pytorch/pytorch/issues/126032 for details.
-            all_data = [[None, None] for _ in range(dist.get_world_size(group=self.group))]
+            all_data = [
+                [None, None] for _ in range(dist.get_world_size(group=self.group))
+            ]
             all_data[self.rank] = [handle, offset]
             ranks = sorted(dist.get_process_group_ranks(group=self.group))
             for i, rank in enumerate(ranks):

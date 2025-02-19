@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 import torch.library
 
-from sglang.srt.utils import is_hpu, is_hip
+from sglang.srt.utils import is_hip, is_hpu
 
 logger = logging.getLogger(__name__)
 use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=True)
@@ -25,6 +25,7 @@ if not is_hpu():
             import sgl_kernel
         except ImportError as e:
             logger.warning("Failed to import from custom_ar with %r", e)
+
 
 def hint_on_error(fn):
 
@@ -95,17 +96,25 @@ if use_vllm_custom_allreduce and not is_hip():
 
 else:
     if is_hip():
-        def init_custom_ar(meta: torch.Tensor, rank_data: torch.Tensor,
-                        handles: List[str], offsets: List[int], rank: int,
-                        full_nvlink: bool) -> int:
-            return sgl_kernel.ops.init_custom_ar(meta, rank_data, handles,
-                                                        offsets, rank, full_nvlink)
+
+        def init_custom_ar(
+            meta: torch.Tensor,
+            rank_data: torch.Tensor,
+            handles: List[str],
+            offsets: List[int],
+            rank: int,
+            full_nvlink: bool,
+        ) -> int:
+            return sgl_kernel.ops.init_custom_ar(
+                meta, rank_data, handles, offsets, rank, full_nvlink
+            )
 
         def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
             sgl_kernel.ops.all_reduce_reg(fa, inp, out)
 
-        def all_reduce_unreg(fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor,
-                            out: torch.Tensor) -> None:
+        def all_reduce_unreg(
+            fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+        ) -> None:
             sgl_kernel.ops.all_reduce_unreg(fa, inp, reg_buffer, out)
 
         def dispose(fa: int) -> None:
@@ -114,15 +123,17 @@ else:
         def meta_size() -> int:
             return sgl_kernel.ops.meta_size()
 
-        def register_buffer(fa: int, t: torch.Tensor, handles: List[str],
-                            offsets: List[int]) -> None:
+        def register_buffer(
+            fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
+        ) -> None:
             return sgl_kernel.ops.register_buffer(fa, t, handles, offsets)
 
         def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
             return sgl_kernel.ops.get_graph_buffer_ipc_meta(fa)
 
-        def register_graph_buffers(fa: int, handles: List[str],
-                                offsets: List[List[int]]) -> None:
+        def register_graph_buffers(
+            fa: int, handles: List[str], offsets: List[List[int]]
+        ) -> None:
             sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
 
         def allocate_meta_buffer(size: int) -> torch.Tensor:
@@ -130,6 +141,7 @@ else:
 
         def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
             return sgl_kernel.ops.get_meta_buffer_ipc_handle(inp)
+
     else:
         # custom ar
         def init_custom_ar(

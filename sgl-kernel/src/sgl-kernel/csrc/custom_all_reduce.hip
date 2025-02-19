@@ -178,4 +178,3 @@ std::vector<uint8_t> get_device_bdf(int dev) {
   bdf.resize(bdf.size() - 1);  // remove trailing NULL
   return bdf;
 }
-
