@@ -547,7 +547,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             if not self.use_dp_linear:
                 q = self.q_a_proj(hidden_states)[0]
             else:
-                print(f"[DEBUG] run q_a_proj with dp_linear")
                 bs = hidden_states.shape[0]
                 assert bs % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
                 local_bs = bs // self.tp_size
@@ -568,7 +567,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         if not self.use_dp_linear:
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         else:
-            print(f"[DEBUG] run kv_a_proj_with_mqa with dp_linear")
             bs = hidden_states.shape[0]
             assert bs % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
             local_bs = bs // self.tp_size
