@@ -481,6 +481,8 @@ class Scheduler:
                 # When the server is idle, so self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                # Wait for a bit to prevent heavy single thread load
+                time.sleep(0.01)
 
             self.last_batch = batch
 
@@ -521,6 +523,8 @@ class Scheduler:
                 # When the server is idle, so self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                # Wait for a bit to prevent heavy single thread load
+                time.sleep(0.01)
 
             self.last_batch = batch
 
