@@ -71,7 +71,7 @@ def extend_attention_wave(
     assert shape.num_query_heads % shape.num_kv_heads == 0
 
     # Run the wave kernel.
-    mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
+    mfma_variant = (MMAType.F32_16x16x32_K8_F16, MMAType.F32_16x16x16_F16)
     (
         extend_attention,
         hyperparams,
@@ -97,6 +97,7 @@ def extend_attention_wave(
 
     hyperparams.update(get_default_scheduling_params())
     config = get_default_run_config()
+    compile_config = {"waves_per_eu": 2, "denorm_fp_math_f32": "preserve-sign"}
 
     with tk.gen.TestLaunchContext(
         hyperparams,
@@ -104,6 +105,7 @@ def extend_attention_wave(
         run=True,
         run_bench=False,
         run_config=config,
+        compile_config=compile_config,
         schedule=False,
         use_scheduling_barriers=False,
         dynamic_symbols=dynamic_symbols,
