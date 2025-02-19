@@ -39,5 +39,6 @@ compile:
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
 clean:
+	find . -name "*.ipynb" -exec nbstripout {} \;
 	rm -rf $(BUILDDIR)
 	rm -rf logs
