@@ -1459,15 +1459,18 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
         If the function completes within timeout_short, the result is returned.
         If the function takes longer than timeout_short but completes within
-        timeout_long, the result is returned after the function completes.
-        If the function takes longer than timeout_long, the request is canceled
-        and "request canceled" is returned.
+        timeout_long, the result is returned after the function completes and
+        yields '\n' to keep alive
+        If the function takes longer than timeout_long, then the request is aborted.
         """
 
         start_time = asyncio.get_event_loop().time()
         task = asyncio.create_task(func())
         while True:
             try:
+                if asyncio.get_event_loop().time() - start_time > timeout_long:
+                    task.cancel()
+                    break
                 result = await asyncio.wait_for(
                     asyncio.shield(task), timeout=timeout_short
                 )
@@ -1475,12 +1478,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                 break
 
             except asyncio.TimeoutError:
-                if asyncio.get_event_loop().time() - start_time > timeout_long:
-                    task.cancel()
-                    break
                 yield "\n"
             except asyncio.CancelledError:
-                yield "canceled!"
                 break
 
     return StreamingResponse(
