@@ -35,7 +35,7 @@ The core features include:
    :maxdepth: 1
    :caption: Advanced Features
 
-   backend/speculative_decoding.ipynb
+   backend/speculative_decoding.md
    backend/structured_outputs.ipynb
    backend/function_calling.ipynb
    backend/custom_chat_template.md

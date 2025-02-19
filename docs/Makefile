@@ -28,8 +28,8 @@ compile:
 		exit $$RET_CODE' || exit 1; \
 	END_TOTAL=$$(date +%s); \
 	TOTAL_ELAPSED=$$((END_TOTAL - START_TOTAL)); \
-	echo "---------------------------------" >> logs/timing.log; \
-	echo "Total execution time: $${TOTAL_ELAPSED}s" >> logs/timing.log; \
+	echo "---------------------------------" | tee -a logs/timing.log; \
+	echo "Total execution time: $${TOTAL_ELAPSED}s" | tee -a logs/timing.log; \
 	echo "All Notebook execution timings:" && cat logs/timing.log
 
 
