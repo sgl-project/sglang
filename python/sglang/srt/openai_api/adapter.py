@@ -491,9 +491,9 @@ def v1_generate_request(
     if len(all_requests) > 1:
         first_prompt_type = type(all_requests[0].prompt)
         for request in all_requests:
-            assert type(request.prompt) is first_prompt_type, (
-                "All prompts must be of the same type in file input settings"
-            )
+            assert (
+                type(request.prompt) is first_prompt_type
+            ), "All prompts must be of the same type in file input settings"
             if request.n > 1:
                 raise ValueError(
                     "Parallel sampling is not supported for completions from files"
