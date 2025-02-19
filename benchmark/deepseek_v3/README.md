@@ -185,7 +185,7 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1
 
 ### Example: Serving on any cloud or Kubernetes with SkyPilot
 
-SkyPilot helps finding cheapest available GPUs across any cloud or existing Kubernetes clusters and launch distributed serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1).
+SkyPilot helps find cheapest available GPUs across any cloud or existing Kubernetes clusters and launch distributed serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1).
 
 To serve on multiple nodes:
 
