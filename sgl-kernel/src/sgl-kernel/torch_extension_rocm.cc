@@ -20,7 +20,6 @@ limitations under the License.
 
 TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   // Custom all-reduce kernels
-  // TODO (hubert): https://github.com/ROCm/vllm/blob/main/csrc/torch_bindings.cpp#L511-L541
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
       "str[] handles, int[] offsets, int rank, "
@@ -50,8 +49,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("allocate_meta_buffer", torch::kCUDA, &allocate_meta_buffer);
   m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
   m.impl("get_meta_buffer_ipc_handle", torch::kCPU, &get_meta_buffer_ipc_handle);
-  m.def("get_device_bdf", &get_device_bdf); // TODO (hubert): uint8 error
-  m.impl("get_device_bdf", torch::kCPU, &get_device_bdf);
 
   // moe_align_block_size
   m.def(

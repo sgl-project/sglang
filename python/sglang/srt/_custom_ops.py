@@ -13,9 +13,9 @@ from sglang.srt.utils import is_hpu, is_hip
 
 logger = logging.getLogger(__name__)
 use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=True)
-# TODO (hubert): use USE_VLLM_CUSTOM_ALLREDUCE=0 to test!
 if not is_hpu():
-    if use_vllm_custom_allreduce:
+    # Remove vllm dependency for custom allreduce on ROCm
+    if use_vllm_custom_allreduce and not is_hip():
         try:
             import vllm._C
         except ImportError as e:
@@ -55,7 +55,7 @@ def hint_on_error(fn):
     return wrapper
 
 
-if use_vllm_custom_allreduce:
+if use_vllm_custom_allreduce and not is_hip():
     # custom ar
     def init_custom_ar(
         ipc_tensors: List[torch.Tensor],
@@ -94,7 +94,6 @@ if use_vllm_custom_allreduce:
         torch.ops._C_custom_ar.register_graph_buffers(fa, handles, offsets)
 
 else:
-    # TODO (hubert): check this
     if is_hip():
         def init_custom_ar(meta: torch.Tensor, rank_data: torch.Tensor,
                         handles: List[str], offsets: List[int], rank: int,
@@ -131,8 +130,6 @@ else:
 
         def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
             return sgl_kernel.ops.get_meta_buffer_ipc_handle(inp)
-        def get_device_bdf(dev :int) -> List[int]:
-            return sgl_kernel.ops.get_device_bdf(inp)
     else:
         # custom ar
         def init_custom_ar(

@@ -64,7 +64,6 @@ def apply_rope_with_cos_sin_cache_inplace(
         )
 
 if torch.version.hip is not None:
-    # TODO (hubert): custom allreduce
     def init_custom_ar(meta: torch.Tensor, rank_data: torch.Tensor,
                     handles: List[str], offsets: List[int], rank: int,
                     full_nvlink: bool) -> int:
@@ -100,11 +99,8 @@ if torch.version.hip is not None:
 
     def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
         return torch.ops.sgl_kernels.get_meta_buffer_ipc_handle(inp)
-
-    def get_device_bdf(dev :int) -> List[int]:
-        return torch.ops.sgl_kernels.get_device_bdf(dev)
 else:
-    # TODO (hubert): trt_reduce
+    # trt_reduce
     def init_custom_reduce(
         rank_id, num_devices, rank_data, buffers, tmp_buffers, barrier_in, barrier_out
     ):
