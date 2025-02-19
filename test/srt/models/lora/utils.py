@@ -21,7 +21,6 @@ import torch
 @dataclasses.dataclass
 class LoRAAdaptor:
     name: str
-    # 每个 adaptor 可单独配置容忍度（若未设置，则使用模型默认值）
     prefill_tolerance: float = None
     decode_tolerance: float = None
     rouge_l_tolerance: float = None
