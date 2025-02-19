@@ -138,9 +138,9 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
             )
             chat_template_name = None
         else:
-            assert chat_template_arg.endswith(
-                ".json"
-            ), "unrecognized format of chat template file"
+            assert chat_template_arg.endswith(".json"), (
+                "unrecognized format of chat template file"
+            )
             with open(chat_template_arg, "r") as filep:
                 template = json.load(filep)
                 try:
@@ -491,9 +491,9 @@ def v1_generate_request(
     if len(all_requests) > 1:
         first_prompt_type = type(all_requests[0].prompt)
         for request in all_requests:
-            assert (
-                type(request.prompt) is first_prompt_type
-            ), "All prompts must be of the same type in file input settings"
+            assert type(request.prompt) is first_prompt_type, (
+                "All prompts must be of the same type in file input settings"
+            )
             if request.n > 1:
                 raise ValueError(
                     "Parallel sampling is not supported for completions from files"
@@ -851,61 +851,18 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
         )
 
     # Non-streaming response.
-    async def response_wrapper():
-        # Non-streaming response.
-        try:
-            ret = await tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
-        except ValueError as e:
-            return create_error_response(str(e))
-        if not isinstance(ret, list):
-            ret = [ret]
-        response: ChatCompletionResponse = v1_chat_generate_response(
-            request,
-            ret,
-            cache_report=tokenizer_manager.server_args.enable_cache_report,
-            tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
-        )
-        return response.model_dump_json()
+    try:
+        ret = await tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
+    except ValueError as e:
+        return create_error_response(str(e))
 
-    async def async_function_with_timeout(func, timeout_short, timeout_long):
-        """
-        Wrap an async function with a timeout.
+    if not isinstance(ret, list):
+        ret = [ret]
 
-        If the function completes within timeout_short, the result is returned.
-        If the function takes longer than timeout_short but completes within
-        timeout_long, the result is returned after the function completes.
-        If the function takes longer than timeout_long, the request is canceled
-        and "request canceled" is returned.
-        """
-
-        start_time = asyncio.get_event_loop().time()
-        task = asyncio.create_task(func())
-        while True:
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.shield(task), timeout=timeout_short
-                )
-                yield result
-                break
-
-            except asyncio.TimeoutError:
-                if asyncio.get_event_loop().time() - start_time > timeout_long:
-                    task.cancel()
-                    break
-                yield "\n"
-            except asyncio.CancelledError:
-                yield "canceled!"
-                break
-
-    return StreamingResponse(
-        async_function_with_timeout(
-            response_wrapper, timeout_short=30, timeout_long=30 * 60
-        ),
-        media_type="text/event-stream",
-        background=tokenizer_manager.create_abort_task(adapted_request),
-    )
+    response = v1_generate_response(request, ret, tokenizer_manager)
+    return response
 
 
 def v1_chat_generate_request(
@@ -1528,11 +1485,12 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
     return StreamingResponse(
         async_function_with_timeout(
-            response_wrapper, timeout_short=2, timeout_long=30 * 60
+            response_wrapper, timeout_short=30, timeout_long=30 * 60
         ),
         media_type="text/event-stream",
         background=tokenizer_manager.create_abort_task(adapted_request),
     )
+
 
 def v1_embedding_request(all_requests, tokenizer_manager):
     prompts = []
