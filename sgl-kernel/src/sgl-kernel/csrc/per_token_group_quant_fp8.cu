@@ -1,7 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
-#include <flashinfer/vec_dtypes.cuh>
+
 #include <cmath>
+#include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
 
@@ -37,14 +38,14 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
 
   constexpr uint32_t vec_size = 16 / sizeof(T);
   using vec_t = flashinfer::vec_t<T, vec_size>;
-  
+
   const int32_t num_vec_elems = group_size / vec_size;
-  
+
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
-    
-    #pragma unroll
+
+#pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
       float abs_val = fabsf(val);
@@ -69,8 +70,8 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
-    
-    #pragma unroll
+
+#pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
       float q_val = fminf(fmaxf(val / y_s, fp8_min), fp8_max);
