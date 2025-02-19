@@ -283,7 +283,7 @@ class SRTRunner:
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
-        mem_fraction_static: float = 0.88,
+        mem_fraction_static: float = 0.65,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
