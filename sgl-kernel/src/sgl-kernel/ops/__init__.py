@@ -100,6 +100,9 @@ if torch.version.hip is not None:
 
     def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
         return torch.ops.sgl_kernels.get_meta_buffer_ipc_handle(inp)
+
+    def get_device_bdf(dev :int) -> List[int]:
+        return torch.ops.sgl_kernels.get_device_bdf(dev)
 else:
     # TODO (hubert): trt_reduce
     def init_custom_reduce(

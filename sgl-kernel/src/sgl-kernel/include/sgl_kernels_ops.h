@@ -55,6 +55,7 @@ using fptr_t = int64_t;
                               const std::vector<std::vector<int64_t>>& offsets);
   torch::Tensor allocate_meta_buffer(int64_t size);
   torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+  std::vector<uint8_t> get_device_bdf(int dev);
 #else
   fptr_t init_custom_ar(int64_t rank_id, int64_t world_size, torch::Tensor& rank_data, const std::vector<fptr_t>& buffers,
                         const std::vector<fptr_t>& tmp_result_buffers, const std::vector<fptr_t>& barrier_in,

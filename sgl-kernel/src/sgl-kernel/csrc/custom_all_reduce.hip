@@ -170,3 +170,12 @@ torch::Tensor allocate_meta_buffer(int64_t size) {
                      .device(torch::kCUDA, device_index);
   return torch::from_blob(buffer, {size}, free_meta_buffer, options);
 }
+
+std::vector<uint8_t> get_device_bdf(int dev) {
+  char busIdStr[] = "0000:00:00.0";
+  std::vector<uint8_t> bdf(sizeof(busIdStr), 0);
+  CUDACHECK(hipDeviceGetPCIBusId((char*)bdf.data(), sizeof(busIdStr), dev));
+  bdf.resize(bdf.size() - 1);  // remove trailing NULL
+  return bdf;
+}
+

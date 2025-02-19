@@ -45,7 +45,7 @@ sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/custom_all_reduce.hip",
-    # "src/sgl-kernel/csrc/custom_all_reduce.cu",     # TODO (hubert)
+    #"src/sgl-kernel/csrc/custom_all_reduce.cu",     # TODO (hubert)
 ]
 
 cxx_flags = ["-O3"]
