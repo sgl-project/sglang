@@ -22,7 +22,6 @@ spec:
         model: meta-llama-31-8b-instruct
         engine: sglang
     spec:
-      hostIPC: true
       restartPolicy: Always
       runtimeClassName: nvidia
       containers:
