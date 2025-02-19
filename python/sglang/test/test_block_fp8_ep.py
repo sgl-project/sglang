@@ -1,16 +1,10 @@
 import itertools
+import random
 import unittest
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    w8a8_block_fp8_matmul,
-)
-from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     post_reorder_triton_kernel,
@@ -18,68 +12,10 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+from sglang.srt.layers.moe.topk import select_experts
+
 
 # For test
-def torch_w8a8_block_fp8_ep_moe(
-    a, w1, w2, w1_s, w2_s, score, topk, block_shape,
-    # ep config
-    num_experts: int = 256,
-    fp8_dtype: torch.types = torch.float8_e4m3fn,
-    num_experts_per_partition: int = 128, # num_experts/ep_size
-    start_expert_id: int = 0,
-    end_expert_id: int = 127,    
-):
-    """This function performs fused moe with block-wise quantization using native torch."""
-
-    B, D = a.shape
-    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
-    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
-    score = torch.softmax(score, dim=-1, dtype=torch.float32)
-    topk_weight, topk_ids = torch.topk(score, topk)
-    topk_weight = topk_weight.view(-1)
-    topk_ids = topk_ids.view(-1)
-
-    # run_moe_ep_preproess
-    reorder_topk_ids, reorder_ids = torch.sort(topk_ids, stable=True)
-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
-    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
-    num_toks = topk_ids.numel()
-    for expert in range(num_experts):
-        # compute_seg_indptr_triton_kernel
-        low = 0
-        high = num_toks - 1
-        target_location = -1
-        while low <= high:
-            mid = (low + high) // 2
-            if reorder_topk_ids[mid] > expert:
-                high = mid - 1
-            else:
-                low = mid + 1
-                target_location = mid
-        seg_indptr[expert + 1] = target_location + 1
-    src2dst[reorder_ids] = torch.arange(num_toks)
-
-    _, block_k = block_shape[0], block_shape[1]
-    a_q, a_s = native_per_token_group_quant_fp8(a, block_k)
-    # NOTE(HandH1998): Since "index_cuda" not implemented for 'Float8_e4m3fn', we need to cast `float8`` to `float32``.
-    a_q = a_q.to(torch.float32)
-    for i in range(w1.shape[0]):
-        mask = topk_ids == i
-        if mask.sum():
-            inter_out = native_w8a8_block_fp8_matmul(
-                a_q[mask], w1[i], a_s[mask], w1_s[i], block_shape, output_dtype=a.dtype
-            )
-            act_out = SiluAndMul().forward_native(inter_out)
-            act_out_q, act_out_s = native_per_token_group_quant_fp8(act_out, block_k)
-            act_out = act_out.to(torch.float32)
-            out[mask] = native_w8a8_block_fp8_matmul(
-                act_out_q, w2[i], act_out_s, w2_s[i], block_shape, output_dtype=a.dtype
-            )
-    return (
-        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
-    ).sum(dim=1)
-
 def ep_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -87,14 +23,12 @@ def ep_moe(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
-
-    #ep config
+    # ep config
     num_experts: int = 256,
     fp8_dtype: torch.types = torch.float8_e4m3fn,
-    num_experts_per_partition: int = 128, # num_experts/ep_size
+    num_experts_per_partition: int = 128,
     start_expert_id: int = 0,
     end_expert_id: int = 127,
-
     use_grouped_topk: bool = False,
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
@@ -117,21 +51,21 @@ def ep_moe(
         custom_routing_function=custom_routing_function,
     )
 
-    reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
-        topk_ids, num_experts
-    )
+    reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(topk_ids, num_experts)
 
     gateup_input = torch.empty(
         (int(hidden_states.shape[0] * top_k), hidden_states.shape[1]),
         device=hidden_states.device,
-        dtype=fp8_dtype if use_blockwise_fp8 else hidden_states.dtype,
+        dtype=(
+            fp8_dtype
+            if (use_fp8_w8a8 and not use_blockwise_fp8)
+            else hidden_states.dtype
+        ),
     )
-    # activation_scheme == "dynamic":
-    if use_blockwise_fp8:
+
+    if use_fp8_w8a8 and not use_blockwise_fp8:
         max_value = (
-            torch.max(hidden_states)
-            .repeat(num_experts_per_partition)
-            .to(torch.float32)
+            torch.max(hidden_states).repeat(num_experts_per_partition).to(torch.float32)
         )
         w1_input_scale = max_value / torch.finfo(fp8_dtype).max
     else:
@@ -158,6 +92,7 @@ def ep_moe(
         device=hidden_states.device,
         dtype=torch.int64,
     )
+
     # GroupGemm-0
     gateup_output = torch.empty(
         gateup_input.shape[0],
@@ -165,43 +100,33 @@ def ep_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if use_blockwise_fp8:
-        gateup_output = grouped_gemm_triton(
-            a=gateup_input,
-            b=w1,
-            c=gateup_output,
-            batch_size=num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=False,
-            scale_a=None,#(None if self.quant_method.block_quant else self.w13_weight_scale),
-            scale_b=w1_scale_inv,#if self.quant_method.block_quant
-            block_shape=block_shape
-        )
-    else:
-        gateup_output = grouped_gemm_triton(
-            a=gateup_input,
-            b=w1,
-            c=gateup_output,
-            batch_size=num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=False,
-            scale_a=None,
-            scale_b=None,
-            block_shape=None
-        )
+
+    gateup_output = grouped_gemm_triton(
+        a=gateup_input,
+        b=w1,
+        c=gateup_output,
+        batch_size=num_experts_per_partition,
+        weight_column_major=True,
+        seg_indptr=seg_indptr_cur_rank,
+        weight_indices=weight_indices_cur_rank,
+        use_fp8_w8a8=use_fp8_w8a8,
+        scale_a=w1_input_scale,
+        scale_b=w1_scale_inv,
+        block_shape=block_shape,
+    )
 
     # Act
     down_input = torch.empty(
         gateup_output.shape[0],
         gateup_output.shape[1] // 2,
         device=gateup_output.device,
-        dtype=fp8_dtype,
+        dtype=(
+            fp8_dtype
+            if (use_fp8_w8a8 and not use_blockwise_fp8)
+            else hidden_states.dtype
+        ),
     )
-    if use_blockwise_fp8:
+    if use_fp8_w8a8 and not use_blockwise_fp8:
         w2_input_scale = torch.ones(
             num_experts_per_partition,
             dtype=torch.float32,
@@ -210,7 +135,6 @@ def ep_moe(
     else:
         w2_input_scale = None
 
-    # self.activation == "silu":
     silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
         gateup_output,
         down_input,
@@ -229,34 +153,20 @@ def ep_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if use_blockwise_fp8:
-        down_output = grouped_gemm_triton(
-            a=down_input,
-            b=w2,
-            c=down_output,
-            batch_size=num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=False,
-            scale_a=None,#(None if self.quant_method.block_quant else self.w2_input_scale),
-            scale_b=w2_scale_inv,#if self.quant_method.block_quant
-            block_shape=block_shape,
-        )
-    else:
-        down_output = grouped_gemm_triton(
-            a=down_input,
-            b=w2,
-            c=down_output,
-            batch_size=num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=False,
-            scale_a=None,
-            scale_b=None,
-            block_shape=None,
-        )
+
+    down_output = grouped_gemm_triton(
+        a=down_input,
+        b=w2,
+        c=down_output,
+        batch_size=num_experts_per_partition,
+        weight_column_major=True,
+        seg_indptr=seg_indptr_cur_rank,
+        weight_indices=weight_indices_cur_rank,
+        use_fp8_w8a8=use_fp8_w8a8,
+        scale_a=w2_input_scale,
+        scale_b=w2_scale_inv,
+        block_shape=block_shape,
+    )
 
     # PostReorder
     output = torch.empty_like(hidden_states)
@@ -274,14 +184,62 @@ def ep_moe(
     )
     return output
 
+
+# test util
+def block_dequant(
+    x_q_block: torch.Tensor,
+    x_s: torch.Tensor,
+    block_size: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """This function converts block-wise quantization to tensor-wise quantization.
+    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
+    and the block size.
+    The outputs are tensor-wise quantization tensor and tensor-wise quantization scale.
+    Note only float8 is supported for now.
+    """
+
+    # process 3D tensor
+    if x_q_block.dim() == 3:
+        batch_size = x_q_block.size(0)
+        return torch.stack(
+            [block_dequant(x_q_block[b], x_s[b], block_size) for b in range(batch_size)]
+        )
+
+    block_n, block_k = block_size[0], block_size[1]
+    n, k = x_q_block.shape
+    n_tiles = (n + block_n - 1) // block_n
+    k_tiles = (k + block_k - 1) // block_k
+    assert n_tiles == x_s.shape[0]
+    assert k_tiles == x_s.shape[1]
+
+    x_dq_block = x_q_block.to(torch.float32)
+
+    x_dq_block_tiles = [
+        [
+            x_dq_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            for i in range(k_tiles)
+        ]
+        for j in range(n_tiles)
+    ]
+
+    for i in range(k_tiles):
+        for j in range(n_tiles):
+            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
+
+    return x_dq_block
+
+
 class TestW8A8BlockFP8EPMoE(unittest.TestCase):
-    DTYPES = [torch.float32]#, torch.half, torch.bfloat16]
-    M = [1, 33, 64]#, 222, 1024 * 128]
-    N = [128]#, 1024, 2048]
-    K = [256]#, 4096, 5120]
-    E = [8, 24]
-    TOP_KS = [2, 6]
-    # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
+    DTYPES = [torch.half, torch.bfloat16]
+    M = [1, 222, 1024, 2048]
+    N = [128, 1024, 2048]
+    K = [256, 4096, 5120]
+    E = [8, 16]
+    ep_size = [2, 4]
+    TOP_KS = [2, 4]
     BLOCK_SIZE = [[128, 128]]
     SEEDS = [0]
 
@@ -291,8 +249,11 @@ class TestW8A8BlockFP8EPMoE(unittest.TestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _w8a8_block_fp8_fused_moe(self, M, N, K, E, topk, block_size, dtype, seed):
+    def _w8a8_block_fp8_ep_moe(
+        self, M, N, K, E, ep_size, topk, block_size, dtype, seed
+    ):
         torch.manual_seed(seed)
+        random.seed(seed)
         # NOTE(HandH1998): to avoid overflow when out_dtype = torch.half
         factor_for_scale = 1e-2
         fp8_info = torch.finfo(torch.float8_e4m3fn)
@@ -300,10 +261,10 @@ class TestW8A8BlockFP8EPMoE(unittest.TestCase):
 
         a = torch.randn((M, K), dtype=dtype) / 10
 
-        w1_fp32 = (torch.rand((E, 2 * N, K), dtype=torch.float32) - 0.5) * 2 * fp8_max
+        w1_fp32 = (torch.rand((E, 2 * N, K), dtype=dtype) - 0.5) * 2 * fp8_max
         w1 = w1_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
-        w2_fp32 = (torch.rand((E, K, N), dtype=torch.float32) - 0.5) * 2 * fp8_max
+        w2_fp32 = (torch.rand((E, K, N), dtype=dtype) - 0.5) * 2 * fp8_max
         w2 = w2_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
         block_n, block_k = block_size[0], block_size[1]
@@ -321,25 +282,36 @@ class TestW8A8BlockFP8EPMoE(unittest.TestCase):
             * factor_for_scale
         )
 
+        w1_ref = block_dequant(w1, w1_s, block_size).to(dtype)
+        w2_ref = block_dequant(w2, w2_s, block_size).to(dtype)
+
         score = torch.randn((M, E), dtype=dtype)
+        num_experts_per_partition = E // ep_size
+        cur_rank = random.randint(0, ep_size - 1)
+        start_id = cur_rank * num_experts_per_partition
+        end_id = start_id + num_experts_per_partition - 1
 
         with torch.inference_mode():
-            # out = ep_moe(
-            #     hidden_states=a,
-            #     w1=w1,
-            #     w2=w2,
-            #     router_logits=score,
-            #     top_k=topk,
-            #     renormalize=False,
-            #     use_fp8_w8a8=False,
-            #     w1_scale_inv=w1_s,
-            #     w2_scale_inv=w2_s,
-            #     block_shape=block_size,
-            # )
+            out = ep_moe(
+                hidden_states=a,
+                w1=w1,
+                w2=w2,
+                router_logits=score,
+                top_k=topk,
+                renormalize=False,
+                use_fp8_w8a8=True,
+                w1_scale_inv=w1_s,
+                w2_scale_inv=w2_s,
+                block_shape=block_size,
+                num_experts=E,
+                num_experts_per_partition=num_experts_per_partition,
+                start_expert_id=start_id,
+                end_expert_id=end_id,
+            )
             ref_out = ep_moe(
                 hidden_states=a,
-                w1=w1_fp32,
-                w2=w2_fp32,
+                w1=w1_ref,
+                w2=w2_ref,
                 router_logits=score,
                 top_k=topk,
                 renormalize=False,
@@ -347,20 +319,24 @@ class TestW8A8BlockFP8EPMoE(unittest.TestCase):
                 w1_scale_inv=None,
                 w2_scale_inv=None,
                 block_shape=None,
+                num_experts=E,
+                num_experts_per_partition=num_experts_per_partition,
+                start_expert_id=start_id,
+                end_expert_id=end_id,
             )
-
         self.assertTrue(
             torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
-            / torch.mean(torch.abs(ref_out.to(torch.float32)))
-            < 0.02
+            / (torch.mean(torch.abs(ref_out.to(torch.float32))) + 1e-6)
+            < 0.06
         )
 
-    def test_w8a8_block_fp8_fused_moe(self):
+    def test_w8a8_block_fp8_ep_moe(self):
         for params in itertools.product(
             self.M,
             self.N,
             self.K,
             self.E,
+            self.ep_size,
             self.TOP_KS,
             self.BLOCK_SIZE,
             self.DTYPES,
@@ -371,12 +347,13 @@ class TestW8A8BlockFP8EPMoE(unittest.TestCase):
                 N=params[1],
                 K=params[2],
                 E=params[3],
-                topk=params[4],
-                block_size=params[5],
-                dtype=params[6],
-                seed=params[7],
+                ep_size=params[4],
+                topk=params[5],
+                block_size=params[6],
+                dtype=params[7],
+                seed=params[8],
             ):
-                self._w8a8_block_fp8_fused_moe(*params)
+                self._w8a8_block_fp8_ep_moe(*params)
             torch.cuda.empty_cache()
 
 
