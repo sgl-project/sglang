@@ -637,6 +637,7 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
             "image_seq_mask": images_seq_mask,
             "image_spatial_crop": batched_images_spatial_crop,
             "modalities": request_obj.modalities or ["image"],
+        }
           
 class Qwen2_5VLImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
