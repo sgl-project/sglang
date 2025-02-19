@@ -7,6 +7,11 @@ import triton.language as tl
 
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
+if _is_cuda:
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
 logger = logging.getLogger(__name__)
 
 
@@ -220,9 +225,9 @@ def grouped_gemm_triton_kernel(
     seg_indptr,
     weight_indices,
     m_num_tiles_indptr,
-    use_fp8_w8a8,
     scale_a,
     scale_b,
+    use_fp8_w8a8: tl.constexpr,
     group_n: tl.constexpr,
     group_k: tl.constexpr,
     a_stride_0: tl.constexpr,
@@ -291,15 +296,14 @@ def grouped_gemm_triton_kernel(
             b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2)
             accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
         else:
-            tl.static_print(a_tile.dtype, b_tile.dtype)
             accumulator = tl.dot(a_tile, b_tile.T, accumulator)
         a_ptr += BLOCK_SIZE_K
         b_ptr += BLOCK_SIZE_K
 
-    # if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
-    #     scale_a_value = tl.load(scale_a + expert_id)
-    #     scale_b_value = tl.load(scale_b + expert_id)
-    #     accumulator *= scale_a_value * scale_b_value
+    if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
+        scale_a_value = tl.load(scale_a + expert_id)
+        scale_b_value = tl.load(scale_b + expert_id)
+        accumulator *= scale_a_value * scale_b_value
 
     c_tile = accumulator.to(c_dtype)
 
@@ -341,12 +345,16 @@ def grouped_gemm_triton(
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
-        a, scale_a = per_token_group_quant_fp8(a, block_k)
+        if _is_cuda:
+            a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
+        else:
+            a, scale_a = per_token_group_quant_fp8(a, block_k)
 
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
 
+    # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
     config = {
         "BLOCK_SIZE_M": 32,
@@ -364,7 +372,6 @@ def grouped_gemm_triton(
         triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
     )
 
-
     grouped_gemm_triton_kernel[grid](
         a,
         b,
@@ -375,9 +382,9 @@ def grouped_gemm_triton(
         seg_indptr,
         weight_indices,
         m_num_tiles_indptr,
-        use_fp8_w8a8,
         scale_a,
         scale_b,
+        use_fp8_w8a8,
         0 if block_shape is None else block_shape[0],
         0 if block_shape is None else block_shape[1],
         a.stride(0),
