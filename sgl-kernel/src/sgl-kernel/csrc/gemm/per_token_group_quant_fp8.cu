@@ -58,7 +58,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
+      float val = castToFloat(input_vec[j]);
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
     }
@@ -84,7 +84,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
+      float val = castToFloat(input_vec[j]);
       float q_val = fminf(fmaxf(val / y_s, fp8_min), fp8_max);
       group_output[i * vec_size + j] = FP8_TYPE(q_val);
     }
