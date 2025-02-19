@@ -138,9 +138,9 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
             )
             chat_template_name = None
         else:
-            assert chat_template_arg.endswith(".json"), (
-                "unrecognized format of chat template file"
-            )
+            assert chat_template_arg.endswith(
+                ".json"
+            ), "unrecognized format of chat template file"
             with open(chat_template_arg, "r") as filep:
                 template = json.load(filep)
                 try:
