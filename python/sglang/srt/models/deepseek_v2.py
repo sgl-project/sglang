@@ -548,15 +548,21 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q = self.q_a_proj(hidden_states)[0]
             else:
                 bs = hidden_states.shape[0]
-                assert bs % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
-                local_bs = bs // self.tp_size
+                pad_size = (self.tp_size - bs % self.tp_size) % self.tp_size
+                if pad_size > 0:
+                    pad_tensor = torch.zeros((pad_size, *hidden_states.shape[1:]),dtype=hidden_states.dtype,device=hidden_states.device)
+                    hidden_states = torch.cat([hidden_states, pad_tensor], dim=0)
+                bs_pad = hidden_states.shape[0]
+                local_bs = bs_pad // self.tp_size
                 start_idx = self.tp_rank * local_bs 
                 end_idx = start_idx + local_bs    
                 local_x = hidden_states[start_idx:end_idx, :] 
                 local_q = self.q_a_proj(local_x)[0]
                 assert local_q.shape[1] == self.q_lora_rank 
-                q = torch.zeros(bs, self.q_lora_rank, dtype=local_q.dtype, device=local_q.device)
+                q = torch.zeros(bs_pad, self.q_lora_rank, dtype=local_q.dtype, device=local_q.device)
                 torch.distributed.all_gather_into_tensor(q, local_q)
+                hidden_states = hidden_states[:bs, :]
+                q = q[:bs, :]
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
@@ -568,15 +574,21 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         else:
             bs = hidden_states.shape[0]
-            assert bs % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
-            local_bs = bs // self.tp_size
+            pad_size = (self.tp_size - bs % self.tp_size) % self.tp_size
+            if pad_size > 0:
+                pad_tensor = torch.zeros((pad_size, *hidden_states.shape[1:]),dtype=hidden_states.dtype,device=hidden_states.device)
+                hidden_states = torch.cat([hidden_states, pad_tensor], dim=0)
+            bs_pad = hidden_states.shape[0]
+            local_bs = bs_pad // self.tp_size
             start_idx = self.tp_rank * local_bs 
             end_idx = start_idx + local_bs    
             local_x = hidden_states[start_idx:end_idx, :] 
             local_compressed_kv = self.kv_a_proj_with_mqa(local_x)[0]
             assert local_compressed_kv.shape[1] == self.kv_lora_rank + self.qk_rope_head_dim 
             latent_cache = torch.zeros(bs, local_compressed_kv.shape[1], dtype=local_compressed_kv.dtype, device=local_compressed_kv.device)
-            torch.distributed.all_gather_into_tensor(latent_cache, local_compressed_kv)            
+            torch.distributed.all_gather_into_tensor(latent_cache, local_compressed_kv)
+            hidden_states = hidden_states[:bs, :]
+            latent_cache = latent_cache[:bs, :]        
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a.contiguous())
