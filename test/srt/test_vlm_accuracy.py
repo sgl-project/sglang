@@ -17,8 +17,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
 
-MiniCPMV = "openbmb/MiniCPM-V-2_6"
-
 
 # Test the logits output between HF and SGLang
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
@@ -155,7 +153,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model_path = MiniCPMV
+        cls.model_path = "openbmb/MiniCPM-V-2_6"
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
@@ -204,6 +202,57 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
             )
 
         self.compare_outputs(sglang_output, hf_output)
+
+
+#
+# class TestQwen2_5VLLogits(VisionLLMLogitsBase):
+#     @classmethod
+#     def setUpClass(cls):
+#         super().setUpClass()
+#         cls.model_path = "MiniCPMV"
+#         cls.tokenizer = AutoTokenizer.from_pretrained(
+#             cls.model_path, trust_remote_code=True
+#         )
+#         cls.processor = AutoProcessor.from_pretrained(
+#             cls.model_path, trust_remote_code=True
+#         )
+#         cls.chat_template = "minicpmv"
+#
+#         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         cls.model = AutoModel.from_pretrained(
+#             cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+#         ).eval()
+#         cls.model.to(cls.device)
+#
+#     async def test_output_ids(self):
+#         max_new_tokens = 128
+#         inputs = self.get_processor_output()
+#
+#         with torch.no_grad():
+#             model_inputs = {
+#                 "input_ids": inputs.input_ids,
+#                 "image_bound": inputs.image_bound,
+#                 "pixel_values": inputs.pixel_values,
+#                 "tgt_sizes": inputs.tgt_sizes,
+#             }
+#             hf_outputs = self.model.forward(**inputs)
+#             hf_logits = hf_outputs.logits[0, -1, :]
+
+# with torch.no_grad():
+#     model = self.get_sglang_model()
+#     input_ids = inputs["input_ids"].to(self.device).flatten()
+#     positions = compute_position_triton()
+#     forward_batch =
+#     image_inputs = model.forward(
+#         input_ids,
+#         positions,
+#         for
+#     )
+#     (sglang_output, _) = model.get_embedding(
+#         input_ids=input_ids, image_inputs=image_inputs
+#     )
+#
+# self.compare_outputs(sglang_output, hf_output)
 
 
 if __name__ == "__main__":
