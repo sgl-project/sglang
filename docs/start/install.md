@@ -4,40 +4,22 @@ You can install SGLang using any of the methods below. For running DeepSeek V3/R
 
 ## Method 1: With pip or uv
 
-You may use pip to install SGLang in your environment by running the following commands:
+We recommend using uv to install the dependencies with a higher installation speed:
+
 ```bash
 pip install --upgrade pip
-
-pip install setuptools
-pip install sgl-kernel
-pip install torch==2.5.1
-pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
-pip install "sglang[all]"
-pip install transformers==4.48.3
-```
-
-We recommend to use uv to install the dependencies with higher installation speed.
-Please [install uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't done so.
-
-Initialize new virtual environment:
-```bash
-uv venv
-```
-
-Then install the dependencies as follows:
-```bash
-uv pip install setuptools
-uv pip install sgl-kernel
-uv pip install torch==2.5.1
-uv pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
-uv pip install "sglang[all]"
+pip install uv
+uv pip install sgl-kernel --force-reinstall --no-deps
+uv pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 uv pip install transformers==4.48.3
 ```
 
-Activate the venv to use SGLang:
-```bash
-source .venv/bin/activate
-```
+Note: SGLang currently uses torch 2.5, so you need to install the flashinfer version for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the package currently used by FlashInfer is named `flashinfer-python`, not `flashinfer`.
+
+If you experience an error like `OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root`， please try either of the following solutions:
+
+- Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
+- Follow the procedure described in [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) first, then install SGLang as described above.
 
 ## Method 2: From source
 ```
