@@ -15,7 +15,7 @@ compile:
 	echo "Notebook execution timings:" > logs/timing.log; \
 	START_TOTAL=$$(date +%s); \
 	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print0 | \
-		parallel -0 -j3 --halt soon,fail=1 ' \
+		parallel --ungroup -0 -j3 --halt soon,fail=1 ' \
 		NB_NAME=$$(basename {}); \
 		START_TIME=$$(date +%s); \
 		jupyter nbconvert --to notebook --execute --inplace "{}" \
@@ -24,7 +24,7 @@ compile:
 		RET_CODE=$$?; \
 		END_TIME=$$(date +%s); \
 		ELAPSED_TIME=$$((END_TIME - START_TIME)); \
-		echo "$${NB_NAME}: $${ELAPSED_TIME}s" >> logs/timing.log; \
+		echo "$${NB_NAME}: $${ELAPSED_TIME}s" | tee -a logs/timing.log; \
 		exit $$RET_CODE' || exit 1; \
 	END_TOTAL=$$(date +%s); \
 	TOTAL_ELAPSED=$$((END_TOTAL - START_TOTAL)); \
@@ -39,4 +39,5 @@ compile:
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
 clean:
-	rm -rf $(BUILDDIR)/* logs/timing.log
+	rm -rf $(BUILDDIR)
+	rm -rf logs

@@ -12,7 +12,7 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Getting Started
+   :caption: Installation
 
    start/install.md
 
@@ -26,10 +26,20 @@ The core features include:
    backend/openai_api_embeddings.ipynb
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
-   backend/structured_outputs.ipynb
-   backend/speculative_decoding.ipynb
-   backend/function_calling.ipynb
    backend/server_arguments.md
+   backend/sampling_params.md
+   backend/hyperparameter_tuning.md
+
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Advanced Features
+
+   backend/speculative_decoding.ipynb
+   backend/structured_outputs.ipynb
+   backend/function_calling.ipynb
+   backend/custom_chat_template.md
+   backend/quantization.md
 
 .. toctree::
    :maxdepth: 1
@@ -44,48 +54,11 @@ The core features include:
 
    router/router.md
 
-
-References
-==========
-
-General
----------------------
 .. toctree::
-   :maxdepth: 1
+      :maxdepth: 1
+      :caption: References
 
-   references/supported_models.md
-   references/contribution_guide.md
-   references/troubleshooting.md
-   references/faq.md
-   references/learn_more.md
-
-Hardware
---------------------------
-.. toctree::
-   :maxdepth: 1
-
-   references/AMD.md
-   references/amd_configure.md
-   references/nvidia_jetson.md
-
-Advanced Models & Deployment
-------------------------------
-.. toctree::
-   :maxdepth: 1
-
-   references/deepseek.md
-   references/multi_node.md
-   references/multi_node_inference_k8s_lws.md
-   references/modelscope.md
-
-Performance & Tuning
---------------------
-.. toctree::
-   :maxdepth: 1
-
-   references/sampling_params.md
-   references/hyperparameter_tuning.md
-   references/benchmark_and_profiling.md
-   references/accuracy_evaluation.md
-   references/custom_chat_template.md
-   references/quantization.md
+      references/general
+      references/hardware
+      references/advanced_deploy
+      references/performance_tuning
