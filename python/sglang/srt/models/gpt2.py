@@ -24,12 +24,12 @@ from torch import nn
 from transformers import GPT2Config
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import NewGELU
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.activation import NewGELU
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
