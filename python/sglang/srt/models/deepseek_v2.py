@@ -58,11 +58,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
-#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode import decode_attention_fwd_normal
-#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_2 import decode_attention_fwd_normal
-#from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import decode_attention_fwd_grouped_rope
 from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope1 import decode_attention_fwd_grouped_rope
-#from sglang.srt.layers.attention.triton_ops.sglang_ref import decode_attention_fwd_grouped
 
 is_hip_ = is_hip()
 
@@ -520,7 +516,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal(positions, hidden_states, forward_batch)
         else:
             if is_hip_:
-                if os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1":
+                if os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1" and forward_batch.forward_mode.is_decode():
                     return self.forward_absorb_fused_mla_rope(positions, hidden_states, forward_batch)
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
@@ -575,7 +571,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        print ("CHAI: entered into original forward_absorb")
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
@@ -652,10 +647,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        print ("----------------------------------------")
-        print ("CHAI: entered into fused absorb mla rope")
-        print ("is_extend mode = {}".format(forward_batch.forward_mode.is_extend()))
-        print ("is_decode mode = {}".format(forward_batch.forward_mode.is_decode()))
         enable_rope_fusion = os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
@@ -708,35 +699,23 @@ class DeepseekV2AttentionMLA(nn.Module):
         #attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         # Use Fused ROPE with use_rope=OFF.
         attn_output = torch.empty((q_len, self.num_local_heads, self.kv_lora_rank), dtype=q.dtype, device=q.device)
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        b_req_idx = forward_batch.req_pool_indices
-        b_seq_len = forward_batch.seq_lens
-        _, _, kv_indptr, kv_indices, _, _, _ = forward_batch.attn_backend.forward_metadata
+        attn_logits, _, kv_indptr, kv_indices, _, _, _ = forward_batch.attn_backend.forward_metadata
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         num_kv_split = forward_batch.attn_backend.num_kv_splits 
         sm_scale = self.attn_mqa.scaling
-        attn_logits = torch.empty(
-                             (
-                                forward_batch.batch_size,
-                                self.num_local_heads,
-                                num_kv_split,
-                                self.kv_lora_rank + 1,
-                             ), dtype=torch.float32, device=q.device)
+        if attn_logits is None:
+            attn_logits = torch.empty(
+                                 (
+                                    forward_batch.batch_size,
+                                    self.num_local_heads,
+                                    num_kv_split,
+                                    self.kv_lora_rank + 1,
+                                 ), dtype=torch.float32, device=q.device)
 
         # save current latent cache.
         forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
         key_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
-
-        print ("q_input={}:{}, key_cache_buf={}:{}, value_buf={}:{}".format(q_input.size(), q_input.dtype, key_cache_buf.size(), key_cache_buf.dtype, val_cache_buf.size(), val_cache_buf.dtype)) 
-        print ("attn_output={}:{}".format(attn_output.size(), attn_output.dtype))
-        print ("kv_indptr={}:{}, kv_indices={}:{}".format(kv_indptr.size(), kv_indptr.dtype, kv_indices.size(), kv_indices.dtype))
-        if enable_rope_fusion:
-            print ("k_pe_output={}:{}".format(k_pe_output.size(), k_pe_output.dtype))
-        print ("kv_lora_rank={}, rotary_dim={}: cos_sin_cache={}".format(self.kv_lora_rank, self.rotary_emb.rotary_dim, cos_sin_cache.size()))
-        print ("positions={}:{}".format(positions.size(), positions.dtype))
-        print ("attn_logits={}:{}".format(attn_logits.size(), attn_logits.dtype))
-        print ("num_kv_split={}, sm_scale={}, logit_cap={}".format(num_kv_split, sm_scale, self.attn_mqa.logit_cap))
 
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -760,23 +739,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
             forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k_input, None)
-
-        #decode_attention_fwd_grouped(
-        #    q_input,
-        #    key_cache_buf,
-        #    val_cache_buf,
-        #    attn_output,
-        #    req_to_token,
-        #    b_req_idx,
-        #    b_seq_len,
-        #    attn_logits,
-        #    num_kv_split,
-        #    sm_scale,
-        #    logit_cap=0.0)
-
-
-        #torch.cuda.synchronize() 
-        #print ("---- done ----")
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
