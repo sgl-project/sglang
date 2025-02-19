@@ -258,10 +258,12 @@ class ModelRunner:
 
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
+            ] or self.model_config.hf_config.architectures == [
+                "Qwen2_5_VLForConditionalGeneration"
             ]:
-                # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
+                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info(
-                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen-vl series."
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
