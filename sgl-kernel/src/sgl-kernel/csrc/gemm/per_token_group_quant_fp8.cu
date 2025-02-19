@@ -2,7 +2,12 @@
 #include <c10/util/Float8_e4m3fn.h>
 
 #include <cmath>
+
+#ifndef USE_ROCM
 #include <flashinfer/vec_dtypes.cuh>
+#else
+#include "hip_vec_dtypes.h"
+#endif
 
 #include "utils.h"
 
