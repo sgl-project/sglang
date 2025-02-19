@@ -38,6 +38,7 @@
 - Mistral embedding models
 - Qwen embedding models
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
+  - `python -m sglang.launch_server --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct --is-embedding --chat-template gme-qwen2-vl`
 
 ## Reward Models
 
