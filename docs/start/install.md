@@ -11,15 +11,18 @@ pip install --upgrade pip
 pip install uv
 uv pip install sgl-kernel --force-reinstall --no-deps
 uv pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
-uv pip install transformers==4.48.3
 ```
 
-Note: SGLang currently uses torch 2.5, so you need to install the flashinfer version for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the package currently used by FlashInfer is named `flashinfer-python`, not `flashinfer`.
+**Quick Fix to Installation**
 
-If you experience an error like `OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root`， please try either of the following solutions:
+- SGLang currently uses torch 2.5, so you need to install the flashinfer version for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the package currently used by FlashInfer is named `flashinfer-python`, not `flashinfer`.
 
-- Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
-- Follow the procedure described in [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) first, then install SGLang as described above.
+- If you experience an error like `OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root`, please try either of the following solutions:
+
+1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
+2. Follow the procedure described in [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) first, then install SGLang as described above.
+
+- If you encounter `ImportError; cannot import name 'is_valid_list_of_images' from 'transformers.models.llama.image_processing_llama'`, try to use the specified version of `transformers` in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/python/pyproject.toml). Currently, just running `pip install transformers==4.48.3`.
 
 ## Method 2: From source
 ```
