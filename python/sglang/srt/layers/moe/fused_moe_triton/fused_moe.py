@@ -938,7 +938,7 @@ def fused_experts_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = cache[:M * topk_ids.shape[1] * N].view(
+    intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
     intermediate_cache2 = torch.empty(
@@ -946,7 +946,7 @@ def fused_experts_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache3 = cache[:M * topk_ids.shape[1] * w2.shape[1]].view(
+    intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
         (M, topk_ids.shape[1], w2.shape[1]),
     )
 
