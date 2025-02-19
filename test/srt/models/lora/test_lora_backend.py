@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team   
+# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -18,11 +18,10 @@ import unittest
 from typing import List
 
 import torch
+from utils import *
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
-
-from utils import *
 
 CI_LORA_MODELS = [
     LoRAModelCase(
@@ -107,20 +106,14 @@ class TestLoRABackend(unittest.TestCase):
             mem_fraction_static=0.88,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                lora_paths=[adaptor.name]
+                prompt, max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
             )
 
         with HFRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation"
+            base_path, torch_dtype=torch_dtype, model_type="generation"
         ) as hf_runner:
             hf_outputs = hf_runner.forward(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                lora_paths=[adaptor.name]
+                prompt, max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
             )
 
         with SRTRunner(
@@ -144,13 +137,19 @@ class TestLoRABackend(unittest.TestCase):
 
         # Use individual adapter tolerances if set, otherwise use model defaults
         prefill_tol = (
-            adaptor.prefill_tolerance if adaptor.prefill_tolerance is not None else model_case.prefill_tolerance
+            adaptor.prefill_tolerance
+            if adaptor.prefill_tolerance is not None
+            else model_case.prefill_tolerance
         )
         decode_tol = (
-            adaptor.decode_tolerance if adaptor.decode_tolerance is not None else model_case.decode_tolerance
+            adaptor.decode_tolerance
+            if adaptor.decode_tolerance is not None
+            else model_case.decode_tolerance
         )
         rouge_tol = (
-            adaptor.rouge_l_tolerance if adaptor.rouge_l_tolerance is not None else model_case.rouge_l_tolerance
+            adaptor.rouge_l_tolerance
+            if adaptor.rouge_l_tolerance is not None
+            else model_case.rouge_l_tolerance
         )
 
         # Compare prefill stage logprobs (HF vs SRTRunner with LoRA)
@@ -191,8 +190,14 @@ class TestLoRABackend(unittest.TestCase):
         # Additional: compare prefill outputs between base model (no LoRA) and LoRA model for reference
         hf_no_lora_prefill = torch.tensor(hf_no_lora_outputs.top_input_logprobs[0])
         srt_no_lora_prefill = torch.tensor(srt_no_lora_outputs.top_input_logprobs[0])
-        print("Max diff (SRT base vs SRT LoRA prefill):", torch.max(torch.abs(srt_no_lora_prefill - srt_prefill)))
-        print("Max diff (HF base vs HF LoRA prefill):", torch.max(torch.abs(hf_no_lora_prefill - hf_prefill)))
+        print(
+            "Max diff (SRT base vs SRT LoRA prefill):",
+            torch.max(torch.abs(srt_no_lora_prefill - srt_prefill)),
+        )
+        print(
+            "Max diff (HF base vs HF LoRA prefill):",
+            torch.max(torch.abs(hf_no_lora_prefill - hf_prefill)),
+        )
 
     def run_backend_batch(
         self,
@@ -203,16 +208,28 @@ class TestLoRABackend(unittest.TestCase):
         backend: str,
     ):
         # TODO: Implement batch processing version of run_backend
-        raise NotImplementedError("Batch processing version of run_backend is not implemented yet.")
+        raise NotImplementedError(
+            "Batch processing version of run_backend is not implemented yet."
+        )
 
     def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
-            prompts = PROMPTS if not model_case.skip_long_prompt else [p for p in PROMPTS if len(p) < 1000]
+            prompts = (
+                PROMPTS
+                if not model_case.skip_long_prompt
+                else [p for p in PROMPTS if len(p) < 1000]
+            )
             for torch_dtype in TORCH_DTYPES:
                 for backend in BACKENDS:
                     for prompt in prompts:
-                        self.run_backend(prompt, model_case, torch_dtype, max_new_tokens=32, backend=backend)
+                        self.run_backend(
+                            prompt,
+                            model_case,
+                            torch_dtype,
+                            max_new_tokens=32,
+                            backend=backend,
+                        )
 
     def test_ci_lora_models(self):
         self._run_backend_on_model_cases(CI_LORA_MODELS)

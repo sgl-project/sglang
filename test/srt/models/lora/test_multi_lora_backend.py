@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team    
+# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -18,11 +18,10 @@ import unittest
 from typing import List
 
 import torch
+from utils import *
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
-
-from utils import *
 
 MULTI_LORA_MODELS = [
     LoRAModelCase(
@@ -72,15 +71,27 @@ class TestMultiLoRABackend(unittest.TestCase):
             f"\n========== Testing multi-LoRA backend '{backend}' for base '{model_case.base}' --- "
             f"Using prompts {[p[:50] for p in prompts]} with adaptors: {adaptor_names} ---"
         )
-        print("run_backend_batch: Multi-LoRA backend test functionality is pending support.")
+        print(
+            "run_backend_batch: Multi-LoRA backend test functionality is pending support."
+        )
 
     def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters.
-            batch_prompts = PROMPTS if not model_case.skip_long_prompt else [p for p in PROMPTS if len(p) < 1000]
+            batch_prompts = (
+                PROMPTS
+                if not model_case.skip_long_prompt
+                else [p for p in PROMPTS if len(p) < 1000]
+            )
             for torch_dtype in TORCH_DTYPES:
                 for backend in BACKENDS:
-                    self.run_backend_batch(batch_prompts, model_case, torch_dtype, max_new_tokens=32, backend=backend)
+                    self.run_backend_batch(
+                        batch_prompts,
+                        model_case,
+                        torch_dtype,
+                        max_new_tokens=32,
+                        backend=backend,
+                    )
 
     def test_multi_lora_models(self):
         # Optionally skip tests in CI environments.
