@@ -183,6 +183,15 @@ python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
 ```
 
+### Example: Launch on any cloud or Kubernetes with SkyPilot and SGLang
+
+SkyPilot helps finding cheapest available GPUs across any cloud or existing Kubernetes clusters. You can launch the DeepSeek SGLang serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1):
+
+```bash
+git clone https://github.com/skypilot-org/skypilot.git
+sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B.yaml --retry-until-up
+```
+
 #### Troubleshooting
 
 If you encounter the following error with fp16/bf16 checkpoint:
