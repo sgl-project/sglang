@@ -1,6 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
-
+#include <flashinfer/vec_dtypes.cuh>
 #include <cmath>
 
 #include "utils.h"
@@ -21,44 +21,60 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
                                                  const int num_groups, const float eps, const float fp8_min,
                                                  const float fp8_max) {
   const int groups_per_block = 16;
+  const int local_group_id = threadIdx.x / 16;
+  const int lane_id = threadIdx.x % 16;
+
   const int block_group_id = blockIdx.x * groups_per_block;
-  const int tid = threadIdx.x;
-  const int local_group_id = tid / 16;
-  const int local_tid = tid % 16;
+  const int block_group_offset = (block_group_id + local_group_id) * group_size;
 
   __shared__ float s_absmax[16];
 
   float local_absmax = eps;
 
-  if (block_group_id + local_group_id < num_groups) {
-    const T* group_input = input + (block_group_id + local_group_id) * group_size;
-    FP8_TYPE* group_output = static_cast<FP8_TYPE*>(output_q) + (block_group_id + local_group_id) * group_size;
-    float* scale_output = output_s + block_group_id + local_group_id;
+  const T* group_input = input + block_group_offset;
+  FP8_TYPE* group_output = static_cast<FP8_TYPE*>(output_q) + block_group_offset;
+  float* scale_output = output_s + block_group_id + local_group_id;
 
-    for (int i = local_tid; i < group_size; i += 16) {
-      float val = static_cast<float>(group_input[i]);
+  constexpr uint32_t vec_size = 16 / sizeof(T);
+  using vec_t = flashinfer::vec_t<T, vec_size>;
+  
+  const int32_t num_vec_elems = group_size / vec_size;
+  
+  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+    vec_t input_vec;
+    input_vec.cast_load(group_input + i * vec_size);
+    
+    #pragma unroll
+    for (uint32_t j = 0; j < vec_size; ++j) {
+      float val = static_cast<float>(input_vec[j]);
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
     }
+  }
 
-    local_absmax = GroupReduce(local_absmax, local_tid);
+  local_absmax = GroupReduce(local_absmax, lane_id);
 
-    if (local_tid == 0) {
-      s_absmax[local_group_id] = local_absmax;
-    }
-    __syncthreads();
+  if (lane_id == 0) {
+    s_absmax[local_group_id] = local_absmax;
+  }
+  __syncthreads();
 
-    const float group_absmax = s_absmax[local_group_id];
-    const float y_s = group_absmax / fp8_max;
+  const float group_absmax = s_absmax[local_group_id];
+  const float y_s = group_absmax / fp8_max;
 
-    if (local_tid == 0) {
-      *scale_output = y_s;
-    }
+  if (lane_id == 0) {
+    *scale_output = y_s;
+  }
 
-    for (int i = local_tid; i < group_size; i += 16) {
-      float val = static_cast<float>(group_input[i]);
+  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+    vec_t input_vec;
+    input_vec.cast_load(group_input + i * vec_size);
+    
+    #pragma unroll
+    for (uint32_t j = 0; j < vec_size; ++j) {
+      float val = static_cast<float>(input_vec[j]);
       float q_val = fminf(fmaxf(val / y_s, fp8_min), fp8_max);
-      group_output[i] = FP8_TYPE(q_val);
+      group_output[i * vec_size + j] = FP8_TYPE(q_val);
     }
   }
 }
