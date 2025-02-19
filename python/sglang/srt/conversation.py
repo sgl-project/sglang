@@ -603,6 +603,7 @@ register_conv_template(
     )
 )
 
+# Reference: https://huggingface.co/Alibaba-NLP/gme-Qwen2-VL-2B-Instruct#usage
 register_conv_template(
     Conversation(
         name="gme-qwen2-vl",
