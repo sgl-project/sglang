@@ -158,7 +158,9 @@ class EPMoE(torch.nn.Module):
             self.use_fp8_w8a8 = True
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
-                self.quant_config.weight_block_size if self.use_block_quant else None
+                self.quant_method.quant_config.weight_block_size
+                if self.use_block_quant
+                else None
             )
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
@@ -389,7 +391,6 @@ class EPMoE(torch.nn.Module):
                 weight_name,
                 shard_id,
                 expert_id,
-                self.quant_method.block_quant,
             )
             return
 
