@@ -35,6 +35,7 @@ def _get_version():
 operator_namespace = "sgl_kernel"
 include_dirs = [
     root / "include",
+    root / "include" / "impl",
     root / "csrc",
 ]
 
