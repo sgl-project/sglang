@@ -175,7 +175,7 @@ def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
         for block_m in [32, 64, 128, 256]:
             for block_k in [32, 64, 128, 256]:
                 for block_n in [16, 32, 64, 128, 256]:
-                    for num_warps in [4, 8]:
+                    for num_warps in [1, 2, 4, 8]:
                         for group_size in [1, 4, 8, 16, 32]:
                             configs.append(
                                 {

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.3"
+version = "0.4.3.post2"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -21,12 +21,12 @@ runtime_common = [
     "hf_transfer", "huggingface_hub", "interegular", "modelscope",
     "orjson", "packaging", "pillow", "prometheus-client>=0.20.0",
     "psutil", "pydantic", "python-multipart", "pyzmq>=25.1.2",
-    "torchao>=0.7.0", "uvicorn", "uvloop", "xgrammar==0.1.10", "ninja"
+    "torchao>=0.7.0", "uvicorn", "uvloop", "xgrammar==0.1.10", "ninja", "transformers==4.48.3"
 ]
 srt = [
     "sglang[runtime_common]", "cuda-python",
     "sgl-kernel>=0.0.3.post6", "torch", "vllm>=0.6.4.post1,<=0.7.2",
-    "flashinfer_python>=0.2.1.post1",
+    "flashinfer_python>=0.2.1.post2",
     "outlines>=0.0.44,<=0.1.11",
 ]
 
