@@ -361,7 +361,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
         use_dp=False,
-        use_dp_linear=False, 
+        use_dp_linear=False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -379,7 +379,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.use_dp_linear = use_dp_linear 
+        self.use_dp_linear = use_dp_linear
 
         if self.use_dp_linear:
             self.tp_rank = get_tensor_model_parallel_rank()
@@ -558,6 +558,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 #assert local_q.shape[1] == self.q_lora_rank 
                 q = torch.zeros(bs, self.q_lora_rank, dtype=local_q.dtype, device=local_q.device)
                 torch.distributed.all_gather_into_tensor(q, local_q)
+                hidden_states = hidden_states[:bs, :]
+                q = q[:bs, :]
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
@@ -751,7 +753,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
                 use_dp=self.enable_dp_attention,
-                use_dp_linear=True 
+                use_dp_linear=True,
             )
         else:
             self.self_attn = DeepseekV2Attention(
