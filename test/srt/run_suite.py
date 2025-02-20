@@ -5,10 +5,11 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "per-commit": [
+        "models/lora/test_lora.py",
+        "models/lora/test_lora_backend.py",
+        "models/lora/test_multi_lora_backend.py",
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
-        "models/test_lora.py",
-        "models/test_lora_backend.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
         "sampling/penaltylib",
