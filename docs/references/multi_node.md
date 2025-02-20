@@ -1,4 +1,4 @@
-# Run Multi-Node Inference
+# Multi-Node Deployment
 
 ## Llama 3.1 405B
 
