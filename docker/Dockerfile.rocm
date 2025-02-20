@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.3 -t v0.4.3-rocm630 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.3.post2 -t v0.4.3.post2-rocm630 -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE="rocm/vllm-dev:20250114"
@@ -19,8 +19,6 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 ARG ATER_REPO="https://github.com/HaiShaw/ater"
 ARG CK_COMMITS="fa05ae"
-
-RUN apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
 
 RUN git clone ${SGL_REPO} \
     && cd sglang \
