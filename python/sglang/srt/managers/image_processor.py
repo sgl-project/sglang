@@ -583,12 +583,13 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
 class DeepseekVL2ImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
+        self.IMAGE_TOKEN="<image>"
 
     @staticmethod
-    def _process_single_image_task(image, input_text):
-        return global_processor.__call__(conversations=input_text, images=image)
+    def _process_single_image_task(image, input_text,max_req_input_len):
+        return global_processor.__call__(conversations=input_text, images=image,max_req_input_len=max_req_input_len)
 
-    async def _process_single_image(self, image_data: Union[bytes, str], input_text):
+    async def _process_single_image(self, image_data: Union[bytes, str], input_text,max_req_input_len):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             image_inputs = await loop.run_in_executor(
@@ -596,14 +597,15 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
                 DeepseekVL2ImageProcessor._process_single_image_task,
                 image_data,
                 input_text,
+                max_req_input_len,
             )
         else:
             image_inputs = self._process_single_image_task(
-                image_data, input_text)
+                image_data, input_text,max_req_input_len)
 
         return image_inputs
 
-    async def process_images_async(self, image_data, input_text, request_obj,*args,
+    async def process_images_async(self, image_data, input_ids, request_obj,max_req_input_len,*args,
         **kwargs):
         if not image_data:
             return None
@@ -613,13 +615,16 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
 
         images, image_hashes, image_sizes = [], [], []
 
-        for image in image_data:
-            pil_image, _size = load_image(image)
-            pil_image = pil_image.convert("RGB")
-            images += [pil_image]
-            image_hashes += [hash(image)]
-            image_sizes += [_size]
-        res = await self._process_single_image(images, input_text)
+        # for image in image_data:
+        #     pil_image, _size = load_image(image)
+        #     pil_image = pil_image.convert("RGB")
+        #     images += [pil_image]
+        #     image_hashes += [hash(image)]
+        #     image_sizes += [_size]
+        image_token=self.IMAGE_TOKEN
+        base_output=self.load_images(max_req_input_len,input_ids,image_data,image_token)
+        base_output.all_frames=[img.convert("RGB") for img in base_output.all_frames]
+        res = await self._process_single_image(base_output.all_frames, base_output.input_text,max_req_input_len)
         pixel_values = res["images"]
         input_ids = res["input_ids"]
         images_seq_mask = res["images_seq_mask"]
