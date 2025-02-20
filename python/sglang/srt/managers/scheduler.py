@@ -762,6 +762,11 @@ class Scheduler:
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
+        #输出tree_cache:
+        #将self.tree_cache.pretty_print()输出到/workspace/Super_MARIO/tree_cache.txt文件中
+        #with open("/workspace/Super_MARIO/tree_cache.txt", "a") as f:
+        #    f.write(self.tree_cache.pretty_print())
+        self.tree_cache.pretty_print()
 
         logger.info(
             f"Prefill batch. "
@@ -773,6 +778,39 @@ class Scheduler:
             f"#running-req: {running_bs}, "
             f"#queue-req: {len(self.waiting_queue) + has_being_chunked}"
         )
+        """
+        print(
+            f"Prefill batch. "
+            f"#new-seq: {len(can_run_list)}, "
+            f"#new-token: {adder.log_input_tokens}, "
+            f"#cached-token: {adder.log_hit_tokens}, "
+            f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"#running-req: {running_bs}, "
+            f"#queue-req: {len(self.waiting_queue) + has_being_chunked}"
+        )
+        """
+        #将信息保存到/workspace/Super_MARIO/cache_info.txt文件中
+        with open("/workspace/Super_MARIO/cache_info.txt", "a") as f:
+            f.write(
+                f"Prefill batch. "
+                f"#new-seq: {len(can_run_list)}, "
+                f"#new-token: {adder.log_input_tokens}, "
+                f"#cached-token: {adder.log_hit_tokens}, "
+                f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                f"#running-req: {running_bs}, "
+                f"#queue-req: {len(self.waiting_queue) + has_being_chunked}\n"
+            )
+            #将can_run_list中的Req信息写入文件
+            for req in can_run_list:
+                f.write(f"Req: {req.rid}, input_text: {req.origin_input_text}, input_ids:{req.origin_input_ids}, input_len:{len(req.origin_input_ids)}, prefix_indices: {req.prefix_indices}, prefix_len: {len(req.prefix_indices)}\n")
+            f.write("\n")
+
+
+        #将cache hit rate保存到/workspace/Super_MARIO/cache_hit_rate.txt文件中
+        with open("/workspace/Super_MARIO/cache_hit_rate.txt", "a") as f:
+            f.write(str(100.0 * tree_cache_hit_rate) + "\n")
 
         if self.enable_metrics:
             self.stats.num_running_reqs = running_bs
@@ -897,6 +935,12 @@ class Scheduler:
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 
+        #将waiting_queue中的请求的text保存到文件中
+        with open("/workspace/Super_MARIO/waiting_queue.txt", "a") as f:
+            for req in self.waiting_queue:
+                f.write(req.rid + ": " + req.origin_input_text + "\n")
+                f.write("prefix indices: " + str(req.prefix_indices) + "\n")
+                f.write("cached tokens: " + str(req.cached_tokens) + "\n")
         # Handle the cases where prefill is not allowed
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
@@ -907,6 +951,8 @@ class Scheduler:
         if running_bs >= self.max_running_requests:
             self.batch_is_full = True
             return None
+        #添加
+        
 
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
@@ -998,6 +1044,9 @@ class Scheduler:
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
         )
+        #将new_batch保存到/workspace/Super_MARIO/new_batch.txt文件中,添加
+        #with open("/workspace/Super_MARIO/new_batch.txt", "a") as f:
+        #    f.write(new_batch)
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill

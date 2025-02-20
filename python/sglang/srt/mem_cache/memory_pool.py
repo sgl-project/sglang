@@ -194,6 +194,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         logger.info(
             f"KV Cache is allocated. K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB."
         )
+        #添加，讲kv_cache的大小打印出来
+        print(f"KV Cache is allocated. K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB.")
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region():
@@ -230,6 +232,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         for v_cache in self.v_buffer:
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes
+    
+    
 
     # Todo: different memory layout
     def get_flat_data(self, indices):
