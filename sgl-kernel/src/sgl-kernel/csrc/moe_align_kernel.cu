@@ -25,8 +25,9 @@ limitations under the License.
 #define WARP_SIZE 32
 
 template <typename scalar_t>
-__global__ void moe_token_sort_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
-                                      int32_t* cumsum_buffer, size_t numel) {
+__global__ void count_and_sort_expert_tokens_kernel(const scalar_t* __restrict__ topk_ids,
+                                                    int32_t* __restrict__ sorted_token_ids,
+                                                    int32_t* __restrict__ cumsum_buffer, size_t numel) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
@@ -38,9 +39,10 @@ __global__ void moe_token_sort_kernel(scalar_t* __restrict__ topk_ids, int32_t* 
 }
 
 template <typename scalar_t>
-__global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
-                                            int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
-                                            int32_t block_size, size_t numel, int32_t* cumsum) {
+__global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_ids,
+                                            int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
+                                            int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
+                                            int32_t block_size, size_t numel, int32_t* __restrict__ cumsum) {
   __shared__ int32_t shared_counts[WARP_SIZE][8];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
@@ -52,6 +54,8 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
       shared_counts[warp_id][i] = 0;
     }
   }
+
+  __syncthreads();
 
   const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
   const size_t start_idx = threadIdx.x * tokens_per_thread;
@@ -104,7 +108,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
     const int max_blocks = 65535;
     const int actual_blocks = std::min(num_blocks, max_blocks);
 
-    auto sort_kernel = moe_token_sort_kernel<scalar_t>;
+    auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
     sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(topk_ids.data_ptr<scalar_t>(),
                                                              sorted_token_ids.data_ptr<int32_t>(),
                                                              cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel());
