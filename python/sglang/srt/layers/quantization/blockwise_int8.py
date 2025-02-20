@@ -255,6 +255,12 @@ class Int8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            layer.weight = torch.nn.Parameter(
+                layer.weight.data, requires_grad=False
+            )
+            layer.weight_scale_inv = torch.nn.Parameter(
+                layer.weight_scale_inv.data, requires_grad=False
+            )
             return
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         # If checkpoint not serialized int8, quantize the weights.

@@ -792,6 +792,7 @@ def inplace_fused_experts_fake(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = True,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1053,8 +1054,7 @@ def fused_experts_impl(
 
         if activation == "silu":
             if _is_cuda:
-                # silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-                ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
         elif activation == "gelu":
