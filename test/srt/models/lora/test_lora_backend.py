@@ -118,7 +118,7 @@ class TestLoRABackend(unittest.TestCase):
             srt_no_lora_outputs = srt_runner.forward(
                 [prompt], max_new_tokens=max_new_tokens
             )
-    
+
         with HFRunner(
             base_path,
             torch_dtype=torch_dtype,
@@ -151,13 +151,11 @@ class TestLoRABackend(unittest.TestCase):
         max_prefill_diff = torch.max(torch.abs(hf_prefill - srt_prefill))
         print("Max prefill diff (HF vs SRT):", max_prefill_diff)
 
-
         # Compare decode stage logprobs
         hf_decode = torch.tensor(hf_outputs.top_output_logprobs[0])
         srt_decode = torch.tensor(srt_outputs.top_output_logprobs[0])
         max_decode_diff = torch.max(torch.abs(hf_decode - srt_decode))
         print("Max decode diff (HF vs SRT):", max_decode_diff)
-
 
         srt_output_str = srt_outputs.output_strs[0].strip()
         hf_output_str = hf_outputs.output_strs[0].strip()
@@ -177,19 +175,19 @@ class TestLoRABackend(unittest.TestCase):
             "Max diff (HF base vs HF LoRA prefill):",
             torch.max(torch.abs(hf_no_lora_prefill - hf_prefill)),
         )
-        
+
         if hf_prefill.shape[0] <= 100:
             assert torch.all(torch.abs(hf_prefill - srt_prefill) < prefill_tol), (
                 f"Prefill logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
                 f"backend '{backend}', prompt: '{prompt[:50]}...'"
             )
-        
+
         if hf_decode.shape[0] <= 100:
             assert torch.all(torch.abs(hf_decode - srt_decode) < decode_tol), (
                 f"Decode logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
                 f"backend '{backend}', prompt: '{prompt[:50]}...'"
             )
-        
+
         if rouge_score < rouge_tol:
 
             raise AssertionError(
