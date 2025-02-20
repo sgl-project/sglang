@@ -547,7 +547,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             bs = hidden_states.shape[0]
             if (not self.use_dp_linear) or (bs % self.tp_size != 0) :
                 q = self.q_a_proj(hidden_states)[0]
-                print(f"[DEBUG] hidden_state.shape={hidden_states.shape}, bs={hidden_states.shape[0]}")
             else :
                 assert bs % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
                 local_bs = bs // self.tp_size
@@ -613,7 +612,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         q_len = hidden_states.shape[0]
-        print(f"[DEBUG] decode bs ={q_len}")
         q_input = hidden_states.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
         )
