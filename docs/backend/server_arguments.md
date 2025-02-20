@@ -56,6 +56,9 @@ Please consult the documentation below to learn more about the parameters you ma
 * `json_model_override_args`: Override model config with the provided JSON.
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
+> [!IMPORTANT]
+> **Make sure the correct `chat_template` is passed, or performance degradation may occur.**
+
 ## Serving: HTTP & API
 
 ### HTTP Server configuration
