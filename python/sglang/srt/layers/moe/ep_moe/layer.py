@@ -150,6 +150,8 @@ class EPMoE(torch.nn.Module):
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
             self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.block_shape = None
             self.activation_scheme = None
         else:
             self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
