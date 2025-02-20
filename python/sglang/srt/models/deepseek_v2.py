@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import sgl_kernel
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -577,6 +578,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
+        print("self.w_kc.shape", self.w_kc.shape, "self.w_scale.shape", self.w_scale.shape)
+        print("self.w_kc.dtype", self.w_kc.dtype, "self.w_scale.dtype", self.w_scale.dtype)
         if self.w_kc.dtype == torch.float8_e4m3fnuz:
             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
             q_nope_out = torch.bmm(
@@ -591,6 +594,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
         else:
+            print("q_node.dtype", q_nope.dtype, "self.w_kc.dtype", self.w_kc.dtype)
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
 
@@ -976,11 +980,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                             weight, weight_scale, weight_block_size
                         )
                         self_attn.w_scale = scale
-                w_kc, w_vc = w.unflatten(
-                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
@@ -988,6 +987,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                     if is_hip_:
                         self_attn.w_scale *= 2.0
+                
+                if w.dtype == torch.int8:
+                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(torch.bfloat16)
+
+                w_kc, w_vc = w.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

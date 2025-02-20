@@ -1,8 +1,8 @@
 from typing import Any, Dict, List, Optional
-
+from typing import Any, Callable, Dict, List, Optional
 import torch
 
-from sglang.srt.utils import is_cuda_available
+from sglang.srt.utils import is_cuda_available, set_weight_attrs, is_hip
 
 is_cuda = is_cuda_available()
 if is_cuda:
@@ -17,8 +17,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-
-
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+is_hip_ = is_hip()
 class W8A8Int8Config(QuantizationConfig):
     """Config class for W8A8 Int8 Quantization.
 
@@ -55,9 +55,11 @@ class W8A8Int8Config(QuantizationConfig):
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
         from sglang.srt.layers.linear import LinearBase
-
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         if isinstance(layer, LinearBase):
             return W8A8Int8LinearMethod(self)
+        elif isinstance(layer, FusedMoE):
+            return Int8MoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -115,3 +117,187 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         return int8_scaled_mm(
             x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
         )
+
+
+class Int8MoEMethod:
+    """MoE method for FP8.
+    Supports loading FP8 checkpoints with static weight scale and
+    dynamic/static activation scale.
+    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
+    activation scaling. The weight scaling factor will be initialized after
+    the model weights are loaded.
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
+        if not hasattr(cls, "_initialized"):
+            original_init = cls.__init__
+            new_cls = type(
+                cls.__name__,
+                (FusedMoEMethodBase,),
+                {
+                    "__init__": original_init,
+                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
+                },
+            )
+            obj = super(new_cls, new_cls).__new__(new_cls)
+            obj.__init__(*args, **kwargs)
+            return obj
+        return super().__new__(cls)
+
+    def __init__(self, quant_config):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        # if self.quant_config.is_checkpoint_fp8_serialized:
+        #     params_dtype = torch.float8_e4m3fn
+        tp_size = get_tensor_model_parallel_world_size()
+
+        # WEIGHTS
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, hidden_size, dtype=torch.int8
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, intermediate_size, dtype=torch.int8
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+    
+        # 为每一列维护一个scale
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, 2 * intermediate_size, 1, dtype=torch.float32),
+            requires_grad=False
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
+            requires_grad=False
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        # 更新量化方法
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}  # 改为COLUMN
+        )
+        # If loading fp8 checkpoint, pass the weight loaders.
+        # If loading an fp16 checkpoint, do not (we will quantize in
+        #   process_weights_after_loading()
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        w13_input_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+        )
+        layer.register_parameter("w13_input_scale", w13_input_scale)
+        set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+        w2_input_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+        )
+        layer.register_parameter("w2_input_scale", w2_input_scale)
+        set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
+        layer.w13_weight_scale = Parameter(layer.w13_weight_scale.data, requires_grad=False)
+        layer.w2_weight_scale = Parameter(layer.w2_weight_scale.data, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
+
+        # Expert selection
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+        )
+
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            import ater
+            from ater.fused_moe import fused_experts_ck
+
+            assert activation == "silu", f"{activation=} is not supported."
+
+            return fused_experts_ck(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                use_int8_w8a8=True,
+                # use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+
+        else:
+            # Expert fusion with FP8 quantization
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                activation=activation,
+                use_int8_w8a8=True,
+                # use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
