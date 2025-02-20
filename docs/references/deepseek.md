@@ -4,7 +4,7 @@ SGLang provides several optimizations specifically designed for the DeepSeek mod
 
 ## Launch DeepSeek V3 with SGLang
 
-SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3).
+SGLang is recognized as one of the top engines for [DeepSeek model inference](deepseek official). Refer to[ installation and launch](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch) to learn how to run fast inference of DeepSeek V3/R1 with SGLang.
 
 ### Download Weights
 
