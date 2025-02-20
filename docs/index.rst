@@ -27,12 +27,21 @@ The core features include:
    backend/openai_api_embeddings.ipynb
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
-   backend/structured_outputs.ipynb
-   backend/speculative_decoding.ipynb
-   backend/function_calling.ipynb
    backend/server_arguments.md
    backend/sampling_params.md
-   backend/quantization.md
+   backend/hyperparameter_tuning.md
+
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Advanced Features
+
+   advanced/speculative_decoding.ipynb
+   advanced/structured_outputs.ipynb
+   advanced/function_calling.ipynb
+   advanced/custom_chat_template.md
+   advanced/quantization.md
+
 
 .. toctree::
    :maxdepth: 1
@@ -54,10 +63,8 @@ The core features include:
    :caption: References
 
    references/supported_models.md
-   references/hyperparameter_tuning.md
    references/benchmark_and_profiling.md
    references/accuracy_evaluation.md
-   references/custom_chat_template.md
    references/amd_configure.md
    references/deepseek.md
    references/multi_node.md
