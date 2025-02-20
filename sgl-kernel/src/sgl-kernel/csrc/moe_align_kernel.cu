@@ -80,9 +80,10 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void align_global_cumsum(int32_t* local_offsets 
   __syncthreads();
 }
 
-SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_ptr /*src_and_dest*/, int* smem_ptr, int32_t* local_offsets,
-                                                             const int& tid, const int& lane_id, const int& warp_id,
-                                                             const int32_t& num_experts, cg::grid_group& grid) {
+SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_ptr /*src_and_dest*/, int* smem_ptr,
+                                                             int32_t* local_offsets, const int& tid, const int& lane_id,
+                                                             const int& warp_id, const int32_t& num_experts,
+                                                             cg::grid_group& grid) {
   int total_fragments = CEILDIV(num_experts, FRAG_SIZE_N);
   int fragments_per_block = CEILDIV(total_fragments, gridDim.x);
   int fragments_per_warp = CEILDIV(fragments_per_block, FRAGS_PER_BLOCK);
@@ -264,7 +265,8 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
   parallel_unaligned_local_cumsum(tid, tokens_cnts_ptr /*dest*/, local_offsets, local_offsets_buf, shared_counts,
                                   experts_per_warp, num_experts, grid);
 
-  reduce_unaligned_cumsum(tokens_cnts_ptr /*src_and_dest*/, smem_ptr, local_offsets, tid, lane_id, warp_id, num_experts, grid);
+  reduce_unaligned_cumsum(tokens_cnts_ptr /*src_and_dest*/, smem_ptr, local_offsets, tid, lane_id, warp_id, num_experts,
+                          grid);
 
   align_global_cumsum(local_offsets /*src_and_dest*/, tid, block_size, num_experts);
 
