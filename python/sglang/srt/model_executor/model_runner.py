@@ -292,9 +292,18 @@ class ModelRunner:
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
         if not self.is_draft_worker:
-            # Bind OpenMP threads to CPU cores
-            if self.device == "cpu" and self.local_omp_cpuid != "all":
-                torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
+            if self.device == "cpu":
+                # Bind OpenMP threads to CPU cores
+                if self.local_omp_cpuid != "all":
+                    torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
+
+                # Initialization of shm all_reduce
+                import sgl_kernel.common_ops
+
+                shm_comm_op = sgl_kernel.common_ops
+                # Set local size to hint SGLang to use shared memory based AllReduce
+                os.environ["LOCAL_SIZE"] = str(self.tp_size)
+                shm_comm_op.initialize(self.tp_size, self.tp_rank)
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
@@ -305,7 +314,9 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
             )
-            initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            initialize_model_parallel(
+                tensor_model_parallel_size=self.tp_size, shm_comm_op=shm_comm_op
+            )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,

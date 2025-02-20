@@ -21,9 +21,13 @@ from pathlib import Path
 import torch
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
+
+force_cuda = os.environ.get("SGL_KERNEL_FORCE_CUDA", "0") == "1"
+
+build_cuda_sources = torch.cuda.is_available() or force_cuda
 
 
 if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
@@ -55,7 +59,8 @@ cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
 deepgemm = root / "3rdparty" / "deepgemm"
-include_dirs = [
+include_dirs = []
+cuda_include_dirs = [
     root / "include",
     root / "csrc",
     cutlass.resolve() / "include",
@@ -141,30 +146,35 @@ nvcc_flags_fp8 = [
 ]
 
 sources = [
-    "csrc/allreduce/trt_reduce_internal.cu",
-    "csrc/allreduce/trt_reduce_kernel.cu",
-    "csrc/attention/lightning_attention_decode_kernel.cu",
-    "csrc/elementwise/activation.cu",
-    "csrc/elementwise/fused_add_rms_norm_kernel.cu",
-    "csrc/elementwise/rope.cu",
-    "csrc/gemm/bmm_fp8.cu",
-    "csrc/gemm/cublas_grouped_gemm.cu",
-    "csrc/gemm/awq_kernel.cu",
-    "csrc/gemm/fp8_gemm_kernel.cu",
-    "csrc/gemm/fp8_blockwise_gemm_kernel.cu",
-    "csrc/gemm/int8_gemm_kernel.cu",
-    "csrc/gemm/per_token_group_quant_fp8.cu",
-    "csrc/gemm/per_token_quant_fp8.cu",
-    "csrc/gemm/per_tensor_quant_fp8.cu",
-    "csrc/moe/moe_align_kernel.cu",
-    "csrc/speculative/eagle_utils.cu",
-    "csrc/speculative/speculative_sampling.cu",
-    "csrc/torch_extension.cc",
-    "3rdparty/flashinfer/csrc/norm.cu",
-    "3rdparty/flashinfer/csrc/renorm.cu",
-    "3rdparty/flashinfer/csrc/sampling.cu",
+    "src/sgl-kernel/csrc/cpu/interface.cpp",
+    "src/sgl-kernel/csrc/cpu/shm.cpp",
 ]
-
+cuda_sources = (
+    [
+        "csrc/allreduce/trt_reduce_internal.cu",
+        "csrc/allreduce/trt_reduce_kernel.cu",
+        "csrc/attention/lightning_attention_decode_kernel.cu",
+        "csrc/elementwise/activation.cu",
+        "csrc/elementwise/fused_add_rms_norm_kernel.cu",
+        "csrc/elementwise/rope.cu",
+        "csrc/gemm/bmm_fp8.cu",
+        "csrc/gemm/cublas_grouped_gemm.cu",
+        "csrc/gemm/awq_kernel.cu",
+        "csrc/gemm/fp8_gemm_kernel.cu",
+        "csrc/gemm/fp8_blockwise_gemm_kernel.cu",
+        "csrc/gemm/int8_gemm_kernel.cu",
+        "csrc/gemm/per_token_group_quant_fp8.cu",
+        "csrc/gemm/per_token_quant_fp8.cu",
+        "csrc/gemm/per_tensor_quant_fp8.cu",
+        "csrc/moe/moe_align_kernel.cu",
+        "csrc/speculative/eagle_utils.cu",
+        "csrc/speculative/speculative_sampling.cu",
+        "csrc/torch_extension.cc",
+        "3rdparty/flashinfer/csrc/norm.cu",
+        "3rdparty/flashinfer/csrc/renorm.cu",
+        "3rdparty/flashinfer/csrc/sampling.cu",
+    ],
+)
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
 enable_fp8 = os.getenv("SGL_KERNEL_ENABLE_FP8", "0") == "1"
 enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
@@ -205,18 +215,34 @@ for flag in [
         pass
 
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda", "cublas"]
+extra_compile_args = {"cxx": cxx_flags}
+libraries = ["c10", "torch", "torch_python"]
+cuda_libraries = ["cuda", "cublas"]
+cmdclass = {
+    "build_ext": BuildExtension.with_options(use_ninja=True),
+}
+if build_cuda_sources:
+    sources.update(cuda_sources)
+    include_dirs.extend(cuda_include_dirs)
+    extra_compile_args.update({"nvcc": nvcc_flags})
+    libraries.extend(cuda_libraries)
+    cmdclass.update(
+        {
+            "build_py": CustomBuildPy,
+        }
+    )
+    Extension = CUDAExtension
+else:
+    Extension = CppExtension
+
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
-    CUDAExtension(
+    Extension(
         name="sgl_kernel.common_ops",
         sources=sources,
         include_dirs=include_dirs,
-        extra_compile_args={
-            "nvcc": nvcc_flags,
-            "cxx": cxx_flags,
-        },
+        extra_compile_args=extra_compile_args,
         libraries=libraries,
         extra_link_args=extra_link_args,
         py_limited_api=True,
@@ -229,9 +255,6 @@ setup(
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     ext_modules=ext_modules,
-    cmdclass={
-        "build_ext": BuildExtension.with_options(use_ninja=True),
-        "build_py": CustomBuildPy,
-    },
+    cmdclass=cmdclass,
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )

@@ -10,6 +10,15 @@ from .parallel_state import get_tp_group
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    if input_.is_cpu:
+        from sglang.srt.distributed import get_tp_group
+
+        shm_comm_op = get_tp_group().shm_comm_op
+        shm_comm_op.shm_allreduce(
+            input_, get_tp_group().device_group, torch.distributed.ReduceOp.SUM
+        )
+        return input_
+
     return get_tp_group().all_reduce(input_)
 
 
