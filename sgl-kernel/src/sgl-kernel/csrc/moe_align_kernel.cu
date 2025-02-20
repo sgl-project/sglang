@@ -23,7 +23,6 @@ limitations under the License.
 
 #include "utils.h"
 
-#define WARP_SIZE 32
 #define MAX_NUM_EXPERTS 256
 #define EXPERTS_PER_WARP ((MAX_NUM_EXPERTS) / (WARP_SIZE))
 
@@ -50,7 +49,6 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void store_global_cumsum(int* cumsum /*dest*/, i
                                                          const int& num_experts, cg::grid_group& grid) {
   int active_threads = CEILDIV(num_experts + 1, kElementsPerThr);
   if (tid < active_threads - 1) {
-    // NOTE(yiakwy) : loop body useful for workload with the number of experts upto 256
     for (int i = tid * kElementsPerThr; i < (tid + 1) * kElementsPerThr; i += kElementsPerAccess) {
       *(int4*)(cumsum + i) = *(int4*)(local_offsets + i);
     }
@@ -69,15 +67,8 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void store_global_cumsum(int* cumsum /*dest*/, i
   grid.sync();
 }
 
-SGLANG_FORCE_INLINE_DEVICE_FUNC void align_global_cumsum(const int* tokens_cnts_ptr /*src*/,
-                                                         int32_t* local_offsets /*dest*/, const int tid,
+SGLANG_FORCE_INLINE_DEVICE_FUNC void align_global_cumsum(int32_t* local_offsets /*src_and_dest*/, const int tid,
                                                          const int32_t& block_size, const int32_t& num_experts) {
-  if (tid < num_experts) {
-    *(local_offsets + tid + 1) = *(tokens_cnts_ptr + tid);
-  }
-  __syncthreads();
-
-  // TODO (yiakwy) : distribute work to other threads
   if (tid == 0) {
     for (int i = num_experts; i > 0; i--) {
       local_offsets[i] = local_offsets[i] - local_offsets[i - 1];
@@ -89,7 +80,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void align_global_cumsum(const int* tokens_cnts_
   __syncthreads();
 }
 
-SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_ptr /*src_and_dest*/, int* smem_ptr,
+SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_ptr /*src_and_dest*/, int* smem_ptr, int32_t* local_offsets,
                                                              const int& tid, const int& lane_id, const int& warp_id,
                                                              const int32_t& num_experts, cg::grid_group& grid) {
   int total_fragments = CEILDIV(num_experts, FRAG_SIZE_N);
@@ -127,7 +118,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_pt
 
       if (warp_id * fragments_per_warp < kWarpsToLoad * fragments_per_block) {
         if (warp_id % kWarpsToLoad == 0) {
-          for (int k = 0; k < FRAG_SIZE_N; k += (WARP_SIZE / FRAG_SIZE_N)) {
+          for (int k = 0; k < FRAG_SIZE_M; k += (WARP_SIZE / FRAG_SIZE_N)) {
             int sRow = lane_id / FRAG_SIZE_N + k;
             int sThrColOff = lane_id % FRAG_SIZE_N;
             int sCol = sThrColOff + (warp_id / kWarpsToLoad) * FRAG_SIZE_N;
@@ -147,6 +138,11 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_pt
   }    // end of i
   __threadfence_system();
   grid.sync();
+
+  if (tid < num_experts) {
+    *(local_offsets + tid + 1) = *(tokens_cnts_ptr + tid);
+  }
+  __syncthreads();
 }
 
 SGLANG_FORCE_INLINE_DEVICE_FUNC void parallel_unaligned_local_cumsum(
@@ -268,9 +264,9 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
   parallel_unaligned_local_cumsum(tid, tokens_cnts_ptr /*dest*/, local_offsets, local_offsets_buf, shared_counts,
                                   experts_per_warp, num_experts, grid);
 
-  reduce_unaligned_cumsum(tokens_cnts_ptr /*src_and_dest*/, smem_ptr, tid, lane_id, warp_id, num_experts, grid);
+  reduce_unaligned_cumsum(tokens_cnts_ptr /*src_and_dest*/, smem_ptr, local_offsets, tid, lane_id, warp_id, num_experts, grid);
 
-  align_global_cumsum(tokens_cnts_ptr /*src*/, local_offsets /*dest*/, tid, block_size, num_experts);
+  align_global_cumsum(local_offsets /*src_and_dest*/, tid, block_size, num_experts);
 
   store_global_cumsum(cumsum /*dest*/, total_tokens_post_pad /*dest*/, local_offsets /*src*/, tid, num_experts, grid);
 
