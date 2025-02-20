@@ -31,8 +31,8 @@ class LoRAModelCase:
     base: str
     adaptors: List[LoRAAdaptor]
     tp_size: int = 1
-    prefill_tolerance: float = 5e-1
-    decode_tolerance: float = 5e-1
+    prefill_tolerance: float = 5e-2
+    decode_tolerance: float = 5e-2
     rouge_l_tolerance: float = 1.0
     max_loras_per_batch: int = 1
     skip_long_prompt: bool = False

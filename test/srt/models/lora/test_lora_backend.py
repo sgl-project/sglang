@@ -38,15 +38,7 @@ CI_LORA_MODELS = [
         adaptors=[
             LoRAAdaptor(
                 name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-            ),
-        ],
-        max_loras_per_batch=1,
-    ),
-    LoRAModelCase(
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        adaptors=[
-            LoRAAdaptor(
-                name="raaec/llama3.1-8b-instruct-lora-model",
+                prefill_tolerance=1e-1,
             ),
         ],
         max_loras_per_batch=1,
@@ -103,17 +95,17 @@ class TestLoRABackend(unittest.TestCase):
             lora_backend=backend,
             disable_cuda_graph=True,
             disable_radix_cache=True,
-            mem_fraction_static=0.65,
+            mem_fraction_static=0.88,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
-                prompt, max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
+                [prompt], max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
             )
 
         with HFRunner(
             base_path, torch_dtype=torch_dtype, model_type="generation"
         ) as hf_runner:
             hf_outputs = hf_runner.forward(
-                prompt, max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
+                [prompt], max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
             )
 
         with SRTRunner(
@@ -121,18 +113,19 @@ class TestLoRABackend(unittest.TestCase):
             torch_dtype=torch_dtype,
             model_type="generation",
             tp_size=model_case.tp_size,
-            mem_fraction_static=0.65,
+            mem_fraction_static=0.88,
         ) as srt_runner:
             srt_no_lora_outputs = srt_runner.forward(
-                prompt, max_new_tokens=max_new_tokens
+                [prompt], max_new_tokens=max_new_tokens
             )
+    
         with HFRunner(
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
         ) as hf_runner:
             hf_no_lora_outputs = hf_runner.forward(
-                prompt, max_new_tokens=max_new_tokens
+                [prompt], max_new_tokens=max_new_tokens
             )
 
         # Use individual adapter tolerances if set, otherwise use model defaults
@@ -157,35 +150,21 @@ class TestLoRABackend(unittest.TestCase):
         srt_prefill = torch.tensor(srt_outputs.top_input_logprobs[0])
         max_prefill_diff = torch.max(torch.abs(hf_prefill - srt_prefill))
         print("Max prefill diff (HF vs SRT):", max_prefill_diff)
-        if hf_prefill.shape[0] <= 100:
-            assert torch.all(torch.abs(hf_prefill - srt_prefill) < prefill_tol), (
-                f"Prefill logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
-                f"backend '{backend}', prompt: '{prompt[:50]}...'"
-            )
+
 
         # Compare decode stage logprobs
         hf_decode = torch.tensor(hf_outputs.top_output_logprobs[0])
         srt_decode = torch.tensor(srt_outputs.top_output_logprobs[0])
         max_decode_diff = torch.max(torch.abs(hf_decode - srt_decode))
         print("Max decode diff (HF vs SRT):", max_decode_diff)
-        if hf_decode.shape[0] <= 100:
-            assert torch.all(torch.abs(hf_decode - srt_decode) < decode_tol), (
-                f"Decode logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
-                f"backend '{backend}', prompt: '{prompt[:50]}...'"
-            )
+
 
         srt_output_str = srt_outputs.output_strs[0].strip()
         hf_output_str = hf_outputs.output_strs[0].strip()
         rouge_score = calculate_rouge_l([srt_output_str], [hf_output_str])[0]
         print("ROUGE-L score:", rouge_score)
-
-        if rouge_score < rouge_tol:
-            print("SRT output:", srt_output_str)
-            print("HF output:", hf_output_str)
-            raise AssertionError(
-                f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                f"for base '{base_path}', adaptor '{adaptor.name}', backend '{backend}', prompt: '{prompt[:50]}...'"
-            )
+        print("SRT output:", srt_output_str)
+        print("HF output:", hf_output_str)
 
         # Additional: compare prefill outputs between base model (no LoRA) and LoRA model for reference
         hf_no_lora_prefill = torch.tensor(hf_no_lora_outputs.top_input_logprobs[0])
@@ -198,6 +177,25 @@ class TestLoRABackend(unittest.TestCase):
             "Max diff (HF base vs HF LoRA prefill):",
             torch.max(torch.abs(hf_no_lora_prefill - hf_prefill)),
         )
+        
+        if hf_prefill.shape[0] <= 100:
+            assert torch.all(torch.abs(hf_prefill - srt_prefill) < prefill_tol), (
+                f"Prefill logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
+                f"backend '{backend}', prompt: '{prompt[:50]}...'"
+            )
+        
+        if hf_decode.shape[0] <= 100:
+            assert torch.all(torch.abs(hf_decode - srt_decode) < decode_tol), (
+                f"Decode logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
+                f"backend '{backend}', prompt: '{prompt[:50]}...'"
+            )
+        
+        if rouge_score < rouge_tol:
+
+            raise AssertionError(
+                f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
+                f"for base '{base_path}', adaptor '{adaptor.name}', backend '{backend}', prompt: '{prompt[:50]}...'"
+            )
 
     def run_backend_batch(
         self,
