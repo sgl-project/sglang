@@ -5,10 +5,11 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "per-commit": [
+        "models/lora/test_lora.py",
+        "models/lora/test_lora_backend.py",
+        "models/lora/test_multi_lora_backend.py",
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
-        "models/test_lora.py",
-        "models/test_lora_backend.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
         "sampling/penaltylib",
@@ -21,11 +22,11 @@ suites = {
         "test_eval_accuracy_mini.py",
         "test_gguf.py",
         "test_input_embeddings.py",
+        "test_mla.py",
+        "test_mla_fp8.py",
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
         "test_metrics.py",
-        "test_mla.py",
-        "test_mla_fp8.py",
         "test_no_chunked_prefill.py",
         "test_no_overlap_scheduler.py",
         "test_openai_server.py",

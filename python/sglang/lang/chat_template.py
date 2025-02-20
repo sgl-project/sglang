@@ -427,6 +427,8 @@ def match_chat_ml(model_path: str):
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     # Now the suffix for qwen2 chat model is "instruct"
+    if "qwen" in model_path and "vl" in model_path:
+        return get_chat_template("qwen2-vl")
     if "qwen" in model_path:
         if "vl" in model_path:
             return get_chat_template("qwen2-vl")
@@ -441,6 +443,12 @@ def match_chat_ml(model_path: str):
         or "llava-onevision-qwen2" in model_path
     ):
         return get_chat_template("chatml-llava")
+
+
+@register_chat_template_matching_function
+def match_chat_minicpm(model_path: str):
+    if "minicpm" in model_path:
+        return get_chat_template("minicpmv")
 
 
 @register_chat_template_matching_function
