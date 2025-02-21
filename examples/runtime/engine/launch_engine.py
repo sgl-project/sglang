@@ -7,7 +7,7 @@ import sglang as sgl
 
 def main():
     llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
-    llm.chat("What is the capital of France?")
+    llm.generate("What is the capital of France?")
     llm.shutdown()
 
 
