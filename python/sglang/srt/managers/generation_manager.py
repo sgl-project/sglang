@@ -470,9 +470,9 @@ class GenerationConverter:
 
         if (
             hasattr(recv_obj, "output_hidden_states")
-            and len(recv_obj.output_hidden_states[i]) > 0
+            and len(recv_obj.output_hidden_states[index]) > 0
         ):
-            meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+            meta_info["hidden_states"] = recv_obj.output_hidden_states[index]
 
         return meta_info
 
