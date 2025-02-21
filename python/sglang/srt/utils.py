@@ -63,8 +63,6 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 
-from sglang.srt.distributed import get_tp_group
-
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -1285,6 +1283,8 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 
 def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
+    from sglang.srt.distributed import get_tp_group
+
     if isinstance(w, DTensor):
         tp_device_mesh = get_tp_group().device_mesh_device
         # print(
