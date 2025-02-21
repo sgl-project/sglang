@@ -1086,40 +1086,24 @@ def initialize_model_parallel(
 
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-    group_ranks = []
+    tp_group_ranks = []
     for i in range(num_tensor_model_parallel_groups):
         ranks = list(
             range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
         )
-        group_ranks.append(ranks)
-
-    global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    # message queue broadcaster is only used in tensor model parallel group
-    _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=True,
-        group_name="tp",
-    )
+        tp_group_ranks.append(ranks)
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
-    group_ranks = []
+    pp_group_ranks = []
     for i in range(num_pipeline_model_parallel_groups):
         ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
+        pp_group_ranks.append(ranks)
 
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
-    # pipeline parallel does not need custom allreduce
-    _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_custom_allreduce=False,
-        group_name="pp",
+    _initialize_model_parallel_inner(
+        tp_group_ranks=tp_group_ranks,
+        pp_group_ranks=pp_group_ranks,
+        backend=backend,
     )
 
 
@@ -1145,6 +1129,34 @@ def initialize_model_parallel_via_existing(
         group_ranks=None,
         local_rank=get_world_group().local_rank,
         backend=None,
+        use_custom_allreduce=False,
+        group_name="pp",
+    )
+
+
+def _initialize_model_parallel_inner(
+    tp_group_ranks,
+    pp_group_ranks,
+    backend,
+) -> None:
+    global _TP
+    assert _TP is None, "tensor model parallel group is already initialized"
+    # message queue broadcaster is only used in tensor model parallel group
+    _TP = init_model_parallel_group(
+        tp_group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="tp",
+    )
+
+    global _PP
+    assert _PP is None, "pipeline model parallel group is already initialized"
+    # pipeline parallel does not need custom allreduce
+    _PP = init_model_parallel_group(
+        pp_group_ranks,
+        get_world_group().local_rank,
+        backend,
         use_custom_allreduce=False,
         group_name="pp",
     )
