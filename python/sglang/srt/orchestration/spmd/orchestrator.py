@@ -1,5 +1,6 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.generation_manager import GenerationConverter
 from sglang.srt.managers.io_struct import BatchTokenIDOut, GenerateReqInput
@@ -14,6 +15,7 @@ class SpmdOrchestrator:
         nccl_port: int,
         gpu_id: int,
         tp_rank: int,
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
     ):
         self._scheduler = Scheduler(
             server_args=server_args,
@@ -21,6 +23,7 @@ class SpmdOrchestrator:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=None,
+            parallel_process_groups=parallel_process_groups,
         )
         self._generation_converter = GenerationConverter(server_args)
         self._detokenizer = DetokenizerManager(server_args)

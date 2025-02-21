@@ -62,6 +62,8 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 
+from sglang.srt.distributed import GroupCoordinator
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -665,6 +667,20 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+def broadcast_pyobj_in_group(
+    data: List[Any],
+    index_in_group: int,
+    dist_group_coordinator: GroupCoordinator,
+    src_index_in_group: int = 0,
+):
+    return broadcast_pyobj(
+        data=data,
+        rank=dist_group_coordinator.ranks[index_in_group],
+        dist_group=dist_group_coordinator.cpu_group,
+        src=dist_group_coordinator.ranks[src_index_in_group],
+    )
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
@@ -673,7 +689,7 @@ def broadcast_pyobj(
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
-    if rank == 0:
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
             dist.broadcast(tensor_size, src=src, group=dist_group)

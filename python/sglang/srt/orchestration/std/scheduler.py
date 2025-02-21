@@ -8,7 +8,6 @@ from typing import List, Optional
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -29,7 +28,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    broadcast_pyobj,
+    broadcast_pyobj_in_group,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
@@ -43,10 +42,10 @@ logger = logging.getLogger(__name__)
 
 class SchedulerCommunicator:
     def __init__(
-        self,
-        core: Scheduler,
-        server_args: ServerArgs,
-        port_args: PortArgs,
+            self,
+            core: Scheduler,
+            server_args: ServerArgs,
+            port_args: PortArgs,
     ):
         self.core = core
         self.server_args = server_args
@@ -146,19 +145,19 @@ class SchedulerCommunicator:
 
             if self.core.attn_tp_size != 1:
                 attn_tp_rank_0 = self.core.dp_rank * self.core.attn_tp_size
-                work_reqs = broadcast_pyobj(
+                work_reqs = broadcast_pyobj_in_group(
                     work_reqs,
                     self.core.attn_tp_rank,
                     self.core.attn_tp_cpu_group,
                     src=attn_tp_rank_0,
                 )
             if self.core.tp_size != 1:
-                control_reqs = broadcast_pyobj(
+                control_reqs = broadcast_pyobj_in_group(
                     control_reqs, self.core.tp_rank, self.core.tp_cpu_group
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.core.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
+            recv_reqs = broadcast_pyobj_in_group(
                 recv_reqs, self.core.tp_rank, self.core.tp_cpu_group
             )
         return recv_reqs
@@ -174,12 +173,12 @@ class SchedulerCommunicator:
 
 
 def run_scheduler_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    gpu_id: int,
-    tp_rank: int,
-    dp_rank: Optional[int],
-    pipe_writer,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: Optional[int],
+        pipe_writer,
 ):
     setproctitle.setproctitle("sglang::scheduler")
     faulthandler.enable()
