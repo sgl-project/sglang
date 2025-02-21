@@ -189,6 +189,7 @@ class GroupCoordinator:
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        existing: Optional['DimProcessGroups'] = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -199,19 +200,31 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self.device_group = device_group
-                self.cpu_group = cpu_group
+        if existing is not None:
+            assert torch_distributed_backend is None and group_ranks is None, \
+                'When using argument `existing`, should not provide `torch_distributed_backend` and `group_ranks`'
+            ranks = existing.device_mesh_device.mesh.tolist()
+            self.ranks = ranks
+            self.world_size = len(ranks)
+            self.rank_in_group = ranks.index(self.rank)
+            self.device_group = existing.device_mesh_device.get_group()
+            self.cpu_group = existing.device_mesh_cpu.get_group()
+            self.device_mesh_device = existing.device_mesh_device
+        else:
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination between
+                # processes through the CPU.
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self.device_group = device_group
+                    self.cpu_group = cpu_group
+            self.device_mesh_device = None
 
         assert self.cpu_group is not None
         assert self.device_group is not None
