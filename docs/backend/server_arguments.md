@@ -83,8 +83,8 @@ Please consult the documentation below to learn more about the parameters you ma
 * `load_balance_method`: Will be deprecated. Load balancing strategy for data parallel requests.
 
 ### Expert parallelism
-
-* `ep_size`: Distribute the experts onto multiple GPUs for MoE models. Remember to shard the model weights with `tp_size=ep_size`, for detailed benchmarking refer to [this PR](https://github.com/sgl-project/sglang/pull/2203).
+* `enable_ep_moe`: Enables expert parallelism that distributes the experts onto multiple GPUs for MoE models.
+* `ep_size`: The size of EP. Please shard the model weights with `tp_size=ep_size`, for detailed benchmarking refer to [this PR](https://github.com/sgl-project/sglang/pull/2203). If not set, `ep_size` will be automatically set to `tp_size`.
 
 ## Memory and scheduling
 
@@ -179,7 +179,6 @@ Please consult the documentation below to learn more about the parameters you ma
 
 * `enable_mixed_chunk`: Enables mixing prefill and decode, see [this discussion](https://github.com/sgl-project/sglang/discussions/1163).
 * `enable_dp_attention`: Enable [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models) for Deepseek models. Note that you need to choose `dp_size = tp_size` for this.
-* `enable_ep_moe`: Enables expert parallelism, see the description of `ep_size`.
 * `enable_torch_compile`: Torch compile the model. This is an experimental feature.
 * `torch_compile_max_bs`: The maximum batch size when using `torch_compile`.
 * `cuda_graph_max_bs`: Adjust the maximum batchsize when using cuda graph. By default this is chosen for you based on GPU specifics.

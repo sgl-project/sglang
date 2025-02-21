@@ -141,7 +141,9 @@ def biased_grouped_topk(
         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
         .reshape(num_token, -1)
     )  # [n, e]
-    tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+    tmp_scores = scores_for_choice.masked_fill(
+        ~score_mask.bool(), float("-inf")
+    )  # [n, e]
     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
     topk_weights = scores.gather(1, topk_ids)
 
