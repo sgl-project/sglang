@@ -219,9 +219,14 @@ class Engine(EngineBase):
             self.orchestrator.update_weights_from_distributed(obj, None)
         )
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
+            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors),
+            load_format=load_format,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(

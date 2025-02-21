@@ -1,7 +1,6 @@
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
@@ -47,8 +46,17 @@ class EngineBase:
         )
         return self._generate_impl(obj)
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        """Update weights from tensor."""
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
+        """
+        Update weights from distributed source.
+        Args:
+            named_tensors: The name and value of the tensors used to update weights
+            load_format: `None` for default HF format, and `direct` for 1-to-1 matching the raw SGLang format
+        """
         raise NotImplementedError
 
     def _generate_impl(self, obj: GenerateReqInput):

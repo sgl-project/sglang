@@ -18,7 +18,6 @@ import threading
 from typing import List, Optional, Tuple
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -27,14 +26,12 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     broadcast_pyobj_in_group,
     set_random_seed,
 )
@@ -112,7 +109,7 @@ class TpModelWorker:
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
                 else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                     // (server_args.dp_size if server_args.enable_dp_attention else 1)
             ),
             self.model_runner.req_to_token_pool.size,
         )
@@ -218,8 +215,9 @@ class TpModelWorker:
         )
         return success, message
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        success, message = self.model_runner.update_weights_from_tensor(named_tensors)
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]],
+                                   load_format: Optional[str] = None):
+        success, message = self.model_runner.update_weights_from_tensor(named_tensors, load_format)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):

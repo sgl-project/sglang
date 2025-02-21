@@ -1,7 +1,6 @@
 from typing import List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.entrypoints.engine_base import EngineBase
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -35,8 +34,12 @@ class EngineFragment(EngineBase):
     def _generate_impl(self, obj: GenerateReqInput):
         return self._entrypoint.generate(obj)
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        self._entrypoint.update_weights_from_tensor(named_tensors)
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
+        self._entrypoint.update_weights_from_tensor(named_tensors, load_format)
 
     def shutdown(self):
         self._entrypoint.shutdown()
