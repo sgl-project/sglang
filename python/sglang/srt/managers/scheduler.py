@@ -284,7 +284,7 @@ class Scheduler:
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
-        self.overlap_result_queue = deque()
+        self.result_queue = deque()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
 
@@ -424,7 +424,7 @@ class Scheduler:
 
         if batch:
             result = self.run_batch(batch)
-            self.overlap_result_queue.append((batch.copy(), result))
+            self.result_queue.append((batch.copy(), result))
 
             if self.last_batch is None:
                 # Create a dummy first batch to start the pipeline for overlap schedule.
@@ -438,7 +438,7 @@ class Scheduler:
 
         if self.last_batch:
             # Process the results of the last batch
-            tmp_batch, tmp_result = self.overlap_result_queue.popleft()
+            tmp_batch, tmp_result = self.result_queue.popleft()
             tmp_batch.next_batch_sampling_info = (
                 self.tp_worker.cur_sampling_info if batch else None
             )
