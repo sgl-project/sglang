@@ -73,7 +73,6 @@ def run():
     fragment = EngineFragment(
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
-        tp_size=tp_size,
         tp_rank=tp_rank,
         nccl_port=23456,
         gpu_id=local_rank,

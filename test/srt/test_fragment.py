@@ -6,11 +6,10 @@ import unittest
 from multiprocessing import Process
 
 import torch
-from torch.distributed.device_mesh import init_device_mesh
-
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.entrypoints.engine_fragment import EngineFragment
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from torch.distributed.device_mesh import init_device_mesh
 
 _TP_SIZE = 2
 
@@ -66,7 +65,6 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
         fragment = EngineFragment(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             mem_fraction_static=0.1,
-            tp_size=_TP_SIZE,
             random_seed=42,
             # fragment args
             tp_rank=tp_rank,
@@ -92,7 +90,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             outputs = fragment.generate(
                 prompt=prompt,
                 sampling_params=[dict(max_new_tokens=16, temperature=0.0)]
-                * len(prompt),
+                                * len(prompt),
             )
             print(
                 f"subprocess[{tp_rank=}] End generation {prompt=} {outputs=}",
