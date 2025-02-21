@@ -80,6 +80,15 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
+            # from sglang.srt.layers.attention.triton_backend import (
+            #     TritonMultiStepDraftBackend,
+            # )
+
+            # self.draft_attn_backend = TritonMultiStepDraftBackend(
+            #     self.model_runner,
+            #     self.topk,
+            #     self.speculative_num_steps,
+            # )
         elif server_args.attention_backend == "triton":
             from sglang.srt.layers.attention.triton_backend import (
                 TritonMultiStepDraftBackend,
@@ -144,6 +153,8 @@ class EAGLEWorker(TpModelWorker):
                 model_worker_batch
             )
 
+            print("!!!!! batch forward mode: ", batch.forward_mode)
+
             # Forward with the draft model.
             batch.spec_info = EagleDraftInput(
                 hidden_states=logits_output.hidden_states,
@@ -195,6 +206,12 @@ class EAGLEWorker(TpModelWorker):
 
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
+
+        print("!!!!! debug draft output !!!!!")
+        print("score list: ", score_list)
+        print("token list: ", token_list)
+        print("parents list: ", parents_list)
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
@@ -280,6 +297,7 @@ class EAGLEWorker(TpModelWorker):
         return res + (model_worker_batch,)
 
     def forward_draft_extend(self, batch: ScheduleBatch):
+        print("!!!! draft extend")
         self._set_mem_pool(batch, self.model_runner)
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -294,6 +312,7 @@ class EAGLEWorker(TpModelWorker):
         batch.req_to_token_pool = runner.req_to_token_pool
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+        print("!!!! draft extend after decode")
         seq_lens_backup = batch.seq_lens
         req_pool_indices_backup = batch.req_pool_indices
 

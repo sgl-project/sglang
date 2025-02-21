@@ -298,11 +298,13 @@ class EagleVerifyInput:
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
-    def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
+    def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:        
         draft_token = torch.cat(
             [self.draft_token, torch.full([1], -1, dtype=torch.int32, device="cuda")],
             dim=-1,
         )
+        print("@@@@@@@ draft token: ", draft_token)
+        print("####### retrive_index: ", self.retrive_index)
         candidates = draft_token[self.retrive_index]
         if batch.sampling_info.is_all_greedy:
             # temp == 0

@@ -161,12 +161,32 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+        print(0000000000000000000000000000)
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 if (
                     self.enable_flashinfer_mla
                     and not global_server_args_dict["disable_radix_cache"]
                 ):
+                    print(111111111111111111111111111111)
+                    # use mla paged prefill
+                    self.prefill_wrappers_paged.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            backend="fa2",
+                        )
+                    )
+                    self.prefill_wrappers_verify.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            backend="fa2",
+                        )
+                    )
+                elif (
+                    self.enable_flashinfer_mla
+                    and global_server_args_dict["disable_radix_cache"]    # draft model extend needs to use absorb
+                ):
+                    print(222222222222222222222222222222)
                     # use mla paged prefill
                     self.prefill_wrappers_paged.append(
                         BatchMLAPagedAttentionWrapper(
@@ -181,6 +201,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         )
                     )
                 else:
+                    print(333333333333333333333333333)
                     self.prefill_wrappers_paged.append(
                         BatchPrefillWithPagedKVCacheWrapper(
                             self.workspace_buffer,
@@ -194,10 +215,12 @@ class FlashInferAttnBackend(AttentionBackend):
                         )
                     )
             if self.enable_flashinfer_mla:
+                print(444444444444444444444444444444)
                 self.decode_wrappers.append(
                     BatchMLAPagedAttentionWrapper(self.workspace_buffer, backend="fa2")
                 )
             else:
+                print(5555555555555555555555555555)
                 self.decode_wrappers.append(
                     BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -244,6 +267,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
+            print("!!!!!!! for target verify should plan !!!!!!!")
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -270,6 +294,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = True
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
+            print("======= debug =======  use ragged: ", use_ragged)
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -457,7 +482,13 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             logits_soft_cap = layer.logit_cap
-            if global_server_args_dict["disable_radix_cache"] and not forward_batch.forward_mode.is_target_verify(): # turn it off first force to use paged
+            if (
+                    global_server_args_dict["disable_radix_cache"] and 
+                    (
+                        not forward_batch.forward_mode.is_target_verify() 
+                        and not forward_batch.forward_mode.is_draft_extend()
+                    )
+            ): # turn it off force to use paged
                 # use mla ragged prefill
                 o, _ = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -489,6 +520,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
+
+                print("------------------------")
+                print("qall: ", qall.shape)
+                print("k_buf: ", k_buf.shape)
+                print("------------------------")
                 o = prefill_wrapper_paged.run(
                     qall[:, :, : layer.v_head_dim],
                     qall[:, :, layer.v_head_dim :],
@@ -1075,7 +1111,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
         elif (
             global_config.enable_flashinfer_mla
-            # and not global_server_args_dict["disable_radix_cache"]
+            # and (not global_server_args_dict["disable_radix_cache"] or custom_mask is not None) # increment prefill or target verify should run this
         ):
             # mla paged prefill
             kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
