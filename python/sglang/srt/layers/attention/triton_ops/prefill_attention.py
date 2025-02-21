@@ -166,6 +166,12 @@ def _fwd_kernel(
 def context_attention_fwd(
     q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True
 ):
+    """
+    q, k, v: [b * s, head, head_dim]
+    b_start_loc: [b]
+    b_seq_len: [b]
+    out: [b * s, head, head_dim]
+    """
     if is_cuda_available and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
     else:
