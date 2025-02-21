@@ -29,26 +29,31 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size, exis
     )
     _DP_SIZE = dp_size
 
-    # TODO implement in the next PR
-    assert (existing_groups is None) or not enable_dp_attention, \
-        'DP attention for EngineFragment is not yet implemented'
-
-    tp_group = get_tp_group()
-    _ATTN_TP_GROUP = GroupCoordinator(
-        group_ranks=[
+    if existing_groups is None:
+        tp_group = get_tp_group()
+        group_ranks = [
             list(range(head, head + _ATTN_TP_SIZE))
             for head in range(0, tp_size, _ATTN_TP_SIZE)
-        ] if existing_groups is None else None,
+        ]
+        torch_distributed_backend = torch.distributed.get_backend(tp_group.device_group)
+        existing_groups_chosen = None
+    else:
+        # TODO implement in the next PR
+        assert not enable_dp_attention, 'DP attention for EngineFragment is not yet implemented'
+        existing_groups_chosen = existing_groups.tp
+        group_ranks = torch_distributed_backend = None
+
+    _ATTN_TP_GROUP = GroupCoordinator(
+        group_ranks=group_ranks,
         local_rank=tp_rank,
-        torch_distributed_backend=torch.distributed.get_backend(
-            tp_group.device_group) if existing_groups is None else None,
+        torch_distributed_backend=torch_distributed_backend,
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_custom_allreduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_message_queue_broadcaster=False,
         group_name="attention_tp",
-        existing_groups=existing_groups.tp,
+        existing_groups=existing_groups_chosen,
     )
 
 
