@@ -1,6 +1,6 @@
-import torch
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.generation_manager import GenerationConverter
@@ -21,7 +21,8 @@ class SpmdOrchestrator:
         if parallel_process_groups is None:
             assert nccl_port is not None and tp_rank is not None
         else:
-            assert nccl_port is None
+            assert nccl_port is None and tp_rank is None, \
+                'When passing `parallel_process_groups`, there is no need to pass `nccl_port` and `tp_rank`'
             tp_rank = parallel_process_groups.tp.device_mesh_device.get_local_rank()
 
         self._scheduler = Scheduler(
