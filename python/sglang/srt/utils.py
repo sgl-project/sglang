@@ -1290,25 +1290,29 @@ def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
         # print(
         #     f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=}')
 
-        ans = w
-        # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
-        # Now we can either do this hacky full_tensor+from_local+redistribute (to test logical correctness and
-        # easier to flip in the future), or do full_tensor+narrow
-        ans = DTensor.from_local(
-            ans.full_tensor(),
-            device_mesh=tp_device_mesh,
-            placements=[Replicate() for _ in range(tp_device_mesh.ndim)],
-        )
-        ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
-
         rank_via_mesh = tp_device_mesh.get_local_rank()
-        rank_via_arg = start // length
         size_via_mesh = tp_device_mesh.size()
-        size_via_arg = w.shape[dim] // length
-        # print(f'weight_loader_narrow END {rank_via_mesh=} {size_via_mesh=} {ans.shape=}')
-        assert rank_via_mesh == rank_via_arg
-        assert size_via_mesh == size_via_arg
-        assert ans.shape[dim] == length
+
+        if (size_via_mesh * length == w.shape[dim]) and (rank_via_mesh * length == start):
+            ans = w
+            # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
+            # Now we can either do this hacky full_tensor+from_local+redistribute (to test logical correctness and
+            # easier to flip in the future), or do full_tensor+narrow
+            ans = DTensor.from_local(
+                ans.full_tensor(),
+                device_mesh=tp_device_mesh,
+                placements=[Replicate() for _ in range(tp_device_mesh.ndim)],
+            )
+            ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
+        else:
+            ans = w.full_tensor().narrow(dim, start, length)
+
+        assert ans.shape[dim] == length, (
+            f'weight_loader_tp_narrow '
+            f'{w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} '
+            f'{w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=} '
+            f'{rank_via_mesh=} {size_via_mesh=} {ans.shape=}'
+        )
 
         return ans
     else:
