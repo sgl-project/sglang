@@ -13,12 +13,14 @@ class EngineFragment(EngineBase):
         gpu_id: int,
         nccl_port: Optional[int] = None,
         tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
         log_level: str = "error",
         *args,
         **kwargs,
     ):
-        tp_size = kwargs.get('tp_size') or parallel_process_groups.tp.device_mesh_device.get_local_size()
+        if tp_size is None:
+            tp_size = parallel_process_groups.tp.device_mesh_device.get_local_size()
         server_args = ServerArgs(*args, log_level=log_level, tp_size=tp_size, **kwargs)
         self._entrypoint = SpmdOrchestrator(
             server_args=server_args,
