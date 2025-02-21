@@ -73,8 +73,6 @@ def run():
     fragment = EngineFragment(
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
-        tp_rank=tp_rank,
-        nccl_port=23456,
         gpu_id=local_rank,
         parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
             device_mesh_device=device_mesh_device,

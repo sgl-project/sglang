@@ -17,14 +17,13 @@ _TP_SIZE = 2
 class TestFragment(unittest.TestCase):
     def test_fragment(self):
         multiprocessing.set_start_method("spawn")
-        nccl_port = 12345
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         for tp_rank in range(_TP_SIZE):
             p = Process(
                 target=_run_subprocess,
-                args=(tp_rank, nccl_port, output_writer),
+                args=(tp_rank, output_writer),
             )
             p.start()
             processes.append(p)
@@ -47,7 +46,7 @@ class TestFragment(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
+def _run_subprocess(tp_rank: int, output_writer):
     try:
         print(f"subprocess[{tp_rank=}] Start {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
 
@@ -67,9 +66,7 @@ def _run_subprocess(tp_rank: int, nccl_port: int, output_writer):
             mem_fraction_static=0.1,
             random_seed=42,
             # fragment args
-            tp_rank=tp_rank,
             gpu_id=tp_rank,
-            nccl_port=nccl_port,
             parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
                 device_mesh_device=inference_device_mesh_device,
                 device_mesh_cpu=inference_device_mesh_cpu,
