@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -184,7 +185,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -265,12 +266,6 @@ class ModelRunner:
                     distributed_init_method=dist_init_method,
                 )
                 initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
-                initialize_dp_attention(
-                    enable_dp_attention=self.server_args.enable_dp_attention,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    dp_size=self.server_args.dp_size,
-                )
             else:
                 init_distributed_environment_via_existing(
                     backend=backend,
@@ -279,6 +274,13 @@ class ModelRunner:
                 initialize_model_parallel_via_existing(
                     existing_groups=self.parallel_process_groups,
                 )
+
+            initialize_dp_attention(
+                enable_dp_attention=self.server_args.enable_dp_attention,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                dp_size=self.server_args.dp_size,
+            )
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
@@ -732,7 +734,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
