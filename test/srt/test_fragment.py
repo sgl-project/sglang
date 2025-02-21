@@ -8,7 +8,7 @@ from multiprocessing import Process
 import torch
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server.engine_fragment import EngineFragment
+from sglang.srt.entrypoints.engine_fragment import EngineFragment
 from sglang.srt.server_args import find_available_port
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.runners import check_close_model_outputs
