@@ -84,6 +84,8 @@ For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `
 
 If the command fails, try setting the `GLOO_SOCKET_IFNAME` parameter. For more information, see [Common Environment Variables](https://pytorch.org/docs/stable/distributed.html#common-environment-variables).
 
+If the multi nodes support NVIDIA InfiniBand and encounter hanging issues during startup, consider adding the parameter `export NCCL_IB_GID_INDEX=3`. For more information, see [this](https://github.com/sgl-project/sglang/issues/3516#issuecomment-2668493307).
+
 ```bash
 # node 1
 python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
@@ -179,6 +181,20 @@ python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.
 
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
+```
+
+### Example: Serving on any cloud or Kubernetes with SkyPilot
+
+SkyPilot helps find cheapest available GPUs across any cloud or existing Kubernetes clusters and launch distributed serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1).
+
+To serve on multiple nodes:
+
+```bash
+git clone https://github.com/skypilot-org/skypilot.git
+# Serve on 2 H100/H200x8 nodes
+sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B.yaml --retry-until-up
+# Serve on 4 A100x8 nodes
+sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B-A100.yaml --retry-until-up
 ```
 
 #### Troubleshooting
