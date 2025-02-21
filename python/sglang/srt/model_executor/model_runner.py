@@ -29,6 +29,8 @@ from sglang.srt.distributed import (
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
+    init_distributed_environment_via_existing,
+    initialize_model_parallel_via_existing,
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
@@ -252,14 +254,25 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size,
-                rank=self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-            )
-            initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            distributed_environment_local_rank = self.gpu_id
+            if self.parallel_process_groups is None:
+                init_distributed_environment(
+                    backend=backend,
+                    world_size=self.tp_size,
+                    rank=self.tp_rank,
+                    local_rank=distributed_environment_local_rank,
+                    distributed_init_method=dist_init_method,
+                )
+                initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            else:
+                init_distributed_environment_via_existing(
+                    backend=backend,
+                    local_rank=distributed_environment_local_rank,
+                )
+                initialize_model_parallel_via_existing(
+                    existing_groups=self.parallel_process_groups,
+                )
+
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,
