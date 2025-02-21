@@ -36,13 +36,12 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup
-
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_cuda_alike,
     supports_custom_op,
 )
+from torch.distributed import Backend, ProcessGroup
 
 
 @dataclass
@@ -111,8 +110,10 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         group._all_reduce_in_place(tensor)
 
+
     def inplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> None:
         return
+
 
     direct_register_custom_op(
         op_name="inplace_all_reduce",
@@ -121,6 +122,7 @@ if supports_custom_op():
         fake_impl=inplace_all_reduce_fake,
     )
 
+
     def outplace_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
@@ -128,8 +130,10 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_reduce_out_place(tensor)
 
+
     def outplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         return torch.empty_like(tensor)
+
 
     direct_register_custom_op(
         op_name="outplace_all_reduce",
@@ -447,7 +451,7 @@ class GroupCoordinator:
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1:]
         )
         return output_tensor
 
@@ -952,6 +956,16 @@ _ENABLE_CUSTOM_ALL_REDUCE = True
 def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
+
+
+def init_distributed_environment_via_existing(
+    local_rank: int,
+    backend: str,
+):
+    global _WORLD
+    assert _WORLD is None
+    ranks = list(range(torch.distributed.get_world_size()))
+    _WORLD = init_world_group(ranks, local_rank, backend)
 
 
 def init_distributed_environment(
