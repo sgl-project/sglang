@@ -18,7 +18,8 @@ class EngineFragment(EngineBase):
         *args,
         **kwargs,
     ):
-        server_args = ServerArgs(*args, log_level=log_level, tp_size=TODO, **kwargs)
+        tp_size = kwargs.get('tp_size') or parallel_process_groups.tp.device_mesh_device.get_local_size()
+        server_args = ServerArgs(*args, log_level=log_level, tp_size=tp_size, **kwargs)
         self._entrypoint = SpmdOrchestrator(
             server_args=server_args,
             nccl_port=nccl_port,
@@ -32,3 +33,6 @@ class EngineFragment(EngineBase):
 
     def shutdown(self):
         self._entrypoint.shutdown()
+
+
+def _compute_tp_size():

@@ -17,7 +17,12 @@ class SpmdOrchestrator:
         tp_rank: int,
         parallel_process_groups: Optional[ParallelProcessGroups],
     ):
-        assert (parallel_process_groups is None) ^ (nccl_port is None)
+        if parallel_process_groups is None:
+            assert nccl_port is not None and tp_rank is not None
+        else:
+            assert nccl_port is None
+            tp_rank = parallel_process_groups.tp.device_mesh_device.get_local_rank()
+
         self._scheduler = Scheduler(
             server_args=server_args,
             nccl_port=nccl_port,
