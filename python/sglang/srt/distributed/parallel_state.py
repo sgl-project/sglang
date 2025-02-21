@@ -882,13 +882,12 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str, existing_groups=None,
+    ranks: List[int], local_rank: int, backend: str,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        existing_groups=existing_groups,
         use_pynccl=False,
         use_custom_allreduce=False,
         use_hpu_communicator=False,
@@ -904,6 +903,7 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
+    existing_groups=None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -911,6 +911,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
+        existing_groups=existing_groups,
         use_pynccl=True,
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
