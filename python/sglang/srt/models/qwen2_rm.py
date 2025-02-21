@@ -38,7 +38,7 @@ class Qwen2ForRewardModel(nn.Module):
         self.score = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.ReLU(),
-            nn.Linear(config.hidden_size, self.num_labels)
+            nn.Linear(config.hidden_size, self.num_labels),
         )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
@@ -53,9 +53,7 @@ class Qwen2ForRewardModel(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "Qwen2ForRewardModel is only used for embedding"
+        assert get_embedding, "Qwen2ForRewardModel is only used for embedding"
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         logits = self.score(hidden_states)

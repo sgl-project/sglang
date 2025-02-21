@@ -381,7 +381,7 @@ class Qwen2ForCausalLM(nn.Module):
                 continue
             if name.startswith("lm_head"):
                 continue
-            
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
