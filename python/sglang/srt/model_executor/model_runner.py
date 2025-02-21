@@ -33,7 +33,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel_via_existing,
     set_custom_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state, ParallelProcessGroups
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -87,6 +87,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
         is_draft_worker: bool = False,
     ):
         # Parse args
@@ -99,6 +100,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.parallel_process_groups = parallel_process_groups
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.should_log = tp_rank == 0
