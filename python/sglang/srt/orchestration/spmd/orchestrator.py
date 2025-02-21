@@ -13,7 +13,7 @@ class SpmdOrchestrator:
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: Optional[int] = None,
+        tp_rank: int,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
     ):
         self._scheduler = Scheduler(
