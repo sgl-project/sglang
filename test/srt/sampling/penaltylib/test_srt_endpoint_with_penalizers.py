@@ -58,8 +58,7 @@ class TestBatchPenalizerE2E(unittest.TestCase):
                 "logprob_start_len": 0,
             },
         )
-        print(json.dumps(response.json()))
-        print("=" * 100)
+        assert response.status_code == 200, "Request failed: " + response.text
 
     def test_default_values(self):
         self.run_decode()
@@ -112,4 +111,4 @@ class TestBatchPenalizerE2E(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=3)

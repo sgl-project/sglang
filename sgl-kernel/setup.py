@@ -1,5 +1,21 @@
+# Copyright 2025 SGLang Team. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import multiprocessing
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -9,14 +25,8 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 root = Path(__file__).parent.resolve()
 
 
-def _update_wheel_platform_tag():
-    wheel_dir = Path("dist")
-    if wheel_dir.exists() and wheel_dir.is_dir():
-        old_wheel = next(wheel_dir.glob("*.whl"))
-        new_wheel = wheel_dir / old_wheel.name.replace(
-            "linux_x86_64", "manylinux2014_x86_64"
-        )
-        old_wheel.rename(new_wheel)
+if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
+    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
 
 def _get_cuda_version():
@@ -53,7 +63,6 @@ include_dirs = [
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
     "cublas",
-    "cublasLt",
     turbomind.resolve(),
     turbomind.resolve() / "src",
 ]
@@ -71,8 +80,8 @@ nvcc_flags = [
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
-    "-Xcompiler",
-    "-w",
+    "-Xcompiler=-Wconversion",
+    "-Xcompiler=-fno-strict-aliasing",
 ]
 nvcc_flags_fp8 = [
     "-DFLASHINFER_ENABLE_FP8",
@@ -87,13 +96,19 @@ sources = [
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
+    "src/sgl-kernel/csrc/fp8_blockwise_gemm_kernel.cu",
     "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
-    "src/sgl-kernel/csrc/rotary_embedding.cu",
+    "src/sgl-kernel/csrc/fused_add_rms_norm_kernel.cu",
+    "src/sgl-kernel/csrc/eagle_utils.cu",
+    "src/sgl-kernel/csrc/speculative_sampling.cu",
+    "src/sgl-kernel/csrc/per_token_group_quant_fp8.cu",
+    "src/sgl-kernel/csrc/cublas_grouped_gemm.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
+    "3rdparty/flashinfer/csrc/rope.cu",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
@@ -130,7 +145,7 @@ for flag in [
         pass
 
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
+libraries = ["c10", "torch", "torch_python", "cuda", "cublas"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
@@ -161,5 +176,3 @@ setup(
     },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
-
-_update_wheel_platform_tag()

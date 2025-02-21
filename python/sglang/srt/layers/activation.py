@@ -20,26 +20,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_cuda_available
 
-if is_flashinfer_available():
-    from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+if is_cuda_available():
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
-from vllm.model_executor.custom_op import CustomOp
-
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
 
-@register_custom_op("sglang_silu_and_mul")
 class SiluAndMul(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -53,7 +50,6 @@ class SiluAndMul(CustomOp):
         return out
 
 
-@register_custom_op("sglang_gelu_and_mul")
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
         super().__init__()
@@ -74,6 +70,15 @@ class GeluAndMul(CustomOp):
         else:
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
+
+
+class QuickGELU(CustomOp):
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.sigmoid(1.702 * x)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
+        return self.forward_native(x)
 
 
 class ScaledActivation(nn.Module):
@@ -149,8 +154,8 @@ def get_act_fn(
     return act_fn
 
 
-if not is_flashinfer_available():
+if not is_cuda_available():
     logger.info(
-        "FlashInfer is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
