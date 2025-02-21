@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -188,7 +189,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -531,8 +532,11 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]],
-                                   load_format: Optional[str] = None):
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
         # TODO should we name it "direct" or "megatron"?
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
@@ -745,7 +749,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
