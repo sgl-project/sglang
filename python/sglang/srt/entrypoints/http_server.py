@@ -86,6 +86,7 @@ from sglang.srt.utils import (
     delete_directory,
     kill_process_tree,
     set_uvicorn_logging_configs,
+    get_bool_env_var,
 )
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
@@ -126,7 +127,10 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
