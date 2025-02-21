@@ -36,13 +36,16 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
           pip install -r docs/requirements.txt
+          apt-get update
+          apt-get install -y pandoc
+          apt-get update && apt-get install -y parallel
 
       - name: Setup Jupyter Kernel
         run: |
           python -m ipykernel install --user --name python3 --display-name "Python 3"
 
       - name: Execute notebooks
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           cd docs
           make clean

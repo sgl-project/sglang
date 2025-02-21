@@ -85,3 +85,6 @@ class ChunkCache(BasePrefixCache):
 
     def evictable_size(self):
         return 0
+
+    def protected_size(self):
+        return 0

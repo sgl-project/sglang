@@ -183,6 +183,7 @@ async def benchmark(
         api_url=api_url,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
+        lora_name="dummy",  # the lora_name argument will not be used
         extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
@@ -206,6 +207,7 @@ async def benchmark(
             api_url=api_url,
             prompt_len=prompt_len,
             output_len=output_len,
+            lora_name="dummy",
             extra_request_body=extra_request_body,
         )
         tasks.append(
@@ -254,6 +256,9 @@ async def benchmark(
         "{:<40} {:<10.2f}".format(
             "Output token throughput (tok/s):", metrics.output_throughput
         )
+    )
+    print(
+        "{:<40} {:<10.2f}".format("Total throughput (tok/s):", metrics.total_throughput)
     )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(

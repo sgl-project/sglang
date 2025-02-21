@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import ServerArgs
@@ -66,6 +67,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
+    set_cuda_arch,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,8 +111,14 @@ class ModelRunner:
         ):
             # TODO: add MLA optimization on CPU
             if self.server_args.device != "cpu":
-                logger.info("MLA optimization is turned on. Use triton backend.")
-                self.server_args.attention_backend = "triton"
+                if server_args.enable_flashinfer_mla:
+                    logger.info(
+                        "FlashInfer MLA optimization is turned on. Use flashinfer backend for DeepseekV3ForCausalLM."
+                    )
+                    self.server_args.attention_backend = "flashinfer"
+                else:
+                    logger.info("MLA optimization is turned on. Use triton backend.")
+                    self.server_args.attention_backend = "triton"
 
         if self.server_args.enable_double_sparsity:
             logger.info(
@@ -168,6 +176,8 @@ class ModelRunner:
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "device": server_args.device,
+                "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
+                "disable_radix_cache": server_args.disable_radix_cache,
             }
         )
 
@@ -218,7 +228,7 @@ class ModelRunner:
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
-        # Init torch distributed
+
         torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
@@ -290,6 +300,8 @@ class ModelRunner:
                 self.model_config.dtype = torch.float16
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
+
+        set_cuda_arch()
 
         # Prepare the model config
         self.load_config = LoadConfig(
@@ -529,6 +541,7 @@ class ModelRunner:
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,
+            lora_backend=self.server_args.lora_backend,
         )
         logger.info("LoRA manager ready.")
 
@@ -714,8 +727,6 @@ class ModelRunner:
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-
         self.cuda_graph_runner = None
 
         if not self.is_generation:

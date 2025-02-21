@@ -290,6 +290,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale, requires_grad=False
                 )
                 layer.input_scale = None
+            else:
+                layer.weight = torch.nn.Parameter(
+                    layer.weight.data, requires_grad=False
+                )
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    layer.weight_scale_inv.data, requires_grad=False
+                )
             return
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         # If checkpoint not serialized fp8, quantize the weights.
@@ -763,8 +770,8 @@ class Fp8MoEMethod:
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
 
@@ -784,6 +791,8 @@ class Fp8MoEMethod:
         if is_hip_ and get_bool_env_var("CK_MOE"):
             import ater
             from ater.fused_moe import fused_experts_ck
+
+            assert activation == "silu", f"{activation=} is not supported."
 
             return fused_experts_ck(
                 x,
@@ -815,6 +824,7 @@ class Fp8MoEMethod:
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 inplace=True,
+                activation=activation,
                 use_fp8_w8a8=True,
                 w1_scale=(
                     layer.w13_weight_scale_inv

@@ -444,8 +444,6 @@ def load_image(image_file: Union[str, bytes]):
     else:
         raise ValueError(f"Invalid image: {image}")
 
-    # if image_size is None:
-    #     image_size = image.size
     return image, image_size
 
 
@@ -774,7 +772,7 @@ def get_zmq_socket(
 
 
 def dump_to_file(dirpath, name, value):
-    from vllm.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() != 0:
         return
@@ -1046,6 +1044,13 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
+
+
+def get_device_core_count(device_id: int = 0) -> int:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda.get_device_properties(device_id).multi_processor_count
+
+    return 0
 
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
@@ -1439,3 +1444,10 @@ def launch_dummy_health_check_server(host, port):
         timeout_keep_alive=5,
         loop="uvloop",
     )
+
+
+def set_cuda_arch():
+    if is_flashinfer_available():
+        capability = torch.cuda.get_device_capability()
+        arch = f"{capability[0]}.{capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
