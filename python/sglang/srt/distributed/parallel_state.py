@@ -1122,6 +1122,33 @@ def initialize_model_parallel(
     )
 
 
+def initialize_model_parallel_via_existing(
+    existing_groups: ParallelProcessGroups,
+) -> None:
+    global _TP
+    assert _TP is None, "tensor model parallel group is already initialized"
+    _TP = init_model_parallel_group(
+        existing=existing_groups.tp,
+        group_ranks=None,
+        local_rank=get_world_group().local_rank,
+        backend=None,
+        use_message_queue_broadcaster=True,
+        group_name="tp",
+    )
+
+    global _PP
+    assert _PP is None, "pipeline model parallel group is already initialized"
+    # pipeline parallel does not need custom allreduce
+    _PP = init_model_parallel_group(
+        existing=existing_groups.pp,
+        group_ranks=None,
+        local_rank=get_world_group().local_rank,
+        backend=None,
+        use_custom_allreduce=False,
+        group_name="pp",
+    )
+
+
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
