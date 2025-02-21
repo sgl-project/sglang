@@ -1,4 +1,5 @@
-ARG CUDA_VERSION=12.5.1
+# Set to "local" to build from local repo, repo root must be set as docker context.
+ARG SGL_REPO_SOURCE="remote"
 
 FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
 
@@ -26,9 +27,22 @@ RUN pip3 install datamodel_code_generator
 
 WORKDIR /sgl-workspace
 
-ARG CUDA_VERSION
+FROM base AS sglang-remote
+RUN git clone ${SGL_REPO} \
+    && cd sglang \
+    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+         echo "Using ${SGL_DEFAULT}, default branch."; \
+       else \
+         echo "Using ${SGL_BRANCH} branch."; \
+         git checkout ${SGL_BRANCH}; \
+       fi
+
+FROM base AS sglang-local
+COPY . /sgl-workspace/sglang
+
+FROM sglang-${SGL_REPO_SOURCE} AS sglang
+ARG CUDA_VERSION=12.5.1
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
-    && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
