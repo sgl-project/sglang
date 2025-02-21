@@ -958,16 +958,6 @@ def set_custom_all_reduce(enable: bool):
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
 
-def init_distributed_environment_via_existing(
-    local_rank: int,
-    backend: str,
-):
-    global _WORLD
-    assert _WORLD is None
-    ranks = list(range(torch.distributed.get_world_size()))
-    _WORLD = init_world_group(ranks, local_rank, backend)
-
-
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -1013,6 +1003,16 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
+
+
+def init_distributed_environment_via_existing(
+    local_rank: int,
+    backend: str,
+):
+    global _WORLD
+    assert _WORLD is None
+    ranks = list(range(torch.distributed.get_world_size()))
+    _WORLD = init_world_group(ranks, local_rank, backend)
 
 
 def initialize_model_parallel(
