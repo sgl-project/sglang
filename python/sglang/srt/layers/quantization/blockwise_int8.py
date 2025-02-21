@@ -28,7 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.blockwise_int8_utils import (
+from sglang.srt.layers.quantization.int8_utils import (
     apply_w8a8_block_int8_linear,
 )
 from sglang.srt.layers.quantization.fp8_utils import (

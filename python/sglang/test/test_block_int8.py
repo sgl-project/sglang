@@ -5,10 +5,6 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.quantization.blockwise_int8_kernel import (
-    per_token_group_quant_int8,
-    w8a8_block_int8_matmul,
-)
 
 
 # For test
@@ -38,51 +34,6 @@ def native_per_token_group_quant_int8(
     x_s = x_s.reshape(x.shape[:-1] + (x.shape[-1] // group_size,))
 
     return x_q, x_s
-
-
-# class TestPerTokenGroupQuantINT8(unittest.TestCase):
-#     DTYPES = [torch.half, torch.bfloat16, torch.float32]
-#     NUM_TOKENS = [7, 83, 2048]
-#     D = [512, 4096, 5120, 13824]
-#     GROUP_SIZE = [64, 128, 256, 512]
-#     SEEDS = [0]
-
-#     @classmethod
-#     def setUpClass(cls):
-#         if not torch.cuda.is_available():
-#             raise unittest.SkipTest("CUDA is not available")
-#         torch.set_default_device("cuda")
-
-#     def _per_token_group_quant_int8(self, num_tokens, d, dtype, group_size, seed):
-#         torch.manual_seed(seed)
-
-#         x = torch.rand(num_tokens, d, dtype=dtype)
-
-#         with torch.inference_mode():
-#             ref_out, ref_scale = native_per_token_group_quant_int8(x, group_size)
-#             int8out, int8scale = per_token_group_quant_int8(x, group_size)
-
-#         self.assertTrue(
-#             torch.allclose(int8out.to(torch.float32), ref_out.to(torch.float32), rtol=0.15)
-#         )
-#         self.assertTrue(torch.allclose(int8scale, ref_scale))
-
-#     def test_per_token_group_quant_int8(self):
-#         for params in itertools.product(
-#             self.NUM_TOKENS,
-#             self.D,
-#             self.DTYPES,
-#             self.GROUP_SIZE,
-#             self.SEEDS,
-#         ):
-#             with self.subTest(
-#                 num_tokens=params[0],
-#                 d=params[1],
-#                 dtype=params[2],
-#                 group_size=params[3],
-#                 seed=params[4],
-#             ):
-#                 self._per_token_group_quant_int8(*params)
 
 
 # For test
@@ -139,73 +90,6 @@ def native_w8a8_block_int8_matmul(A, B, As, Bs, block_size, output_dtype=torch.f
 
     C = C.reshape(origin_C_shape).to(output_dtype)
     return C
-
-
-# class TestW8A8BlockINT8Matmul(unittest.TestCase):
-#     OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
-#     M = [1, 7, 83, 512, 2048]
-#     N = [128, 512, 1024, 4096, 7748, 13824]
-#     K = [256, 4096, 5120, 3884, 13824]
-#     # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
-#     BLOCK_SIZE = [[128, 128]]
-#     SEEDS = [0]
-
-#     @classmethod
-#     def setUpClass(cls):
-#         if not torch.cuda.is_available():
-#             raise unittest.SkipTest("CUDA is not available")
-#         torch.set_default_device("cuda")
-
-#     def _w8a8_block_int8_matmul(self, M, N, K, block_size, out_dtype, seed):
-#         torch.manual_seed(seed)
-#         # NOTE(HandH1998): to avoid overflow when out_dtype = torch.half
-#         factor_for_scale = 1e-2
-#         int8_info = torch.iinfo(torch.int8)
-#         int8_max, int8_min = int8_info.max, int8_info.min
-
-#         A_fp32 = (torch.rand(M, K, dtype=torch.float32) - 0.5) * 2 * int8_max
-#         A_int8 = A_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
-
-#         B_fp32 = (torch.rand(N, K, dtype=torch.float32) - 0.5) * 2 * int8_max
-#         B_int8 = B_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
-
-#         block_n, block_k = block_size[0], block_size[1]
-#         n_tiles = (N + block_n - 1) // block_n
-#         k_tiles = (K + block_k - 1) // block_k
-
-#         As = torch.rand(M, k_tiles, dtype=torch.float32) * factor_for_scale
-#         Bs = torch.rand(n_tiles, k_tiles, dtype=torch.float32) * factor_for_scale
-
-#         with torch.inference_mode():
-#             ref_out = native_w8a8_block_int8_matmul(
-#                 A_int8, B_int8, As, Bs, block_size, out_dtype
-#             )
-#             int8out = w8a8_block_int8_matmul(A_int8, B_int8, As, Bs, block_size, out_dtype)
-
-#         self.assertTrue(
-#             torch.mean(torch.abs(int8out.to(torch.float32) - ref_out.to(torch.float32)))
-#             / torch.mean(torch.abs(ref_out.to(torch.float32)))
-#             < 0.001
-#         )
-
-#     def test_w8a8_block_int8_matmul(self):
-#         for params in itertools.product(
-#             self.M,
-#             self.N,
-#             self.K,
-#             self.BLOCK_SIZE,
-#             self.OUT_DTYPES,
-#             self.SEEDS,
-#         ):
-#             with self.subTest(
-#                 M=params[0],
-#                 N=params[1],
-#                 K=params[2],
-#                 block_size=params[3],
-#                 out_dtype=params[4],
-#                 seed=params[5],
-#             ):
-#                 self._w8a8_block_int8_matmul(*params)
 
 
 # For test

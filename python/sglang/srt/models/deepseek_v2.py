@@ -47,9 +47,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.layers.quantization.blockwise_int8_utils import (
-    block_quant_to_tensor_quant as int8_block_quant_to_tensor_quant,
-    input_to_int8,
+from sglang.srt.layers.quantization.int8_utils import (
+    block_dequant as int8_block_dequant
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
@@ -1002,11 +1001,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                         assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale_inv
-
-                        w, scale = int8_block_quant_to_tensor_quant(
+                        w = int8_block_dequant(
                             weight, weight_scale, weight_block_size
-                        )
-                        self_attn.w_scale = scale
+                        ).to(torch.bfloat16)
                 w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -1019,10 +1016,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                     if is_hip_:
                         self_attn.w_scale *= 2.0
-                if self_attn.w_kc.dtype == torch.int8:
-                    # store in bf16
-                    self_attn.w_kc = self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
-                    self_attn.w_vc = self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

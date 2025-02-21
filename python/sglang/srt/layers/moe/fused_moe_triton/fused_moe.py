@@ -15,7 +15,7 @@ from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.layers.quantization.blockwise_int8_kernel import per_token_group_quant_int8
+from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_name,
