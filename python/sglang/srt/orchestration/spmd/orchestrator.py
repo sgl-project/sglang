@@ -12,14 +12,12 @@ class SpmdOrchestrator:
     def __init__(
         self,
         server_args: ServerArgs,
-        nccl_port: int,
         gpu_id: int,
         tp_rank: int,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
     ):
         self._scheduler = Scheduler(
             server_args=server_args,
-            nccl_port=nccl_port,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=None,
