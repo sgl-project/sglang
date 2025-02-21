@@ -1,5 +1,5 @@
 import re
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 REASONING_MODELS = ["deepseek-r1"]
 
@@ -11,12 +11,15 @@ def is_reasoning_model(model_name: str) -> bool:
 
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
+
     def __init__(self, normal_text: str = "", reasoning_text: str = ""):
         self.normal_text = normal_text
         self.reasoning_text = reasoning_text
 
+
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
+
     def __init__(self, stream_reasoning: bool = False):
         self._buffer = ""
         self._in_reasoning = False
@@ -31,18 +34,20 @@ class BaseReasoningFormatDetector:
         """Streaming incremental parsing."""
         raise NotImplementedError
 
+
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """
     Detector for DeepSeek-R1 model.
     Assumes reasoning format:
       (<think>)*(.*)</think>
-    Returns all the text before the </think> tag as `reasoning_text` 
+    Returns all the text before the </think> tag as `reasoning_text`
     and the rest of the text as `normal_text`.
 
     Args:
         stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
             If True, streams reasoning content as it arrives.
     """
+
     def __init__(self, stream_reasoning: bool = False):
         super().__init__(stream_reasoning=stream_reasoning)
         self.think_start_token = "<think>"
@@ -67,10 +72,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         reasoning_text = splits[0]
         text = splits[1].strip()
 
-        return StreamingParseResult(
-            normal_text=text,
-            reasoning_text=reasoning_text
-        )
+        return StreamingParseResult(normal_text=text, reasoning_text=reasoning_text)
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -103,12 +105,11 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
 
             self._in_reasoning = False
             self._current_reasoning = ""
-            normal_text = current_text[end_idx + len(self.think_end_token):]
+            normal_text = current_text[end_idx + len(self.think_end_token) :]
             self._buffer = ""
 
             return StreamingParseResult(
-                normal_text=normal_text,
-                reasoning_text=reasoning_text.rstrip()
+                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
             )
 
         # Continue with reasoning content
@@ -129,6 +130,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
 
         return StreamingParseResult()
 
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -139,6 +141,7 @@ class ReasoningParser:
         stream_reasoning (bool): If Flase, accumulates reasoning content until complete.
             If True, streams reasoning content as it arrives.
     """
+
     DetectorMap: Dict[str, BaseReasoningFormatDetector] = {
         "deepseek-r1": DeepSeekR1Detector
     }
