@@ -1,28 +1,13 @@
 import asyncio
-import atexit
-import dataclasses
 import logging
 import multiprocessing as mp
 import os
 import signal
-import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Tuple
 
-import torch
 import uvloop
-
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
-)
-from sglang.srt.managers.io_struct import (
-    EmbeddingReqInput,
-    GenerateReqInput,
-    GetWeightsByNameReqInput,
-    InitWeightsUpdateGroupReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.orchestration.std.detokenizer import run_detokenizer_process
@@ -31,7 +16,6 @@ from sglang.srt.orchestration.std.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
     kill_process_tree,
@@ -41,7 +25,6 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -134,7 +117,9 @@ def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
     # Launch tokenizer process
     orchestrator = StdOrchestrator(server_args, port_args)
     if server_args.chat_template:
-        load_chat_template_for_openai_api(orchestrator, server_args.chat_template)
+        load_chat_template_for_openai_api(
+            orchestrator, server_args.chat_template, server_args.model_path
+        )
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -165,7 +150,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
 
@@ -184,8 +169,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
-            "flashinfer",
-            "0.1.6",
+            "flashinfer_python",
+            "0.2.1.post2",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
