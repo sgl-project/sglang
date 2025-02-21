@@ -189,7 +189,7 @@ class GroupCoordinator:
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
-        existing: Optional['DimProcessGroups'] = None,
+        existing_groups: Optional['DimProcessGroups'] = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -200,16 +200,16 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
 
-        if existing is not None:
+        if existing_groups is not None:
             assert torch_distributed_backend is None and group_ranks is None, \
-                'When using argument `existing`, should not provide `torch_distributed_backend` and `group_ranks`'
-            ranks = existing.device_mesh_device.mesh.tolist()
+                'When using argument `existing_groups`, should not provide `torch_distributed_backend` and `group_ranks`'
+            ranks = existing_groups.device_mesh_device.mesh.tolist()
             self.ranks = ranks
             self.world_size = len(ranks)
             self.rank_in_group = ranks.index(self.rank)
-            self.device_group = existing.device_mesh_device.get_group()
-            self.cpu_group = existing.device_mesh_cpu.get_group()
-            self.device_mesh_device = existing.device_mesh_device
+            self.device_group = existing_groups.device_mesh_device.get_group()
+            self.cpu_group = existing_groups.device_mesh_cpu.get_group()
+            self.device_mesh_device = existing_groups.device_mesh_device
         else:
             for ranks in group_ranks:
                 device_group = torch.distributed.new_group(
@@ -882,12 +882,13 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: List[int], local_rank: int, backend: str, existing_groups=None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
         torch_distributed_backend=backend,
+        existing_groups=existing_groups,
         use_pynccl=False,
         use_custom_allreduce=False,
         use_hpu_communicator=False,
@@ -1138,7 +1139,7 @@ def _initialize_model_parallel_inner(
     assert _TP is None, "tensor model parallel group is already initialized"
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
-        existing=existing_groups.tp if existing_groups else None,
+        existing_groups=existing_groups.tp if existing_groups else None,
         group_ranks=tp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
@@ -1150,7 +1151,7 @@ def _initialize_model_parallel_inner(
     assert _PP is None, "pipeline model parallel group is already initialized"
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(
-        existing=existing_groups.pp if existing_groups else None,
+        existing_groups=existing_groups.pp if existing_groups else None,
         group_ranks=pp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
