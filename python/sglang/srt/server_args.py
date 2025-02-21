@@ -24,6 +24,7 @@ import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
+    find_available_port,
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -31,7 +32,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_valid_ipv6_address,
-    nullable_str, find_available_port,
+    nullable_str,
 )
 
 logger = logging.getLogger(__name__)

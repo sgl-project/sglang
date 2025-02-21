@@ -19,11 +19,11 @@ from typing import List, Union
 
 import torch
 import torch.nn.functional as F
+from transformers import AutoModelForCausalLM
+
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server import Engine
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
-from sglang.test.test_utils import calculate_rouge_l
-from transformers import AutoModelForCausalLM
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -147,7 +147,9 @@ class HFRunner:
             ).cuda()
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
-        self.tokenizer = get_tokenizer(model_path, torch_dtype=torch.dtype, trust_remote_code=True)
+        self.tokenizer = get_tokenizer(
+            model_path, torch_dtype=torch.dtype, trust_remote_code=True
+        )
 
         # Run forward
         while True:
@@ -157,15 +159,17 @@ class HFRunner:
 
             if prompts is not None:
                 if self.model_type == "generation":
-                    out_queue.put(self.forward_generation_raw(
-                        prompts=prompts,
-                        max_new_tokens=max_new_tokens,
-                        base_model=self.base_model,
-                        tokenizer=self.tokenizer,
-                        lora_paths=lora_paths,
-                        torch_dtype=torch_dtype,
-                        output_str_only=self.output_str_only,
-                    ))
+                    out_queue.put(
+                        self.forward_generation_raw(
+                            prompts=prompts,
+                            max_new_tokens=max_new_tokens,
+                            base_model=self.base_model,
+                            tokenizer=self.tokenizer,
+                            lora_paths=lora_paths,
+                            torch_dtype=torch_dtype,
+                            output_str_only=self.output_str_only,
+                        )
+                    )
 
                 elif self.model_type == "embedding":
                     assert not self.output_str_only
@@ -223,9 +227,7 @@ class HFRunner:
         top_output_logprobs = []
         for i, p in enumerate(prompts):
             if isinstance(p, str):
-                input_ids = tokenizer.encode(
-                    p, return_tensors="pt"
-                ).cuda()
+                input_ids = tokenizer.encode(p, return_tensors="pt").cuda()
             else:
                 input_ids = torch.tensor([p], device="cuda")
 
@@ -250,7 +252,7 @@ class HFRunner:
                 return_dict_in_generate=True,
                 output_scores=(not output_str_only),
             )
-            
+
             text = tokenizer.decode(
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
@@ -260,14 +262,12 @@ class HFRunner:
                     "Received an empty text response. Please verify your input or model configuration."
                 )
             output_strs.append(text)
-            
+
             if not output_str_only:
                 # outputs.scores: (num_token, 1, vocab_size)
                 top_output_logprobs.append(
                     [
-                        get_top_logprobs(
-                            logits[0], NUM_TOP_LOGPROBS
-                        ).tolist()
+                        get_top_logprobs(logits[0], NUM_TOP_LOGPROBS).tolist()
                         for logits in outputs.scores
                     ]
                 )
@@ -275,9 +275,7 @@ class HFRunner:
 
                 input_logits = model.forward(input_ids).logits[0]
                 top_input_logprobs.append(
-                    get_top_logprobs(
-                        input_logits, NUM_TOP_LOGPROBS
-                    ).tolist()
+                    get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist()
                 )
                 del input_logits
 
@@ -405,7 +403,7 @@ class SRTRunner:
                     "Received an empty text response. Please verify your input or model configuration."
                 )
             output_strs.append(text)
-            
+
             top_input_logprobs.append(
                 [
                     [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
@@ -415,8 +413,8 @@ class SRTRunner:
                     [
                         tup[0]
                         for tup in response["meta_info"]["output_top_logprobs"][0][
-                                   :NUM_TOP_LOGPROBS
-                                   ]
+                            :NUM_TOP_LOGPROBS
+                        ]
                     ]
                 ]
             )
@@ -476,15 +474,13 @@ def check_close_model_outputs(
     prefill_tolerance: float,
     decode_tolerance: float,
     rouge_l_tolerance: float,
-    debug_text: str = '',
+    debug_text: str = "",
     check_logprobs: bool = True,
 ):
     # Compare output strings
     print(f"{hf_outputs.output_strs=}")
     print(f"{srt_outputs.output_strs=}")
-    rouge_l_scores = calculate_rouge_l(
-        hf_outputs.output_strs, srt_outputs.output_strs
-    )
+    rouge_l_scores = calculate_rouge_l(hf_outputs.output_strs, srt_outputs.output_strs)
     print(f"{rouge_l_scores=}")
     assert all(
         score >= rouge_l_tolerance for score in rouge_l_scores

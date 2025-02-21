@@ -26,8 +26,13 @@ import unittest
 from typing import List
 
 import torch
-from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.runners import check_close_model_outputs
+
+from sglang.test.runners import (
+    DEFAULT_PROMPTS,
+    HFRunner,
+    SRTRunner,
+    check_close_model_outputs,
+)
 from sglang.test.test_utils import is_in_ci
 
 

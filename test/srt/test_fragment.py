@@ -6,14 +6,6 @@ import unittest
 from multiprocessing import Process
 
 import torch
-from sglang.srt.distributed import ParallelProcessGroups
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.entrypoints.engine_fragment import EngineFragment
-from sglang.srt.server_args import find_available_port
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.runners import check_close_model_outputs
-from sglang.test.runners import get_dtype_str
-from sglang.test.test_utils import is_in_ci
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -24,6 +16,18 @@ from torch.distributed.fsdp.api import (
     StateDictType,
 )
 from transformers import AutoModelForCausalLM
+
+from sglang.srt.distributed import ParallelProcessGroups
+from sglang.srt.entrypoints.engine_fragment import EngineFragment
+from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import find_available_port
+from sglang.test.runners import (
+    HFRunner,
+    SRTRunner,
+    check_close_model_outputs,
+    get_dtype_str,
+)
+from sglang.test.test_utils import is_in_ci
 
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
@@ -41,14 +45,27 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     dict(model_path="Qwen/Qwen2-1.5B"),
-    dict(model_path="Qwen/Qwen2.5-14B-Instruct", mem_fraction_static=0.1, tp_size=8, tight_memory=True,
-         decode_tolerance=1.3),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
+    dict(
+        model_path="Qwen/Qwen2.5-14B-Instruct",
+        mem_fraction_static=0.1,
+        tp_size=8,
+        tight_memory=True,
+        decode_tolerance=1.3,
+    ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
     dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
     dict(model_path="allenai/OLMo-1B-0724-hf"),
-    dict(model_path="THUDM/glm-4-9b-chat", mem_fraction_static=0.1, tp_size=8, tight_memory=True),
+    dict(
+        model_path="THUDM/glm-4-9b-chat",
+        mem_fraction_static=0.1,
+        tp_size=8,
+        tight_memory=True,
+    ),
     dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
-    dict(model_path="ibm-granite/granite-3.0-2b-instruct", prefill_tolerance=0.22, decode_tolerance=0.22),
-
+    dict(
+        model_path="ibm-granite/granite-3.0-2b-instruct",
+        prefill_tolerance=0.22,
+        decode_tolerance=0.22,
+    ),
     # Fail to run these models in test_generation_models.py, need to fix that first
     # dict(model_path="openai-community/gpt2"),
     # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
@@ -73,7 +90,7 @@ class TestFragment(unittest.TestCase):
         nccl_port = find_available_port(12345)
         master_port = find_available_port(23456)
 
-        print(f'assert_fragment_e2e_execution START {index=} {model_path=}')
+        print(f"assert_fragment_e2e_execution START {index=} {model_path=}")
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
@@ -97,8 +114,10 @@ class TestFragment(unittest.TestCase):
             processes.append(p)
 
         for _ in range(tp_size):
-            self.assertTrue(output_reader.recv(),
-                            f'Subprocess has error, please see logs above. ({index=} {model_path=})')
+            self.assertTrue(
+                output_reader.recv(),
+                f"Subprocess has error, please see logs above. ({index=} {model_path=})",
+            )
 
         for p in processes:
             p.join()
@@ -146,7 +165,7 @@ def _run_subprocess(
 
         fragment = EngineFragment(
             model_path=model_path,
-            load_format='dummy' if _ENABLE_UPDATE_WEIGHTS else 'auto',
+            load_format="dummy" if _ENABLE_UPDATE_WEIGHTS else "auto",
             mem_fraction_static=mem_fraction_static,
             random_seed=42,
             trust_remote_code=True,
@@ -163,8 +182,9 @@ def _run_subprocess(
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
         # hf model is used for comparison
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=_TORCH_DTYPE,
-                                                        trust_remote_code=True).cuda()
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=_TORCH_DTYPE, trust_remote_code=True
+        ).cuda()
         hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
 
         hf_outputs = HFRunner.forward_generation_raw(
@@ -220,7 +240,7 @@ def _run_subprocess(
                 decode_tolerance=decode_tolerance,
                 rouge_l_tolerance=1,
                 check_logprobs=not enable_batch,
-                debug_text=f'{enable_batch=} {tp_rank=}',
+                debug_text=f"{enable_batch=} {tp_rank=}",
             )
 
         execution_ok = True
