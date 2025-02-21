@@ -4,13 +4,19 @@ on:
   push:
     branches: [ main ]
     paths:
+      - "python/pyproject.toml"
       - "python/sglang/**"
       - "test/**"
+      - "docs/**"
+      - "scripts/**"
   pull_request:
     branches: [ main ]
     paths:
+      - "python/pyproject.toml"
       - "python/sglang/**"
       - "test/**"
+      - "docs/**"
+      - "scripts/**"
   workflow_dispatch:
     inputs:
       version:
@@ -27,9 +33,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  filter:
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.set_run_tests.outputs.run_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Filter changes
+        id: filter
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+            scripts:
+              - 'scripts/**'
+            sglang:
+              - 'python/sglang/**'
+            test:
+              - 'test/**'
+            pyproject:
+              - 'python/pyproject.toml'
+      - name: Set run_tests output
+        id: set_run_tests
+        run: |
+          if [ "${{ steps.filter.outputs.sglang }}" == "true" ] || [ "${{ steps.filter.outputs.test }}" == "true" ] || [ "${{ steps.filter.outputs.pyproject }}" == "true" ]; then
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_tests=false" >> $GITHUB_OUTPUT
+          fi
 
   unit-test-frontend:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -37,7 +76,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -48,9 +87,13 @@ jobs:
           python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     strategy:
+      fail-fast: false
       matrix:
         range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-100]
     steps:
@@ -59,23 +102,37 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 25
+        if: github.event.pull_request.head.repo.fork == false
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        timeout-minutes: 30
         run: |
           RANGE=${{ matrix.range }}
           range_begin=${RANGE%-*}
           range_end=${RANGE#*-}
-
           cd test/srt
           python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
 
+      - name: Run test (fork)
+        if: github.event.pull_request.head.repo.fork == true
+        timeout-minutes: 30
+        run: |
+          RANGE=${{ matrix.range }}
+          range_begin=${RANGE%-*}
+          range_end=${RANGE#*-}
+          cd test/srt
+          python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
 
   unit-test-backend-2-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -83,7 +140,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -118,7 +175,10 @@ jobs:
           python3 test_moe_ep.py
 
   performance-test-1-gpu-part-1:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -126,7 +186,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -160,9 +220,11 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
-
   performance-test-1-gpu-part-2:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -170,7 +232,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -193,7 +255,10 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -201,7 +266,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -229,9 +294,11 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-
   accuracy-test-1-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -239,10 +306,9 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
-
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -253,9 +319,11 @@ jobs:
           cd test/srt
           python3 test_eval_accuracy_large.py
 
-
   accuracy-test-2-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -263,10 +331,9 @@ jobs:
 
       - name: Install dependencies
         env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.4/flashinfer' || 'https://flashinfer.ai/whl/cu124/torch2.4/flashinfer' }}
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
-
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -277,8 +344,8 @@ jobs:
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
-
   finish:
+    if: always()
     needs: [
       unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,

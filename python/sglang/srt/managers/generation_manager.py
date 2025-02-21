@@ -468,6 +468,12 @@ class GenerationConverter:
                 }
             )
 
+        if (
+            hasattr(recv_obj, "output_hidden_states")
+            and len(recv_obj.output_hidden_states[i]) > 0
+        ):
+            meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
         return meta_info
 
     def _convert_logprob_style(
