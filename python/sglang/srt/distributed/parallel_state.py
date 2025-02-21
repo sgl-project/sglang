@@ -1110,45 +1110,22 @@ def initialize_model_parallel(
 def initialize_model_parallel_via_existing(
     existing_groups: ParallelProcessGroups,
 ) -> None:
-    global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    _TP = init_model_parallel_group(
-        existing=existing_groups.tp,
-        # group_ranks=None,
-        # local_rank=get_world_group().local_rank,
-        # backend=None,
-        # use_message_queue_broadcaster=True,
-        # group_name="tp",
-    )
-
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
-    # pipeline parallel does not need custom allreduce
-    _PP = init_model_parallel_group(
-        existing=existing_groups.pp,
-        # group_ranks=None,
-        # local_rank=get_world_group().local_rank,
-        # backend=None,
-        # use_custom_allreduce=False,
-        # group_name="pp",
-    )
-
     _initialize_model_parallel_inner(
-        tp_group_ranks=None,
-        pp_group_ranks=None,
-        backend=None,
+        existing_groups=existing_groups,
     )
 
 
 def _initialize_model_parallel_inner(
-    tp_group_ranks,
-    pp_group_ranks,
-    backend,
+    tp_group_ranks=None,
+    pp_group_ranks=None,
+    backend=None,
+    existing_groups: Optional[ParallelProcessGroups] = None,
 ) -> None:
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
+        existing=existing_groups.tp if existing_groups else None,
         group_ranks=tp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
@@ -1160,6 +1137,7 @@ def _initialize_model_parallel_inner(
     assert _PP is None, "pipeline model parallel group is already initialized"
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(
+        existing=existing_groups.pp if existing_groups else None,
         group_ranks=pp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
