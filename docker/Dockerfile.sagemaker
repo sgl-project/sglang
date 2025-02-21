@@ -28,7 +28,7 @@ WORKDIR /sgl-workspace
 
 ARG CUDA_VERSION
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
-    && git clone --depth=1 -b dev https://github.com/andjsmi/sglang.git \
+    && git clone --depth=1 -b dev https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \

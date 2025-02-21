@@ -28,4 +28,4 @@ if [ -n "$CHUNKED_PREFILL_SIZE" ]; then
     SERVER_ARGS="${SERVER_ARGS} --chunked-prefill-size ${CHUNKED_PREFILL_SIZE}"
 fi
 
-python -m sglang.launch_server --model-path /opt/ml/model $SERVER_ARGS
+python3 -m sglang.launch_server --model-path /opt/ml/model $SERVER_ARGS
