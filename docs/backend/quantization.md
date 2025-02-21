@@ -6,11 +6,11 @@ Offline quantization loads pre-quantized model weights directly during inference
 
 Online quantization dynamically computes scaling parameters—such as the maximum/minimum values of model weights—during runtime. Like NVIDIA FP8 training's [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html#Mixed-precision-training-with-FP8) mechanism, online quantization calculates the appropriate scaling factors on-the-fly to convert high-precision weights into a lower-precision format.
 
-Note that, for better performance, usability and convenience, offline quantization is recommended over online quantization. And if you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time. For popular pre-quantized models, please visit [neuralmagic collection](https://huggingface.co/collections/neuralmagic) for some popular quantized LLMs on huggingface.
+**Note that, for better performance, usability and convenience, offline quantization is recommended over online quantization.** And if you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time. For popular pre-quantized models, please visit [neuralmagic collection](https://huggingface.co/collections/neuralmagic) for some popular quantized LLMs on huggingface.
 
 ## Offline Quantization
 
-To load already quantized models, simply load the model weights and config. Again, if the model has been quantized offline, there's no need to add `--quantization` argument when starting the engine. The quantization method will be parsed from the downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.
+To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline, there's no need to add `--quantization` argument when starting the engine. The quantization method will be parsed from the downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.**
 
 ```bash
 python3 -m sglang.launch_server \
