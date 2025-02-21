@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter, UninitializedParameter
+
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -27,7 +29,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs, weight_loader_tp_narrow
-from torch.nn.parameter import Parameter, UninitializedParameter
 
 logger = logging.getLogger(__name__)
 
@@ -700,8 +701,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             block_n, _ = weight_block_size[0], weight_block_size[1]
             shard_offset = (
-                               (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
-                           ) // self.tp_size
+                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
+            ) // self.tp_size
             shard_size = (
                 (self.output_sizes[loaded_shard_id] + block_n - 1)
                 // block_n
