@@ -995,6 +995,14 @@ def init_distributed_environment(
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         else:
             local_rank = rank
+
+    init_distributed_environment_via_existing(local_rank=local_rank, backend=backend)
+
+
+def init_distributed_environment_via_existing(
+    local_rank: int,
+    backend: str,
+):
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
@@ -1003,16 +1011,6 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
-
-
-def init_distributed_environment_via_existing(
-    local_rank: int,
-    backend: str,
-):
-    global _WORLD
-    assert _WORLD is None
-    ranks = list(range(torch.distributed.get_world_size()))
-    _WORLD = init_world_group(ranks, local_rank, backend)
 
 
 def initialize_model_parallel(
