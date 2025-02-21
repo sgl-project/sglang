@@ -10,6 +10,10 @@ SGLang is recognized as one of the top engines for [DeepSeek model inference](ht
 
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3]([https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only)) offical guide to download the weights.
 
+### Caching `torch.compile`
+
+The DeepSeek series have huge model weights, it takes some time to compile the model with `torch.compile` for the first time if you have added the flag `--enable-torch-compile`. By default, `torch.compile` will automatically cache the FX graph and Triton in `/tmp/torchinductor_root`, which might be cleared according to the [system policy](https://serverfault.com/questions/377348/when-does-tmp-get-cleared). You can export the environment variable `TORCHINDUCTOR_CACHE_DIR` to save compilation cache in your desired directory to avoid unwanted deletion. You can also share the cache with other machines to reduce the compilation time. You may refer to the [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [SGLang Documentation](./torch_compile_cache.md) for more details.
+
 ### Launch with One node of 8 H200
 
 Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended). **Note that Deepseek V3 is already in FP8. So we should not run it with any quantization arguments like `--quantization fp8 --kv-cache-dtype fp8_e5m2`.** Also, `--enable-dp-attention` can be useful to improve for Deepseek V3/R1's throughput. Please refer to [Data Parallelism Attention](https://docs.sglang.ai/references/deepseek.html#multi-head-latent-attention-mla-throughput-optimizations) for detail.
@@ -77,21 +81,3 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 - **Weight**: Per-128x128-block quantization for better numerical stability.
 
 **Usage**: turn on by default for DeepSeek V3 models.
-
-### Cublas Grouped Gemm
-
-**Description**: [Grouped Gemm API](https://docs.nvidia.com/cuda/cublas/index.html#cublasgemmgroupedbatchedex) provided by Cublas 12.5 is attached to SGLang for acceleration of
-settings where a group of matrix multiplication with different shapes needs to be executed. Typical examples are expert parallel in MoE layers, and lora modules in multi-serving Lora layers.
-
-**Usage**: SGLang currently only supports Pytorch 2.5, which is installed with Cuda 12.4 packages together. Users need to work on a Cuda environment >= 12.5 and forcely upgrade the Cublas package in the following way:
-
-1. Make sure the system Cuda version is >= 12.5 with `nvcc -V`
-2. Install sglang under instruction of [official document ](https://docs.sglang.ai/start/install.html)
-3. Reinstall cublas 12.5 through `pip install nvidia-cublas-cu12==12.5.3.2` so that the cublas package is upgraded
-4. Compile the new sgl-kernel library with `cd sgl-kernel && make build`
-
-Then the cublas grouped gemm kernel can be imported with
-```python
-from sgl_kernel import cublas_grouped_gemm
-```
-Currently Cublas only support grouped gemm kernel for fp16/bf16/fp32 tensors, so fp8 tensors cannot be applied.
