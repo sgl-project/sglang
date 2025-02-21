@@ -62,7 +62,6 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 
-from sglang.srt.distributed import GroupCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -670,7 +669,7 @@ def set_weight_attrs(
 def broadcast_pyobj_in_group(
     data: List[Any],
     index_in_group: int,
-    dist_group_coordinator: GroupCoordinator,
+    dist_group_coordinator,
     src_index_in_group: int = 0,
 ):
     return broadcast_pyobj(
