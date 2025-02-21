@@ -162,6 +162,7 @@ class DetokenizerManager:
 
             # Incremental decoding
             output_strs = []
+            finished_reqs = []
             for i in range(bs):
                 try:
                     s = self.decode_status[recv_obj.rids[i]]
@@ -184,6 +185,8 @@ class DetokenizerManager:
                         new_text = ""
                     else:
                         new_text = find_printable_text(new_text)
+                else:
+                    finished_reqs.append(recv_obj.rids[i])
 
                 output_strs.append(
                     self.trim_matched_stop(
@@ -213,6 +216,10 @@ class DetokenizerManager:
                     output_hidden_states=recv_obj.output_hidden_states,
                 )
             )
+
+            # remove decodestatus for completed requests
+            for rid in finished_reqs:
+                self.decode_status.pop(rid)
 
 
 class LimitedCapacityDict(OrderedDict):
