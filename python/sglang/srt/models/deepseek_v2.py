@@ -257,6 +257,8 @@ class DeepseekV2Attention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
             quant_config=quant_config,
+            # FIXME: quick fix for skip quantization
+            prefix=f"self_attn.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -457,6 +459,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
             quant_config=quant_config,
+            # FIXME: quick fix for skip quantization
+            prefix=f"self_attn.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -508,20 +512,31 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Use normal computation for prefill and use weight absorption for extend/decode
-        if (
-            forward_batch.forward_mode.is_extend()
-            and forward_batch.extend_prefix_lens.sum() == 0
-        ):
-            return self.forward_normal(positions, hidden_states, forward_batch)
-        else:
-            if is_hip_:
-                if os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1" and forward_batch.forward_mode.is_decode():
-                    return self.forward_absorb_fused_mla_rope(positions, hidden_states, forward_batch)
+        if global_server_args_dict["enable_flashinfer_mla"]:
+            if global_server_args_dict["disable_radix_cache"]:
+                if forward_batch.forward_mode.is_extend():
+                    return self.forward_normal(positions, hidden_states, forward_batch)
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
             else:
                 return self.forward_absorb(positions, hidden_states, forward_batch)
+        else:
+            # Triton: Use normal computation for prefill and use weight absorption for extend/decode
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+                and forward_batch.extend_prefix_lens.sum() == 0
+            ):
+                return self.forward_normal(positions, hidden_states, forward_batch)
+            else:
+                if is_hip_:
+                    if os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1" and forward_batch.forward_mode.is_decode():
+                        return self.forward_absorb_fused_mla_rope(positions, hidden_states, forward_batch)
+                    else:
+                        return self.forward_absorb(positions, hidden_states, forward_batch)
+                else:
+                    return self.forward_absorb(positions, hidden_states, forward_batch)
 
     def forward_normal(
         self,
@@ -803,6 +818,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -854,7 +870,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
             )
-        if (
+        if is_nextn or (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0

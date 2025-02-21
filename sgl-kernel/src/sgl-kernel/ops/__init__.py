@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import sgl_kernel.ops._kernels
 import torch
@@ -122,6 +122,16 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         scales_b,
         out_dtype,
         bias,
+    )
+
+
+def fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype):
+    return torch.ops.sgl_kernels.fp8_blockwise_scaled_mm(
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        out_dtype,
     )
 
 
@@ -593,3 +603,24 @@ def sgl_per_token_group_quant_fp8(
     torch.ops.sgl_kernels.sgl_per_token_group_quant_fp8(
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max
     )
+
+
+def cublas_grouped_gemm(
+    inputs: List[torch.Tensor],
+    weights: List[torch.Tensor],
+    outputs: List[torch.Tensor],
+    out_dtype: torch.dtype,
+) -> None:
+    with inputs[0].device as device:
+        assert (
+            len(inputs) > 0 and len(weights) > 0 and len(outputs) > 0
+        ), "Inputs/weights/outputs should not be empty!"
+        cublas_handle = torch.cuda.current_blas_handle()
+        torch.ops.sgl_kernels.cublas_grouped_gemm(
+            inputs,
+            weights,
+            outputs,
+            out_dtype,
+            cublas_handle,
+            _get_cuda_stream(device),
+        )

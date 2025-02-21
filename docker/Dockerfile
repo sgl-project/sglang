@@ -14,6 +14,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
     && update-alternatives --set python3 /usr/bin/python3.10 && apt install python3.10-distutils -y \
     && apt install curl git sudo libibverbs-dev -y \
+    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
     && curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3 get-pip.py \
     && python3 --version \
     && python3 -m pip --version \
@@ -43,26 +44,26 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          if [ "$CUDA_VERSION" = "12.1.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu121/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu121/torch2.5/flashinfer-python; \
          elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python; \
          elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python; \
          elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu118/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[srt]" --find-links https://flashinfer.ai/whl/cu118/torch2.5/flashinfer-python; \
            python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
          else \
            echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
          fi; \
        else \
          if [ "$CUDA_VERSION" = "12.1.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu121/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu121/torch2.5/flashinfer-python; \
          elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python; \
          elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python; \
          elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
-           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu118/torch2.5/flashinfer/; \
+           python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu118/torch2.5/flashinfer-python; \
            python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
          else \
            echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \

@@ -1,34 +1,44 @@
-# Minimal makefile for Sphinx documentation
-#
-
-# You can set these variables from the terminal, and also
-# from the environment for the first two.
+# Minimal Makefile for Sphinx documentation
 SPHINXOPTS    ?=
 SPHINXBUILD   ?= sphinx-build
 SOURCEDIR     = .
 BUILDDIR      = _build
 
-# Put it first so that "make" without argument is like "make help".
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
-# New target to compile Markdown and Jupyter Notebook files
+# Compile Notebook files and record execution time
 compile:
-	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print | while read nb; do \
-		if [ -f "$$nb" ]; then \
-			echo "Executing $$nb"; \
-			jupyter nbconvert --to notebook --execute --inplace "$$nb" \
-				--ExecutePreprocessor.timeout=600 \
-				--ExecutePreprocessor.kernel_name=python3 || exit 1; \
-		fi; \
-	done
+	@set -e; \
+	echo "Starting Notebook compilation..."; \
+	mkdir -p logs; \
+	echo "Notebook execution timings:" > logs/timing.log; \
+	START_TOTAL=$$(date +%s); \
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print0 | \
+		parallel -0 -j3 --halt soon,fail=1 ' \
+		NB_NAME=$$(basename {}); \
+		START_TIME=$$(date +%s); \
+		jupyter nbconvert --to notebook --execute --inplace "{}" \
+			--ExecutePreprocessor.timeout=600 \
+			--ExecutePreprocessor.kernel_name=python3; \
+		RET_CODE=$$?; \
+		END_TIME=$$(date +%s); \
+		ELAPSED_TIME=$$((END_TIME - START_TIME)); \
+		echo "$${NB_NAME}: $${ELAPSED_TIME}s" >> logs/timing.log; \
+		exit $$RET_CODE' || exit 1; \
+	END_TOTAL=$$(date +%s); \
+	TOTAL_ELAPSED=$$((END_TOTAL - START_TOTAL)); \
+	echo "---------------------------------" >> logs/timing.log; \
+	echo "Total execution time: $${TOTAL_ELAPSED}s" >> logs/timing.log; \
+	echo "All Notebook execution timings:" && cat logs/timing.log
 
-.PHONY: help Makefile compile
 
-# Catch-all target: route all unknown targets to Sphinx using the new
-# "make mode" option.  $(O) is meant as a shortcut for $(SPHINXOPTS).
+.PHONY: help Makefile compile clean
+
 %: Makefile
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
 clean:
-	rm -rf $(BUILDDIR)/*
+	find . -name "*.ipynb" -exec nbstripout {} \;
+	rm -rf $(BUILDDIR)
+	rm -rf logs
