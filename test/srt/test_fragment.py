@@ -35,7 +35,7 @@ class TestFragment(unittest.TestCase):
                     " how to improve the performance of my website. I've been doing some research and",
                     " a new user of the platform. I am looking for a new laptop to buy",
                     " I'm not sure if you're aware, but I've been trying to get",
-                    " the science of numbers and their properties. It is a vast and complex field that",
+                    " the science of numbers and their properties. It is a branch of mathematics that deals",
                 ],
             )
 
