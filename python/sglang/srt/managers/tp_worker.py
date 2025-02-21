@@ -110,7 +110,7 @@ class TpModelWorker:
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
                 else server_args.max_running_requests
-                     // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                // (server_args.dp_size if server_args.enable_dp_attention else 1)
             ),
             self.model_runner.req_to_token_pool.size,
         )
