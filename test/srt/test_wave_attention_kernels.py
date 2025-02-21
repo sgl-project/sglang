@@ -40,7 +40,7 @@ class TestWaveAttention(unittest.TestCase):
 
     def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D):
         dtype = torch.float16
-        extend_seq_len = 128
+        extend_seq_len = 1024
 
         b_seq_len_prefix = torch.full(
             (B,), N_CTX // B, dtype=torch.int32, device="cuda"

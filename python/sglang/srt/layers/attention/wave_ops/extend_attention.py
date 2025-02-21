@@ -98,6 +98,7 @@ def extend_attention_wave(
     hyperparams.update(get_default_scheduling_params())
     config = get_default_run_config()
     compile_config = {"waves_per_eu": 2, "denorm_fp_math_f32": "preserve-sign"}
+    config["gpu-native-math-precision"] = True
 
     with tk.gen.TestLaunchContext(
         hyperparams,
