@@ -149,7 +149,7 @@ class SchedulerCommunicator:
                 work_reqs = broadcast_pyobj_in_group(
                     work_reqs,
                     self.core.attn_tp_rank,
-                    self.core.attn_tp_cpu_group,
+                    self.core.tp_worker.get_attention_tp_group(),
                     src=attn_tp_rank_0,
                 )
             if self.core.tp_size != 1:
