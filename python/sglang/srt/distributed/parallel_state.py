@@ -1086,8 +1086,6 @@ def initialize_model_parallel(
 
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-    global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = []
     for i in range(num_tensor_model_parallel_groups):
         ranks = list(
@@ -1095,6 +1093,8 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
 
+    global _TP
+    assert _TP is None, "tensor model parallel group is already initialized"
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1106,12 +1106,13 @@ def initialize_model_parallel(
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = []
     for i in range(num_pipeline_model_parallel_groups):
         ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
         group_ranks.append(ranks)
+
+    global _PP
+    assert _PP is None, "pipeline model parallel group is already initialized"
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(
         group_ranks,
