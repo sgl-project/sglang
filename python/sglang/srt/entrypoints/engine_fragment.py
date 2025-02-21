@@ -18,7 +18,7 @@ class EngineFragment(EngineBase):
         *args,
         **kwargs,
     ):
-        server_args = ServerArgs(*args, log_level=log_level, **kwargs)
+        server_args = ServerArgs(*args, log_level=log_level, tp_size=TODO, **kwargs)
         self._entrypoint = SpmdOrchestrator(
             server_args=server_args,
             nccl_port=nccl_port,

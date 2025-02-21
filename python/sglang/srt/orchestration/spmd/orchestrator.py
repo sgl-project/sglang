@@ -14,15 +14,10 @@ class SpmdOrchestrator:
         server_args: ServerArgs,
         gpu_id: int,
         nccl_port: Optional[int],
-        tp_rank: Optional[int],
+        tp_rank: int,
         parallel_process_groups: Optional[ParallelProcessGroups],
     ):
-        if parallel_process_groups is None:
-            assert nccl_port is not None and tp_rank is not None
-        else:
-            assert nccl_port is None
-            tp_rank = parallel_process_groups.tp.device_mesh_device.get_local_rank()
-
+        assert (parallel_process_groups is None) ^ (nccl_port is None)
         self._scheduler = Scheduler(
             server_args=server_args,
             nccl_port=nccl_port,
