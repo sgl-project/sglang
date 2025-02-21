@@ -1007,15 +1007,7 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
-
+        port = find_available_port(base_port=server_args.port)
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -1050,6 +1042,17 @@ class PortArgs:
                 nccl_port=port,
             )
 
+
+# TODO move to utils
+def find_available_port(base_port: int):
+    port = base_port + random.randint(100, 1000)
+    while True:
+        if is_port_available(port):
+            return port
+        if port < 60000:
+            port += 42
+        else:
+            port -= 43
 
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
