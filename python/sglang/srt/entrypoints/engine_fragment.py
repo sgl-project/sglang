@@ -11,7 +11,7 @@ class EngineFragment(EngineBase):
     def __init__(
         self,
         gpu_id: int,
-        tp_rank: int,
+        tp_rank: Optional[int] = None,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
         log_level: str = "error",
         *args,
