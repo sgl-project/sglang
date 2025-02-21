@@ -7,18 +7,27 @@ Before starting, ensure the following:
 - [**NVIDIA Jetson AGX Orin Devkit**](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/) is set up with **JetPack 6.1** or later.
 - **CUDA Toolkit** and **cuDNN** are installed.
 - Verify that the Jetson AGX Orin is in **high-performance mode**:
-  ```bash
-  sudo nvpmodel -m 0
-  ```
-- A custom PyPI index hosted at https://pypi.jetson-ai-lab.dev/jp6/cu126, tailored for NVIDIA Jetson Orin platforms and CUDA 12.6.
-
-To install torch from this index:
-  ```bash
-pip install torch --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
- ```
+```bash
+sudo nvpmodel -m 0
+```
 * * * * *
-## Installation
-Please refer to [Installation Guide](https://docs.sglang.ai/start/install.html) to install FlashInfer and SGLang.
+## Installing and running SGLang with Jetson Containers
+Clone the jetson-containers github repository:
+```
+git clone https://github.com/dusty-nv/jetson-containers.git
+```
+Run the installation script:
+```
+bash jetson-containers/install.sh
+```
+Build the container:
+```
+CUDA_VERSION=12.6 jetson-containers build sglang
+```
+Run the container:
+```
+docker run --runtime nvidia -it --rm --network=host IMAGE_NAME
+```
 * * * * *
 
 Running Inference
