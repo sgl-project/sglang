@@ -10,7 +10,7 @@ Online quantization dynamically computes scaling parameters—such as the maximu
 
 ## Offline Quantization
 
-To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline, there's no need to add "--quantization" argument when starting the engine. The quantization method will be parsed from the downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.**
+To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline, there's no need to add `--quantization` argument when starting the engine. The quantization method will be parsed from the downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.**
 
 ```bash
 python3 -m sglang.launch_server \
