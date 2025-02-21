@@ -117,6 +117,23 @@ def create_streaming_error_response(
     return json_str
 
 
+def create_streaming_usage_info(
+    request: Request, prompt_tokens: Dict[int, int], completion_tokens: Dict[int, int]
+):
+    if request.stream_options and request.stream_options.include_usage:
+        total_prompt_tokens = sum(
+            tokens for i, tokens in prompt_tokens.items() if i % request.n == 0
+        )
+        total_completion_tokens = sum(tokens for tokens in completion_tokens.values())
+        return UsageInfo(
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=total_completion_tokens,
+            total_tokens=total_prompt_tokens + total_completion_tokens,
+        )
+
+    return None
+
+
 def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, model_path):
     global chat_template_name
 
@@ -803,11 +820,15 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             else None
                         ),
                     )
+                    usage = create_streaming_usage_info(
+                        request, prompt_tokens, completion_tokens
+                    )
                     chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         object="text_completion",
                         choices=[choice_data],
                         model=request.model,
+                        usage=usage,
                     )
 
                     stream_buffers[index] = stream_buffer
@@ -815,20 +836,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 if request.stream_options and request.stream_options.include_usage:
-                    total_prompt_tokens = sum(
-                        tokens
-                        for i, tokens in prompt_tokens.items()
-                        if i % request.n == 0
+                    usage = create_streaming_usage_info(
+                        request, prompt_tokens, completion_tokens
                     )
-                    total_completion_tokens = sum(
-                        tokens for tokens in completion_tokens.values()
-                    )
-                    usage = UsageInfo(
-                        prompt_tokens=total_prompt_tokens,
-                        completion_tokens=total_completion_tokens,
-                        total_tokens=total_prompt_tokens + total_completion_tokens,
-                    )
-
                     final_usage_chunk = CompletionStreamResponse(
                         id=str(uuid.uuid4().hex),
                         choices=[],
@@ -1391,29 +1401,22 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             ),
                             logprobs=choice_logprobs,
                         )
+                        create_streaming_usage_info(
+                            request, prompt_tokens, completion_tokens
+                        )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             choices=[choice_data],
                             model=request.model,
+                            usage=usage,
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
                         stream_buffers[index] = new_stream_buffer
                         is_firsts[index] = is_first
                 if request.stream_options and request.stream_options.include_usage:
-                    total_prompt_tokens = sum(
-                        tokens
-                        for i, tokens in prompt_tokens.items()
-                        if i % request.n == 0
+                    usage = create_streaming_usage_info(
+                        request, prompt_tokens, completion_tokens
                     )
-                    total_completion_tokens = sum(
-                        tokens for tokens in completion_tokens.values()
-                    )
-                    usage = UsageInfo(
-                        prompt_tokens=total_prompt_tokens,
-                        completion_tokens=total_completion_tokens,
-                        total_tokens=total_prompt_tokens + total_completion_tokens,
-                    )
-
                     final_usage_chunk = ChatCompletionStreamResponse(
                         id=str(uuid.uuid4().hex),
                         choices=[],
