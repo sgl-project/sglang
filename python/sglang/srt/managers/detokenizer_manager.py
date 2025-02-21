@@ -195,6 +195,7 @@ class DetokenizerManager:
             input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
             output_top_logprobs_val=recv_obj.output_top_logprobs_val,
             output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+            output_hidden_states=recv_obj.output_hidden_states,
         )
 
 
