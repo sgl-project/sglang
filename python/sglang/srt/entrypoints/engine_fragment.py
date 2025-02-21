@@ -10,9 +10,9 @@ from sglang.srt.server_args import ServerArgs
 class EngineFragment(EngineBase):
     def __init__(
         self,
-        nccl_port: int,
         gpu_id: int,
-        tp_rank: int,
+        nccl_port: Optional[int] = None,
+        tp_rank: Optional[int] = None,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
         log_level: str = "error",
         *args,
