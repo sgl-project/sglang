@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import set_weight_attrs, weight_loader_tp_narrow
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
