@@ -39,8 +39,9 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size, exis
             list(range(head, head + _ATTN_TP_SIZE))
             for head in range(0, tp_size, _ATTN_TP_SIZE)
         ] if existing_groups is None else None,
-        local_rank=tp_rank if existing_groups is None else None,
-        torch_distributed_backend=torch.distributed.get_backend(tp_group.device_group),
+        local_rank=tp_rank,
+        torch_distributed_backend=torch.distributed.get_backend(
+            tp_group.device_group) if existing_groups is None else None,
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_custom_allreduce=False,
         use_hpu_communicator=False,
