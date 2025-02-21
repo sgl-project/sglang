@@ -154,12 +154,12 @@ class SchedulerCommunicator:
                 )
             if self.core.tp_size != 1:
                 control_reqs = broadcast_pyobj_in_group(
-                    control_reqs, self.core.tp_rank, self.core.tp_cpu_group
+                    control_reqs, self.core.tp_rank, self.core.tp_worker.get_tp_group()
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.core.tp_size != 1:
             recv_reqs = broadcast_pyobj_in_group(
-                recv_reqs, self.core.tp_rank, self.core.tp_cpu_group
+                recv_reqs, self.core.tp_rank, self.core.tp_worker.get_tp_group()
             )
         return recv_reqs
 
