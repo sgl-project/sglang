@@ -84,7 +84,8 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # Fast API
-app = FastAPI()
+app = FastAPI(openapi_url=None if os.environ.get("DISABLE_OPENAPI_DOC") == "true" else "/openapi.json")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
