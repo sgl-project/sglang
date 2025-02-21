@@ -47,7 +47,7 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size, exis
         use_xpu_communicator=False,
         use_message_queue_broadcaster=False,
         group_name="attention_tp",
-        existing_groups=existing_groups,
+        existing_groups=existing_groups.tp,
     )
 
 
