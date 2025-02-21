@@ -22,6 +22,7 @@ If you only need to use the distributed environment without model/pipeline
  steps.
 """
 import contextlib
+import dataclasses
 import gc
 import logging
 import os
@@ -42,6 +43,7 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 from torch.distributed import Backend, ProcessGroup
+from torch.distributed.device_mesh import DeviceMesh
 
 
 @dataclass
@@ -1011,6 +1013,36 @@ def init_distributed_environment_via_existing(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
+
+
+@dataclasses.dataclass
+class ParallelProcessGroups:
+    tp: "DimProcessGroups"
+    pp: "DimProcessGroups"
+
+    @staticmethod
+    def from_devices_meshes(
+        device_mesh_device: DeviceMesh,
+        device_mesh_cpu: DeviceMesh,
+        dim_tp: str,
+        dim_pp: str,
+    ):
+        return ParallelProcessGroups(
+            tp=DimProcessGroups(
+                device_mesh_cpu=device_mesh_cpu[dim_tp],
+                device_mesh_device=device_mesh_device[dim_tp],
+            ),
+            pp=DimProcessGroups(
+                device_mesh_cpu=device_mesh_cpu[dim_pp],
+                device_mesh_device=device_mesh_device[dim_pp],
+            ),
+        )
+
+
+@dataclasses.dataclass
+class DimProcessGroups:
+    device_mesh_device: DeviceMesh
+    device_mesh_cpu: DeviceMesh
 
 
 def initialize_model_parallel(
