@@ -35,6 +35,3 @@ class EngineFragment(EngineBase):
 
     def shutdown(self):
         self._entrypoint.shutdown()
-
-
-def _compute_tp_size():
