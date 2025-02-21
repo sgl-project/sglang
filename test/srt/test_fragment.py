@@ -34,7 +34,7 @@ class TestFragment(unittest.TestCase):
                     " to spend it outdoors. I decided to take a walk in the nearby park.",
                     " how to improve the performance of my website. I've been doing some research and",
                     " a new user of the platform. I am looking for a new laptop to buy",
-                    " I'm looking for someone to help me with a project.\nI'm a student",
+                    " I'm not sure if you're aware, but I've been trying to get",
                     " the science of numbers and their properties. It is a vast and complex field that",
                 ],
             )
