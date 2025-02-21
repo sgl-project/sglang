@@ -169,11 +169,8 @@ def main():
     print(f"{changed_model_path=}")
     llm = EngineFragment(
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
-        tp_size=tensor_model_parallel_size,
         dtype="bfloat16",
         mem_fraction_static=0.1,
-        nccl_port=12345,
-        tp_rank=rank,
         gpu_id=rank,
         parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
             device_mesh_device=inference_device_mesh_device,
