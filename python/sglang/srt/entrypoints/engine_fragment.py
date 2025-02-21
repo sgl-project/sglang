@@ -20,7 +20,7 @@ class EngineFragment(EngineBase):
         **kwargs,
     ):
         if tp_size is None:
-            tp_size = parallel_process_groups.tp.device_mesh_device.size
+            tp_size = parallel_process_groups.tp.device_mesh_device.size()
         server_args = ServerArgs(*args, log_level=log_level, tp_size=tp_size, **kwargs)
         self._entrypoint = SpmdOrchestrator(
             server_args=server_args,

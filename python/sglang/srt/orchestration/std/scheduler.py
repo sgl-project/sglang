@@ -8,6 +8,7 @@ from typing import List, Optional
 import psutil
 import setproctitle
 import zmq
+
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -42,10 +43,10 @@ logger = logging.getLogger(__name__)
 
 class SchedulerCommunicator:
     def __init__(
-            self,
-            core: Scheduler,
-            server_args: ServerArgs,
-            port_args: PortArgs,
+        self,
+        core: Scheduler,
+        server_args: ServerArgs,
+        port_args: PortArgs,
     ):
         self.core = core
         self.server_args = server_args
@@ -173,12 +174,12 @@ class SchedulerCommunicator:
 
 
 def run_scheduler_process(
-        server_args: ServerArgs,
-        port_args: PortArgs,
-        gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        pipe_writer,
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
 ):
     setproctitle.setproctitle("sglang::scheduler")
     faulthandler.enable()
