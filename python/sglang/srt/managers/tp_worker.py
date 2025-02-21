@@ -13,9 +13,10 @@
 # ==============================================================================
 """A tensor parallel worker."""
 
+import torch
 import logging
 import threading
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import ParallelProcessGroups
@@ -213,10 +214,8 @@ class TpModelWorker:
         )
         return success, message
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.update_weights_from_tensor(
-            MultiprocessingSerializer.deserialize(recv_req.serialized_named_tensors)
-        )
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        success, message = self.model_runner.update_weights_from_tensor(named_tensors)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):

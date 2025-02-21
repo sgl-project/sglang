@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional
+import torch
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
@@ -60,6 +61,9 @@ class SpmdOrchestrator:
             pass
 
         return outputs
+
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        self._scheduler.update_weights_from_tensor_raw(named_tensors)
 
     def shutdown(self):
         self._scheduler.shutdown()

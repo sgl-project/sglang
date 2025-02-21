@@ -461,7 +461,9 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Copy the data.
         if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            loaded_weight = weight_loader_tp_narrow(
+                loaded_weight, output_dim, start_idx, shard_size
+            )
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 

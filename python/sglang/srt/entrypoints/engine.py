@@ -220,7 +220,6 @@ class Engine(EngineBase):
         )
 
     def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        """Update weights from distributed source."""
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
         )
