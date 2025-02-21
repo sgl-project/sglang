@@ -31,7 +31,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_valid_ipv6_address,
-    nullable_str,
+    nullable_str, find_available_port,
 )
 
 logger = logging.getLogger(__name__)
@@ -1042,17 +1042,6 @@ class PortArgs:
                 nccl_port=port,
             )
 
-
-# TODO move to utils
-def find_available_port(base_port: int):
-    port = base_port + random.randint(100, 1000)
-    while True:
-        if is_port_available(port):
-            return port
-        if port < 60000:
-            port += 42
-        else:
-            port -= 43
 
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
