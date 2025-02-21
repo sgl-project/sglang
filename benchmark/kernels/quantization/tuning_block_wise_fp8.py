@@ -14,6 +14,7 @@
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import time
 from datetime import datetime
@@ -23,8 +24,15 @@ import torch
 import triton
 from tqdm import tqdm
 
-from sglang.srt.layers.quantization.fp8_kernel import _w8a8_block_fp8_matmul
-from sglang.srt.utils import get_device_name
+mp.set_start_method("spawn", force=True)
+
+from sglang.srt.layers.quantization.fp8_kernel import (
+    _w8a8_block_fp8_matmul,
+    _w8a8_block_fp8_matmul_unrolledx4,
+)
+from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
+
+is_hip_ = is_hip()
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -80,7 +88,19 @@ def w8a8_block_fp8_matmul(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
-    _w8a8_block_fp8_matmul[grid](
+    # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
+    # Empirical testing shows the sweet spot lies when it's less than the # of
+    # compute units available on the device.
+    num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
+        N, config["BLOCK_SIZE_N"]
+    )
+    kernel = (
+        _w8a8_block_fp8_matmul_unrolledx4
+        if (is_hip_ == True and num_workgroups <= get_device_core_count())
+        else _w8a8_block_fp8_matmul
+    )
+
+    kernel[grid](
         A,
         B,
         C,
@@ -107,14 +127,15 @@ def w8a8_block_fp8_matmul(
     return C
 
 
-def get_configs_compute_bound():
+def get_rocm_configs_compute_bound():
     configs = []
-    for num_stages in [2, 3, 4, 5]:
-        for block_m in [16, 32, 64, 128, 256]:
-            for block_k in [64, 128]:
-                for block_n in [32, 64, 128, 256]:
+    waves_per_eu_range = 0
+    for num_stages in [2]:
+        for block_m in [32, 64, 128, 256]:
+            for block_k in [32, 64, 128, 256]:
+                for block_n in [16, 32, 64, 128, 256]:
                     for num_warps in [4, 8]:
-                        for group_size in [1, 16, 32, 64]:
+                        for group_size in [1, 4, 8, 16, 32]:
                             configs.append(
                                 {
                                     "BLOCK_SIZE_M": block_m,
@@ -123,8 +144,33 @@ def get_configs_compute_bound():
                                     "GROUP_SIZE_M": group_size,
                                     "num_warps": num_warps,
                                     "num_stages": num_stages,
+                                    "waves_per_eu": waves_per_eu_range,
                                 }
                             )
+    return configs
+
+
+def get_configs_compute_bound():
+    configs = []
+    if is_hip_:
+        configs = get_rocm_configs_compute_bound()
+    else:
+        for num_stages in [2, 3, 4, 5]:
+            for block_m in [16, 32, 64, 128, 256]:
+                for block_k in [64, 128]:
+                    for block_n in [32, 64, 128, 256]:
+                        for num_warps in [4, 8]:
+                            for group_size in [1, 16, 32, 64]:
+                                configs.append(
+                                    {
+                                        "BLOCK_SIZE_M": block_m,
+                                        "BLOCK_SIZE_N": block_n,
+                                        "BLOCK_SIZE_K": block_k,
+                                        "GROUP_SIZE_M": group_size,
+                                        "num_warps": num_warps,
+                                        "num_stages": num_stages,
+                                    }
+                                )
     return configs
 
 
@@ -190,14 +236,18 @@ def benchmark_config(
 
 def tune(M, N, K, block_size, out_dtype, search_space):
     factor_for_scale = 1e-2
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    fp8_info = torch.finfo(torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn)
     fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
     A_fp32 = (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
-    A_fp8 = A_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+    A_fp8 = A_fp32.clamp(min=fp8_min, max=fp8_max).to(
+        torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+    )
 
     B_fp32 = (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
-    B_fp8 = B_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+    B_fp8 = B_fp32.clamp(min=fp8_min, max=fp8_max).to(
+        torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+    )
 
     block_n, block_k = block_size[0], block_size[1]
     n_tiles = (N + block_n - 1) // block_n
@@ -256,14 +306,23 @@ def save_configs(
         f.write("\n")
 
 
-def main(args):
-    print(args)
+def get_available_gpu_count():
+    """Get the number of available GPUs."""
+    return torch.cuda.device_count()
+
+
+def tune_on_gpu(args_dict):
+    """Run tuning on a specific GPU."""
+    gpu_id = args_dict["gpu_id"]
+    batch_sizes = args_dict["batch_sizes"]
+    weight_shapes = args_dict["weight_shapes"]
+    args = args_dict["args"]
+
+    torch.cuda.set_device(gpu_id)
+    print(f"Starting tuning on GPU {gpu_id} with batch sizes {batch_sizes}")
 
     block_n = args.block_n
     block_k = args.block_k
-
-    tp_size = args.tp_size
-    assert args.out_dtype in ["float32", "float16", "bfloat16", "half"]
     out_dtype = DTYPE_MAP[args.out_dtype]
     save_path = args.save_path
 
@@ -271,6 +330,42 @@ def main(args):
     search_space = [
         config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
     ]
+
+    start = time.time()
+    results = {}
+    for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
+        N, K = shape[0], shape[1]
+        print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")
+        benchmark_results = [
+            tune(batch_size, N, K, [block_n, block_k], out_dtype, search_space)
+            for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
+        ]
+        best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
+        save_configs(N, K, block_n, block_k, best_configs, save_path)
+
+    end = time.time()
+    print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
+
+
+def distribute_batch_sizes(batch_sizes, num_gpus):
+    """Distribute batch sizes across available GPUs."""
+    batches_per_gpu = []
+    for i in range(num_gpus):
+        start_idx = i * len(batch_sizes) // num_gpus
+        end_idx = (i + 1) * len(batch_sizes) // num_gpus
+        batches_per_gpu.append(batch_sizes[start_idx:end_idx])
+    return batches_per_gpu
+
+
+def main(args):
+    print(args)
+
+    num_gpus = get_available_gpu_count()
+    if num_gpus == 0:
+        raise RuntimeError("No GPU available for tuning")
+    print(f"Found {num_gpus} GPUs for parallel tuning")
+
+    torch.cuda.init()
 
     if args.batch_size is None:
         batch_sizes = [
@@ -295,23 +390,28 @@ def main(args):
         ]
     else:
         batch_sizes = [args.batch_size]
+        num_gpus = 1  # If only one batch size, use only one GPU
 
-    print(f"Start tuning over {len(search_space)} configurations...")
+    weight_shapes = get_weight_shapes(args.tp_size)
 
-    weight_shapes = get_weight_shapes(tp_size)
-    start = time.time()
-    for shape in tqdm(weight_shapes):
-        N, K = shape[0], shape[1]
-        print(f"Tune for weight shape of `N: {N}, K: {K}`")
-        benchmark_results = [
-            tune(batch_size, N, K, [block_n, block_k], out_dtype, search_space)
-            for batch_size in batch_sizes
-        ]
-        best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
-        save_configs(N, K, block_n, block_k, best_configs, save_path)
+    batches_per_gpu = distribute_batch_sizes(batch_sizes, num_gpus)
 
-    end = time.time()
-    print(f"Tuning took {end - start:.2f} seconds")
+    process_args = []
+    for gpu_id in range(num_gpus):
+        process_args.append(
+            {
+                "gpu_id": gpu_id,
+                "batch_sizes": batches_per_gpu[gpu_id],
+                "weight_shapes": weight_shapes,  # Each GPU processes all weight shapes
+                "args": args,
+            }
+        )
+
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(num_gpus) as pool:
+        pool.map(tune_on_gpu, process_args)
+
+    print("Multi-GPU tuning completed")
 
 
 if __name__ == "__main__":

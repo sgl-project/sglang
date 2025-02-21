@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     bear \
+    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 

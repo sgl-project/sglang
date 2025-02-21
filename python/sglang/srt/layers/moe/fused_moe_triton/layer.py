@@ -167,8 +167,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            import ater
-            from ater.fused_moe import fused_experts_ck
+            import aiter
+            from aiter.fused_moe import fused_experts_ck
 
             assert activation == "silu", f"{activation=} is not supported."
 
@@ -298,7 +298,9 @@ class FusedMoE(torch.nn.Module):
             layer=self,
             num_experts=num_experts,
             hidden_size=hidden_size,
+            # FIXME: figure out which intermediate_size to use
             intermediate_size=self.intermediate_size_per_partition,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
