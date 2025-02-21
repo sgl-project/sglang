@@ -1,3 +1,17 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
 
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/library.h>
@@ -40,25 +54,25 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "bias) -> Tensor");
   m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
 
+  // fp8_blockwise_scaled_mm
+  m.def(
+      "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype) -> "
+      "Tensor");
+  m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
+
   // lightning_attention_decode
   m.def(
       "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
       "new_kv) -> ()");
   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 
-  // rotary embedding
-  m.def(
-      "rotary_embedding(Tensor positions, Tensor! query, Tensor! key, int head_size, Tensor cos_sin_cache, bool "
-      "is_neox) -> ()");
-  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
-
   // rms norm
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
 
   // fused rms norm
-  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, int cuda_stream) -> ()");
-  m.impl("fused_add_rmsnorm", torch::kCUDA, &fused_add_rmsnorm);
+  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
+  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
 
   // gemma rms norm
   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
@@ -116,6 +130,47 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor! success, Tensor? "
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
+
+  // apply rope with cos sin cache
+  m.def(
+      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
+      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+
+  // tree spec decode
+  m.def(
+      "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor uniform_samples, Tensor target_probs, Tensor draft_probs, "
+      "bool deterministic, int cuda_stream) -> ()");
+  m.impl("tree_speculative_sampling_target_only", torch::kCUDA, &tree_speculative_sampling_target_only);
+
+  // eagle build tree
+  m.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! "
+      "retrive_next_sibling, "
+      "int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+
+  // eagle build tree
+  m.def(
+      "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
+      "int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
+
+  // per_token_group_quant_fp8
+  m.def(
+      "sgl_per_token_group_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, float fp8_min, float fp8_max) -> ()");
+  m.impl("sgl_per_token_group_quant_fp8", torch::kCUDA, &sgl_per_token_group_quant_fp8);
+
+  // cublas grouped gemm
+  m.def(
+      "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
+      " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
+  m.impl("cublas_grouped_gemm", torch::kCUDA, &cublas_grouped_gemm);
 }
 
 REGISTER_EXTENSION(_kernels)

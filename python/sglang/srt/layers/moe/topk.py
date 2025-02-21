@@ -17,6 +17,8 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.utils import get_compiler_backend
+
 
 def fused_topk_native(
     hidden_states: torch.Tensor,
@@ -73,7 +75,8 @@ def fused_topk(
     return topk_weights, topk_ids
 
 
-# This is used by the Deepseek-V2 model
+# This is used by the Deepseek V2/V3/R1 series models
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -108,6 +111,7 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def biased_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -137,7 +141,9 @@ def biased_grouped_topk(
         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
         .reshape(num_token, -1)
     )  # [n, e]
-    tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+    tmp_scores = scores_for_choice.masked_fill(
+        ~score_mask.bool(), float("-inf")
+    )  # [n, e]
     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
     topk_weights = scores.gather(1, topk_ids)
 
