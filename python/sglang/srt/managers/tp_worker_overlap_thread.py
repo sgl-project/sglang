@@ -22,6 +22,7 @@ from typing import Optional
 
 import psutil
 import torch
+
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
@@ -61,7 +62,9 @@ class TpModelWorkerClient:
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port, parallel_process_groups)
+        self.worker = TpModelWorker(
+            server_args, gpu_id, tp_rank, dp_rank, nccl_port, parallel_process_groups
+        )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
@@ -148,7 +151,7 @@ class TpModelWorkerClient:
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
             self.future_token_ids_map[
-            future_token_ids_ct + 1: future_token_ids_ct + bs + 1
+                future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
             ] = next_token_ids
 
             # Copy results to the CPU
@@ -212,8 +215,8 @@ class TpModelWorkerClient:
             device=self.device,
         )
         self.future_token_ids_ct = (
-                                       self.future_token_ids_ct + bs
-                                   ) % self.future_token_ids_limit
+            self.future_token_ids_ct + bs
+        ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

@@ -31,7 +31,11 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, set_random_seed, broadcast_pyobj_in_group
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    broadcast_pyobj_in_group,
+    set_random_seed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +110,7 @@ class TpModelWorker:
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
                 else server_args.max_running_requests
-                     // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                // (server_args.dp_size if server_args.enable_dp_attention else 1)
             ),
             self.model_runner.req_to_token_pool.size,
         )

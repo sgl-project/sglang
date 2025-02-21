@@ -2,9 +2,10 @@ import datetime
 import os
 import sys
 
+from torch.distributed.device_mesh import init_device_mesh
+
 from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.entrypoints.engine_fragment import EngineFragment
-from torch.distributed.device_mesh import init_device_mesh
 
 
 def run():

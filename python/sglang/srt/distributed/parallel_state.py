@@ -37,13 +37,14 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
+from torch.distributed import Backend, ProcessGroup
+from torch.distributed.device_mesh import DeviceMesh
+
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_cuda_alike,
     supports_custom_op,
 )
-from torch.distributed import Backend, ProcessGroup
-from torch.distributed.device_mesh import DeviceMesh
 
 
 @dataclass
@@ -112,10 +113,8 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         group._all_reduce_in_place(tensor)
 
-
     def inplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> None:
         return
-
 
     direct_register_custom_op(
         op_name="inplace_all_reduce",
@@ -124,7 +123,6 @@ if supports_custom_op():
         fake_impl=inplace_all_reduce_fake,
     )
 
-
     def outplace_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
@@ -132,10 +130,8 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_reduce_out_place(tensor)
 
-
     def outplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         return torch.empty_like(tensor)
-
 
     direct_register_custom_op(
         op_name="outplace_all_reduce",
@@ -189,7 +185,7 @@ class GroupCoordinator:
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
-        existing_groups: Optional['DimProcessGroups'] = None,
+        existing_groups: Optional["DimProcessGroups"] = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -201,8 +197,9 @@ class GroupCoordinator:
         self.cpu_group = None
 
         if existing_groups is not None:
-            assert torch_distributed_backend is None and group_ranks is None, \
-                'When using argument `existing_groups`, should not provide `torch_distributed_backend` and `group_ranks`'
+            assert (
+                torch_distributed_backend is None and group_ranks is None
+            ), "When using argument `existing_groups`, should not provide `torch_distributed_backend` and `group_ranks`"
             ranks = existing_groups.device_mesh_device.mesh.tolist()
             self.ranks = ranks
             self.world_size = len(ranks)
@@ -466,7 +463,7 @@ class GroupCoordinator:
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1:]
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
 
@@ -882,7 +879,9 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str,
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],

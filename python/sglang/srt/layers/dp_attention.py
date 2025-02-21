@@ -19,7 +19,9 @@ def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_si
     return attn_tp_rank, attn_tp_size, dp_rank
 
 
-def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size, existing_groups):
+def initialize_dp_attention(
+    enable_dp_attention, tp_rank, tp_size, dp_size, existing_groups
+):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK, _DP_SIZE
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -40,7 +42,7 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size, exis
     else:
         if enable_dp_attention:
             # TODO implement this branchin the next PR
-            assert False, 'DP attention for EngineFragment is not yet implemented'
+            assert False, "DP attention for EngineFragment is not yet implemented"
         else:
             existing_groups_chosen = existing_groups.tp
             group_ranks = torch_distributed_backend = None
