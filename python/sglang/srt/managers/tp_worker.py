@@ -13,10 +13,11 @@
 # ==============================================================================
 """A tensor parallel worker."""
 
-import torch
 import logging
 import threading
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
+
+import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import ParallelProcessGroups
