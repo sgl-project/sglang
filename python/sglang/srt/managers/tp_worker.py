@@ -49,7 +49,7 @@ class TpModelWorker:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
-        nccl_port: Optional[int],
+        nccl_port: int,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
         is_draft_worker: bool = False,
     ):

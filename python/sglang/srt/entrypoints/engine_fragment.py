@@ -10,6 +10,7 @@ from sglang.srt.server_args import ServerArgs
 class EngineFragment(EngineBase):
     def __init__(
         self,
+        nccl_port: int,
         gpu_id: int,
         tp_rank: int,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
@@ -20,6 +21,7 @@ class EngineFragment(EngineBase):
         server_args = ServerArgs(*args, log_level=log_level, **kwargs)
         self._entrypoint = SpmdOrchestrator(
             server_args=server_args,
+            nccl_port=nccl_port,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             parallel_process_groups=parallel_process_groups,
