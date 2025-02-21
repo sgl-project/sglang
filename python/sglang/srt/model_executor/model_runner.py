@@ -21,7 +21,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -88,7 +87,7 @@ class ModelRunner:
         gpu_id: int,
         tp_rank: int,
         tp_size: int,
-        nccl_port: int,
+        nccl_port: Optional[int],
         server_args: ServerArgs,
         parallel_process_groups: Optional[ParallelProcessGroups] = None,
         is_draft_worker: bool = False,
@@ -188,7 +187,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -738,7 +737,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
