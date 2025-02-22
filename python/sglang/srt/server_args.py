@@ -262,14 +262,17 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        if self.speculative_algorithm == "EAGLE":
+        if (
+            self.speculative_algorithm == "EAGLE"
+            or self.speculative_algorithm == "NEXTN"
+        ):
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
             self.disable_overlap_schedule = True
             self.chunked_prefill_size = -1
             logger.info(
-                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
+                f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
             )
 
         # GGUF
@@ -706,7 +709,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE"],
+            choices=["EAGLE", "NEXTN"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

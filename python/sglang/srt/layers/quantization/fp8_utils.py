@@ -62,6 +62,8 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 
 def cutlass_block_fp8_supported() -> bool:
+    if os.environ.get("SUPPORT_CUTLASS_BLOCK_FP8") is None:
+        return False
     if _is_cuda:
         major, minor = torch.cuda.get_device_capability()
         sm_version = major * 10 + minor

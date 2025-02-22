@@ -8,6 +8,7 @@ on:
       - "python/sglang/**"
       - "test/**"
       - "docs/**"
+      - "scripts/**"
   pull_request:
     branches: [ main ]
     paths:
@@ -15,6 +16,7 @@ on:
       - "python/sglang/**"
       - "test/**"
       - "docs/**"
+      - "scripts/**"
   workflow_dispatch:
     inputs:
       version:
@@ -45,6 +47,8 @@ jobs:
           filters: |
             docs:
               - 'docs/**'
+            scripts:
+              - 'scripts/**'
             sglang:
               - 'python/sglang/**'
             test:
@@ -103,6 +107,19 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
+        if: github.event.pull_request.head.repo.fork == false
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        timeout-minutes: 30
+        run: |
+          RANGE=${{ matrix.range }}
+          range_begin=${RANGE%-*}
+          range_end=${RANGE#*-}
+          cd test/srt
+          python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
+
+      - name: Run test (fork)
+        if: github.event.pull_request.head.repo.fork == true
         timeout-minutes: 30
         run: |
           RANGE=${{ matrix.range }}
