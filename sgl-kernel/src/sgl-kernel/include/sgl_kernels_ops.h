@@ -157,3 +157,6 @@ void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q, at::Te
 void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& weights,
                          const std::vector<torch::Tensor>& outputs, const torch::Dtype& out_dtype,
                          int64_t cublas_handle, int64_t cuda_stream);
+
+// sgl_per_tensor_quant_fp8
+void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
