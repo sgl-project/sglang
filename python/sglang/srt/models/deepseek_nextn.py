@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import is_hip
+from vllm.model_executor.models.utils import maybe_prefix
 
 is_hip_ = is_hip()
 
@@ -48,6 +49,7 @@ class DeepseekModelNextN(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -56,6 +58,7 @@ class DeepseekModelNextN(nn.Module):
             config.vocab_size,
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
+            prefix=f"{prefix}.embed_tokens"
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -64,7 +67,7 @@ class DeepseekModelNextN(nn.Module):
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         self.decoder = DeepseekV2DecoderLayer(
-            config, 0, quant_config=quant_config, is_nextn=True
+            config, 0, quant_config=quant_config, is_nextn=True, prefix=f"{prefix}.decoder"
         )
 
         self.shared_head = nn.Module()
@@ -108,18 +111,20 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
 
-        self.model = DeepseekModelNextN(config, quant_config)
+        self.model = DeepseekModelNextN(config, quant_config, prefix=maybe_prefix(prefix, "model"))
 
         if global_server_args_dict["enable_dp_attention"]:
             self.model.shared_head.head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
+                prefix=maybe_prefix(prefix, "model.shared_head.head")
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
@@ -127,6 +132,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "model.shared_head.head")
             )
             self.logits_processor = LogitsProcessor(config)
 

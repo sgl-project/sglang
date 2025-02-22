@@ -57,6 +57,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
+from vllm.model_executor.models.utils import maybe_prefix
 
 is_hip_ = is_hip()
 
@@ -72,10 +73,11 @@ class DeepseekV2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_up_proj"
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -83,6 +85,7 @@ class DeepseekV2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            prefix=f"{prefix}.down_proj"
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -99,7 +102,7 @@ class DeepseekV2MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, prefix: str = "",):
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
@@ -122,6 +125,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -140,7 +144,7 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config)
+        self.gate = MoEGate(config=config, prefix=f"{prefix}.gate")
 
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         self.experts = MoEImpl(
@@ -154,6 +158,7 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            prefix=f"{prefix}.experts",
         )
 
         if config.n_shared_experts is not None:
@@ -164,6 +169,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=f"{prefix}.shared_experts",
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -210,6 +216,7 @@ class DeepseekV2Attention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -234,6 +241,7 @@ class DeepseekV2Attention(nn.Module):
                 self.q_lora_rank,
                 bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.q_a_proj"
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -241,6 +249,7 @@ class DeepseekV2Attention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.q_b_proj"
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -248,6 +257,7 @@ class DeepseekV2Attention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.q_proj"
             )
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -255,8 +265,7 @@ class DeepseekV2Attention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
             quant_config=quant_config,
-            # FIXME: quick fix for skip quantization
-            prefix=f"self_attn.kv_a_proj_with_mqa",
+            prefix=f"{prefix}.kv_a_proj_with_mqa"
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -264,6 +273,7 @@ class DeepseekV2Attention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.kv_b_proj"
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -271,6 +281,7 @@ class DeepseekV2Attention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj"
         )
         rope_scaling["rope_type"] = "deepseek_yarn"
         self.rotary_emb = get_rope_wrapper(
@@ -296,6 +307,7 @@ class DeepseekV2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
+            prefix=f"{prefix}.attn"
         )
 
     def forward(
@@ -361,6 +373,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
         use_dp=False,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -387,6 +400,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.q_lora_rank,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.q_a_proj"
                 )
                 self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
                 self.q_b_proj = ReplicatedLinear(
@@ -394,6 +408,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.num_heads * self.qk_head_dim,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.q_b_proj"
                 )
             else:
                 self.q_proj = ReplicatedLinear(
@@ -401,12 +416,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.num_heads * self.qk_head_dim,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.q_proj"
                 )
             self.kv_b_proj = ReplicatedLinear(
                 self.kv_lora_rank,
                 self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.kv_b_proj"
             )
             # O projection.
             self.o_proj = ReplicatedLinear(
@@ -414,6 +431,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.hidden_size,
                 bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.o_proj"
             )
         else:
             # For tensor parallel attention
@@ -423,6 +441,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.q_lora_rank,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.q_a_proj"
                 )
                 self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
                 self.q_b_proj = ColumnParallelLinear(
@@ -430,6 +449,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.num_heads * self.qk_head_dim,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.q_b_proj"
                 )
             else:
                 self.q_proj = ColumnParallelLinear(
@@ -437,12 +457,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.num_heads * self.qk_head_dim,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.q_proj"
                 )
             self.kv_b_proj = ColumnParallelLinear(
                 self.kv_lora_rank,
                 self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.kv_b_proj"
             )
             # O projection.
             self.o_proj = RowParallelLinear(
@@ -450,6 +472,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.hidden_size,
                 bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.o_proj"
             )
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -457,8 +480,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
             quant_config=quant_config,
-            # FIXME: quick fix for skip quantization
-            prefix=f"self_attn.kv_a_proj_with_mqa",
+            prefix=f"{prefix}.kv_a_proj_with_mqa"
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -489,6 +511,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            prefix=f"{prefix}.attn_mqa"
         )
 
         self.attn_mha = RadixAttention(
@@ -498,6 +521,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            prefix=f"{prefix}.attn_mha"
         )
 
         self.w_kc = None
@@ -686,6 +710,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -718,6 +743,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
                 use_dp=self.enable_dp_attention,
+                prefix=f"{prefix}.self_attn",
             )
         else:
             self.self_attn = DeepseekV2Attention(
@@ -736,19 +762,21 @@ class DeepseekV2DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 layer_id=layer_id,
+                prefix=f"{prefix}.self_attn",
             )
         if is_nextn or (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config)
+            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config, prefix=f"{prefix}.mlp",)
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -800,6 +828,7 @@ class DeepseekV2Model(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.padding_id = config.pad_token_id
@@ -816,6 +845,7 @@ class DeepseekV2Model(nn.Module):
                     config,
                     layer_id,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{layer_id}"
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -846,21 +876,23 @@ class DeepseekV2ForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = DeepseekV2Model(config, quant_config)
+        self.model = DeepseekV2Model(config, quant_config, prefix=maybe_prefix(prefix, "model"))
         if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
+                prefix=maybe_prefix(prefix, "lm_head")
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
             )
             self.logits_processor = LogitsProcessor(config)
 

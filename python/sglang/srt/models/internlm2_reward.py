@@ -22,6 +22,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM, InternLM2Model
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class InternLM2ForRewardModel(nn.Module):
@@ -29,12 +30,13 @@ class InternLM2ForRewardModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
-        self.model = InternLM2Model(config, quant_config)
+        self.model = InternLM2Model(config, quant_config, prefix=maybe_prefix(prefix, "model"))
         self.v_head = nn.Linear(config.hidden_size, 1, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 

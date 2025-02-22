@@ -43,6 +43,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.utils import get_exception_traceback
+from vllm.model_executor.models.utils import maybe_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,7 @@ class GraniteAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=f"{prefix}.attn"
         )
 
     def forward(
@@ -252,6 +254,7 @@ class GraniteModel(nn.Module):
         self,
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -263,7 +266,7 @@ class GraniteModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 GraniteDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -300,17 +303,18 @@ class GraniteForCausalLM(nn.Module):
         self,
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = GraniteModel(config, quant_config=quant_config)
+        self.model = GraniteModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
         # If tie_word_embeddings == True, then input and output embeddings are
         # the same tensor. Enforce during object creation so that weights will
         # load correctly even if the LM head weights don't have a separate entry
         # in the state dict.
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
         )
         if self.config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)

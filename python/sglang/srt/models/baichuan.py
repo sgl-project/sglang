@@ -46,7 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
+from vllm.model_executor.models.utils import maybe_prefix
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
@@ -80,13 +80,14 @@ class BaiChuanMLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_up_proj"
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, quant_config=quant_config
+            intermediate_size, hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj"
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -114,6 +115,7 @@ class BaiChuanAttention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -167,6 +169,7 @@ class BaiChuanAttention(nn.Module):
                 scaling,
                 num_kv_heads=self.num_kv_heads,
                 layer_id=layer_id,
+                prefix=f"{prefix}.attn"
             )
         else:
             self.rotary_emb = get_rope(
@@ -182,6 +185,7 @@ class BaiChuanAttention(nn.Module):
                 self.scaling,
                 num_kv_heads=self.num_kv_heads,
                 layer_id=layer_id,
+                prefix=f"{prefix}.attn"
             )
 
     def forward(
@@ -207,6 +211,7 @@ class BaiChuanDecoderLayer(nn.Module):
         position_embedding: str,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -220,12 +225,14 @@ class BaiChuanDecoderLayer(nn.Module):
             layer_id=layer_id,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
         self.mlp = BaiChuanMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -264,6 +271,7 @@ class BaiChuanModel(nn.Module):
         config: PretrainedConfig,
         position_embedding: str,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -281,6 +289,7 @@ class BaiChuanModel(nn.Module):
                     layer_id=i,
                     position_embedding=position_embedding,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}",
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -330,18 +339,19 @@ class BaiChuanBaseForCausalLM(nn.Module):
         config: PretrainedConfig,
         position_embedding: str,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
         self.config = config
 
         self.quant_config = quant_config
-        self.model = BaiChuanModel(config, position_embedding, quant_config)
+        self.model = BaiChuanModel(config, position_embedding, quant_config, prefix=maybe_prefix(prefix, "model"))
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
             )
         self.logits_processor = LogitsProcessor(config)
 
@@ -404,11 +414,12 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ):
         if config.hidden_size == 4096:  # baichuan2 7b
-            super().__init__(config, "ROPE", quant_config)
+            super().__init__(config, "ROPE", quant_config, prefix=prefix)
         else:  # baichuan 13b, baichuan2 13b
-            super().__init__(config, "ALIBI", quant_config)
+            super().__init__(config, "ALIBI", quant_config, prefix=prefix)
 
 
 EntryClass = [BaichuanForCausalLM]

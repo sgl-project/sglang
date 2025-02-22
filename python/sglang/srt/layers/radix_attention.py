@@ -34,6 +34,7 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_q_head_num = num_heads

@@ -47,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import set_weight_attrs
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class DbrxRouter(nn.Module):
@@ -58,6 +59,7 @@ class DbrxRouter(nn.Module):
         self,
         config: DbrxConfig,
         params_dtype: Optional[torch.dtype] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -89,6 +91,7 @@ class DbrxExperts(nn.Module):
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
         params_dtype: Optional[torch.dtype] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -189,6 +192,7 @@ class DbrxAttention(nn.Module):
         config: DbrxConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.d_model = config.d_model
@@ -207,12 +211,14 @@ class DbrxAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.Wqkv"
         )
         self.out_proj = RowParallelLinear(
             self.d_model,
             self.d_model,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.out_proj"
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -244,6 +250,7 @@ class DbrxAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=f"{prefix}.attn"
         )
 
     def forward(
@@ -268,10 +275,11 @@ class DbrxFusedNormAttention(nn.Module):
         config: DbrxConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.d_model = config.d_model
-        self.attn = DbrxAttention(config, layer_id, quant_config=quant_config)
+        self.attn = DbrxAttention(config, layer_id, quant_config=quant_config, prefix=f"{prefix}.attn")
         self.norm_1 = nn.LayerNorm(self.d_model)
         self.norm_2 = nn.LayerNorm(self.d_model)
 
@@ -300,10 +308,11 @@ class DbrxBlock(nn.Module):
         config: DbrxConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.norm_attn_norm = DbrxFusedNormAttention(
-            config, layer_id, quant_config=quant_config
+            config, layer_id, quant_config=quant_config, prefix=f"{prefix}.norm_attn_norm"
         )
         self.ffn = DbrxExperts(config, quant_config=quant_config)
 
@@ -328,6 +337,7 @@ class DbrxModel(nn.Module):
         self,
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ):
         super().__init__()
         self.wte = VocabParallelEmbedding(
@@ -336,7 +346,7 @@ class DbrxModel(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                DbrxBlock(config, i, quant_config=quant_config)
+                DbrxBlock(config, i, quant_config=quant_config, prefix=f"{prefix}.blocks.{i}")
                 for i in range(config.n_layers)
             ]
         )
@@ -369,17 +379,19 @@ class DbrxForCausalLM(nn.Module):
         self,
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
         self.unpadded_vocab_size = config.vocab_size
-        self.transformer = DbrxModel(config, quant_config=quant_config)
+        self.transformer = DbrxModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "transformer"))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.d_model,
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
+            prefix=maybe_prefix(prefix, "lm_head")
         )
         self.logits_processor = LogitsProcessor(config)
 

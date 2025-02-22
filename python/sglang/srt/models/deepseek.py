@@ -46,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class DeepseekMLP(nn.Module):
@@ -57,10 +58,11 @@ class DeepseekMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_up_proj"
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -68,6 +70,7 @@ class DeepseekMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            prefix = f"{prefix}.down_proj"
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -89,6 +92,7 @@ class DeepseekMoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -110,6 +114,7 @@ class DeepseekMoE(nn.Module):
                     hidden_act=config.hidden_act,
                     quant_config=quant_config,
                     reduce_results=False,
+                    prefix=f"{prefix}.{idx}.experts"
                 )
                 for idx in range(self.n_routed_experts)
             ]
@@ -117,7 +122,7 @@ class DeepseekMoE(nn.Module):
         self.pack_params()
 
         self.gate = ReplicatedLinear(
-            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None
+            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None, prefix=f"{prefix}.gate"
         )
 
         if config.n_shared_experts is not None:
@@ -128,6 +133,7 @@ class DeepseekMoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=f"{prefix}.shared_experts"
             )
 
     def pack_params(self):
@@ -185,6 +191,7 @@ class DeepseekAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -216,6 +223,7 @@ class DeepseekAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj"
         )
 
         self.o_proj = RowParallelLinear(
@@ -223,6 +231,7 @@ class DeepseekAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj"
         )
 
         self.rotary_emb = get_rope(
@@ -238,6 +247,7 @@ class DeepseekAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=f"{prefix}.attn"
         )
 
     def forward(
@@ -261,6 +271,7 @@ class DeepseekDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -276,19 +287,21 @@ class DeepseekDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
         if (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekMoE(config=config, quant_config=quant_config)
+            self.mlp = DeepseekMoE(config=config, quant_config=quant_config, prefix=f"{prefix}.mlp")
         else:
             self.mlp = DeepseekMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=f"{prefix}.mlp"
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -328,6 +341,7 @@ class DeepseekModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -339,7 +353,7 @@ class DeepseekModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekDecoderLayer(config, layer_id, quant_config=quant_config)
+                DeepseekDecoderLayer(config, layer_id, quant_config=quant_config, prefix=f"{prefix}.layers.{layer_id}")
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
@@ -368,13 +382,14 @@ class DeepseekForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = DeepseekModel(config, quant_config)
+        self.model = DeepseekModel(config, quant_config, prefix=maybe_prefix(prefix, "model"))
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
         )
         self.logits_processor = LogitsProcessor(config)
 

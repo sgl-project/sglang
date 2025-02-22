@@ -39,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class ExaoneGatedMLP(nn.Module):
@@ -244,6 +245,7 @@ class ExaoneModel(nn.Module):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.config = config
@@ -256,7 +258,7 @@ class ExaoneModel(nn.Module):
         self.h = nn.ModuleList(
             [
                 ExaoneDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.h.{i}"
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.h.{i}"
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -293,12 +295,13 @@ class ExaoneForCausalLM(nn.Module):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.transformer = ExaoneModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.transformer = ExaoneModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "transformer"))
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
