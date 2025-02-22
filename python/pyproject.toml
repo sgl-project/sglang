@@ -96,3 +96,6 @@ exclude = [
     "scripts*",
     "tests*",
 ]
+
+[project.scripts]
+sglang = "sglang.launch_server:main"
