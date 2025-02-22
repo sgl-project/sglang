@@ -13,7 +13,7 @@
 # ==============================================================================
 """
 The definition of objects transfered between different
-processes (TokenizerManager, DetokenizerManager, Controller).
+processes (StdOrchestrator, DetokenizerManager, Controller).
 """
 
 import uuid
@@ -449,6 +449,7 @@ class UpdateWeightsFromDistributedReqOutput:
 @dataclass
 class UpdateWeightsFromTensorReqInput:
     serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    load_format: Optional[str]
 
 
 @dataclass
