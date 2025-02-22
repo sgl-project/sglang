@@ -305,7 +305,7 @@ class Qwen2VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
+                    attn_implementation=vision_config._attn_implementation,
                     quant_config=quant_config,
                 )
                 for _ in range(depth)
@@ -405,36 +405,50 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     # Use grid_t * grid_w * grid_h to pad tokens for each image
     # add replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        image_grid_thws = image_inputs.image_grid_thws
-        pad_values = image_inputs.pad_values
-
-        image_indices = [
-            idx
-            for idx, token in enumerate(input_ids)
-            if token == self.config.image_token_id
-        ]
+        new_input_ids = []
+        last_idx = 0
+        image_idx = -1
         image_inputs.image_offsets = []
 
-        input_ids_with_image = []
-        for image_cnt, _ in enumerate(image_grid_thws):
-            num_image_tokens = self.calculate_num_image_tokens(
-                image_grid_thws[image_cnt]
-            )
-            if image_cnt == 0:
-                non_image_tokens = input_ids[: image_indices[image_cnt]]
-            else:
-                non_image_tokens = input_ids[
-                    image_indices[image_cnt - 1] + 1 : image_indices[image_cnt]
-                ]
-            input_ids_with_image.extend(non_image_tokens)
-            image_inputs.image_offsets.append(len(input_ids_with_image))
-            pad_ids = pad_values * (
-                (num_image_tokens + len(pad_values)) // len(pad_values)
-            )
-            input_ids_with_image.extend(pad_ids[:num_image_tokens])
-        input_ids_with_image.extend(input_ids[image_indices[-1] + 1 :])
+        # Get all special token IDs
+        im_start_id = image_inputs.im_start_id
+        im_end_id = image_inputs.im_end_id
 
-        return input_ids_with_image
+        # Find all start and end positions for both types
+        start_indices = [i for i, x in enumerate(input_ids) if x == im_start_id]
+        end_indices = [i for i, x in enumerate(input_ids) if x == im_end_id]
+
+        if len(start_indices) != len(end_indices):
+            return input_ids
+        # Process each region (both image and slice)
+        for start_idx, end_idx in zip(start_indices, end_indices):
+            # Add non-image tokens before this region
+            new_input_ids.extend(input_ids[last_idx : start_idx + 1])
+
+            is_image_start = input_ids[start_idx] == im_start_id
+
+            if is_image_start:
+                image_inputs.image_offsets += [start_idx + 1]
+                image_idx += 1
+
+            num_tokens = end_idx - start_idx - 1  # exclude start and end tokens
+
+            # Generate pad_ids
+            pad_values = [image_inputs.pad_values[image_idx]]
+
+            pad_ids = pad_values * ((num_tokens + len(pad_values)) // len(pad_values))
+            pad_ids = pad_ids[:num_tokens]
+
+            # Add pad_ids
+            new_input_ids.extend(pad_ids)
+
+            # Update last_idx to after end token
+            last_idx = end_idx
+
+        # Add remaining tokens after last region
+        new_input_ids.extend(input_ids[last_idx:])
+        assert len(input_ids) == len(new_input_ids)
+        return new_input_ids
 
     def __init__(
         self,
@@ -530,8 +544,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     continue
                 start_idx = extend_start_loc_cpu[i]
                 prefix_len = prefix_lens_cpu[i]
+                pixel_values = image.pixel_values.clone()
 
-                pixel_values = torch.tensor(image.pixel_values, device="cuda")
                 image_grid_thws = torch.tensor(
                     np.array(image.image_grid_thws), device="cuda"
                 )
@@ -550,14 +564,13 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     )
 
                     left_idx = start_idx + (image_offset - prefix_len)
-                    right_idx = (
-                        start_idx + (image_offset - prefix_len) + num_image_tokens
-                    )
+                    right_idx = left_idx + num_image_tokens
 
                     inputs_embeds[left_idx:right_idx] = image_embeds[
                         image_embeds_offset : image_embeds_offset + num_image_tokens
                     ]
                     image_embeds_offset += num_image_tokens
+            input_ids = None
 
         hidden_states = self.model(
             input_ids=input_ids,

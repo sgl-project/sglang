@@ -151,13 +151,18 @@ class ImageInputs:
 
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
+    video_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    # Qwen2-VL video related
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
+    im_token_id: Optional[int] = None
+    video_token_id: Optional[int] = None
 
     # MiniCPMV related
     # All the images in the batch should share the same special image
     # bound token ids.
-    im_start_id: Optional[torch.Tensor] = None
-    im_end_id: Optional[torch.Tensor] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
     slice_start_id: Optional[torch.Tensor] = None
     slice_end_id: Optional[torch.Tensor] = None
     tgt_sizes: Optional[list] = None
