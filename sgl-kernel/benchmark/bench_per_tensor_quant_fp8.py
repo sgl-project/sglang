@@ -2,22 +2,25 @@ import itertools
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-from vllm import _custom_ops as ops
-from sgl_kernel import sgl_per_tensor_quant_fp8
 import numpy as np
+import torch
 import triton
 import triton.testing
+from sgl_kernel import sgl_per_tensor_quant_fp8
+from vllm import _custom_ops as ops
+
 from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
 
 is_hip_ = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+
 
 def vllm_scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return ops.scaled_fp8_quant(input, scale)
+
 
 def sglang_scaled_fp8_quant(
     input: torch.Tensor,
@@ -33,17 +36,18 @@ def sglang_scaled_fp8_quant(
 
     return output, scale
 
+
 def calculate_diff(batch_size: int, seq_len: int):
     """Calculate difference between VLLM and SGLang implementations."""
     device = torch.device("cuda")
     x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
-    
+
     vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
     sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-    
+
     scale_diff = torch.abs(vllm_scale - sglang_scale).item()
     output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
-    
+
     if torch.allclose(
         vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
     ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
@@ -51,10 +55,12 @@ def calculate_diff(batch_size: int, seq_len: int):
     else:
         print("❌ Implementations differ")
 
+
 batch_size_range = [16, 32, 64, 128, 256, 512]
 seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 configs = list(itertools.product(batch_size_range, seq_len_range))
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
