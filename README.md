@@ -46,7 +46,7 @@ The core features include:
 
 ## Getting Started
 - [Install SGLang](https://docs.sglang.ai/start/install.html)
-- [Quick Start](https://docs.sglang.ai/start/send_request.html)
+- [Quick Start](https://docs.sglang.ai/backend/send_request.html)
 - [Backend Tutorial](https://docs.sglang.ai/backend/openai_api_completions.html)
 - [Frontend Tutorial](https://docs.sglang.ai/frontend/frontend.html)
 - [Contribution Guide](https://docs.sglang.ai/references/contribution_guide.html)
