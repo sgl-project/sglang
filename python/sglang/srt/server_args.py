@@ -24,6 +24,7 @@ import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
+    find_available_port,
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -1007,15 +1008,7 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
-
+        port = find_available_port(base_port=server_args.port)
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -1039,7 +1032,7 @@ class PortArgs:
             if dp_rank is None:
                 scheduler_input_port = (
                     port_base + 2
-                )  # TokenizerManager to DataParallelController
+                )  # StdOrchestrator to DataParallelController
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
 

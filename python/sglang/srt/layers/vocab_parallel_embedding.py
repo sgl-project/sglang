@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import set_weight_attrs, weight_loader_tp_narrow
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -461,7 +461,9 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Copy the data.
         if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            loaded_weight = weight_loader_tp_narrow(
+                loaded_weight, output_dim, start_idx, shard_size
+            )
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 

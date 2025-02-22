@@ -19,7 +19,9 @@ def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_si
     return attn_tp_rank, attn_tp_size, dp_rank
 
 
-def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size):
+def initialize_dp_attention(
+    enable_dp_attention, tp_rank, tp_size, dp_size, existing_groups
+):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK, _DP_SIZE
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -30,19 +32,38 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size):
     _DP_SIZE = dp_size
 
     tp_group = get_tp_group()
-    _ATTN_TP_GROUP = GroupCoordinator(
-        [
+    tp_group_backend = torch.distributed.get_backend(tp_group.device_group)
+
+    if existing_groups is None:
+        group_ranks = [
             list(range(head, head + _ATTN_TP_SIZE))
             for head in range(0, tp_size, _ATTN_TP_SIZE)
-        ],
-        tp_rank,
-        torch.distributed.get_backend(tp_group.device_group),
-        SYNC_TOKEN_IDS_ACROSS_TP,
-        False,
-        False,
-        False,
-        False,
+        ]
+        existing_groups_chosen = None
+    else:
+        if enable_dp_attention:
+            assert _ATTN_TP_SIZE == 1
+            group_ranks = [
+                [head] for head in range(0, torch.distributed.get_world_size())
+            ]
+            existing_groups_chosen = None
+        else:
+            existing_groups_chosen = existing_groups.tp
+            group_ranks = None
+
+    _ATTN_TP_GROUP = GroupCoordinator(
+        group_ranks=group_ranks,
+        local_rank=tp_rank,
+        torch_distributed_backend=(
+            tp_group_backend if existing_groups_chosen is None else None
+        ),
+        use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+        use_custom_allreduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_message_queue_broadcaster=False,
         group_name="attention_tp",
+        existing_groups=existing_groups_chosen,
     )
 
 
