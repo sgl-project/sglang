@@ -789,8 +789,8 @@ class Fp8MoEMethod:
         )
 
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            import ater
-            from ater.fused_moe import fused_experts_ck
+            import aiter
+            from aiter.fused_moe import fused_experts_ck
 
             assert activation == "silu", f"{activation=} is not supported."
 
