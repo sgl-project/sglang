@@ -31,6 +31,7 @@
 - Phi-3 / Phi-4
 - Phi-3-Small
 - IBM Granite 3
+- Deepseek-VL2 / Deepseek-VL2-small
 
 ## Embedding Models
 

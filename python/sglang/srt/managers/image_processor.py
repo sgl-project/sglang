@@ -20,7 +20,17 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_image
 from sglang.utils import get_exception_traceback
 
+import torch
+
+import contextlib
+from transformers import AutoProcessor
+from sglang.srt.managers.image_preprocessors.processing_deepseek_vl_v2 import DeepseekVLV2Processor
+
 logger = logging.getLogger(__name__)
+
+# register deepseek-vl2 preprocess
+with contextlib.suppress(ValueError):
+    AutoProcessor.register("DeepseekVLV2Processor", DeepseekVLV2Processor)
 
 global global_processor
 
@@ -57,7 +67,8 @@ class BaseImageProcessor(ABC):
             initializer=init_global_processor,
             mp_context=mp.get_context("fork"),
             initargs=(server_args,),
-            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
+            max_workers=int(os.environ.get(
+                "SGLANG_CPU_COUNT", os.cpu_count())),
         )
 
     @abstractmethod
@@ -221,7 +232,8 @@ class LlavaImageProcessor(BaseImageProcessor):
                 if image_aspect_ratio == "pad":
                     image = expand2square(
                         image,
-                        tuple(int(x * 255) for x in image_processor.image_mean),
+                        tuple(int(x * 255)
+                              for x in image_processor.image_mean),
                     )
                     pixel_values = image_processor(image.convert("RGB"))[
                         "pixel_values"
@@ -241,7 +253,8 @@ class LlavaImageProcessor(BaseImageProcessor):
 
                 return pixel_values, image_hash, image.size
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in TokenizerManager:\n" +
+                         get_exception_traceback())
 
     async def _process_single_image(
         self, image_data: Union[bytes, str], aspect_ratio: str, grid_pinpoints: str
@@ -340,7 +353,8 @@ class MllamaImageProcessor(BaseImageProcessor):
                 input_text,
             )
         else:
-            image_inputs = self._processor(images, input_text, return_tensors="pt")
+            image_inputs = self._processor(
+                images, input_text, return_tensors="pt")
 
         return image_inputs
 
@@ -453,7 +467,8 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             initializer=init_global_processor,
             mp_context=mp.get_context("fork"),
             initargs=(server_args,),
-            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
+            max_workers=int(os.environ.get(
+                "SGLANG_CPU_COUNT", os.cpu_count())),
         )
 
     @staticmethod
@@ -491,7 +506,8 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
 
                 return pixel_values, image_hash, image.size, image_grid_thws
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in TokenizerManager:\n" +
+                         get_exception_traceback())
 
     async def _process_single_image(self, image_data: Union[bytes, str]):
         if self.executor is not None:
@@ -564,6 +580,70 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         }
 
 
+class DeepseekVL2ImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
+        self.IMAGE_TOKEN="<image>"
+
+    @staticmethod
+    def _process_single_image_task(image, input_text,max_req_input_len):
+        return global_processor.__call__(conversations=input_text, images=image,max_req_input_len=max_req_input_len)
+
+    async def _process_single_image(self, image_data: Union[bytes, str], input_text,max_req_input_len):
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            image_inputs = await loop.run_in_executor(
+                self.executor,
+                DeepseekVL2ImageProcessor._process_single_image_task,
+                image_data,
+                input_text,
+                max_req_input_len,
+            )
+        else:
+            image_inputs = self._process_single_image_task(
+                image_data, input_text,max_req_input_len)
+
+        return image_inputs
+
+    async def process_images_async(self, image_data, input_ids, request_obj,max_req_input_len,*args,
+        **kwargs):
+        if not image_data:
+            return None
+
+        if not isinstance(image_data, list):
+            image_data = [image_data]
+
+        images, image_hashes, image_sizes = [], [], []
+
+        # for image in image_data:
+        #     pil_image, _size = load_image(image)
+        #     pil_image = pil_image.convert("RGB")
+        #     images += [pil_image]
+        #     image_hashes += [hash(image)]
+        #     image_sizes += [_size]
+        image_token=self.IMAGE_TOKEN
+        base_output=self.load_images(max_req_input_len,input_ids,image_data,image_token)
+        base_output.all_frames=[img.convert("RGB") for img in base_output.all_frames]
+        res = await self._process_single_image(base_output.all_frames, base_output.input_text,max_req_input_len)
+        pixel_values = res["images"]
+        input_ids = res["input_ids"]
+        images_seq_mask = res["images_seq_mask"]
+        images_spatial_crop = res["images_spatial_crop"]
+        batched_images_spatial_crop = []
+        batched_images_spatial_crop.append(images_spatial_crop)
+        batched_images_spatial_crop = torch.stack(
+            batched_images_spatial_crop, dim=0)
+
+        return {
+            "input_ids": input_ids.tolist(),
+            "pixel_values": pixel_values,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "image_seq_mask": images_seq_mask,
+            "image_spatial_crop": batched_images_spatial_crop,
+            "modalities": request_obj.modalities or ["image"],
+        }
+          
 class Qwen2_5VLImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
@@ -640,6 +720,8 @@ def get_image_processor(
 
     elif "MiniCPMV" in hf_config.architectures:
         return MiniCPMVImageProcessor(hf_config, server_args, processor)
+    elif "DeepseekVL2ForCausalLM" in hf_config.architectures:
+        return DeepseekVL2ImageProcessor(hf_config, server_args, processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
 
