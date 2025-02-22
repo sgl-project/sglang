@@ -28,10 +28,15 @@ from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.distributed import (
     get_tp_group,
     init_distributed_environment,
+    init_distributed_environment_via_existing,
     initialize_model_parallel,
+    initialize_model_parallel_via_existing,
     set_custom_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    ParallelProcessGroups,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -83,8 +88,9 @@ class ModelRunner:
         gpu_id: int,
         tp_rank: int,
         tp_size: int,
-        nccl_port: int,
+        nccl_port: Optional[int],
         server_args: ServerArgs,
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
         is_draft_worker: bool = False,
     ):
         # Parse args
@@ -97,6 +103,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.parallel_process_groups = parallel_process_groups
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.should_log = tp_rank == 0
@@ -252,19 +259,31 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size,
-                rank=self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-            )
-            initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            distributed_environment_local_rank = self.gpu_id
+            if self.parallel_process_groups is None:
+                init_distributed_environment(
+                    backend=backend,
+                    world_size=self.tp_size,
+                    rank=self.tp_rank,
+                    local_rank=distributed_environment_local_rank,
+                    distributed_init_method=dist_init_method,
+                )
+                initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            else:
+                init_distributed_environment_via_existing(
+                    backend=backend,
+                    local_rank=distributed_environment_local_rank,
+                )
+                initialize_model_parallel_via_existing(
+                    existing_groups=self.parallel_process_groups,
+                )
+
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
+                existing_groups=self.parallel_process_groups,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(

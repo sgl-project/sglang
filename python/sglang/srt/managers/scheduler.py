@@ -13,7 +13,6 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import faulthandler
 import logging
 import os
 import signal
@@ -24,17 +23,15 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import psutil
-import setproctitle
 import torch
-import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -51,9 +48,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
-    ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
-    ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -85,20 +80,15 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
-    broadcast_pyobj,
-    configure_logger,
+    MultiprocessingSerializer,
     crash_on_warnings,
     get_bool_env_var,
-    get_zmq_socket,
-    set_gpu_proc_affinity,
     set_random_seed,
-    suppress_other_loggers,
 )
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +115,11 @@ class Scheduler:
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        nccl_port: Optional[int],
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -150,6 +141,7 @@ class Scheduler:
             else 1
         )
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.on_generation_output: Optional[Callable] = None
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -161,31 +153,6 @@ class Scheduler:
                 self.dp_size,
             )
         )
-
-        # Init inter-process communication
-        context = zmq.Context(2)
-        if self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
-            self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-
-            if server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-                )
-            else:
-                # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
-        else:
-            self.recv_from_tokenizer = None
-            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -242,7 +209,8 @@ class Scheduler:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
-            nccl_port=port_args.nccl_port,
+            nccl_port=nccl_port,
+            parallel_process_groups=parallel_process_groups,
         )
 
         # Launch a worker for speculative decoding if needed
@@ -253,7 +221,7 @@ class Scheduler:
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 server_args=server_args,
-                nccl_port=port_args.nccl_port,
+                nccl_port=nccl_port,
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
@@ -324,6 +292,7 @@ class Scheduler:
         self.last_decode_stats_tic = time.time()
         self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
+        self.result_queue = deque()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
 
@@ -415,35 +384,6 @@ class Scheduler:
         # The largest context length (prefill + generation) of a single request
         self._largest_prefill_decode_len: int = 0
 
-        # Init request dispatcher
-        self._request_dispatcher = TypeBasedDispatcher(
-            [
-                (TokenizedGenerateReqInput, self.handle_generate_request),
-                (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
-                (AbortReq, self.abort_request),
-                (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
-                (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
-                (
-                    UpdateWeightsFromDistributedReqInput,
-                    self.update_weights_from_distributed,
-                ),
-                (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
-                (GetWeightsByNameReqInput, self.get_weights_by_name),
-                (ProfileReq, self.profile),
-                (OpenSessionReqInput, self.open_session),
-                (CloseSessionReqInput, self.close_session),
-                (
-                    ReleaseMemoryOccupationReqInput,
-                    lambda _: self.release_memory_occupation(),
-                ),
-                (
-                    ResumeMemoryOccupationReqInput,
-                    lambda _: self.resume_memory_occupation(),
-                ),
-            ]
-        )
-
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one batch takes too long."""
         self.watchdog_last_forward_ct = 0
@@ -464,122 +404,61 @@ class Scheduler:
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
-    @torch.no_grad()
-    def event_loop_normal(self):
-        """A normal scheduler loop."""
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-            else:
-                # When the server is idle, so self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-
-            self.last_batch = batch
-
-    @torch.no_grad()
-    def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue = deque()
-
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-
-            if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
-
-                if self.last_batch is None:
-                    # Create a dummy first batch to start the pipeline for overlap schedule.
-                    # It is now used for triggering the sampling_info_done event.
-                    tmp_batch = ScheduleBatch(
-                        reqs=None,
-                        forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                    )
-                    self.process_batch_result(tmp_batch, None)
-
-            if self.last_batch:
-                # Process the results of the last batch
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
-                self.process_batch_result(tmp_batch, tmp_result)
-            elif batch is None:
-                # When the server is idle, so self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-
-            self.last_batch = batch
-
-    def recv_requests(self) -> List[Req]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        if self.attn_tp_rank == 0:
-            recv_reqs = []
-
-            while True:
-                try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                recv_reqs.append(recv_req)
+    def process_batch(self):
+        if self.enable_overlap:
+            return self._process_batch_overlap()
         else:
-            recv_reqs = None
+            return self._process_batch_normal()
 
-        if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0:
-                work_reqs = [
-                    req
-                    for req in recv_reqs
-                    if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-                control_reqs = [
-                    req
-                    for req in recv_reqs
-                    if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-            else:
-                work_reqs = None
-                control_reqs = None
+    @torch.no_grad()
+    def _process_batch_normal(self):
+        batch = self.get_next_batch_to_run()
+        self.cur_batch = batch
 
-            if self.attn_tp_size != 1:
-                attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_rank,
-                    self.attn_tp_cpu_group,
-                    src=attn_tp_rank_0,
+        if batch:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+        else:
+            # When the server is idle, so self-check and re-init some states
+            self.check_memory()
+            self.new_token_ratio = self.init_new_token_ratio
+
+        self.last_batch = batch
+        return batch is not None
+
+    @torch.no_grad()
+    def _process_batch_overlap(self):
+        batch = self.get_next_batch_to_run()
+        self.cur_batch = batch
+
+        if batch:
+            result = self.run_batch(batch)
+            self.result_queue.append((batch.copy(), result))
+
+            if self.last_batch is None:
+                # Create a dummy first batch to start the pipeline for overlap schedule.
+                # It is now used for triggering the sampling_info_done event.
+                tmp_batch = ScheduleBatch(
+                    reqs=None,
+                    forward_mode=ForwardMode.DUMMY_FIRST,
+                    next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                 )
-            if self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs, self.tp_rank, self.tp_cpu_group
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
-        return recv_reqs
+                self.process_batch_result(tmp_batch, None)
 
-    def process_input_requests(self, recv_reqs: List):
-        for recv_req in recv_reqs:
-            output = self._request_dispatcher(recv_req)
-            if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+        if self.last_batch:
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            tmp_batch.next_batch_sampling_info = (
+                self.tp_worker.cur_sampling_info if batch else None
+            )
+            self.process_batch_result(tmp_batch, tmp_result)
+        elif batch is None:
+            # When the server is idle, so self-check and re-init some states
+            self.check_memory()
+            self.new_token_ratio = self.init_new_token_ratio
+
+        self.last_batch = batch
+        return batch is not None
 
     def handle_generate_request(
         self,
@@ -1493,7 +1372,7 @@ class Scheduler:
 
             # Send to detokenizer
             if rids:
-                self.send_to_detokenizer.send_pyobj(
+                self.on_generation_output(
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
@@ -1529,7 +1408,7 @@ class Scheduler:
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
-            self.send_to_detokenizer.send_pyobj(
+            self.on_generation_output(
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
@@ -1696,7 +1575,14 @@ class Scheduler:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
+        return self.update_weights_from_tensor_raw(
+            MultiprocessingSerializer.deserialize(recv_req.serialized_named_tensors)
+        )
+
+    def update_weights_from_tensor_raw(
+        self, named_tensors: List[Tuple[str, torch.Tensor]]
+    ):
+        success, message = self.tp_worker.update_weights_from_tensor(named_tensors)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             flash_cache_success = self.flush_cache()
@@ -1768,6 +1654,9 @@ class Scheduler:
         else:
             del self.sessions[session_id]
 
+    def shutdown(self):
+        self.tp_worker.shutdown()
+
 
 def _export_static_state(model):
     return dict(
@@ -1781,51 +1670,3 @@ def _import_static_state(model, static_params):
     self_named_buffers = dict(model.named_buffers())
     for name, tensor in static_params["buffers"]:
         self_named_buffers[name][...] = tensor
-
-
-def run_scheduler_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    gpu_id: int,
-    tp_rank: int,
-    dp_rank: Optional[int],
-    pipe_writer,
-):
-    setproctitle.setproctitle("sglang::scheduler")
-    faulthandler.enable()
-
-    # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
-
-    # Configue the logger
-    if dp_rank is None:
-        configure_logger(server_args, prefix=f" TP{tp_rank}")
-    else:
-        configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
-    suppress_other_loggers()
-
-    # Set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
-
-    parent_process = psutil.Process().parent()
-
-    # Create a scheduler and run the event loop
-    try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "max_total_num_tokens": scheduler.max_total_num_tokens,
-                "max_req_input_len": scheduler.max_req_input_len,
-            }
-        )
-        if scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)

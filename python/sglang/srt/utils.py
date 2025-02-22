@@ -52,6 +52,7 @@ from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from starlette.routing import Mount
 from torch import nn
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -665,6 +666,20 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+def broadcast_pyobj_in_group(
+    data: List[Any],
+    index_in_group: int,
+    dist_group_coordinator,
+    src_index_in_group: int = 0,
+):
+    return broadcast_pyobj(
+        data=data,
+        rank=dist_group_coordinator.ranks[index_in_group],
+        dist_group=dist_group_coordinator.cpu_group,
+        src=dist_group_coordinator.ranks[src_index_in_group],
+    )
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
@@ -673,7 +688,7 @@ def broadcast_pyobj(
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
-    if rank == 0:
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
             dist.broadcast(tensor_size, src=src, group=dist_group)
@@ -1265,6 +1280,45 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
     return x_
+
+
+def weight_loader_tp_narrow(w: torch.Tensor, dim: int, start: int, length: int):
+    from sglang.srt.distributed import get_tp_group
+
+    if isinstance(w, DTensor):
+        tp_device_mesh = get_tp_group().device_mesh_device
+        # print(
+        #     f'weight_loader_narrow START {w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} {w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=}')
+
+        rank_via_mesh = tp_device_mesh.get_local_rank()
+        size_via_mesh = tp_device_mesh.size()
+
+        if (size_via_mesh * length == w.shape[dim]) and (
+            rank_via_mesh * length == start
+        ):
+            ans = w
+            # TODO Remove this when one day the torch error "Cross device mesh comm not supported yet!" is implemented
+            # Now we can either do this hacky full_tensor+from_local+redistribute (to test logical correctness and
+            # easier to flip in the future), or do full_tensor+narrow
+            ans = DTensor.from_local(
+                ans.full_tensor(),
+                device_mesh=tp_device_mesh,
+                placements=[Replicate() for _ in range(tp_device_mesh.ndim)],
+            )
+            ans = ans.redistribute(tp_device_mesh, [Shard(dim)]).to_local()
+        else:
+            ans = w.full_tensor().narrow(dim, start, length)
+
+        assert ans.shape[dim] == length, (
+            f"weight_loader_tp_narrow "
+            f"{w.shape=} {w.dtype=} {type(w)=} {dim=} {start=} {length=} "
+            f"{w.device_mesh=} {w.placements=} {tp_device_mesh=} {w.device_mesh == tp_device_mesh=} "
+            f"{rank_via_mesh=} {size_via_mesh=} {ans.shape=}"
+        )
+
+        return ans
+    else:
+        return w.narrow(dim, start, length)
 
 
 class MultiprocessingSerializer:

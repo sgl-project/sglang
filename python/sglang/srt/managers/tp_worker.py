@@ -15,9 +15,12 @@
 
 import logging
 import threading
-from typing import Optional
+from typing import List, Optional, Tuple
+
+import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
@@ -30,7 +33,11 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    broadcast_pyobj_in_group,
+    set_random_seed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +51,8 @@ class TpModelWorker:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
-        nccl_port: int,
+        nccl_port: Optional[int],
+        parallel_process_groups: Optional[ParallelProcessGroups] = None,
         is_draft_worker: bool = False,
     ):
         # Parse args
@@ -73,6 +81,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            parallel_process_groups=parallel_process_groups,
             is_draft_worker=is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
@@ -117,10 +126,10 @@ class TpModelWorker:
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
+        self.random_seed = broadcast_pyobj_in_group(
             [server_args.random_seed],
             self.tp_rank,
-            self.model_runner.tp_group.cpu_group,
+            self.model_runner.tp_group,
         )[0]
         set_random_seed(self.random_seed)
 
@@ -142,8 +151,14 @@ class TpModelWorker:
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
+    def get_tp_group(self):
+        return self.model_runner.tp_group
+
     def get_tp_cpu_group(self):
         return self.model_runner.tp_group.cpu_group
+
+    def get_attention_tp_group(self):
+        return self.model_runner.attention_tp_group
 
     def get_attention_tp_cpu_group(self):
         return self.model_runner.attention_tp_group.cpu_group
@@ -203,10 +218,8 @@ class TpModelWorker:
         )
         return success, message
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.update_weights_from_tensor(
-            MultiprocessingSerializer.deserialize(recv_req.serialized_named_tensors)
-        )
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        success, message = self.model_runner.update_weights_from_tensor(named_tensors)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -214,3 +227,6 @@ class TpModelWorker:
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def shutdown(self):
+        pass
