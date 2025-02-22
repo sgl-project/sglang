@@ -214,3 +214,6 @@ class TpModelWorker:
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def shutdown(self):
+        pass
