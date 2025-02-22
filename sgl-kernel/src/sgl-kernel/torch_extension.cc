@@ -173,10 +173,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("cublas_grouped_gemm", torch::kCUDA, &cublas_grouped_gemm);
 
   // per tensor quant fp8
-  m.def(
-      "sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
+  m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kCUDA, &sgl_per_tensor_quant_fp8);
-
 }
 
 REGISTER_EXTENSION(_kernels)
