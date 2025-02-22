@@ -433,6 +433,8 @@ class Phi3SmallForCausalLM(nn.Module):
                 continue
             if name.endswith(".bias") and name not in params_dict:
                 continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
 
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
