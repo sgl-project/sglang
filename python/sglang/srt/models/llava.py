@@ -42,6 +42,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class LlavaBaseForCausalLM(nn.Module):
@@ -475,6 +476,7 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
 
@@ -484,7 +486,7 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self.config.text_config.hidden_size = config.hidden_size
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
+        self.language_model = LlamaForCausalLM(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "language_model"))
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
@@ -496,6 +498,7 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
 
@@ -516,7 +519,7 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
             self.config.image_token_index = 151646
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = Qwen2ForCausalLM(config, quant_config=quant_config)
+        self.language_model = Qwen2ForCausalLM(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "language_model"))
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
@@ -528,6 +531,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
 
@@ -548,7 +552,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
             self.config.image_token_index = 32000
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = MistralForCausalLM(config, quant_config=quant_config)
+        self.language_model = MistralForCausalLM(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "language_model"))
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)

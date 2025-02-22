@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers, print_warning_once
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class OlmoeMoE(nn.Module):
@@ -69,7 +70,7 @@ class OlmoeMoE(nn.Module):
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
-            hidden_size, num_experts, bias=False, quant_config=None
+            hidden_size, num_experts, bias=False, quant_config=None, prefix=f"{prefix}.gate",
         )
 
         self.experts = FusedMoE(
@@ -81,6 +82,7 @@ class OlmoeMoE(nn.Module):
             renormalize=False,
             quant_config=quant_config,
             tp_size=tp_size,
+            prefix=f"{prefix}.experts",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -107,6 +109,7 @@ class OlmoeAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 4096,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -138,6 +141,7 @@ class OlmoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.q_norm = RMSNorm(hidden_size, eps=1e-5)
         self.k_norm = RMSNorm(hidden_size, eps=1e-5)
@@ -146,6 +150,7 @@ class OlmoeAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
@@ -162,6 +167,7 @@ class OlmoeAttention(nn.Module):
             self.scaling,
             layer_id=layer_id,
             num_kv_heads=self.num_kv_heads,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -186,6 +192,7 @@ class OlmoeDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -202,6 +209,7 @@ class OlmoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
 
         self.mlp = OlmoeMoE(
@@ -210,6 +218,7 @@ class OlmoeDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
@@ -246,6 +255,7 @@ class OlmoeModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -254,6 +264,7 @@ class OlmoeModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -261,7 +272,9 @@ class OlmoeModel(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 layer_id=idx,
+                prefix=prefix,
             ),
+            prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=1e-5)
 
@@ -294,13 +307,14 @@ class OlmoeForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = OlmoeModel(config, quant_config)
+        self.model = OlmoeModel(config, quant_config, prefix=maybe_prefix(prefix, "model"))
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
         )
         self.logits_processor = LogitsProcessor(config)
 

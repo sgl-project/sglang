@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class MixtralMoE(nn.Module):
@@ -168,6 +169,7 @@ class MixtralAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -258,11 +260,12 @@ class MixtralModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = nn.ModuleList(
             [
                 MixtralDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers"
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -296,12 +299,13 @@ class MixtralForCausalLM(nn.Module):
         self,
         config: MixtralConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = MixtralModel(config, quant_config=quant_config, prefix="model")
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = MixtralModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
         self.logits_processor = LogitsProcessor(config)
 
     def forward(

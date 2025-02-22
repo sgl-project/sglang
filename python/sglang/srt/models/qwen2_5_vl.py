@@ -52,6 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen2_vl import Qwen2VLImageInputs, Qwen2VLVideoInputs
+from vllm.model_executor.models.utils import maybe_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -65,16 +66,17 @@ class Qwen2_5_VLMLP(nn.Module):
         bias: bool = True,
         hidden_act="silu",
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.gate_proj = ColumnParallelLinear(
-            in_features, hidden_features, bias=bias, quant_config=quant_config
+            in_features, hidden_features, bias=bias, quant_config=quant_config, prefix=f"{prefix}.gate_proj",
         )
         self.up_proj = ColumnParallelLinear(
-            in_features, hidden_features, bias=bias, quant_config=quant_config
+            in_features, hidden_features, bias=bias, quant_config=quant_config, prefix=f"{prefix}.up_proj",
         )
         self.down_proj = RowParallelLinear(
-            hidden_features, in_features, bias=bias, quant_config=quant_config
+            hidden_features, in_features, bias=bias, quant_config=quant_config, prefix=f"{prefix}.down_proj",
         )
         self.act = ACT2FN[hidden_act]
 
@@ -98,6 +100,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         norm_layer: Type[nn.Module] = None,
         attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -123,9 +126,10 @@ class Qwen2_5_VisionBlock(nn.Module):
             use_full_precision_softmax=use_full_precision_softmax,
             flatten_batch=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
         self.mlp = Qwen2_5_VLMLP(
-            dim, intermediate_dim, hidden_act=hidden_act, quant_config=quant_config
+            dim, intermediate_dim, hidden_act=hidden_act, quant_config=quant_config, prefix=f"{prefix}.mlp",
         )
 
     def forward(
@@ -178,6 +182,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         context_dim: int,
         spatial_merge_size: int = 2,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -189,10 +194,11 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     self.hidden_size,
                     bias=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.mlp.0",
                 ),
                 nn.GELU(),
                 RowParallelLinear(
-                    self.hidden_size, dim, bias=True, quant_config=quant_config
+                    self.hidden_size, dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.mlp.2",
                 ),
             ]
         )
@@ -250,6 +256,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         vision_config: Qwen2_5_VLVisionConfig,
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -286,8 +293,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     attn_implementation="sdpa",
                     quant_config=quant_config,
+                    prefix=f"{prefix}.blocks.{i}",
                 )
-                for _ in range(depth)
+                for i in range(depth)
             ]
         )
         self.merger = Qwen2_5_VisionPatchMerger(
@@ -295,6 +303,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             context_dim=hidden_size,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
+            prefix=f"{prefix}.merger",
         )
 
     def get_window_index(self, grid_thw):
@@ -447,6 +456,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self,
         config: Qwen2VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -457,15 +467,16 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # NOTE: Qwen2-VL vision encoder does not support any
             # quantization method now.
             quant_config=None,
+            prefix=maybe_prefix(prefix, "visual"),
         )
 
-        self.model = Qwen2Model(config, quant_config)
+        self.model = Qwen2Model(config, quant_config, prefix=maybe_prefix(prefix, "model"),)
 
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head"),
             )
 
         self.logits_processor = LogitsProcessor(config)

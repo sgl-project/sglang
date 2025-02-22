@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class MixtralMLP(nn.Module):
@@ -54,6 +55,7 @@ class MixtralMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.num_experts = num_experts
@@ -61,13 +63,13 @@ class MixtralMLP(nn.Module):
         self.hidden_dim = hidden_size
 
         self.w1 = ReplicatedLinear(
-            self.hidden_dim, self.ffn_dim, bias=False, quant_config=quant_config
+            self.hidden_dim, self.ffn_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.w1",
         )
         self.w2 = ReplicatedLinear(
-            self.ffn_dim, self.hidden_dim, bias=False, quant_config=quant_config
+            self.ffn_dim, self.hidden_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.w2",
         )
         self.w3 = ReplicatedLinear(
-            self.hidden_dim, self.ffn_dim, bias=False, quant_config=quant_config
+            self.hidden_dim, self.ffn_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.w3",
         )
 
         # TODO: Use vllm's SiluAndMul
@@ -87,6 +89,7 @@ class MixtralMoE(nn.Module):
         self,
         config: MixtralConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -114,6 +117,7 @@ class MixtralMoE(nn.Module):
                         config.hidden_size,
                         config.intermediate_size,
                         quant_config=quant_config,
+                        prefix=f"{prefix}.experts.{idx}",
                     )
                     if idx in self.expert_indicies
                     else None
@@ -122,7 +126,7 @@ class MixtralMoE(nn.Module):
             ]
         )
         self.gate = ReplicatedLinear(
-            config.hidden_size, self.num_total_experts, bias=False, quant_config=None
+            config.hidden_size, self.num_total_experts, bias=False, quant_config=None, prefix=f"{prefix}.gate"
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -159,6 +163,7 @@ class MixtralAttention(nn.Module):
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -189,12 +194,14 @@ class MixtralAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -209,6 +216,7 @@ class MixtralAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -231,6 +239,7 @@ class MixtralDecoderLayer(nn.Module):
         config: MixtralConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -244,8 +253,9 @@ class MixtralDecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
-        self.block_sparse_moe = MixtralMoE(config=config, quant_config=quant_config)
+        self.block_sparse_moe = MixtralMoE(config=config, quant_config=quant_config, prefix=f"{prefix}.block_sparse_moe",)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -281,6 +291,7 @@ class MixtralModel(nn.Module):
         self,
         config: MixtralConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -289,10 +300,11 @@ class MixtralModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = nn.ModuleList(
             [
-                MixtralDecoderLayer(config, i, quant_config=quant_config)
+                MixtralDecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}",)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -324,12 +336,13 @@ class QuantMixtralForCausalLM(nn.Module):
         self,
         config: MixtralConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = MixtralModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = MixtralModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

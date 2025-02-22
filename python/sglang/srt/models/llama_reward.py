@@ -22,6 +22,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class LlamaForSequenceClassification(nn.Module):
@@ -29,12 +30,13 @@ class LlamaForSequenceClassification(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
         self.num_labels = config.num_labels
-        self.model = LlamaModel(config, quant_config=quant_config)
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
@@ -82,8 +84,9 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ) -> None:
-        super().__init__(config, quant_config)
+        super().__init__(config, quant_config, prefix=prefix)
         self.weights = self.Weights(config.hidden_size, self.num_labels)
 
     @torch.no_grad()

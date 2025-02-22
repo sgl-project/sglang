@@ -30,6 +30,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
+from vllm.model_executor.models.utils import maybe_prefix
 
 Qwen2Config = None
 
@@ -42,7 +43,7 @@ class Qwen2DecoderLayer(Qwen2DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config)
+        super().__init__(config, layer_id, quant_config, prefix=prefix)
 
         # Skip the input_layernorm
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
@@ -56,6 +57,7 @@ class Qwen2Model(nn.Module):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -63,11 +65,12 @@ class Qwen2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = nn.ModuleList(
             [
                 Qwen2DecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -108,16 +111,17 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config=None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2Model(config, quant_config=quant_config)
+        self.model = Qwen2Model(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
             )
         self.logits_processor = LogitsProcessor(config)
 

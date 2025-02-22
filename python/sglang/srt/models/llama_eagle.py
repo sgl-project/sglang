@@ -31,6 +31,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -55,6 +56,7 @@ class LlamaModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -62,11 +64,12 @@ class LlamaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=f"{prefix}.embed_tokens"
         )
         self.layers = nn.ModuleList(
             [
                 LlamaDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -107,18 +110,19 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config=None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config)
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
             )
         self.logits_processor = LogitsProcessor(config)
 

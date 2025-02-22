@@ -8,6 +8,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
+from vllm.model_executor.models.utils import maybe_prefix
 
 
 class LlamaEmbeddingModel(nn.Module):
@@ -15,9 +16,10 @@ class LlamaEmbeddingModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config=None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
-        self.model = LlamaModel(config, quant_config=quant_config)
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     @torch.no_grad()
