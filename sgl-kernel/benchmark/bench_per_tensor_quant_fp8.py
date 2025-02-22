@@ -79,7 +79,7 @@ def benchmark(batch_size, seq_len, provider):
     dtype = torch.float16
     device = torch.device("cuda")
 
-    x = torch.randn(batch_size*seq_len, 4096, device=device, dtype=dtype)
+    x = torch.randn(batch_size * seq_len, 4096, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
 
