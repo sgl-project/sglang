@@ -47,6 +47,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class MixtralMoE(nn.Module):
     """A tensor-parallel MoE implementation for Mixtral that shards each expert
@@ -304,8 +306,8 @@ class MixtralForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = MixtralModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
+        self.model = MixtralModel(config, quant_config=quant_config, prefix=add_prefix( "model", prefix))
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=add_prefix( "lm_head", prefix))
         self.logits_processor = LogitsProcessor(config)
 
     def forward(

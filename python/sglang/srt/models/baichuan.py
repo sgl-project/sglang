@@ -46,7 +46,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
+
+from python.sglang.srt.utils import add_prefix
+
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
@@ -346,12 +348,12 @@ class BaiChuanBaseForCausalLM(nn.Module):
         self.config = config
 
         self.quant_config = quant_config
-        self.model = BaiChuanModel(config, position_embedding, quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = BaiChuanModel(config, position_embedding, quant_config, prefix=add_prefix("model", prefix))
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix( "lm_head", prefix)
             )
         self.logits_processor = LogitsProcessor(config)
 

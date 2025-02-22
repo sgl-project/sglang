@@ -39,6 +39,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class MiniCPMMLP(nn.Module):
     def __init__(
@@ -295,14 +297,14 @@ class MiniCPMForCausalLM(nn.Module):
 
         self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
-        self.model = MiniCPMModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = MiniCPMModel(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
         # self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if not self.config.tie_word_embeddings:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
-                prefix = maybe_prefix(prefix, "lm_head")
+                prefix = add_prefix( "lm_head", prefix)
             )
 
         self.scale_width = self.config.hidden_size / self.config.dim_model_base

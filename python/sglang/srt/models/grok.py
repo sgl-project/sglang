@@ -49,6 +49,8 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class Grok1MLP(nn.Module):
     def __init__(
@@ -393,9 +395,9 @@ class Grok1ForCausalLM(nn.Module):
             config,
             quant_config=quant_config,
             use_presharded_weights=self.use_presharded_weights,
-            prefix=maybe_prefix(prefix, "model")
+            prefix=add_prefix( "model", prefix)
         )
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=maybe_prefix(prefix, "lm_head"))
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=add_prefix( "lm_head", prefix))
         self.logits_processor = LogitsProcessor(config)
 
     def forward(

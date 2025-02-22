@@ -38,6 +38,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class ColumnParallelConv2dPatch(torch.nn.Module):
     """Conv2D Patching layer with model parallelism.
@@ -310,10 +312,10 @@ class MllamaVisionModel(nn.Module):
             config.num_hidden_layers,
             is_gated=False,
             output_hidden_states=config.intermediate_layers_indices,
-            prefix=maybe_prefix(prefix, "transformer"),
+            prefix=add_prefix( "transformer", prefix),
         )
         self.global_transformer = MllamaVisionEncoder(
-            config, config.num_global_layers, is_gated=True, prefix=maybe_prefix(prefix, "global_transformer"),
+            config, config.num_global_layers, is_gated=True, prefix=add_prefix( "global_transformer", prefix),
         )
 
     def apply_class_embedding(self, hidden_state: torch.Tensor) -> torch.Tensor:
@@ -705,14 +707,14 @@ class MllamaForCausalLM(nn.Module):
     ):
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.model = MllamaTextModel(config, quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = MllamaTextModel(config, quant_config, prefix=add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "lm_head")
+            prefix=add_prefix( "lm_head", prefix)
         )
 
     def forward(
@@ -754,11 +756,11 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.image_size = config.vision_config.image_size
 
-        self.vision_model = MllamaVisionModel(config.vision_config, prefix=maybe_prefix(prefix, "vision_model"))
+        self.vision_model = MllamaVisionModel(config.vision_config, prefix=add_prefix( "vision_model", prefix))
         self.language_model = MllamaForCausalLM(
             config.text_config,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "language_model")
+            prefix=add_prefix( "language_model", prefix)
         )
         self.multi_modal_projector = nn.Linear(
             config.vision_config.vision_output_dim,

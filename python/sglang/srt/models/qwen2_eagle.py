@@ -12,6 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+from python.sglang.srt.utils import add_prefix
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
@@ -116,12 +117,12 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2Model(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = Qwen2Model(config, quant_config=quant_config, prefix=add_prefix( "model", prefix))
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix( "lm_head", prefix)
             )
         self.logits_processor = LogitsProcessor(config)
 

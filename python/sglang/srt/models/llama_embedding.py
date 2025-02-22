@@ -10,6 +10,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class LlamaEmbeddingModel(nn.Module):
     def __init__(
@@ -19,7 +21,7 @@ class LlamaEmbeddingModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.model = LlamaModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=add_prefix( "model", prefix))
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     @torch.no_grad()

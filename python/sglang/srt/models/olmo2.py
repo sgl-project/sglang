@@ -48,6 +48,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class Olmo2Attention(nn.Module):
     """
@@ -331,7 +333,7 @@ class Olmo2ForCausalLM(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.model = Olmo2Model(config, quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = Olmo2Model(config, quant_config, prefix=add_prefix( "model", prefix))
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -341,7 +343,7 @@ class Olmo2ForCausalLM(nn.Module):
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head")
+                prefix=add_prefix( "lm_head", prefix)
             )
         self.logits_processor = LogitsProcessor(config)
 

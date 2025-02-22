@@ -66,7 +66,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import get_compiler_backend, set_weight_attrs
-from vllm.model_executor.models.utils import maybe_prefix
+
+from python.sglang.srt.utils import add_prefix
 
 
 @torch.compile(backend=get_compiler_backend())
@@ -337,7 +338,7 @@ class CohereForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.logits_processor = LogitsProcessor(config)
-        self.model = CohereModel(config, quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = CohereModel(config, quant_config, prefix=add_prefix("model", prefix))
 
     @torch.no_grad()
     def forward(

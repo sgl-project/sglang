@@ -15,7 +15,7 @@
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
-
+from readline import add_history
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -48,6 +48,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import make_layers
 from vllm.model_executor.models.utils import maybe_prefix
+
+from python.sglang.srt.utils import add_prefix
 
 Qwen2Config = None
 
@@ -345,12 +347,12 @@ class Qwen2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2Model(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = Qwen2Model(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix("lm_head", prefix)
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

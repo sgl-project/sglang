@@ -24,6 +24,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class Qwen2ForRewardModel(nn.Module):
     def __init__(
@@ -36,7 +38,7 @@ class Qwen2ForRewardModel(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.num_labels = 1
-        self.model = Qwen2Model(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = Qwen2Model(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
         self.score = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.ReLU(),

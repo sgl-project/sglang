@@ -41,7 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
+from python.sglang.srt.utils import add_prefix
 
 LoraConfig = None
 
@@ -368,7 +368,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.config: ChatGLMConfig = config
         self.quant_config = quant_config
         self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
-        self.transformer = ChatGLMM(config, quant_config, prefix=maybe_prefix(prefix, "transformer"))
+        self.transformer = ChatGLMM(config, quant_config, prefix=add_prefix("transformer", prefix))
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
 

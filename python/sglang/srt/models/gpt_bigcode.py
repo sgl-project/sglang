@@ -35,7 +35,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
+
+from python.sglang.srt.utils import add_prefix
 
 
 class GPTBigCodeAttention(nn.Module):
@@ -252,7 +253,7 @@ class GPTBigCodeForCausalLM(nn.Module):
         self.config = config
 
         self.quant_config = quant_config
-        self.transformer = GPTBigCodeModel(config, quant_config, prefix=maybe_prefix(prefix, "transformer"))
+        self.transformer = GPTBigCodeModel(config, quant_config, prefix=add_prefix( "transformer", prefix))
         self.lm_head = self.transformer.wte
         self.unpadded_vocab_size = config.vocab_size
         self.logits_processor = LogitsProcessor(config)

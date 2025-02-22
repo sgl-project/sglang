@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import is_hip
-from vllm.model_executor.models.utils import maybe_prefix
+from python.sglang.srt.utils import add_prefix
 
 is_hip_ = is_hip()
 
@@ -117,14 +117,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.quant_config = quant_config
 
-        self.model = DeepseekModelNextN(config, quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = DeepseekModelNextN(config, quant_config, prefix=add_prefix( "model", prefix))
 
         if global_server_args_dict["enable_dp_attention"]:
             self.model.shared_head.head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
-                prefix=maybe_prefix(prefix, "model.shared_head.head")
+                prefix=add_prefix("model.shared_head.head", prefix)
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
@@ -132,7 +132,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "model.shared_head.head")
+                prefix=add_prefix( "model.shared_head.head", prefix)
             )
             self.logits_processor = LogitsProcessor(config)
 

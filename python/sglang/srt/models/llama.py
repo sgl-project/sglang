@@ -53,6 +53,8 @@ from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,6 +267,7 @@ class LlamaModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -366,14 +369,14 @@ class LlamaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=add_prefix( "model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix("lm_head", prefix)
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

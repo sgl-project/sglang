@@ -40,7 +40,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import make_layers
-from vllm.model_executor.models.utils import maybe_prefix
+
+from python.sglang.srt.utils import add_prefix
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -354,7 +355,7 @@ class Gemma2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Gemma2Model(config, quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = Gemma2Model(config, quant_config, prefix=add_prefix("model", prefix))
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

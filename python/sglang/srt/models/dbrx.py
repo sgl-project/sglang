@@ -47,7 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import set_weight_attrs
-from vllm.model_executor.models.utils import maybe_prefix
+from python.sglang.srt.utils import add_prefix
 
 
 class DbrxRouter(nn.Module):
@@ -385,13 +385,13 @@ class DbrxForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.unpadded_vocab_size = config.vocab_size
-        self.transformer = DbrxModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "transformer"))
+        self.transformer = DbrxModel(config, quant_config=quant_config, prefix=add_prefix("transformer",prefix))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.d_model,
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
-            prefix=maybe_prefix(prefix, "lm_head")
+            prefix=add_prefix( "lm_head", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
 

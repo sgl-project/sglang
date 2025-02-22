@@ -28,6 +28,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class LlavaVidForCausalLM(nn.Module):
     def __init__(
@@ -46,7 +48,7 @@ class LlavaVidForCausalLM(nn.Module):
         self.resampler = nn.AvgPool2d(
             kernel_size=self.mm_spatial_pool_stride, stride=self.mm_spatial_pool_stride
         )
-        self.language_model = LlamaForCausalLM(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "language_model"))
+        self.language_model = LlamaForCausalLM(config, quant_config=quant_config, prefix=add_prefix("language_model", prefix))
         self.num_frames = getattr(self.config, "num_frames", 16)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(

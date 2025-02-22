@@ -24,6 +24,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class LlamaForSequenceClassification(nn.Module):
     def __init__(
@@ -36,7 +38,7 @@ class LlamaForSequenceClassification(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.num_labels = config.num_labels
-        self.model = LlamaModel(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 

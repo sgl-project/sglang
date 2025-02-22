@@ -44,6 +44,8 @@ from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 class LlavaBaseForCausalLM(nn.Module):
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
@@ -486,7 +488,7 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self.config.text_config.hidden_size = config.hidden_size
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = LlamaForCausalLM(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "language_model"))
+        self.language_model = LlamaForCausalLM(config, quant_config=quant_config, prefix=add_prefix( "language_model", prefix))
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
@@ -519,7 +521,7 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
             self.config.image_token_index = 151646
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = Qwen2ForCausalLM(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "language_model"))
+        self.language_model = Qwen2ForCausalLM(config, quant_config=quant_config, prefix=add_prefix( "language_model", prefix))
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
@@ -552,7 +554,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
             self.config.image_token_index = 32000
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = MistralForCausalLM(config, quant_config=quant_config, prefix=maybe_prefix(prefix, "language_model"))
+        self.language_model = MistralForCausalLM(config, quant_config=quant_config, prefix=add_prefix("language_model", prefix))
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)

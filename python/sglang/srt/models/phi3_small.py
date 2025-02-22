@@ -27,6 +27,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 
 @torch.jit.script
 def quick_gelu(x):
@@ -349,7 +351,7 @@ class Phi3SmallForCausalLM(nn.Module):
         self.model = Phi3SmallModel(
             config=config,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix=add_prefix( "model", prefix),
         )
         self.vocab_size = config.vocab_size
         self.mup_width_multiplier = config.mup_width_multiplier
@@ -359,7 +361,7 @@ class Phi3SmallForCausalLM(nn.Module):
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
+            prefix=add_prefix( "lm_head", prefix),
         )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

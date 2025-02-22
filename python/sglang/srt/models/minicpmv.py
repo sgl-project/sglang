@@ -58,6 +58,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 RawImageType = Union[Image.Image, torch.Tensor]
 
 
@@ -674,8 +676,8 @@ class MiniCPMVBaseModel(nn.Module):
         self.config = config
 
         self.version = get_version_by_config(self.config)
-        self.llm = self.init_llm(config=config, quant_config=quant_config, prefix=maybe_prefix(prefix, "llm"))
-        self.vpm = self.init_vision_module(config, quant_config, maybe_prefix(prefix, "vpm"))
+        self.llm = self.init_llm(config=config, quant_config=quant_config, prefix=add_prefix( "llm", prefix))
+        self.vpm = self.init_vision_module(config, quant_config, add_prefix( "vpm", prefix))
         self.vision_dim = (
             self.vpm.embed_dim
             if self.version == (2, 0)
@@ -684,7 +686,7 @@ class MiniCPMVBaseModel(nn.Module):
         self.embed_dim = self.config.hidden_size
 
         self.resampler = self.init_resampler(
-            self.embed_dim, self.vision_dim, quant_config=quant_config, prefix=maybe_prefix(prefix, "resampler")
+            self.embed_dim, self.vision_dim, quant_config=quant_config, prefix=add_prefix( "resampler", prefix)
         )
 
         self.logits_processor = LogitsProcessor(config)

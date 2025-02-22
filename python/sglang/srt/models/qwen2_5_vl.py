@@ -54,6 +54,8 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen2_vl import Qwen2VLImageInputs, Qwen2VLVideoInputs
 from vllm.model_executor.models.utils import maybe_prefix
 
+from python.sglang.srt.utils import add_prefix
+
 logger = logging.getLogger(__name__)
 
 
@@ -467,16 +469,16 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # NOTE: Qwen2-VL vision encoder does not support any
             # quantization method now.
             quant_config=None,
-            prefix=maybe_prefix(prefix, "visual"),
+            prefix=add_prefix( "visual", prefix),
         )
 
-        self.model = Qwen2Model(config, quant_config, prefix=maybe_prefix(prefix, "model"),)
+        self.model = Qwen2Model(config, quant_config, prefix=add_prefix( "model", prefix),)
 
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head"),
+                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix("lm_head", prefix),
             )
 
         self.logits_processor = LogitsProcessor(config)
