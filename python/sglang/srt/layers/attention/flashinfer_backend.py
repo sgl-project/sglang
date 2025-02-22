@@ -110,7 +110,8 @@ class FlashInferAttnBackend(AttentionBackend):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         self.enable_flashinfer_mla = False
-        if "DeepseekV3ForCausalLM" in model_runner.model_config.hf_config.architectures:
+        if ("DeepseekV3ForCausalLM" in model_runner.model_config.hf_config.architectures or 
+            "DeepseekV3ForCausalLMNextN" in model_runner.model_config.hf_config.architectures):
             if global_server_args_dict["enable_flashinfer_mla"]:
                 self.enable_flashinfer_mla = True
                 global_config.enable_flashinfer_mla = True
@@ -162,10 +163,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
-                if (
-                    self.enable_flashinfer_mla
-                    and not global_server_args_dict["disable_radix_cache"]
-                ):
+                if self.enable_flashinfer_mla:
                     # use mla paged prefill
                     self.prefill_wrappers_paged.append(
                         BatchMLAPagedAttentionWrapper(
@@ -361,19 +359,32 @@ class FlashInferAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                if global_config.enable_flashinfer_mla:
+                    prefill_wrappers.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            use_cuda_graph=True,
+                            qo_indptr=self.qo_indptr[i][: bs + 1],
+                            kv_indptr=self.kv_indptr[i][: bs + 1],
+                            kv_indices=self.cuda_graph_kv_indices[i],
+                            kv_len_arr=self.kv_last_page_len[:bs],
+                            backend="fa2",
+                        )
                     )
-                )
+                else:
+                    prefill_wrappers.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            use_cuda_graph=True,
+                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                            paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                            paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                            custom_mask_buf=self.cuda_graph_custom_mask,
+                            mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        )
+                    )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_prefill.update(
                 req_pool_indices,
@@ -443,9 +454,13 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             logits_soft_cap = layer.logit_cap
-
-            if global_server_args_dict["disable_radix_cache"]:
-                # use mla ragged prefill
+            if (
+                    global_server_args_dict["disable_radix_cache"] and 
+                    (
+                        not forward_batch.forward_mode.is_target_verify() 
+                        and not forward_batch.forward_mode.is_draft_extend()
+                    )
+            ):
                 o, _ = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -778,12 +793,17 @@ class FlashInferIndicesUpdaterDecode:
         if global_config.enable_flashinfer_mla:
             sm_scale = 1.0 / math.sqrt(192)
             q_indptr = torch.arange(0, bs + 1).to(0).int()
-            kv_lens = paged_kernel_lens.to(torch.int32)
+
+            if spec_info is not None:
+                kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+            else:
+                kv_len_arr = paged_kernel_lens.to(torch.int32)
+
             wrapper.plan(
                 q_indptr,
                 kv_indptr,
                 kv_indices,
-                kv_lens,
+                kv_len_arr,
                 self.num_qo_heads,
                 512,
                 64,
@@ -1039,42 +1059,41 @@ class FlashInferIndicesUpdaterPrefill:
                     self.head_dim,
                     q_data_type=self.q_data_type,
                 )
-
-        if not global_config.enable_flashinfer_mla:
-            # cached part
-            wrapper_paged.begin_forward(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                q_data_type=self.q_data_type,
-                custom_mask=custom_mask,
-                non_blocking=True,
-            )
-        elif (
-            global_config.enable_flashinfer_mla
-            and not global_server_args_dict["disable_radix_cache"]
-        ):
-            # mla paged prefill
-            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
-            wrapper_paged.plan(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_len_arr,
-                self.num_qo_heads,
-                512,
-                64,
-                1,
-                True,
-                1 / math.sqrt(192),
-                self.data_type,
-                self.data_type,
-            )
+        else:
+            if not global_config.enable_flashinfer_mla:
+                # cached part
+                wrapper_paged.begin_forward(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    self.kv_last_page_len[:bs],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    1,
+                    q_data_type=self.q_data_type,
+                    custom_mask=custom_mask,
+                    non_blocking=True,
+                )
+            elif (
+                global_config.enable_flashinfer_mla
+            ):
+                # mla paged prefill
+                kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+                wrapper_paged.plan(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_len_arr,
+                    self.num_qo_heads,
+                    512,
+                    64,
+                    1,
+                    True,
+                    1 / math.sqrt(192),
+                    self.data_type,
+                    self.data_type,
+                )
 
 
 class FlashInferMultiStepDraftBackend:
