@@ -400,13 +400,7 @@ class Int8MoEMethod:
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
-        # Use torch Parameter to avoid cuda graph capturing issue
-        layer.weight = torch.nn.Parameter(
-            layer.weight.data, requires_grad=False
-        )
-        layer.weight_scale_inv = torch.nn.Parameter(
-            layer.weight_scale_inv.data, requires_grad=False
-        )
+        return
 
     def apply(
         self,
@@ -450,13 +444,9 @@ class Int8MoEMethod:
             use_int8_w8a8=True,
             w1_scale=(
                 layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
             ),
             w2_scale=(
                 layer.w2_weight_scale_inv
-                if self.block_quant
-                else layer.w2_weight_scale
             ),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
