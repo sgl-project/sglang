@@ -17,6 +17,7 @@ REGEX_STR = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 @dataclasses.dataclass
 class SglSamplingParams:
     max_new_tokens: int = 128
+    n: int = 1
     min_new_tokens: int = 0
     stop: Union[str, List[str]] = ()
     stop_token_ids: Optional[List[int]] = ()
@@ -40,6 +41,7 @@ class SglSamplingParams:
     def clone(self):
         return SglSamplingParams(
             self.max_new_tokens,
+            self.n,
             self.min_new_tokens,
             self.stop,
             self.stop_token_ids,
@@ -64,6 +66,7 @@ class SglSamplingParams:
         return {
             "max_tokens": self.max_new_tokens,
             "max_completion_tokens": self.max_new_tokens,
+            "n": self.n,
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -154,6 +157,7 @@ class SglFunction:
         self,
         *args,
         max_new_tokens: int = 128,
+        n: int = 1,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
@@ -182,6 +186,7 @@ class SglFunction:
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
+            n=n,
             stop=stop,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
@@ -212,6 +217,7 @@ class SglFunction:
         batch_kwargs,
         *,
         max_new_tokens: int = 128,
+        n: int = 1,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
@@ -257,6 +263,7 @@ class SglFunction:
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
+            n=n,
             stop=stop,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
@@ -439,6 +446,7 @@ class SglGen(SglExpr):
         self,
         name: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
+        n: Optional[int] = None,
         min_new_tokens: Optional[int] = None,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
@@ -462,6 +470,7 @@ class SglGen(SglExpr):
         self.name = name
         self.sampling_params = SglSamplingParams(
             max_new_tokens=max_new_tokens,
+            n=n,
             min_new_tokens=min_new_tokens,
             stop=stop,
             stop_token_ids=stop_token_ids,
