@@ -1,7 +1,7 @@
 # Set to "local" to build from local repo, repo root must be set as docker context.
 ARG SGL_REPO_SOURCE="remote"
 
-FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
+FROM nvcr.io/nvidia/tritonserver:24.04-py3-min AS base
 
 ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
@@ -26,6 +26,9 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 RUN pip3 install datamodel_code_generator
 
 WORKDIR /sgl-workspace
+ARG SGL_REPO="https://github.com/sgl-project/sglang"
+ENV SGL_DEFAULT="main"
+ARG SGL_BRANCH=${SGL_DEFAULT}
 
 FROM base AS sglang-remote
 RUN git clone ${SGL_REPO} \
