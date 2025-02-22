@@ -10,12 +10,6 @@ from torch.nn.parameter import Parameter
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    all_close_1d,
-    apply_int8_linear,
-    per_tensor_dequantize,
-    requantize_with_max_scale,
-)
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
@@ -35,7 +29,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     BlockQuantScaleParameter,
 )
 from sglang.srt.utils import (
-    print_warning_once,
     set_weight_attrs,
 )
 
@@ -135,14 +128,8 @@ class Int8LinearMethod(LinearMethodBase):
     Supports loading INT8 checkpoints with static weight scale and
     dynamic/static activation scale.
 
-    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
-    activation scaling. The weight scaling factor will be initialized after
-    the model weights are loaded.
-
     Limitations:
-    1. Only support per-tensor quantization due to torch._scaled_mm support.
-    2. Only support float8_e4m3fn data type due to the limitation of
-       torch._scaled_mm (https://github.com/pytorch/pytorch/blob/2e48b39603411a41c5025efbe52f89560b827825/aten/src/ATen/native/cuda/Blas.cpp#L854-L856)
+    Only support block-wise int8 quantization and int8 checkpoint
 
     Args:
         quant_config: The quantization config.
@@ -150,7 +137,8 @@ class Int8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Int8Config):
         self.quant_config = quant_config
-        self.block_quant = self.quant_config.weight_block_size is not None
+        assert self.quant_config.weight_block_size is not None
+        assert self.quant_config.is_checkpoint_int8_serialized
 
     def create_weights(
         self,
@@ -166,30 +154,30 @@ class Int8LinearMethod(LinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         tp_size = get_tensor_model_parallel_world_size()
-        if self.block_quant:
-            block_n, block_k = (
-                self.quant_config.weight_block_size[0],
-                self.quant_config.weight_block_size[1],
-            )
-            # Required by row parallel
-            if tp_size > 1 and input_size // input_size_per_partition == tp_size:
-                if input_size_per_partition % block_k != 0:
+
+        block_n, block_k = (
+            self.quant_config.weight_block_size[0],
+            self.quant_config.weight_block_size[1],
+        )
+        # Required by row parallel
+        if tp_size > 1 and input_size // input_size_per_partition == tp_size:
+            if input_size_per_partition % block_k != 0:
+                raise ValueError(
+                    f"Weight input_size_per_partition = "
+                    f"{input_size_per_partition} is not divisible by "
+                    f"weight quantization block_k = {block_k}."
+                )
+        # Required by collum parallel or enabling merged weights
+        if (
+            tp_size > 1 and output_size // output_size_per_partition == tp_size
+        ) or len(output_partition_sizes) > 1:
+            for output_partition_size in output_partition_sizes:
+                if output_partition_size % block_n != 0:
                     raise ValueError(
-                        f"Weight input_size_per_partition = "
-                        f"{input_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
+                        f"Weight output_partition_size = "
+                        f"{output_partition_size} is not divisible by "
+                        f"weight quantization block_n = {block_n}."
                     )
-            # Required by collum parallel or enabling merged weights
-            if (
-                tp_size > 1 and output_size // output_size_per_partition == tp_size
-            ) or len(output_partition_sizes) > 1:
-                for output_partition_size in output_partition_sizes:
-                    if output_partition_size % block_n != 0:
-                        raise ValueError(
-                            f"Weight output_partition_size = "
-                            f"{output_partition_size} is not divisible by "
-                            f"weight quantization block_n = {block_n}."
-                        )
 
         layer.logical_widths = output_partition_sizes
 
@@ -213,95 +201,43 @@ class Int8LinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
+        
+        # WEIGHT SCALE
+        assert self.quant_config.activation_scheme == "dynamic"
+        scale = BlockQuantScaleParameter(
+            data=torch.empty(
+                (output_size_per_partition + block_n - 1) // block_n,
+                (input_size_per_partition + block_k - 1) // block_k,
+                dtype=torch.float32,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        scale[:] = torch.finfo(torch.float32).min
+        layer.register_parameter("weight_scale_inv", scale)
 
-        # If checkpoint is serialized int8, load them.
-        # Otherwise, wait until process_weights_after_loading.
-        if self.quant_config.is_checkpoint_int8_serialized:
-            # WEIGHT SCALE
-            if self.block_quant:
-                assert self.quant_config.activation_scheme == "dynamic"
-                scale = BlockQuantScaleParameter(
-                    data=torch.empty(
-                        (output_size_per_partition + block_n - 1) // block_n,
-                        (input_size_per_partition + block_k - 1) // block_k,
-                        dtype=torch.float32,
-                    ),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=weight_loader,
-                )
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale_inv", scale)
-            else:
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale", scale)
+        # INPUT ACTIVATION SCALE
+        if self.quant_config.activation_scheme == "static":
+            scale = PerTensorScaleParameter(
+                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
 
-            # INPUT ACTIVATION SCALE
-            if self.quant_config.activation_scheme == "static":
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("input_scale", scale)
-            else:
-                layer.register_parameter("input_scale", None)
+            scale[:] = torch.finfo(torch.float32).min
+            layer.register_parameter("input_scale", scale)
+        else:
+            layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
-        if self.block_quant:
-            layer.weight = torch.nn.Parameter(
-                layer.weight.data, requires_grad=False
-            )
-            layer.weight_scale_inv = torch.nn.Parameter(
-                layer.weight_scale_inv.data, requires_grad=False
-            )
-            return
-        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
-        # If checkpoint not serialized int8, quantize the weights.
-        if not self.quant_config.is_checkpoint_int8_serialized:
-            qweight, weight_scale = ops.scaled_int8_quant(layer.weight, scale=None)
-
-            # Update the layer with the new values.
-            layer.weight = Parameter(qweight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-            layer.input_scale = None
-
-        # If checkpoint is int8, handle that there are N scales for N
-        # shards in a fused module
-        else:
-            layer.weight_scale = torch.nn.Parameter(
-                layer.weight_scale.data, requires_grad=False
-            )
-            if self.quant_config.activation_scheme == "static":
-                layer.input_scale = torch.nn.Parameter(
-                    layer.input_scale.data, requires_grad=False
-                )
-
-            # If using w8a8, torch._scaled_mm needs per tensor, so
-            # requantize the logical shards as a single weight.
-            else:
-                # Dequant -> Quant with max scale so we can run per tensor.
-                weight = layer.weight
-                weight_scale = layer.weight_scale
-                weight_scale, weight = requantize_with_max_scale(
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    logical_widths=layer.logical_widths,
-                )
-
-            # Update layer with new values.
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-            if self.quant_config.activation_scheme == "static":
-                layer.input_scale = Parameter(
-                    layer.input_scale.max(), requires_grad=False
-                )
+        # Use torch Parameter to avoid cuda graph capturing issue
+        layer.weight = torch.nn.Parameter(
+            layer.weight.data, requires_grad=False
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            layer.weight_scale_inv.data, requires_grad=False
+        )
 
     def apply(
         self,
@@ -309,21 +245,12 @@ class Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.block_quant:
-            return apply_w8a8_block_int8_linear(
-                input=x,
-                weight=layer.weight,
-                block_size=self.quant_config.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
-                input_scale=None,
-                bias=bias,
-            )
-
-        return apply_int8_linear(
+        return apply_w8a8_block_int8_linear(
             input=x,
             weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
+            block_size=self.quant_config.weight_block_size,
+            weight_scale=layer.weight_scale_inv,
+            input_scale=None,
             bias=bias,
         )
 
@@ -333,9 +260,8 @@ class Int8MoEMethod:
     Supports loading INT8 checkpoints with static weight scale and
     dynamic/static activation scale.
 
-    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
-    activation scaling. The weight scaling factor will be initialized after
-    the model weights are loaded.
+    Limitations:
+    Only support block-wise int8 quantization and int8 checkpoint
 
     Args:
         quant_config: The quantization config.
@@ -361,7 +287,8 @@ class Int8MoEMethod:
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
-        self.block_quant = self.quant_config.weight_block_size is not None
+        assert self.quant_config.weight_block_size is not None
+        assert self.quant_config.is_checkpoint_int8_serialized
 
     def create_weights(
         self,
@@ -377,27 +304,27 @@ class Int8MoEMethod:
         if self.quant_config.is_checkpoint_int8_serialized:
             params_dtype = torch.int8
         tp_size = get_tensor_model_parallel_world_size()
-        if self.block_quant:
-            block_n, block_k = (
-                self.quant_config.weight_block_size[0],
-                self.quant_config.weight_block_size[1],
+
+        block_n, block_k = (
+            self.quant_config.weight_block_size[0],
+            self.quant_config.weight_block_size[1],
+        )
+        # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+        # Required by collum parallel or enabling merged weights
+        if intermediate_size % block_n != 0:
+            raise ValueError(
+                f"The output_size of gate's and up's weight = "
+                f"{intermediate_size} is not divisible by "
+                f"weight quantization block_n = {block_n}."
             )
-            # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-            # Required by collum parallel or enabling merged weights
-            if intermediate_size % block_n != 0:
+        if tp_size > 1:
+            # Required by row parallel
+            if intermediate_size % block_k != 0:
                 raise ValueError(
-                    f"The output_size of gate's and up's weight = "
+                    f"The input_size of down's weight = "
                     f"{intermediate_size} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
+                    f"weight quantization block_k = {block_k}."
                 )
-            if tp_size > 1:
-                # Required by row parallel
-                if intermediate_size % block_k != 0:
-                    raise ValueError(
-                        f"The input_size of down's weight = "
-                        f"{intermediate_size} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
-                    )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -419,52 +346,33 @@ class Int8MoEMethod:
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        if self.block_quant:
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    num_experts,
-                    2 * ((intermediate_size + block_n - 1) // block_n),
-                    (hidden_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    num_experts,
-                    (hidden_size + block_n - 1) // block_n,
-                    (intermediate_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
-            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
-            assert self.quant_config.activation_scheme == "dynamic"
-        else:
-            # Allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
-            )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-            )
-            layer.register_parameter("w13_weight_scale", w13_weight_scale)
-            layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        # Add the quantization method used (per tensor/grouped/channel)
-        # to ensure the weight scales are loaded in properly
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                2 * ((intermediate_size + block_n - 1) // block_n),
+                (hidden_size + block_k - 1) // block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                (hidden_size + block_n - 1) // block_n,
+                (intermediate_size + block_k - 1) // block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        assert self.quant_config.activation_scheme == "dynamic"
+
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-            if self.block_quant
-            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
-        # If loading int8 checkpoint, pass the weight loaders.
-        # If loading an fp16 checkpoint, do not (we will quantize in
-        #   process_weights_after_loading()
-        if self.quant_config.is_checkpoint_int8_serialized:
-            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # INPUT_SCALES
         if self.quant_config.activation_scheme == "static":
@@ -491,89 +399,14 @@ class Int8MoEMethod:
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            padding_size,  # Avoid circular import
-        )
-
         # Block quant doesn't need to process weights after loading
-        if self.block_quant:
-            return
-        # If checkpoint is fp16 or bfloat16, quantize in place.
-        if not self.quant_config.is_checkpoint_int8_serialized:
-            # If ROCm, use float8_e4m3fnuz instead (MI300x HW)
-            int8_dtype = torch.int8
-            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=int8_dtype)
-            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=int8_dtype)
-
-            # Re-initialize w13_scale because we directly quantize
-            # merged w13 weights and generate a single scaling factor.
-            layer.w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    layer.num_experts, dtype=torch.float32, device=w13_weight.device
-                ),
-                requires_grad=False,
-            )
-            for expert in range(layer.num_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    ops.scaled_int8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    ops.scaled_int8_quant(layer.w2_weight.data[expert, :, :])
-                )
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-
-            return
-
-        # If checkpoint is int8, we need to handle that the
-        # MoE kernels require single activation scale and single weight
-        # scale for w13 per expert.
-        else:
-            # Int8 moe kernels require a single activation scale.
-            # We take the max of all the scales in case they differ.
-            if self.quant_config.activation_scheme == "static":
-                if layer.w13_input_scale is None or layer.w2_input_scale is None:
-                    raise ValueError(
-                        "QuantConfig has static quantization, but found "
-                        "activation scales are None."
-                    )
-                if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
-                    layer.w2_input_scale
-                ):
-                    print_warning_once(
-                        "Found input_scales that are not equal for "
-                        "int8 MoE layer. Using the maximum across experts "
-                        "for each layer. "
-                    )
-                layer.w13_input_scale = torch.nn.Parameter(
-                    layer.w13_input_scale.max(), requires_grad=False
-                )
-                layer.w2_input_scale = torch.nn.Parameter(
-                    layer.w2_input_scale.max(), requires_grad=False
-                )
-
-            # Int8 moe kernel needs single weight scale for w13 per expert.
-            # We take the max then dequant and requant each expert.
-            assert layer.w13_weight_scale is not None
-            shard_size = layer.intermediate_size_per_partition
-            max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.num_experts):
-                start = 0
-                for shard_id in range(2):
-                    dq_weight = per_tensor_dequantize(
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        layer.w13_weight_scale[expert_id][shard_id],
-                    )
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_int8_quant(dq_weight, max_w13_scales[expert_id])
-                    )
-                    start += shard_size
-
-            layer.w13_weight_scale = torch.nn.Parameter(
-                max_w13_scales, requires_grad=False
-            )
-
-            return
+        # Use torch Parameter to avoid cuda graph capturing issue
+        layer.weight = torch.nn.Parameter(
+            layer.weight.data, requires_grad=False
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            layer.weight_scale_inv.data, requires_grad=False
+        )
 
     def apply(
         self,
