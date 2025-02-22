@@ -1,4 +1,5 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
+from copy import deepcopy
 from typing import Callable, Dict, Optional, Type
 
 import torch
@@ -65,8 +66,6 @@ def get_linear_quant_method(
     prefix: str,
     linear_method_cls: type,
 ):
-    from copy import deepcopy
-
     from vllm.model_executor.layers.quantization.utils.gptq_utils import (
         get_dynamic_override,
         override_config,
