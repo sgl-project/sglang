@@ -46,7 +46,8 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import make_layers, maybe_prefix
+from sglang.srt.utils import make_layers
+from vllm.model_executor.models.utils import maybe_prefix
 
 Qwen2Config = None
 

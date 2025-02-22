@@ -303,19 +303,6 @@ class LayerFn(Protocol):
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
 
 
-def maybe_prefix(prefix: str, name: str) -> str:
-    """Add a prefix to a name if the prefix is non-empty.
-
-    Args:
-        prefix: The prefix to add. If empty, no prefix will be added.
-        name: The name to potentially prefix.
-
-    Returns:
-        The string "prefix.name" if prefix was non-empty, otherwise just "name".
-    """
-    return name if not prefix else f"{prefix}.{name}"
-
-
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
@@ -561,46 +548,6 @@ def monkey_patch_vllm_gguf_config():
         return None
 
     setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
-
-def monkey_patch_vllm_get_linear_quant_method():
-    from vllm.model_executor.layers.quantization.utils import gptq_utils
-    from vllm.model_executor.layers.quantization.utils.gptq_utils import get_dynamic_override, override_config
-    from vllm.config import QuantizationConfig
-    from copy import deepcopy
-    from vllm.model_executor.layers.linear import (LinearBase,
-                                                   UnquantizedLinearMethod)
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        ParallelLMHead, UnquantizedEmbeddingMethod)
-    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead as sglang_ParallelLMHead
-
-    def get_linear_quant_method(
-        config: QuantizationConfig,
-        layer: torch.nn.Module,
-        prefix: str,
-        linear_method_cls: type,
-    ):
-        cloned_config = deepcopy(config)
-        parallel_lm_head_quantized = isinstance(
-            layer, (ParallelLMHead, sglang_ParallelLMHead)) and cloned_config.lm_head_quantized
-
-        if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
-            # False = skip module, None = no override, else = Positive match
-            if get_dynamic_override(  # noqa: E712
-                cloned_config,  # noqa: E712
-                layer_name=prefix) == False:  # noqa: E712
-                if parallel_lm_head_quantized:
-                    return UnquantizedEmbeddingMethod()
-                return UnquantizedLinearMethod()
-
-            if prefix:
-                # Dynamic per module/layer rules may override base config
-                override_config(cloned_config, prefix=prefix)
-
-            return linear_method_cls(cloned_config)
-        return None
-
-    gptq_utils.get_linear_quant_method = staticmethod(get_linear_quant_method)
-
 
 
 def maybe_set_triton_cache_manager() -> None:
