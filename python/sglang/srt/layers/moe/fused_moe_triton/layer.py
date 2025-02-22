@@ -588,6 +588,7 @@ class FusedMoE(torch.nn.Module):
 
         if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
             from aiter.ops.shuffle import shuffle_weight
+
             if not self.aiter_shuffle:
                 self.w13_weight.data = shuffle_weight(self.w13_weight, (16, 16))
                 self.w2_weight.data = shuffle_weight(self.w2_weight, (16, 16))
