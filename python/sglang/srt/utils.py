@@ -499,14 +499,17 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
     if include_parent:
-        try:
-            itself.kill()
+        if parent_pid == os.getpid():
+            sys.exit(0)
+        else:
+            try:
+                itself.kill()
 
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
+                # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+                # so we send an additional signal to kill them.
+                itself.send_signal(signal.SIGQUIT)
+            except psutil.NoSuchProcess:
+                pass
 
 
 def monkey_patch_p2p_access_check():
