@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.layers.quantization.blockwise_int8 import Int8Config
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -34,6 +35,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "fp8": Fp8Config,
+    "blockwise_int8": Int8Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
     "modelopt": ModelOptFp8Config,
