@@ -1,6 +1,10 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from typing import Callable, Dict, Optional, Type
 
+from sglang.srt.utils import monkey_patch_vllm_get_linear_quant_method
+
+monkey_patch_vllm_get_linear_quant_method()
+
 import torch
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
