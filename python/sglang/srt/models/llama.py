@@ -458,6 +458,8 @@ class LlamaForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
             # Handle FP8 kv-scale remapping
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
