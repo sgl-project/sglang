@@ -377,6 +377,8 @@ class Qwen2ForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
