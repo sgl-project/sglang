@@ -32,6 +32,7 @@ from sgl_kernel.ops import (
     rmsnorm,
     sampling_scaling_penalties,
     sgl_per_token_group_quant_fp8,
+    sgl_per_tensor_quant_fp8,
     silu_and_mul,
     top_k_renorm_prob,
     top_k_top_p_sampling_from_probs,
@@ -71,4 +72,5 @@ __all__ = [
     "build_tree_kernel_efficient",
     "build_tree_kernel",
     "sgl_per_token_group_quant_fp8",
+    "sgl_per_tensor_quant_fp8",
 ]

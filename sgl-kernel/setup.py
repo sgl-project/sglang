@@ -102,6 +102,7 @@ sources = [
     "src/sgl-kernel/csrc/eagle_utils.cu",
     "src/sgl-kernel/csrc/speculative_sampling.cu",
     "src/sgl-kernel/csrc/per_token_group_quant_fp8.cu",
+    "src/sgl-kernel/csrc/per_tensor_quant_fp8.cu",
     "src/sgl-kernel/csrc/cublas_grouped_gemm.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",

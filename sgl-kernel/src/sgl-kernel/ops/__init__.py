@@ -624,3 +624,13 @@ def cublas_grouped_gemm(
             cublas_handle,
             _get_cuda_stream(device),
         )
+
+def sgl_per_tensor_quant_fp8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    is_static: bool,
+) -> None:
+    torch.ops.sgl_kernels.sgl_per_tensor_quant_fp8(
+        input, output_q, output_s, is_static
+    )
