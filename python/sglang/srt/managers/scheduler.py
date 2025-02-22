@@ -98,7 +98,8 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback, rpd_mark
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -384,10 +385,10 @@ class Scheduler:
         )
 
         # Init profiler
-        if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
-            self.profiler = None
-        else:
-            self.torch_profiler_trace_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+        self.SGLANG_TORCH_PROFILER_DIR = os.getenv("SGLANG_TORCH_PROFILER_DIR", "")
+        self.SGLANG_RPD_PROFILER_DIR = os.getenv("SGLANG_RPD_PROFILER_DIR", "")
+        if self.SGLANG_TORCH_PROFILER_DIR:
+            self.torch_profiler_trace_dir = self.SGLANG_TORCH_PROFILER_DIR
             logger.info(
                 "Profiling enabled. Traces will be saved to: %s",
                 self.torch_profiler_trace_dir,
@@ -399,6 +400,21 @@ class Scheduler:
                 ],
                 with_stack=True,
             )
+        elif self.SGLANG_RPD_PROFILER_DIR:
+            from sglang.utils import rpd_trace
+            rpd_profiler_trace_dir = Path(self.SGLANG_RPD_PROFILER_DIR)
+            if rpd_profiler_trace_dir.suffix != ".rpd":
+                rpd_profiler_trace_dir = rpd_profiler_trace_dir / "trace.rpd"
+            rpd_profiler_trace_dir.parent.mkdir(parents=True, exist_ok=True)
+            logger.info("Profiling enabled. Traces will be saved to: %s",
+                        rpd_profiler_trace_dir)
+            if self.tp_rank == 0:
+                rpd_trace.create_file(filename=str(rpd_profiler_trace_dir))
+            self.profiler = rpd_trace(filename=str(rpd_profiler_trace_dir),
+                                      name='Worker RPD Enabled',
+                                      nvtx=True)
+        else:
+            self.profiler = None
 
         # Init metrics stats
         self.stats = SchedulerStats()
@@ -463,7 +479,7 @@ class Scheduler:
         # Wait sometimes so that the parent process can print the error.
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
-
+    @rpd_mark()
     @torch.no_grad()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -483,7 +499,7 @@ class Scheduler:
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
-
+    @rpd_mark()
     @torch.no_grad()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1734,15 +1750,21 @@ class Scheduler:
     def start_profile(self) -> None:
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
-        self.profiler.start()
+        if self.SGLANG_RPD_PROFILER_DIR:
+            self.profiler.__enter__()
+        else:
+            self.profiler.start()
 
     def stop_profile(self) -> None:
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
-        self.profiler.stop()
-        self.profiler.export_chrome_trace(
-            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
-        )
+        if self.SGLANG_RPD_PROFILER_DIR:
+            self.profiler.__exit__()
+        else:
+            self.profiler.stop()
+            self.profiler.export_chrome_trace(
+                self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
+            )
         logger.info("Profiler is done")
 
     def open_session(self, recv_req: OpenSessionReqInput):
