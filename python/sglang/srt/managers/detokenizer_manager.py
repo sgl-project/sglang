@@ -64,17 +64,7 @@ class DetokenizerManager:
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
     ):
-        # Init inter-process communication
-        context = zmq.Context(2)
-        self.recv_from_scheduler = get_zmq_socket(
-            context, zmq.PULL, port_args.detokenizer_ipc_name, True
-        )
-        self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-        )
-
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -116,14 +106,6 @@ class DetokenizerManager:
             assert len(output) > 0
             return output[:-1]
         return output
-
-    def event_loop(self):
-        """The event loop that handles requests"""
-
-        while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
-            output = self._request_dispatcher(recv_obj)
-            self.send_to_tokenizer.send_pyobj(output)
 
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
         # If it is embedding model, no detokenization is needed.
@@ -244,20 +226,3 @@ class LimitedCapacityDict(OrderedDict):
             self.popitem(last=False)
         # Set the new item
         super().__setitem__(key, value)
-
-
-def run_detokenizer_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-):
-    setproctitle.setproctitle("sglang::detokenizer")
-    configure_logger(server_args)
-    parent_process = psutil.Process().parent()
-
-    try:
-        manager = DetokenizerManager(server_args, port_args)
-        manager.event_loop()
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DetokenizerManager hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)

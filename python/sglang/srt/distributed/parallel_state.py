@@ -22,6 +22,7 @@ If you only need to use the distributed environment without model/pipeline
  steps.
 """
 import contextlib
+import dataclasses
 import gc
 import logging
 import os
@@ -37,6 +38,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
+from torch.distributed.device_mesh import DeviceMesh
 
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -183,6 +185,7 @@ class GroupCoordinator:
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        existing_groups: Optional["DimProcessGroups"] = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -193,19 +196,32 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self.device_group = device_group
-                self.cpu_group = cpu_group
+        if existing_groups is not None:
+            assert (
+                torch_distributed_backend is None and group_ranks is None
+            ), "When using argument `existing_groups`, should not provide `torch_distributed_backend` and `group_ranks`"
+            ranks = existing_groups.device_mesh_device.mesh.tolist()
+            self.ranks = ranks
+            self.world_size = len(ranks)
+            self.rank_in_group = ranks.index(self.rank)
+            self.device_group = existing_groups.device_mesh_device.get_group()
+            self.cpu_group = existing_groups.device_mesh_cpu.get_group()
+            self.device_mesh_device = existing_groups.device_mesh_device
+        else:
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination between
+                # processes through the CPU.
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self.device_group = device_group
+                    self.cpu_group = cpu_group
+            self.device_mesh_device = None
 
         assert self.cpu_group is not None
         assert self.device_group is not None
@@ -863,7 +879,9 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -884,6 +902,7 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
+    existing_groups=None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -891,6 +910,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
+        existing_groups=existing_groups,
         use_pynccl=True,
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
@@ -991,6 +1011,14 @@ def init_distributed_environment(
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         else:
             local_rank = rank
+
+    init_distributed_environment_via_existing(local_rank=local_rank, backend=backend)
+
+
+def init_distributed_environment_via_existing(
+    local_rank: int,
+    backend: str,
+):
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
@@ -999,6 +1027,36 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
+
+
+@dataclasses.dataclass
+class ParallelProcessGroups:
+    tp: "DimProcessGroups"
+    pp: "DimProcessGroups"
+
+    @staticmethod
+    def from_devices_meshes(
+        device_mesh_device: DeviceMesh,
+        device_mesh_cpu: DeviceMesh,
+        dim_tp: str,
+        dim_pp: str,
+    ):
+        return ParallelProcessGroups(
+            tp=DimProcessGroups(
+                device_mesh_cpu=device_mesh_cpu[dim_tp],
+                device_mesh_device=device_mesh_device[dim_tp],
+            ),
+            pp=DimProcessGroups(
+                device_mesh_cpu=device_mesh_cpu[dim_pp],
+                device_mesh_device=device_mesh_device[dim_pp],
+            ),
+        )
+
+
+@dataclasses.dataclass
+class DimProcessGroups:
+    device_mesh_device: DeviceMesh
+    device_mesh_cpu: DeviceMesh
 
 
 def initialize_model_parallel(
@@ -1042,37 +1100,61 @@ def initialize_model_parallel(
 
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-    global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = []
+    tp_group_ranks = []
     for i in range(num_tensor_model_parallel_groups):
         ranks = list(
             range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
         )
-        group_ranks.append(ranks)
+        tp_group_ranks.append(ranks)
 
+    # Build the pipeline model-parallel groups.
+    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
+    pp_group_ranks = []
+    for i in range(num_pipeline_model_parallel_groups):
+        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+        pp_group_ranks.append(ranks)
+
+    _initialize_model_parallel_inner(
+        tp_group_ranks=tp_group_ranks,
+        pp_group_ranks=pp_group_ranks,
+        backend=backend,
+    )
+
+
+def initialize_model_parallel_via_existing(
+    existing_groups: ParallelProcessGroups,
+) -> None:
+    _initialize_model_parallel_inner(
+        existing_groups=existing_groups,
+    )
+
+
+def _initialize_model_parallel_inner(
+    tp_group_ranks=None,
+    pp_group_ranks=None,
+    backend=None,
+    existing_groups: Optional[ParallelProcessGroups] = None,
+) -> None:
+    global _TP
+    assert _TP is None, "tensor model parallel group is already initialized"
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
+        existing_groups=existing_groups.tp if existing_groups else None,
+        group_ranks=tp_group_ranks,
+        local_rank=get_world_group().local_rank,
+        backend=backend,
         use_message_queue_broadcaster=True,
         group_name="tp",
     )
 
-    # Build the pipeline model-parallel groups.
-    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
+        existing_groups=existing_groups.pp if existing_groups else None,
+        group_ranks=pp_group_ranks,
+        local_rank=get_world_group().local_rank,
+        backend=backend,
         use_custom_allreduce=False,
         group_name="pp",
     )
