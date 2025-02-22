@@ -110,7 +110,7 @@ class FlashInferAttnBackend(AttentionBackend):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         self.enable_flashinfer_mla = False
-        if "DeepseekV3ForCausalLM" in model_runner.model_config.hf_config.architectures:
+        if any(arch in model_runner.model_config.hf_config.architectures for arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]):
             if global_server_args_dict["enable_flashinfer_mla"]:
                 self.enable_flashinfer_mla = True
                 global_config.enable_flashinfer_mla = True
