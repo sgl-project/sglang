@@ -77,6 +77,13 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
 
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (BatchEmbeddingOut, self.handle_batch_embedding_out),
+                (BatchTokenIDOut, self.handle_batch_token_id_out),
+            ]
+        )
+
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
@@ -148,6 +155,7 @@ class DetokenizerManager:
 
         # Incremental decoding
         output_strs = []
+        finished_reqs = []
         for i in range(bs):
             try:
                 s = self.decode_status[recv_obj.rids[i]]
@@ -170,6 +178,8 @@ class DetokenizerManager:
                     new_text = ""
                 else:
                     new_text = find_printable_text(new_text)
+            else:
+                finished_reqs.append(recv_obj.rids[i])
 
             output_strs.append(
                 self.trim_matched_stop(
@@ -179,7 +189,7 @@ class DetokenizerManager:
                 )
             )
 
-        return BatchStrOut(
+        out = BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
@@ -197,6 +207,12 @@ class DetokenizerManager:
             output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
             output_hidden_states=recv_obj.output_hidden_states,
         )
+
+        # remove decodestatus for completed requests
+        for rid in finished_reqs:
+            self.decode_status.pop(rid)
+
+        return out
 
 
 class LimitedCapacityDict(OrderedDict):

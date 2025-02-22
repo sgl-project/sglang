@@ -463,6 +463,18 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 
+## SageMaker API
+@app.get("/ping")
+async def sagemaker_health() -> Response:
+    """Check the health of the http server."""
+    return Response(status_code=200)
+
+
+@app.post("/invocations")
+async def sagemaker_chat_completions(raw_request: Request):
+    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+
+
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
