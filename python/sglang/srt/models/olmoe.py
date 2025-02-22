@@ -41,10 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers, print_warning_once
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_layers, print_warning_once
 
 
 class OlmoeMoE(nn.Module):
@@ -72,7 +69,11 @@ class OlmoeMoE(nn.Module):
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
-            hidden_size, num_experts, bias=False, quant_config=None, prefix=f"{prefix}.gate",
+            hidden_size,
+            num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
         )
 
         self.experts = FusedMoE(
@@ -314,9 +315,14 @@ class OlmoeForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = OlmoeModel(config, quant_config, prefix=add_prefix( "model", prefix))
+        self.model = OlmoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix( "lm_head", prefix)
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 

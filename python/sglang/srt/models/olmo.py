@@ -38,10 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_layers
 
 
 class OlmoAttention(nn.Module):
@@ -188,10 +185,19 @@ class OlmoDecoderLayer(nn.Module):
     ):
         super().__init__()
         # Attention block.
-        self.self_attn = OlmoAttention(config, layer_id, quant_config, prefix=f"{prefix}.self_attn",)
+        self.self_attn = OlmoAttention(
+            config,
+            layer_id,
+            quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
 
         # MLP block.
-        self.mlp = OlmoMLP(config, quant_config, prefix=f"{prefix}.mlp",)
+        self.mlp = OlmoMLP(
+            config,
+            quant_config,
+            prefix=f"{prefix}.mlp",
+        )
 
         # LayerNorm
         self.input_layernorm = nn.LayerNorm(
@@ -224,13 +230,18 @@ class OlmoDecoderLayer(nn.Module):
 class OlmoModel(nn.Module):
 
     def __init__(
-        self, config: OlmoConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+        self,
+        config: OlmoConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
 
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens",
+            config.vocab_size,
+            config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -292,7 +303,7 @@ class OlmoForCausalLM(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.model = OlmoModel(config, quant_config, prefix=add_prefix( "model", prefix))
+        self.model = OlmoModel(config, quant_config, prefix=add_prefix("model", prefix))
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -302,7 +313,7 @@ class OlmoForCausalLM(nn.Module):
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 quant_config=quant_config,
-                prefix=add_prefix( "lm_head", prefix)
+                prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
 

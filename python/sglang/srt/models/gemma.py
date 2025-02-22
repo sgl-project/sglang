@@ -37,8 +37,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class GemmaMLP(nn.Module):
@@ -217,7 +216,7 @@ class GemmaModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -228,7 +227,9 @@ class GemmaModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                GemmaDecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
+                GemmaDecoderLayer(
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -290,12 +291,14 @@ class GemmaForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = GemmaModel(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
+        self.model = GemmaModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

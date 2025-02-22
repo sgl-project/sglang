@@ -37,9 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class MiniCPMMLP(nn.Module):
@@ -57,14 +55,14 @@ class MiniCPMMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj"
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj"
+            prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -123,14 +121,14 @@ class MiniCPMAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj"
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj"
+            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
@@ -148,7 +146,7 @@ class MiniCPMAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -191,14 +189,14 @@ class MiniCPMDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn"
+            prefix=f"{prefix}.self_attn",
         )
         self.mlp = MiniCPMMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp"
+            prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -250,11 +248,13 @@ class MiniCPMModel(nn.Module):
             self.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            prefix=f"{prefix}.embed_tokens"
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = nn.ModuleList(
             [
-                MiniCPMDecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
+                MiniCPMDecoderLayer(
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -297,14 +297,16 @@ class MiniCPMForCausalLM(nn.Module):
 
         self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
-        self.model = MiniCPMModel(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
+        self.model = MiniCPMModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         # self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if not self.config.tie_word_embeddings:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
-                prefix = add_prefix( "lm_head", prefix)
+                prefix=add_prefix("lm_head", prefix),
             )
 
         self.scale_width = self.config.hidden_size / self.config.dim_model_base

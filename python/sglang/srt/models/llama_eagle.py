@@ -12,7 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-from python.sglang.srt.utils import add_prefix
+
+from sglang.srt.utils import add_prefix
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
@@ -32,7 +33,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
-from vllm.model_executor.models.utils import maybe_prefix
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -63,9 +63,7 @@ class LlamaModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=f"{prefix}.embed_tokens"
+            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
         self.layers = nn.ModuleList(
             [
@@ -116,14 +114,19 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config, prefix=add_prefix( "model", prefix))
+        self.model = LlamaModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix( "lm_head", prefix)
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
 

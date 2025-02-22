@@ -46,10 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import make_layers
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_layers
 
 Qwen2Config = None
 
@@ -158,7 +155,7 @@ class Qwen2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -342,17 +339,22 @@ class Qwen2ForCausalLM(nn.Module):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2Model(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
+        self.model = Qwen2Model(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix("lm_head", prefix)
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

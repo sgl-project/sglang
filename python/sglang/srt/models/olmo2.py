@@ -45,10 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_layers
 
 
 class Olmo2Attention(nn.Module):
@@ -98,7 +95,7 @@ class Olmo2Attention(nn.Module):
             self.total_num_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj"
+            prefix=f"{prefix}.qkv_proj",
         )
         self.tp_rank = get_tensor_model_parallel_rank()
 
@@ -121,7 +118,7 @@ class Olmo2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
 
         # Attention output projection.
@@ -130,7 +127,7 @@ class Olmo2Attention(nn.Module):
             self.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj"
+            prefix=f"{prefix}.o_proj",
         )
 
     def _apply_qk_norm(
@@ -186,7 +183,7 @@ class Olmo2MLP(nn.Module):
             [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj"
+            prefix=f"{prefix}.gate_up_proj",
         )
 
         # Activation function.
@@ -198,7 +195,7 @@ class Olmo2MLP(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj"
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(
@@ -227,7 +224,9 @@ class Olmo2DecoderLayer(nn.Module):
     ):
         super().__init__()
         # Attention block.
-        self.self_attn = Olmo2Attention(config, layer_id, quant_config, prefix=f"{prefix}.self_attn")
+        self.self_attn = Olmo2Attention(
+            config, layer_id, quant_config, prefix=f"{prefix}.self_attn"
+        )
 
         # MLP block.
         self.mlp = Olmo2MLP(config, quant_config, prefix=f"{prefix}.mlp")
@@ -283,7 +282,7 @@ class Olmo2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            prefix=f"{prefix}.layers"
+            prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -333,7 +332,9 @@ class Olmo2ForCausalLM(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.model = Olmo2Model(config, quant_config, prefix=add_prefix( "model", prefix))
+        self.model = Olmo2Model(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -343,7 +344,7 @@ class Olmo2ForCausalLM(nn.Module):
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 quant_config=quant_config,
-                prefix=add_prefix( "lm_head", prefix)
+                prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
 

@@ -42,9 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class StablelmMLP(nn.Module):
@@ -63,14 +61,14 @@ class StablelmMLP(nn.Module):
             [config.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj"
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj"
+            prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
 
@@ -130,14 +128,14 @@ class StablelmAttention(nn.Module):
             self.total_num_key_value_heads,
             self.qkv_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj"
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj"
+            prefix=f"{prefix}.o_proj",
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -151,7 +149,7 @@ class StablelmAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_key_value_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -177,8 +175,12 @@ class StablelmDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.self_attn = StablelmAttention(config, layer_id=layer_id, prefix=f"{prefix}.self_attn")
-        self.mlp = StablelmMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        self.self_attn = StablelmAttention(
+            config, layer_id=layer_id, prefix=f"{prefix}.self_attn"
+        )
+        self.mlp = StablelmMLP(
+            config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+        )
         norm_eps = getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-05))
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
@@ -217,13 +219,13 @@ class StableLMEpochModel(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=f"{prefix}.embed_tokens"
+            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
         self.layers = nn.ModuleList(
             [
-                StablelmDecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
+                StablelmDecoderLayer(
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -262,8 +264,12 @@ class StableLmForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = StableLMEpochModel(config, quant_config=quant_config, prefix=add_prefix( "model", prefix))
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=add_prefix( "lm_head", prefix))
+        self.model = StableLMEpochModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

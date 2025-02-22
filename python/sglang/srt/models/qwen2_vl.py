@@ -46,9 +46,7 @@ from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +96,17 @@ class Qwen2VisionMLP(nn.Module):
     ):
         super().__init__()
         self.fc1 = ColumnParallelLinear(
-            in_features, hidden_features, quant_config=quant_config, prefix=f"{prefix}.fc1"
+            in_features,
+            hidden_features,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc1",
         )
         self.act = act_layer()
         self.fc2 = RowParallelLinear(
-            hidden_features, in_features, quant_config=quant_config, prefix=f"{prefix}.fc2"
+            hidden_features,
+            in_features,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc2",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -150,10 +154,14 @@ class Qwen2VisionBlock(nn.Module):
             use_full_precision_softmax=use_full_precision_softmax,
             flatten_batch=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
         self.mlp = Qwen2VisionMLP(
-            dim, mlp_hidden_dim, act_layer=act_layer, quant_config=quant_config, prefix=f"{prefix}.mlp"
+            dim,
+            mlp_hidden_dim,
+            act_layer=act_layer,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
         )
 
     def forward(
@@ -219,11 +227,15 @@ class Qwen2VisionPatchMerger(nn.Module):
                     self.hidden_size,
                     bias=True,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.0"
+                    prefix=f"{prefix}.mlp.0",
                 ),
                 nn.GELU(),
                 RowParallelLinear(
-                    self.hidden_size, d_model, bias=True, quant_config=quant_config, prefix=f"{prefix}.mlp.2"
+                    self.hidden_size,
+                    d_model,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp.2",
                 ),
             ]
         )
@@ -316,7 +328,7 @@ class Qwen2VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     attn_implementation="sdpa",
                     quant_config=quant_config,
-                    prefix=f"{prefix}.blocks.{i}"
+                    prefix=f"{prefix}.blocks.{i}",
                 )
                 for i in range(depth)
             ]
@@ -326,7 +338,7 @@ class Qwen2VisionTransformer(nn.Module):
             context_dim=embed_dim,
             norm_layer=norm_layer,
             quant_config=quant_config,
-            prefix=f"{prefix}.merger"
+            prefix=f"{prefix}.merger",
         )
 
     @property
@@ -462,16 +474,21 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             # NOTE: Qwen2-VL vision encoder does not support any
             # quantization method now.
             quant_config=None,
-            prefix=add_prefix("visual", prefix)
+            prefix=add_prefix("visual", prefix),
         )
 
-        self.model = Qwen2Model(config, quant_config, prefix=add_prefix( "model", prefix))
+        self.model = Qwen2Model(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
 
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix( "lm_head", prefix)
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
 
         self.logits_processor = LogitsProcessor(config)

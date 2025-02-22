@@ -65,9 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import get_compiler_backend, set_weight_attrs
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
 
 
 @torch.compile(backend=get_compiler_backend())
@@ -248,16 +246,23 @@ class CohereDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
 
         self.self_attn = CohereAttention(
-            config, layer_id=layer_id, quant_config=quant_config, prefix=f"{prefix}.self_attn",
+            config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
 
-        self.mlp = CohereMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp",)
+        self.mlp = CohereMLP(
+            config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
         self.input_layernorm = LayerNorm(
             param_shape=(config.hidden_size), eps=config.layer_norm_eps
         )
@@ -289,7 +294,7 @@ class CohereModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -299,7 +304,9 @@ class CohereModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                CohereDecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
+                CohereDecoderLayer(
+                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -338,7 +345,9 @@ class CohereForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.logits_processor = LogitsProcessor(config)
-        self.model = CohereModel(config, quant_config, prefix=add_prefix("model", prefix))
+        self.model = CohereModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
 
     @torch.no_grad()
     def forward(

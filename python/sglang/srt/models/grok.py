@@ -47,9 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class Grok1MLP(nn.Module):
@@ -122,7 +120,7 @@ class Grok1MoE(nn.Module):
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
-            prefix=f"{prefix}.gate"
+            prefix=f"{prefix}.gate",
         )
 
         self.router_logit_softcapping = getattr(
@@ -140,7 +138,7 @@ class Grok1MoE(nn.Module):
             tp_size=tp_size,
             activation="gelu",
             use_presharded_weights=use_presharded_weights,
-            prefix=f"{prefix}.experts"
+            prefix=f"{prefix}.experts",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -202,7 +200,7 @@ class Grok1Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj"
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -210,7 +208,7 @@ class Grok1Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            prefix=f"{prefix}.o_proj"
+            prefix=f"{prefix}.o_proj",
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -229,7 +227,7 @@ class Grok1Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             logit_cap=logit_cap,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -270,7 +268,7 @@ class Grok1DecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
         self.block_sparse_moe = Grok1MoE(
             config=config,
@@ -285,7 +283,7 @@ class Grok1DecoderLayer(nn.Module):
             quant_config=quant_config,
             reduce_results=True,
             use_presharded_weights=use_presharded_weights,
-            prefix=f"{prefix}.block_sparse_moe"
+            prefix=f"{prefix}.block_sparse_moe",
         )
         self.pre_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -332,9 +330,7 @@ class Grok1Model(nn.Module):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=f"{prefix}.embed_tokens"
+            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
         self.layers = nn.ModuleList(
             [
@@ -343,7 +339,7 @@ class Grok1Model(nn.Module):
                     i,
                     quant_config=quant_config,
                     use_presharded_weights=use_presharded_weights,
-                    prefix=f"{prefix}.layers.{i}"
+                    prefix=f"{prefix}.layers.{i}",
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -395,9 +391,11 @@ class Grok1ForCausalLM(nn.Module):
             config,
             quant_config=quant_config,
             use_presharded_weights=self.use_presharded_weights,
-            prefix=add_prefix( "model", prefix)
+            prefix=add_prefix("model", prefix),
         )
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=add_prefix( "lm_head", prefix))
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     def forward(

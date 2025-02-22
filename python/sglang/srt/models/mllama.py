@@ -36,9 +36,7 @@ from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class ColumnParallelConv2dPatch(torch.nn.Module):
@@ -150,7 +148,12 @@ class MllamaPrecomputedPositionEmbedding(nn.Module):
 
 
 class MllamaVisionMLP(nn.Module):
-    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.activation_fn = get_act_fn(config.hidden_act)
@@ -179,7 +182,10 @@ class MllamaVisionMLP(nn.Module):
 
 class MllamaVisionEncoderLayer(nn.Module):
     def __init__(
-        self, config: config_mllama.MllamaVisionConfig, is_gated: bool = False, prefix: str = ""
+        self,
+        config: config_mllama.MllamaVisionConfig,
+        is_gated: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -246,7 +252,12 @@ class MllamaVisionEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [MllamaVisionEncoderLayer(config, is_gated, prefix=f"{prefix}.layers.{i}") for i in range(num_layers)]
+            [
+                MllamaVisionEncoderLayer(
+                    config, is_gated, prefix=f"{prefix}.layers.{i}"
+                )
+                for i in range(num_layers)
+            ]
         )
         self.output_hidden_states = output_hidden_states or []
 
@@ -312,10 +323,13 @@ class MllamaVisionModel(nn.Module):
             config.num_hidden_layers,
             is_gated=False,
             output_hidden_states=config.intermediate_layers_indices,
-            prefix=add_prefix( "transformer", prefix),
+            prefix=add_prefix("transformer", prefix),
         )
         self.global_transformer = MllamaVisionEncoder(
-            config, config.num_global_layers, is_gated=True, prefix=add_prefix( "global_transformer", prefix),
+            config,
+            config.num_global_layers,
+            is_gated=True,
+            prefix=add_prefix("global_transformer", prefix),
         )
 
     def apply_class_embedding(self, hidden_state: torch.Tensor) -> torch.Tensor:
@@ -625,13 +639,15 @@ class MllamaTextModel(nn.Module):
         self,
         config: config_mllama.MllamaTextConfig,
         quant_config: Optional[QuantizationConfig],
-        prefix: str = ""
+        prefix: str = "",
     ):
         super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size + 8, config.hidden_size, prefix=f"{prefix}.embed_tokens",
+            config.vocab_size + 8,
+            config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.cross_attention_layers = config.cross_attention_layers
 
@@ -640,14 +656,20 @@ class MllamaTextModel(nn.Module):
             if layer_id in self.cross_attention_layers:
                 layers.append(
                     MllamaCrossAttentionDecoderLayer(
-                        config, layer_id, quant_config=quant_config, prefix=f"{prefix}.layers.{layer_id}",
+                        config,
+                        layer_id,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.layers.{layer_id}",
                     )
                 )
             else:
                 # TODO: force LlamaDecoderLayer to config.attention_bias=False
                 layers.append(
                     LlamaDecoderLayer(
-                        config, quant_config=quant_config, layer_id=layer_id, prefix=f"{prefix}.layers.{layer_id}",
+                        config,
+                        quant_config=quant_config,
+                        layer_id=layer_id,
+                        prefix=f"{prefix}.layers.{layer_id}",
                     )
                 )
 
@@ -707,14 +729,16 @@ class MllamaForCausalLM(nn.Module):
     ):
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.model = MllamaTextModel(config, quant_config, prefix=add_prefix("model", prefix))
+        self.model = MllamaTextModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
             quant_config=quant_config,
-            prefix=add_prefix( "lm_head", prefix)
+            prefix=add_prefix("lm_head", prefix),
         )
 
     def forward(
@@ -756,11 +780,13 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.image_size = config.vision_config.image_size
 
-        self.vision_model = MllamaVisionModel(config.vision_config, prefix=add_prefix( "vision_model", prefix))
+        self.vision_model = MllamaVisionModel(
+            config.vision_config, prefix=add_prefix("vision_model", prefix)
+        )
         self.language_model = MllamaForCausalLM(
             config.text_config,
             quant_config=quant_config,
-            prefix=add_prefix( "language_model", prefix)
+            prefix=add_prefix("language_model", prefix),
         )
         self.multi_modal_projector = nn.Linear(
             config.vision_config.vision_output_dim,

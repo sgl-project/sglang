@@ -42,9 +42,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
 from sglang.utils import get_exception_traceback
-
-from python.sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +158,7 @@ class GraniteAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -304,18 +303,23 @@ class GraniteForCausalLM(nn.Module):
         self,
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = GraniteModel(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
+        self.model = GraniteModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         # If tie_word_embeddings == True, then input and output embeddings are
         # the same tensor. Enforce during object creation so that weights will
         # load correctly even if the LM head weights don't have a separate entry
         # in the state dict.
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix( "lm_head", prefix)
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         if self.config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)

@@ -264,7 +264,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         quant_method = None
         if quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
-            print("quant_method",quant_method)
+            print("quant_method", quant_method)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
 

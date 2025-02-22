@@ -38,9 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class InternLM2MLP(nn.Module):
@@ -54,10 +52,18 @@ class InternLM2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_up_proj"
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.w2 = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.w2"
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -116,14 +122,14 @@ class InternLM2Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.wqkv"
+            prefix=f"{prefix}.wqkv",
         )
         self.wo = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.wo"
+            prefix=f"{prefix}.wo",
         )
 
         self.rotary_emb = get_rope(
@@ -134,7 +140,12 @@ class InternLM2Attention(nn.Module):
             rope_scaling=rope_scaling,
         )
         self.attn = RadixAttention(
-            self.num_heads, self.head_dim, self.scaling, self.num_kv_heads, layer_id, prefix=f"{prefix}.attn"
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            self.num_kv_heads,
+            layer_id,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -173,14 +184,14 @@ class InternLMDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=f"{prefix}.attention"
+            prefix=f"{prefix}.attention",
         )
         self.feed_forward = InternLM2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.feed_forward"
+            prefix=f"{prefix}.feed_forward",
         )
         self.attention_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -222,13 +233,13 @@ class InternLM2Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.tok_embeddings = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=f"{prefix}.tok_embeddings"
+            config.vocab_size, config.hidden_size, prefix=f"{prefix}.tok_embeddings"
         )
         self.layers = nn.ModuleList(
             [
-                InternLMDecoderLayer(config, i, quant_config, prefix=f"{prefix}.layers.{i}")
+                InternLMDecoderLayer(
+                    config, i, quant_config, prefix=f"{prefix}.layers.{i}"
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -268,8 +279,12 @@ class InternLM2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = InternLM2Model(config, quant_config, prefix=add_prefix( "model", prefix))
-        self.output = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=add_prefix( "output", prefix))
+        self.model = InternLM2Model(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.output = ParallelLMHead(
+            config.vocab_size, config.hidden_size, prefix=add_prefix("output", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

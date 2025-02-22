@@ -39,9 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class QWenMLP(nn.Module):
@@ -228,7 +226,12 @@ class QWenModel(nn.Module):
         )
         self.h = nn.ModuleList(
             [
-                QWenBlock(config, i, quant_config=quant_config, prefix=f"{prefix}.h.{i}",)
+                QWenBlock(
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.h.{i}",
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -261,9 +264,13 @@ class QWenLMHeadModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.transformer = QWenModel(config, quant_config=quant_config, prefix=add_prefix("transformer", prefix))
+        self.transformer = QWenModel(
+            config, quant_config=quant_config, prefix=add_prefix("transformer", prefix)
+        )
         vocab_size = ((config.vocab_size + 63) // 64) * 64
-        self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix))
+        self.lm_head = ParallelLMHead(
+            vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

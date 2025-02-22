@@ -41,7 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 LoraConfig = None
 
@@ -113,7 +113,7 @@ class GLMAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn"
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -210,7 +210,9 @@ class GLMBlock(nn.Module):
         )
 
         # Self attention.
-        self.self_attention = GLMAttention(config, layer_id, quant_config, prefix=f"{prefix}.self_attention")
+        self.self_attention = GLMAttention(
+            config, layer_id, quant_config, prefix=f"{prefix}.self_attention"
+        )
         self.hidden_dropout = config.hidden_dropout
 
         # Layernorm on the attention output
@@ -276,7 +278,15 @@ class GLMTransformer(nn.Module):
 
         # Transformer layers.
         self.layers = nn.ModuleList(
-            [GLMBlock(config, i, quant_config, prefix=f"{prefix}.layers.{i}",) for i in range(self.num_layers)]
+            [
+                GLMBlock(
+                    config,
+                    i,
+                    quant_config,
+                    prefix=f"{prefix}.layers.{i}",
+                )
+                for i in range(self.num_layers)
+            ]
         )
 
         if self.post_layer_norm:
@@ -311,7 +321,7 @@ class ChatGLMM(nn.Module):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -324,7 +334,11 @@ class ChatGLMM(nn.Module):
         self.kv_channels = config.kv_channels
         self.encoder = GLMTransformer(config, quant_config, prefix=f"{prefix}.encoder")
 
-        self.output_layer = ParallelLMHead(config.padded_vocab_size, config.hidden_size, prefix=f"{prefix}.output_layer")
+        self.output_layer = ParallelLMHead(
+            config.padded_vocab_size,
+            config.hidden_size,
+            prefix=f"{prefix}.output_layer",
+        )
 
     def forward(
         self,
@@ -368,7 +382,9 @@ class ChatGLMForCausalLM(nn.Module):
         self.config: ChatGLMConfig = config
         self.quant_config = quant_config
         self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
-        self.transformer = ChatGLMM(config, quant_config, prefix=add_prefix("transformer", prefix))
+        self.transformer = ChatGLMM(
+            config, quant_config, prefix=add_prefix("transformer", prefix)
+        )
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
 

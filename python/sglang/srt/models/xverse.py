@@ -40,9 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class XverseMLP(nn.Module):
@@ -306,8 +304,12 @@ class XverseForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = XverseModel(config, quant_config=quant_config, prefix=add_prefix( "model", prefix))
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=add_prefix( "lm_head", prefix))
+        self.model = XverseModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

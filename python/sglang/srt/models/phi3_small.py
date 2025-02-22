@@ -24,10 +24,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
-from vllm.model_executor.models.utils import maybe_prefix
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_layers
 
 
 @torch.jit.script
@@ -244,9 +241,16 @@ class Phi3SmallDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Phi3SmallSelfAttention(
-            config, layer_id, quant_config=quant_config, prefix=f"{prefix}.self_attn",
+            config,
+            layer_id,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
-        self.mlp = Phi3SmallMLP(config, quant_config, prefix=f"{prefix}.mlp",)
+        self.mlp = Phi3SmallMLP(
+            config,
+            quant_config,
+            prefix=f"{prefix}.mlp",
+        )
 
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_epsilon
@@ -290,13 +294,18 @@ class Phi3SmallModel(nn.Module):
 
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens",
+            config.vocab_size,
+            config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.mup_embedding_multiplier = config.mup_embedding_multiplier
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Phi3SmallDecoderLayer(
-                config, int(prefix.split(".")[-1]), quant_config, prefix=prefix,
+                config,
+                int(prefix.split(".")[-1]),
+                quant_config,
+                prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -351,7 +360,7 @@ class Phi3SmallForCausalLM(nn.Module):
         self.model = Phi3SmallModel(
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix( "model", prefix),
+            prefix=add_prefix("model", prefix),
         )
         self.vocab_size = config.vocab_size
         self.mup_width_multiplier = config.mup_width_multiplier
@@ -361,7 +370,7 @@ class Phi3SmallForCausalLM(nn.Module):
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
             quant_config=quant_config,
-            prefix=add_prefix( "lm_head", prefix),
+            prefix=add_prefix("lm_head", prefix),
         )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

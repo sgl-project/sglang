@@ -46,8 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -86,10 +85,18 @@ class BaiChuanMLP(nn.Module):
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_up_proj"
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj"
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -171,7 +178,7 @@ class BaiChuanAttention(nn.Module):
                 scaling,
                 num_kv_heads=self.num_kv_heads,
                 layer_id=layer_id,
-                prefix=f"{prefix}.attn"
+                prefix=f"{prefix}.attn",
             )
         else:
             self.rotary_emb = get_rope(
@@ -187,7 +194,7 @@ class BaiChuanAttention(nn.Module):
                 self.scaling,
                 num_kv_heads=self.num_kv_heads,
                 layer_id=layer_id,
-                prefix=f"{prefix}.attn"
+                prefix=f"{prefix}.attn",
             )
 
     def forward(
@@ -213,7 +220,7 @@ class BaiChuanDecoderLayer(nn.Module):
         position_embedding: str,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -348,12 +355,17 @@ class BaiChuanBaseForCausalLM(nn.Module):
         self.config = config
 
         self.quant_config = quant_config
-        self.model = BaiChuanModel(config, position_embedding, quant_config, prefix=add_prefix("model", prefix))
+        self.model = BaiChuanModel(
+            config, position_embedding, quant_config, prefix=add_prefix("model", prefix)
+        )
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=add_prefix( "lm_head", prefix)
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
 
@@ -416,7 +428,7 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
         if config.hidden_size == 4096:  # baichuan2 7b
             super().__init__(config, "ROPE", quant_config, prefix=prefix)

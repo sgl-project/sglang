@@ -59,29 +59,38 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     return QUANTIZATION_METHODS[quantization]
 
 
-
 def get_linear_quant_method(
     config: QuantizationConfig,
     layer: torch.nn.Module,
     prefix: str,
     linear_method_cls: type,
 ):
-    from vllm.model_executor.layers.quantization.utils.gptq_utils import get_dynamic_override, override_config
     from copy import deepcopy
-    from sglang.srt.layers.linear import (LinearBase,
-                                                   UnquantizedLinearMethod)
+
+    from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+        get_dynamic_override,
+        override_config,
+    )
+
+    from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
     from sglang.srt.layers.vocab_parallel_embedding import (
-        ParallelLMHead, UnquantizedEmbeddingMethod)
+        ParallelLMHead,
+        UnquantizedEmbeddingMethod,
+    )
 
     cloned_config = deepcopy(config)
-    parallel_lm_head_quantized = isinstance(
-        layer, ParallelLMHead) and cloned_config.lm_head_quantized
+    parallel_lm_head_quantized = (
+        isinstance(layer, ParallelLMHead) and cloned_config.lm_head_quantized
+    )
 
     if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
         # False = skip module, None = no override, else = Positive match
-        if get_dynamic_override(  # noqa: E712
-            cloned_config,  # noqa: E712
-            layer_name=prefix) == False:  # noqa: E712
+        if (
+            get_dynamic_override(  # noqa: E712
+                cloned_config, layer_name=prefix  # noqa: E712
+            )
+            == False
+        ):  # noqa: E712
             if parallel_lm_head_quantized:
                 return UnquantizedEmbeddingMethod()
             return UnquantizedLinearMethod()
@@ -93,21 +102,27 @@ def get_linear_quant_method(
         return linear_method_cls(cloned_config)
     return None
 
+
 def gptq_get_quant_method(self, layer, prefix):
+    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
         GPTQMarlinMoEMethod,
     )
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
 
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
     if isinstance(layer, FusedMoE):
         return GPTQMarlinMoEMethod(self)
 
     if isinstance(self, GPTQConfig):
-        return get_linear_quant_method(self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod)
+        return get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+        )
     elif isinstance(self, GPTQMarlinConfig):
-        return get_linear_quant_method(self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod)
+        return get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
+        )
     return None
 
 

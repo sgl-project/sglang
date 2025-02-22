@@ -36,8 +36,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
-from python.sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix
 
 
 class GPT2Attention(nn.Module):
@@ -228,7 +227,9 @@ class GPT2LMHeadModel(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.transformer = GPT2Model(config, quant_config, prefix=add_prefix( "transformer", prefix))
+        self.transformer = GPT2Model(
+            config, quant_config, prefix=add_prefix("transformer", prefix)
+        )
         self.lm_head = self.transformer.wte
 
         self.logits_processor = LogitsProcessor(config)
