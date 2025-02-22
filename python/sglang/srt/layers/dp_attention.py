@@ -43,7 +43,9 @@ def initialize_dp_attention(
     else:
         if enable_dp_attention:
             assert _ATTN_TP_SIZE == 1
-            group_ranks = [[head] for head in range(0, torch.distributed.get_world_size())]
+            group_ranks = [
+                [head] for head in range(0, torch.distributed.get_world_size())
+            ]
             existing_groups_chosen = None
         else:
             existing_groups_chosen = existing_groups.tp
@@ -52,7 +54,9 @@ def initialize_dp_attention(
     _ATTN_TP_GROUP = GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=tp_rank,
-        torch_distributed_backend=tp_group_backend if existing_groups_chosen is None else None,
+        torch_distributed_backend=(
+            tp_group_backend if existing_groups_chosen is None else None
+        ),
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_custom_allreduce=False,
         use_hpu_communicator=False,
