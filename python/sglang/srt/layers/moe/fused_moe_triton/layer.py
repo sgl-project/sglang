@@ -305,6 +305,7 @@ class FusedMoE(torch.nn.Module):
             weight_loader=self.weight_loader,
         )
         self.use_presharded_weights = use_presharded_weights
+        self.aiter_shuffle = False
 
     def _load_per_tensor_weight_scale(
         self,
@@ -585,6 +586,12 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+            from aiter.ops.shuffle import shuffle_weight
+            if not self.aiter_shuffle:
+                self.w13_weight.data = shuffle_weight(self.w13_weight, (16, 16))
+                self.w2_weight.data = shuffle_weight(self.w2_weight, (16, 16))
+                self.aiter_shuffle = True
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
