@@ -43,6 +43,8 @@ srt_hpu = ["sglang[runtime_common]", "outlines>=0.0.44,<0.1.0"]
 # To install vllm for CPU, please follow the instruction here:
 # https://docs.vllm.ai/en/latest/getting_started/installation/cpu/index.html
 srt_cpu = ["sglang[runtime_common]", "torch", "outlines>=0.0.44,<0.1.0"]
+# https://vllm-ascend.readthedocs.io/en/latest/installation.html
+srt_npu = ["sglang[runtime_common]", "outlines>=0.0.44,<0.1.0"]
 
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
@@ -61,6 +63,7 @@ all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[lit
 all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 
 dev = ["sglang[all]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]

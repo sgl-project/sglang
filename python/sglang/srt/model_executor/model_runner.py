@@ -240,6 +240,8 @@ class ModelRunner:
             backend = "hccl"
         elif self.device == "cpu":
             backend = "gloo"
+        elif self.device == "npu":
+            backend = "hccl"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
