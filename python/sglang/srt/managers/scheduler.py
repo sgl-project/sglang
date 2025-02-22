@@ -392,11 +392,14 @@ class Scheduler:
                 "Profiling enabled. Traces will be saved to: %s",
                 self.torch_profiler_trace_dir,
             )
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+            if self.device == "hpu":
+                activities.append(torch.profiler.ProfilerActivity.HPU)
             self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=activities,
                 with_stack=True,
             )
 
