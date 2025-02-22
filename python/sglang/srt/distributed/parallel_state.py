@@ -165,10 +165,10 @@ class GroupCoordinator:
     rank_in_group: int  # rank inside the group
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
-    use_pynccl: bool  # a hint of whether to use PyNccl
+    device_group_clone: Optional[ProcessGroup]  # PG clone for cuda graph
+    use_pg_clone: bool  # a hint of whether to use PG clone
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     # communicators are only created for world size > 1
-    pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
@@ -177,7 +177,7 @@ class GroupCoordinator:
         group_ranks: List[List[int]],
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
-        use_pynccl: bool,
+        use_pg_clone: bool,
         use_custom_allreduce: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
@@ -191,6 +191,7 @@ class GroupCoordinator:
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_group = None
+        self.device_group_clone = None
         self.cpu_group = None
 
         for ranks in group_ranks:
@@ -210,12 +211,14 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
+        self.active_device_group = self.device_group
+
         if is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         else:
             self.device = torch.device("cpu")
 
-        self.use_pynccl = use_pynccl
+        self.use_pg_clone = use_pg_clone
         self.use_custom_allreduce = use_custom_allreduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
@@ -224,15 +227,11 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
-        from sglang.srt.distributed.device_communicators.pynccl import (
-            PyNcclCommunicator,
-        )
 
-        self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if use_pynccl and self.world_size > 1:
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group,
-                device=self.device,
+        if use_pg_clone and self.world_size > 1:
+            self.device_group_clone = torch.distributed.new_group(
+                torch.distributed.get_process_group_ranks(self.device_group),
+                backend=torch_distributed_backend
             )
 
         self.ca_comm: Optional[CustomAllreduce] = None
@@ -328,27 +327,26 @@ class GroupCoordinator:
             #     allreduce \ Mode   |  Eager  |  Graph  |
             # --------------------------------------------
             # custom allreduce       | enabled | enabled |
-            # PyNccl                 | disabled| enabled |
+            # torch.distributed clone| disabled| enabled |
             # torch.distributed      | enabled | disabled|
             #
             # Note that custom allreduce will have a runtime check, if the
             #  tensor size is too large, it will fallback to the next
             #  available option.
             # In summary: When using CUDA graph, we use
-            #  either custom all-reduce kernel or pynccl. When not using
-            #  CUDA graph, we use either custom all-reduce kernel or
+            #  either custom all-reduce kernel or torch.distributed clone.
+            #  When not using CUDA graph, we use either custom all-reduce kernel or
             #  PyTorch NCCL. We always prioritize using custom all-reduce
-            #  kernel but fall back to PyTorch or pynccl if it is
+            #  kernel but fall back to PyTorch or torch.distributed clone if it is
             #  disabled or not supported.
-            pynccl_comm = self.pynccl_comm
-            maybe_pynccl_context: Any
-            if not pynccl_comm:
-                maybe_pynccl_context = nullcontext()
+            maybe_pg_clone_context: Any
+            if not self.device_group_clone:
+                maybe_pg_clone_context = nullcontext()
             else:
-                maybe_pynccl_context = pynccl_comm.change_state(
-                    enable=True, stream=torch.cuda.current_stream()
+                maybe_pg_clone_context = self.change_pg_state(
+                    enable_clone=True
                 )
-            with maybe_pynccl_context:
+            with maybe_pg_clone_context:
                 yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -407,11 +405,12 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_reduce(input_)
-        else:
-            torch.distributed.all_reduce(input_, group=self.device_group)
+        torch.distributed.all_reduce(input_, group=self.active_device_group)
+
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        torch.distributed.all_gather_into_tensor(
+            output, input, group=self.active_device_group
+        )
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -440,9 +439,7 @@ class GroupCoordinator:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        self.all_gather_into_tensor(output_tensor, input_)
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -478,7 +475,7 @@ class GroupCoordinator:
             gather_list = None
         # Gather.
         torch.distributed.gather(
-            input_, gather_list, dst=self.ranks[dst], group=self.device_group
+            input_, gather_list, dst=self.ranks[dst], group=self.active_device_group
         )
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
@@ -497,7 +494,7 @@ class GroupCoordinator:
             return input_
         # Broadcast.
         torch.distributed.broadcast(
-            input_, src=self.ranks[src], group=self.device_group
+            input_, src=self.ranks[src], group=self.active_device_group
         )
         return input_
 
@@ -538,7 +535,7 @@ class GroupCoordinator:
             return obj_list
         # Broadcast.
         torch.distributed.broadcast_object_list(
-            obj_list, src=self.ranks[src], group=self.device_group
+            obj_list, src=self.ranks[src], group=self.active_device_group
         )
         return obj_list
 
@@ -619,7 +616,7 @@ class GroupCoordinator:
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
 
-        group = self.device_group
+        group = self.active_device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
 
@@ -705,7 +702,7 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
+        group = self.active_device_group
         metadata_group = self.cpu_group
 
         if dst is None:
@@ -757,7 +754,7 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
+        group = self.active_device_group
         metadata_group = self.cpu_group
 
         if src is None:
@@ -817,11 +814,7 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.send(tensor, dst)
-        else:
-            torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+        torch.distributed.send(tensor, self.ranks[dst], self.active_device_group)
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
@@ -832,27 +825,37 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.recv(tensor, src)
-        else:
-            torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+        torch.distributed.recv(tensor, self.ranks[src], self.active_device_group)
         return tensor
 
     def destroy(self):
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
+        if self.device_group_clone is not None:
+            torch.distributed.destroy_process_group(self.device_group_clone)
+            self.device_group = None
+        self.active_device_group = None
         if self.cpu_group is not None:
             torch.distributed.destroy_process_group(self.cpu_group)
             self.cpu_group = None
-        if self.pynccl_comm is not None:
-            self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
+    @contextmanager
+    def change_pg_state(
+        self, enable_clone: bool
+    ):
+        """
+        A context manager to change PG to clone
+        """
+        old_pg = self.active_device_group
+        if enable_clone:
+            self.active_device_group = self.device_group_clone
+        yield
+        self.active_device_group = old_pg
 
 _WORLD: Optional[GroupCoordinator] = None
 
@@ -869,7 +872,7 @@ def init_world_group(
         group_ranks=[ranks],
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=False,
+        use_pg_clone=False,
         use_custom_allreduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
@@ -891,7 +894,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=True,
+        use_pg_clone=True,
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
