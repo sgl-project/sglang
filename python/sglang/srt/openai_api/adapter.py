@@ -1441,24 +1441,60 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             background=tokenizer_manager.create_abort_task(adapted_request),
         )
 
-    # Non-streaming response.
-    try:
-        ret = await tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
-    except ValueError as e:
-        return create_error_response(str(e))
-    if not isinstance(ret, list):
-        ret = [ret]
+    async def response_wrapper():
+        # Non-streaming response.
+        try:
+            ret = await tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+        except ValueError as e:
+            return create_error_response(str(e))
+        if not isinstance(ret, list):
+            ret = [ret]
+        response: ChatCompletionResponse = v1_chat_generate_response(
+            request,
+            ret,
+            cache_report=tokenizer_manager.server_args.enable_cache_report,
+            tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+        )
+        return response.model_dump_json()
 
-    response = v1_chat_generate_response(
-        request,
-        ret,
-        cache_report=tokenizer_manager.server_args.enable_cache_report,
-        tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+    async def async_function_with_timeout(func, timeout_short, timeout_long):
+        """
+        Wrap an async function with a timeout.
+
+        If the function completes within timeout_short, the result is returned.
+        If the function takes longer than timeout_short but completes within
+        timeout_long, the result is returned after the function completes and
+        yields '\n' to keep alive
+        If the function takes longer than timeout_long, then the request is aborted.
+        """
+
+        start_time = asyncio.get_event_loop().time()
+        task = asyncio.create_task(func())
+        while True:
+            try:
+                if asyncio.get_event_loop().time() - start_time > timeout_long:
+                    task.cancel()
+                    break
+                result = await asyncio.wait_for(
+                    asyncio.shield(task), timeout=timeout_short
+                )
+                yield result
+                break
+
+            except asyncio.TimeoutError:
+                yield "\n"
+            except asyncio.CancelledError:
+                break
+
+    return StreamingResponse(
+        async_function_with_timeout(
+            response_wrapper, timeout_short=30, timeout_long=30 * 60
+        ),
+        media_type="text/event-stream",
+        background=tokenizer_manager.create_abort_task(adapted_request),
     )
-
-    return response
 
 
 def v1_embedding_request(all_requests, tokenizer_manager):
