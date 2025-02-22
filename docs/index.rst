@@ -45,7 +45,7 @@ The core features include:
    :maxdepth: 1
    :caption: Frontend Tutorial
 
-   frontend/frontend.md
+   frontend/frontend.ipynb
    frontend/choices_methods.md
 
 .. toctree::
