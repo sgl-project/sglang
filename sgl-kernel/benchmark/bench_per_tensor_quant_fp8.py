@@ -56,8 +56,8 @@ def calculate_diff(batch_size: int, seq_len: int):
         print("❌ Implementations differ")
 
 
-batch_size_range = [16, 32, 64, 128, 256, 512]
-seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
+batch_size_range = [1, 2, 4, 8, 16, 32, 64]
+seq_len_range = [64, 128, 256, 512, 1024, 2048]
 
 configs = list(itertools.product(batch_size_range, seq_len_range))
 
@@ -79,7 +79,7 @@ def benchmark(batch_size, seq_len, provider):
     dtype = torch.float16
     device = torch.device("cuda")
 
-    x = torch.randn(batch_size, seq_len, device=device, dtype=dtype)
+    x = torch.randn(batch_size*seq_len, 4096, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
 
