@@ -264,6 +264,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         quant_method = None
         if quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
+            print("quant_method",quant_method)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
 
@@ -446,7 +447,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             packed_factor = (
                 param.packed_factor
                 if isinstance(param, BasevLLMParameter)
-                else param.pack_factor
+                else param.packed_factor
             )
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size // param.packed_factor
