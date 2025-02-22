@@ -85,6 +85,14 @@ class SamplingBatchInfo:
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
 
+        logit_bias = None
+        if any(r.sampling_params.logit_bias is not None for r in reqs):
+            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            for i, r in enumerate(reqs):
+                if r.sampling_params.logit_bias is not None:
+                    for key, value in r.sampling_params.logit_bias.items():
+                        logit_bias[i, int(key)] = value
+
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
             batch.enable_custom_logit_processor  # check the flag first.
@@ -130,6 +138,7 @@ class SamplingBatchInfo:
             device=device,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
+            logit_bias=logit_bias,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
@@ -173,9 +182,6 @@ class SamplingBatchInfo:
             device=batch.device,
             Penalizers=penalizers,
         )
-
-        # Handle logit bias but only allocate when needed
-        ret.logit_bias = None
 
         return ret
 
@@ -280,11 +286,15 @@ class SamplingBatchInfo:
                 shape, dtype = lhs.shape[1:], lhs.dtype
             else:
                 shape, dtype = rhs.shape[1:], rhs.dtype
-            with torch.dtype(dtype):
-                if lhs is None:
-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
-                if rhs is None:
-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
+
+            if lhs is None:
+                lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(
+                    default
+                )
+            if rhs is None:
+                rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(
+                    default
+                )
             return torch.cat([lhs, rhs])
 
         return None
