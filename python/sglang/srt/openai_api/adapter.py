@@ -937,7 +937,10 @@ def v1_chat_generate_request(
                     )
 
                 if assistant_prefix:
-                    prompt_ids += orchestrator.tokenizer.encode(assistant_prefix)
+                    encoded = orchestrator.tokenizer.encode(assistant_prefix)
+                    if encoded and encoded[0] == orchestrator.tokenizer.bos_token_id:
+                        encoded = encoded[1:]
+                    prompt_ids += encoded
                 stop = request.stop
                 image_data = None
                 modalities = []
