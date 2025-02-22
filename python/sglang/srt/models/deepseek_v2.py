@@ -361,6 +361,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
         use_dp=False,
+        use_dp_linear=False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -378,6 +379,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.use_dp_linear = use_dp_linear
+
+        if self.use_dp_linear:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group().device_group
 
         if use_dp:
             # For data parallel attention
@@ -536,8 +543,23 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        q_len = hidden_states.shape[0]
+        use_dp_linear = self.use_dp_linear and (q_len % self.tp_size == 0 ) and q_len >= 1024 
         if self.q_lora_rank is not None:
-            q = self.q_a_proj(hidden_states)[0]
+            if not use_dp_linear: 
+                q = self.q_a_proj(hidden_states)[0]
+            else :
+                if self.tp_rank == 0 :
+                    print(f"[DEBUG] prefill hidden_state.shape={hidden_states.shape}, q_len={q_len}, 88={use_dp_linear}")
+                assert q_len % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
+                local_bs = q_len // self.tp_size
+                start_idx = self.tp_rank * local_bs 
+                end_idx = start_idx + local_bs    
+                local_x = hidden_states[start_idx:end_idx, :] 
+                local_q = self.q_a_proj(local_x)[0]
+                #assert local_q.shape[1] == self.q_lora_rank 
+                q = torch.empty(q_len, self.q_lora_rank, dtype=local_q.dtype, device=local_q.device)
+                torch.distributed.all_gather_into_tensor(q, local_q)
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
@@ -545,7 +567,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                 -1, self.num_local_heads, self.qk_head_dim
             )
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        if not use_dp_linear:
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        else:
+            assert q_len % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
+            local_bs = q_len // self.tp_size
+            start_idx = self.tp_rank * local_bs 
+            end_idx = start_idx + local_bs    
+            local_x = hidden_states[start_idx:end_idx, :] 
+            local_compressed_kv = self.kv_a_proj_with_mqa(local_x)[0]
+            #assert local_compressed_kv.shape[1] == self.kv_lora_rank + self.qk_rope_head_dim 
+            latent_cache = torch.empty(q_len, local_compressed_kv.shape[1], dtype=local_compressed_kv.dtype, device=local_compressed_kv.device)
+            torch.distributed.all_gather_into_tensor(latent_cache, local_compressed_kv)                     
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a.contiguous())
@@ -582,8 +615,23 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_input = hidden_states.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
         )
+        use_dp_linear = self.use_dp_linear and (q_len % self.tp_size == 0 ) and q_len >= 1024 
         if self.q_lora_rank is not None:
-            q = self.q_a_proj(hidden_states)[0]
+            if not use_dp_linear: 
+                q = self.q_a_proj(hidden_states)[0]
+            else :
+                if self.tp_rank == 0 :
+                    print(f"[DEBUG] decode hidden_state.shape={hidden_states.shape}, q_len={q_len},  88={use_dp_linear}")
+                assert q_len % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
+                local_bs = q_len // self.tp_size
+                start_idx = self.tp_rank * local_bs 
+                end_idx = start_idx + local_bs    
+                local_x = hidden_states[start_idx:end_idx, :] 
+                local_q = self.q_a_proj(local_x)[0]
+                #assert local_q.shape[1] == self.q_lora_rank 
+                q = torch.empty(q_len, self.q_lora_rank, dtype=local_q.dtype, device=local_q.device)
+                torch.distributed.all_gather_into_tensor(q, local_q)
+            # q = self.q_a_proj(hidden_states)[0]
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
@@ -609,7 +657,18 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
 
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        if not use_dp_linear :
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        else :     
+            assert q_len % self.tp_size == 0, "hidden_states[0] is not divided by tp_size"
+            local_bs = q_len // self.tp_size
+            start_idx = self.tp_rank * local_bs 
+            end_idx = start_idx + local_bs    
+            local_x = hidden_states[start_idx:end_idx, :] 
+            local_compressed_kv = self.kv_a_proj_with_mqa(local_x)[0]
+            #assert local_compressed_kv.shape[1] == self.kv_lora_rank + self.qk_rope_head_dim 
+            latent_cache = torch.empty(q_len, local_compressed_kv.shape[1], dtype=local_compressed_kv.dtype, device=local_compressed_kv.device)
+            torch.distributed.all_gather_into_tensor(latent_cache, local_compressed_kv)              
         v_input = latent_cache[..., : self.kv_lora_rank]
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
@@ -718,6 +777,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
                 use_dp=self.enable_dp_attention,
+                use_dp_linear=True,
             )
         else:
             self.self_attn = DeepseekV2Attention(
