@@ -586,7 +586,7 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
-        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+        if is_hip_ and get_bool_env_var("SGLANG_ROCM_AITER_BLOCK_MOE"):
             from aiter.ops.shuffle import shuffle_weight
 
             if not self.aiter_shuffle:
