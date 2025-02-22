@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from abc import abstractmethod
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +33,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -132,6 +134,129 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class MediaPaddingHelper:
+    """
+    Media tokens (like image tokens) often need special handling during padding
+    to maintain model compatibility. This class provides the interface for
+    implementing different padding strategies for media tokens
+    """
+
+    @abstractmethod
+    def pad_input_tokens(
+        self, input_ids: List[int], image_inputs: ImageInputs
+    ) -> List[int]:
+        """
+        Pad the input ids sequence containing media tokens, and replace them with pad_values
+        """
+        pass
+
+
+class MediaPaddingHelperTokenPairs(MediaPaddingHelper):
+    """Handles media tokens enclosed by special token pairs (e.g., <image>...</image>).
+
+    This strategy is used when media content is marked by start/end token pairs
+    in the input sequence.
+    """
+
+    def __init__(self, media_token_pairs: List[Tuple[int, int]]) -> None:
+        self.media_token_pairs = media_token_pairs
+
+    def pad_input_tokens(
+        self, input_ids: List[int], image_inputs: ImageInputs
+    ) -> List[int]:
+        """
+        Media tokens are enclosed by special token pairs (e.g. <image>...</image>)
+
+        Pad the input ids sequence containing media tokens, and replace them with pad_values
+        """
+        pad_values = image_inputs.pad_values
+        media_token_pairs = self.media_token_pairs
+        start_tokens = [s for s, _e in media_token_pairs]
+        end_tokens = [e for _s, e in media_token_pairs]
+        # First start token marks new media
+        media_start_token = start_tokens[0]
+
+        padded_ids = []
+        last_idx = 0
+        media_idx = -1
+
+        start_indices = [i for i, x in enumerate(input_ids) if x in start_tokens]
+        end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens]
+
+        if len(start_indices) != len(end_indices):
+            return input_ids
+
+        for start_idx, end_idx in zip(start_indices, end_indices):
+            padded_ids.extend(input_ids[last_idx : start_idx + 1])
+
+            if input_ids[start_idx] == media_start_token:
+                media_idx += 1
+
+            num_tokens = end_idx - start_idx - 1
+            pad_value = pad_values[media_idx]
+            padded_ids.extend([pad_value] * num_tokens)
+
+            last_idx = end_idx
+
+        padded_ids.extend(input_ids[last_idx:])
+
+        assert len(input_ids) == len(padded_ids)
+        return padded_ids
+
+
+class MediaPaddingHelperSingleToken(MediaPaddingHelper):
+    """Handles single media tokens that need to be expanded to multiple tokens.
+
+    This strategy is used when a single media token represents content that should
+    be expanded to multiple tokens during processing.
+    """
+
+    def __init__(
+        self, num_media_token_calc_func: Callable[[Tuple[int, int, int]], int]
+    ) -> None:
+        self.num_media_token_calc_func = num_media_token_calc_func
+
+    def pad_input_tokens(
+        self, input_ids: List[int], image_inputs: ImageInputs
+    ) -> List[int]:
+        """
+        Media tokens are enclosed by special token pairs (e.g. <image>...</image>)
+
+        Pad the input ids sequence containing media tokens, and replace them with pad_values
+        """
+        image_grid_thws = image_inputs.image_grid_thws
+        pad_values = image_inputs.pad_values
+
+        image_indices = [
+            idx
+            for idx, token in enumerate(input_ids)
+            if token == image_inputs.im_token_id
+        ]
+
+        image_inputs.image_offsets = []
+
+        input_ids_with_image = []
+        for image_cnt, _ in enumerate(image_grid_thws):
+            num_image_tokens = self.num_media_token_calc_func(
+                image_grid_thws[image_cnt]
+            )
+            if image_cnt == 0:
+                non_image_tokens = input_ids[: image_indices[image_cnt]]
+            else:
+                non_image_tokens = input_ids[
+                    image_indices[image_cnt - 1] + 1 : image_indices[image_cnt]
+                ]
+            input_ids_with_image.extend(non_image_tokens)
+            image_inputs.image_offsets.append(len(input_ids_with_image))
+            pad_ids = pad_values * (
+                (num_image_tokens + len(pad_values)) // len(pad_values)
+            )
+            input_ids_with_image.extend(pad_ids[:num_image_tokens])
+        input_ids_with_image.extend(input_ids[image_indices[-1] + 1 :])
+
+        return input_ids_with_image
+
+
 @dataclasses.dataclass
 class ImageInputs:
     """The image related inputs."""
@@ -153,7 +278,8 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
-    # MiniCPMV related
+    # The id of the single-image placeholder token
+    im_token_id: Optional[torch.Tensor] = None
     # All the images in the batch should share the same special image
     # bound token ids.
     im_start_id: Optional[torch.Tensor] = None
@@ -161,6 +287,11 @@ class ImageInputs:
     slice_start_id: Optional[torch.Tensor] = None
     slice_end_id: Optional[torch.Tensor] = None
     tgt_sizes: Optional[list] = None
+
+    # denotes the number of valid image tokens in each image
+    images_emb_mask: Optional[torch.BoolTensor] = None
+
+    media_padding_helper: MediaPaddingHelper = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -181,11 +312,13 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "im_token_id",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
             "slice_end_id",
             "tgt_sizes",
+            "images_emb_mask",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -216,6 +349,25 @@ class ImageInputs:
         for arg in optional_args:
             if getattr(self, arg, None) is not None:
                 setattr(self, arg, getattr(self, arg) + getattr(other, arg))
+
+    def pad_media_tokens(self, input_ids: List[int]) -> List[int]:
+        """
+        Pad media tokens (image/audio) in input_ids with special values.
+
+        Args:
+            input_ids: List of token ids containing media tokens
+
+        Returns:
+            List of token ids with media tokens replaced by padding values
+        """
+        if self.media_padding_helper is None:
+            return input_ids
+        return self.media_padding_helper.pad_input_tokens(
+            input_ids=input_ids, image_inputs=self
+        )
+
+    def image_count(self) -> int:
+        return self.pixel_values.shape[0]
 
 
 class Req:

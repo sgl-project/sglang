@@ -150,7 +150,7 @@ class VisionAttention(nn.Module):
             x: [b, s, embed_dim]
             cu_seqlens: [b]
         Returns:
-             [s, b, num_heads * head]
+             [b, s, num_heads * head]
         """
         bsz, s, _ = x.shape
         if self.use_qkv_parallel:
