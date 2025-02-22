@@ -2,10 +2,13 @@
 import asyncio
 import concurrent.futures
 import dataclasses
+import importlib
 import logging
 import multiprocessing as mp
 import os
+import pkgutil
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from typing import List, Optional, Union
 
 import numpy as np
@@ -13,9 +16,16 @@ import PIL
 import transformers
 from decord import VideoReader, cpu
 from PIL import Image
+from transformers import IMAGE_PROCESSOR_MAPPING
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.mm_utils import expand2square, process_anyres_image
+from sglang.srt.models.llava import LlavaMistralForCausalLM, LlavaQwenForCausalLM
+from sglang.srt.models.llavavid import LlavaVidForCausalLM
+from sglang.srt.models.minicpmv import MiniCPMV
+from sglang.srt.models.mllama import MllamaForConditionalGeneration
+from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_image
 from sglang.utils import get_exception_traceback
@@ -25,15 +35,16 @@ logger = logging.getLogger(__name__)
 global global_processor
 
 
-def init_global_processor(server_args: ServerArgs):
-    """Init the global processor for multi modal models."""
+def init_global_processor(sglang_image_processor, server_args: ServerArgs):
+    """Init the global processor for multi-modal models."""
     global global_processor
     transformers.logging.set_verbosity_error()
-    global_processor = get_processor(
-        server_args.tokenizer_path,
-        tokenizer_mode=server_args.tokenizer_mode,
-        trust_remote_code=server_args.trust_remote_code,
-    )
+    global_processor = sglang_image_processor._build_processor(server_args=server_args)
+
+
+def get_global_processor():
+    global global_processor
+    return global_processor
 
 
 @dataclasses.dataclass
@@ -55,9 +66,20 @@ class BaseImageProcessor(ABC):
 
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
+            initargs=(
+                self,
+                server_args,
+            ),
             mp_context=mp.get_context("fork"),
-            initargs=(server_args,),
             max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
+        )
+
+    def _build_processor(self, server_args):
+        """Init the global processor for multi modal models."""
+        return get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
         )
 
     @abstractmethod
@@ -109,13 +131,19 @@ class BaseImageProcessor(ABC):
 
     def load_images(
         self,
-        max_req_input_len: int,
         input_ids: list,
         image_data,
         image_token: str,
+        max_req_input_len: int,
+        preserve_alpha_channel=False,
     ) -> BaseImageProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
+
+        Args:
+
+            preserve_alpha_channel: if True, preserve the alpha channel in the returned images
+
         """
         image_hashes, image_sizes = [], []
         all_frames = []
@@ -161,6 +189,8 @@ class BaseImageProcessor(ABC):
                         )
                     else:
                         raw_image, _size = load_image(image)
+                        if preserve_alpha_channel == False:
+                            raw_image = raw_image.convert("RGB")
                         frames = [raw_image]
                     if len(frames) == 0:
                         continue
@@ -203,7 +233,9 @@ class LlavaImageProcessor(BaseImageProcessor):
         image_grid_pinpoints: Optional[str] = None,
         image_processor=None,
     ):
-        image_processor = image_processor or global_processor.image_processor
+        processor = global_processor
+
+        image_processor = image_processor or processor.image_processor
 
         try:
             image, image_size = load_image(image_data)
@@ -376,9 +408,8 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
     @staticmethod
     def _process_images_task(images, input_text):
-        result = global_processor.__call__(
-            text=input_text, images=images, return_tensors="pt"
-        )
+        processor = global_processor
+        result = processor.__call__(text=input_text, images=images, return_tensors="pt")
         return {
             "input_ids": result.input_ids,
             "pixel_values": result.pixel_values,
@@ -414,7 +445,7 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
             image_data = [image_data]
 
         base_output = self.load_images(
-            max_req_input_len, input_ids, image_data, self.IMAGE_TOKEN
+            input_ids, image_data, self.IMAGE_TOKEN, max_req_input_len
         )
         if base_output is None:
             return None
@@ -427,11 +458,11 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
         # Collect special token ids
         tokenizer = self._processor.tokenizer
-        im_start_id = [tokenizer.im_start_id]
-        im_end_id = [tokenizer.im_end_id]
+        im_start_id = tokenizer.im_start_id
+        im_end_id = tokenizer.im_end_id
         if tokenizer.slice_start_id:
-            slice_start_id = [tokenizer.slice_start_id]
-            slice_end_id = [tokenizer.slice_end_id]
+            slice_start_id = tokenizer.slice_start_id
+            slice_end_id = tokenizer.slice_end_id
         return {
             "input_ids": res["input_ids"].flatten().tolist(),
             "pixel_values": res["pixel_values"],
@@ -446,15 +477,10 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _image_processor):
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
         self.hf_config = hf_config
-        self._image_processor = _image_processor
-        self.executor = concurrent.futures.ProcessPoolExecutor(
-            initializer=init_global_processor,
-            mp_context=mp.get_context("fork"),
-            initargs=(server_args,),
-            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
-        )
+        self._image_processor = _processor
 
     @staticmethod
     def _process_single_image_task(
@@ -554,10 +580,10 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             image_grid_thws = [image_grid_thw]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
-
         return {
             "pixel_values": pixel_values,
             "image_hashes": image_hashes,
+            "im_token_id": self.hf_config.image_token_id,
             "image_sizes": image_sizes,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": image_grid_thws,
@@ -611,7 +637,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_images(
-            max_req_input_len, input_ids, image_data, image_token
+            input_ids, image_data, image_token, max_req_input_len
         )
 
         ret = await self._process_images(base_output.all_frames, base_output.input_text)
@@ -627,22 +653,48 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         }
 
 
+IMAGE_PROCESSOR_MAPPING = {
+    LlavaVidForCausalLM: LlavaImageProcessor,
+    LlavaQwenForCausalLM: LlavaImageProcessor,
+    LlavaMistralForCausalLM: LlavaImageProcessor,
+    MllamaForConditionalGeneration: MllamaImageProcessor,
+    Qwen2VLForConditionalGeneration: Qwen2VLImageProcessor,
+    Qwen2_5_VLForConditionalGeneration: Qwen2_5VLImageProcessor,
+    MiniCPMV: MiniCPMVImageProcessor,
+}
+
+
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor
 ) -> BaseImageProcessor:
-    if "MllamaForConditionalGeneration" in hf_config.architectures:
-        return MllamaImageProcessor(hf_config, server_args, processor)
-    elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
-
-        return Qwen2VLImageProcessor(hf_config, server_args, processor)
-    elif "Qwen2_5_VLForConditionalGeneration" in hf_config.architectures:
-        return Qwen2_5VLImageProcessor(hf_config, server_args, processor)
-
-    elif "MiniCPMV" in hf_config.architectures:
-        return MiniCPMVImageProcessor(hf_config, server_args, processor)
-    else:
-        return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
+    for model_cls, processor_cls in IMAGE_PROCESSOR_MAPPING.items():
+        if model_cls.__name__ in hf_config.architectures:
+            return processor_cls(hf_config, server_args, processor)
+    raise ValueError(
+        f"No image processor found for architecture: {hf_config.architectures}"
+    )
 
 
 def get_dummy_image_processor():
     return DummyImageProcessor()
+
+
+@lru_cache()
+def import_image_processors():
+    package_name = "sglang.srt.managers.image_processors"
+    package = importlib.import_module(package_name)
+    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
+        if not ispkg:
+            try:
+                module = importlib.import_module(name)
+            except Exception as e:
+                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                continue
+            if hasattr(module, "ImageProcessorMapping"):
+                entry = module.ImageProcessorMapping
+                if isinstance(entry, dict):
+                    for processor_name, cls in entry.items():
+                        IMAGE_PROCESSOR_MAPPING[processor_name] = cls
+
+
+import_image_processors()

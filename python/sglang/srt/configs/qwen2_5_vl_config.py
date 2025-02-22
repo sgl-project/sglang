@@ -53,6 +53,9 @@ from transformers.processing_utils import ProcessingKwargs, Unpack, VideosKwargs
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 
+def is_valid_list_of_images(images: List):
+    return images and all(is_valid_image(image) for image in images)
+
 
 def is_valid_list_of_images(images: List):
     return images and all(is_valid_image(image) for image in images)
