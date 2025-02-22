@@ -1,10 +1,6 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from typing import Callable, Dict, Optional, Type
 
-from sglang.srt.utils import monkey_patch_vllm_get_linear_quant_method
-
-monkey_patch_vllm_get_linear_quant_method()
-
 import torch
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
@@ -63,19 +59,55 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     return QUANTIZATION_METHODS[quantization]
 
 
+
+def get_linear_quant_method(
+    config: QuantizationConfig,
+    layer: torch.nn.Module,
+    prefix: str,
+    linear_method_cls: type,
+):
+    from vllm.model_executor.layers.quantization.utils.gptq_utils import get_dynamic_override, override_config
+    from copy import deepcopy
+    from sglang.srt.layers.linear import (LinearBase,
+                                                   UnquantizedLinearMethod)
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead, UnquantizedEmbeddingMethod)
+
+    cloned_config = deepcopy(config)
+    parallel_lm_head_quantized = isinstance(
+        layer, ParallelLMHead) and cloned_config.lm_head_quantized
+
+    if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
+        # False = skip module, None = no override, else = Positive match
+        if get_dynamic_override(  # noqa: E712
+            cloned_config,  # noqa: E712
+            layer_name=prefix) == False:  # noqa: E712
+            if parallel_lm_head_quantized:
+                return UnquantizedEmbeddingMethod()
+            return UnquantizedLinearMethod()
+
+        if prefix:
+            # Dynamic per module/layer rules may override base config
+            override_config(cloned_config, prefix=prefix)
+
+        return linear_method_cls(cloned_config)
+    return None
+
 def gptq_get_quant_method(self, layer, prefix):
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
         GPTQMarlinMoEMethod,
     )
+    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
 
-    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
-    if isinstance(layer, LinearBase):
-        return GPTQMarlinLinearMethod(self)
-    elif isinstance(layer, FusedMoE):
+    if isinstance(layer, FusedMoE):
         return GPTQMarlinMoEMethod(self)
+
+    if isinstance(self, GPTQConfig):
+        return get_linear_quant_method(self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod)
+    elif isinstance(self, GPTQMarlinConfig):
+        return get_linear_quant_method(self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod)
     return None
 
 
@@ -157,6 +189,7 @@ def apply_monkey_patches():
     from vllm.model_executor.layers.quantization.awq_marlin import AWQMoEMethod
 
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
+    setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
     setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
     setattr(AWQMoEMethod, "apply", awq_moe_method_apply)
 
