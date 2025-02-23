@@ -168,7 +168,6 @@ class EPMoE(torch.nn.Module):
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
         if is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
-            self.aiter_shuffle = False
             self.routed_scaling_factor = routed_scaling_factor
 
             self.expert_mask = torch.zeros((self.num_experts + self.num_shared_experts + 1) , device='cuda', dtype=torch.int)
@@ -193,12 +192,6 @@ class EPMoE(torch.nn.Module):
         assert self.activation == "silu"
 
         if is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
-            import aiter
-            from aiter.ops.shuffle import shuffle_weight
-            if not self.aiter_shuffle:
-                self.w13_weight.data = shuffle_weight(self.w13_weight.contiguous(), (16, 16))
-                self.w2_weight.data = shuffle_weight(self.w2_weight.contiguous(), (16, 16))
-                self.aiter_shuffle = True
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
                 layer=self,
@@ -756,6 +749,11 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     w2_weight_scale, requires_grad=False
                 )
                 layer.w2_input_scale = None
+                if os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+                    import aiter
+                    from aiter.ops.shuffle import shuffle_weight
+                    layer.w13_weight.data = shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
+                    layer.w2_weight.data = shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
             return
 
     def apply(

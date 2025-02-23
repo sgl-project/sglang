@@ -857,8 +857,8 @@ class DeepseekV2Model(nn.Module):
                 fake_expertid = num_experts + num_shared_experts
 
                 # TODO need find a formal way
-                assert num_tokens<=(4096 * 100)
-                num_tokens= 4096 * 100
+                assert num_tokens<=(4096 * 128)
+                num_tokens= 4096 * 128
                 # all layers reuse same buffer
                 self.total_topk_ids = torch.empty((num_tokens, top_k + num_shared_experts + 1), dtype=torch.int32, device='cuda')
                 self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split([top_k, num_shared_experts + 1], dim=1)
