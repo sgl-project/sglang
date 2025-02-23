@@ -846,12 +846,15 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    expert_mask:torch.Tensor = None,
 ):
     if is_hip_flag and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
         import aiter
         from aiter.fused_moe_bf16_asm import moe_sorting_ck
 
-        E = w1.shape[0]
+        local_E = E = w1.shape[0]
+        if expert_mask is not None:
+            E = expert_mask.numel()
         topk = topk_ids.shape[1]
         model_dim = w1.shape[-1]
         dtype = hidden_states.dtype
@@ -863,7 +866,7 @@ def fused_experts(
             sorted_expert_ids,
             num_valid_ids,
             out_asm,
-        ) = moe_sorting_ck(topk_ids, topk_weights, E, model_dim, dtype)
+        ) = moe_sorting_ck(topk_ids, topk_weights, E, model_dim, dtype, expert_mask=expert_mask)
 
         a1, a1_scale = per_token_group_quant_fp8(hidden_states, scale_blk_k)
         aiter.fmoe_fp8_blockscale_g1u1(
@@ -876,8 +879,8 @@ def fused_experts(
             sorted_expert_ids,
             num_valid_ids,
             topk,
-            w1_scale.view(E, -1),
-            w2_scale.view(E, -1),
+            w1_scale.view(local_E, -1),
+            w2_scale.view(local_E, -1),
             a1_scale.t().contiguous(),
             block_shape[0],
             block_shape[1],

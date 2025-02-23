@@ -262,6 +262,8 @@ class FusedMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
         use_presharded_weights: bool = False,
+        num_shared_experts: Optional[int] = 0,
+        routed_scaling_factor: Optional[float] = 1.0,
     ):
         super().__init__()
 
@@ -620,6 +622,7 @@ class FusedMoE(torch.nn.Module):
         ckpt_down_proj_name: str,
         ckpt_up_proj_name: str,
         num_experts: int,
+        num_shared_experts: Optional[int] = 0,
     ) -> List[Tuple[str, str, int, str]]:
 
         return [
