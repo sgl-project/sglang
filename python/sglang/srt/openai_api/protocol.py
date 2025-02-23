@@ -238,25 +238,25 @@ ChatCompletionMessageContentPart = Union[
 ]
 
 
-class ChatCompletionMessageGenericParam(BaseModel):
+class MessagewithContent(BaseModel):
+    role: str
+    content: Union[str, List[ChatCompletionMessageContentPart]]
+
+    # Avoid openai InternalServerError when input is None
+    @field_validator("content", mode="before")
+    def handle_none_content(cls, v):
+        """Convert None to empty string to avoid validation errors."""
+        return "" if v is None else v
+
+
+class ChatCompletionMessageGenericParam(MessagewithContent):
     role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
-    # Avoid InternalServerError when input is None
-    @field_validator("content", mode="before")
-    def handle_none_content(cls, v):
-        """Convert None to empty string to avoid validation errors."""
-        return "" if v is None else v
 
-
-class ChatCompletionMessageUserParam(BaseModel):
+class ChatCompletionMessageUserParam(MessagewithContent):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
-
-    @field_validator("content", mode="before")
-    def handle_none_content(cls, v):
-        """Convert None to empty string to avoid validation errors."""
-        return "" if v is None else v
 
 
 ChatCompletionMessageParam = Union[
@@ -352,15 +352,10 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
-class ChatMessage(BaseModel):
+class ChatMessage(MessagewithContent):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-
-    @field_validator("content", mode="before")
-    def handle_none_content(cls, v):
-        """Convert None to empty string to avoid validation errors."""
-        return "" if v is None else v
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -380,15 +375,10 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
 
 
-class DeltaMessage(BaseModel):
+class DeltaMessage(MessagewithContent):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-
-    @field_validator("content", mode="before")
-    def handle_none_content(cls, v):
-        """Convert None to empty string to avoid validation errors."""
-        return "" if v is None else v
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
