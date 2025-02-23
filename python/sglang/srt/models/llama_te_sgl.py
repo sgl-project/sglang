@@ -176,6 +176,15 @@ class TELlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         # tp_group = get_tp_group()
+        ranks = list(range(tp_size))
+        tp_group = torch.distributed.new_group(ranks)
+        te.initialize_ub(
+            shape=[1, self.hidden_size],
+            tp_size=tp_size,
+            use_fp8=False,
+            dtype=torch.bfloat16,
+            bootstrap_backend=opts.bootstrap_backend,
+        )
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
@@ -204,7 +213,7 @@ class TELlamaDecoderLayer(nn.Module):
             hidden_size=self.hidden_size,
             ffn_hidden_size=config.intermediate_size,
             eps=config.rms_norm_eps,
-            # tp_group=tp_group,
+            tp_group=tp_group,
             tp_size=tp_size,
             bias=False,
             return_layernorm_output=True,
@@ -218,6 +227,8 @@ class TELlamaDecoderLayer(nn.Module):
             normalization="RMSNorm",
             activation="swiglu",
         )
+        # 立即设置 TP group
+        self.layernorm_mlp.set_tensor_parallel_group(tp_group)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -241,8 +252,8 @@ class TELlamaDecoderLayer(nn.Module):
         )
 
         # Fully Connected with TE
-        tp_group = get_tp_group()
-        self.layernorm_mlp.set_tensor_parallel_group(tp_group)
+        # tp_group = get_tp_group()
+        # self.layernorm_mlp.set_tensor_parallel_group(tp_group)
         hidden_states, residual = self.layernorm_mlp(
             hidden_states
         )  # set return_layernorm_output = true
