@@ -48,6 +48,27 @@ from sglang.srt.utils import dataclass_to_string_truncated
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass
+class _MetricReqState:
+    created_time: float
+    first_token_time: Optional[float] = None
+
+
+@dataclasses.dataclass
+class _ReqState:
+    """Store the state a request."""
+
+    out_list: List
+    finished: bool
+    event: asyncio.Event
+    obj: Any
+
+    metric: _MetricReqState
+
+    # For streaming output
+    last_output_offset: int = 0
+
+
 class GenerationManager:
     def __init__(
         self,
@@ -582,7 +603,7 @@ class _MetricManager:
         self,
         recv_obj,
         i: int,
-        state: "_MetricReqState",
+        state: _MetricReqState,
         finished: bool,
         stream: Optional[bool],
     ):
@@ -643,11 +664,11 @@ class _RequestDumper:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
 
-    def maybe_dump_requests(self, state: "_ReqState", out_dict: dict):
+    def maybe_dump_requests(self, state: _ReqState, out_dict: dict):
         if self.dump_requests_folder and state.finished and state.obj.log_metrics:
             self._dump_requests(state, out_dict)
 
-    def _dump_requests(self, state: "_ReqState", out_dict: dict):
+    def _dump_requests(self, state: _ReqState, out_dict: dict):
         self.dump_request_list.append(
             (state.obj, out_dict, state.metric.created_time, time.time())
         )
@@ -669,24 +690,3 @@ class _RequestDumper:
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
-
-
-@dataclasses.dataclass
-class _ReqState:
-    """Store the state a request."""
-
-    out_list: List
-    finished: bool
-    event: asyncio.Event
-    obj: Any
-
-    metric: "_MetricReqState"
-
-    # For streaming output
-    last_output_offset: int = 0
-
-
-@dataclasses.dataclass
-class _MetricReqState:
-    created_time: float
-    first_token_time: Optional[float] = None
