@@ -249,12 +249,12 @@ class MessagewithContent(BaseModel):
         return "" if v is None else v
 
 
-class ChatCompletionMessageGenericParam(MessagewithContent):
+class ChatCompletionMessageGenericParam(MessagewithContent, BaseModel):
     role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
 
-class ChatCompletionMessageUserParam(MessagewithContent):
+class ChatCompletionMessageUserParam(MessagewithContent, BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
 
@@ -352,7 +352,7 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
-class ChatMessage(MessagewithContent):
+class ChatMessage(MessagewithContent, BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
@@ -375,7 +375,7 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
 
 
-class DeltaMessage(MessagewithContent):
+class DeltaMessage(MessagewithContent, BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
