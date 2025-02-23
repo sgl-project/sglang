@@ -326,6 +326,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.attn_backend = attn_backend
 
@@ -374,7 +375,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             self.req_to_token.shape[1],
         )
 
-        sm_scale = 1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+        sm_scale = self.scaling
         q_indptr = torch.arange(0, bs + 1).to(0).int()
         kv_lens = paged_kernel_lens.to(torch.int32)
         wrapper.plan(
@@ -406,6 +407,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
+        self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.attn_backend = attn_backend
@@ -484,7 +486,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
         qo_indptr = qo_indptr[: bs + 1]
-        sm_scale = 1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+        sm_scale = self.scaling
 
         # extend part
         if use_ragged:
