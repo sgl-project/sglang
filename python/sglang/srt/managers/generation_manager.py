@@ -23,7 +23,6 @@ from http import HTTPStatus
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -58,7 +57,7 @@ class GenerationManager:
         self.server_args = server_args
         self.on_request = on_request
 
-        self.model_config = _compute_model_config(server_args)
+        self.model_config = _create_model_config_from_server_args(server_args)
         self.generation_converter = GenerationConverter(server_args=server_args)
 
         self.rid_to_state: Dict[str, _ReqState] = {}
@@ -288,7 +287,7 @@ class GenerationConverter:
         server_args: ServerArgs,
     ):
         self.server_args = server_args
-        self.model_config = _compute_model_config(server_args)
+        self.model_config = _create_model_config_from_server_args(server_args)
 
         # Create image processor placeholder
         self.image_processor = get_dummy_image_processor()
@@ -557,7 +556,7 @@ class GenerationConverter:
         return ret
 
 
-def _compute_model_config(server_args: ServerArgs):
+def _create_model_config_from_server_args(server_args: ServerArgs):
     return ModelConfig(
         server_args.model_path,
         trust_remote_code=server_args.trust_remote_code,
