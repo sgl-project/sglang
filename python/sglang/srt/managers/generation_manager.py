@@ -1,3 +1,16 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 import asyncio
 import copy
 import dataclasses
@@ -22,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    ConfigureLoggingReq,
     EmbeddingReqInput,
     GenerateReqInput,
     SessionParams,
@@ -36,6 +50,27 @@ from sglang.srt.utils import dataclass_to_string_truncated
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass
+class _MetricReqState:
+    created_time: float
+    first_token_time: Optional[float] = None
+
+
+@dataclasses.dataclass
+class _ReqState:
+    """Store the state a request."""
+
+    out_list: List
+    finished: bool
+    event: asyncio.Event
+    obj: Any
+
+    metric: _MetricReqState
+
+    # For streaming output
+    last_output_offset: int = 0
+
+
 class GenerationManager:
     def __init__(
         self,
@@ -45,7 +80,7 @@ class GenerationManager:
         self.server_args = server_args
         self.on_request = on_request
 
-        self.model_config = _compute_model_config(server_args)
+        self.model_config = _create_model_config_from_server_args(server_args)
         self.generation_converter = GenerationConverter(server_args=server_args)
 
         self.rid_to_state: Dict[str, _ReqState] = {}
@@ -58,10 +93,10 @@ class GenerationManager:
         else:
             self._metric_manager = None
 
-        self.request_logger = _RequestLogger(server_args)
-        self.request_dumper = _RequestDumper()
+        self._request_logger = _RequestLogger(server_args)
+        self._request_dumper = _RequestDumper()
 
-    async def generate(
+    async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
@@ -76,7 +111,7 @@ class GenerationManager:
 
         obj.normalize_batch_and_arguments()
 
-        self.request_logger.log_generate(obj)
+        self._request_logger.log_generation(obj)
 
         is_single = obj.is_single
         if is_single:
@@ -124,7 +159,7 @@ class GenerationManager:
 
             state.out_list = []
             if state.finished:
-                self.request_logger.log_response(obj, out)
+                self._request_logger.log_response(obj, out)
                 del self.rid_to_state[obj.rid]
 
                 # Check if this was an abort/error created by scheduler
@@ -253,7 +288,7 @@ class GenerationManager:
                     stream=state.obj.stream if hasattr(state.obj, "stream") else None,
                 )
 
-            self.request_dumper.maybe_dump_requests(state=state, out_dict=out_dict)
+            self._request_dumper.maybe_dump_requests(state=state, out_dict=out_dict)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
@@ -266,6 +301,16 @@ class GenerationManager:
     def tokenizer(self):
         return self.generation_converter.tokenizer
 
+    def configure_logging(self, obj: ConfigureLoggingReq):
+        self._request_logger.configure(
+            log_requests=obj.log_requests, log_requests_level=obj.log_requests_level
+        )
+        self._request_dumper.configure(
+            dump_requests_folder=obj.dump_requests_folder,
+            dump_requests_threshold=obj.dump_requests_threshold,
+        )
+        logging.info(f"Config logging: {obj=}")
+
 
 class GenerationConverter:
     """Preprocessors and postprocessors for generation"""
@@ -275,7 +320,7 @@ class GenerationConverter:
         server_args: ServerArgs,
     ):
         self.server_args = server_args
-        self.model_config = _compute_model_config(server_args)
+        self.model_config = _create_model_config_from_server_args(server_args)
 
         # Create image processor placeholder
         self.image_processor = get_dummy_image_processor()
@@ -544,7 +589,7 @@ class GenerationConverter:
         return ret
 
 
-def _compute_model_config(server_args: ServerArgs):
+def _create_model_config_from_server_args(server_args: ServerArgs):
     return ModelConfig(
         server_args.model_path,
         trust_remote_code=server_args.trust_remote_code,
@@ -570,7 +615,7 @@ class _MetricManager:
         self,
         recv_obj,
         i: int,
-        state: "_MetricReqState",
+        state: _MetricReqState,
         finished: bool,
         stream: Optional[bool],
     ):
@@ -611,7 +656,13 @@ class _RequestLogger:
         self.log_requests = server_args.log_requests
         self.log_requests_level = 0
 
-    def log_generate(self, obj):
+    def configure(self, log_requests, log_requests_level):
+        if log_requests is not None:
+            self.log_requests = log_requests
+        if log_requests_level is not None:
+            self.log_requests_level = log_requests_level
+
+    def log_generation(self, obj):
         if self.log_requests:
             max_length = 2048 if self.log_requests_level == 0 else 1 << 30
             logger.info(
@@ -631,11 +682,17 @@ class _RequestDumper:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
 
-    def maybe_dump_requests(self, state: "_ReqState", out_dict: dict):
+    def configure(self, dump_requests_folder, dump_requests_threshold):
+        if dump_requests_folder is not None:
+            self.dump_requests_folder = dump_requests_folder
+        if dump_requests_threshold is not None:
+            self.dump_requests_threshold = dump_requests_threshold
+
+    def maybe_dump_requests(self, state: _ReqState, out_dict: dict):
         if self.dump_requests_folder and state.finished and state.obj.log_metrics:
             self._dump_requests(state, out_dict)
 
-    def _dump_requests(self, state: "_ReqState", out_dict: dict):
+    def _dump_requests(self, state: _ReqState, out_dict: dict):
         self.dump_request_list.append(
             (state.obj, out_dict, state.metric.created_time, time.time())
         )
@@ -657,24 +714,3 @@ class _RequestDumper:
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
-
-
-@dataclasses.dataclass
-class _ReqState:
-    """Store the state a request."""
-
-    out_list: List
-    finished: bool
-    event: asyncio.Event
-    obj: Any
-
-    metric: "_MetricReqState"
-
-    # For streaming output
-    last_output_offset: int = 0
-
-
-@dataclasses.dataclass
-class _MetricReqState:
-    created_time: float
-    first_token_time: Optional[float] = None
