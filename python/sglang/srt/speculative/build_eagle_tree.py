@@ -18,23 +18,56 @@ def build_tree_kernel_efficient_preprocess(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
-    num_verify_tokens: int,
+    topm: int,
 ):
+    """
+    Rerank and select topm tokens with highest prob from ALL the tokens
+
+    Args:
+        score_list: n [bs, 1, topk], n = 1 + (num_steps-1) * self.topk, of all tokens
+        parents_list: list of size of depth tensors of:
+            1. [0]:  [bs, topk + 1], plus 1 is for the root
+            2. [1:]: [bs, topk]
+    Returns:
+        parents_list: [bs, topk * (depth - 1) + 1)], top-k selected tokens from each expanded layer, in the entire tree
+            e.g. topk = 3: [-1,0,1,2], [3,5,6] from [3, 11]
+            index in selected top-k tokens -> index of them in entire tree
+        top_scores_index:
+            index in selected top-m tokens(of each rerank process) -> index of them in entire tree
+    """
+    # print(f"score_list {score_list[0].shape}")
+
     score_list = torch.cat(score_list, dim=1).flatten(
         1
-    )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
+    )  # b, n * topk; n = 1 + (num_steps-1) * self.topk
     ss_token_list = torch.cat(
         token_list, dim=1
     )  # b, (self.topk + (num_steps-1) * self.topk)
-    top_scores = torch.topk(score_list, num_verify_tokens - 1, dim=-1)
+    # print(f"score_list {score_list.shape}")
+    # print(f"topm {topm}")
+    actual_m = min(topm, score_list.size(-1))
+    top_scores = torch.topk(score_list, actual_m - 1, dim=-1)
+    # top_scores = torch.topk(score_list, topm - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
-
+    # print(f"top_scores_index {top_scores_index}")
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
     draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
-    parent_list = torch.cat(parents_list[:-1], dim=1)
 
-    return parent_list, top_scores_index, draft_tokens
+    # print(f"parent_list: {parents_list}")
+
+    if len(parents_list) == 1:
+        parents = parents_list[0]
+        parents_shape = list(parents.shape)
+        parents_shape[1] = 0
+        # print(f"shape: {parents_shape}")
+        parent_list = torch.empty(parents_shape).to(parents.device)
+    else:
+        parent_list = torch.cat(parents_list[:-1], dim=1)
+
+    # print(f"parent_list shape: {parent_list.shape}")
+
+    return actual_m, parent_list, top_scores_index, draft_tokens
 
 
 def build_tree_kernel_efficient(
@@ -46,15 +79,15 @@ def build_tree_kernel_efficient(
     seq_lens_sum: int,
     topk: int,
     spec_steps: int,
-    num_verify_tokens: int,
+    draft_token_num: int,
 ):
-    parent_list, top_scores_index, draft_tokens = (
+    actual_k, parent_list, top_scores_index, draft_tokens = (
         build_tree_kernel_efficient_preprocess(
             verified_id,
             score_list,
             token_list,
             parents_list,
-            num_verify_tokens,
+            topm=draft_token_num,
         )
     )
 
@@ -65,26 +98,23 @@ def build_tree_kernel_efficient(
     # where each row indicates the attending pattern of each draft token
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
     tree_mask = torch.full(
-        (
-            seq_lens_sum * num_verify_tokens
-            + num_verify_tokens * num_verify_tokens * bs,
-        ),
+        (seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs,),
         True,
         device=device,
     )
     retrive_index = torch.full(
-        (bs, num_verify_tokens), -1, device=device, dtype=torch.long
+        (bs, draft_token_num), -1, device=device, dtype=torch.long
     )
     retrive_next_token = torch.full(
-        (bs, num_verify_tokens), -1, device=device, dtype=torch.long
+        (bs, draft_token_num), -1, device=device, dtype=torch.long
     )
     retrive_next_sibling = torch.full(
-        (bs, num_verify_tokens), -1, device=device, dtype=torch.long
+        (bs, draft_token_num), -1, device=device, dtype=torch.long
     )
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
-    positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
+    positions = torch.empty((bs * draft_token_num,), device=device, dtype=torch.long)
 
     sgl_build_tree_kernel_efficient(
         parent_list,
@@ -95,9 +125,9 @@ def build_tree_kernel_efficient(
         retrive_index,
         retrive_next_token,
         retrive_next_sibling,
-        topk,
-        spec_steps,
-        num_verify_tokens,
+        topk=topk,
+        depth=spec_steps,
+        draft_token_num=draft_token_num,
     )
     return (
         tree_mask,
@@ -116,35 +146,40 @@ def build_tree_kernel(
     parents_list: List[torch.Tensor],
     seq_lens: torch.Tensor,
     seq_lens_sum: int,
-    topk: int,
+    top_k: int,
     spec_steps: int,
-    num_verify_tokens: int,
+    top_m: int,
 ):
-    parent_list, top_scores_index, draft_tokens = (
+    """
+    Build the tree for verification
+    """
+    actual_draft_token_num, parent_list, top_scores_index, draft_tokens = (
         build_tree_kernel_efficient_preprocess(
             verified_id,
             score_list,
             token_list,
             parents_list,
-            num_verify_tokens,
+            top_m,
         )
     )
+    # print(f"actual_draft_token_num: {actual_draft_token_num}")
+    # print(f"draft_token_num: {top_m}")
 
+    top_m = actual_draft_token_num
     bs = seq_lens.numel()
     device = seq_lens.device
 
     tree_mask = torch.full(
-        (
-            seq_lens_sum * num_verify_tokens
-            + num_verify_tokens * num_verify_tokens * bs,
-        ),
+        (seq_lens_sum * top_m + top_m * top_m * bs,),
         True,
         device=device,
     )
-    retrive_index = torch.full(
-        (bs, num_verify_tokens, spec_steps + 2), -1, device=device, dtype=torch.long
+    retrieve_index = torch.full(
+        (bs, top_m, spec_steps + 2), -1, device=device, dtype=torch.long
     )
-    positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
+    positions = torch.empty((bs * top_m,), device=device, dtype=torch.long)
+    # print(f"retrieve_index: {retrieve_index}")
+    # print(f"retrieve_index shape: {retrieve_index.shape}")
 
     sgl_build_tree_kernel(
         parent_list,
@@ -152,21 +187,29 @@ def build_tree_kernel(
         seq_lens.to(torch.int32),
         tree_mask,
         positions,
-        retrive_index,
-        topk,
-        spec_steps,
-        num_verify_tokens,
+        retrieve_index,
+        topk=top_k,
+        depth=spec_steps,
+        # draft_token_num=draft_token_num,
+        draft_token_num=top_m,
     )
 
-    index = retrive_index.sum(dim=-1) != -spec_steps - 2
+    # print(f"retrieve_index: {retrieve_index}")
+    spec_steps = retrieve_index.shape[2]
+    # get the index of top_m tokens which have at least one retrieved in all steps
+    # [bs, top_m]
+    index = retrieve_index.sum(dim=-1) != -spec_steps
+    # cum_len of selected token in each batch
+    # [bs]
     cum_len = torch.cumsum(torch.sum(index, dim=-1), dim=-1)
-    retrive_cum_len = torch.zeros(
+    retrieve_cum_len = torch.zeros(
         (cum_len.numel() + 1,), dtype=torch.int32, device="cuda"
     )
-    retrive_cum_len[1:] = cum_len
+    retrieve_cum_len[1:] = cum_len
     # TODO: this indexing cause a synchronization, optimize this
-    retrive_index = retrive_index[index]
-    return tree_mask, positions, retrive_index, retrive_cum_len, draft_tokens
+    # all retrieved indices
+    retrieve_index = retrieve_index[index]
+    return tree_mask, positions, retrieve_index, retrieve_cum_len, draft_tokens
 
 
 def test_build_tree_kernel():
@@ -620,9 +663,9 @@ def test_build_tree_kernel_efficient():
             parents_list=parents_list,
             seq_lens=seq_lens,
             seq_lens_sum=torch.sum(seq_lens).item(),
-            topk=topk,
+            top_k=topk,
             spec_steps=depth,
-            num_verify_tokens=num_draft_token,
+            top_m=num_draft_token,
         )
     )
 
@@ -634,7 +677,24 @@ def test_build_tree_kernel_efficient():
     first_rank_print(f"{retrive_index=}", flush=True)
     first_rank_print(f"{retrive_cum_len=}", flush=True)
     first_rank_print(f"{draft_tokens=}", flush=True)
-    assert position.tolist() == [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
+    assert position.tolist() == [
+        5,
+        6,
+        6,
+        7,
+        7,
+        8,
+        8,
+        9,
+        10,
+        11,
+        12,
+        12,
+        12,
+        12,
+        13,
+        14,
+    ]
     assert retrive_index.tolist() == [
         [0, -1, -1, -1, -1, -1],
         [0, 2, 4, 6, -1, -1],
@@ -680,8 +740,9 @@ def test_build_tree_kernel_efficient():
         seq_lens=seq_lens,
         seq_lens_sum=torch.sum(seq_lens).item(),
         topk=topk,
+        # num_verify_tokens=topm,
         spec_steps=depth,
-        num_verify_tokens=num_draft_token,
+        draft_token_num=num_draft_token,
     )
 
     first_rank_print("=========== build tree kernel efficient ==========")
@@ -691,7 +752,24 @@ def test_build_tree_kernel_efficient():
     first_rank_print(f"{retrive_next_token=}", flush=True)
     first_rank_print(f"{retrive_next_sibling=}", flush=True)
     first_rank_print(f"{draft_tokens=}", flush=True)
-    assert position.tolist() == [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
+    assert position.cpu().tolist() == [
+        5,
+        6,
+        6,
+        7,
+        7,
+        8,
+        8,
+        9,
+        10,
+        11,
+        12,
+        12,
+        12,
+        12,
+        13,
+        14,
+    ]
     assert retrive_index.tolist() == [
         [0, 1, 2, 3, 4, 5, 6, 7],
         [8, 9, 10, 11, 12, 13, 14, 15],
@@ -726,4 +804,4 @@ def test_build_tree_kernel_efficient():
 
 if __name__ == "__main__":
     test_build_tree_kernel_efficient()
-    test_build_tree_kernel()
+    # test_build_tree_kernel()

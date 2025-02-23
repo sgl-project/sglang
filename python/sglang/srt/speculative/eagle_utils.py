@@ -171,8 +171,9 @@ class EagleVerifyInput:
     retrive_next_token: torch.Tensor
     retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
-    draft_token_num: int
+    topk: int
     spec_steps: int
+    draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
 
     @classmethod
@@ -186,11 +187,11 @@ class EagleVerifyInput:
         seq_lens_sum: int,
         topk: int,
         spec_steps: int,
-        num_verify_tokens: int,
+        draft_token_num: int,
         is_all_greedy: bool,
     ):
         if is_all_greedy:
-            tree_mask, position, retrive_index, retrive_cum_len, draft_tokens = (
+            tree_mask, position, retrieve_index, retrive_cum_len, draft_tokens = (
                 build_tree_kernel(
                     verified_id,
                     score_list,  # b, n, topk; n= 1 + (num_steps-1) * self.topk
@@ -198,9 +199,9 @@ class EagleVerifyInput:
                     parents_list,
                     seq_lens,
                     seq_lens_sum,
-                    topk,
-                    spec_steps,
-                    num_verify_tokens,
+                    top_k=topk,
+                    spec_steps=spec_steps,
+                    top_m=draft_token_num,
                 )
             )
 
@@ -208,21 +209,22 @@ class EagleVerifyInput:
                 draft_tokens,
                 tree_mask,
                 position,
-                retrive_index,
+                retrieve_index,
                 None,
                 None,
                 retrive_cum_len,
-                num_verify_tokens,
-                spec_steps,
-                CaptureHiddenMode.FULL,
+                topk=topk,
+                spec_steps=spec_steps,
+                draft_token_num=draft_token_num,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
         else:
             (
                 tree_mask,
                 position,
-                retrive_index,
-                retrive_next_token,
-                retrive_next_sibling,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
                 draft_tokens,
             ) = build_tree_kernel_efficient(
                 verified_id,
@@ -231,22 +233,23 @@ class EagleVerifyInput:
                 parents_list,
                 seq_lens,
                 seq_lens_sum,
-                topk,
-                spec_steps,
-                num_verify_tokens,
+                topk=topk,
+                spec_steps=spec_steps,
+                draft_token_num=draft_token_num,
             )
 
             return cls(
                 draft_tokens,
                 tree_mask,
                 position,
-                retrive_index,
-                retrive_next_token,
-                retrive_next_sibling,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
                 None,
-                num_verify_tokens,
-                spec_steps,
-                CaptureHiddenMode.FULL,
+                topk=topk,
+                spec_steps=spec_steps,
+                draft_token_num=draft_token_num,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
     def prepare_for_verify(self, batch: ScheduleBatch):
@@ -651,14 +654,15 @@ def generate_draft_decode_kv_indices(
 
 @torch.compile
 def select_top_k_tokens(
-    i: int,
+    step: int,
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
     hidden_states: torch.Tensor,
     scores: torch.Tensor,
     topk: int,
 ):
-    if i == 0:
+    # print(f"topk_p shape: {topk_p.shape}")
+    if step == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
         hidden_states = hidden_states.repeat_interleave(topk, dim=0)
@@ -694,9 +698,8 @@ def select_top_k_tokens(
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)
             topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
+            topk_cs_index + (topk**2 * (step - 1) + topk),  # shape: (b, topk)
         )
-
     return input_ids, hidden_states, scores, tree_info
 
 

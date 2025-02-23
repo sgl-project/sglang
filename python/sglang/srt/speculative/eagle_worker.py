@@ -203,10 +203,10 @@ class EAGLEWorker(TpModelWorker):
             parents_list,
             batch.seq_lens,
             batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.server_args.speculative_num_draft_tokens,
-            batch.sampling_info.is_all_greedy,
+            draft_token_num=self.server_args.speculative_num_draft_tokens,
+            topk=self.topk,
+            spec_steps=self.speculative_num_steps,
+            is_all_greedy=batch.sampling_info.is_all_greedy,
         )
 
         # Free cache locations
@@ -215,6 +215,11 @@ class EAGLEWorker(TpModelWorker):
         return ret
 
     def draft_forward(self, forward_batch: ForwardBatch):
+        """
+
+        Returns:
+            parents_list: list of [bs, topk * (depth - 1) + 1)]
+        """
         # Parse args
         spec_info = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
@@ -231,16 +236,16 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
-        for i in range(self.speculative_num_steps):
+        for step in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+                step, topk_p, topk_index, hidden_states, scores, self.topk
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
 
             # we don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
+            if step == self.speculative_num_steps - 1:
                 break
 
             # Set inputs
@@ -248,12 +253,12 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.out_cache_loc = out_cache_loc[
                 forward_batch.batch_size
                 * self.topk
-                * i : forward_batch.batch_size
+                * step : forward_batch.batch_size
                 * self.topk
-                * (i + 1)
+                * (step + 1)
             ]
             forward_batch.positions.add_(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[step]
             spec_info.hidden_states = hidden_states
 
             # Run forward
@@ -271,6 +276,8 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
+        # print(f"{model_worker_batch.input_ids}")
+        print(f"model_worker_batch: {model_worker_batch}")
         logits_output, _ = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True
         )

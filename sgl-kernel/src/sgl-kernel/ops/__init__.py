@@ -1,7 +1,5 @@
-import os
 from typing import List, Optional, Tuple, Union
 
-import sgl_kernel.ops._kernels
 import torch
 from sgl_kernel.ops.utils import (
     _get_cache_buf,
@@ -578,6 +576,8 @@ def build_tree_kernel(
     draft_token_num: int,
 ) -> None:
     with parent_list.device as device:
+        print(f"draft_token_num: {draft_token_num}")
+        print(f"num_verify_steps: {topk}")
         torch.ops.sgl_kernels.build_tree_kernel(
             parent_list,
             selected_index,
@@ -585,9 +585,9 @@ def build_tree_kernel(
             tree_mask,
             positions,
             retrive_index,
-            topk,
-            depth,
-            draft_token_num,
+            topk=topk,
+            depth=depth,
+            top_m=draft_token_num,
         )
 
 

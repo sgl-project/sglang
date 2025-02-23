@@ -725,7 +725,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-num-draft-tokens",
             type=int,
-            help="The number of token sampled from draft model in Speculative Decoding.",
+            help="The number of token sampled from draft model in Speculative Decoding. For EAGLE2, it's the number of token selected from the expanded draft tree for reranking.",
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
