@@ -67,14 +67,34 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void store_global_cumsum(int* cumsum /*dest*/, i
   grid.sync();
 }
 
-SGLANG_FORCE_INLINE_DEVICE_FUNC void align_global_cumsum(int32_t* local_offsets /*src_and_dest*/, const int tid,
+SGLANG_FORCE_INLINE_DEVICE_FUNC void align_global_cumsum(int32_t* local_offsets /*src_and_dest*/,
+                                                         int32_t* local_offsets_buf, int* smem_ptr, const int tid,
                                                          const int32_t& block_size, const int32_t& num_experts) {
+  int active_threads = CEILDIV(num_experts, kElementsPerThr);
   if (tid == 0) {
-    for (int i = num_experts; i > 0; i--) {
-      local_offsets[i] = local_offsets[i] - local_offsets[i - 1];
+    smem_ptr[0] = 0;
+  }
+  for (int i = tid * kElementsPerThr + 1; i < MIN((tid + 1) * kElementsPerThr + 1, num_experts + 1); ++i) {
+    smem_ptr[i] = local_offsets[i] - local_offsets[i - 1];
+  }
+  __syncthreads();
+
+  for (int i = tid * kElementsPerThr + 1; i < MIN((tid + 1) * kElementsPerThr + 1, num_experts + 1); ++i) {
+    int last_val = (i - 1) % kElementsPerThr == 0 ? 0 : local_offsets[i - 1];
+    local_offsets[i] = last_val + CEILDIV(smem_ptr[i], block_size) * block_size;
+  }
+
+  local_offsets_buf[tid] = local_offsets[(tid + 1) * kElementsPerThr];
+  __syncthreads();
+
+  if (tid < active_threads && tid > 0) {
+    int offset = 0;
+    for (int j = 0; j < threadIdx.x; ++j) {
+      offset += local_offsets_buf[j];
     }
-    for (int i = 1; i < num_experts + 1; i++) {
-      local_offsets[i] = local_offsets[i - 1] + CEILDIV(local_offsets[i], block_size) * block_size;
+
+    for (int i = tid * kElementsPerThr + 1; i < MIN((tid + 1) * kElementsPerThr + 1, num_experts + 1); ++i) {
+      local_offsets[i] += offset;
     }
   }
   __syncthreads();
@@ -128,7 +148,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_pt
             int gWarpColOff_0 = (warp_id / kWarpsToLoad * fragments_per_warp + j) * FRAG_SIZE_N;
             int gCol = gBlockColOff + gWarpColOff_0 + sThrColOff;
             if (gCol < num_experts) {
-              atomicAdd(tokens_cnts_ptr + gCol, *(smem_ptr + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol));
+              atomicAdd(local_offsets + gCol + 1, *(smem_ptr + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol));
             }
           }
         }
@@ -137,6 +157,11 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_pt
 
     }  // end of j
   }    // end of i
+
+  if (threadIdx.x < num_experts) {
+    atomicAdd(tokens_cnts_ptr + threadIdx.x, *(local_offsets + threadIdx.x + 1));
+  }
+
   __threadfence_system();
   grid.sync();
 
@@ -155,8 +180,9 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void parallel_unaligned_local_cumsum(
   if (threadIdx.x == 0) {
     local_offsets[0] = 0;
   }
-  if (threadIdx.x < active_threads - 1) {
-    for (int i = threadIdx.x * kElementsPerThr + 1; i < (threadIdx.x + 1) * kElementsPerThr + 1; ++i) {
+  if (threadIdx.x < active_threads) {
+    for (int i = threadIdx.x * kElementsPerThr + 1; i < MIN((threadIdx.x + 1) * kElementsPerThr + 1, num_experts + 1);
+         ++i) {
       int warp_idx = (i - 1) / experts_per_warp;
       int expert_offset = (i - 1) % experts_per_warp;
 
@@ -168,39 +194,16 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void parallel_unaligned_local_cumsum(
 
     local_offsets_buf[threadIdx.x] = local_offsets[(threadIdx.x + 1) * kElementsPerThr];
   }
-
-  if (threadIdx.x == active_threads - 1) {
-#pragma unroll
-    for (int i = threadIdx.x * kElementsPerThr + 1; i < num_experts + 1; ++i) {
-      int warp_idx = (i - 1) / experts_per_warp;
-      int expert_offset = (i - 1) % experts_per_warp;
-
-      int expert_count = shared_counts[warp_idx][expert_offset];
-
-      int last_val = (i - 1) % kElementsPerThr == 0 ? 0 : local_offsets[i - 1];
-      local_offsets[i] = last_val + expert_count;
-    }
-
-    local_offsets_buf[threadIdx.x] = local_offsets[num_experts];
-  }
   __syncthreads();
 
-  if (threadIdx.x < active_threads - 1 && threadIdx.x > 0) {
+  if (threadIdx.x < active_threads && threadIdx.x > 0) {
     int offset = 0;
     for (int j = 0; j < threadIdx.x; ++j) {
       offset += local_offsets_buf[j];
     }
 
-    for (int i = threadIdx.x * kElementsPerThr + 1; i < (threadIdx.x + 1) * kElementsPerThr + 1; ++i) {
-      local_offsets[i] += offset;
-    }
-  }
-  if (threadIdx.x == active_threads - 1) {
-    int offset = 0;
-    for (int j = 0; j < threadIdx.x; ++j) {
-      offset += local_offsets_buf[j];
-    }
-    for (int i = threadIdx.x * kElementsPerThr + 1; i < num_experts + 1; ++i) {
+    for (int i = threadIdx.x * kElementsPerThr + 1; i < MIN((threadIdx.x + 1) * kElementsPerThr + 1, num_experts + 1);
+         ++i) {
       local_offsets[i] += offset;
     }
   }
@@ -226,7 +229,7 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
                                             int32_t block_size, size_t numel, int32_t* __restrict__ tokens_cnts,
                                             int32_t* __restrict__ cumsum, const int tokens_per_block,
                                             const int tokens_per_thread, const int K) {
-  __shared__ int32_t smem[FRAG_SIZE_M * FRAG_SIZE_N * FRAGS_PER_BLOCK];
+  __shared__ int32_t smem[FRAG_SIZE_M * FRAG_SIZE_N * FRAGS_PER_BLOCK + 1];
   int32_t(*shared_counts)[EXPERTS_PER_WARP] = (int32_t(*)[EXPERTS_PER_WARP]) & smem[0];
 
   __shared__ int32_t local_offsets[MAX_NUM_EXPERTS + 1];
@@ -268,7 +271,7 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
   reduce_unaligned_cumsum(tokens_cnts_ptr /*src_and_dest*/, smem_ptr, local_offsets, tid, lane_id, warp_id, num_experts,
                           grid);
 
-  align_global_cumsum(local_offsets /*src_and_dest*/, tid, block_size, num_experts);
+  align_global_cumsum(local_offsets /*src_and_dest*/, local_offsets_buf, smem_ptr, tid, block_size, num_experts);
 
   store_global_cumsum(cumsum /*dest*/, total_tokens_post_pad /*dest*/, local_offsets /*src*/, tid, num_experts, grid);
 
