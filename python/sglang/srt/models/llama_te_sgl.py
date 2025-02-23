@@ -200,6 +200,7 @@ class TELlamaDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         # TE's LayerNormMLP (combines post_attention_layernorm and MLP)
+        # We don't need to return_layernorm_output and return_layernorm_output_gathered
         self.layernorm_mlp = te.pytorch.LayerNormMLP(
             hidden_size=self.hidden_size,
             ffn_hidden_size=config.intermediate_size,
@@ -207,8 +208,8 @@ class TELlamaDecoderLayer(nn.Module):
             # tp_group=tp_group,
             tp_size=tp_size,
             bias=False,
-            return_layernorm_output=True,
-            return_layernorm_output_gathered=True,
+            return_layernorm_output=False,
+            return_layernorm_output_gathered=False,
             set_parallel_mode=True,
             ub_bulk_wgrad=True,
             ub_bulk_dgrad=True,
@@ -234,18 +235,24 @@ class TELlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
         # Fully Connected with TE
-        tp_group = get_tp_group()
+        tp_group = get_tp_group().device_group
         self.layernorm_mlp.set_tensor_parallel_group(tp_group)
-        hidden_states, residual = self.layernorm_mlp(
+        
+        # This code is from rmsnorm forward_native in sglang
+        if residual is not None:
+            hidden_states = hidden_states + residual
+            residual = hidden_states
+
+        hidden_states = self.layernorm_mlp(
             hidden_states
-        )  # set return_layernorm_output = true
+        )
         return hidden_states, residual
 
 
@@ -457,86 +464,82 @@ class TELlamaForCausalLM(nn.Module):
                 qkv_name = name.replace(
                     "self_attn.q_proj.weight", "self_attn.qkv_proj.weight"
                 )
-                if qkv_name in params_dict:
-                    param = params_dict[qkv_name]
-                    # weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, "q")
+                assert qkv_name in params_dict
+                param = params_dict[qkv_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, "q")
 
             elif "self_attn.k_proj.weight" in name:
                 qkv_name = name.replace(
                     "self_attn.k_proj.weight", "self_attn.qkv_proj.weight"
                 )
-                if qkv_name in params_dict:
-                    param = params_dict[qkv_name]
-                    # weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, "k")
+                assert qkv_name in params_dict
+                param = params_dict[qkv_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, "k")
 
             elif "self_attn.v_proj.weight" in name:
                 qkv_name = name.replace(
                     "self_attn.v_proj.weight", "self_attn.qkv_proj.weight"
                 )
-                if qkv_name in params_dict:
-                    param = params_dict[qkv_name]
-                    # weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    # print(f"param of v_proj and qkv_name: {param}")
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, "v")
-
+                assert qkv_name in params_dict
+                param = params_dict[qkv_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, "v")
+            
+            # 处理 TE LayerNormMLP
             elif "post_attention_layernorm.weight" in name:
                 te_name = name.replace(
                     "post_attention_layernorm.weight", "layernorm_mlp.layer_norm_weight"
                 )
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    # print(f"param of layernorm_weight: {param}")
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    # param.data[:] = loaded_weight
-                    weight_loader(param, loaded_weight)
-                    # weight_loader = param.weight_loader
-                    # weight_loader(param, loaded_weight)
+                param = params_dict[te_name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
 
-            # 处理 TE 的 MLP 权重
+            elif "mlp.up_proj.weight" in name:
+                te_name = name.replace(
+                    "mlp.up_proj.weight", "layernorm_mlp.fc1_weight"
+                )
+                assert te_name in params_dict
+                param = params_dict[te_name]
+                up_chunks = torch.chunk(loaded_weight, tp_size, dim=0)
+                shard_size = param.size(0) // 2
+                default_weight_loader(
+                    param.narrow(0, shard_size, shard_size), 
+                    up_chunks[tp_rank]
+                )
+
             elif "mlp.gate_proj.weight" in name:
                 te_name = name.replace(
                     "mlp.gate_proj.weight", "layernorm_mlp.fc1_weight"
                 )
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    # print(f"param of fc_weight: {param}")
-                    # print(f"loaded_weight.size(0): {loaded_weight.size(0)}")
-                    # print(f"loaded_weight.size(1): {loaded_weight.size(1)}")
-                    # print(f"self.config.intermediate_size: {self.config.intermediate_size}")
-                    # param.data[:self.config.intermediate_size] = loaded_weight
-                    # weight_loader = param.weight_loader
-                    # weight_loader(param, loaded_weight, 0)
-
-            elif "mlp.up_proj.weight" in name:
-                te_name = name.replace("mlp.up_proj.weight", "layernorm_mlp.fc1_weight")
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    # param.data[loaded_weight.size(0):] = loaded_weight
-
+                assert te_name in params_dict
+                param = params_dict[te_name]
+                gate_chunks = torch.chunk(loaded_weight, tp_size, dim=0)
+                shard_size = param.size(0) // 2
+                default_weight_loader(
+                    param.narrow(0, 0, shard_size), 
+                    gate_chunks[tp_rank]
+                )
+                
             elif "mlp.down_proj.weight" in name:
                 te_name = name.replace(
                     "mlp.down_proj.weight", "layernorm_mlp.fc2_weight"
                 )
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    slice_size = loaded_weight.size(1) // tp_size
-                    start_idx = tp_rank * slice_size
-                    end_idx = (tp_rank + 1) * slice_size
-                    # param.data[:] = loaded_weight[:, start_idx:end_idx]
-
+                assert te_name in params_dict
+                param = params_dict[te_name]
+                down_chunks = torch.chunk(loaded_weight, tp_size, dim=1)
+                default_weight_loader(param, down_chunks[tp_rank])
+            
             # 处理其他权重
             elif name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
     ) -> Optional[torch.Tensor]:

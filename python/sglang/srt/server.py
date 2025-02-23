@@ -577,14 +577,15 @@ def _set_envs_and_config(server_args: ServerArgs):
         maybe_set_triton_cache_manager()
 
     # Check flashinfer version
-    if server_args.attention_backend == "flashinfer":
-        assert_pkg_version(
-            "flashinfer",
-            "0.1.6",
-            "Please uninstall the old version and "
-            "reinstall the latest version by following the instructions "
-            "at https://docs.flashinfer.ai/installation.html.",
-        )
+    # Currently, we use flashinfer-python, not flashinfer
+    # if server_args.attention_backend == "flashinfer":
+    #     assert_pkg_version(
+    #         "flashinfer",
+    #         "0.1.6",
+    #         "Please uninstall the old version and "
+    #         "reinstall the latest version by following the instructions "
+    #         "at https://docs.flashinfer.ai/installation.html.",
+    #     )
 
     # Register the signal handler.
     # The child processes will send SIGQUIT to this process when any error happens
