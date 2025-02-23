@@ -175,7 +175,7 @@ class TokenizerManager:
     ):
         self.auto_create_handle_loop()
         async with self.model_update_lock.reader_lock:
-            async for value in self._generation_manager.generate(obj, request):
+            async for value in self._generation_manager.generate_request(obj, request):
                 yield value
 
     def flush_cache(self):

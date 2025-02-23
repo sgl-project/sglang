@@ -94,7 +94,7 @@ class GenerationManager:
         self._request_logger = _RequestLogger(server_args)
         self._request_dumper = _RequestDumper()
 
-    async def generate(
+    async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
