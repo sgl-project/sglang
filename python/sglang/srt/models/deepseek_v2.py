@@ -755,6 +755,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             not global_server_args_dict["disable_mla"]
             and global_server_args_dict["enable_dp_attention"]
         )
+        self.enable_dp_linear = (
+            not global_server_args_dict["disable_mla"]
+            and global_server_args_dict["enable_dp_linear"]
+        )
         if self.enable_dp_attention:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
@@ -777,7 +781,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
                 use_dp=self.enable_dp_attention,
-                use_dp_linear=True,
+                use_dp_linear=self.enable_dp_linear,
             )
         else:
             self.self_attn = DeepseekV2Attention(

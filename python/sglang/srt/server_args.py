@@ -147,6 +147,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_dp_linear: bool = False
     enable_ep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -828,6 +829,11 @@ class ServerArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+        )
+        parser.add_argument(
+            "--enable-dp-linear",
+            action="store_true",
+            help="Enabling data parallelism for MLA Linear. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
             "--enable-ep-moe",

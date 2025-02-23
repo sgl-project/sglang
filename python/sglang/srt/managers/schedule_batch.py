@@ -64,6 +64,7 @@ global_server_args_dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "enable_dp_linear": ServerArgs.enable_dp_linear,
     "device": ServerArgs.device,
     "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
