@@ -38,7 +38,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     SessionParams,
     TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
+    TokenizedGenerateReqInput, ConfigureLoggingReq,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -298,6 +298,13 @@ class GenerationManager:
     @property
     def tokenizer(self):
         return self.generation_converter.tokenizer
+
+    def configure_logging(self, obj: ConfigureLoggingReq):
+        self.request_logger.configure(log_requests=obj.log_requests,
+                                      log_requests_level=obj.log_requests_level)
+        self.request_dumper.configure(dump_requests_folder=obj.dump_requests_folder,
+                                      dump_requests_threshold=obj.dump_requests_threshold)
+        logging.info(f"Config logging: {obj=}")
 
 
 class GenerationConverter:

@@ -331,11 +331,7 @@ class TokenizerManager:
         await self.send_to_scheduler.send_pyobj(obj)
 
     def configure_logging(self, obj: ConfigureLoggingReq):
-        self._generation_manager.request_logger.configure(log_requests=obj.log_requests,
-                                                          log_requests_level=obj.log_requests_level)
-        self._generation_manager.request_dumper.configure(dump_requests_folder=obj.dump_requests_folder,
-                                                          dump_requests_threshold=obj.dump_requests_threshold)
-        logging.info(f"Config logging: {obj=}")
+        self._generation_manager.configure_logging(obj)
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
