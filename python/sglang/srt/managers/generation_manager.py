@@ -88,7 +88,7 @@ class GenerationManager:
 
         obj.normalize_batch_and_arguments()
 
-        self.request_logger.log_generate(obj)
+        self.request_logger.log_generation(obj)
 
         is_single = obj.is_single
         if is_single:
@@ -623,7 +623,7 @@ class _RequestLogger:
         self.log_requests = server_args.log_requests
         self.log_requests_level = 0
 
-    def log_generate(self, obj):
+    def log_generation(self, obj):
         if self.log_requests:
             max_length = 2048 if self.log_requests_level == 0 else 1 << 30
             logger.info(
