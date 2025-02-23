@@ -242,6 +242,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
+    # Avoid InternalServerError when input is None
     @field_validator("content", mode="before")
     def handle_none_content(cls, v):
         """Convert None to empty string to avoid validation errors."""
