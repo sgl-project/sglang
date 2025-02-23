@@ -9,7 +9,7 @@ on:
     branches:
       - main
     paths:
-      - sgl-kernel/version.py
+      - sgl-kernel/src/sgl-kernel/version.py
 
 jobs:
   build-wheels:
@@ -59,7 +59,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cat sgl-kernel/src/sgl-kernel/version.py | cut -d'"' -f2)"
             echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT

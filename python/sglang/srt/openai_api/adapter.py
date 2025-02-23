@@ -20,11 +20,13 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
+
+from sglang.lang.chat_template import get_chat_template_by_model_path
 
 try:
     from outlines.fsm.json_schema import convert_json_schema_to_str
@@ -92,7 +94,6 @@ file_id_response: Dict[str, FileResponse] = {}
 # map file id to file path in SGLang backend
 file_id_storage: Dict[str, str] = {}
 
-
 # backend storage directory
 storage_dir = None
 
@@ -116,12 +117,13 @@ def create_streaming_error_response(
     return json_str
 
 
-def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
+def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, model_path):
     global chat_template_name
 
     logger.info(
         f"Use chat template for the OpenAI-compatible API server: {chat_template_arg}"
     )
+
     if not chat_template_exists(chat_template_arg):
         if not os.path.exists(chat_template_arg):
             raise RuntimeError(
@@ -162,6 +164,18 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
             chat_template_name = template["name"]
     else:
         chat_template_name = chat_template_arg
+
+    # check chat-template
+    chat_template = get_chat_template_by_model_path(model_path)
+    if chat_template is not None:
+        official_chat_template = chat_template.name
+        used_chat_template = chat_template_name
+        if official_chat_template != used_chat_template:
+            logger.warning(
+                f"Using a chat_template: '{used_chat_template}', "
+                f"which is different from official chat template: '{official_chat_template}', "
+                f"This discrepancy may lead to performance degradation."
+            )
 
 
 async def v1_files_create(file: UploadFile, purpose: str, file_storage_pth: str = None):
@@ -927,7 +941,13 @@ def v1_chat_generate_request(
                     )
 
                 if assistant_prefix:
-                    prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
+                    encoded = tokenizer_manager.tokenizer.encode(assistant_prefix)
+                    if (
+                        encoded
+                        and encoded[0] == tokenizer_manager.tokenizer.bos_token_id
+                    ):
+                        encoded = encoded[1:]
+                    prompt_ids += encoded
                 stop = request.stop
                 image_data = None
                 modalities = []

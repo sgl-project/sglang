@@ -22,6 +22,7 @@ We use [pre-commit](https://pre-commit.com/) to maintain consistent code style c
 
 ```bash
 pip3 install pre-commit
+pre-commit install
 pre-commit run --all-files
 ```
 

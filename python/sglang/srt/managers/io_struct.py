@@ -371,6 +371,8 @@ class BatchTokenIDOut:
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
 
+    output_hidden_states: List[List[float]]
+
 
 @dataclass
 class BatchStrOut:
@@ -396,6 +398,8 @@ class BatchStrOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
+
+    output_hidden_states: List[List[float]]
 
 
 @dataclass

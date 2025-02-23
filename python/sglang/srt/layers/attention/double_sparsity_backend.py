@@ -17,11 +17,9 @@ class DoubleSparseAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.double_sparsity_attention import (
+            extend_attention_fwd,
             flash_decode_attention_fwd,
             flash_decode_sparse_attention_fwd,
-        )
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
-            extend_attention_fwd,
         )
 
         super().__init__()

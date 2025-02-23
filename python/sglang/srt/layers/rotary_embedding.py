@@ -7,9 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from vllm import _custom_ops as ops
-from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.custom_op_util import register_custom_op
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda_available
 
 _is_cuda_available = is_cuda_available()
@@ -59,7 +58,6 @@ def _apply_rotary_emb(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-@register_custom_op("sglang_rotary_embedding")
 class RotaryEmbedding(CustomOp):
     """Original rotary positional embedding."""
 
