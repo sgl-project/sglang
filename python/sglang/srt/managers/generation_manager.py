@@ -91,8 +91,8 @@ class GenerationManager:
         else:
             self._metric_manager = None
 
-        self.request_logger = _RequestLogger(server_args)
-        self.request_dumper = _RequestDumper()
+        self._request_logger = _RequestLogger(server_args)
+        self._request_dumper = _RequestDumper()
 
     async def generate(
         self,
@@ -109,7 +109,7 @@ class GenerationManager:
 
         obj.normalize_batch_and_arguments()
 
-        self.request_logger.log_generation(obj)
+        self._request_logger.log_generation(obj)
 
         is_single = obj.is_single
         if is_single:
@@ -157,7 +157,7 @@ class GenerationManager:
 
             state.out_list = []
             if state.finished:
-                self.request_logger.log_response(obj, out)
+                self._request_logger.log_response(obj, out)
                 del self.rid_to_state[obj.rid]
 
                 # Check if this was an abort/error created by scheduler
@@ -286,7 +286,7 @@ class GenerationManager:
                     stream=state.obj.stream if hasattr(state.obj, "stream") else None,
                 )
 
-            self.request_dumper.maybe_dump_requests(state=state, out_dict=out_dict)
+            self._request_dumper.maybe_dump_requests(state=state, out_dict=out_dict)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
@@ -300,10 +300,10 @@ class GenerationManager:
         return self.generation_converter.tokenizer
 
     def configure_logging(self, obj: ConfigureLoggingReq):
-        self.request_logger.configure(log_requests=obj.log_requests,
-                                      log_requests_level=obj.log_requests_level)
-        self.request_dumper.configure(dump_requests_folder=obj.dump_requests_folder,
-                                      dump_requests_threshold=obj.dump_requests_threshold)
+        self._request_logger.configure(log_requests=obj.log_requests,
+                                       log_requests_level=obj.log_requests_level)
+        self._request_dumper.configure(dump_requests_folder=obj.dump_requests_folder,
+                                       dump_requests_threshold=obj.dump_requests_threshold)
         logging.info(f"Config logging: {obj=}")
 
 
