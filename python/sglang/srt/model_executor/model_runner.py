@@ -114,7 +114,7 @@ class ModelRunner:
             if self.server_args.device != "cpu":
                 if server_args.enable_flashinfer_mla:
                     logger.info(
-                        "FlashInfer MLA optimization is turned on. Use flashinfer mla backend for DeepseekV3ForCausalLM."
+                        "MLA optimization is turned on. Use flashinfer mla backend."
                     )
                     self.server_args.attention_backend = "flashinfer_mla"
                 else:

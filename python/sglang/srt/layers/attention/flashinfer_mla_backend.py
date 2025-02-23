@@ -69,10 +69,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
 
-        assert global_server_args_dict["enable_flashinfer_mla"] and (
-            "DeepseekV3ForCausalLM" in model_runner.model_config.hf_config.architectures
-        ), "FlashInferMLAAttnBackend can only be used on DeepSeek v3 model when enable_flashinfer_mla is True"
-
         global_config.enable_flashinfer_mla = True
 
         # Allocate buffers
@@ -109,16 +105,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             # use mla paged prefill
             self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
-                backend="fa2",
+                backend="auto",
             )
         else:
             self.prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
-                backend="fa2",
+                backend="auto",
             )
         self.decode_wrapper = BatchMLAPagedAttentionWrapper(
-            self.workspace_buffer, backend="fa2"
+            self.workspace_buffer, backend="auto"
         )
 
         # Create indices updater
@@ -198,7 +194,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_indptr=self.kv_indptr[: num_tokens + 1],
                 kv_indices=self.cuda_graph_kv_indices,
                 kv_len_arr=self.kv_last_page_len[:num_tokens],
-                backend="fa2",
+                backend="auto",
             )
 
             seq_lens_sum = seq_lens.sum().item()
