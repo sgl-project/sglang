@@ -23,6 +23,7 @@ from http import HTTPStatus
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
@@ -34,11 +35,12 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    ConfigureLoggingReq,
     EmbeddingReqInput,
     GenerateReqInput,
     SessionParams,
     TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput, ConfigureLoggingReq,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -300,10 +302,13 @@ class GenerationManager:
         return self.generation_converter.tokenizer
 
     def configure_logging(self, obj: ConfigureLoggingReq):
-        self._request_logger.configure(log_requests=obj.log_requests,
-                                       log_requests_level=obj.log_requests_level)
-        self._request_dumper.configure(dump_requests_folder=obj.dump_requests_folder,
-                                       dump_requests_threshold=obj.dump_requests_threshold)
+        self._request_logger.configure(
+            log_requests=obj.log_requests, log_requests_level=obj.log_requests_level
+        )
+        self._request_dumper.configure(
+            dump_requests_folder=obj.dump_requests_folder,
+            dump_requests_threshold=obj.dump_requests_threshold,
+        )
         logging.info(f"Config logging: {obj=}")
 
 
