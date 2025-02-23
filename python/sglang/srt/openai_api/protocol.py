@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing_extensions import Literal
 
 
@@ -242,10 +242,20 @@ class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
+    @field_validator("content", mode="before")
+    def handle_none_content(cls, v):
+        """Convert None to empty string to avoid validation errors."""
+        return "" if v is None else v
+
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+
+    @field_validator("content", mode="before")
+    def handle_none_content(cls, v):
+        """Convert None to empty string to avoid validation errors."""
+        return "" if v is None else v
 
 
 ChatCompletionMessageParam = Union[
@@ -346,6 +356,11 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
+    @field_validator("content", mode="before")
+    def handle_none_content(cls, v):
+        """Convert None to empty string to avoid validation errors."""
+        return "" if v is None else v
+
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
@@ -368,6 +383,11 @@ class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+
+    @field_validator("content", mode="before")
+    def handle_none_content(cls, v):
+        """Convert None to empty string to avoid validation errors."""
+        return "" if v is None else v
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
