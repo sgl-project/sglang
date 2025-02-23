@@ -644,6 +644,12 @@ class _RequestLogger:
         self.log_requests = server_args.log_requests
         self.log_requests_level = 0
 
+    def configure(self, log_requests, log_requests_level):
+        if log_requests is not None:
+            self.log_requests = log_requests
+        if log_requests_level is not None:
+            self.log_requests_level = log_requests_level
+
     def log_generation(self, obj):
         if self.log_requests:
             max_length = 2048 if self.log_requests_level == 0 else 1 << 30
@@ -663,6 +669,12 @@ class _RequestDumper:
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
+
+    def configure(self, dump_requests_folder, dump_requests_threshold):
+        if dump_requests_folder is not None:
+            self.dump_requests_folder = dump_requests_folder
+        if dump_requests_threshold is not None:
+            self.dump_requests_threshold = dump_requests_threshold
 
     def maybe_dump_requests(self, state: _ReqState, out_dict: dict):
         if self.dump_requests_folder and state.finished and state.obj.log_metrics:
