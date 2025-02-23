@@ -420,7 +420,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
-        self.head_dim = model_runner.model_config.head_dim
+        self.kv_lora_rank = model_runner.model_config.kv_lora_rank
+        self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
+        self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.v_head_dim = model_runner.model_config.v_head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.attn_backend = attn_backend
@@ -502,6 +505,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
         qo_indptr = qo_indptr[: bs + 1]
+        sm_scale = 1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
 
         # extend part
         if use_ragged:
@@ -510,8 +514,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indptr=qo_indptr,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
-                head_dim_qk=192,
-                head_dim_vo=128,
+                head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
             )
 
@@ -524,12 +528,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indices,
                 kv_len_arr,
                 self.num_qo_heads,
-                512,
-                64,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
                 1,
                 True,
-                1 / math.sqrt(192),
-                self.data_type,
+                sm_scale,
+                self.q_data_type,
                 self.data_type,
             )
 
