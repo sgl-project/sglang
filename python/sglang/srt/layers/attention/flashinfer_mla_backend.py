@@ -50,7 +50,6 @@ class PrefillMetadata:
         BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper
     ]
     use_ragged: bool
-    extend_no_prefix: bool
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -142,18 +141,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
                 decode_wrapper=self.decode_wrapper,
-                encoder_lens=forward_batch.encoder_lens,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
         else:
             prefix_lens = forward_batch.extend_prefix_lens
-
-            if not global_server_args_dict["disable_radix_cache"]:
-                use_ragged = False
-                extend_no_prefix = False
-            else:
-                use_ragged = True
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            use_ragged = global_server_args_dict["disable_radix_cache"]
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -162,10 +154,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefix_lens,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 use_ragged=use_ragged,
-                encoder_lens=forward_batch.encoder_lens,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_paged, use_ragged, extend_no_prefix
+                self.prefill_wrapper_paged, use_ragged
             )
 
     def init_cuda_graph_state(
@@ -216,7 +207,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens_sum,
                 decode_wrapper=decode_wrapper,
-                encoder_lens=encoder_lens,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
             self.forward_metadata = DecodeMetadata(decode_wrapper)
@@ -239,7 +229,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_sum,
                 decode_wrapper=self.decode_cuda_graph_metadata[bs],
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -355,7 +344,6 @@ class FlashInferMLAIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrapper: BatchMLAPagedAttentionWrapper,
-        encoder_lens: Optional[torch.Tensor],
     ):
         decode_wrappers = decode_wrapper or self.decode_wrapper
         self.call_begin_forward(
@@ -364,7 +352,6 @@ class FlashInferMLAIndicesUpdaterDecode:
             seq_lens,
             seq_lens_sum,
             self.kv_indptr,
-            None,
         )
 
     def call_begin_forward(
@@ -374,7 +361,6 @@ class FlashInferMLAIndicesUpdaterDecode:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
-        kv_start_idx: torch.Tensor,
     ):
         bs = len(req_pool_indices)
         kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -387,7 +373,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             req_pool_indices,
             paged_kernel_lens,
             kv_indptr,
-            kv_start_idx,
+            None,
             kv_indices,
             self.req_to_token.shape[1],
         )
@@ -445,7 +431,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
             BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper
         ],
         use_ragged: bool,
-        encoder_lens: Optional[torch.Tensor],
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -462,7 +447,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
             paged_kernel_lens_sum,
             seq_lens,
             prefix_lens,
-            None,
             self.kv_indptr,
             self.qo_indptr,
             use_ragged,
@@ -479,7 +463,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         paged_kernel_lens_sum: int,
         seq_lens: torch.Tensor,
         prefix_lens: torch.Tensor,
-        kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
@@ -489,7 +472,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indptr = kv_indptr[: bs + 1]
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + 256,
+            paged_kernel_lens_sum,
             dtype=torch.int32,
             device=req_pool_indices.device,
         )
@@ -498,7 +481,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             req_pool_indices,
             paged_kernel_lens,
             kv_indptr,
-            kv_start_idx,
+            None,
             kv_indices,
             self.req_to_token.shape[1],
         )
