@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -17,6 +18,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -24,16 +27,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.utils import is_hip, set_weight_attrs
-
-import os
 from sglang.srt.layers.quantization.fp8_utils import (
     BlockQuantScaleParameter,
     apply_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+from sglang.srt.utils import is_hip, set_weight_attrs
 
 is_hip_ = is_hip()
 
@@ -172,9 +171,13 @@ class EPMoE(torch.nn.Module):
         if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
             self.routed_scaling_factor = routed_scaling_factor
 
-            self.expert_mask = torch.zeros((self.num_experts + self.num_shared_experts + 1) , device='cuda', dtype=torch.int)
+            self.expert_mask = torch.zeros(
+                (self.num_experts + self.num_shared_experts + 1),
+                device="cuda",
+                dtype=torch.int,
+            )
             self.expert_mask[self.start_expert_id : self.end_expert_id + 1] = 1
-            self.expert_mask[self.num_experts:-1] = 1
+            self.expert_mask[self.num_experts : -1] = 1
 
             self.num_experts_per_partition += self.num_shared_experts
 
@@ -381,7 +384,11 @@ class EPMoE(torch.nn.Module):
                     if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
                     else "experts.w2_"
                 ),
-                f"shared_experts.{expert_id}.{weight_name}." if num_shared_experts >= 2 else f"shared_experts.{weight_name}.",
+                (
+                    f"shared_experts.{expert_id}.{weight_name}."
+                    if num_shared_experts >= 2
+                    else f"shared_experts.{weight_name}."
+                ),
                 -num_shared_experts + expert_id,
                 shard_id,
             )
@@ -391,7 +398,7 @@ class EPMoE(torch.nn.Module):
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
             ]
-        ] 
+        ]
 
     def weight_loader(
         self,
@@ -401,10 +408,12 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id >= 0 and (expert_id < self.start_expert_id or expert_id > self.end_expert_id):
+        if expert_id >= 0 and (
+            expert_id < self.start_expert_id or expert_id > self.end_expert_id
+        ):
             return
-        #expert_id < 0 means shared expert
-        if expert_id >=0:
+        # expert_id < 0 means shared expert
+        if expert_id >= 0:
             expert_id = expert_id - self.start_expert_id
 
         if shard_id not in ("w1", "w2", "w3"):
@@ -452,7 +461,7 @@ class EPMoE(torch.nn.Module):
             param_data[expert_id] = loaded_weight
         # Weight scales
         elif "weight_scale_inv" in weight_name:
-        # elif getattr(param, "quant_method", None) == FusedMoeWeightScaleSupported.BLOCK.value:
+            # elif getattr(param, "quant_method", None) == FusedMoeWeightScaleSupported.BLOCK.value:
             if shard_id in ("w1", "w3"):
                 idx = 0 if shard_id == "w1" else 1
                 param_data[expert_id][idx] = loaded_weight
@@ -754,8 +763,13 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                 if os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
                     import aiter
                     from aiter.ops.shuffle import shuffle_weight
-                    layer.w13_weight.data = shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
-                    layer.w2_weight.data = shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
+
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
             return
 
     def apply(
@@ -791,28 +805,28 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             topk_weights = layer.total_topk_weights[:token]
 
             return fused_experts(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    inplace=True,
-                    activation=layer.activation,
-                    use_fp8_w8a8=True,
-                    w1_scale=(
-                        layer.w13_weight_scale_inv
-                        if self.block_quant
-                        else layer.w13_weight_scale
-                    ),
-                    w2_scale=(
-                        layer.w2_weight_scale_inv
-                        if self.block_quant
-                        else layer.w2_weight_scale
-                    ),
-                    a1_scale=layer.w13_input_scale,
-                    a2_scale=layer.w2_input_scale,
-                    block_shape=self.quant_config.weight_block_size,
-                    expert_mask=layer.expert_mask,
-                )
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                activation=layer.activation,
+                use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.quant_config.weight_block_size,
+                expert_mask=layer.expert_mask,
+            )
         else:
             raise NotImplementedErrors

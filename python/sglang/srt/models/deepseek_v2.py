@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -57,7 +58,6 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
-import os
 
 is_hip_ = is_hip()
 
@@ -176,9 +176,13 @@ class DeepseekV2MoE(nn.Module):
         router_logits = self.gate(hidden_states)
         if is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
             if global_server_args_dict["enable_ep_moe"]:
-                final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
                 if self.tp_size > 1:
-                    final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                    final_hidden_states = tensor_model_parallel_all_reduce(
+                        final_hidden_states
+                    )
                 return final_hidden_states.view(num_tokens, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
@@ -844,11 +848,15 @@ class DeepseekV2Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        if global_server_args_dict["enable_ep_moe"] and is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+        if (
+            global_server_args_dict["enable_ep_moe"]
+            and is_hip()
+            and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1"
+        ):
             model_dim = hidden_states.shape[-1]
             num_tokens = hidden_states.view(-1, model_dim).shape[0]
             if not self.aiter_init:
-                self.aiter_init=True
+                self.aiter_init = True
                 tp_rank = get_tensor_model_parallel_rank()
                 tp_size = get_tensor_model_parallel_world_size()
                 top_k = self.num_experts_per_tok
@@ -857,19 +865,39 @@ class DeepseekV2Model(nn.Module):
                 fake_expertid = num_experts + num_shared_experts
 
                 # TODO need find a formal way
-                assert num_tokens<=(4096 * 128)
-                num_tokens= 4096 * 128
+                assert num_tokens <= (4096 * 128)
+                num_tokens = 4096 * 128
                 # all layers reuse same buffer
-                self.total_topk_ids = torch.empty((num_tokens, top_k + num_shared_experts + 1), dtype=torch.int32, device='cuda')
-                self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split([top_k, num_shared_experts + 1], dim=1)
-                shared_expert_ids = [num_experts + i for i in range(num_shared_experts + 1)]
-                s_topk_ids_list = [[fake_expertid]* (num_shared_experts + 1)] * num_tokens
+                self.total_topk_ids = torch.empty(
+                    (num_tokens, top_k + num_shared_experts + 1),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split(
+                    [top_k, num_shared_experts + 1], dim=1
+                )
+                shared_expert_ids = [
+                    num_experts + i for i in range(num_shared_experts + 1)
+                ]
+                s_topk_ids_list = [
+                    [fake_expertid] * (num_shared_experts + 1)
+                ] * num_tokens
                 for i in range(tp_rank, num_tokens, tp_size):
                     s_topk_ids_list[i] = shared_expert_ids
-                self.s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=torch.int32, device='cuda')
+                self.s_topk_ids[:] = torch.tensor(
+                    s_topk_ids_list, dtype=torch.int32, device="cuda"
+                )
 
-                self.total_topk_weights = torch.empty((num_tokens, top_k + num_shared_experts + 1), dtype=torch.float32, device='cuda')
-                self.ns_topk_weights, self.s_topk_weights = self.total_topk_weights.split([top_k, num_shared_experts + 1], dim=1)
+                self.total_topk_weights = torch.empty(
+                    (num_tokens, top_k + num_shared_experts + 1),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                self.ns_topk_weights, self.s_topk_weights = (
+                    self.total_topk_weights.split(
+                        [top_k, num_shared_experts + 1], dim=1
+                    )
+                )
                 shared_E_score = 1.0
                 self.s_topk_weights.fill_(shared_E_score)
 
@@ -878,11 +906,11 @@ class DeepseekV2Model(nn.Module):
                     mlp = self.layers[i].mlp
                     if not isinstance(mlp, DeepseekV2MoE):
                         continue
-                    mlp.experts.total_topk_weights=self.total_topk_weights
-                    mlp.experts.total_topk_ids=self.total_topk_ids
-                    mlp.experts.ns_topk_weights=self.ns_topk_weights
-                    mlp.experts.ns_topk_ids=self.ns_topk_ids
-                
+                    mlp.experts.total_topk_weights = self.total_topk_weights
+                    mlp.experts.total_topk_ids = self.total_topk_ids
+                    mlp.experts.ns_topk_weights = self.ns_topk_weights
+                    mlp.experts.ns_topk_ids = self.ns_topk_ids
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -974,7 +1002,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                if global_server_args_dict["enable_ep_moe"] and ("mlp.shared_experts" in name):
+                if global_server_args_dict["enable_ep_moe"] and (
+                    "mlp.shared_experts" in name
+                ):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
