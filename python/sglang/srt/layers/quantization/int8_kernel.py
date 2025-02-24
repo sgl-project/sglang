@@ -12,6 +12,7 @@ from sglang.srt.utils import get_device_name
 
 logger = logging.getLogger(__name__)
 
+
 @triton.jit
 def _per_token_quant_int8(
     x_ptr,
@@ -61,6 +62,7 @@ def per_token_quant_int8(x):
     )
 
     return x_q, scales
+
 
 @triton.jit
 def _per_token_group_quant_int8(

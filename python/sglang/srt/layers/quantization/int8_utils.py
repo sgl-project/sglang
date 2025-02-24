@@ -7,6 +7,7 @@ from sglang.srt.layers.quantization.int8_kernel import (
     w8a8_block_int8_matmul,
 )
 
+
 def apply_w8a8_block_int8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -81,6 +82,7 @@ def block_quant_to_tensor_quant(
     x_q_tensor, scale = input_to_int8(x_dq_block, dtype=x_q_block.dtype)
     return x_q_tensor, scale
 
+
 def block_dequant(
     x_q_block: torch.Tensor,
     x_s: torch.Tensor,
@@ -97,6 +99,9 @@ def block_dequant(
 
     for i in range(k_tiles):
         for j in range(n_tiles):
-            x_dq_block[j * block_n : min((j + 1) * block_n, n), i * block_k : min((i + 1) * block_k, k)] *= x_s[j][i]
-            
+            x_dq_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ] *= x_s[j][i]
+
     return x_dq_block

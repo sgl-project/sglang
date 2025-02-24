@@ -8,9 +8,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 
 
 # For test
-def native_per_token_group_quant_int8(
-    x, group_size, eps=1e-10, dtype=torch.int8
-):
+def native_per_token_group_quant_int8(x, group_size, eps=1e-10, dtype=torch.int8):
     """Function to perform per-token-group quantization on an input tensor `x` using native torch.
 
     It converts the tensor values into float8 values and returns the
@@ -127,9 +125,9 @@ def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
 
 class TestW8A8BlockINT8FusedMoE(unittest.TestCase):
     DTYPES = [torch.float32, torch.half, torch.bfloat16]
-    M = [1, 33, 64, 222]#, 1024 * 128]
-    N = [128, 1024]#, 2048]
-    K = [256, 4096]#, 5120]
+    M = [1, 33, 64, 222]  # , 1024 * 128]
+    N = [128, 1024]  # , 2048]
+    K = [256, 4096]  # , 5120]
     E = [8, 24]
     TOP_KS = [2, 6]
     # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]

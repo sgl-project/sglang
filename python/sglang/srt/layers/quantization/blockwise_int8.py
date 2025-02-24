@@ -22,15 +22,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.int8_utils import (
-    apply_w8a8_block_int8_linear,
-)
-from sglang.srt.layers.quantization.fp8_utils import (
-    BlockQuantScaleParameter,
-)
-from sglang.srt.utils import (
-    set_weight_attrs,
-)
+from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
+from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
+from sglang.srt.utils import set_weight_attrs
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -168,9 +162,9 @@ class Int8LinearMethod(LinearMethodBase):
                     f"weight quantization block_k = {block_k}."
                 )
         # Required by collum parallel or enabling merged weights
-        if (
-            tp_size > 1 and output_size // output_size_per_partition == tp_size
-        ) or len(output_partition_sizes) > 1:
+        if (tp_size > 1 and output_size // output_size_per_partition == tp_size) or len(
+            output_partition_sizes
+        ) > 1:
             for output_partition_size in output_partition_sizes:
                 if output_partition_size % block_n != 0:
                     raise ValueError(
@@ -201,7 +195,7 @@ class Int8LinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
-        
+
         # WEIGHT SCALE
         assert self.quant_config.activation_scheme == "dynamic"
         scale = BlockQuantScaleParameter(
@@ -232,9 +226,7 @@ class Int8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         # Use torch Parameter to avoid cuda graph capturing issue
-        layer.weight = torch.nn.Parameter(
-            layer.weight.data, requires_grad=False
-        )
+        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         layer.weight_scale_inv = torch.nn.Parameter(
             layer.weight_scale_inv.data, requires_grad=False
         )
@@ -442,12 +434,8 @@ class Int8MoEMethod:
             inplace=True,
             activation=activation,
             use_int8_w8a8=True,
-            w1_scale=(
-                layer.w13_weight_scale_inv
-            ),
-            w2_scale=(
-                layer.w2_weight_scale_inv
-            ),
+            w1_scale=(layer.w13_weight_scale_inv),
+            w2_scale=(layer.w2_weight_scale_inv),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
