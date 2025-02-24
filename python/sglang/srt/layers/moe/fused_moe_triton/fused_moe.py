@@ -205,19 +205,7 @@ def fused_moe_kernel(
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
-        elif use_fp8_w8a8:
-            if group_k > 0 and group_n > 0:
-                k_start = k * BLOCK_SIZE_K
-                offs_ks = k_start // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
-                )
-                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
-            else:
-                accumulator = tl.dot(a, b, acc=accumulator)
-        elif use_int8_w8a8:
+        elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_SIZE_K
                 offs_ks = k_start // group_k
@@ -792,7 +780,7 @@ def inplace_fused_experts_fake(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = True,
+    use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,

@@ -4,11 +4,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 from torch.nn import Module
-from torch.nn.parameter import Parameter
-from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -31,7 +27,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 
 
-class Int8Config(QuantizationConfig):
+class BlockInt8Config(QuantizationConfig):
     """Config class for INT8."""
 
     def __init__(
@@ -68,7 +64,7 @@ class Int8Config(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "int8"
+        return "blockwise_int8"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -83,7 +79,7 @@ class Int8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "Int8Config":
+    def from_config(cls, config: Dict[str, Any]) -> "BlockInt8Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
@@ -99,28 +95,24 @@ class Int8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        from vllm.attention.layer import Attention  # Avoid circular import
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
-            return Int8LinearMethod(self)
+            return BlockInt8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            return Int8MoEMethod(self)
-        elif isinstance(layer, Attention):
-            return Int8KVCacheMethod(self)
+            return BlockInt8MoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
 
 
-class Int8LinearMethod(LinearMethodBase):
+class BlockInt8LinearMethod(LinearMethodBase):
     """Linear method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
-    dynamic/static activation scale.
+    dynamic activation scale.
 
     Limitations:
     Only support block-wise int8 quantization and int8 checkpoint
@@ -129,7 +121,7 @@ class Int8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Int8Config):
+    def __init__(self, quant_config: BlockInt8Config):
         self.quant_config = quant_config
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized
@@ -197,7 +189,7 @@ class Int8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         # WEIGHT SCALE
-        assert self.quant_config.activation_scheme == "dynamic"
+        
         scale = BlockQuantScaleParameter(
             data=torch.empty(
                 (output_size_per_partition + block_n - 1) // block_n,
@@ -212,16 +204,8 @@ class Int8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale_inv", scale)
 
         # INPUT ACTIVATION SCALE
-        if self.quant_config.activation_scheme == "static":
-            scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-
-            scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("input_scale", scale)
-        else:
-            layer.register_parameter("input_scale", None)
+        assert self.quant_config.activation_scheme == "dynamic"
+        layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
@@ -247,10 +231,10 @@ class Int8LinearMethod(LinearMethodBase):
         )
 
 
-class Int8MoEMethod:
+class BlockInt8MoEMethod:
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
-    dynamic/static activation scale.
+    dynamic activation scale.
 
     Limitations:
     Only support block-wise int8 quantization and int8 checkpoint
@@ -358,7 +342,6 @@ class Int8MoEMethod:
         )
         layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
-        assert self.quant_config.activation_scheme == "dynamic"
 
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
@@ -367,28 +350,9 @@ class Int8MoEMethod:
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # INPUT_SCALES
-        if self.quant_config.activation_scheme == "static":
-            if not self.quant_config.is_checkpoint_int8_serialized:
-                raise ValueError(
-                    "Found static activation scheme for checkpoint that "
-                    "was not serialized int8."
-                )
-
-            w13_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-            )
-            layer.register_parameter("w13_input_scale", w13_input_scale)
-            set_weight_attrs(w13_input_scale, extra_weight_attrs)
-
-            w2_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-            )
-            layer.register_parameter("w2_input_scale", w2_input_scale)
-            set_weight_attrs(w2_input_scale, extra_weight_attrs)
-
-        else:
-            layer.w13_input_scale = None
-            layer.w2_input_scale = None
+        assert self.quant_config.activation_scheme == "dynamic"
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
@@ -440,12 +404,3 @@ class Int8MoEMethod:
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
         )
-
-
-class Int8KVCacheMethod(BaseKVCacheMethod):
-    """
-    Supports loading kv-cache scaling factors from INT8 checkpoints.
-    """
-
-    def __init__(self, quant_config: Int8Config):
-        super().__init__(quant_config)

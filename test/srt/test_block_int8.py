@@ -104,8 +104,6 @@ def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
 
     _, block_k = block_shape[0], block_shape[1]
     a_q, a_s = native_per_token_group_quant_int8(a, block_k)
-    # NOTE(HandH1998): Since "index_cuda" is implemented for 'Float8_e4m3fn', we need to cast `float8`` to `float32``.
-    # a_q = a_q.to(torch.float32)
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():

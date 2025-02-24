@@ -44,50 +44,16 @@ def input_to_int8(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
-def block_quant_to_tensor_quant(
-    x_q_block: torch.Tensor,
-    x_s: torch.Tensor,
-    block_size: List[int],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """This function converts block-wise quantization to tensor-wise quantization.
-    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
-    and the block size.
-    The outputs are tensor-wise quantization tensor and tensor-wise quantization scale.
-    Note only float8 is supported for now.
-    """
-    block_n, block_k = block_size[0], block_size[1]
-    n, k = x_q_block.shape
-    n_tiles = (n + block_n - 1) // block_n
-    k_tiles = (k + block_k - 1) // block_k
-    assert n_tiles == x_s.shape[0]
-    assert k_tiles == x_s.shape[1]
-
-    x_dq_block = x_q_block.to(torch.float32)
-
-    x_dq_block_tiles = [
-        [
-            x_dq_block[
-                j * block_n : min((j + 1) * block_n, n),
-                i * block_k : min((i + 1) * block_k, k),
-            ]
-            for i in range(k_tiles)
-        ]
-        for j in range(n_tiles)
-    ]
-
-    for i in range(k_tiles):
-        for j in range(n_tiles):
-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
-
-    x_q_tensor, scale = input_to_int8(x_dq_block, dtype=x_q_block.dtype)
-    return x_q_tensor, scale
-
-
 def block_dequant(
     x_q_block: torch.Tensor,
     x_s: torch.Tensor,
     block_size: List[int],
 ) -> torch.Tensor:
+    """This function conducts block-wise dequantization.
+    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
+    and the block size.
+    The outputs are dequantized tensor.
+    """
     block_n, block_k = block_size[0], block_size[1]
     n, k = x_q_block.shape
     n_tiles = (n + block_n - 1) // block_n
