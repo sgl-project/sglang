@@ -339,6 +339,8 @@ class MiniCPMForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
