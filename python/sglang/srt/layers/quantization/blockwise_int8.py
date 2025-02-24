@@ -189,7 +189,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         # WEIGHT SCALE
-        
+
         scale = BlockQuantScaleParameter(
             data=torch.empty(
                 (output_size_per_partition + block_n - 1) // block_n,
