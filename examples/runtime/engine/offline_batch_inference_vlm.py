@@ -16,16 +16,6 @@ from sglang.srt.conversation import chat_templates
 from sglang.srt.server_args import ServerArgs
 
 
-def download_image(url, filename):
-    response = requests.get(url)
-    if response.status_code == 200:
-        with open(filename, "wb") as f:
-            f.write(response.content)
-        print(f"Successfully downloaded {filename}")
-    else:
-        print(f"Failed to download image: Status code {response.status_code}")
-
-
 def main(
     server_args: ServerArgs,
 ):
@@ -35,12 +25,6 @@ def main(
     image_token = conv.image_token
 
     image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-    download_image(image_url, "example_image.png")
-
-    image = Image.open("example_image.png")
-    bytes_io = io.BytesIO()
-    image.save(bytes_io, format="PNG")
-    png_bytes = bytes_io.getvalue()
 
     prompt = f"What's in this image?\n{image_token}"
 
@@ -51,7 +35,7 @@ def main(
 
     output = vlm.generate(
         prompt=prompt,
-        image_data=[png_bytes],
+        image_data=image_url,
         sampling_params=sampling_params,
     )
 
@@ -59,7 +43,6 @@ def main(
     print(f"Prompt: {prompt}")
     print(f"Generated text: {output['text']}")
 
-    os.remove("example_image.png")
     vlm.shutdown()
 
 
@@ -69,5 +52,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     args = parser.parse_args()
+
     server_args = ServerArgs.from_cli_args(args)
     main(server_args)
