@@ -162,12 +162,9 @@ class ServerArgs:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     return_hidden_states: bool = False
-
-    # Custom logit processor
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
-
     enable_flashinfer_mla: bool = False
 
     def __post_init__(self):
@@ -918,7 +915,6 @@ class ServerArgs:
             action="store_true",
             help="Return hidden states in the response.",
         )
-        # Function Calling
         parser.add_argument(
             "--tool-call-parser",
             type=str,
