@@ -98,7 +98,7 @@ class Engine:
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
 
-        # Shutdown the subprocesses automatically when the program exists
+        # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
         # Launch subprocesses
