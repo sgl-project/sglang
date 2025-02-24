@@ -350,4 +350,4 @@ class InternLM2ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-EntryClass = InternLM2ForCausalLM
+EntryClass = (InternLM2ForCausalLM, "InternLM 2")

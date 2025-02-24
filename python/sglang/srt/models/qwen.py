@@ -315,4 +315,4 @@ class QWenLMHeadModel(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = QWenLMHeadModel
+EntryClass = (QWenLMHeadModel, "Qwen")

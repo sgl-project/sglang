@@ -651,4 +651,4 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = Qwen2VLForConditionalGeneration
+EntryClass = (Qwen2VLForConditionalGeneration, "Qwen 2 VL")

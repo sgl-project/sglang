@@ -20,4 +20,4 @@ class MistralForCausalLM(LlamaForCausalLM):
     pass
 
 
-EntryClass = MistralForCausalLM
+EntryClass = (MistralForCausalLM, "Mistral")

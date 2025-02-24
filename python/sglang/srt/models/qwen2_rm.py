@@ -74,5 +74,5 @@ class Qwen2ForRewardModel(nn.Module):
 
 
 EntryClass = [
-    Qwen2ForRewardModel,
+    (Qwen2ForRewardModel, "Qwen2ForRewardModel"),
 ]

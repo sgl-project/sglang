@@ -373,4 +373,4 @@ class OlmoForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = OlmoForCausalLM
+EntryClass = (OlmoForCausalLM, "OLMo")

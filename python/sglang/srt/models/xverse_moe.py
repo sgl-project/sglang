@@ -468,4 +468,4 @@ class XverseMoeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = XverseMoeForCausalLM
+EntryClass = (XverseMoeForCausalLM, "XVERSE MoE")

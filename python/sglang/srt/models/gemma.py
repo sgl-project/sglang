@@ -358,4 +358,4 @@ class GemmaForCausalLM(nn.Module):
             loaded_params.add(name)
 
 
-EntryClass = GemmaForCausalLM
+EntryClass = (GemmaForCausalLM, "Gemma")

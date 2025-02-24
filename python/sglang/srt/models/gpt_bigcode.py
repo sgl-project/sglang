@@ -300,4 +300,4 @@ class GPTBigCodeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = GPTBigCodeForCausalLM
+EntryClass = (GPTBigCodeForCausalLM, "GPTBigCode")

@@ -327,4 +327,4 @@ class StableLmForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = StableLmForCausalLM
+EntryClass = (StableLmForCausalLM, "StableLM")

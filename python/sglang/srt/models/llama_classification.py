@@ -78,4 +78,4 @@ class LlamaForClassification(nn.Module):
                 LlamaForCausalLM.load_weights(self, [(name, loaded_weight)])
 
 
-EntryClass = LlamaForClassification
+EntryClass = (LlamaForClassification, "Llama")

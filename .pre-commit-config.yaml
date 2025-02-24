@@ -33,3 +33,11 @@ repos:
         args:
           - '--keep-output'
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+  - repo: local
+    hooks:
+      - id: check-doc-up-to-date
+        name: check doc up to date
+        entry: python docs/utils/check_doc_update_to_date.py
+        language: system
+        types: [python]
+        pass_filenames: false

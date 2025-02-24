@@ -685,4 +685,4 @@ class MiniCPM3ForCausalLM(nn.Module):
                 del self_attn.kv_b_proj
 
 
-EntryClass = MiniCPM3ForCausalLM
+EntryClass = (MiniCPM3ForCausalLM, "MiniCPM 3")

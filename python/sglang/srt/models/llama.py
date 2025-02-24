@@ -598,4 +598,8 @@ class InternLM3ForCausalLM(LlamaForCausalLM):
     pass
 
 
-EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM]
+EntryClass = [
+    (LlamaForCausalLM, "Llama"),
+    (Phi3ForCausalLM, "Phi-3"),
+    (InternLM3ForCausalLM, "InternLM 3"),
+]

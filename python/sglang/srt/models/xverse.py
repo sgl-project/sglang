@@ -378,4 +378,4 @@ class XverseForCausalLM(nn.Module):
             load_weights_per_param(name, loaded_weight)
 
 
-EntryClass = XverseForCausalLM
+EntryClass = (XverseForCausalLM, "XVERSE")

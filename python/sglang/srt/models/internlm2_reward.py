@@ -61,4 +61,4 @@ class InternLM2ForRewardModel(nn.Module):
         return InternLM2ForCausalLM.load_weights(self, weights)
 
 
-EntryClass = InternLM2ForRewardModel
+EntryClass = (InternLM2ForRewardModel, "InternLM2ForRewardModel")

@@ -423,4 +423,4 @@ class ChatGLMModel(ChatGLMForCausalLM):
     pass
 
 
-EntryClass = [ChatGLMModel]
+EntryClass = [(ChatGLMModel, "ChatGLM")]

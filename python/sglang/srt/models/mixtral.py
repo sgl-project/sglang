@@ -404,4 +404,4 @@ class MixtralForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-EntryClass = MixtralForCausalLM
+EntryClass = (MixtralForCausalLM, "Mixtral")

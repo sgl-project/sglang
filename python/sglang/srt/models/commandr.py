@@ -414,4 +414,4 @@ class Cohere2ForCausalLM(CohereForCausalLM):
     pass
 
 
-EntryClass = [CohereForCausalLM, Cohere2ForCausalLM]
+EntryClass = [(CohereForCausalLM, "Command-R"), (Cohere2ForCausalLM, "Command-R")]

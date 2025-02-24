@@ -571,4 +571,8 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
             )
 
 
-EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
+EntryClass = [
+    (LlavaLlamaForCausalLM, "LLaVA"),
+    (LlavaQwenForCausalLM, "LLaVA"),
+    (LlavaMistralForCausalLM, "LLaVA"),
+]

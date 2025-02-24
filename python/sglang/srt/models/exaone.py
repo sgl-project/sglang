@@ -368,4 +368,4 @@ class ExaoneForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = ExaoneForCausalLM
+EntryClass = (ExaoneForCausalLM, "Exaone 3")

@@ -121,6 +121,9 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
 
 
 EntryClass = [
-    LlamaForSequenceClassification,
-    LlamaForSequenceClassificationWithNormal_Weights,
+    (LlamaForSequenceClassification, "LlamaForSequenceClassification"),
+    (
+        LlamaForSequenceClassificationWithNormal_Weights,
+        "LlamaForSequenceClassification",
+    ),
 ]

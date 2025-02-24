@@ -112,4 +112,4 @@ class YiVLMultiModalProjector(nn.Module):
         return hidden_states
 
 
-EntryClass = YiVLForCausalLM
+EntryClass = (YiVLForCausalLM, "Yi-VL")
