@@ -1002,5 +1002,9 @@ class Qwen2_5_VLImageProcessor(BaseImageProcessor):
         return BatchFeature(data=data, tensor_type=return_tensors)
 
 
-AutoImageProcessor.register(Qwen2_5_VLConfig, None, Qwen2_5_VLImageProcessor, None)
-AutoProcessor.register(Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
+try:
+    AutoImageProcessor.register(Qwen2_5_VLConfig, None, Qwen2_5_VLImageProcessor, None)
+    AutoProcessor.register(Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
+except ValueError as e:
+    # workaround, to resolve Warning: '<class 'sglang.srt.configs.qwen2_5_vl_config.Qwen2_5_VLConfig'>' is already used by a Transformers model.
+    print(f"Warning: {e}")
