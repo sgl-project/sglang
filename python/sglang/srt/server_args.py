@@ -1039,7 +1039,7 @@ class PortArgs:
             if dp_rank is None:
                 scheduler_input_port = (
                     port_base + 2
-                )  # TokenizerManager to DataParallelController
+                )  # StdOrchestrator to DataParallelController
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
 
