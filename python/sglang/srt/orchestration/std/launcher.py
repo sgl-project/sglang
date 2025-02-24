@@ -128,7 +128,7 @@ def launch(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict]:
     )
     detoken_proc.start()
 
-    # Launch tokenizer process
+    # Launch orchestrator process
     orchestrator = StdOrchestrator(server_args, port_args)
     if server_args.chat_template:
         load_chat_template_for_openai_api(
