@@ -75,7 +75,7 @@ class Engine:
 
     - The engine consists of three components:
         1. StdOrchestrator: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        2. Scheduler (subprocess): Receives requests from the StdOrchestrator, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
