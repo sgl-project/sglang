@@ -1,4 +1,4 @@
-# Run Multi-Node Inference
+# Multi-Node Deployment
 
 ## Llama 3.1 405B
 
@@ -22,7 +22,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instr
 
 ## DeepSeek V3/R1
 
-Please refer to [DeepSeek documents for reference.](https://docs.sglang.ai/references/deepseek.html#running-examples-on-multi-node).
+Please refer to [DeepSeek documents for reference](https://docs.sglang.ai/references/deepseek.html#running-examples-on-multi-node).
 
 ## Multi-Node Inference on SLURM
 
