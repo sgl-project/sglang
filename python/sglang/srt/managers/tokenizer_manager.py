@@ -347,44 +347,37 @@ class TokenizerManager:
                 f"model's context length ({self.context_len} tokens)."
             )
 
-        max_new_tokens_init = obj.sampling_params.get("max_new_tokens")
+        sampling_params = copy.deepcopy(obj.sampling_params)
+        max_new_tokens = sampling_params.get("max_new_tokens")
         if (
-            obj.sampling_params.get("max_new_tokens") is not None
-            and obj.sampling_params.get("max_new_tokens") + input_token_num
-            >= self.context_len
+            max_new_tokens is not None
+            and max_new_tokens + input_token_num >= self.context_len
         ):
             if self.server_args.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count exceeds the model's maximum context length "
                     f"of {self.context_len} tokens. You requested a total of "
-                    f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
+                    f"{max_new_tokens + input_token_num} "
                     f"tokens: {input_token_num} tokens from the input messages and "
-                    f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
-                    f"completion. Truncated max_new_tokens to {self.context_len-input_token_num=}."
+                    f"{max_new_tokens} tokens for the completion. "
+                    f"Truncated max_new_tokens to {self.context_len-input_token_num=}."
                 )
-                obj.sampling_params["max_new_tokens"] = (
-                    self.context_len - input_token_num
-                )
+                sampling_params["max_new_tokens"] = self.context_len - input_token_num
             else:
                 raise ValueError(
                     f"Requested token count exceeds the model's maximum context length "
                     f"of {self.context_len} tokens. You requested a total of "
-                    f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
+                    f"{max_new_tokens + input_token_num} "
                     f"tokens: {input_token_num} tokens from the input messages and "
-                    f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
-                    f"completion. Please reduce the number of tokens in the input "
+                    f"{max_new_tokens} tokens for the completion. "
+                    f"Please reduce the number of tokens in the input "
                     f"messages or the completion to fit within the limit."
                 )
 
         # Parse sampling parameters
-        sampling_params = SamplingParams(**obj.sampling_params)
+        sampling_params = SamplingParams(**sampling_params)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
-
-        # Reset max_new_tokens in obj to the initial value if it is truncated
-        # for the current input
-        if max_new_tokens_init is not None:
-            obj.sampling_params["max_new_tokens"] = max_new_tokens_init
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
