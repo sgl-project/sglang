@@ -830,13 +830,13 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = CompletionStreamResponse(
-                        id=str(uuid.uuid4().hex),
+                        id=content["meta_info"]["id"],
                         choices=[],
                         model=request.model,
                         usage=usage,
                     )
                     final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=True
+                        exclude_none=True
                     )
                     yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
@@ -1421,13 +1421,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = ChatCompletionStreamResponse(
-                        id=str(uuid.uuid4().hex),
+                        id=content["meta_info"]["id"],
                         choices=[],
                         model=request.model,
                         usage=usage,
                     )
                     final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=True
+                        exclude_none=True
                     )
                     yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
