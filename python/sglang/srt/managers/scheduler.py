@@ -396,13 +396,13 @@ class Scheduler:
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
-    def process_batch(self):
+    def process_batch(self) -> bool:
+        """Processes a batch and returns whether it has successfully run a batch."""
         if self.enable_overlap:
             return self._process_batch_overlap()
         else:
             return self._process_batch_normal()
 
-    @torch.no_grad()
     def _process_batch_normal(self):
         batch = self.get_next_batch_to_run()
         self.cur_batch = batch
@@ -418,7 +418,6 @@ class Scheduler:
         self.last_batch = batch
         return batch is not None
 
-    @torch.no_grad()
     def _process_batch_overlap(self):
         batch = self.get_next_batch_to_run()
         self.cur_batch = batch

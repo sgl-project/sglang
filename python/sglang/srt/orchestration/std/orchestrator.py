@@ -175,7 +175,7 @@ class StdOrchestrator:
     ):
         self.auto_create_handle_loop()
         async with self.model_update_lock.reader_lock:
-            async for value in self._generation_manager.generate(obj, request):
+            async for value in self._generation_manager.generate_request(obj, request):
                 yield value
 
     def flush_cache(self):
@@ -331,21 +331,7 @@ class StdOrchestrator:
         await self.send_to_scheduler.send_pyobj(obj)
 
     def configure_logging(self, obj: ConfigureLoggingReq):
-        if obj.log_requests is not None:
-            self._generation_manager.request_logger.log_requests = obj.log_requests
-        if obj.log_requests_level is not None:
-            self._generation_manager.request_logger.log_requests_level = (
-                obj.log_requests_level
-            )
-        if obj.dump_requests_folder is not None:
-            self._generation_manager.request_dumper.dump_requests_folder = (
-                obj.dump_requests_folder
-            )
-        if obj.dump_requests_threshold is not None:
-            self._generation_manager.request_dumper.dump_requests_threshold = (
-                obj.dump_requests_threshold
-            )
-        logging.info(f"Config logging: {obj=}")
+        self._generation_manager.configure_logging(obj)
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
