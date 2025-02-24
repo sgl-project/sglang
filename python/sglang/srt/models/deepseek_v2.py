@@ -833,6 +833,26 @@ class DeepseekV2Model(nn.Module):
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+def dequantize_gptq(qweight, qzeros, qscales):
+    wf = torch.tensor(list(range(0, 32, 4)), dtype=torch.int32).unsqueeze(0).to(qweight.device)
+
+    zeros = torch.bitwise_right_shift(torch.unsqueeze(qzeros, 2).expand(-1, -1, 32 // 4), wf.unsqueeze(0)).to(torch.int8)
+    zeros = torch.bitwise_and(zeros, (2 ** 4) - 1)
+    zeros = zeros + 1
+
+    zeros = zeros.reshape(-1, 1, zeros.shape[1] * zeros.shape[2])
+
+    scales = qscales
+    scales = scales.reshape(-1, 1, scales.shape[-1])
+
+    weight = torch.bitwise_right_shift(torch.unsqueeze(qweight, 1).expand(-1, 32 // 4, -1), wf.unsqueeze(-1)).to(torch.int8)
+    weight = torch.bitwise_and(weight,(2 ** 4) - 1)
+    weight = weight.reshape(-1, 128, weight.shape[2])
+    weight = (scales * (weight - zeros))
+    weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+    weight = weight.T
+    return weight
+
 
 class DeepseekV2ForCausalLM(nn.Module):
 
@@ -953,14 +973,19 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn = self.model.layers[layer_id].self_attn
                 if hasattr(self_attn.kv_b_proj, "qweight"):
                     # AWQ compatible
-                    w = ops.awq_dequantize(
+                   # w = ops.awq_dequantize(
+                   #     self_attn.kv_b_proj.qweight,
+                   #     self_attn.kv_b_proj.scales,
+                   #     self_attn.kv_b_proj.qzeros,
+                   #     0,
+                   #     0,
+                   #     0,
+                   # ).T
+
+                    w = dequantize_gptq(
                         self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
-                        0,
-                        0,
-                        0,
-                    ).T
+                        self_attn.kv_b_proj.scales)
                 else:
                     w = self_attn.kv_b_proj.weight
                 # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.

@@ -19,6 +19,7 @@ from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
 from vllm.model_executor.layers.quantization.gptq_marlin_24 import GPTQMarlin24Config
+from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
@@ -65,13 +66,15 @@ def gptq_get_quant_method(self, layer, prefix):
         GPTQMarlinMoEMethod,
     )
 
+    from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, LinearBase):
         return GPTQMarlinLinearMethod(self)
     elif isinstance(layer, FusedMoE):
-        return GPTQMarlinMoEMethod(self)
+        return MoeWNA16Method(MoeWNA16Config.from_config(self.full_config))
+        # return GPTQMarlinMoEMethod(self)
     return None
 
 
