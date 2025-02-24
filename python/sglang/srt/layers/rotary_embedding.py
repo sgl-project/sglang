@@ -169,6 +169,36 @@ class RotaryEmbedding(CustomOp):
             )
         return query, key
 
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        import torch_npu
+        
+        if self.cos_sin_cache.device != query.device:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        if self.cos_sin_cache.dtype != query.dtype:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
+        if offsets is not None:
+            raise NotImplementedError(
+                    "Batched rotary embedding is currently not supported on NPU.")
+        else:
+            # TODO: Remove the contiguous in the future.
+            query = query.contiguous()
+            key = key.contiguous()
+            torch_npu.npu_rope(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
+        return query, key
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"
