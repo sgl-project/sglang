@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
 import logging
@@ -65,8 +66,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
-class StdOrchestrator:
-    """StdOrchestrator is the primary entrypoint of orchestration.std package"""
+class TokenizerManager:
+    """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
         self,
@@ -438,20 +439,20 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"StdOrchestrator hit an exception: {traceback}")
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
 
 class SignalHandler:
-    def __init__(self, orchestrator):
-        self.orchestrator = orchestrator
+    def __init__(self, tokenizer_manager):
+        self.tokenizer_manager = tokenizer_manager
 
     def signal_handler(self, signum=None, frame=None):
         logger.warning(
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
-        self.orchestrator.gracefully_exit = True
+        self.tokenizer_manager.gracefully_exit = True
 
 
 T = TypeVar("T")
