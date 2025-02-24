@@ -60,3 +60,6 @@ class EngineBase:
 
     def _generate_impl(self, obj: GenerateReqInput):
         raise NotImplementedError
+
+    def shutdown(self):
+        raise NotImplementedError
