@@ -129,6 +129,7 @@ class ServerArgs:
     speculative_eagle_topk: int = 8
     speculative_num_draft_tokens: int = 64
     speculative_token_map: Optional[str] = None
+    speculative_token_map_num_dynamic_tokens: int = 0
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -757,6 +758,12 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-token-map-num-dynamic-tokens",
+            type=int,
+            help="The number of hot tokens which change in runtime.",
+            default=ServerArgs.speculative_token_map_num_dynamic_tokens,
         )
 
         # Double Sparsity

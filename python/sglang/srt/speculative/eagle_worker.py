@@ -25,6 +25,7 @@ from sglang.srt.speculative.eagle_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.hot_table_utils import HotVocabTable
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +48,14 @@ class EAGLEWorker(TpModelWorker):
 
         if server_args.speculative_token_map is not None:
             try:
-                self.hot_token_id = torch.load(server_args.speculative_token_map)
+                init_hot_token_ids = torch.load(server_args.speculative_token_map)
             except:
                 raise RuntimeError(f"there is not hot_token_ids.pt file in {self.server_args.speculative_token_map}")
-            self.hot_token_id = torch.tensor(self.hot_token_id, dtype=torch.int32, device='cuda')
-            server_args.json_model_override_args=f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
+            if server_args.speculative_token_map_num_dynamic_tokens > len(init_hot_token_ids):
+                server_args.speculative_token_map_num_dynamic_tokens = len(init_hot_token_ids)
+            self.hot_token_pool = HotVocabTable(init_hot_token_ids, server_args.speculative_token_map_num_dynamic_tokens)
+            server_args.json_model_override_args=f'{{"hot_vocab_size": {len(init_hot_token_ids)}}}'
+            self.hot_token_ids = self.hot_token_pool.get_hot_token_ids()
             
         super().__init__(
             gpu_id=gpu_id,
@@ -76,11 +80,14 @@ class EAGLEWorker(TpModelWorker):
         if not self.speculative_algorithm.is_nextn():
             embed, head = self.target_worker.model_runner.model.get_embed_and_head()
             if server_args.speculative_token_map is not None:
-                head = head.clone()
-                head.data = head.data[self.hot_token_id]
+                self.target_worker_lm_haed = head
+                head_small = head.clone()
+                head_small.data = head_small.data[self.hot_token_ids]
+                self.model_runner.model.set_embed_and_head(embed, head_small)
             else:
-                self.hot_token_id = None
-            self.model_runner.model.set_embed_and_head(embed, head)
+                self.hot_token_pool = None
+                self.hot_token_ids = None
+                self.model_runner.model.set_embed_and_head(embed, head)
         self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
 
         # Create multi-step attn backends and cuda graph runners
@@ -127,6 +134,11 @@ class EAGLEWorker(TpModelWorker):
     def forward_batch_speculative_generation(self, batch: ScheduleBatch):
         if batch.forward_mode.is_decode():
             # Draft
+            if self.hot_token_pool is not None:
+                # Update lm_head
+                self.hot_token_pool.add_token(batch.input_ids)
+                self.hot_token_ids = self.hot_token_pool.get_hot_token_ids()
+                self.model_runner.model.lm_head.weight = self.target_worker_lm_haed.data[self.hot_token_ids]
             spec_info: EagleVerifyInput = self.draft(batch)
 
             # Verify
@@ -237,7 +249,8 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-        topk_index = self.hot_token_id[topk_index] if self.hot_token_id is not None else topk_index
+
+        topk_index = self.hot_token_ids[topk_index] if self.hot_token_ids is not None else topk_index
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -277,7 +290,7 @@ class EAGLEWorker(TpModelWorker):
             )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            topk_index = self.hot_token_id[topk_index] if self.hot_token_id is not None else topk_index
+            topk_index = self.hot_token_ids[topk_index] if self.hot_token_ids is not None else topk_index
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list
