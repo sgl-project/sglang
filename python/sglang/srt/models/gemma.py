@@ -344,4 +344,4 @@ class GemmaForCausalLM(nn.Module):
             )
 
 
-EntryClass = GemmaForCausalLM
+EntryClass = (GemmaForCausalLM, "Gemma")

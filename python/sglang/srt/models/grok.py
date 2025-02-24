@@ -523,4 +523,4 @@ class Grok1ModelForCausalLM(Grok1ForCausalLM):
     pass
 
 
-EntryClass = [Grok1ForCausalLM, Grok1ModelForCausalLM]
+EntryClass = [(Grok1ForCausalLM, "Grok"), (Grok1ModelForCausalLM, "Grok")]

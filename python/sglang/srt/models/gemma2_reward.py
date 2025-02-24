@@ -63,4 +63,4 @@ class Gemma2ForSequenceClassification(nn.Module):
         Gemma2ForCausalLM.load_weights(self, weights)
 
 
-EntryClass = [Gemma2ForSequenceClassification]
+EntryClass = [(Gemma2ForSequenceClassification, "Gemma2ForSequenceClassification")]
