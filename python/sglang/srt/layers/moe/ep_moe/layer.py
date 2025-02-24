@@ -35,6 +35,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+is_hip_ = is_hip()
+
 logger = logging.getLogger(__name__)
 
 
@@ -167,7 +169,7 @@ class EPMoE(torch.nn.Module):
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
-        if is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
             self.routed_scaling_factor = routed_scaling_factor
 
             self.expert_mask = torch.zeros((self.num_experts + self.num_shared_experts + 1) , device='cuda', dtype=torch.int)
@@ -191,7 +193,7 @@ class EPMoE(torch.nn.Module):
         assert self.quant_method is not None
         assert self.activation == "silu"
 
-        if is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
                 layer=self,
@@ -726,7 +728,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                 )
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip():
+            if is_hip_:
                 # activation_scheme: dynamic
                 w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=layer.w13_weight,
@@ -768,7 +770,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
-        if is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
