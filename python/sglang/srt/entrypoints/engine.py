@@ -90,10 +90,6 @@ class Engine(EngineBase):
         self.scheduler_info = scheduler_info
 
     def _generate_impl(self, obj: GenerateReqInput):
-        """
-        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
-        Please refer to `GenerateReqInput` for the documentation.
-        """
         loop = asyncio.get_event_loop()
         generator = self.orchestrator.generate_request(obj, None)
 
