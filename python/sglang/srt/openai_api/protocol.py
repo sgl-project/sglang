@@ -257,8 +257,10 @@ class MessagewithContent(BaseModel):
     # Avoid openai InternalServerError when input is None
     @field_validator("content", mode="before")
     def handle_none_content(cls, v):
-        """Convert None to empty string to avoid validation errors."""
-        return "" if v is None else v
+        raise ValueError(
+            "Message content for Chat Completion and Tool Calling cannot be None. "
+            + "Please input a valid string."
+        )
 
 
 class ChatCompletionMessageGenericParam(MessagewithContent, BaseModel):
