@@ -174,7 +174,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        if is_hip() and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
             if global_server_args_dict["enable_ep_moe"]:
                 final_hidden_states = self.experts(
                     hidden_states=hidden_states, router_logits=router_logits
@@ -850,7 +850,7 @@ class DeepseekV2Model(nn.Module):
         residual = None
         if (
             global_server_args_dict["enable_ep_moe"]
-            and is_hip()
+            and is_hip_
             and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1"
         ):
             model_dim = hidden_states.shape[-1]
