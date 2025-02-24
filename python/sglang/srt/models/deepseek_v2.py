@@ -47,6 +47,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from sglang.srt.layers.quantization.int8_utils import (
+    block_dequant as int8_block_dequant,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -510,25 +513,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if global_server_args_dict["enable_flashinfer_mla"]:
-            if global_server_args_dict["disable_radix_cache"]:
-                if forward_batch.forward_mode.is_extend():
-                    return self.forward_normal(positions, hidden_states, forward_batch)
-                else:
-                    return self.forward_absorb(positions, hidden_states, forward_batch)
+
+        def no_absorb() -> bool:
+            if global_server_args_dict["enable_flashinfer_mla"]:
+                # Flashinfer MLA: Only do not use absorb when prefilling/extending without radix cache
+                return (
+                    global_server_args_dict["disable_radix_cache"]
+                    and forward_batch.forward_mode.is_extend()
+                )
             else:
-                return self.forward_absorb(positions, hidden_states, forward_batch)
+                # Triton: Use normal computation for prefill and use weight absorption for extend/decode
+                return (
+                    forward_batch.forward_mode.is_extend()
+                    and not forward_batch.forward_mode.is_target_verify()
+                    and not forward_batch.forward_mode.is_draft_extend()
+                    and forward_batch.extend_prefix_lens.sum() == 0
+                )
+
+        if no_absorb():
+            return self.forward_normal(positions, hidden_states, forward_batch)
         else:
-            # Triton: Use normal computation for prefill and use weight absorption for extend/decode
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and forward_batch.extend_prefix_lens.sum() == 0
-            ):
-                return self.forward_normal(positions, hidden_states, forward_batch)
-            else:
-                return self.forward_absorb(positions, hidden_states, forward_batch)
+            return self.forward_absorb(positions, hidden_states, forward_batch)
 
     def forward_normal(
         self,
@@ -992,6 +997,18 @@ class DeepseekV2ForCausalLM(nn.Module):
                             weight, weight_scale, weight_block_size
                         )
                         self_attn.w_scale = scale
+                if (
+                    hasattr(self.quant_config, "weight_block_size")
+                    and w.dtype == torch.int8
+                ):
+                    weight_block_size = self.quant_config.weight_block_size
+                    if weight_block_size is not None:
+                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                        w = int8_block_dequant(
+                            weight, weight_scale, weight_block_size
+                        ).to(torch.bfloat16)
                 w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
