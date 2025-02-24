@@ -124,8 +124,8 @@ class ServerArgs:
     speculative_draft_model_path: Optional[str] = None
     speculative_algorithm: Optional[str] = None
     speculative_num_steps: int = 5
-    speculative_num_draft_tokens: int = 64
     speculative_eagle_topk: int = 8
+    speculative_num_draft_tokens: int = 64
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -720,17 +720,17 @@ class ServerArgs:
             default=ServerArgs.speculative_num_steps,
         )
         parser.add_argument(
-            "--speculative-num-draft-tokens",
-            type=int,
-            help="The number of token sampled from draft model in Speculative Decoding.",
-            default=ServerArgs.speculative_num_draft_tokens,
-        )
-        parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
             help="The number of token sampled from draft model in eagle2 each step.",
             choices=[1, 2, 4, 8],
             default=ServerArgs.speculative_eagle_topk,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
         )
 
         # Double Sparsity
