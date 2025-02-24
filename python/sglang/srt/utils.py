@@ -120,6 +120,9 @@ def is_hpu() -> bool:
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
 
 def is_flashinfer_available():
     """
@@ -1242,6 +1245,9 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.get_device_name(device_id)
 
 
 @lru_cache(maxsize=1)
