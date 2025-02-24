@@ -32,6 +32,9 @@ class CustomOp(nn.Module):
     def forward_hpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_npu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
