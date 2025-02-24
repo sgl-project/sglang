@@ -228,17 +228,11 @@ class ModelRunner:
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
-
         torch.get_device_module(self.device).set_device(self.gpu_id)
-        if self.device == "cuda":
-            backend = "nccl"
-        elif self.device == "xpu":
+        backend = torch.distributed.get_default_backend_for_device(self.device)
+        if self.device == "xpu":
             # TODO(liangan1): Just use gloo to bypass the initilization fail
             # Need to use xccl for xpu backend in the future
-            backend = "gloo"
-        elif self.device == "hpu":
-            backend = "hccl"
-        elif self.device == "cpu":
             backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
