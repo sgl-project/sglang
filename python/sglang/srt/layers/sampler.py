@@ -29,7 +29,7 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
+        self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
         self.tp_sync_group = get_tensor_model_parallel_group().device_group
 
         if global_server_args_dict["enable_dp_attention"]:
@@ -48,7 +48,7 @@ class Sampler(nn.Module):
         if sampling_info.has_custom_logit_processor:
             self._apply_custom_logit_processor(logits, sampling_info)
 
-        if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
+        if self.use_nan_detection and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
             logits = torch.where(
                 torch.isnan(logits), torch.full_like(logits, -1e5), logits
@@ -97,7 +97,7 @@ class Sampler(nn.Module):
                         filter_apply_order="joint",
                     )
 
-                    if self.use_nan_detectioin and not torch.all(success):
+                    if self.use_nan_detection and not torch.all(success):
                         logger.warning("Detected errors during sampling!")
                         batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
 
