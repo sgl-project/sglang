@@ -379,7 +379,8 @@ def openai_completion(
     for attempt in range(retries):
         try:
             if is_chat:
-                kwargs.pop("stop", None)
+                if "stop" in kwargs and kwargs["stop"] is None:
+                    kwargs.pop("stop")
                 ret = client.chat.completions.create(messages=prompt, **kwargs)
                 if len(ret.choices) == 1:
                     comp = ret.choices[0].message.content
