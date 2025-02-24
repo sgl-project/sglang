@@ -174,7 +174,7 @@ class Scheduler:
             )
 
             if server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
+                # Directly send to the StdOrchestrator
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )

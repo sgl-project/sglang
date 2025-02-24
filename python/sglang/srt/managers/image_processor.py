@@ -241,7 +241,7 @@ class LlavaImageProcessor(BaseImageProcessor):
 
                 return pixel_values, image_hash, image.size
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in StdOrchestrator:\n" + get_exception_traceback())
 
     async def _process_single_image(
         self, image_data: Union[bytes, str], aspect_ratio: str, grid_pinpoints: str
@@ -491,7 +491,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
 
                 return pixel_values, image_hash, image.size, image_grid_thws
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in StdOrchestrator:\n" + get_exception_traceback())
 
     async def _process_single_image(self, image_data: Union[bytes, str]):
         if self.executor is not None:
@@ -544,7 +544,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 image_hashes = [image_hash]
                 image_sizes = [image_size]
                 image_grid_thws = [image_grid_thw]
-        elif isinstance(image_data, str):
+        elif isinstance(image_data, str) or isinstance(image_data, bytes):
             # A single image
             pixel_values, image_hash, image_size, image_grid_thw = (
                 await self._process_single_image(image_data)
@@ -553,6 +553,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             image_sizes = [image_size]
             image_grid_thws = [image_grid_thw]
         else:
+
             raise ValueError(f"Invalid image data: {image_data}")
 
         return {
