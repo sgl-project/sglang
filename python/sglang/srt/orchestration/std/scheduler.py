@@ -20,6 +20,7 @@ from typing import List, Optional
 
 import psutil
 import setproctitle
+import torch
 import zmq
 
 from sglang.srt.managers.io_struct import (
@@ -233,9 +234,10 @@ def run_scheduler_process(
             }
         )
 
-        while True:
-            communicator.recv_and_process_input_requests()
-            scheduler.process_batch()
+        with torch.no_grad():
+            while True:
+                communicator.recv_and_process_input_requests()
+                scheduler.process_batch()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")

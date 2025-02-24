@@ -402,7 +402,6 @@ class Scheduler:
         else:
             return self._process_batch_normal()
 
-    @torch.no_grad()
     def _process_batch_normal(self):
         batch = self.get_next_batch_to_run()
         self.cur_batch = batch
@@ -417,7 +416,6 @@ class Scheduler:
 
         self.last_batch = batch
 
-    @torch.no_grad()
     def _process_batch_overlap(self):
         batch = self.get_next_batch_to_run()
         self.cur_batch = batch
