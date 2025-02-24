@@ -182,6 +182,7 @@ class GroupCoordinator:
         use_custom_allreduce: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
+        use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
     ):
@@ -220,6 +221,7 @@ class GroupCoordinator:
         self.use_custom_allreduce = use_custom_allreduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
+        self.use_npu_communicator = use_npu_communicator
 
         # lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -259,6 +261,14 @@ class GroupCoordinator:
         self.xpu_communicator: Optional[XpuCommunicator]
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
+
+        from sglang.srt.distributed.device_communicators.npu_communicator import (
+            NpuCommunicator,
+        )
+
+        self.npu_communicator: Optional[NpuCommunicator]
+        if use_npu_communicator and self.world_size > 1:
+            self.npu_communicator = NpuCommunicator(group=self.device_group)
 
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
@@ -386,6 +396,9 @@ class GroupCoordinator:
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
             return self.xpu_communicator.all_reduce(input_)
+        
+        if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            return self.npu_communicator.all_reduce(input_)
 
         if (
             self.ca_comm is not None
@@ -874,6 +887,7 @@ def init_world_group(
         use_custom_allreduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
+        use_npu_communicator=False,
         group_name="world",
     )
 
@@ -896,6 +910,7 @@ def init_model_parallel_group(
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
+        use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
     )
