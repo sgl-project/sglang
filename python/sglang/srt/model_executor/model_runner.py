@@ -183,7 +183,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -519,6 +519,7 @@ class ModelRunner:
         self, named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
     ):
+        named_tensors = [(name, _deserialize_tensor(tensor)) for name, tensor in named_tensors]
         # TODO should we name it "direct" or "megatron"?
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
@@ -733,7 +734,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -847,7 +848,15 @@ class ModelRunner:
             return False
         return rope_scaling.get("type", None) == "mrope"
 
+
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
         default_weight_loader(params_dict[name], tensor)
+
+
+# TODO improve names + improve where these things are handled...
+def _deserialize_tensor(tensor):
+    if isinstance(tensor, list) and isinstance(tensor[0], bytes):
+        return TODO
+    return tensor
