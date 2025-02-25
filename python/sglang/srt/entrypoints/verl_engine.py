@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 from sglang.srt.server import Engine
 from sglang.srt.utils import broadcast_pyobj, MultiprocessingSerializer
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor import DeviceMesh
 
 
@@ -85,7 +86,7 @@ class VerlEngine:
             load_format: Optional[str] = None,
     ):
         for name, tensor in named_tensors:
-            serialized_tensor = MultiprocessingSerializer.serialize(tensor)
+            serialized_tensor = MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor))
 
             if self._tp_rank == 0:
                 gathered_serialized_tensors = [None for _ in range(self._tp_size)]
@@ -111,3 +112,9 @@ class VerlEngine:
     def resume_memory_occupation(self):
         if self._tp_rank == 0:
             self._engine.resume_memory_occupation()
+
+
+def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
+    if isinstance(tensor, DTensor):
+        return tensor.full_tensor()
+    return tensor
