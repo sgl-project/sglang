@@ -277,8 +277,8 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
+                            timestamp = time.perf_counter()
                             if data["text"]:
-                                timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
@@ -766,7 +766,9 @@ async def benchmark(
         if args.dataset_name == "random":
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
-            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
+            output_file_name = (
+                f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
+            )
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
@@ -1001,6 +1003,11 @@ if __name__ == "__main__":
         "--tokenizer",
         type=str,
         help="Name or path of the tokenizer. If not set, using the model conf.",
+    )
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
     )
     parser.add_argument(
         "--num-prompts",
