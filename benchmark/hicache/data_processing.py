@@ -18,6 +18,7 @@ from sglang.bench_serving import (
     gen_prompt,
     get_gen_prefix_cache_path,
 )
+from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.openai_api.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64
 
@@ -264,8 +265,11 @@ def sample_nextqa_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     max_frames: int,  # Specific for video
+    model_path: str,
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,  # No multiturn support for now
+    backend: str = "sglang-oai",
+    chat_template_name: Optional[str] = None,
     fixed_output_len: Optional[int] = None,
 ) -> SampleOutput:
     """
@@ -278,6 +282,11 @@ def sample_nextqa_requests(
         ],
     }
     """
+    # NOTE: The input len is dependent on how the
+    # vision encoder expand the IMAGE token to embedded image or video
+    # TODO: Remove 144 which is specific for llavavid with mm_spatial_pool_stride=2
+    num_tokens_per_frame = 144
+
     if fixed_output_len is None:
         fixed_output_len = 4096
 
@@ -302,6 +311,18 @@ def sample_nextqa_requests(
 
             # text prompt
             prompt = video.prompt
+
+            # NOTE: Chat Template is a must for video benchmark because we have to
+            # add special image token for later expansion
+            if backend == "sglang" or backend == "sglang-native":
+                if "chat_template" in tokenizer.init_kwargs:
+                    chat_template = get_chat_template(tokenizer.get_chat_template())
+                elif chat_template_name is not None:
+                    chat_template = get_chat_template(chat_template_name)
+                else:
+                    chat_template = get_chat_template_by_model_path(model_path)
+                prompt = chat_template.image_token + prompt
+
             prompt_token_ids = tokenizer(prompt).input_ids
             prompt_len = len(prompt_token_ids)
             output_len = fixed_output_len  # max output len, not real output len
@@ -309,8 +330,7 @@ def sample_nextqa_requests(
             # video input
             base64_data = encode_video_base64(video.path, video.num_frames)
             # TODO: Support more models than 7B
-            # TODO: Remove fixed 144
-            prompt_len += video.num_frames * 144
+            prompt_len += video.num_frames * num_tokens_per_frame
 
             # add to content
             content = [
@@ -540,8 +560,11 @@ def get_dataset(args, tokenizer):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             max_frames=args.max_frames,
+            model_path=args.model,
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
+            backend=args.backend,
+            chat_template_name=args.chat_template,
             fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "random":
