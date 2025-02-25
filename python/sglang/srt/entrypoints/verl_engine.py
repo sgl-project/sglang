@@ -24,6 +24,7 @@ from torch.distributed.tensor import DeviceMesh
 class VerlEngine:
     def __init__(
             self,
+            # TODO Discuss: what should be the params?
             first_rank_in_node: bool,
             device_mesh_cpu: DeviceMesh,
             **kwargs,
