@@ -178,11 +178,13 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
             )
 
 
-async def v1_files_create(file: UploadFile, purpose: str, file_storage_pth: str = None):
+async def v1_files_create(
+    file: UploadFile, purpose: str, file_storage_path: str = None
+):
     try:
         global storage_dir
-        if file_storage_pth:
-            storage_dir = file_storage_pth
+        if file_storage_path:
+            storage_dir = file_storage_path
         # Read the file content
         file_content = await file.read()
 
