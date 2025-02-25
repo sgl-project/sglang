@@ -70,10 +70,9 @@ def run():
     fragment = VerlEngine(
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
-        first_rank_in_node=tp_rank == 0,
         device_mesh_cpu=device_mesh_cpu['tp'],
-        # TODO not true when dp>1
-        base_gpu_id=0,
+        first_rank_in_node=tp_rank == 0,
+        base_gpu_id=dp_rank,
         gpu_id_step=dp_size,
     )
     _log(f"{fragment=}")
