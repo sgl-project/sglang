@@ -69,7 +69,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch,
+    set_cuda_arch, MultiprocessingSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -519,7 +519,7 @@ class ModelRunner:
         self, named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
     ):
-        named_tensors = [(name, _deserialize_tensor(tensor)) for name, tensor in named_tensors]
+        named_tensors = [(name, _deserialize_tensor(tensor, tp_rank=self.tp_rank)) for name, tensor in named_tensors]
         # TODO should we name it "direct" or "megatron"?
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
@@ -856,7 +856,7 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
 
 
 # TODO improve names + improve where these things are handled...
-def _deserialize_tensor(tensor):
+def _deserialize_tensor(tensor, tp_rank):
     if isinstance(tensor, list) and isinstance(tensor[0], bytes):
-        return TODO
+        return MultiprocessingSerializer.deserialize(tensor[tp_rank])
     return tensor
