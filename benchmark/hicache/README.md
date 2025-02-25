@@ -34,7 +34,6 @@ This script will automatically download the required dataset to the current work
 - sharegpt
 - ultrachat
 - loogle
-- nextqa (WIP)
 ### Example Usage:
 ```bash
 python3 bench_serving.py --model mistralai/Mistral-7B-Instruct-v0.3 --backend sglang \
@@ -57,7 +56,6 @@ yield the most benefit compared to a FIFO scheduler)
 ## Shared Prefix Benchmark
 ### Supported Datasets
 - loogle
-- nextqa (WIP)
 ### Example Usage:
 ```bash
 python3 bench_serving.py --model mistralai/Mistral-7B-Instruct-v0.3 --backend sglang \
@@ -72,6 +70,20 @@ backend in the following order: `[A+Q1, A+Q2, B+Q1, B+Q2, B+Q3, C+Q1, C+Q2, C+Q3
 
 
 ## Multi Modality Benchmark (WIP)
+### Supported Datasets:
+- nextqa
+### Example Usage:
+```bash
+Server:
+python3 -m sglang.launch_server --model-path lmms-lab/LLaVA-NeXT-Video-7B  --tp 2 --dp 1 --port 8001 \
+--host 0.0.0.0 --mem-fraction-static 0.9 --tokenizer-path llava-hf/llava-1.5-7b-hf \
+--json-model-override-args "{\"architectures\": [\"LlavaVidForCausalLM\"], \"model_type\":\"llava\", \"mm_spatial_pool_stride\":2}"
+
+Client:
+python3 bench_serving.py --model lmms-lab/LLaVA-NeXT-Video-7B --backend sglang-oai  --dataset-path \
+NExTVideo  --dataset-name nextqa --request-rate 10 --num-prompts 1 --disable-shuffle --port 8001 \ --enable-multiturn --max-frames 16 --tokenizer llava-hf/llava-1.5-7b-hf --fixed-output-len 2048
+```
+Note: for the server args, `tokenizer-path`, overriding architecture are necessary.
 
 ## Supported Backend
 - sglang
