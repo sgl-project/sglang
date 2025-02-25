@@ -546,9 +546,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                         positions, hidden_states, forward_batch
                     )
                 else:
-                    return self.forward_absorb(
-                        positions, hidden_states, forward_batch
-                    )
+                    return self.forward_absorb(positions, hidden_states, forward_batch)
             else:
                 return self.forward_absorb(positions, hidden_states, forward_batch)
 
