@@ -336,12 +336,14 @@ class GemmaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            raise RuntimeError(
-                "Some weights are not initialized from checkpoints: "
-                f"{unloaded_params}"
-            )
+
+        # TODO Ask: All other models do not seem to have this behavior, shall we delete it?
+        # unloaded_params = params_dict.keys() - loaded_params
+        # if unloaded_params:
+        #     raise RuntimeError(
+        #         "Some weights are not initialized from checkpoints: "
+        #         f"{unloaded_params}"
+        #     )
 
 
 EntryClass = GemmaForCausalLM
