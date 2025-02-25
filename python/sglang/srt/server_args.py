@@ -969,6 +969,7 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert self.gpu_id_step >= 1, "gpu_id_step must be postiive"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
