@@ -10,13 +10,13 @@
 #define WARP_SIZE 32
 
 #ifndef USE_ROCM
-  #include <c10/util/Float8_e4m3fn.h>
+#include <c10/util/Float8_e4m3fn.h>
 using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX =
-    std::numeric_limits<FP8_TYPE>::max();
+C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else
-  #include <c10/util/Float8_e4m3fnuz.h>
-  #include "amd/quant_utils.cuh"
+#include <c10/util/Float8_e4m3fnuz.h>
+
+#include "amd/quant_utils.cuh"
 using FP8_TYPE = c10::Float8_e4m3fnuz;
 // Using the default max value from pytorch (240.0) will cause accuracy
 // issue when running dynamic quantization. Here use 224.0f for rocm.
@@ -111,9 +111,8 @@ __global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input, FP8_TYP
       output_arr[j] = static_cast<FP8_TYPE>(val);
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
-      __hip_cvt_float_to_fp8(value, fp8::fp8_type::__default_saturation,
-                             fp8::fp8_type::__default_interpret),
-      c10::Float8_e4m3fnuz::from_bits());
+          __hip_cvt_float_to_fp8(value, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
+          c10::Float8_e4m3fnuz::from_bits());
 #endif
     }
 
@@ -127,12 +126,11 @@ __global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input, FP8_TYP
   for (int32_t idx = remaining_start + gid; idx < num_elements; idx += grid_size) {
     float val = fmax(-FP8_E4M3_MAX, fmin(static_cast<float>(input[idx]) * scale_val, FP8_E4M3_MAX));
 #ifndef USE_ROCM
-      output[idx] = static_cast<FP8_TYPE>(val);
+    output[idx] = static_cast<FP8_TYPE>(val);
 #else
-      output[idx] = c10::Float8_e4m3fnuz(
-      __hip_cvt_float_to_fp8(value, fp8::fp8_type::__default_saturation,
-                             fp8::fp8_type::__default_interpret),
-      c10::Float8_e4m3fnuz::from_bits());
+    output[idx] = c10::Float8_e4m3fnuz(
+        __hip_cvt_float_to_fp8(value, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
+        c10::Float8_e4m3fnuz::from_bits());
 #endif
   }
 }
