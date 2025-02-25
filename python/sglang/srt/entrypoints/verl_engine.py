@@ -86,19 +86,19 @@ class VerlEngine:
     ):
         for name, tensor in named_tensors:
             if self._tp_rank == 0:
-                object_gather_list = [None for _ in range(self._tp_size)]
+                gathered_tensors = [None for _ in range(self._tp_size)]
             else:
-                object_gather_list = None
+                gathered_tensors = None
             dist.gather_object(
                 obj=MultiprocessingSerializer.serialize(tensor),
-                object_gather_list=object_gather_list,
+                object_gather_list=gathered_tensors,
                 dst=self._device_mesh_cpu.mesh.tolist()[0],
                 group=self._device_mesh_cpu.get_group(),
             )
 
             if self._tp_rank == 0:
                 self._engine.update_weights_from_tensor(
-                    named_tensors=[(name, TODO)],
+                    named_tensors=[(name, gathered_tensors)],
                     load_format=load_format,
                 )
 
