@@ -47,7 +47,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `trust_remote_code`:  If `True`, will use locally cached config files, otherwise use remote configs in HuggingFace.
 * `dtype`: Dtype used for the model, defaults to `bfloat16`.
 * `kv_cache_dtype`: Dtype of the kv cache, defaults to the `dtype`.
-* `context_length`: The number of tokens our model can process *including the input*. Not that extending the default might lead to strange behavior.
+* `context_length`: The number of tokens our model can process *including the input*. Note that extending the default might lead to strange behavior.
 * `device`: The device we put the model, defaults to `cuda`.
 * `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.html#Chat-Template).
 * `is_embedding`: Set to true to perform [embedding](https://docs.sglang.ai/backend/openai_api_embeddings.html) / [encode](https://docs.sglang.ai/backend/native_api.html#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api.html#Classify-(reward-model)) tasks.
