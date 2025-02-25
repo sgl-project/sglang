@@ -157,6 +157,7 @@ def _run_subprocess(
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
         torch.distributed.init_process_group(rank=tp_rank, world_size=tp_size)
+        torch.get_device_module('cuda').set_device(tp_rank)
 
         mesh_kwargs = dict(mesh_shape=(tp_size, 1), mesh_dim_names=["tp", "pp"])
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
