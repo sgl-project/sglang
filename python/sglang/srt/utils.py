@@ -717,11 +717,11 @@ def gather_pyobj(
     tensor_size = torch.tensor([size], dtype=torch.long)
 
     if rank == dst:
-        gather_list_size = [torch.tensor([0], dtype=torch.long) for _ in range(TODO)]
+        gather_list_sizes = [torch.tensor([0], dtype=torch.long) for _ in range(TODO)]
     else:
-        gather_list_size = None
-
-    dist.gather(tensor_size, gather_list=TODO, dst=dst, group=dist_group)
+        gather_list_sizes = None
+    dist.gather(tensor_size, gather_list=gather_list_sizes, dst=dst, group=dist_group)
+    sizes = [x.item() for x in gather_list_sizes]
 
     dist.gather(tensor_data, gather_list=TODO, dst=dst, group=dist_group)
 
