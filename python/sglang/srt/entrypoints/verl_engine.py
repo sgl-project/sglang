@@ -14,6 +14,7 @@
 from typing import Optional, Union, List, Dict
 
 from sglang.srt.server import Engine
+from sglang.srt.utils import broadcast_pyobj
 from torch.distributed.tensor import DeviceMesh
 
 
@@ -61,5 +62,14 @@ class VerlEngine:
                 lora_path=lora_path,
                 custom_logit_processor=custom_logit_processor,
             )
+        else:
+            output = None
+
+        output = broadcast_pyobj(
+            output,
+            self._tp_rank,
+            self._device_mesh_cpu.get_group(),
+            src=TODO,
+        )
 
         return TODO
