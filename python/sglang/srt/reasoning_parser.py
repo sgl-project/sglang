@@ -35,7 +35,7 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
             rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL
         )
 
-        self.is_reasoning = False
+        self.is_reasoning = True 
 
     def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         # After DeepSeek update their chat templates in R1 series models, the reasoning models do not output "<think>\n"
