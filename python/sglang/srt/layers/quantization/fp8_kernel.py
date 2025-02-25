@@ -586,14 +586,14 @@ def w8a8_block_fp8_matmul(
         # For AMD GPUs, ensure block sizes are compatible with MFMA instructions
         if is_hip_:
             num_gpus = get_num_gpus()
-            if num_gpus <= 4:
+            if num_gpus < 8:
                 config = {
-                    "BLOCK_SIZE_M": 32,
-                    "BLOCK_SIZE_N": 32,
-                    "BLOCK_SIZE_K": 32,
+                    "BLOCK_SIZE_M": 64,
+                    "BLOCK_SIZE_N": 16,
+                    "BLOCK_SIZE_K": 128,
                     "GROUP_SIZE_M": 8,
                     "num_warps": 4,
-                    "num_stages": 1,
+                    "num_stages": 2,
                 }
             else:
                 config = {
