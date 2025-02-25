@@ -11,6 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import Optional, Union, List, Dict
+
 from sglang.srt.server import Engine
 from torch.distributed.tensor import DeviceMesh
 
@@ -31,6 +33,33 @@ class VerlEngine:
         else:
             self._engine = None
 
-    def generate(self):
+    def generate(
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        # The image input. It can be a file name, a url, or base64 encoded string.
+        # See also python/sglang/srt/utils.py:load_image.
+        image_data: Optional[Union[List[str], str]] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        custom_logit_processor: Optional[Union[List[str], str]] = None,
+    ) -> Dict:
         if self._tp_rank == 0:
-            self._engine.generate()
+            output = self._engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                input_ids=input_ids,
+                image_data=image_data,
+                return_logprob=return_logprob,
+                logprob_start_len=logprob_start_len,
+                top_logprobs_num=top_logprobs_num,
+                lora_path=lora_path,
+                custom_logit_processor=custom_logit_processor,
+            )
+
+        return TODO
