@@ -42,10 +42,11 @@ def benchmark_config(
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int8_w8a8: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
-    init_dtype = torch.float16 if use_fp8_w8a8 else dtype
+    init_dtype = torch.float16 if (use_fp8_w8a8 or use_int8_w8a8) else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16:
         w1 = torch.randint(
@@ -107,6 +108,27 @@ def benchmark_config(
 
         w1 = w1.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
         w2 = w2.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
+    if use_int8_w8a8:
+        if block_shape is None:
+            w1_scale = torch.randn(num_experts, dtype=torch.float32)
+            w2_scale = torch.randn(num_experts, dtype=torch.float32)
+            a1_scale = torch.randn(1, dtype=torch.float32)
+            a2_scale = torch.randn(1, dtype=torch.float32)
+        else:
+            block_n, block_k = block_shape[0], block_shape[1]
+            n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
+            n_tiles_w2 = (hidden_size + block_n - 1) // block_n
+            k_tiles_w1 = (hidden_size + block_k - 1) // block_k
+            k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+            w1_scale = torch.rand(
+                (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.float32
+            )
+            w2_scale = torch.rand(
+                (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.float32
+            )
+
+        w1 = w1.to(torch.int8)
+        w2 = w2.to(torch.int8)
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
@@ -127,6 +149,7 @@ def benchmark_config(
                 inplace=True,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
+                use_int8_w8a8=use_int8_w8a8,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
@@ -236,6 +259,7 @@ class BenchmarkWorker:
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int8_w8a8: bool,
         block_shape: List[int],
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
@@ -271,6 +295,7 @@ class BenchmarkWorker:
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int8_w8a8,
             block_shape,
         )
         return config, kernel_time
@@ -285,6 +310,7 @@ class BenchmarkWorker:
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
+        use_int8_w8a8: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
     ) -> Dict[str, int]:
@@ -302,6 +328,7 @@ class BenchmarkWorker:
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    use_int8_w8a8,
                     block_shape,
                     num_iters=10,
                 )
@@ -397,6 +424,7 @@ def main(args: argparse.Namespace):
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
+    use_int8_w8a8 = args.dtype == "int8_w8a8"
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -468,6 +496,7 @@ def main(args: argparse.Namespace):
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    use_int8_w8a8,
                     block_shape,
                     search_space,
                 )
@@ -486,6 +515,7 @@ def main(args: argparse.Namespace):
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int8_w8a8,
             block_shape,
         )
         end = time.time()
@@ -503,6 +533,7 @@ def main(args: argparse.Namespace):
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    use_int8_w8a8,
                     block_shape,
                 )
                 for batch_size in batch_sizes
@@ -521,7 +552,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tp-size", "-tp", type=int, default=2)
     parser.add_argument(
-        "--dtype", type=str, choices=["auto", "fp8_w8a8", "int8_w8a16"], default="auto"
+        "--dtype",
+        type=str,
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8"],
+        default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
