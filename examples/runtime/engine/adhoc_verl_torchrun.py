@@ -19,6 +19,7 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.entrypoints.verl_engine import VerlEngine
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -29,8 +30,6 @@ from torch.distributed.fsdp.api import (
     StateDictType,
 )
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-from sglang.srt.entrypoints.verl_engine import VerlEngine
 
 
 def main():
@@ -127,14 +126,15 @@ def main():
 
     state_dict = fsdp_model.state_dict()
 
-    if rank == 0:
-        lines = ["------------------------ state_dict ------------------------"]
-        for k, v in state_dict.items():
-            v_local = v.to_local()
-            lines.append(
-                f"{k}\t: {v.shape=} {v_local.shape=} {v.dtype=} {v_local.dtype=} {type(v)=} {type(v_local)=}"
-            )
-        print("\n".join(lines))
+    # for debug
+    # if rank == 0:
+    #     lines = ["------------------------ state_dict ------------------------"]
+    #     for k, v in state_dict.items():
+    #         v_local = v.to_local()
+    #         lines.append(
+    #             f"{k}\t: {v.shape=} {v_local.shape=} {v.dtype=} {v_local.dtype=} {type(v)=} {type(v_local)=}"
+    #         )
+    #     print("\n".join(lines))
 
     # NOTE MODIFIED
     # sampling_params = SamplingParams(temperature=0,
