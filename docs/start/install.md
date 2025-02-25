@@ -22,7 +22,20 @@ pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu
 
 - If you encounter `ImportError; cannot import name 'is_valid_list_of_images' from 'transformers.models.llama.image_processing_llama'`, try to use the specified version of `transformers` in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/python/pyproject.toml). Currently, just running `pip install transformers==4.48.3`.
 
-## Method 2: From source
+## Method 2: With uv
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package installer and resolver that can be used as an alternative to pip.
+
+Refer to [uv installation doc](https://docs.astral.sh/uv/getting-started/installation/) to install uv if you don't have it already.
+
+```bash
+uv pip install --upgrade pip
+uv pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+```
+
+The same quick fixes for installation issues mentioned in the pip method apply here as well.
+
+## Method 3: From source
 ```
 # Use the last release branch
 git clone -b v0.4.3.post2 https://github.com/sgl-project/sglang.git
@@ -50,7 +63,7 @@ cd ..
 pip install -e "python[all_hip]"
 ```
 
-## Method 3: Using docker
+## Method 4: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
@@ -84,7 +97,7 @@ drun -p 30000:30000 \
 drun v0.4.3.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
-## Method 4: Using docker compose
+## Method 5: Using docker compose
 
 <details>
 <summary>More</summary>
@@ -96,7 +109,7 @@ drun v0.4.3.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --in
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
-## Method 5: Run on Kubernetes or Clouds with SkyPilot
+## Method 6: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
 <summary>More</summary>
