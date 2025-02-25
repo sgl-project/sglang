@@ -7,14 +7,14 @@ The router is an independent Python package, and it can be used as a drop-in rep
 ## Installation
 
 ```bash
-$ pip install sglang-router
+pip install sglang-router
 ```
 
-Detailed usage of the router can be found in [launch_router](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang_router/launch_router.py) and [launch_server](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang/launch_server.py). Also, you can directly run the following command to see the usage of the router.
+Detailed usage of the router can be found in [launch_router](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang_router/launch_router.py) and [launch_server](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang_router/launch_server.py). Also, you can directly run the following command to see the usage of the router.
 
 ```bash
-$ python -m sglang_router.launch_server --help
-$ python -m sglang_router.launch_router --help
+python -m sglang_router.launch_server --help
+python -m sglang_router.launch_router --help
 ```
 
 The router supports two working modes:
