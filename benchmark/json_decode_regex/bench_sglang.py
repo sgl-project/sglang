@@ -46,6 +46,7 @@ def json_decode(s, document):
 
 def main(args):
     lines = read_jsonl(args.data_path)
+    lines = list(lines)
     arguments = []
     for i in range(len(lines[: args.num_questions])):
         arguments.append(
