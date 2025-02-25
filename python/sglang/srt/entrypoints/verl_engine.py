@@ -94,7 +94,7 @@ class VerlEngine:
 
             if self._tp_rank == 0:
                 self._engine.update_weights_from_tensor(
-                    named_tensors=[TODO],
+                    named_tensors=[(name, TODO)],
                     load_format=load_format,
                 )
 
