@@ -39,9 +39,10 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
 
     def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         # After DeepSeek update their chat templates in R1 series models, the reasoning models do not output "<think>\n"
-        # We assume the output has an invisible "<think>\n", and the reasoning part is the whole text.
+        # We assume the output has an "<think>\n", and the reasoning part is the whole text.
         if self.think_end_token not in text:
-            return text, None
+            # Remove "<think>\n" if exists
+            return text.replace(self.think_start_token, ""), None
 
         else:
             # Add the start token to the beginning of the text.
@@ -60,11 +61,13 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
     def parse_streaming_increment(
         self, new_text: str
     ) -> Tuple[Optional[str], Optional[str]]:
-        # Again, we assume the output has an invisible "<think>\n"
-        self._buffer += new_text
 
         # Should parse
         if self.is_reasoning:
+            # Again, we assume the output has an "<think>\n"
+            if len(self._buffer) == 0:
+                new_text = new_text.replace(self.think_start_token, "")
+            self._buffer += new_text
             # Reasoning continues
             if self.think_end_token not in self._buffer:
                 return new_text, None
