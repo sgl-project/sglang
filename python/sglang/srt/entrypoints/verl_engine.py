@@ -23,16 +23,14 @@ class VerlEngine:
         **kwargs,
     ):
         self._device_mesh_cpu = device_mesh_cpu
-        tp_rank = device_mesh_cpu.get_local_rank()
+        self._tp_rank = device_mesh_cpu.get_local_rank()
         tp_size = device_mesh_cpu.size()
 
         if first_rank_in_node:
-            self._engine = Engine(**kwargs, tp_rank=tp_rank, tp_size=tp_size)
+            self._engine = Engine(**kwargs, tp_rank=self._tp_rank, tp_size=tp_size)
         else:
             self._engine = None
 
     def generate(self):
-        if self._engine is not None:
+        if self._tp_rank == 0:
             self._engine.generate()
-
-        TODO
