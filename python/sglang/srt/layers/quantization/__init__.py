@@ -3,64 +3,89 @@ import builtins
 import inspect
 import re
 from copy import deepcopy
-from typing import Callable, Dict, Optional, Type, Union
+from typing import Callable, Dict, List, Optional, Type, Union
 
 import torch
-from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
-from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
-from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
-from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
-from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
-from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-from vllm.model_executor.layers.quantization.gptq_marlin_24 import GPTQMarlin24Config
-from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-from vllm.model_executor.layers.quantization.qqq import QQQConfig
-from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
-
+from sglang.srt.layers.quantization.gptq import GPTQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
-from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
-QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
-    "aqlm": AQLMConfig,
-    "awq": AWQConfig,
-    "deepspeedfp": DeepSpeedFPConfig,
-    "tpu_int8": Int8TpuConfig,
-    "fp8": Fp8Config,
-    "blockwise_int8": BlockInt8Config,
-    "fbgemm_fp8": FBGEMMFp8Config,
-    "marlin": MarlinConfig,
-    "modelopt": ModelOptFp8Config,
-    "gguf": GGUFConfig,
-    "gptq_marlin_24": GPTQMarlin24Config,
-    "gptq_marlin": GPTQMarlinConfig,
-    "awq_marlin": AWQMarlinConfig,
-    "gptq": GPTQConfig,
-    "compressed-tensors": CompressedTensorsConfig,
-    "bitsandbytes": BitsAndBytesConfig,
-    "qqq": QQQConfig,
-    "experts_int8": ExpertsInt8Config,
-    "w8a8_int8": W8A8Int8Config,
-    "w8a8_fp8": W8A8Fp8Config,
+QUANTIZATION_METHODS: List[str] = {
+    "aqlm",
+    "awq",
+    "deepspeedfp",
+    "tpu_int8",
+    "fp8",
+    "blockwise_int8",
+    "fbgemm_fp8",
+    "marlin",
+    "modelopt",
+    "gguf",
+    "gptq_marlin_24",
+    "gptq_marlin",
+    "awq_marlin",
+    "gptq",
+    "compressed-tensors",
+    "bitsandbytes",
+    "qqq",
+    "experts_int8",
+    "w8a8_int8",
+    "w8a8_fp8",
 }
 
 
 def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
-        raise ValueError(
-            f"Invalid quantization method: {quantization}. "
-            f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
-        )
-    return QUANTIZATION_METHODS[quantization]
+        raise ValueError(f"Invalid quantization method: {quantization}.")
+
+    from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
+    from vllm.model_executor.layers.quantization.awq import AWQConfig
+    from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
+    from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
+    from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
+    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+    from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
+        GPTQMarlin24Config,
+    )
+    from vllm.model_executor.layers.quantization.marlin import MarlinConfig
+    from vllm.model_executor.layers.quantization.qqq import QQQConfig
+    from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
+
+    from .blockwise_int8 import BlockInt8Config
+    from .fp8 import Fp8Config
+    from .gptq import GPTQConfig
+    from .modelopt_quant import ModelOptFp8Config
+    from .w8a8_int8 import W8A8Int8Config
+    from .w8a8_fp8 import W8A8Fp8Config
+
+    method_to_config: Dict[str, Type[QuantizationConfig]] = {
+        "aqlm": AQLMConfig,
+        "awq": AWQConfig,
+        "deepspeedfp": DeepSpeedFPConfig,
+        "tpu_int8": Int8TpuConfig,
+        "fp8": Fp8Config,
+        "blockwise_int8": BlockInt8Config,
+        "fbgemm_fp8": FBGEMMFp8Config,
+        "marlin": MarlinConfig,
+        "modelopt": ModelOptFp8Config,
+        "gguf": GGUFConfig,
+        "gptq_marlin_24": GPTQMarlin24Config,
+        "gptq_marlin": GPTQMarlinConfig,
+        "awq_marlin": AWQMarlinConfig,
+        "gptq": GPTQConfig,
+        "compressed-tensors": CompressedTensorsConfig,
+        "bitsandbytes": BitsAndBytesConfig,
+        "qqq": QQQConfig,
+        "experts_int8": ExpertsInt8Config,
+        "w8a8_int8": W8A8Int8Config,
+        "w8a8_fp8": W8A8Fp8Config,
+    }
+
+    return method_to_config[quantization]
 
 
 # Match dynamic rules with module name (prefix) and override quantize
