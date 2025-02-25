@@ -149,6 +149,12 @@ jobs:
           cd test/srt
           python3 test_update_weights_from_distributed.py
 
+      - name: Test EngineFragment
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_fragment.py
+
       - name: Test expert parallelism (EP=2)
         timeout-minutes: 10
         run: |
