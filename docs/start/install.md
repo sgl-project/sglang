@@ -10,7 +10,6 @@ We recommend using uv to install the dependencies with a higher installation spe
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install sgl-kernel --force-reinstall --no-deps
 uv pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
 
@@ -32,7 +31,6 @@ git clone -b v0.4.3.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
-pip install sgl-kernel --force-reinstall --no-deps
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
 
