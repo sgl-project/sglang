@@ -117,6 +117,10 @@ class VerlEngine:
         if self._tp_rank == 0:
             self._engine.resume_memory_occupation()
 
+    def shutdown(self):
+        if self._tp_rank == 0:
+            self._engine.shutdown()
+
 
 def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
     if isinstance(tensor, DTensor):
