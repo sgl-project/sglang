@@ -4,7 +4,6 @@ import sys
 
 from torch.distributed.device_mesh import init_device_mesh
 
-from sglang.srt.distributed import ParallelProcessGroups
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 
 
@@ -45,7 +44,7 @@ def run():
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
     # model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9 # test large models
 
-    # TODO remove this in next PR
+    # TODO remove this
     for k in [
         "GROUP_RANK",
         "GROUP_WORLD_SIZE",
