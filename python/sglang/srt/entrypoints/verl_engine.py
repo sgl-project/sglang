@@ -38,6 +38,8 @@ class VerlEngine:
         else:
             self._engine = None
 
+        dist.barrier(group=self._device_mesh_cpu.get_group())
+
     def generate(
             self,
             # The input prompt. It can be a single prompt or a batch of prompts.
