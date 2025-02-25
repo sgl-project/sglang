@@ -16,5 +16,12 @@ from sglang import Engine
 
 
 class VerlEngine:
-    def __init__(self, **kwargs):
-        self.engine = Engine(**kwargs)
+    def __init__(
+        self,
+        first_rank_in_node: bool,
+        **kwargs,
+    ):
+        if first_rank_in_node:
+            self.engine = Engine(**kwargs)
+        else:
+            self.engine = None
