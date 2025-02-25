@@ -62,7 +62,11 @@ class Qwen2ForRewardModel(nn.Module):
         return EmbeddingPoolerOutput(pooled_logits)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        return Qwen2ForCausalLM.load_weights(self, weights)
+        # Filter out lm_head weights of Qwen2ForCausalLM
+        filtered_weights = [
+            (name, w) for name, w in weights if not name.startswith("lm_head")
+        ]
+        return Qwen2ForCausalLM.load_weights(self, filtered_weights)
 
 
 EntryClass = [
