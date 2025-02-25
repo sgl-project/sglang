@@ -29,7 +29,7 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
+        self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
         self.tp_sync_group = get_tensor_model_parallel_group().device_group
 
         if global_server_args_dict["enable_dp_attention"]:
@@ -48,7 +48,7 @@ class Sampler(nn.Module):
         if sampling_info.has_custom_logit_processor:
             self._apply_custom_logit_processor(logits, sampling_info)
 
-        if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
+        if self.use_nan_detection and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
             logits = torch.where(
                 torch.isnan(logits), torch.full_like(logits, -1e5), logits
@@ -72,9 +72,11 @@ class Sampler(nn.Module):
                     # NOTE: the top_p_renorm_prob from flashinfer has numerical problems,
                     # https://github.com/flashinfer-ai/flashinfer/issues/708
                     # so we use the torch implementation.
+
+                    # clamp to avoid -inf
                     logprobs = torch.log(
                         top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    )
+                    ).clamp(min=torch.finfo(probs.dtype).min)
 
                 max_top_k_round, batch_size = 32, probs.shape[0]
                 uniform_samples = torch.rand(
@@ -83,7 +85,7 @@ class Sampler(nn.Module):
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                    batch_next_token_ids, success = min_p_sampling_from_probs(
+                    batch_next_token_ids = min_p_sampling_from_probs(
                         probs, uniform_samples, sampling_info.min_ps
                     )
                 else:
@@ -95,9 +97,9 @@ class Sampler(nn.Module):
                         filter_apply_order="joint",
                     )
 
-                if self.use_nan_detectioin and not torch.all(success):
-                    logger.warning("Detected errors during sampling!")
-                    batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
+                    if self.use_nan_detection and not torch.all(success):
+                        logger.warning("Detected errors during sampling!")
+                        batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
 
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 # A slower fallback implementation with torch native operations.
@@ -109,9 +111,10 @@ class Sampler(nn.Module):
                     sampling_info.need_min_p_sampling,
                 )
                 if return_logprob:
+                    # clamp to avoid -inf
                     logprobs = torch.log(
                         top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    )
+                    ).clamp(min=torch.finfo(probs.dtype).min)
             else:
                 raise ValueError(
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"

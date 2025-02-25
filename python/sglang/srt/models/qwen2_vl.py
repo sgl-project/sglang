@@ -30,13 +30,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
-from vllm.model_executor.layers.activation import QuickGELU
+from einops import rearrange
+from transformers import Qwen2VLConfig
+from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
 
-from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
-from sglang.srt.distributed import parallel_state
-from sglang.srt.distributed import utils as dist_utils
 from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -118,6 +117,7 @@ class Qwen2VisionBlock(nn.Module):
         mlp_ratio: float,
         act_layer: Type[nn.Module] = QuickGELU,
         norm_layer: Type[nn.Module] = None,
+        attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -126,12 +126,24 @@ class Qwen2VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
+        if attn_implementation == "sdpa":
+            use_context_forward = False
+            use_full_precision_softmax = False
+        elif attn_implementation == "flash_attention_2":
+            use_full_precision_softmax = False
+            use_context_forward = True
+        elif attn_implementation == "eager":
+            use_full_precision_softmax = True
+            use_context_forward = False
 
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=False,
+            use_context_forward=use_context_forward,
+            use_full_precision_softmax=use_full_precision_softmax,
+            flatten_batch=True,
             quant_config=quant_config,
         )
         self.mlp = Qwen2VisionMLP(
@@ -286,7 +298,6 @@ class Qwen2VisionTransformer(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = embed_dim // num_heads
         self.rotary_pos_emb = Qwen2VisionRotaryEmbedding(head_dim // 2)
-
         self.blocks = nn.ModuleList(
             [
                 Qwen2VisionBlock(
@@ -294,6 +305,7 @@ class Qwen2VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     norm_layer=norm_layer,
+                    attn_implementation="sdpa",
                     quant_config=quant_config,
                 )
                 for _ in range(depth)
@@ -482,10 +494,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 opensource models), the shape will be `(3, seq_len)`,
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
-            pixel_values: Pixel values to be fed to a model.
-                `None` if no images are passed.
-            image_grid_thw: Tensor `(n_images, 3)` of image 3D grid in LLM.
-                `None` if no images are passed.
         """
         if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
             positions = forward_batch.mrope_positions
@@ -540,10 +548,12 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     num_image_tokens = self.calculate_num_image_tokens(
                         image_grid_thws[idx]
                     )
+
                     left_idx = start_idx + (image_offset - prefix_len)
                     right_idx = (
                         start_idx + (image_offset - prefix_len) + num_image_tokens
                     )
+
                     inputs_embeds[left_idx:right_idx] = image_embeds[
                         image_embeds_offset : image_embeds_offset + num_image_tokens
                     ]
@@ -575,6 +585,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

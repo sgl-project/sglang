@@ -249,7 +249,10 @@ class Qwen2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        if hasattr(self.config, "scale_emb"):
+            return self.embed_tokens(input_ids) * self.config.scale_emb
+        else:
+            return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -373,6 +376,8 @@ class Qwen2ForCausalLM(nn.Module):
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue

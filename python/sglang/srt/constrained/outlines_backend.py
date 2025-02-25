@@ -20,7 +20,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import interegular
 import torch
 from outlines.fsm.guide import RegexGuide
-from outlines.fsm.json_schema import build_regex_from_schema
 from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
 
@@ -29,6 +28,12 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
+
+try:
+    from outlines.fsm.json_schema import build_regex_from_schema
+except ImportError:
+    from outlines_core.fsm.json_schema import build_regex_from_schema
+
 
 logger = logging.getLogger(__name__)
 

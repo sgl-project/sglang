@@ -82,6 +82,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -149,6 +150,7 @@ class Scheduler:
             if not self.spec_algorithm.is_none()
             else 1
         )
+        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -299,16 +301,24 @@ class Scheduler:
                 token_to_kv_pool=self.token_to_kv_pool,
             )
         else:
-            self.tree_cache = RadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
-                disable=server_args.disable_radix_cache,
+            self.tree_cache = (
+                HiRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                )
+                if self.enable_hierarchical_cache
+                else RadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    disable=server_args.disable_radix_cache,
+                )
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        self.staging_reqs = {}
         # The running decoding batch for continuous batching
         self.running_batch: Optional[ScheduleBatch] = None
         # The current forward batch
@@ -831,10 +841,16 @@ class Scheduler:
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        if available_size != self.max_total_num_tokens:
+        protected_size = self.tree_cache.protected_size()
+        memory_leak = available_size != (
+            self.max_total_num_tokens
+            if not self.enable_hierarchical_cache
+            else self.max_total_num_tokens - protected_size
+        )
+        if memory_leak:
             msg = (
                 "KV cache pool leak detected!"
-                f"{available_size=}, {self.max_total_num_tokens=}\n"
+                f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
             )
             warnings.warn(msg)
             if crash_on_warnings():
@@ -946,10 +962,41 @@ class Scheduler:
                 break
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
+
+            if self.enable_hierarchical_cache and req.last_node is not None:
+                if req.last_node.evicted:
+                    # loading KV cache for the request
+                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
+                        req.last_node,
+                        req.prefix_indices,
+                        adder.rem_total_tokens,
+                    )
+                    if req.last_node.loading:
+                        # to prevent frequent cache invalidation
+                        if req.rid in self.staging_reqs:
+                            self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                        self.tree_cache.inc_lock_ref(req.last_node)
+                        self.staging_reqs[req.rid] = req.last_node
+                        continue
+                elif req.last_node.loading:
+                    if not self.tree_cache.loading_complete(req.last_node):
+                        continue
+
+                if req.rid in self.staging_reqs:
+                    self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                    del self.staging_reqs[req.rid]
+
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    self.batch_is_full = True
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.batch_is_full = len(adder.can_run_list) > 0 or (
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
+                    else:
+                        self.batch_is_full = True
                 break
             if self.server_args.prefill_only_one_req:
                 break
@@ -983,6 +1030,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.return_hidden_states,
         )
         new_batch.prepare_for_extend()
 
@@ -1142,6 +1190,8 @@ class Scheduler:
                         logits_output.input_token_logprobs.tolist()
                     )
 
+            hidden_state_offset = 0
+
             # Check finish conditions
             logprob_pt = 0
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -1166,6 +1216,21 @@ class Scheduler:
                     if req.return_logprob:
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
+                        )
+
+                    if (
+                        self.server_args.return_hidden_states
+                        and logits_output.hidden_states is not None
+                    ):
+                        req.hidden_states.append(
+                            logits_output.hidden_states[
+                                hidden_state_offset : (
+                                    hidden_state_offset := hidden_state_offset
+                                    + len(req.origin_input_ids)
+                                )
+                            ]
+                            .cpu()
+                            .clone()
                         )
 
                     if req.grammar is not None:
@@ -1260,6 +1325,12 @@ class Scheduler:
                     req.output_top_logprobs_idx.append(
                         logits_output.next_token_top_logprobs_idx[i]
                     )
+
+            if (
+                self.server_args.return_hidden_states
+                and logits_output.hidden_states is not None
+            ):
+                req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
 
             if req.grammar is not None:
                 req.grammar.accept_token(next_token_id)
@@ -1384,6 +1455,7 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
+            output_hidden_states = [] if self.server_args.return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1450,6 +1522,9 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
+                    if self.server_args.return_hidden_states:
+                        output_hidden_states.append(req.hidden_states)
+
             # Send to detokenizer
             if rids:
                 self.send_to_detokenizer.send_pyobj(
@@ -1476,6 +1551,7 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
+                        output_hidden_states,
                     )
                 )
         else:  # embedding or reward model
@@ -1539,6 +1615,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.return_hidden_states,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -1755,7 +1832,7 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
-    # Configue the logger
+    # Configure the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:

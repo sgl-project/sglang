@@ -290,6 +290,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale, requires_grad=False
                 )
                 layer.input_scale = None
+            else:
+                layer.weight = torch.nn.Parameter(
+                    layer.weight.data, requires_grad=False
+                )
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    layer.weight_scale_inv.data, requires_grad=False
+                )
             return
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         # If checkpoint not serialized fp8, quantize the weights.
@@ -782,8 +789,8 @@ class Fp8MoEMethod:
         )
 
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            import ater
-            from ater.fused_moe import fused_experts_ck
+            import aiter
+            from aiter.fused_moe import fused_experts_ck
 
             assert activation == "silu", f"{activation=} is not supported."
 

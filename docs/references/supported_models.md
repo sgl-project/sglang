@@ -2,9 +2,9 @@
 
 ## Generative Models
 - Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2
-- Mistral / Mixtral / Mistral NeMo
+- Mistral / Mixtral / Mistral NeMo / Mistral Small 3
 - Gemma / Gemma 2
-- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL
+- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL
 - DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
 - OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
@@ -36,7 +36,7 @@
 
 - LlamaEmbeddingModel
 - Mistral embedding models
-- QWen embedding models
+- Qwen embedding models
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
 ## Reward Models
@@ -47,12 +47,35 @@
   - `python -m sglang.launch_server --model-path Skywork/Skywork-Reward-Gemma-2-27B-v0.2 --is-embedding`
 - InternLM2ForRewardModel
   - `python -m sglang.launch_server --model-path internlm/internlm2-7b-reward --is-embedding --trust-remote-code`
-
-## How to Support a New Model
+- Qwen2ForRewardModel
+  - `python -m sglang.launch_server --model-path Qwen/Qwen2.5-Math-RM-72B --is-embedding --trust-remote-code --tp-size=4`
+## How to Support a New Language Model
 
 To support a new model in SGLang, you only need to add a single file under [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
 You can learn from existing model implementations and create new files for the new models.
 For most models, you should be able to find a similar model to start with (e.g., starting from Llama).
+
+## How to Support a New vLM
+
+To support a new vision-language model (vLM) in SGLang, there are several key components in addition to the standard
+LLM.
+
+1. **Register your new model as multimodal**: Extend `is_multimodal_model` in [
+   `model_config.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/model_config.py) to
+   return True for your model.
+2. **Process Images**: Create a new `ImageProcessor` class that inherits from `BaseImageProcessor` and register this
+   processor as your model's dedicated processor. See [
+   `image_processor.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/image_processor.py)
+   for more details.
+3. **Handle Image Tokens**: Implement a `pad_input_ids` function for your new model, in which image tokens in the prompt
+   should be expanded and replaced with image-hashes, so that SGLang can recognize different images for
+   `RadixAttention`.
+4. Replace Multi-headed `Attention` of ViT with SGLang's `VisionAttention`.
+
+You can refer [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen2_vl.py) or other
+vLMs. These models demonstrate how to properly handle both visual and textual inputs.
+
+You should test the new vLM locally against hf models. See [`mmmu`](https://github.com/sgl-project/sglang/tree/main/benchmark/mmmu) for an example.
 
 ### Test the correctness
 
@@ -78,6 +101,7 @@ Another valuable resource is the [vLLM Models Directory](https://github.com/vllm
 To port a model from vLLM to SGLang, you can compare these two files [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama.py) and [vLLM Llama Implementation](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py). This comparison will help you understand how to convert a model implementation from vLLM to SGLang. The major difference is the replacement of Attention with RadixAttention. The other parts are almost identical. Specifically,
   - Replace vllm's `Attention` with `RadixAttention`. Note that you need to pass `layer_id` all the way to `RadixAttention`.
   - Replace vllm's `LogitsProcessor` with SGLang's `LogitsProcessor`.
+  - Replace Multi-headed `Attention` of ViT with SGLang's `VisionAttention`.
   - Replace other vLLM layers with SGLang layers (e.g., `RMSNorm`, `SiluAndMul`).
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.

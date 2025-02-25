@@ -2,19 +2,19 @@
 
 Given multiple GPUs running multiple SGLang Runtimes, SGLang Router distributes the requests to different Runtimes with its unique cache-aware load-balancing algorithm.
 
-The router is a independent Python package, and it can be used as a drop-in replacement for the OpenAI API.
+The router is an independent Python package, and it can be used as a drop-in replacement for the OpenAI API.
 
 ## Installation
 
 ```bash
-$ pip install sglang-router
+pip install sglang-router
 ```
 
-Detailed usage of the router can be found in [launch_router](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang_router/launch_router.py) and [launch_server](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang/launch_server.py). Also, you can directly run the following command to see the usage of the router.
+Detailed usage of the router can be found in [launch_router](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang_router/launch_router.py) and [launch_server](https://github.com/sgl-project/sglang/blob/main/sgl-router/py_src/sglang_router/launch_server.py). Also, you can directly run the following command to see the usage of the router.
 
 ```bash
-$ python -m sglang_router.launch_server --help
-$ python -m sglang_router.launch_router --help
+python -m sglang_router.launch_server --help
+python -m sglang_router.launch_router --help
 ```
 
 The router supports two working modes:
@@ -24,7 +24,7 @@ The router supports two working modes:
 
 ## Co-launch Router and Runtimes
 
-This will be a drop-in replacement for the existing `--dp-size` arguement of SGLang Runtime. Under the hood, it uses multi-processes to launch multiple workers, wait for them to be ready, then connect the router to all workers.
+This will be a drop-in replacement for the existing `--dp-size` argument of SGLang Runtime. Under the hood, it uses multi-processes to launch multiple workers, wait for them to be ready, then connect the router to all workers.
 
 ```bash
 $ python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dp-size 1

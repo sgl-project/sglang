@@ -79,6 +79,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
+    dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
 
@@ -113,6 +114,7 @@ class ServerArgs:
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
+    lora_backend: str = "triton"
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -123,8 +125,8 @@ class ServerArgs:
     speculative_draft_model_path: Optional[str] = None
     speculative_algorithm: Optional[str] = None
     speculative_num_steps: int = 5
-    speculative_num_draft_tokens: int = 64
     speculative_eagle_topk: int = 8
+    speculative_num_draft_tokens: int = 64
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -139,6 +141,7 @@ class ServerArgs:
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
@@ -159,10 +162,11 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
-
-    # Custom logit processor
+    return_hidden_states: bool = False
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
+    enable_hierarchical_cache: bool = False
+    enable_flashinfer_mla: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -256,14 +260,17 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        if self.speculative_algorithm == "EAGLE":
+        if (
+            self.speculative_algorithm == "EAGLE"
+            or self.speculative_algorithm == "NEXTN"
+        ):
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
             self.disable_overlap_schedule = True
             self.chunked_prefill_size = -1
             logger.info(
-                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
+                f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
             )
 
         # GGUF
@@ -271,6 +278,10 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
+
+        # AMD-specific Triton attention KV splits default number
+        if is_hip():
+            self.triton_attention_num_kv_splits = 16
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -525,6 +536,12 @@ class ServerArgs:
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
         )
         parser.add_argument(
+            "--dist-timeout",
+            type=int,
+            default=ServerArgs.dist_timeout,
+            help="Set timeout for torch.distributed initialization.",
+        )
+        parser.add_argument(
             "--download-dir",
             type=str,
             default=ServerArgs.download_dir,
@@ -648,13 +665,19 @@ class ServerArgs:
             nargs="*",
             default=None,
             action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}.",
         )
         parser.add_argument(
             "--max-loras-per-batch",
             type=int,
             default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
+            help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--lora-backend",
+            type=str,
+            default="triton",
+            help="Choose the kernel backend for multi-LoRA serving.",
         )
 
         # Kernel backend
@@ -679,12 +702,17 @@ class ServerArgs:
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
+        parser.add_argument(
+            "--enable-flashinfer-mla",
+            action="store_true",
+            help="Enable FlashInfer MLA optimization",
+        )
 
         # Speculative decoding
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE"],
+            choices=["EAGLE", "NEXTN"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -699,17 +727,17 @@ class ServerArgs:
             default=ServerArgs.speculative_num_steps,
         )
         parser.add_argument(
-            "--speculative-num-draft-tokens",
-            type=int,
-            help="The number of token sampled from draft model in Speculative Decoding.",
-            default=ServerArgs.speculative_num_draft_tokens,
-        )
-        parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
             help="The number of token sampled from draft model in eagle2 each step.",
             choices=[1, 2, 4, 8],
             default=ServerArgs.speculative_eagle_topk,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
         )
 
         # Double Sparsity
@@ -771,6 +799,11 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
+            "--enable-nccl-nvls",
+            action="store_true",
+            help="Enable NCCL NVLS for prefill heavy requests when available.",
+        )
+        parser.add_argument(
             "--disable-outlines-disk-cache",
             action="store_true",
             help="Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -783,7 +816,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-mla",
             action="store_true",
-            help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+            help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -884,13 +917,22 @@ class ServerArgs:
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
-        # Function Calling
+        parser.add_argument(
+            "--return-hidden-states",
+            action="store_true",
+            help="Return hidden states in the response.",
+        )
         parser.add_argument(
             "--tool-call-parser",
             type=str,
             choices=["qwen25", "mistral", "llama3"],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+        )
+        parser.add_argument(
+            "--enable-hierarchical-cache",
+            action="store_true",
+            help="Enable hierarchical cache",
         )
 
     @classmethod

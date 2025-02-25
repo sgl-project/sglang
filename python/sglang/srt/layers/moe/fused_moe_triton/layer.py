@@ -5,14 +5,13 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -67,7 +66,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
-@register_custom_op("sglang_unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
@@ -169,8 +167,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            import ater
-            from ater.fused_moe import fused_experts_ck
+            import aiter
+            from aiter.fused_moe import fused_experts_ck
 
             assert activation == "silu", f"{activation=} is not supported."
 
@@ -300,7 +298,9 @@ class FusedMoE(torch.nn.Module):
             layer=self,
             num_experts=num_experts,
             hidden_size=hidden_size,
+            # FIXME: figure out which intermediate_size to use
             intermediate_size=self.intermediate_size_per_partition,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )

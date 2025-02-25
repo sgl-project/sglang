@@ -65,6 +65,8 @@ global_server_args_dict = {
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "device": ServerArgs.device,
+    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
+    "disable_radix_cache": ServerArgs.disable_radix_cache,
 }
 
 logger = logging.getLogger(__name__)
@@ -315,6 +317,7 @@ class Req:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
                 self.output_top_logprobs_val
             ) = self.output_top_logprobs_idx = None
+        self.hidden_states = []
 
         # Logprobs (internal values)
         # The tokens is prefilled but need to be considered as decode tokens
@@ -604,6 +607,9 @@ class ScheduleBatch:
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
 
+    # Return hidden states
+    return_hidden_states: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -615,6 +621,7 @@ class ScheduleBatch:
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
+        return_hidden_states: bool = False,
     ):
         return cls(
             reqs=reqs,
@@ -629,6 +636,7 @@ class ScheduleBatch:
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
+            return_hidden_states=return_hidden_states,
         )
 
     def batch_size(self):
@@ -1196,9 +1204,15 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             capture_hidden_mode=(
-                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
-                if self.spec_info
-                else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL
+                if self.return_hidden_states
+                else (
+                    getattr(
+                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                    )
+                    if self.spec_info
+                    else CaptureHiddenMode.NULL
+                )
             ),
         )
 

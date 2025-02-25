@@ -796,6 +796,9 @@ class TokenizerManager:
                     }
                 )
 
+            if getattr(recv_obj, "output_hidden_states", None):
+                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
             if isinstance(recv_obj, BatchStrOut):
                 out_dict = {
                     "text": recv_obj.output_strs[i],
