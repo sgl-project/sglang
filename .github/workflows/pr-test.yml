@@ -67,8 +67,8 @@ jobs:
   unit-test-frontend:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -89,13 +89,13 @@ jobs:
   unit-test-backend-1-gpu:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
       matrix:
-        range: [ 0-6, 6-15, 15-22, 22-32, 32-40, 40-100 ]
+        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-100]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -118,8 +118,8 @@ jobs:
   unit-test-backend-2-gpu:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -164,8 +164,8 @@ jobs:
   performance-test-1-gpu-part-1:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -210,8 +210,8 @@ jobs:
   performance-test-1-gpu-part-2:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -244,8 +244,8 @@ jobs:
   performance-test-2-gpu:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -284,8 +284,8 @@ jobs:
   accuracy-test-1-gpu:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -309,8 +309,8 @@ jobs:
   accuracy-test-2-gpu:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
