@@ -192,11 +192,8 @@ def _run_subprocess(
                 torch.cuda.empty_cache()
 
             # test update weights
+            print(f"subprocess[{tp_rank=}] get_fsdp_state_dict", flush=True)
             fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model, tp_size=tp_size)
-            print(
-                f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
-                flush=True,
-            )
 
         engine = VerlEngine(
             model_path=model_path,
@@ -211,6 +208,7 @@ def _run_subprocess(
         print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
 
         if _ENABLE_UPDATE_WEIGHTS:
+            print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
             engine.update_weights_from_tensor(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
