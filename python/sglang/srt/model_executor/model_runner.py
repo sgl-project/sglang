@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -514,8 +515,17 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        self.model.load_weights(named_tensors)
+    def update_weights_from_tensor(
+        self, named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+    ):
+        # TODO should we name it "direct" or "megatron"?
+        if load_format == "direct":
+            _model_load_weights_direct(self.model, named_tensors)
+        elif load_format is None:
+            self.model.load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
     def get_weights_by_name(
@@ -836,3 +846,8 @@ class ModelRunner:
         if rope_scaling is None:
             return False
         return rope_scaling.get("type", None) == "mrope"
+
+def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+    params_dict = dict(model.named_parameters())
+    for name, tensor in named_tensors:
+        default_weight_loader(params_dict[name], tensor)
