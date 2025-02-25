@@ -1099,6 +1099,8 @@ def v1_chat_generate_response(
                 reasoning_content, ret_item["text"] = parser.parse_non_stream(
                     ret_item["text"]
                 )
+                if not ret_item["text"]:
+                    ret_item["text"] = ""
             except Exception as e:
                 logger.error(f"Exception: {e}")
                 return create_error_response(
@@ -1335,6 +1337,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         reasoning_content, delta = reasoning_parser_dict[
                             index
                         ].parse_stream_chunk(delta)
+                        if not delta:
+                            delta = ""
 
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:

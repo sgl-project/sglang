@@ -23,14 +23,14 @@ class BaseReasoningParser:
 
 class DeepSeekR1ReasoningParser(BaseReasoningParser):
     """
-    DeepSeekR1 reasoning parser, which use "<think>\n" and "\n</think>" to detect the reasoning part.
+    DeepSeekR1 reasoning parser, which use "<think>" and "</think>" to detect the reasoning part.
     Referring to https://github.com/deepseek-ai/DeepSeek-R1?tab=readme-ov-file#usage-recommendations~.
     """
 
     def __init__(self):
         super().__init__()
-        self.think_start_token = "<think>\n"
-        self.think_end_token = "\n</think>"
+        self.think_start_token = "<think>"
+        self.think_end_token = "</think>"
         self.pattern = re.compile(
             rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL
         )
@@ -38,10 +38,10 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
         self.is_reasoning = True 
 
     def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
-        # After DeepSeek update their chat templates in R1 series models, the reasoning models do not output "<think>\n"
-        # We assume the output has an "<think>\n", and the reasoning part is the whole text.
+        # After DeepSeek update their chat templates in R1 series models, the reasoning models do not output "<think>"
+        # We assume the output has an "<think>", and the reasoning part is the whole text.
         if self.think_end_token not in text:
-            # Remove "<think>\n" if exists
+            # Remove "<think>" if exists
             return text.replace(self.think_start_token, ""), None
 
         else:
@@ -64,7 +64,7 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
 
         # Should parse
         if self.is_reasoning:
-            # Again, we assume the output has an "<think>\n"
+            # Again, we assume the output has an "<think>"
             if len(self._buffer) == 0:
                 new_text = new_text.replace(self.think_start_token, "")
             self._buffer += new_text
