@@ -94,6 +94,8 @@ class ServerArgs:
     api_key: Optional[str] = None
     file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
+    enable_reasoning: bool = False
+    reasoning_parser: Optional[str] = None
 
     # Data parallelism
     dp_size: int = 1
@@ -281,6 +283,12 @@ class ServerArgs:
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+
+        # API Related
+        if self.enable_reasoning and not self.reasoning_parser:
+            raise ValueError(
+                "Reasoning parser must be specified when reasoning is enabled."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -599,6 +607,17 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--enable-reasoning",
+            action="store_true",
+            help="Enable the reasoning feature.",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            default=ServerArgs.reasoning_parser,
+            help="Specify the parser for reasoning tasks.",
         )
 
         # Data parallelism
