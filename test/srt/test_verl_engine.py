@@ -166,18 +166,6 @@ def _run_subprocess(
             f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
 
-        engine = VerlEngine(
-            model_path=model_path,
-            load_format="dummy" if _ENABLE_UPDATE_WEIGHTS else "auto",
-            mem_fraction_static=mem_fraction_static,
-            random_seed=42,
-            trust_remote_code=True,
-            dtype=get_dtype_str(_TORCH_DTYPE),
-            device_mesh_cpu=inference_device_mesh_cpu['tp'],
-            first_rank_in_node=tp_rank == 0,
-        )
-        print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
-
         # hf model is used for comparison
         hf_model = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=_TORCH_DTYPE, trust_remote_code=True
@@ -209,6 +197,20 @@ def _run_subprocess(
                 f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
                 flush=True,
             )
+
+        engine = VerlEngine(
+            model_path=model_path,
+            load_format="dummy" if _ENABLE_UPDATE_WEIGHTS else "auto",
+            mem_fraction_static=mem_fraction_static,
+            random_seed=42,
+            trust_remote_code=True,
+            dtype=get_dtype_str(_TORCH_DTYPE),
+            device_mesh_cpu=inference_device_mesh_cpu['tp'],
+            first_rank_in_node=tp_rank == 0,
+        )
+        print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
+
+        if _ENABLE_UPDATE_WEIGHTS:
             engine.update_weights_from_tensor(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
