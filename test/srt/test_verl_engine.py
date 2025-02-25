@@ -158,12 +158,22 @@ def _run_subprocess(
         os.environ["MASTER_PORT"] = str(master_port)
         torch.distributed.init_process_group(rank=tp_rank, world_size=tp_size)
 
+        torch.get_device_module('cuda').set_device(tp_rank)
+
         mesh_kwargs = dict(mesh_shape=(tp_size, 1), mesh_dim_names=["tp", "pp"])
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
         inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
         print(
             f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
+
+        # hf model is used for comparison
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=_TORCH_DTYPE, trust_remote_code=True
+        ).cuda()
+        hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
+        fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model, tp_size=tp_size)
+        raise Exception('hi')
 
         engine = VerlEngine(
             model_path=model_path,
