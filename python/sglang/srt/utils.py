@@ -703,6 +703,7 @@ def broadcast_pyobj(
         data = pickle.loads(serialized_data)
         return data
 
+
 def gather_pyobj(
     data: Any,
     rank: int,
@@ -717,16 +718,16 @@ def gather_pyobj(
         )
         tensor_size = torch.tensor([size], dtype=torch.long)
 
-        dist.broadcast(tensor_size, src=src, group=dist_group)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
+        dist.gather(tensor_size, src=src, group=dist_group)
+        dist.gather(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
+        dist.gather(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
+        dist.gather(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -775,10 +776,10 @@ def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
 ):
     mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    total_mem = mem.total / 1024 ** 3
+    available_mem = mem.available / 1024 ** 3
     if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
+        buf_size = int(0.5 * 1024 ** 3)
     else:
         buf_size = -1
 
@@ -1258,9 +1259,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             "{"
             + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-            )
+            f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+            for k, v in data.items()
+        )
             + "}"
         )
     elif dataclasses.is_dataclass(data):
@@ -1268,9 +1269,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-            )
+            f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+            for f in fields
+        )
             + ")"
         )
     else:
@@ -1412,7 +1413,6 @@ def get_ip() -> str:
 
 
 def get_open_port() -> int:
-
     port = os.getenv("SGLANG_PORT")
     if port is not None:
         while True:
