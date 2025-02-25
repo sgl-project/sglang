@@ -390,7 +390,7 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
         )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
-            gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+            gpu_id = server_args.base_gpu_id + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
