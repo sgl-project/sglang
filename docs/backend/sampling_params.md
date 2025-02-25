@@ -8,7 +8,7 @@ If you want a high-level endpoint that can automatically handle chat templates, 
 
 The `/generate` endpoint accepts the following parameters in JSON format. For in detail usage see the [native api doc](https://docs.sglang.ai/backend/native_api.html).
 
-* `prompt`: The input prompt. Can be a single prompt or a batch of prompts.
+* `text`: The input prompt. Can be a single prompt or a batch of prompts.
 * `input_ids`: Alternative to `text`. Specify the input as token IDs instead of text.
 * `sampling_params`: The sampling parameters as described in the sections below.
 * `return_logprob`: Whether to return log probabilities for tokens.
