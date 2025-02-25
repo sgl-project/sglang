@@ -46,8 +46,8 @@ __forceinline__ __device__ float cast(__hip_bfloat16 val) {
 }  // namespace amdgpu
 
 template <typename T>
-__forceinline__ __device__ float __shfl_xor_sync(unsigned mask, T var, int laneMask, int width = warpSize) {
-  return amdgpu::shfl_xor_sync(var, laneMask, width);
+__forceinline__ __device__ T __shfl_xor_sync(unsigned mask, T var, int laneMask, int width = warpSize) {
+  return amdgpu::shfl_xor_sync(mask, var, laneMask, width);
 }
 
 template <typename srcDtype>

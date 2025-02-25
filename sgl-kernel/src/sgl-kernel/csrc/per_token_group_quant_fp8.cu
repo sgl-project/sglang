@@ -17,9 +17,18 @@
 #define FULL_MASK 0xffffffff
 #endif
 
-using FP8_TYPE = c10::Float8_e4m3fn;
+#define kGROUPS_PER_BLOCK   16
+#define kTHRS_PER_GROUP     16
+#define kBitsToLoad         128
+#define kBytesToLoad        (kBitsToLoad / 8)
 
-__device__ __forceinline__ float GroupReduce(float val, const int tid) {
+#ifndef USE_ROCM
+using FP8_TYPE = c10::Float8_e4m3fn;
+#else
+using FP8_TYPE = c10::Float8_e4m3fnuz;
+#endif
+
+__device__ __forceinline__ float GroupReduce(float val) {
   val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 8));
   val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 4));
   val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, 2));
@@ -32,14 +41,14 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
                                                  float* __restrict__ output_s, const int group_size,
                                                  const int num_groups, const float eps, const float fp8_min,
                                                  const float fp8_max) {
-  const int groups_per_block = 16;
-  const int local_group_id = threadIdx.x / 16;
-  const int lane_id = threadIdx.x % 16;
+  const int groups_per_block = kGROUPS_PER_BLOCK;
+  const int local_group_id = threadIdx.x / kTHRS_PER_GROUP;
+  const int lane_id = threadIdx.x % kTHRS_PER_GROUP;
 
   const int block_group_id = blockIdx.x * groups_per_block;
   const int block_group_offset = (block_group_id + local_group_id) * group_size;
 
-  __shared__ float s_absmax[16];
+  __shared__ float s_absmax[kGROUPS_PER_BLOCK];
 
   float local_absmax = eps;
 
@@ -47,12 +56,12 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
   FP8_TYPE* group_output = static_cast<FP8_TYPE*>(output_q) + block_group_offset;
   float* scale_output = output_s + block_group_id + local_group_id;
 
-  constexpr uint32_t vec_size = 16 / sizeof(T);
+  constexpr uint32_t vec_size = kBytesToLoad / sizeof(T);
   using vec_t = flashinfer::vec_t<T, vec_size>;
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+  for (int32_t i = lane_id; i < num_vec_elems; i += kTHRS_PER_GROUP) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
@@ -64,7 +73,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     }
   }
 
-  local_absmax = GroupReduce(local_absmax, lane_id);
+  local_absmax = GroupReduce(local_absmax);
 
   if (lane_id == 0) {
     s_absmax[local_group_id] = local_absmax;
@@ -78,7 +87,7 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     *scale_output = y_s;
   }
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+  for (int32_t i = lane_id; i < num_vec_elems; i += kTHRS_PER_GROUP) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
@@ -101,8 +110,8 @@ void sgl_per_token_group_quant_fp8(torch::Tensor input, torch::Tensor output_q, 
 
   CHECK_EQ(input.numel() % group_size, 0);
 
-  dim3 grid(CEILDIV(num_groups, 16));
-  dim3 block(256);
+  dim3 grid(CEILDIV(num_groups, kGROUPS_PER_BLOCK));
+  dim3 block(kGROUPS_PER_BLOCK * kTHRS_PER_GROUP);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
