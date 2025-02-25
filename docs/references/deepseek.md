@@ -4,7 +4,7 @@ SGLang provides several optimizations specifically designed for the DeepSeek mod
 
 ## Launch DeepSeek V3 with SGLang
 
-SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3).
+SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). Refer to [installation and launch](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch) to learn how to run fast inference of DeepSeek V3/R1 with SGLang.
 
 ### Download Weights
 
@@ -81,3 +81,9 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 - **Weight**: Per-128x128-block quantization for better numerical stability.
 
 **Usage**: turn on by default for DeepSeek V3 models.
+
+## FAQ
+
+**Question**: What should I do if model loading takes too long and NCCL timeout occurs?
+
+Answer: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.i

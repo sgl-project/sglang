@@ -82,6 +82,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -300,16 +301,24 @@ class Scheduler:
                 token_to_kv_pool=self.token_to_kv_pool,
             )
         else:
-            self.tree_cache = RadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
-                disable=server_args.disable_radix_cache,
+            self.tree_cache = (
+                HiRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                )
+                if self.enable_hierarchical_cache
+                else RadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    disable=server_args.disable_radix_cache,
+                )
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        self.staging_reqs = {}
         # The running decoding batch for continuous batching
         self.running_batch: Optional[ScheduleBatch] = None
         # The current forward batch
@@ -953,6 +962,30 @@ class Scheduler:
                 break
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
+
+            if self.enable_hierarchical_cache and req.last_node is not None:
+                if req.last_node.evicted:
+                    # loading KV cache for the request
+                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
+                        req.last_node,
+                        req.prefix_indices,
+                        adder.rem_total_tokens,
+                    )
+                    if req.last_node.loading:
+                        # to prevent frequent cache invalidation
+                        if req.rid in self.staging_reqs:
+                            self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                        self.tree_cache.inc_lock_ref(req.last_node)
+                        self.staging_reqs[req.rid] = req.last_node
+                        continue
+                elif req.last_node.loading:
+                    if not self.tree_cache.loading_complete(req.last_node):
+                        continue
+
+                if req.rid in self.staging_reqs:
+                    self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                    del self.staging_reqs[req.rid]
+
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1121,6 +1154,10 @@ class Scheduler:
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_batch_result(result.bid)
+                if batch.next_batch_sampling_info:
+                    batch.next_batch_sampling_info.update_regex_vocab_mask()
+                    self.current_stream.synchronize()
+                    batch.next_batch_sampling_info.sampling_info_done.set()
         elif batch.forward_mode.is_dummy_first():
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
@@ -1422,7 +1459,7 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            hidden_states = []
+            output_hidden_states = [] if self.server_args.return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1489,7 +1526,8 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                    hidden_states.append(req.hidden_states)
+                    if self.server_args.return_hidden_states:
+                        output_hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
             if rids:
@@ -1517,7 +1555,7 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
-                        hidden_states,
+                        output_hidden_states,
                     )
                 )
         else:  # embedding or reward model
@@ -1596,16 +1634,34 @@ class Scheduler:
             except futures._base.TimeoutError:
                 break
 
-        if self.tp_size > 1:
-            # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
-            )
-            num_ready_reqs_max = tensor.item()
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
-            num_ready_reqs = num_ready_reqs_max
+        if self.server_args.enable_dp_attention:
+            if self.attn_tp_size > 1:
+                # Sync across attn TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=self.attn_tp_cpu_group,
+                )
+                num_ready_reqs_max = tensor.item()
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    self.grammar_queue[i].grammar = self.grammar_queue[
+                        i
+                    ].grammar.result()
+                num_ready_reqs = num_ready_reqs_max
+        else:
+            if self.tp_size > 1:
+                # Sync across TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+                )
+                num_ready_reqs_max = tensor.item()
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    self.grammar_queue[i].grammar = self.grammar_queue[
+                        i
+                    ].grammar.result()
+                num_ready_reqs = num_ready_reqs_max
 
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
@@ -1798,7 +1854,7 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
-    # Configue the logger
+    # Configure the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
