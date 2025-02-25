@@ -618,7 +618,7 @@ class ServerArgs:
             type=str,
             choices=["deepseek-r1"],
             default=ServerArgs.reasoning_parser,
-            help="Specify the parser for reasoning tasks.",
+            help="Specify the parser for reasoning models, supported parsers are: deepseek-r1.",
         )
 
         # Data parallelism
