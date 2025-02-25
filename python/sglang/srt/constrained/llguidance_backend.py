@@ -35,6 +35,8 @@ class GuidanceGrammar(BaseGrammarObject):
     ):
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
+
+        # TODO: add support for fast-forward tokens in the future
         self.ll_interpreter = llguidance.LLInterpreter(
             self.llguidance_tokenizer,
             self.serialized_grammar,
