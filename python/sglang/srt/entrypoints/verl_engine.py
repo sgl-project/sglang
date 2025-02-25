@@ -65,7 +65,8 @@ class VerlEngine:
         else:
             output = None
 
-        # TODO improve
+        # Most naive implementation, can extract tensor and send via gloo if too slow
+        # TODO improve the args
         ranks = self._device_mesh_cpu.mesh.tolist()
         [output] = broadcast_pyobj(
             data=[output],
