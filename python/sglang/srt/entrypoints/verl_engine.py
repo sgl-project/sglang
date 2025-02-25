@@ -83,10 +83,11 @@ class VerlEngine:
             named_tensors: List[Tuple[str, torch.Tensor]],
             load_format: Optional[str] = None,
     ):
-        TODO_gather
+        for name, tensor in named_tensors:
+            TODO_gather
 
-        if self._tp_rank == 0:
-            self._engine.update_weights_from_tensor(TODO)
+            if self._tp_rank == 0:
+                self._engine.update_weights_from_tensor(TODO)
 
     def release_memory_occupation(self):
         if self._tp_rank == 0:
