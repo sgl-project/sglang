@@ -154,6 +154,30 @@ def main():
     tp_rank = inference_device_mesh_cpu.get_local_rank("tp")
     print(f"{inference_device_mesh_cpu=}")
 
+    # TODO remove this
+    for k in [
+        "GROUP_RANK",
+        "GROUP_WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "OMP_NUM_THREADS",
+        "RANK",
+        "ROLE_NAME",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "TORCHELASTIC_ERROR_FILE",
+        "TORCHELASTIC_MAX_RESTARTS",
+        "TORCHELASTIC_RESTART_COUNT",
+        "TORCHELASTIC_RUN_ID",
+        "TORCHELASTIC_USE_AGENT_STORE",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+        "WORLD_SIZE",
+    ]:
+        if k in os.environ:
+            del os.environ[k]
+
     print(actor_model_config)
     # llm = LLM(model=None,
     #           tokenizer=tokenizer,
