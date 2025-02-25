@@ -5,7 +5,7 @@ import sys
 from torch.distributed.device_mesh import init_device_mesh
 
 from sglang.srt.distributed import ParallelProcessGroups
-from sglang.srt.entrypoints.engine_fragment import EngineFragment
+from sglang.srt.entrypoints.verl_engine import VerlEngine
 
 
 def run():
@@ -70,10 +70,12 @@ def run():
         if k in os.environ:
             del os.environ[k]
 
-    fragment = EngineFragment(
+    fragment = VerlEngine(
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
         gpu_id=local_rank,
+        first_rank_in_node=TODO,
+        device_mesh_cpu=TODO,
         parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
             device_mesh_device=device_mesh_device,
             device_mesh_cpu=device_mesh_cpu,
