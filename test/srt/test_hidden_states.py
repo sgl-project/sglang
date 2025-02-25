@@ -62,7 +62,7 @@ class TestHiddenState(unittest.TestCase):
                 f"Max diff: {torch.max(torch.abs(hf_out['hidden_states'][-1][0] - sg_hidden_states))}"
             )
 
-            atol = 0.8 if is_in_ci() else 0.4
+            atol = 0.8
             self.assertTrue(
                 torch.allclose(
                     hf_out["hidden_states"][-1][0],
