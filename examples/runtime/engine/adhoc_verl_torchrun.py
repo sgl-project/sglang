@@ -30,8 +30,7 @@ from torch.distributed.fsdp.api import (
 )
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from sglang.srt.distributed import ParallelProcessGroups
-from sglang.srt.entrypoints.engine_fragment import EngineFragment
+from sglang.srt.entrypoints.verl_engine import VerlEngine
 
 
 def main():
@@ -168,7 +167,7 @@ def main():
     changed_model_path = local_model_path.replace("-Instruct", "")
     assert changed_model_path != local_model_path
     print(f"{changed_model_path=}")
-    llm = EngineFragment(
+    llm = VerlEngine(
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
         dtype="bfloat16",
         mem_fraction_static=0.1,
