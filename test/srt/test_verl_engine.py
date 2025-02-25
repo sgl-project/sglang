@@ -161,18 +161,17 @@ def _run_subprocess(
             f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
 
-        fragment = VerlEngine(
+        engine = VerlEngine(
             model_path=model_path,
             load_format="dummy" if _ENABLE_UPDATE_WEIGHTS else "auto",
             mem_fraction_static=mem_fraction_static,
             random_seed=42,
             trust_remote_code=True,
             dtype=get_dtype_str(_TORCH_DTYPE),
-            # fragment args
             device_mesh_cpu=inference_device_mesh_cpu['tp'],
             first_rank_in_node=tp_rank == 0,
         )
-        print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
+        print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
 
         # hf model is used for comparison
         hf_model = AutoModelForCausalLM.from_pretrained(
@@ -205,7 +204,7 @@ def _run_subprocess(
                 f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
                 flush=True,
             )
-            fragment.update_weights_from_tensor(
+            engine.update_weights_from_tensor(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
 
@@ -219,7 +218,7 @@ def _run_subprocess(
                 prompts=_PROMPTS,
                 max_new_tokens=_MAX_NEW_TOKENS,
                 lora_paths=None,
-                engine=fragment,
+                engine=engine,
             )
             print(
                 f"subprocess[{tp_rank=}] call srt.forward {enable_batch=} {srt_outputs=}",
@@ -246,7 +245,7 @@ def _run_subprocess(
     output_writer.send(execution_ok)
     output_writer.close()
 
-    fragment.shutdown()
+    engine.shutdown()
     print(f"subprocess[{tp_rank=}] end", flush=True)
 
 
