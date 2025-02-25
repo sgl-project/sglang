@@ -209,7 +209,7 @@ def main():
         llm.update_weights_from_tensor([(k, v) for k, v in state_dict_full.items()])
     else:
         llm.update_weights_from_tensor([(k, v) for k, v in state_dict.items()])
-    print(f"gather + update weights: {time.time() - t:.2f}")
+    print(f"[{tp_rank=}] gather + update weights: {time.time() - t:.2f}")
 
     input_ids = input_ids.cuda()
     attention_mask = attention_mask.cuda()
