@@ -73,7 +73,7 @@ def run():
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
         gpu_id=local_rank,
-        first_rank_in_node=TODO,
+        first_rank_in_node=tp_rank == 0,
         device_mesh_cpu=device_mesh_cpu,
     )
     _log(f"{fragment=}")
