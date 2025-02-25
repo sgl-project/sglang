@@ -500,11 +500,11 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
 
     if include_parent:
         try:
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
+            if itself.is_running():  # Check if the process is still running
+                itself.kill()
+                # Avoid sending SIGQUIT if the process is already terminating
+                if itself.is_running():
+                    itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
 
