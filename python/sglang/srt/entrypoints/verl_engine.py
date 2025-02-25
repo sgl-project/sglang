@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from sglang import Engine
+from sglang.srt.server import Engine
 from torch.distributed.tensor import DeviceMesh
 
 
