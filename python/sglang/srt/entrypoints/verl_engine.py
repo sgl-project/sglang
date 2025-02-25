@@ -92,7 +92,7 @@ class VerlEngine:
             dist.gather_object(
                 obj=TODO,
                 object_gather_list=object_gather_list,
-                dst=TODO,
+                dst=self._device_mesh_cpu.mesh.tolist()[0],
                 group=self._device_mesh_cpu.get_group(),
             )
 
