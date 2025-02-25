@@ -503,7 +503,9 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             ret_code = run_with_timeout(
                 run_one_file, args=(filename,), timeout=timeout_per_file
             )
-            assert ret_code == 0
+            assert (
+                ret_code == 0
+            ), f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
             kill_process_tree(process.pid)
             time.sleep(5)
