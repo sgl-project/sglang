@@ -139,14 +139,18 @@ if supports_custom_op():
         fake_impl=outplace_all_reduce_fake,
     )
 
-    def reg_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, group_name: str) -> None:
+    def reg_all_gather_into_tensor(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
         group._all_gather_into_tensor(output, input)
 
-    def reg_all_gather_into_tensor_fake(output: torch.Tensor, input: torch.Tensor, group_name: str) -> None:
+    def reg_all_gather_into_tensor_fake(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
         pass
 
     direct_register_custom_op(
@@ -444,9 +448,9 @@ class GroupCoordinator:
         if not supports_custom_op():
             self._all_gather_into_tensor(output, input)
         else:
-            torch.ops.sglang.reg_all_gather_into_tensor(output,
-                                                        input,
-                                                        group_name=self.unique_name)
+            torch.ops.sglang.reg_all_gather_into_tensor(
+                output, input, group_name=self.unique_name
+            )
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
