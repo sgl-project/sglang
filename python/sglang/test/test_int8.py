@@ -72,7 +72,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
 
 
 class TestW8A8Int8FusedMoE(unittest.TestCase):
-    DTYPES = [torch.half]
+    DTYPES = [torch.half, torch.bfloat16]
     M = [1, 33]
     N = [128, 1024]
     K = [256, 4096]
@@ -107,8 +107,8 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
         w2 = (w2_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
 
         # Generate scale for each column (per-column quantization)
-        w1_s = torch.max(torch.abs(w1_fp32), dim=2)[0] * factor_for_scale  # [E, 2*N]
-        w2_s = torch.max(torch.abs(w2_fp32), dim=2)[0] * factor_for_scale  # [E, N]
+        w1_s = torch.rand(E, 2 * N, device=w1_fp32.device) * factor_for_scale
+        w2_s = torch.rand(E, K, device=w2_fp32.device) * factor_for_scale
         score = torch.randn((M, E), dtype=dtype)
 
         with torch.inference_mode():
@@ -129,11 +129,6 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
             )
 
         # Check results
-        print(
-            "diff: ",
-            torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
-            / torch.mean(torch.abs(ref_out.to(torch.float32))),
-        )
         self.assertTrue(
             torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
             / torch.mean(torch.abs(ref_out.to(torch.float32)))
