@@ -1,11 +1,10 @@
 import time
 import unittest
-from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -13,37 +12,107 @@ from sglang.test.test_utils import (
 )
 
 
-class TestW8A8(unittest.TestCase):
+def check_quant_method(model_path: str, use_marlin_kernel: bool):
+    from sglang.srt.model_loader import get_model
+    from sglang.srt.configs.device_config import DeviceConfig
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+    from sglang.srt.server_args import PortArgs, ServerArgs
+    from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+    from sglang.srt.distributed import (
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+        set_custom_all_reduce,
+    )
+    try:
+        init_distributed_environment(
+            backend="nccl",
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="tcp://127.0.0.1:2646",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
+        monkey_patch_vllm_parallel_state()
+    except AssertionError:
+        # ignore this error: tensor model parallel group is already initialized
+        pass
+
+    server_args = ServerArgs(model_path=model_path, dtype=torch.float16)
+    model_config = ModelConfig(
+        server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        context_length=server_args.context_length,
+        model_override_args=server_args.json_model_override_args,
+        is_embedding=server_args.is_embedding,
+        dtype=server_args.dtype,
+        quantization=server_args.quantization,
+    )
+
+    load_config = LoadConfig()
+    device_config = DeviceConfig("cuda")
+    model = get_model(model_config=model_config, load_config=load_config, device_config=device_config)
+
+    from sglang.srt.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+    from vllm.model_executor.layers.quantization.gptq_marlin import (
+        GPTQMarlinLinearMethod)
+    from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+        get_dynamic_override)
+    linear_method_cls = GPTQMarlinLinearMethod if use_marlin_kernel else (
+        GPTQLinearMethod)
+
+    for name, submodule in model.named_modules():
+        if name == "lm_head":
+            assert isinstance(submodule.quant_method, linear_method_cls)
+        elif name == 'model.layers.0.self_attn.qkv_proj':
+            # The first layer is quantized using bits=4, group_size=128
+            # desc_act=True
+            assert isinstance(submodule.quant_method, linear_method_cls)
+            config = submodule.quant_method.quant_config
+            assert config.weight_bits == 4
+            assert config.group_size == 128
+            assert config.desc_act
+        elif name == 'model.layers.1.self_attn.qkv_proj':
+            # The second layer is quantized using bits=8, group_size=32
+            # desc_act=False
+            assert isinstance(submodule.quant_method, linear_method_cls)
+            config = submodule.quant_method.quant_config
+            assert get_dynamic_override(config, layer_name=name,
+                                        key="bits") == 8
+            assert get_dynamic_override(config,
+                                        layer_name=name,
+                                        key="group_size") == 32
+            assert not get_dynamic_override(
+                config, layer_name=name, key="desc_act")
+        elif (name == 'model.layers.2.self_attn.qkv_proj'
+              or name == 'model.layers.2.mlp.gate_up_proj'):
+            # All other layers (layer index >= 2) are not quantized
+            assert isinstance(submodule.quant_method, UnquantizedLinearMethod)
+
+    del model
+
+
+class TestGPTQDynamic(unittest.TestCase):
+    MODEL_PATH = "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
+
     @classmethod
     def setUpClass(cls):
-        cls.model = "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"
+        cls.model = cls.MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            # other_args=["--quantization", "w8a8_int8"],
+            other_args=["--dtype", "float16"],
         )
 
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    # def test_gsm8k(self):
-    #     args = SimpleNamespace(
-    #         num_shots=5,
-    #         data_path=None,
-    #         num_questions=200,
-    #         max_new_tokens=512,
-    #         parallel=128,
-    #         host="http://127.0.0.1",
-    #         port=int(self.base_url.split(":")[-1]),
-    #     )
-    #     metrics = run_eval(args)
-    #     print(metrics)
-    #
-    #     self.assertGreater(metrics["accuracy"], 0.7)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -67,6 +136,54 @@ class TestW8A8(unittest.TestCase):
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
         assert throughput >= 140
+
+    def test_gptq_module(self):
+        check_quant_method(self.MODEL_PATH, use_marlin_kernel=False)
+
+
+class TestGPTQMarlinDynamic(unittest.TestCase):
+    MODEL_PATH = "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = cls.MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--dtype", "float16"],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def run_decode(self, max_new_tokens):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "max_new_tokens": max_new_tokens,
+                },
+            },
+        )
+        return response.json()
+
+    def test_throughput(self):
+        max_tokens = 256
+
+        tic = time.time()
+        res = self.run_decode(max_tokens)
+        tok = time.time()
+
+        throughput = max_tokens / (tok - tic)
+        print(f"Throughput: {throughput} tokens/s")
+        assert throughput >= 140
+
+    def test_gptq_marlin_module(self):
+        check_quant_method(self.MODEL_PATH, use_marlin_kernel=True)
 
 
 if __name__ == "__main__":
