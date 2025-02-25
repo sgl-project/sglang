@@ -27,10 +27,7 @@ def run():
     )
 
     tp_size = 4
-    # TODO
-    # TODO temp
-    # TODO
-    dp_size = 1
+    dp_size = 2
     assert world_size == tp_size * dp_size
 
     device_mesh_kwargs = dict(
