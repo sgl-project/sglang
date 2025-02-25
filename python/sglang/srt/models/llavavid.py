@@ -110,6 +110,9 @@ class LlavaVidForCausalLM(nn.Module):
         if forward_batch.forward_mode.is_extend():
             bs = forward_batch.batch_size
 
+            # Clamp input ids. See llava.py for more details
+            input_ids = input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
+
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
