@@ -12,5 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
+from sglang import Engine
+
+
 class VerlEngine:
-    TODO
+    def __init__(self, **kwargs):
+        self.engine = Engine(**kwargs)
