@@ -6,6 +6,16 @@ import unittest
 from multiprocessing import Process
 
 import torch
+from sglang.srt.entrypoints.verl_engine import VerlEngine
+from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import find_available_port
+from sglang.test.runners import (
+    HFRunner,
+    SRTRunner,
+    check_close_model_outputs,
+    get_dtype_str,
+)
+from sglang.test.test_utils import is_in_ci
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -16,18 +26,6 @@ from torch.distributed.fsdp.api import (
     StateDictType,
 )
 from transformers import AutoModelForCausalLM
-
-from sglang.srt.distributed import ParallelProcessGroups
-from sglang.srt.entrypoints.engine_fragment import EngineFragment
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server_args import find_available_port
-from sglang.test.runners import (
-    HFRunner,
-    SRTRunner,
-    check_close_model_outputs,
-    get_dtype_str,
-)
-from sglang.test.test_utils import is_in_ci
 
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
@@ -163,7 +161,7 @@ def _run_subprocess(
             f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
 
-        fragment = EngineFragment(
+        fragment = VerlEngine(
             model_path=model_path,
             load_format="dummy" if _ENABLE_UPDATE_WEIGHTS else "auto",
             mem_fraction_static=mem_fraction_static,
@@ -171,13 +169,8 @@ def _run_subprocess(
             trust_remote_code=True,
             dtype=get_dtype_str(_TORCH_DTYPE),
             # fragment args
-            gpu_id=tp_rank,
-            parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
-                device_mesh_device=inference_device_mesh_device,
-                device_mesh_cpu=inference_device_mesh_cpu,
-                dim_tp="tp",
-                dim_pp="pp",
-            ),
+            device_mesh_cpu=inference_device_mesh_cpu['tp'],
+            first_rank_in_node=tp_rank == 0,
         )
         print(f"subprocess[{tp_rank=}] {fragment=}", flush=True)
 
