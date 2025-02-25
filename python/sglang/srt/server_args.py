@@ -79,6 +79,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
+    dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
 
@@ -534,6 +535,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+        parser.add_argument(
+            "--dist-timeout",
+            type=int,
+            default=ServerArgs.dist_timeout,
+            help="Set timeout for torch.distributed initialization.",
         )
         parser.add_argument(
             "--download-dir",
