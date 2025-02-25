@@ -266,6 +266,7 @@ class W8A8Int8MoEMethod:
                 w2_scale=(layer.w2_weight_scale),
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                per_channel=True,
             )
 
         else:
@@ -282,4 +283,5 @@ class W8A8Int8MoEMethod:
                 w2_scale=(layer.w2_weight_scale),
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                per_channel=True,
             )
