@@ -177,7 +177,7 @@ class DataParallelController:
                 rank_port_args.nccl_port = port_args.nccl_port
 
             reader, writer = mp.Pipe(duplex=False)
-            assert server_args.gpu_id_step == 1, 'gpu_id_step not implemented yet in DP'
+            assert server_args.gpu_id_step == 1, "gpu_id_step not implemented yet in DP"
             gpu_id = server_args.base_gpu_id + base_gpu_id + tp_rank % tp_size_per_node
             proc = mp.Process(
                 target=run_scheduler_process,

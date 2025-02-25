@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -60,6 +61,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_custom_process_group,
@@ -68,7 +70,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch, MultiprocessingSerializer,
+    set_cuda_arch,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,7 +184,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -515,10 +517,14 @@ class ModelRunner:
             return False, error_msg
 
     def update_weights_from_tensor(
-        self, named_tensors: List[Tuple[str, torch.Tensor]],
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
     ):
-        named_tensors = [(name, _deserialize_tensor(tensor, tp_rank=self.tp_rank)) for name, tensor in named_tensors]
+        named_tensors = [
+            (name, _deserialize_tensor(tensor, tp_rank=self.tp_rank))
+            for name, tensor in named_tensors
+        ]
         # TODO should we name it "direct" or "megatron"?
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
@@ -733,7 +739,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()

@@ -19,7 +19,6 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
-from sglang.srt.entrypoints.verl_engine import VerlEngine
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -30,6 +29,8 @@ from torch.distributed.fsdp.api import (
     StateDictType,
 )
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from sglang.srt.entrypoints.verl_engine import VerlEngine
 
 
 def main():
@@ -196,9 +197,10 @@ def main():
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
         dtype="bfloat16",
         mem_fraction_static=0.2,
-        device_mesh_cpu=inference_device_mesh_cpu['tp'],
+        device_mesh_cpu=inference_device_mesh_cpu["tp"],
         first_rank_in_node=tp_rank == 0,
-        base_gpu_id=0, gpu_id_step=1,
+        base_gpu_id=0,
+        gpu_id_step=1,
     )
 
     t = time.time()

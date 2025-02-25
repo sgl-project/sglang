@@ -413,8 +413,8 @@ class SRTRunner:
                     [
                         tup[0]
                         for tup in response["meta_info"]["output_top_logprobs"][0][
-                                   :NUM_TOP_LOGPROBS
-                                   ]
+                            :NUM_TOP_LOGPROBS
+                        ]
                     ]
                 ]
             )

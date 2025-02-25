@@ -273,8 +273,12 @@ class Engine:
 
     # TODO: Should the `List[bytes]` "tensor" type be public API; if not, shall we add a new function,
     #       or, to minimize changes, just do not change the type hint here?
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]],
-                                   load_format: Optional[str] = None, has_more: bool = False):
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+        has_more: bool = False,
+    ):
         """Update weights from distributed source. If there are going to be more updates, set `has_more` to be true
         to avoid duplicated operations such as clearing cache."""
         obj = UpdateWeightsFromTensorReqInput(
@@ -390,7 +394,10 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
         )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
-            gpu_id = server_args.base_gpu_id + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            gpu_id = (
+                server_args.base_gpu_id
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
