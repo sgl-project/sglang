@@ -35,12 +35,11 @@ def run():
     device_mesh_kwargs = dict(
         mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=["tp", "dp", "pp"]
     )
-    device_mesh_device = init_device_mesh("cuda", **device_mesh_kwargs)
     device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
-    _log(f"{device_mesh_device=} {device_mesh_cpu=}")
+    _log(f"{device_mesh_cpu=}")
 
-    tp_rank = device_mesh_device.get_local_rank("tp")
-    dp_rank = device_mesh_device.get_local_rank("dp")
+    tp_rank = device_mesh_cpu.get_local_rank("tp")
+    dp_rank = device_mesh_cpu.get_local_rank("dp")
     _log(f"{tp_rank=} {tp_size=} ; {dp_rank=} {dp_size=}")
 
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
@@ -75,13 +74,7 @@ def run():
         mem_fraction_static=mem_fraction_static,
         gpu_id=local_rank,
         first_rank_in_node=TODO,
-        device_mesh_cpu=TODO,
-        parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
-            device_mesh_device=device_mesh_device,
-            device_mesh_cpu=device_mesh_cpu,
-            dim_tp="tp",
-            dim_pp="pp",
-        ),
+        device_mesh_cpu=device_mesh_cpu,
     )
     _log(f"{fragment=}")
 
