@@ -85,6 +85,7 @@ class VerlEngine:
             named_tensors: List[Tuple[str, torch.Tensor]],
             load_format: Optional[str] = None,
     ):
+        # Most naive implementation, can optimize a lot if it is bottleneck
         for tensor_index, (name, tensor) in enumerate(named_tensors):
             serialized_tensor = MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor))
 
