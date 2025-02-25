@@ -11,8 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Optional, Union, List, Dict
+from typing import Optional, Union, List, Dict, Tuple
 
+import torch
 from sglang.srt.server import Engine
 from sglang.srt.utils import broadcast_pyobj
 from torch.distributed.tensor import DeviceMesh
@@ -76,3 +77,13 @@ class VerlEngine:
         )
 
         return output
+
+    def update_weights_from_tensor(
+            self,
+            named_tensors: List[Tuple[str, torch.Tensor]],
+            load_format: Optional[str] = None,
+    ):
+        TODO_gather
+
+        if self._tp_rank == 0:
+            self._engine.update_weights_from_tensor(TODO)
