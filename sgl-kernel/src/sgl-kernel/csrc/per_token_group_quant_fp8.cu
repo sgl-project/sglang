@@ -17,10 +17,10 @@
 #define FULL_MASK 0xffffffff
 #endif
 
-#define kGROUPS_PER_BLOCK   16
-#define kTHRS_PER_GROUP     16
-#define kBitsToLoad         128
-#define kBytesToLoad        (kBitsToLoad / 8)
+#define kGROUPS_PER_BLOCK 16
+#define kTHRS_PER_GROUP 16
+#define kBitsToLoad 128
+#define kBytesToLoad (kBitsToLoad / 8)
 
 #ifndef USE_ROCM
 using FP8_TYPE = c10::Float8_e4m3fn;
