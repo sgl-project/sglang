@@ -11,17 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 from sglang import Engine
+from torch.distributed.tensor import DeviceMesh
 
 
 class VerlEngine:
     def __init__(
         self,
         first_rank_in_node: bool,
+        device_mesh_cpu: DeviceMesh,
         **kwargs,
     ):
+        self._device_mesh_cpu = device_mesh_cpu
+
         if first_rank_in_node:
-            self.engine = Engine(**kwargs)
+            self._engine = Engine(**kwargs)
         else:
-            self.engine = None
+            self._engine = None
