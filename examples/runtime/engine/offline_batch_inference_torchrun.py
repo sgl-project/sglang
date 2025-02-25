@@ -44,27 +44,7 @@ def run():
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
     # model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9 # test large models
 
-    # TODO remove this
-    for k in [
-        "GROUP_RANK",
-        "GROUP_WORLD_SIZE",
-        "LOCAL_RANK",
-        "LOCAL_WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "OMP_NUM_THREADS",
-        "RANK",
-        "ROLE_NAME",
-        "ROLE_RANK",
-        "ROLE_WORLD_SIZE",
-        "TORCHELASTIC_ERROR_FILE",
-        "TORCHELASTIC_MAX_RESTARTS",
-        "TORCHELASTIC_RESTART_COUNT",
-        "TORCHELASTIC_RUN_ID",
-        "TORCHELASTIC_USE_AGENT_STORE",
-        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
-        "WORLD_SIZE",
-    ]:
+    for k in ["TORCHELASTIC_USE_AGENT_STORE"]:
         if k in os.environ:
             del os.environ[k]
 
