@@ -442,7 +442,7 @@ class MLATokenToKVPoolHost:
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 2.0,
+        host_to_device_ratio: float = 4.0,
         pin_memory: bool = False,  # no need to use pin memory with the double buffering
         device: str = "cpu",
     ):
@@ -501,6 +501,9 @@ class MLATokenToKVPoolHost:
 
     def get_flat_data(self, indices):
         return self.kv_buffer[:, :, indices]
+
+    def assign_flat_data(self, indices, flat_data):
+        self.kv_buffer[:, :, indices] = flat_data
 
     @debug_timing
     def transfer(self, indices, flat_data):
