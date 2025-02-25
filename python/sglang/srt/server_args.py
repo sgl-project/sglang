@@ -616,6 +616,7 @@ class ServerArgs:
         parser.add_argument(
             "--reasoning-parser",
             type=str,
+            choices=["deepseek-r1"],
             default=ServerArgs.reasoning_parser,
             help="Specify the parser for reasoning tasks.",
         )
