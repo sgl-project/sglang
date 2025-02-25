@@ -151,9 +151,9 @@ def main():
 
     tp_size, dp_size = 4, 1
     kwargs = dict(mesh_shape=(tp_size, dp_size, 1), mesh_dim_names=["tp", "dp", "pp"])
-    inference_device_mesh_device = init_device_mesh("cuda", **kwargs)
     inference_device_mesh_cpu = init_device_mesh("cpu", **kwargs)
-    print(f"{inference_device_mesh_device=} {inference_device_mesh_cpu=}")
+    tp_rank = inference_device_mesh_cpu.get_local_rank("tp")
+    print(f"{inference_device_mesh_cpu=}")
 
     print(actor_model_config)
     # llm = LLM(model=None,
@@ -172,13 +172,9 @@ def main():
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
         dtype="bfloat16",
         mem_fraction_static=0.1,
-        gpu_id=rank,
-        parallel_process_groups=ParallelProcessGroups.from_devices_meshes(
-            device_mesh_device=inference_device_mesh_device,
-            device_mesh_cpu=inference_device_mesh_cpu,
-            dim_tp="tp",
-            dim_pp="pp",
-        ),
+        device_mesh_cpu=inference_device_mesh_cpu['tp'],
+        first_rank_in_node=tp_rank == 0,
+        base_gpu_id=0, gpu_id_step=1,
     )
 
     t = time.time()
