@@ -7,6 +7,16 @@ import unittest
 from multiprocessing import Process
 
 import torch
+from sglang.srt.entrypoints.verl_engine import VerlEngine
+from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils import is_port_available
+from sglang.test.runners import (
+    HFRunner,
+    SRTRunner,
+    check_close_model_outputs,
+    get_dtype_str,
+)
+from sglang.test.test_utils import is_in_ci
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -18,17 +28,6 @@ from torch.distributed.fsdp.api import (
 )
 from transformers import AutoModelForCausalLM
 
-from sglang.srt.entrypoints.verl_engine import VerlEngine
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import is_port_available
-from sglang.test.runners import (
-    HFRunner,
-    SRTRunner,
-    check_close_model_outputs,
-    get_dtype_str,
-)
-from sglang.test.test_utils import is_in_ci
-
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
 _TORCH_DTYPE = torch.float16
@@ -39,42 +38,36 @@ _ENABLE_UPDATE_WEIGHTS = True
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
 CI_MODELS = [
-    # TODO
-    # TODO temp disable
-    # TODO
     dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
-    # dict(model_path="google/gemma-2-2b"),
+    dict(model_path="google/gemma-2-2b"),
 ]
 ALL_OTHER_MODELS = [
-    # TODO
-    # TODO temp disable
-    # TODO
-    # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
-    # dict(model_path="Qwen/Qwen2-1.5B"),
-    # dict(
-    #     model_path="Qwen/Qwen2.5-14B-Instruct",
-    #     mem_fraction_static=0.1,
-    #     tp_size=8,
-    #     tight_memory=True,
-    #     decode_tolerance=1.3,
-    # ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
-    # dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
-    # dict(model_path="allenai/OLMo-1B-0724-hf"),
-    # dict(
-    #     model_path="THUDM/glm-4-9b-chat",
-    #     mem_fraction_static=0.1,
-    #     tp_size=8,
-    #     tight_memory=True,
-    # ),
-    # dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
-    # dict(
-    #     model_path="ibm-granite/granite-3.0-2b-instruct",
-    #     prefill_tolerance=0.22,
-    #     decode_tolerance=0.22,
-    # ),
-    # Fail to run these models in test_generation_models.py, need to fix that first
-    # dict(model_path="openai-community/gpt2"),
-    # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
+    dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
+    dict(model_path="Qwen/Qwen2-1.5B"),
+    dict(
+        model_path="Qwen/Qwen2.5-14B-Instruct",
+        mem_fraction_static=0.1,
+        tp_size=8,
+        tight_memory=True,
+        decode_tolerance=1.3,
+    ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
+    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
+    dict(model_path="allenai/OLMo-1B-0724-hf"),
+    dict(
+        model_path="THUDM/glm-4-9b-chat",
+        mem_fraction_static=0.1,
+        tp_size=8,
+        tight_memory=True,
+    ),
+    dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
+    dict(
+        model_path="ibm-granite/granite-3.0-2b-instruct",
+        prefill_tolerance=0.22,
+        decode_tolerance=0.22,
+    ),
+    Fail to run these models in test_generation_models.py, need to fix that first
+    dict(model_path="openai-community/gpt2"),
+    dict(model_path="microsoft/Phi-3-small-8k-instruct"),
 ]
 
 
