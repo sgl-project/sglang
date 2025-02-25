@@ -14,10 +14,10 @@
 from typing import Optional, Union, List, Dict, Tuple
 
 import torch
+import torch.distributed as dist
 from sglang.srt.server import Engine
 from sglang.srt.utils import broadcast_pyobj
 from torch.distributed.tensor import DeviceMesh
-import torch.distributed as dist
 
 
 class VerlEngine:
@@ -29,10 +29,10 @@ class VerlEngine:
     ):
         self._device_mesh_cpu = device_mesh_cpu
         self._tp_rank = device_mesh_cpu.get_local_rank()
-        tp_size = device_mesh_cpu.size()
+        self._tp_size = device_mesh_cpu.size()
 
         if first_rank_in_node:
-            self._engine = Engine(**kwargs, tp_rank=self._tp_rank, tp_size=tp_size)
+            self._engine = Engine(**kwargs, tp_rank=self._tp_rank, tp_size=self._tp_size)
         else:
             self._engine = None
 
@@ -85,9 +85,13 @@ class VerlEngine:
             load_format: Optional[str] = None,
     ):
         for name, tensor in named_tensors:
+            if self._tp_rank == 0:
+                object_gather_list = [None for _ in range(self._tp_size)]
+            else:
+                object_gather_list = None
             dist.gather_object(
                 obj=TODO,
-                object_gather_list=TODO,
+                object_gather_list=object_gather_list,
                 dst=TODO,
                 group=self._device_mesh_cpu.get_group(),
             )
