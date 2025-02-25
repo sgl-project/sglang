@@ -73,7 +73,6 @@ def run():
     fragment = VerlEngine(
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
-        gpu_id=local_rank,
         first_rank_in_node=tp_rank == 0,
         device_mesh_cpu=device_mesh_cpu['tp'],
     )
