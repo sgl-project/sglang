@@ -82,6 +82,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -173,7 +174,7 @@ class Scheduler:
             )
 
             if server_args.skip_tokenizer_init:
-                # Directly send to the StdOrchestrator
+                # Directly send to the TokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
@@ -300,16 +301,24 @@ class Scheduler:
                 token_to_kv_pool=self.token_to_kv_pool,
             )
         else:
-            self.tree_cache = RadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
-                disable=server_args.disable_radix_cache,
+            self.tree_cache = (
+                HiRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                )
+                if self.enable_hierarchical_cache
+                else RadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    disable=server_args.disable_radix_cache,
+                )
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        self.staging_reqs = {}
         # The running decoding batch for continuous batching
         self.running_batch: Optional[ScheduleBatch] = None
         # The current forward batch
@@ -953,6 +962,30 @@ class Scheduler:
                 break
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
+
+            if self.enable_hierarchical_cache and req.last_node is not None:
+                if req.last_node.evicted:
+                    # loading KV cache for the request
+                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
+                        req.last_node,
+                        req.prefix_indices,
+                        adder.rem_total_tokens,
+                    )
+                    if req.last_node.loading:
+                        # to prevent frequent cache invalidation
+                        if req.rid in self.staging_reqs:
+                            self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                        self.tree_cache.inc_lock_ref(req.last_node)
+                        self.staging_reqs[req.rid] = req.last_node
+                        continue
+                elif req.last_node.loading:
+                    if not self.tree_cache.loading_complete(req.last_node):
+                        continue
+
+                if req.rid in self.staging_reqs:
+                    self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                    del self.staging_reqs[req.rid]
+
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1422,7 +1455,7 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            hidden_states = []
+            output_hidden_states = [] if self.server_args.return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1489,7 +1522,8 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                    hidden_states.append(req.hidden_states)
+                    if self.server_args.return_hidden_states:
+                        output_hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
             if rids:
@@ -1517,7 +1551,7 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
-                        hidden_states,
+                        output_hidden_states,
                     )
                 )
         else:  # embedding or reward model
