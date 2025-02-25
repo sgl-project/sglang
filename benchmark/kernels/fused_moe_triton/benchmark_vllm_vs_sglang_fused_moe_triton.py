@@ -179,7 +179,7 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
     shard_intermediate_size = model_config["shard_intermediate_size"]
     topk = model_config["topk"]
     dtype = model_config["dtype"]
-    block_shape = model_config.get("block_shape", None)
+    block_shape = model_config["block_shape"]
 
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     w1_scale = w2_scale = a1_scale = a2_scale = None
