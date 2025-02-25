@@ -41,8 +41,8 @@ CI_MODELS = [
     # TODO
     # TODO temp disable
     # TODO
-    # dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
-    dict(model_path="google/gemma-2-2b"),
+    dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
+    # dict(model_path="google/gemma-2-2b"),
 ]
 ALL_OTHER_MODELS = [
     # TODO
