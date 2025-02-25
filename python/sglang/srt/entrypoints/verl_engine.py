@@ -87,3 +87,11 @@ class VerlEngine:
 
         if self._tp_rank == 0:
             self._engine.update_weights_from_tensor(TODO)
+
+    def release_memory_occupation(self):
+        if self._tp_rank == 0:
+            self._engine.release_memory_occupation()
+
+    def resume_memory_occupation(self):
+        if self._tp_rank == 0:
+            self._engine.resume_memory_occupation()
