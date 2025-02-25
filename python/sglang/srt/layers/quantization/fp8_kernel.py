@@ -33,6 +33,8 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
+def get_num_gpus():
+    return torch.cuda.device_count()
 
 @triton.jit
 def _per_token_group_quant_fp8(
@@ -501,11 +503,17 @@ def get_w8a8_block_fp8_configs(
     # First look up if an optimized configuration is available in the configs
     # directory
     device_name = get_device_name().replace(" ", "_")
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
+
+    # Just in case we want to specify config files WHEN using a different tp setting
+    if is_hip_ and get_num_gpus() < 8:
+        json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
+    else:
+        json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
     config_file_path = os.path.join(
         os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
     )
+
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             logger.info(
@@ -575,14 +583,36 @@ def w8a8_block_fp8_matmul(
     else:
         # Default config
         # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+        # For AMD GPUs, ensure block sizes are compatible with MFMA instructions
+        if is_hip_:
+            num_gpus = get_num_gpus()
+            if num_gpus <= 4:
+                config = {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": 32,
+                    "BLOCK_SIZE_K": 32,
+                    "GROUP_SIZE_M": 8,
+                    "num_warps": 4,
+                    "num_stages": 1,
+                }
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 64,
+                    "BLOCK_SIZE_N": block_size[0],
+                    "BLOCK_SIZE_K": block_size[1],
+                    "GROUP_SIZE_M": 32,
+                    "num_warps": 4,
+                    "num_stages": 3,
+                }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
 
     def grid(META):
         return (
