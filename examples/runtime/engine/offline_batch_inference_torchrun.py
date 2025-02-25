@@ -2,9 +2,8 @@ import datetime
 import os
 import sys
 
-from torch.distributed.device_mesh import init_device_mesh
-
 from sglang.srt.entrypoints.verl_engine import VerlEngine
+from torch.distributed.device_mesh import init_device_mesh
 
 
 def run():
@@ -73,7 +72,7 @@ def run():
         mem_fraction_static=mem_fraction_static,
         gpu_id=local_rank,
         first_rank_in_node=tp_rank == 0,
-        device_mesh_cpu=device_mesh_cpu,
+        device_mesh_cpu=device_mesh_cpu['tp'],
     )
     _log(f"{fragment=}")
 
