@@ -522,7 +522,7 @@ def invoke_fused_moe_kernel(
             A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
-            assert trion.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16:
         assert B_scale is not None
     elif use_int8_w8a8:
