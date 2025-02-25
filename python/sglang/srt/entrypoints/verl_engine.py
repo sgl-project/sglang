@@ -85,7 +85,7 @@ class VerlEngine:
             named_tensors: List[Tuple[str, torch.Tensor]],
             load_format: Optional[str] = None,
     ):
-        for name, tensor in named_tensors:
+        for tensor_index, (name, tensor) in enumerate(named_tensors):
             serialized_tensor = MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor))
 
             if self._tp_rank == 0:
@@ -103,6 +103,7 @@ class VerlEngine:
                 self._engine.update_weights_from_tensor(
                     named_tensors=[(name, gathered_serialized_tensors)],
                     load_format=load_format,
+                    has_more=tensor_index != len(named_tensors) - 1,
                 )
 
     def release_memory_occupation(self):
