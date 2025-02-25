@@ -81,3 +81,9 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 - **Weight**: Per-128x128-block quantization for better numerical stability.
 
 **Usage**: turn on by default for DeepSeek V3 models.
+
+## FAQ
+
+**Question**: What should I do if model loading takes too long and NCCL timeout occurs?
+
+Answer: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.i

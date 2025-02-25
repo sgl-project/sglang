@@ -174,7 +174,7 @@ class Scheduler:
             )
 
             if server_args.skip_tokenizer_init:
-                # Directly send to the StdOrchestrator
+                # Directly send to the TokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
@@ -1455,7 +1455,7 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            hidden_states = []
+            output_hidden_states = [] if self.server_args.return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1522,7 +1522,8 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                    hidden_states.append(req.hidden_states)
+                    if self.server_args.return_hidden_states:
+                        output_hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
             if rids:
@@ -1550,7 +1551,7 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
-                        hidden_states,
+                        output_hidden_states,
                     )
                 )
         else:  # embedding or reward model
@@ -1831,7 +1832,7 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
-    # Configue the logger
+    # Configure the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
