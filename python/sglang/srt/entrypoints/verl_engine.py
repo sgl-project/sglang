@@ -17,6 +17,7 @@ import torch
 from sglang.srt.server import Engine
 from sglang.srt.utils import broadcast_pyobj
 from torch.distributed.tensor import DeviceMesh
+import torch.distributed as dist
 
 
 class VerlEngine:
@@ -84,10 +85,18 @@ class VerlEngine:
             load_format: Optional[str] = None,
     ):
         for name, tensor in named_tensors:
-            TODO_gather
+            dist.gather_object(
+                obj=TODO,
+                object_gather_list=TODO,
+                dst=TODO,
+                group=self._device_mesh_cpu.get_group(),
+            )
 
             if self._tp_rank == 0:
-                self._engine.update_weights_from_tensor(TODO)
+                self._engine.update_weights_from_tensor(
+                    named_tensors=[TODO],
+                    load_format=load_format,
+                )
 
     def release_memory_occupation(self):
         if self._tp_rank == 0:
