@@ -16,7 +16,7 @@ from typing import Optional, Union, List, Dict, Tuple
 import torch
 import torch.distributed as dist
 from sglang.srt.server import Engine
-from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils import broadcast_pyobj, MultiprocessingSerializer
 from torch.distributed.tensor import DeviceMesh
 
 
@@ -90,7 +90,7 @@ class VerlEngine:
             else:
                 object_gather_list = None
             dist.gather_object(
-                obj=TODO,
+                obj=MultiprocessingSerializer.serialize(tensor),
                 object_gather_list=object_gather_list,
                 dst=self._device_mesh_cpu.mesh.tolist()[0],
                 group=self._device_mesh_cpu.get_group(),
