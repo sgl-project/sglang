@@ -194,7 +194,7 @@ def main():
     llm = VerlEngine(
         model_path=changed_model_path,  # use model of same type but different weight to test update_weights
         dtype="bfloat16",
-        mem_fraction_static=0.1,
+        mem_fraction_static=0.2,
         device_mesh_cpu=inference_device_mesh_cpu['tp'],
         first_rank_in_node=tp_rank == 0,
         base_gpu_id=0, gpu_id_step=1,
