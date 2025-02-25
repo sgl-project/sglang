@@ -717,11 +717,12 @@ def gather_pyobj(
     tensor_size = torch.tensor([size], dtype=torch.long)
 
     if rank == dst:
-        TODO
+        gather_list_size = [torch.tensor([0], dtype=torch.long) for _ in range(TODO)]
     else:
-        TODO
+        gather_list_size = None
 
     dist.gather(tensor_size, gather_list=TODO, dst=dst, group=dist_group)
+
     dist.gather(tensor_data, gather_list=TODO, dst=dst, group=dist_group)
 
     serialized_data = bytes(tensor_data.cpu().numpy())
