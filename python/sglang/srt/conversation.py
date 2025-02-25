@@ -589,7 +589,7 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="minicpmo",
-        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant",
         system_template="<|im_start|>system\n{system_message}.",
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="<|im_end|>\n",

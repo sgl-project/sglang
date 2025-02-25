@@ -172,8 +172,8 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
         used_chat_template = chat_template_name
         if official_chat_template != used_chat_template:
             logger.warning(
-                f"Using a chat_template: '{used_chat_template}', "
-                f"which is different from official chat template: '{official_chat_template}', "
+                f"Using chat template: '{used_chat_template}', "
+                f"which is different from the official chat template: '{official_chat_template}', "
                 f"This discrepancy may lead to performance degradation."
             )
 

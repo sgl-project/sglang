@@ -210,7 +210,7 @@ class ImageInputs:
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
-        self.image_hashes += other.image_hashes
+        self.image_hashes += other.data_hashes
         self.pad_values = [x % (1 << 30) for x in self.image_hashes]
 
         optional_args = [

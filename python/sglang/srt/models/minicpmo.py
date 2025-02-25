@@ -64,7 +64,7 @@ from sglang.srt.models.minicpmv import (
     Resampler2_5,
 )
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import get_media_bounds, logger
+from sglang.srt.utils import get_multimodal_data_bounds, logger
 
 try:
     from vector_quantize_pytorch import GroupedResidualFSQ
@@ -1928,11 +1928,11 @@ class MiniCPMO(MiniCPMVBaseModel):
         input_embeddings = input_embeddings.unsqueeze(0)
         bs = len(input_embeddings)
         if len(data.get("audio_features", [])) > 0:
-            audio_bounds = get_media_bounds(
+            audio_bounds = get_multimodal_data_bounds(
                 input_ids=input_ids,
                 pad_values=data["pad_values"],
-                media_start_id=data["audio_start_id"],
-                media_end_id=data["audio_end_id"],
+                data_start_id=data["audio_start_id"],
+                data_end_id=data["audio_end_id"],
             )
 
             if audio_bounds.numel() == 0:
@@ -2021,7 +2021,9 @@ class MiniCPMO(MiniCPMVBaseModel):
         # There values are useless because their embeddings will be replaced by vision embeddings anyway.
         input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
-        vllm_embeddings, _ = self.get_embedding(input_ids, image_inputs)
+        vllm_embeddings = self.get_vllm_embedding(
+            input_ids, image_inputs, forward_batch.forward_mode
+        )
 
         if self.config.init_audio:
             vllm_embeddings = self.get_omni_embedding(

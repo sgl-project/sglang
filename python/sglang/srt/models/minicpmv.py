@@ -52,11 +52,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
-from sglang.srt.utils import get_media_bounds
+from sglang.srt.utils import get_multimodal_data_bounds
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -687,29 +687,26 @@ class MiniCPMVBaseModel(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
-    def get_embedding(
+    def get_vllm_embedding(
         self,
         input_ids: torch.Tensor,
         image_inputs: Optional[MiniCPMVImageInputs],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # print(f"input_ids shape: {input_ids.shape}")
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
         vlm_embedding: torch.Tensor = self.llm.get_input_embeddings(input_ids)
-        # print(f"vlm_embedding shape: {vlm_embedding.shape}")
-        # print(f"image_inputs: {image_inputs}")
-        if image_inputs is None:  # No image
-            vision_hidden_states = torch.tensor([], device=input_ids.device)
-        else:
-            if image_inputs["type"] == "image_embeds":
-                vision_hidden_states = (
-                    image_inputs["data"]
-                    .type(vlm_embedding.dtype)
-                    .to(vlm_embedding.device)
-                )
-            else:
-                vision_hidden_states = self.get_vision_hidden_states(image_inputs)
-            # See NOTE in _parse_and_validate_inputs
-            image_bounds = image_inputs["image_bounds"]
-            if len(image_bounds) > 0:
+        if image_inputs is not None and not forward_mode.is_decode():
+            # the vision embedding is already taken care of in PREFILL/EXTEND phase
+            image_bounds = image_inputs.get("image_bounds")
+            if image_bounds is not None and len(image_bounds) > 0:
+                if image_inputs["type"] == "image_embeds":
+                    vision_hidden_states = (
+                        image_inputs["data"]
+                        .type(vlm_embedding.dtype)
+                        .to(vlm_embedding.device)
+                    )
+                else:
+                    vision_hidden_states = self.get_vision_hidden_states(image_inputs)
+                # See NOTE in _parse_and_validate_inputs
                 image_indices = torch.stack(
                     [
                         torch.arange(start, end, dtype=torch.long)
@@ -723,7 +720,7 @@ class MiniCPMVBaseModel(nn.Module):
                     vision_hidden_states.view(-1, vision_hidden_states.shape[-1]),
                 )
 
-        return vlm_embedding, vision_hidden_states
+        return vlm_embedding
 
     def _parse_and_validate_inputs(
         self,
@@ -739,11 +736,11 @@ class MiniCPMVBaseModel(nn.Module):
         image_embeds = kwargs.pop("image_embeds", None)
         pad_values = kwargs.pop("pad_values", None)
         if image_embeds is not None:
-            image_bounds = get_media_bounds(
+            image_bounds = get_multimodal_data_bounds(
                 input_ids=input_ids,
                 pad_values=pad_values,
-                media_start_id=im_start_id,
-                media_end_id=im_end_id,
+                data_start_id=im_start_id,
+                data_end_id=im_end_id,
                 slice_start_id=slice_start_id,
                 slice_end_id=slice_end_id,
             )
@@ -802,11 +799,11 @@ class MiniCPMVBaseModel(nn.Module):
         if len(pixel_values_flat) == 0:
             return None
 
-        image_bounds = get_media_bounds(
+        image_bounds = get_multimodal_data_bounds(
             input_ids=input_ids,
             pad_values=pad_values,
-            media_start_id=im_start_id,
-            media_end_id=im_end_id,
+            data_start_id=im_start_id,
+            data_end_id=im_end_id,
             slice_start_id=slice_start_id,
             slice_end_id=slice_end_id,
         )
@@ -917,7 +914,9 @@ class MiniCPMVBaseModel(nn.Module):
         # There values are useless because their embeddings will be replaced by vision embeddings anyway.
         input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
-        vlm_embeddings, _ = self.get_embedding(input_ids, image_inputs)
+        vlm_embeddings = self.get_vllm_embedding(
+            input_ids, image_inputs, forward_batch.forward_mode
+        )
 
         # always pass the input via `inputs_embeds`
         # to make sure the computation graph is consistent

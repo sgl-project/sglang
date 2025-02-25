@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 import base64
 import ctypes
 import dataclasses
@@ -50,6 +49,7 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
@@ -420,9 +420,31 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file: Union[str, bytes]):
-    from PIL import Image
+def load_audio(audio_file: str) -> np.ndarray:
+    import librosa
 
+    sr = 16000
+    mono = True
+    if isinstance(audio_file, bytes):
+        audio, _ = librosa.load(io.BytesIO(audio_file), sr=sr, mono=mono)
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(audio_file, timeout=timeout)
+        audio, _ = librosa.load(io.BytesIO(response.content), sr=sr, mono=mono)
+    elif audio_file.lower().endswith(("wav", "mp3", "flac")):
+        audio, _ = librosa.load(audio_file, sr=sr, mono=mono)
+    elif audio_file.startswith("data:"):
+        audio_file = audio_file.split(",")[1]
+        audio, _ = librosa.load(BytesIO(base64.b64decode(audio_file)), sr=sr, mono=mono)
+    elif isinstance(audio_file, str):
+        audio, _ = librosa.load(audio_file, sr=sr, mono=mono)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    return audio
+
+
+def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
     image = image_size = None
 
     if isinstance(image_file, bytes):
@@ -1452,22 +1474,22 @@ def set_cuda_arch():
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
-def get_media_bounds(
+def get_multimodal_data_bounds(
     input_ids: torch.Tensor,
     pad_values: List[int],
-    media_start_id: torch.Tensor,
-    media_end_id: torch.Tensor,
+    data_start_id: torch.Tensor,
+    data_end_id: torch.Tensor,
     slice_start_id: Optional[torch.Tensor] = None,
     slice_end_id: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Returns a tensor indicating the bounds of data (images, video, audio, etc.)
+    Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
 
     """
     # All the images in the batch should share the same special image
     # bound token ids.
-    start_cond = input_ids == media_start_id
-    end_cond = input_ids == media_end_id
+    start_cond = input_ids == data_start_id
+    end_cond = input_ids == data_end_id
     if slice_start_id is not None:
         start_cond |= input_ids == slice_start_id
         end_cond |= input_ids == slice_end_id
@@ -1505,8 +1527,6 @@ def get_media_bounds(
     if not valid_pairs:
         return torch.zeros((0, 2), device=input_ids.device)
 
-    print("valid_image_nums:", valid_image_nums)
-    print("valid_pairs:", valid_pairs)
     # Convert valid pairs to tensor
     valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
     return valid_pairs_tensor

@@ -463,12 +463,6 @@ def match_chat_ml(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_chat_minicpm(model_path: str):
-    if "minicpm" in model_path:
-        return get_chat_template("minicpmv")
-
-
-@register_chat_template_matching_function
 def match_chat_yi(model_path: str):
     model_path = model_path.lower()
     if "yi-vl" in model_path and "llava" not in model_path:
@@ -487,8 +481,10 @@ def match_gemma_it(model_path: str):
 @register_chat_template_matching_function
 def match_openbmb_minicpm(model_path: str):
     model_path = model_path.lower()
-    if "minicpm" in model_path:
+    if "minicpm-v" in model_path:
         return get_chat_template("minicpmv")
+    elif "minicpm-o" in model_path:
+        return get_chat_template("minicpmo")
 
 
 @register_chat_template_matching_function

@@ -235,7 +235,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                     "slice_end_id": self.tokenizer.slice_end_id,
                 },
             )
-            (sglang_output, _) = model.get_embedding(
+            (sglang_output, _) = model.get_vllm_embedding(
                 input_ids=input_ids, image_inputs=image_inputs
             )
 
@@ -293,7 +293,7 @@ class TestMiniCPMOLogits(VisionLLMLogitsBase):
                     "slice_end_id": self.tokenizer.slice_end_id,
                 },
             )
-            (sglang_output, _) = model.get_embedding(
+            (sglang_output, _) = model.get_vllm_embedding(
                 input_ids=input_ids, image_inputs=image_inputs
             )
 
