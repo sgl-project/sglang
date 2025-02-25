@@ -705,31 +705,6 @@ def broadcast_pyobj(
         return data
 
 
-def gather_pyobj(
-    data: Any,
-    rank: int,
-    dist_group: Optional[torch.distributed.ProcessGroup] = None,
-    dst: int = 0,
-) -> List[Any]:
-    serialized_data = pickle.dumps(data)
-    size = len(serialized_data)
-    tensor_data = torch.ByteTensor(np.frombuffer(serialized_data, dtype=np.uint8))
-    tensor_size = torch.tensor([size], dtype=torch.long)
-
-    if rank == dst:
-        gather_list_sizes = [torch.tensor([0], dtype=torch.long) for _ in range(TODO)]
-    else:
-        gather_list_sizes = None
-    dist.gather(tensor_size, gather_list=gather_list_sizes, dst=dst, group=dist_group)
-    sizes = [x.item() for x in gather_list_sizes]
-
-    dist.gather(tensor_data, gather_list=TODO, dst=dst, group=dist_group)
-
-    serialized_data = bytes(tensor_data.cpu().numpy())
-    data = pickle.loads(serialized_data)
-    return data
-
-
 step_counter = 0
 
 
