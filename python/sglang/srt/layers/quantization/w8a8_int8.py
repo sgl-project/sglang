@@ -197,7 +197,7 @@ class W8A8Int8MoEMethod:
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
         extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}  # 改为COLUMN
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )
 
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)

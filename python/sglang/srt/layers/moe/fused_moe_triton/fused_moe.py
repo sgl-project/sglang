@@ -5,14 +5,17 @@
 import functools
 import json
 import logging
-import orjson
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import orjson
 import torch
 import triton
 import triton.language as tl
 from vllm import _custom_ops as ops
+
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 _is_rocm = torch.cuda.is_available() and torch.version.hip
 
@@ -36,9 +39,9 @@ if is_cuda:
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
-    # from sglang.srt.layers.quantization.fp8_kernel import (
-    #     sglang_per_token_group_quant_fp8,
-    # )
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
 
 if _is_cuda or _is_rocm:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -120,7 +123,7 @@ def fused_moe_kernel(
     - expert_ids: A tensor containing the indices of the expert for each
         block. It determines which expert matrix from B should be used for
         each block in A.
-    
+
     This kernel performs the multiplication of a token by its corresponding
     expert matrix as determined by `expert_ids`. The sorting of
     `sorted_token_ids` by expert index and padding ensures divisibility by
@@ -519,12 +522,11 @@ def invoke_fused_moe_kernel(
             A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
-            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+            assert trion.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16:
         assert B_scale is not None
     elif use_int8_w8a8:
         A, A_scale = per_token_quant_int8(A)
-
     else:
         assert A_scale is None
         assert B_scale is None
@@ -577,7 +579,6 @@ def invoke_fused_moe_kernel(
         even_Ks=even_Ks,
         **config,
     )
-
 
 
 def get_config_file_name(
