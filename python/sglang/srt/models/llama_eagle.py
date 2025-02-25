@@ -117,7 +117,7 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            if hasattr(config, 'hot_vocab_size'):
+            if hasattr(config, "hot_vocab_size"):
                 self.lm_head = ParallelLMHead(
                     config.hot_vocab_size, config.hidden_size, quant_config=quant_config
                 )
