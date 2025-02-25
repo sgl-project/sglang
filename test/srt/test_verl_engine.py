@@ -1,14 +1,15 @@
 import multiprocessing
 import multiprocessing as mp
 import os
+import random
 import traceback
 import unittest
 from multiprocessing import Process
 
 import torch
+from python.sglang.srt.utils import is_port_available
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server_args import find_available_port
 from sglang.test.runners import (
     HFRunner,
     SRTRunner,
@@ -85,7 +86,6 @@ class TestVerlEngine(unittest.TestCase):
         prefill_tolerance: float = 0.1,
         decode_tolerance: float = 0.1,
     ):
-        nccl_port = find_available_port(12345)
         master_port = find_available_port(23456)
 
         print(f"assert_fragment_e2e_execution START {index=} {model_path=}")
@@ -99,7 +99,6 @@ class TestVerlEngine(unittest.TestCase):
                     tp_rank=tp_rank,
                     tp_size=tp_size,
                     master_port=master_port,
-                    nccl_port=nccl_port,
                     output_writer=output_writer,
                     model_path=model_path,
                     mem_fraction_static=mem_fraction_static,
@@ -139,7 +138,6 @@ def _run_subprocess(
     tp_rank: int,
     tp_size: int,
     master_port: int,
-    nccl_port: int,
     output_writer,
     model_path: str,
     mem_fraction_static: float,
@@ -280,6 +278,18 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
     )
 
     return fsdp_model.state_dict()
+
+
+# TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
+def find_available_port(base_port: int):
+    port = base_port + random.randint(100, 1000)
+    while True:
+        if is_port_available(port):
+            return port
+        if port < 60000:
+            port += 42
+        else:
+            port -= 43
 
 
 if __name__ == "__main__":
