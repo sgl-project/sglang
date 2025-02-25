@@ -85,20 +85,22 @@ class VerlEngine:
             load_format: Optional[str] = None,
     ):
         for name, tensor in named_tensors:
+            serialized_tensor = MultiprocessingSerializer.serialize(tensor)
+
             if self._tp_rank == 0:
-                gathered_tensors = [None for _ in range(self._tp_size)]
+                gathered_serialized_tensors = [None for _ in range(self._tp_size)]
             else:
-                gathered_tensors = None
+                gathered_serialized_tensors = None
             dist.gather_object(
-                obj=MultiprocessingSerializer.serialize(tensor),
-                object_gather_list=gathered_tensors,
+                obj=serialized_tensor,
+                object_gather_list=gathered_serialized_tensors,
                 dst=self._device_mesh_cpu.mesh.tolist()[0],
                 group=self._device_mesh_cpu.get_group(),
             )
 
             if self._tp_rank == 0:
                 self._engine.update_weights_from_tensor(
-                    named_tensors=[(name, gathered_tensors)],
+                    named_tensors=[(name, gathered_serialized_tensors)],
                     load_format=load_format,
                 )
 
