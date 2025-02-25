@@ -179,7 +179,6 @@ def _run_subprocess(
         print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
 
         # hf model is used for comparison
-        torch.get_device_module('cuda').set_device(tp_rank)
         hf_model = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=_TORCH_DTYPE, trust_remote_code=True
         ).cuda()
@@ -205,7 +204,6 @@ def _run_subprocess(
                 torch.cuda.empty_cache()
 
             # test update weights
-            torch.get_device_module('cuda').set_device(tp_rank)
             fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model, tp_size=tp_size)
             print(
                 f"subprocess[{tp_rank=}] call update_weights_from_tensor ({list(fsdp_state_dict.keys())=})",
@@ -286,10 +284,7 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
         state_dict_config=ShardedStateDictConfig(),
     )
 
-    print('hi state dict BEFORE')
-    fsdp_model.state_dict()
-    print('hi state dict AFTER')
-    raise
+    return fsdp_model.state_dict()
 
 
 # TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
