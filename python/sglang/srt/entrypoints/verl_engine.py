@@ -30,3 +30,9 @@ class VerlEngine:
             self._engine = Engine(**kwargs, tp_rank=tp_rank, tp_size=tp_size)
         else:
             self._engine = None
+
+    def generate(self):
+        if self._engine is not None:
+            self._engine.generate()
+
+        TODO
