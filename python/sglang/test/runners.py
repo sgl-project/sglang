@@ -468,6 +468,7 @@ def monkey_patch_gemma2_sdpa():
     setattr(Gemma2PreTrainedModel, "_check_and_enable_sdpa", _check_and_enable_sdpa)
 
 
+# TODO Ask: is it ok to refactor test code like this
 def check_close_model_outputs(
     hf_outputs: ModelOutput,
     srt_outputs: ModelOutput,
