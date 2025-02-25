@@ -34,7 +34,7 @@ class VerlEngine:
         self._tp_size = device_mesh_cpu.size()
 
         if first_rank_in_node:
-            self._engine = Engine(**kwargs, tp_rank=self._tp_rank, tp_size=self._tp_size)
+            self._engine = Engine(**kwargs, tp_size=self._tp_size)
         else:
             self._engine = None
 
