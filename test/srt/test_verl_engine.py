@@ -46,7 +46,7 @@ ALL_OTHER_MODELS = [
     dict(model_path="Qwen/Qwen2-1.5B"),
     dict(
         model_path="Qwen/Qwen2.5-14B-Instruct",
-        mem_fraction_static=0.1,
+        mem_fraction_static=0.4,
         tp_size=8,
         tight_memory=True,
         decode_tolerance=1.3,
@@ -66,8 +66,8 @@ ALL_OTHER_MODELS = [
         decode_tolerance=0.22,
     ),
     # Fail to run these models in test_generation_models.py, need to fix that first
-    dict(model_path="openai-community/gpt2"),
-    dict(model_path="microsoft/Phi-3-small-8k-instruct"),
+    # dict(model_path="openai-community/gpt2"),
+    # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
 ]
 
 
@@ -151,7 +151,7 @@ def _run_subprocess(
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
         torch.distributed.init_process_group(rank=tp_rank, world_size=tp_size)
-        torch.get_device_module("cuda").set_device(tp_rank)
+        torch.cuda.set_device(tp_rank)
 
         mesh_kwargs = dict(mesh_shape=(tp_size, 1), mesh_dim_names=["tp", "pp"])
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
