@@ -59,6 +59,10 @@ class VerlEngine:
             lora_path: Optional[List[Optional[str]]] = None,
             custom_logit_processor: Optional[Union[List[str], str]] = None,
     ) -> Dict:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
+        Please refer to `GenerateReqInput` for the documentation.
+        """
         if self._tp_rank == 0:
             output = self._engine.generate(
                 prompt=prompt,
