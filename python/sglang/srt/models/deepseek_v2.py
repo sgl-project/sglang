@@ -1156,21 +1156,21 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
                         self_attn.w_scale = scale
                 if w.dtype == torch.int8:
-                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-                        torch.bfloat16
-                    )
-                if (
-                    hasattr(self.quant_config, "weight_block_size")
-                    and w.dtype == torch.int8
-                ):
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                        w = int8_block_dequant(
-                            weight, weight_scale, weight_block_size
-                        ).to(torch.bfloat16)
+                    if hasattr(self.quant_config, "weight_block_size"):
+                        # block-wise int8 need it
+                        weight_block_size = self.quant_config.weight_block_size
+                        if weight_block_size is not None:
+                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                            weight = w
+                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                            w = int8_block_dequant(
+                                weight, weight_scale, weight_block_size
+                            ).to(torch.bfloat16)
+                    else:
+                        # channel-wise int8 need it
+                        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                            torch.bfloat16
+                        )
                 w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)

@@ -2,7 +2,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda_available, is_hip, set_weight_attrs
+from sglang.srt.utils import is_cuda_available, set_weight_attrs
 
 is_cuda = is_cuda_available()
 if is_cuda:
@@ -18,8 +18,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-
-is_hip_ = is_hip()
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -249,39 +247,18 @@ class W8A8Int8MoEMethod:
             correction_bias=correction_bias,
         )
 
-        if is_hip_ and get_bool_env_var("CK_MOE"):
-            import ater
-            from ater.fused_moe import fused_experts_ck
-
-            assert activation == "silu", f"{activation=} is not supported."
-
-            return fused_experts_ck(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                use_int8_w8a8=True,
-                w1_scale=(layer.w13_weight_scale),
-                w2_scale=(layer.w2_weight_scale),
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                per_channel=True,
-            )
-
-        else:
-            return fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=True,
-                activation=activation,
-                use_int8_w8a8=True,
-                w1_scale=(layer.w13_weight_scale),
-                w2_scale=(layer.w2_weight_scale),
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                per_channel=True,
-            )
+        return fused_experts(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=True,
+            activation=activation,
+            use_int8_w8a8=True,
+            w1_scale=(layer.w13_weight_scale),
+            w2_scale=(layer.w2_weight_scale),
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            # per_channel=True,
+        )
