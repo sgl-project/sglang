@@ -869,6 +869,7 @@ def _deserialize_tensor(tensor, tp_rank):
 
 @dataclass
 class LocalSerializedTensor:
+    """TODO: Comments"""
     values: List[bytes]
 
     def get(self, rank: int):

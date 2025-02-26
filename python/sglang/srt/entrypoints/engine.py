@@ -271,8 +271,6 @@ class Engine:
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
-    # TODO: Should the `List[bytes]` "tensor" type be public API; if not, shall we add a new function,
-    #       or, to minimize changes, just do not change the type hint here?
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],

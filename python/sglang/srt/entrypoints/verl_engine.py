@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.server import Engine
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
 from torch.distributed.tensor import DeviceMesh, DTensor
@@ -112,7 +113,7 @@ class VerlEngine:
 
             if self._tp_rank == 0:
                 self._engine.update_weights_from_tensor(
-                    named_tensors=[(name, gathered_serialized_tensors)],
+                    named_tensors=[(name, LocalSerializedTensor(values=gathered_serialized_tensors))],
                     load_format=load_format,
                     has_more=tensor_index != len(named_tensors) - 1,
                 )
