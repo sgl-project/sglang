@@ -345,9 +345,7 @@ class SamplingBatchInfo:
         )
 
         # Merge the return hidden states flag
-        self.return_hidden_states = (
-            self.return_hidden_states or other.return_hidden_states
-        )
+        self.return_hidden_states |= other.return_hidden_states
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
