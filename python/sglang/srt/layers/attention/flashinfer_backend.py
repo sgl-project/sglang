@@ -506,7 +506,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o = prefill_wrapper_paged.forward(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    self._to_dtype(forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id), q.dtype),
                     causal=not layer.is_cross_attention,
                     sm_scale=layer.scaling,
                     window_left=layer.sliding_window_size,
@@ -593,7 +593,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             o = decode_wrapper.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                self._to_dtype(forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id), q.dtype),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
                 k_scale=layer.k_scale,
@@ -602,6 +602,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _to_dtype(self, kv_tuple, dtype):
+        return tuple(t.to(dtype) for t in kv_tuple)
+    
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
             return 0
