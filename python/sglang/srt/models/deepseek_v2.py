@@ -780,7 +780,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
-
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
