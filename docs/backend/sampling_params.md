@@ -55,7 +55,7 @@ Please refer to our dedicated guide on [constrained decoding](https://docs.sglan
 * `ignore_eos`: Don't stop generation when EOS token is sampled.
 * `skip_special_tokens`: Remove special tokens during decoding.
 * `custom_params`: Used when employing `CustomLogitProcessor`. For usage see below.
-* `return_hidden_states`: Return hidden states of the model, which is useful for debugging and advanced use cases.
+* `return_hidden_states`: Whether to return hidden states of the model. Useful for debugging and advanced use cases.
 
 
 ### Custom Logit Processor
