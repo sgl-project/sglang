@@ -22,11 +22,7 @@ class BaseReasoningParser:
         """Parse the new text incrementally, return reasoning_content and content."""
         # Should parse
         if self.is_reasoning:
-            if len(self._buffer) == 0:
-                self._buffer += new_text
-                new_text = new_text.replace(self.think_start_token, "")
-            else:
-                self._buffer += new_text
+            self._buffer += new_text
 
             # Reasoning continues
             if self.think_end_token not in self._buffer:
