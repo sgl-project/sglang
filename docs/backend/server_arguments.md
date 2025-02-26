@@ -68,7 +68,7 @@ Please consult the documentation below to learn more about the parameters you ma
 ### API configuration
 
 * `api_key`: Sets an API key for the server and the OpenAI-compatible API.
-* `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
+* `file_storage_path`: Directory for storing uploaded or generated files from API calls.
 * `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
 ## Parallelism

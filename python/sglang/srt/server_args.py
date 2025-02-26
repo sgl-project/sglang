@@ -43,6 +43,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    skip_tokenizer_init: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = True
     dtype: str = "auto"
@@ -55,7 +56,6 @@ class ServerArgs:
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
-    skip_tokenizer_init: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -93,7 +93,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
-    file_storage_pth: str = "sglang_storage"
+    file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
 
     # Data parallelism
@@ -440,6 +440,7 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
+
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -597,9 +598,9 @@ class ServerArgs:
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
-            "--file-storage-pth",
+            "--file-storage-path",
             type=str,
-            default=ServerArgs.file_storage_pth,
+            default=ServerArgs.file_storage_path,
             help="The path of the file storage in backend.",
         )
         parser.add_argument(
@@ -701,11 +702,6 @@ class ServerArgs:
             choices=["xgrammar", "outlines"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
-        )
-        parser.add_argument(
-            "--enable-flashinfer-mla",
-            action="store_true",
-            help="Enable FlashInfer MLA optimization",
         )
 
         # Speculative decoding
@@ -913,14 +909,14 @@ class ServerArgs:
             help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
         )
         parser.add_argument(
-            "--enable-custom-logit-processor",
-            action="store_true",
-            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
-        )
-        parser.add_argument(
             "--return-hidden-states",
             action="store_true",
             help="Return hidden states in the response.",
+        )
+        parser.add_argument(
+            "--enable-custom-logit-processor",
+            action="store_true",
+            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
         parser.add_argument(
             "--tool-call-parser",
@@ -933,6 +929,11 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mla",
+            action="store_true",
+            help="Enable FlashInfer MLA optimization",
         )
 
     @classmethod

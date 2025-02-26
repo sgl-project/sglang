@@ -425,7 +425,7 @@ def available_models():
 @app.post("/v1/files")
 async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
     return await v1_files_create(
-        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_pth
+        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_path
     )
 
 
