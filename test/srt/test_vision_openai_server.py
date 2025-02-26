@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import openai
 import requests
-from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
@@ -182,6 +181,13 @@ class TestOpenAIVisionServer(unittest.TestCase):
     def prepare_video_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
         # the size of the video embeds differs from the `modality` argument when preprocessed
+
+        # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+        # The following import order will cause Segmentation fault.
+        # import decord
+        # from transformers import AutoTokenizer
+        from decord import VideoReader, cpu
+
         max_frames_num = 12
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)

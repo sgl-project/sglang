@@ -174,7 +174,7 @@ class Scheduler:
             )
 
             if server_args.skip_tokenizer_init:
-                # Directly send to the StdOrchestrator
+                # Directly send to the TokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
@@ -1154,6 +1154,10 @@ class Scheduler:
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_batch_result(result.bid)
+                if batch.next_batch_sampling_info:
+                    batch.next_batch_sampling_info.update_regex_vocab_mask()
+                    self.current_stream.synchronize()
+                    batch.next_batch_sampling_info.sampling_info_done.set()
         elif batch.forward_mode.is_dummy_first():
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
@@ -1455,7 +1459,7 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            hidden_states = []
+            output_hidden_states = [] if self.server_args.return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1522,7 +1526,8 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                    hidden_states.append(req.hidden_states)
+                    if self.server_args.return_hidden_states:
+                        output_hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
             if rids:
@@ -1550,7 +1555,7 @@ class Scheduler:
                         input_top_logprobs_idx,
                         output_top_logprobs_val,
                         output_top_logprobs_idx,
-                        hidden_states,
+                        output_hidden_states,
                     )
                 )
         else:  # embedding or reward model
@@ -1629,16 +1634,34 @@ class Scheduler:
             except futures._base.TimeoutError:
                 break
 
-        if self.tp_size > 1:
-            # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
-            )
-            num_ready_reqs_max = tensor.item()
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
-            num_ready_reqs = num_ready_reqs_max
+        if self.server_args.enable_dp_attention:
+            if self.attn_tp_size > 1:
+                # Sync across attn TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=self.attn_tp_cpu_group,
+                )
+                num_ready_reqs_max = tensor.item()
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    self.grammar_queue[i].grammar = self.grammar_queue[
+                        i
+                    ].grammar.result()
+                num_ready_reqs = num_ready_reqs_max
+        else:
+            if self.tp_size > 1:
+                # Sync across TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+                )
+                num_ready_reqs_max = tensor.item()
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    self.grammar_queue[i].grammar = self.grammar_queue[
+                        i
+                    ].grammar.result()
+                num_ready_reqs = num_ready_reqs_max
 
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
@@ -1831,7 +1854,7 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
-    # Configue the logger
+    # Configure the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:

@@ -81,3 +81,17 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 - **Weight**: Per-128x128-block quantization for better numerical stability.
 
 **Usage**: turn on by default for DeepSeek V3 models.
+
+## FAQ
+
+1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
+
+    **Answer**: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.
+
+2. **Question**: How to use quantized DeepSeek models?
+
+    **Answer**: AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
+
+    ```bash
+    python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
+    ```

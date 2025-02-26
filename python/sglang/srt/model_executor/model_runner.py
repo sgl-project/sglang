@@ -269,6 +269,7 @@ class ModelRunner:
                 rank=self.tp_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
+                timeout=self.server_args.dist_timeout,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
             initialize_dp_attention(
