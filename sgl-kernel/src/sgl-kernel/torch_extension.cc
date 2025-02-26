@@ -171,6 +171,37 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
       " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
   m.impl("cublas_grouped_gemm", torch::kCUDA, &cublas_grouped_gemm);
+
+// Quantized GEMM for VPTQ.
+  m.def(
+      "vptq_gemm(Tensor input,"
+      "          Tensor q_indice,"
+      "          Tensor centroids,"
+      "          Tensor weight_scale,"
+      "          Tensor weight_bias,"
+      "          int[] g_i_o,"
+      "          Tensor? q_indice_residual,"
+      "          Tensor? residual_centroids,"
+      "          Tensor? q_indice_outliers,"
+      "          Tensor? outliers_centroids,"
+      "          Tensor? invperm,"
+      "          Tensor? bias) -> Tensor");
+  m.impl("vptq_gemm", torch::kCUDA, &vptq_gemm);
+
+  // Decompression method for VPTQ.
+  m.def(
+      "vptq_dequant("
+      "  Tensor q_indice, "
+      "  Tensor centroids,"
+      "  Tensor weight_scale,"
+      "  Tensor weight_bias,"
+      "  int[] g_i_o,"
+      "  Tensor? q_indice_residual,"
+      "  Tensor? residual_centroids,"
+      "  Tensor? q_indice_outliers,"
+      "  Tensor? outliers_centroids,"
+      "  Tensor? invperm) -> Tensor");
+  m.impl("vptq_dequant", torch::kCUDA, &vptq_dequant);
 }
 
 REGISTER_EXTENSION(_kernels)

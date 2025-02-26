@@ -103,6 +103,7 @@ sources = [
     "src/sgl-kernel/csrc/speculative_sampling.cu",
     "src/sgl-kernel/csrc/per_token_group_quant_fp8.cu",
     "src/sgl-kernel/csrc/cublas_grouped_gemm.cu",
+    "src/sgl-kernel/csrc/gemm_kernels.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
