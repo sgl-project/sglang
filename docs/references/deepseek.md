@@ -90,8 +90,8 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 2. **Question**: How to use quantized DeepSeek models?
 
-    **Answer**: DeepSeek's MLA does not have support for quantization. You need to add the `--disable-mla` flag to run the quantized model successfully. Meanwhile, AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
+    **Answer**: AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
 
     ```bash
-    python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half --disable-mla
+    python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
     ```
