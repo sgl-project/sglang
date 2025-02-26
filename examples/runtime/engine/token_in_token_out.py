@@ -25,7 +25,7 @@ def main():
 
     # Create an LLM.
     # specify `skip_tokenizer_init=True`, but it requires explicit detokenization at the end
-    llm = sgl.Engine(model_path=MODEL_PATH, skip_tokenizer_init=True, trust_remote_code=True)
+    llm = sgl.Engine(model_path=MODEL_PATH, skip_tokenizer_init=True)
 
     outputs = llm.generate(input_ids=token_ids_list, sampling_params=sampling_params)
     # Print the outputs.
