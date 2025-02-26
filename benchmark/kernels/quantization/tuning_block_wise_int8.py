@@ -27,7 +27,7 @@ from tqdm import tqdm
 mp.set_start_method("spawn", force=True)
 
 from sglang.srt.layers.quantization.int8_kernel import _w8a8_block_int8_matmul
-from sglang.srt.utils import get_device_core_count, get_device_name
+from sglang.srt.utils import get_device_name
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -251,7 +251,7 @@ def save_configs(
 ) -> None:
     os.makedirs(save_path, exist_ok=True)
     device_name = get_device_name().replace(" ", "_")
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
+    json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
     config_file_path = os.path.join(save_path, json_file_name)
     print(f"Writing best config to {config_file_path}...")
