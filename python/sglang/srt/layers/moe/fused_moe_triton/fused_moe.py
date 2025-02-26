@@ -15,7 +15,10 @@ from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_group_quant_int8,
+    per_token_quant_int8,
+)
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_name,
@@ -116,6 +119,7 @@ def fused_moe_kernel(
     - expert_ids: A tensor containing the indices of the expert for each
         block. It determines which expert matrix from B should be used for
         each block in A.
+
     This kernel performs the multiplication of a token by its corresponding
     expert matrix as determined by `expert_ids`. The sorting of
     `sorted_token_ids` by expert index and padding ensures divisibility by
@@ -166,16 +170,37 @@ def fused_moe_kernel(
         )
         b_scale = tl.load(b_scale_ptrs)
 
-    if use_fp8_w8a8 or use_int8_w8a8:
+    if use_fp8_w8a8:
+        # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             offs_bsn = offs_bn // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
+        # tensor-wise
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
+
+    if use_int8_w8a8:
+        # block-wise
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+            )
+        # channel-wise
+        else:
+            # Load per-column scale for weights
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            # Load per-token scale for activations
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -495,9 +520,11 @@ def invoke_fused_moe_kernel(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
+            # activation tensor-wise fp8 quantization
             padded_size = padding_size
             A, A_scale = ops.scaled_fp8_quant(A, A_scale)
         else:
+            # activation block-wise fp8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             if _is_cuda:
@@ -510,9 +537,10 @@ def invoke_fused_moe_kernel(
     elif use_int8_w8a8:
         assert B_scale is not None
         if block_shape is None:
-            padded_size = padding_size
-            A, A_scale = ops.scaled_int8_quant(A, A_scale)
+            # activation channel-wise int8 quantization
+            A, A_scale = per_token_quant_int8(A)
         else:
+            # activation block-wise int8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             A, A_scale = per_token_group_quant_int8(A, block_k)
@@ -1040,7 +1068,6 @@ def fused_experts_impl(
             use_int8_w8a16=use_int8_w8a16,
             block_shape=block_shape,
         )
-
         if activation == "silu":
             if _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
