@@ -31,7 +31,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
 
-
 is_hip_ = is_hip()
 
 DTYPE_MAP = {
