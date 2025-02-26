@@ -17,11 +17,11 @@ import gc
 import json
 import logging
 import time
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -184,7 +184,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -518,7 +518,7 @@ class ModelRunner:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: List[Tuple[str, Union[torch.Tensor, 'LocalSerializedTensor']]],
         load_format: Optional[str] = None,
     ):
         named_tensors = [
@@ -739,7 +739,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -862,6 +862,14 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
 
 # TODO improve names + improve where these things are handled...
 def _deserialize_tensor(tensor, tp_rank):
-    if isinstance(tensor, list) and isinstance(tensor[0], bytes):
-        return MultiprocessingSerializer.deserialize(tensor[tp_rank])
+    if isinstance(tensor, LocalSerializedTensor):
+        return tensor.get(tp_rank)
     return tensor
+
+
+@dataclass
+class LocalSerializedTensor:
+    values: List[bytes]
+
+    def get(self, rank: int):
+        return MultiprocessingSerializer.deserialize(self.values[rank])
