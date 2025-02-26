@@ -4,11 +4,13 @@ You can install SGLang using any of the methods below.
 
 For running DeepSeek V3/R1, refer to [DeepSeek V3 Support](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). It is recommended to use the [latest version](https://pypi.org/project/sglang/#history) and deploy it with [Docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended) to avoid environment-related problems.
 
-## Method 1: With pip
+We recommend using uv to install the dependencies with a higher installation speed:
+## Method 1: With pip or uv
 
 ```bash
 pip install --upgrade pip
-pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+pip install uv
+uv pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
 
 **Quick Fixes to Installation**
