@@ -35,14 +35,14 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
             rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL
         )
 
-        self.is_reasoning = True 
+        self.is_reasoning = True
 
     def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         # After DeepSeek update their chat templates in R1 series models, the reasoning models do not output "<think>"
         # We assume the output has an "<think>", and the reasoning part is the whole text.
         if self.think_end_token not in text:
             # Remove "<think>" if exists
-            return text.replace(self.think_start_token, ""), None
+            return text.replace(self.think_start_token, ""), ""
 
         else:
             # Add the start token to the beginning of the text.
@@ -56,7 +56,7 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
                 + len(self.think_end_token) :
             ]
 
-            return reasoning_content, content if len(content) > 0 else None
+            return reasoning_content, content
 
     def parse_streaming_increment(
         self, new_text: str
@@ -70,7 +70,7 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
             self._buffer += new_text
             # Reasoning continues
             if self.think_end_token not in self._buffer:
-                return new_text, None
+                return new_text, ""
             # Reasoning ends
             else:
                 reasoning_part = new_text.split(self.think_end_token)[0]
@@ -79,12 +79,10 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
                 self.is_reasoning = False
                 self._buffer = ""
 
-                return reasoning_part if len(reasoning_part) > 0 else None, (
-                    content_part if len(content_part) > 0 else None
-                )
+                return reasoning_part, content_part
 
         else:
-            return None, new_text
+            return "", new_text
 
 
 class ReasoningParser:
