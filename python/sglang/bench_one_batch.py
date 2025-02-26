@@ -339,11 +339,14 @@ def latency_test_run_once(
 
     profiler = None
     if profile:
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        if device == "hpu":
+            activities.append(torch.profiler.ProfilerActivity.HPU)
         profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
             with_stack=True,
         )
         profiler.start()
