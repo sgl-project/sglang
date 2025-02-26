@@ -4,11 +4,15 @@ SGLang provides several optimizations specifically designed for the DeepSeek mod
 
 ## Launch DeepSeek V3 with SGLang
 
-SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3).
+SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). Refer to [installation and launch](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch) to learn how to run fast inference of DeepSeek V3/R1 with SGLang.
 
 ### Download Weights
 
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3]([https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only)) offical guide to download the weights.
+
+### Caching `torch.compile`
+
+The DeepSeek series have huge model weights, it takes some time to compile the model with `torch.compile` for the first time if you have added the flag `--enable-torch-compile`. By default, `torch.compile` will automatically cache the FX graph and Triton in `/tmp/torchinductor_root`, which might be cleared according to the [system policy](https://serverfault.com/questions/377348/when-does-tmp-get-cleared). You can export the environment variable `TORCHINDUCTOR_CACHE_DIR` to save compilation cache in your desired directory to avoid unwanted deletion. You can also share the cache with other machines to reduce the compilation time. You may refer to the [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [SGLang Documentation](./torch_compile_cache.md) for more details.
 
 ### Launch with One node of 8 H200
 
@@ -77,3 +81,17 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 - **Weight**: Per-128x128-block quantization for better numerical stability.
 
 **Usage**: turn on by default for DeepSeek V3 models.
+
+## FAQ
+
+1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
+
+    **Answer**: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.
+
+2. **Question**: How to use quantized DeepSeek models?
+
+    **Answer**: DeepSeek's MLA does not have support for quantization. You need to add the `--disable-mla` flag to run the quantized model successfully. Meanwhile, AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
+
+    ```bash
+    python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half --disable-mla
+    ```
