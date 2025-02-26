@@ -58,6 +58,7 @@ The core features include:
       :maxdepth: 1
       :caption: References
 
+      references/deepseek
       references/general
       references/hardware
       references/advanced_deploy
