@@ -5,7 +5,6 @@ python hidden_states.py
 Note that we are actively working on moving return_hidden_states to the sampling_params.
 """
 
-
 import sglang as sgl
 
 
