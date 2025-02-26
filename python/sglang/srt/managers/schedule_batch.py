@@ -133,7 +133,7 @@ class FINISH_ABORT(BaseFinishReason):
 
 
 @dataclasses.dataclass
-class ImageInputs:
+class MultiModalInput:
     """The image related inputs."""
 
     pixel_values: Union[torch.Tensor, np.array]
@@ -169,7 +169,7 @@ class ImageInputs:
 
     @staticmethod
     def from_dict(obj: dict):
-        ret = ImageInputs(
+        ret = MultiModalInput(
             pixel_values=obj["pixel_values"],
             image_hashes=obj["image_hashes"],
         )
@@ -290,7 +290,7 @@ class Req:
         self.decoded_text = ""
 
         # For multimodal inputs
-        self.image_inputs: Optional[ImageInputs] = None
+        self.image_inputs: Optional[MultiModalInput] = None
 
         # Prefix info
         self.prefix_indices = []
@@ -1201,7 +1201,7 @@ class ScheduleBatch:
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            image_inputs=[r.image_inputs for r in self.reqs],
+            multimodal_inputs=[r.image_inputs for r in self.reqs],
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
@@ -1277,7 +1277,7 @@ class ModelWorkerBatch:
     extend_logprob_start_lens: Optional[List[int]]
 
     # For multimodal
-    image_inputs: Optional[List[ImageInputs]]
+    multimodal_inputs: Optional[List[MultiModalInput]]
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]]

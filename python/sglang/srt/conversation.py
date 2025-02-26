@@ -443,7 +443,6 @@ def generate_chat_conv(
                         real_content += image_token
                         conv.append_image(content.image_url.url)
                     elif content.type == "audio_url":
-                        print(f"audio_url")
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
 

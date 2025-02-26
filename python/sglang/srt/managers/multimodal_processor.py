@@ -38,14 +38,20 @@ def init_global_processor(server_args: ServerArgs):
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
-    data_hashes: list[int]
-    image_sizes: list[int]
+    data_hashes: Optional[list[int]]
+    image_sizes: Optional[list[int]]
     # frames loaded from image and video, in given order
-    images: [PIL.Image]
+    images: Optional[list[PIL.Image]]
     # audios
-    audios: list[np.ndarray]
+    audios: Optional[list[np.ndarray]]
     # input_text, with each frame of video/image represented with a image_token
     input_text: str
+
+    def normalize(self):
+        for field_name in ["data_hashes", "image_sizes", "images", "audios"]:
+            field = getattr(self, field_name, None)
+            if field is not None and isinstance(field, list) and len(field) == 0:
+                setattr(self, field_name, None)
 
 
 @dataclasses.dataclass
@@ -73,7 +79,7 @@ class BaseImageProcessor(ABC):
         )
 
     @abstractmethod
-    async def process_images_async(
+    async def process_data_async(
         self, image_data, input_text, max_req_input_len, **kwargs
     ):
         pass
@@ -160,7 +166,9 @@ class BaseImageProcessor(ABC):
         total_frame_count = sum(estimated_frames_list)
         # a heuristic value, suggesting the maximum fraction of frames to embed from all visual inputs.
         # e.g., 0.1 suggests that 1 frame out of 10 input frames should be used
-        scaling_factor = min(1.0, MAX_NUM_FRAMES / total_frame_count)
+        scaling_factor = min(
+            1.0, 1.0 if total_frame_count == 0 else MAX_NUM_FRAMES / total_frame_count
+        )
 
         image_index, audio_index = 0, 0
         # Process each input with allocated frames
@@ -209,6 +217,7 @@ class BaseImageProcessor(ABC):
                     hashes += [hash(audio_file)]
                     audios += [audio]
                     audio_index += 1
+                    new_text_parts += multimodal_tokens.audio_token
                 else:
                     # normal text
                     new_text_parts.append(text_part)
@@ -220,16 +229,19 @@ class BaseImageProcessor(ABC):
         input_text = "".join(new_text_parts)
 
         print(f"input_text: {input_text}")
-        return BaseMultiModalProcessorOutput(
+
+        output = BaseMultiModalProcessorOutput(
             hashes, image_sizes, images, audios, input_text
         )
+        output.normalize()
+        return output
 
 
 class DummyImageProcessor(BaseImageProcessor):
     def __init__(self):
         pass
 
-    async def process_images_async(self, *args, **kwargs):
+    async def process_data_async(self, *args, **kwargs):
         return None
 
 
@@ -301,7 +313,7 @@ class LlavaImageProcessor(BaseImageProcessor):
                 image_data, aspect_ratio, grid_pinpoints
             )
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
@@ -386,7 +398,7 @@ class MllamaImageProcessor(BaseImageProcessor):
 
         return image_inputs
 
-    async def process_images_async(
+    async def process_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
         if not image_data:
@@ -411,6 +423,7 @@ class MllamaImageProcessor(BaseImageProcessor):
         return image_inputs
 
 
+# Compatible with both 'O' and 'V'
 class MiniCPMImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
@@ -418,43 +431,42 @@ class MiniCPMImageProcessor(BaseImageProcessor):
         self.audio_token = "(<audio>./</audio>)"
 
     @staticmethod
-    def _process_images_task(input_text, images, audios=None):
+    def _process_data_task(input_text, images, audios=None):
         result = global_processor.__call__(
-            text=input_text, images=images, audios=audios, return_tensors="pt"
+            text=input_text,
+            images=images,
+            audios=audios,
+            return_tensors="pt",
+            chunk_input=True,
         )
+        print(f"result: {result}")
         return {
             "input_ids": result.input_ids,
             "pixel_values": result.pixel_values,
             "tgt_sizes": result.tgt_sizes,
-            "audio_features": (
-                result["audio_features"] if "audio_features" in result else None
-            ),
-            "audio_feature_lens": (
-                result["audio_feature_lens"] if "audio_feature_lens" in result else None
-            ),
-            "audio_bounds": (
-                result["audio_bounds"] if "audio_bounds" in result else None
-            ),
+            "audio_features": result.audio_features,
+            "audio_feature_lens": result.audio_feature_lens,
+            "audio_bounds": result.audio_bounds,
         }
 
-    async def _process_images(self, images, input_text, audios=None):
+    async def _process_data(self, images, input_text, audios=None):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
-            image_inputs = await loop.run_in_executor(
+            multimodal_data_inputs = await loop.run_in_executor(
                 self.executor,
-                MiniCPMImageProcessor._process_images_task,
+                MiniCPMImageProcessor._process_data_task,
                 input_text,
                 images,
                 audios,
             )
         else:
-            image_inputs = self._processor(
-                images=images, text=input_text, return_tensors="pt"
+            multimodal_data_inputs = self._processor(
+                images=images, text=input_text, audios=audios, return_tensors="pt"
             )
 
-        return image_inputs
+        return multimodal_data_inputs
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_ids,
@@ -481,10 +493,10 @@ class MiniCPMImageProcessor(BaseImageProcessor):
         if base_output is None:
             return None
 
-        if len(base_output.images) == 0:
-            return None
-        res = await self._process_images(
-            images=base_output.images, input_text=base_output.input_text
+        res = await self._process_data(
+            images=base_output.images,
+            input_text=base_output.input_text,
+            audios=base_output.audios,
         )
 
         # Collect special token ids
@@ -578,7 +590,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         else:
             return self._process_single_image_task(image_data)
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
@@ -670,7 +682,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         else:
             return self._process_images_task(images, input_text)
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_ids,

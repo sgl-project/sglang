@@ -51,7 +51,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultiModalInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -722,43 +722,17 @@ class MiniCPMVBaseModel(nn.Module):
 
         return vlm_embedding
 
-    def _parse_and_validate_inputs(
+    def get_image_pixel_inputs(
         self,
         input_ids: torch.Tensor,
-        **kwargs: object,
+        multimodal_input: Optional[MultiModalInput],
     ) -> Optional[MiniCPMVImageInputs]:
-        pixel_values = kwargs.pop("pixel_values", [])
-        tgt_sizes = kwargs.pop("tgt_sizes", [])
-        im_start_id = kwargs.pop("im_start_id", None)
-        im_end_id = kwargs.pop("im_end_id", None)
-        slice_start_id = kwargs.pop("slice_start_id", None)
-        slice_end_id = kwargs.pop("slice_end_id", None)
-        image_embeds = kwargs.pop("image_embeds", None)
-        pad_values = kwargs.pop("pad_values", None)
-        if image_embeds is not None:
-            image_bounds = get_multimodal_data_bounds(
-                input_ids=input_ids,
-                pad_values=pad_values,
-                data_start_id=im_start_id,
-                data_end_id=im_end_id,
-                slice_start_id=slice_start_id,
-                slice_end_id=slice_end_id,
-            )
-            if not isinstance(image_embeds, (torch.Tensor, list)):
-                raise ValueError(
-                    f"Incorrect type of image embeds. "
-                    f"Got type: {type(image_embeds)}"
-                )
-
-            if isinstance(image_embeds, list):
-                image_embeds = torch.concat(image_embeds)
-
-            return MiniCPMVImageEmbeddingInputs(
-                image_bounds=image_bounds,
-                data=image_embeds,
-                type="image_embeds",
-            )
-
+        if not multimodal_input:
+            return None
+        pixel_values = multimodal_input.pixel_values
+        tgt_sizes = multimodal_input.tgt_sizes
+        if not pixel_values or not tgt_sizes:
+            return None
         if not isinstance(pixel_values, (torch.Tensor, list)):
             raise ValueError(
                 "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
@@ -801,11 +775,11 @@ class MiniCPMVBaseModel(nn.Module):
 
         image_bounds = get_multimodal_data_bounds(
             input_ids=input_ids,
-            pad_values=pad_values,
-            data_start_id=im_start_id,
-            data_end_id=im_end_id,
-            slice_start_id=slice_start_id,
-            slice_end_id=slice_end_id,
+            pad_values=multimodal_input.pad_values,
+            data_start_id=multimodal_input.im_start_id,
+            data_end_id=multimodal_input.im_end_id,
+            slice_start_id=multimodal_input.slice_start_id,
+            slice_end_id=multimodal_input.slice_end_id,
         )
         return MiniCPMVImagePixelInputs(
             image_bounds=image_bounds.to(device=input_ids.device),
@@ -814,7 +788,7 @@ class MiniCPMVBaseModel(nn.Module):
             type="pixel_values",
         )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultiModalInput):
         new_input_ids = []
         last_idx = 0
         image_idx = -1
@@ -877,37 +851,11 @@ class MiniCPMVBaseModel(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if forward_batch.image_inputs and forward_batch.image_inputs[0] is not None:
-            image_input = forward_batch.image_inputs[0]
-            kwargs.update(
-                {
-                    "pixel_values": (
-                        None
-                        if forward_batch.image_inputs is None
-                        else [
-                            i.pixel_values
-                            for i in forward_batch.image_inputs
-                            if i is not None
-                        ]
-                    ),
-                    "tgt_sizes": (
-                        None
-                        if forward_batch.image_inputs is None
-                        else [
-                            i.tgt_sizes
-                            for i in forward_batch.image_inputs
-                            if i is not None
-                        ]
-                    ),
-                    "im_start_id": image_input.im_start_id,
-                    "im_end_id": image_input.im_end_id,
-                    "slice_start_id": image_input.slice_start_id,
-                    "slice_end_id": image_input.slice_end_id,
-                    "pad_values": image_input.pad_values,
-                }
-            )
+        multimodal_input = None
+        if forward_batch.multimodal_inputs:
+            multimodal_input = forward_batch.multimodal_inputs[0]
 
-        image_inputs = self._parse_and_validate_inputs(input_ids, **kwargs)
+        image_inputs = self.get_image_pixel_inputs(input_ids, multimodal_input)
 
         # Clamp input ids. This is because the input_ids for the image tokens are
         # filled with the hash values of the image for the prefix matching in the radix attention.

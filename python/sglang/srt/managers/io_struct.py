@@ -239,8 +239,9 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The image inputs
-    image_inputs: dict
+    # The multimodal inputs
+    multimodal_inputs: dict
+    # The audio inputs
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs

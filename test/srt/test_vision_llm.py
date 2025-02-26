@@ -224,7 +224,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         with torch.no_grad():
             model = self.get_sglang_model()
             input_ids = inputs["input_ids"].to(self.device).flatten()
-            image_inputs = model._parse_and_validate_inputs(
+            image_inputs = model.get_image_pixel_inputs(
                 input_ids=input_ids,
                 **{
                     "pixel_values": [inputs["pixel_values"]],
@@ -282,7 +282,7 @@ class TestMiniCPMOLogits(VisionLLMLogitsBase):
         with torch.no_grad():
             model = self.get_sglang_model()
             input_ids = inputs["input_ids"].to(self.device).flatten()
-            image_inputs = model._parse_and_validate_inputs(
+            image_inputs = model.get_image_pixel_inputs(
                 input_ids=input_ids,
                 **{
                     "pixel_values": [inputs["pixel_values"]],

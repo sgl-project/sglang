@@ -24,6 +24,10 @@ from sglang.test.test_utils import (
 )
 
 
+def get_test_files_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "test_files")
+
+
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -364,6 +368,77 @@ class TestOpenAIVisionServer(unittest.TestCase):
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
 
+    def prepare_audio_messages(self, prompt, audio_file_name):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"{audio_file_name}"},
+                    },
+                ],
+            }
+        ]
+
+        return messages
+
+    def get_audio_response(self, file, prompt):
+        audio_file_path = os.path.join(get_test_files_dir(), file)
+
+        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
+
+        messages = self.prepare_audio_messages(prompt, audio_file_path)
+
+        audio_request = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=True,
+        )
+
+        print("-" * 30)
+        audio_response = ""
+        for chunk in audio_request:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                audio_response += content
+                print(content, end="", flush=True)
+        print("-" * 30)
+
+        audio_response = audio_response.lower()
+
+        self.assertIsNotNone(audio_response)
+        self.assertGreater(len(audio_response), 0)
+
+        return audio_response
+
+    def _test_audio_speech_completion(self):
+        audio_response = self.get_audio_response(
+            "audio_speech_trump.mp3",
+            "Please describe what does the person say in the audio.",
+        )
+        assert "thank you" in audio_response
+        assert "it's a privilege to be here" in audio_response
+        assert "business" in audio_response
+        assert "science" in audio_response
+        assert "art" in audio_response
+
+    def _test_audio_ambient_completion(self):
+        audio_response = self.get_audio_response(
+            "audio_bird_song.mp3",
+            "Please listen to the audio snippet carefully and transcribe the content.",
+        )
+        assert "bird" in audio_response
+
+    def test_audio_completion(self):
+        pass
+
 
 class TestQWen2VLServer(TestOpenAIVisionServer):
     @classmethod
@@ -535,67 +610,9 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
-    def _test_audio_chat_completion(self):
-        url = "MiniCPM-o-2_6/assets/mimick.wav"
-        cache_dir = os.path.expanduser("~/.cache")
-        file_path = os.path.join(cache_dir, "jobs.mp4")
-        file_path = ""
-
-        os.makedirs(cache_dir, exist_ok=True)
-
-        if not os.path.exists(file_path):
-            response = requests.get(url)
-            response.raise_for_status()
-
-            with open(file_path, "wb") as f:
-                f.write(response.content)
-
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        messages = self.prepare_audio_messages(file_path)
-
-        audio_request = client.chat.completions.create(
-            model="default",
-            messages=messages,
-            temperature=0,
-            max_tokens=1024,
-            stream=True,
-        )
-
-        print("-" * 30)
-        audio_response = ""
-        for chunk in audio_request:
-            if chunk.choices[0].delta.content is not None:
-                content = chunk.choices[0].delta.content
-                audio_response += content
-                print(content, end="", flush=True)
-        print("-" * 30)
-
-        assert "两年半" in audio_response
-        assert "练习生" in audio_response
-        assert "rap" in audio_response.lower()
-
-        self.assertIsNotNone(audio_response)
-        self.assertGreater(len(audio_response), 0)
-
-    def prepare_audio_messages(self, audio_path):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": f"audio:{audio_path}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": "Please describe what do you hear in the audio.",
-                    },
-                ],
-            }
-        ]
-
-        return messages
+    def test_audio_completion(self):
+        self._test_audio_speech_completion()
+        self._test_audio_ambient_completion()
 
 
 if __name__ == "__main__":

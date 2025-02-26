@@ -1485,6 +1485,8 @@ def get_multimodal_data_bounds(
     """
     Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
 
+    Returns:
+        [bounds_count, 2]
     """
     # All the images in the batch should share the same special image
     # bound token ids.
