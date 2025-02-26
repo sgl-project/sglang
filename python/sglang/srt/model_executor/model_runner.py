@@ -522,7 +522,7 @@ class ModelRunner:
         load_format: Optional[str] = None,
     ):
         named_tensors = [
-            (name, _deserialize_tensor(tensor, tp_rank=self.tp_rank))
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
             for name, tensor in named_tensors
         ]
         # TODO should we name it "direct" or "megatron"?
@@ -860,8 +860,7 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         default_weight_loader(params_dict[name], tensor)
 
 
-# TODO improve names + improve where these things are handled...
-def _deserialize_tensor(tensor, tp_rank):
+def _unwrap_tensor(tensor, tp_rank):
     if isinstance(tensor, LocalSerializedTensor):
         return tensor.get(tp_rank)
     return tensor
