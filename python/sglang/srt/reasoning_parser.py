@@ -7,28 +7,19 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 class BaseReasoningParser:
     """Base class for reasoning parser."""
 
-    def __init__(self, think_start_token: str, think_end_token: str, force_think: bool):
+    def __init__(self, think_start_token: str, think_end_token: str):
         self._buffer = ""
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self.pattern = re.compile(
             rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL
         )
-
-        # whether we assume the output must have a `think_start_token`
-        self.force_think = force_think
-        self.is_reasoning = (
-            self.force_think
-        )  # assume the output has a `think_start_token` at the beginning
+        self.is_reasoning = True
 
     def parse_streaming_increment(
         self, new_text: str
     ) -> Tuple[Optional[str], Optional[str]]:
         """Parse the new text incrementally, return reasoning_content and content."""
-        # Detect the start token for toggling `is_reasoning` when `force_think` is False
-        if not self.force_think and self.think_start_token in new_text:
-            self.is_reasoning = True
-
         # Should parse
         if self.is_reasoning:
             if len(self._buffer) == 0:
@@ -56,18 +47,10 @@ class BaseReasoningParser:
     def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         """Detect and parse the text, return reasoning_content and content."""
         if self.think_end_token not in text:
-            if self.force_think:  # all the output are reasoning content
-                # Remove "<think>" if exists
-                return text.replace(self.think_start_token, ""), ""
-            elif self.think_start_token in text:
-                return text.replace(self.think_start_token, ""), ""
-            else:
-                return "", text
-
+            return text, ""
         else:
             # Add the start token to the beginning of the text.
-            if self.think_start_token not in text:
-                text = self.think_start_token + text
+            text = self.think_start_token + text
 
             reasoning_content = self.pattern.findall(text)[0]
             content = text[
@@ -86,7 +69,7 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
     """
 
     def __init__(self):
-        super().__init__("<think> ", "</think> ", True)
+        super().__init__("<think> ", "</think> ")
 
 
 class ReasoningParser:
