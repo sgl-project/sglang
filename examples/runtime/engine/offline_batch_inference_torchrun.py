@@ -52,7 +52,6 @@ def run():
         model_path=model_name,
         mem_fraction_static=mem_fraction_static,
         device_mesh_cpu=device_mesh_cpu["tp"],
-        first_rank_in_node=tp_rank == 0,
         base_gpu_id=dp_rank,
         gpu_id_step=dp_size,
     )

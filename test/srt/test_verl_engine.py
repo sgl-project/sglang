@@ -7,17 +7,6 @@ import unittest
 from multiprocessing import Process
 
 import torch
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import CPUOffload
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.api import (
-    ShardedStateDictConfig,
-    ShardingStrategy,
-    StateDictType,
-)
-from transformers import AutoModelForCausalLM
-
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import is_port_available
@@ -28,6 +17,16 @@ from sglang.test.runners import (
     get_dtype_str,
 )
 from sglang.test.test_utils import is_in_ci
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import CPUOffload
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp.api import (
+    ShardedStateDictConfig,
+    ShardingStrategy,
+    StateDictType,
+)
+from transformers import AutoModelForCausalLM
 
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
@@ -198,7 +197,6 @@ def _run_subprocess(
             trust_remote_code=True,
             dtype=get_dtype_str(_TORCH_DTYPE),
             device_mesh_cpu=inference_device_mesh_cpu["tp"],
-            first_rank_in_node=tp_rank == 0,
         )
         print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
 
