@@ -21,8 +21,6 @@ class BaseReasoningParser:
             self.force_think
         )  # assume the output has a `think_start_token` at the beginning
 
-        raise NotImplementedError
-
     def parse_streaming_increment(
         self, new_text: str
     ) -> Tuple[Optional[str], Optional[str]]:
