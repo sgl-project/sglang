@@ -869,7 +869,8 @@ def _unwrap_tensor(tensor, tp_rank):
 
 @dataclass
 class LocalSerializedTensor:
-    """TODO: Comments"""
+    """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
+    The i-th element in the list corresponds to i-th rank's GPU."""
 
     values: List[bytes]
 
