@@ -1,3 +1,11 @@
+"""
+Usage:
+python hidden_states.py
+
+Note that we are actively working on moving return_hidden_states to the sampling_params.
+"""
+
+
 import sglang as sgl
 
 
@@ -10,7 +18,8 @@ def main():
     ]
     # Create an LLM.
     llm = sgl.Engine(
-        model_path="Alibaba-NLP/gte-Qwen2-1.5B-instruct", return_hidden_states=True
+        model_path="Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        return_hidden_states=True,
     )
 
     sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 10}
