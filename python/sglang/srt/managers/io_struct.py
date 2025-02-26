@@ -152,14 +152,17 @@ class GenerateReqInput:
                 num = self.batch_size * self.parallel_sample_num
 
             if self.image_data is None:
-                self.image_data = [None] * num
+                # self.image_data = [None] * num
+                self.image_data = []
             elif not isinstance(self.image_data, list):
+                self.image_data = [self.image_data] * num
                 self.image_data = [self.image_data] * num
             elif isinstance(self.image_data, list):
                 pass
 
             if self.audio_data is None:
-                self.audio_data = [None] * num
+                # self.audio_data = [None] * num
+                self.audio_data = []
             elif not isinstance(self.audio_data, list):
                 self.audio_data = [self.audio_data] * num
             elif isinstance(self.audio_data, list):

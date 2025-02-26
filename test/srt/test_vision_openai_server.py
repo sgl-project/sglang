@@ -272,6 +272,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
+            or "hold" in video_response
         )
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)

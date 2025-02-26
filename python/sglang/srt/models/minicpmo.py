@@ -42,7 +42,7 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.activations import ACT2FN
-from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+from transformers.cache_utils import DynamicCache, EncoderDecoderCache, StaticCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.models.paligemma.modeling_paligemma import (
     _prepare_4d_causal_attention_mask_with_cache_position,
@@ -1659,9 +1659,6 @@ class MiniCPMO(MiniCPMVBaseModel):
             if x in {im_end_id, slice_end_id, audio_end_id}
         ]
 
-        print(multimodal_data)
-        print(input_ids)
-
         if len(start_indices) != len(end_indices):
             return input_ids
 
@@ -1670,8 +1667,6 @@ class MiniCPMO(MiniCPMVBaseModel):
             token_id = input_ids[start_idx]
             if token_id == im_start_id or token_id == audio_start_id:
                 region_idx += 1
-            print(region_idx)
-
             if region_idx >= len(multimodal_data.pad_values):
                 region_idx = len(multimodal_data.pad_values) - 1
             pad_value = multimodal_data.pad_values[region_idx]
@@ -1717,6 +1712,8 @@ class MiniCPMO(MiniCPMVBaseModel):
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
+        print("audio embedding")
+
         wavforms = (
             []
             if multimodal_input.audio_features is None
@@ -1836,7 +1833,7 @@ class MiniCPMO(MiniCPMVBaseModel):
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
-
+        print("audio embedding")
         # (bs, 80, frames) or [], multi audios need filled in advance
         wavforms = (
             []
@@ -1940,12 +1937,14 @@ class MiniCPMO(MiniCPMVBaseModel):
         Returns:
             final embeddings with audio feature
         """
-        if stream_input:
-            audio_embeddings = self.get_audio_embedding_streaming(multimodal_input)
-        else:
-            audio_embeddings = self.get_audio_embedding(multimodal_input, chunk_length)
         input_embeddings = input_embeddings.unsqueeze(0)
         if not forward_mode.is_decode() and multimodal_input.audio_features is not None:
+            if stream_input:
+                audio_embeddings = self.get_audio_embedding_streaming(multimodal_input)
+            else:
+                audio_embeddings = self.get_audio_embedding(
+                    multimodal_input, chunk_length
+                )
             audio_bounds = get_multimodal_data_bounds(
                 input_ids=input_ids,
                 pad_values=multimodal_input.pad_values,
@@ -1955,9 +1954,6 @@ class MiniCPMO(MiniCPMVBaseModel):
             audio_bounds = audio_bounds.unsqueeze(0)
 
             bs = len(input_embeddings)
-            print(f"input_ids: {input_ids}")
-            print(f"audio bounds: {audio_bounds}")
-
             if audio_bounds.numel() == 0:
                 return input_embeddings
 
@@ -1965,13 +1961,11 @@ class MiniCPMO(MiniCPMVBaseModel):
             if len(audio_embeddings) > 0:
                 if self.config.chunk_input:
                     for i in range(bs):
-                        print("aaaaaaa")
                         audio_embs = torch.cat(audio_embeddings[i], dim=0).to(
                             device=input_embeddings.device, dtype=input_embeddings.dtype
                         )
                         audio_start_pos = 0
                         for bound in audio_bounds[i]:
-                            print("bbbbb")
                             audio_len = bound[1] - bound[0]
                             input_embeddings[0, bound[0] : bound[1]] = audio_embs[
                                 audio_start_pos : audio_start_pos + audio_len, :
@@ -2004,11 +1998,9 @@ class MiniCPMO(MiniCPMVBaseModel):
         forward_batch: ForwardBatch,
         **data: Any,
     ) -> torch.Tensor:
-        multimodal_input = None
-        if forward_batch.multimodal_inputs:
-            multimodal_input = forward_batch.multimodal_inputs[0]
-
-        image_inputs = self.get_image_pixel_inputs(input_ids, multimodal_input)
+        image_inputs = self.get_image_pixel_inputs(
+            input_ids, forward_batch.multimodal_inputs
+        )
 
         # Clamp input ids. This is because the input_ids for the image tokens are
         # filled with the hash values of the image for the prefix matching in the radix attention.
@@ -2019,10 +2011,10 @@ class MiniCPMO(MiniCPMVBaseModel):
             input_ids, image_inputs, forward_batch.forward_mode
         )
 
-        if self.config.init_audio and multimodal_input:
+        if self.config.init_audio and forward_batch.multimodal_inputs[0] is not None:
             vllm_embeddings = self.get_omni_embedding(
                 input_ids,
-                multimodal_input,
+                forward_batch.multimodal_inputs[0],
                 forward_mode=forward_batch.forward_mode,
                 input_embeddings=vllm_embeddings,
                 chunk_length=self.config.audio_chunk_length,

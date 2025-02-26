@@ -725,12 +725,35 @@ class MiniCPMVBaseModel(nn.Module):
     def get_image_pixel_inputs(
         self,
         input_ids: torch.Tensor,
-        multimodal_input: Optional[MultiModalInput],
+        multimodal_inputs: list[MultiModalInput],
     ) -> Optional[MiniCPMVImageInputs]:
+        if not multimodal_inputs or not isinstance(multimodal_inputs, list):
+            return None
+        multimodal_input = multimodal_inputs[0]
         if not multimodal_input:
             return None
-        pixel_values = multimodal_input.pixel_values
-        tgt_sizes = multimodal_input.tgt_sizes
+        pixel_values = [
+            (
+                multimodal_input.pixel_values
+                if (
+                    multimodal_input is not None
+                    and multimodal_input.pixel_values is not None
+                )
+                else torch.empty((0,))
+            )
+            for multimodal_input in multimodal_inputs
+        ]
+        tgt_sizes = [
+            (
+                multimodal_input.tgt_sizes
+                if (
+                    multimodal_input is not None
+                    and multimodal_input.tgt_sizes is not None
+                )
+                else torch.empty((0,))
+            )
+            for multimodal_input in multimodal_inputs
+        ]
         if not pixel_values or not tgt_sizes:
             return None
         if not isinstance(pixel_values, (torch.Tensor, list)):
@@ -851,11 +874,9 @@ class MiniCPMVBaseModel(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        multimodal_input = None
-        if forward_batch.multimodal_inputs:
-            multimodal_input = forward_batch.multimodal_inputs[0]
-
-        image_inputs = self.get_image_pixel_inputs(input_ids, multimodal_input)
+        image_inputs = self.get_image_pixel_inputs(
+            input_ids, forward_batch.multimodal_inputs
+        )
 
         # Clamp input ids. This is because the input_ids for the image tokens are
         # filled with the hash values of the image for the prefix matching in the radix attention.
@@ -913,6 +934,7 @@ class MiniCPMVBaseModel(nn.Module):
         raise NotImplementedError
 
     def get_vision_hidden_states(self, data: MiniCPMVImageInputs) -> torch.Tensor:
+        print("vision embedding")
         pixel_values = data["data"]
         tgt_sizes = data["tgt_sizes"]
 

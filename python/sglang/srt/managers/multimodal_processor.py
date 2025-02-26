@@ -56,11 +56,11 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultiModalEmbedTokens:
-    image_token: str
-    audio_token: str
+    image_token: Optional[str] = None
+    audio_token: Optional[str] = None
 
     def collect(self) -> list[str]:
-        return [self.image_token, self.audio_token]
+        return [token for token in [self.image_token, self.audio_token] if token]
 
 
 class BaseImageProcessor(ABC):
@@ -439,14 +439,13 @@ class MiniCPMImageProcessor(BaseImageProcessor):
             return_tensors="pt",
             chunk_input=True,
         )
-        print(f"result: {result}")
         return {
             "input_ids": result.input_ids,
-            "pixel_values": result.pixel_values,
-            "tgt_sizes": result.tgt_sizes,
-            "audio_features": result.audio_features,
-            "audio_feature_lens": result.audio_feature_lens,
-            "audio_bounds": result.audio_bounds,
+            "pixel_values": getattr(result, "pixel_values", None),
+            "tgt_sizes": getattr(result, "tgt_sizes", None),
+            "audio_features": getattr(result, "audio_features", None),
+            "audio_feature_lens": getattr(result, "audio_feature_lens", None),
+            "audio_bounds": getattr(result, "audio_bounds", None),
         }
 
     async def _process_data(self, images, input_text, audios=None):
@@ -698,7 +697,11 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_multimodal_data(
-            max_req_input_len, input_ids, [], image_data, [image_token]
+            max_req_input_len,
+            input_ids,
+            [],
+            image_data,
+            MultiModalEmbedTokens(image_token),
         )
 
         ret = await self._process_images(base_output.images, base_output.input_text)
