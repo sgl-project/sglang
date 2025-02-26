@@ -47,7 +47,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -368,6 +367,13 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path
     )
+
+    if server_args.server_role == "prefill":
+        from sglang.srt.managers.splitwise.prefill_scheduler import run_scheduler_process
+    elif server_args.server_role == "decode":
+        from sglang.srt.managers.splitwise.decode_scheduler import run_scheduler_process
+    else:
+        from sglang.srt.managers.scheduler import run_scheduler_process
 
     scheduler_procs = []
     if server_args.dp_size == 1:

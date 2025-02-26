@@ -168,6 +168,9 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     enable_flashinfer_mla: bool = False
 
+    # prefill/decode disaggregation; it has three options: mixed, prefill, decode
+    server_role: str = "mixed" 
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
