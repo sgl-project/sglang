@@ -43,6 +43,7 @@ def run():
 
     model_name, mem_fraction_static = "meta-llama/Llama-3.2-1B-Instruct", 0.1
     # model_name, mem_fraction_static = "meta-llama/Llama-3.1-70B-Instruct", 0.9 # test large models
+    # model_name, mem_fraction_static = "deepseek-ai/DeepSeek-V2-Lite", 0.8
 
     for k in ["TORCHELASTIC_USE_AGENT_STORE"]:
         if k in os.environ:
@@ -54,6 +55,9 @@ def run():
         device_mesh_cpu=device_mesh_cpu["tp"],
         base_gpu_id=dp_rank,
         gpu_id_step=dp_size,
+        port=30000,
+        # for DeepSeek-V2-Lite + DP Attention
+        # enable_dp_attention=True, port=30000 + dp_rank * 100,
     )
     _log(f"{fragment=}")
 
