@@ -12,7 +12,7 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Getting Started
+   :caption: Installation
 
    start/install.md
 
