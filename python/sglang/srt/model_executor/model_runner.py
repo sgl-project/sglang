@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -184,7 +185,7 @@ class ModelRunner:
             }
         )
 
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -518,7 +519,7 @@ class ModelRunner:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, 'LocalSerializedTensor']]],
+        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
     ):
         named_tensors = [
@@ -739,7 +740,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -869,6 +870,7 @@ def _unwrap_tensor(tensor, tp_rank):
 @dataclass
 class LocalSerializedTensor:
     """TODO: Comments"""
+
     values: List[bytes]
 
     def get(self, rank: int):
