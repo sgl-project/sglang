@@ -37,6 +37,9 @@ class SamplingBatchInfo:
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool
 
+    # Whether any request needs to return hidden states
+    return_hidden_states: bool
+
     # Bias Tensors
     vocab_size: int
     grammars: Optional[List] = None
@@ -91,6 +94,9 @@ class SamplingBatchInfo:
             and any(r.custom_logit_processor for r in reqs)  # then check the requests.
         )
 
+        # Check if any request needs to return hidden states
+        return_hidden_states = any(r.sampling_params.return_hidden_states for r in reqs)
+
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
             processor_dict = {}
@@ -130,6 +136,7 @@ class SamplingBatchInfo:
             device=device,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
+            return_hidden_states=return_hidden_states,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
@@ -336,6 +343,12 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
+
+        # Merge the return hidden states flag
+        self.return_hidden_states = (
+            self.return_hidden_states or other.return_hidden_states
+        )
+
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
             # Merge the custom logit processors

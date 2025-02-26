@@ -14,12 +14,15 @@ class TestHiddenState(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
-        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+        sampling_params = {
+            "temperature": 0,
+            "max_new_tokens": 8,
+            "return_hidden_states": True,
+        }
 
         engine = sgl.Engine(
             model_path=model_path,
             random_seed=42,
-            return_hidden_states=True,
             skip_tokenizer_init=True,
         )
         outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
