@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -35,6 +36,7 @@ class VerlEngine:
         first_rank_in_node = self._tp_rank % tp_size_per_node == 0
 
         if first_rank_in_node:
+            os.environ['SGLANG_BLOCK_NONZERO_RANK_CHILDREN'] = '0'
             self._engine = Engine(**kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes)
         else:
             self._engine = None
