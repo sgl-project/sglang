@@ -502,13 +502,17 @@ impl Router {
                 };
 
                 // Update queues and tree
-                *running_queue.get_mut(&selected_url).unwrap() += 1;
-
-                *processed_queue
-                    .lock()
-                    .unwrap()
-                    .get_mut(&selected_url)
-                    .unwrap() += 1;
+                if let Some(count) = running_queue.get_mut(&selected_url) {
+                    *count += 1;
+                } else {
+                    error!("Key {} not found in running_queue", selected_url);
+                }
+                let mut processed_queue = processed_queue.lock().unwrap();
+                if let Some(count) = processed_queue.get_mut(&selected_url) {
+                    *count += 1;
+                } else {
+                    error!("Key {} not found in processed_queue", selected_url);
+                }
                 tree.insert(&text, &selected_url);
 
                 selected_url
@@ -557,19 +561,8 @@ impl Router {
                 }
             };
 
-            // Then decrement running queue counter if using CacheAware
-            if let Router::CacheAware { running_queue, .. } = self {
-                if let Ok(mut queue) = running_queue.lock() {
-                    if let Some(count) = queue.get_mut(worker_url) {
-                        *count = count.saturating_sub(1);
-                    }
-                }
-            }
-
             response
-        } else if let Router::CacheAware { running_queue, .. } = self {
-            let running_queue = Arc::clone(running_queue);
-            let worker_url = worker_url.to_string();
+        } else if let Router::CacheAware { .. } = self {
 
             HttpResponse::build(status)
                 .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
@@ -578,17 +571,15 @@ impl Router {
                         .map_err(|_| {
                             actix_web::error::ErrorInternalServerError("Failed to read stream")
                         })
-                        .inspect(move |bytes| {
-                            let bytes = bytes.as_ref().unwrap();
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                let mut locked_queue = running_queue.lock().unwrap();
-                                let count = locked_queue.get_mut(&worker_url).unwrap();
-                                *count = count.saturating_sub(1);
-                                debug!("Streaming is done!!")
+                        .inspect(move |result| {
+                            if let Ok(bytes) = result {
+                                if bytes
+                                    .as_ref()
+                                    .windows(12)
+                                    .any(|window| window == b"data: [DONE]")
+                                    {
+                                        debug!("Streaming is done!!")
+                                    }
                             }
                         }),
                 )
@@ -624,7 +615,14 @@ impl Router {
                 let response = self
                     .send_generate_request(client, req, body, route, &worker_url)
                     .await;
-
+                // Then decrement running queue counter if using CacheAware
+                if let Router::CacheAware { running_queue, .. } = self {
+                    if let Ok(mut queue) = running_queue.lock() {
+                        if let Some(count) = queue.get_mut(&worker_url) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                }
                 if response.status().is_success() {
                     return response;
                 } else {
