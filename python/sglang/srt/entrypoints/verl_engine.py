@@ -83,7 +83,7 @@ class VerlEngine:
         ranks = self._device_mesh_cpu.mesh.tolist()
         [output] = broadcast_pyobj(
             data=[output],
-            rank=ranks[self._tp_rank],
+            rank=self._tp_rank,
             dist_group=self._device_mesh_cpu.get_group(),
             src=ranks[0],
         )
