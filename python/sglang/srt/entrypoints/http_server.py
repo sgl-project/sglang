@@ -25,7 +25,7 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Dict, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
