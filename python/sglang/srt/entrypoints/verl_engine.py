@@ -124,7 +124,7 @@ class VerlEngine:
             self._engine.resume_memory_occupation()
 
     def shutdown(self):
-        if self._tp_rank == 0:
+        if self._engine is not None:
             self._engine.shutdown()
 
 
