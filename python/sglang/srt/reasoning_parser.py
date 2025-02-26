@@ -7,67 +7,38 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 class BaseReasoningParser:
     """Base class for reasoning parser."""
 
-    def __init__(self):
+    def __init__(self, think_start_token: str, think_end_token: str, force_think: bool):
         self._buffer = ""
+        self.think_start_token = think_start_token
+        self.think_end_token = think_end_token
+        self.pattern = re.compile(
+            rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL
+        )
 
-    def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
-        """Detect and parse the text, return reasoning_content and content."""
+        # whether we assume the output must have a `think_start_token`
+        self.force_think = force_think
+        self.is_reasoning = (
+            self.force_think
+        )  # assume the output has a `think_start_token` at the beginning
+
         raise NotImplementedError
 
     def parse_streaming_increment(
         self, new_text: str
     ) -> Tuple[Optional[str], Optional[str]]:
         """Parse the new text incrementally, return reasoning_content and content."""
-        raise NotImplementedError
-
-
-class DeepSeekR1ReasoningParser(BaseReasoningParser):
-    """
-    DeepSeekR1 reasoning parser, which use "<think>" and "</think>" to detect the reasoning part.
-    Referring to https://github.com/deepseek-ai/DeepSeek-R1?tab=readme-ov-file#usage-recommendations~.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.think_start_token = "<think>"
-        self.think_end_token = "</think>"
-        self.pattern = re.compile(
-            rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL
-        )
-
-        self.is_reasoning = True
-
-    def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
-        # After DeepSeek update their chat templates in R1 series models, the reasoning models do not output "<think>"
-        # We assume the output has an "<think>", and the reasoning part is the whole text.
-        if self.think_end_token not in text:
-            # Remove "<think>" if exists
-            return text.replace(self.think_start_token, ""), ""
-
-        else:
-            # Add the start token to the beginning of the text.
-            if self.think_start_token not in text:
-                text = self.think_start_token + text
-
-            reasoning_content = self.pattern.findall(text)[0]
-            content = text[
-                len(self.think_start_token)
-                + len(reasoning_content)
-                + len(self.think_end_token) :
-            ]
-
-            return reasoning_content, content
-
-    def parse_streaming_increment(
-        self, new_text: str
-    ) -> Tuple[Optional[str], Optional[str]]:
+        # Detect the start token for toggling `is_reasoning` when `force_think` is False
+        if not self.force_think and self.think_start_token in new_text:
+            self.is_reasoning = True
 
         # Should parse
         if self.is_reasoning:
-            # Again, we assume the output has an "<think>"
             if len(self._buffer) == 0:
+                self._buffer += new_text
                 new_text = new_text.replace(self.think_start_token, "")
-            self._buffer += new_text
+            else:
+                self._buffer += new_text
+
             # Reasoning continues
             if self.think_end_token not in self._buffer:
                 return new_text, ""
@@ -83,6 +54,41 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
 
         else:
             return "", new_text
+
+    def detect_and_parse(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        """Detect and parse the text, return reasoning_content and content."""
+        if self.think_end_token not in text:
+            if self.force_think:  # all the output are reasoning content
+                # Remove "<think>" if exists
+                return text.replace(self.think_start_token, ""), ""
+            elif self.think_start_token in text:
+                return text.replace(self.think_start_token, ""), ""
+            else:
+                return "", text
+
+        else:
+            # Add the start token to the beginning of the text.
+            if self.think_start_token not in text:
+                text = self.think_start_token + text
+
+            reasoning_content = self.pattern.findall(text)[0]
+            content = text[
+                len(self.think_start_token)
+                + len(reasoning_content)
+                + len(self.think_end_token) :
+            ]
+
+            return reasoning_content, content
+
+
+class DeepSeekR1ReasoningParser(BaseReasoningParser):
+    """
+    DeepSeekR1 reasoning parser, which use "<think>" and "</think>" to detect the reasoning part.
+    Referring to https://github.com/deepseek-ai/DeepSeek-R1?tab=readme-ov-file#usage-recommendations~.
+    """
+
+    def __init__(self):
+        super().__init__("<think> ", "</think> ", True)
 
 
 class ReasoningParser:
