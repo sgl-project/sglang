@@ -308,7 +308,7 @@ class SRTRunner:
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
             port=port,
-            mem_fraction_static=0.65,
+            mem_fraction_static=mem_fraction_static,
             trust_remote_code=True,
             is_embedding=not self.is_generation,
             lora_paths=lora_paths,
