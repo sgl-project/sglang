@@ -79,13 +79,11 @@ class VerlEngine:
             output = None
 
         # Most naive implementation, can extract tensor and send via gloo if too slow
-        # TODO improve the args
-        ranks = self._device_mesh_cpu.mesh.tolist()
         [output] = broadcast_pyobj(
             data=[output],
             rank=self._tp_rank,
             dist_group=self._device_mesh_cpu.get_group(),
-            src=ranks[0],
+            src=self._device_mesh_cpu.mesh[0].item(),
         )
 
         return output
