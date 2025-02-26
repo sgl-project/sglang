@@ -30,7 +30,6 @@ The core features include:
    backend/sampling_params.md
    backend/hyperparameter_tuning.md
 
-
 .. toctree::
    :maxdepth: 1
    :caption: Advanced Features
@@ -45,7 +44,7 @@ The core features include:
    :maxdepth: 1
    :caption: Frontend Tutorial
 
-   frontend/frontend.md
+   frontend/frontend.ipynb
    frontend/choices_methods.md
 
 .. toctree::
