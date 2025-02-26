@@ -1091,12 +1091,11 @@ def v1_chat_generate_response(
             choice_logprobs = None
 
         reasoning_content = None
+        text = ret_item["text"]
         if reasoning_parser:
             try:
                 parser = ReasoningParser(reasoning_parser)
-                reasoning_content, ret_item["text"] = parser.parse_non_stream(
-                    ret_item["text"]
-                )
+                reasoning_content, text = parser.parse_non_stream(text)
             except Exception as e:
                 logger.error(f"Exception: {e}")
                 return create_error_response(
@@ -1106,7 +1105,6 @@ def v1_chat_generate_response(
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
         tool_calls = None
-        text = ret_item["text"]
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
