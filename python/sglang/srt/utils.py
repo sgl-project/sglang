@@ -499,14 +499,17 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
     if include_parent:
-        try:
-            itself.kill()
+        if parent_pid == os.getpid():
+            sys.exit(0)
+        else:
+            try:
+                itself.kill()
 
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
+                # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+                # so we send an additional signal to kill them.
+                itself.send_signal(signal.SIGQUIT)
+            except psutil.NoSuchProcess:
+                pass
 
 
 def monkey_patch_p2p_access_check():
@@ -1154,9 +1157,9 @@ def set_gpu_proc_affinity(
 
     if psutil.cpu_count() != psutil.cpu_count(logical=False):
         # HT on
-        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
+        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
     else:
         # HT off
         bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]

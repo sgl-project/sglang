@@ -13,7 +13,7 @@
 # ==============================================================================
 """
 The definition of objects transfered between different
-processes (StdOrchestrator, DetokenizerManager, Controller).
+processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
 import uuid
