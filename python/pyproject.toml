@@ -38,6 +38,7 @@ runtime_common = [
     "xgrammar==0.1.10",
     "ninja",
     "transformers==4.48.3",
+    "llguidance>=0.6.15"
 ]
 srt = [
     "sglang[runtime_common]",
