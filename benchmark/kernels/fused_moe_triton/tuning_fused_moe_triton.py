@@ -368,10 +368,14 @@ def save_configs(
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int8_w8a8: bool,
     block_shape: List[int],
 ) -> None:
     dtype_str = get_config_dtype_str(
-        dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
+        dtype,
+        use_int8_w8a16=use_int8_w8a16,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
