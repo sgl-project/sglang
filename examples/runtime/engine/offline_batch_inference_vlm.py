@@ -5,56 +5,45 @@ python offline_batch_inference_vlm.py --model-path Qwen/Qwen2-VL-7B-Instruct --c
 
 import argparse
 import dataclasses
+import io
+import os
 
-from transformers import AutoProcessor
+import requests
+from PIL import Image
 
 import sglang as sgl
-from sglang.srt.openai_api.adapter import v1_chat_generate_request
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.conversation import chat_templates
 from sglang.srt.server_args import ServerArgs
 
 
 def main(
     server_args: ServerArgs,
 ):
-    # Create an LLM.
     vlm = sgl.Engine(**dataclasses.asdict(server_args))
 
-    # prepare prompts.
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "What’s in this image?"},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true",
-                    },
-                },
-            ],
-        }
-    ]
-    chat_request = ChatCompletionRequest(
-        messages=messages,
-        model=server_args.model_path,
-        temperature=0.8,
-        top_p=0.95,
-    )
-    gen_request, _ = v1_chat_generate_request(
-        [chat_request],
-        vlm.tokenizer_manager,
-    )
+    conv = chat_templates[server_args.chat_template].copy()
+    image_token = conv.image_token
 
-    outputs = vlm.generate(
-        input_ids=gen_request.input_ids,
-        image_data=gen_request.image_data,
-        sampling_params=gen_request.sampling_params,
+    image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+
+    prompt = f"What's in this image?\n{image_token}"
+
+    sampling_params = {
+        "temperature": 0.001,
+        "max_new_tokens": 30,
+    }
+
+    output = vlm.generate(
+        prompt=prompt,
+        image_data=image_url,
+        sampling_params=sampling_params,
     )
 
     print("===============================")
-    print(f"Prompt: {messages[0]['content'][0]['text']}")
-    print(f"Generated text: {outputs['text']}")
+    print(f"Prompt: {prompt}")
+    print(f"Generated text: {output['text']}")
+
+    vlm.shutdown()
 
 
 # The __main__ condition is necessary here because we use "spawn" to create subprocesses
@@ -63,5 +52,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     args = parser.parse_args()
+
     server_args = ServerArgs.from_cli_args(args)
     main(server_args)
