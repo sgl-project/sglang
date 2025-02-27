@@ -16,18 +16,23 @@ tar xf vscode_cli_alpine_x64_cli.tar.gz
 
 The following startup command is an example for internal development by the SGLang team. You can **modify or add directory mappings as needed**, especially for model weight downloads, to prevent repeated downloads by different Docker containers.
 
+❗️ **Note on RDMA**
+
+    1. `--network host` and `--privileged` are required by RDMA. If you don't need RDMA, you can remove them but keeping them there does not harm. Thus, we enable these two flags by default in the commands below.
+    2. You may need to set `NCCL_IB_GID_INDEX` if you are using RoCE, for example: `export NCCL_IB_GID_INDEX=3`.
+
 ### H100
 
 ```bash
 # Change the name to yours
-docker run -itd --shm-size 32g --gpus all -v /opt/dlami/nvme/.cache:/root/.cache --ipc=host --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
+docker run -itd --shm-size 32g --gpus all -v /opt/dlami/nvme/.cache:/root/.cache --ipc=host --network=host --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
 docker exec -it sglang_zhyncs /bin/zsh
 ```
 
 ### H200
 
 ```bash
-docker run -itd --shm-size 32g --gpus all -v /mnt/co-research/shared-models:/root/.cache/huggingface --ipc=host --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
+docker run -itd --shm-size 32g --gpus all -v /mnt/co-research/shared-models:/root/.cache/huggingface --ipc=host --network=host --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
 docker exec -it sglang_zhyncs /bin/zsh
 ```
 
