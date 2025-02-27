@@ -259,7 +259,7 @@ class ResponseFormat(BaseModel):
 
 
 class StructuresResponseFormat(BaseModel):
-    start: str
+    begin: str
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
     end: str
 
