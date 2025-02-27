@@ -241,7 +241,7 @@ def fused_moe_kernel(
 
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
-                accumulator = tl.dot(a, b, acc=accumulator)
+                accumulator += tl.dot(a, b)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
