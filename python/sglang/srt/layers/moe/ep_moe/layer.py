@@ -493,13 +493,6 @@ class EPMoE(torch.nn.Module):
                 )
             param_data[expert_id] = loaded_weight
         # Weight scales
-        elif "weight_scale_inv" in weight_name:
-            # elif getattr(param, "quant_method", None) == FusedMoeWeightScaleSupported.BLOCK.value:
-            if shard_id in ("w1", "w3"):
-                idx = 0 if shard_id == "w1" else 1
-                param_data[expert_id][idx] = loaded_weight
-            else:
-                param_data[expert_id] = loaded_weight
         elif "weight_scale" in weight_name:
             if self.use_block_quant:
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
