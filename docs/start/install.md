@@ -1,26 +1,26 @@
 # Install SGLang
 
-You can install SGLang using any of the methods below. For running DeepSeek V3/R1 with SGLang, refer to [DeepSeek V3 Support](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). It is always recommended to use the [latest release version](https://pypi.org/project/sglang/#history) and deploy it with [Docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended) to avoid fixed issues and environment-related problems.
+You can install SGLang using any of the methods below.
 
-## Method 1: With pip or uv
+For running DeepSeek V3/R1, refer to [DeepSeek V3 Support](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). It is recommended to use the [latest version](https://pypi.org/project/sglang/#history) and deploy it with [Docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended) to avoid environment-related problems.
 
 We recommend using uv to install the dependencies with a higher installation speed:
+## Method 1: With pip or uv
 
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install sgl-kernel --force-reinstall --no-deps
 uv pip install "sglang[all]>=0.4.3.post2" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
 
-**Quick Fix to Installation**
+**Quick Fixes to Installation**
 
-- SGLang currently uses torch 2.5, so you need to install the flashinfer version for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the package currently used by FlashInfer is named `flashinfer-python`, not `flashinfer`.
+- SGLang currently uses torch 2.5, so you need to install flashinfer for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the FlashInfer pypi package is called `flashinfer-python` instead of `flashinfer`.
 
-- If you experience an error like `OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root`, please try either of the following solutions:
+- If you encounter `OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root`, please try either of the following solutions:
 
 1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
-2. Follow the procedure described in [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) first, then install SGLang as described above.
+2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
 
 - If you encounter `ImportError; cannot import name 'is_valid_list_of_images' from 'transformers.models.llama.image_processing_llama'`, try to use the specified version of `transformers` in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/python/pyproject.toml). Currently, just running `pip install transformers==4.48.3`.
 
@@ -31,15 +31,14 @@ git clone -b v0.4.3.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
-pip install sgl-kernel --force-reinstall --no-deps
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
 
-Note: SGLang currently uses torch 2.5, so you need to install the flashinfer version for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html).
+Note: SGLang currently uses torch 2.5, so you need to install flashinfer for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html).
 
-If you want to work on development in SGLang, it is highly recommended that you use docker. Please refer to [setup docker container](https://github.com/sgl-project/sglang/blob/main/docs/developer/development_guide_using_docker.md#setup-docker-container) for guidance. The image used is `lmsysorg/sglang:dev`.
+If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](https://github.com/sgl-project/sglang/blob/main/docs/developer/development_guide_using_docker.md#setup-docker-container) for guidance. The docker image is `lmsysorg/sglang:dev`.
 
-Note: To AMD ROCm system with Instinct/MI GPUs, do following instead:
+Note: For AMD ROCm system with Instinct/MI GPUs, do following instead:
 
 ```
 # Use the last release branch
@@ -68,7 +67,7 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
-Note: To AMD ROCm system with Instinct/MI GPUs, it is recommended to use `docker/Dockerfile.rocm` to build images, example and usage as below:
+Note: For AMD ROCm system with Instinct/MI GPUs, it is recommended to use `docker/Dockerfile.rocm` to build images, example and usage as below:
 
 ```bash
 docker build --build-arg SGL_BRANCH=v0.4.3.post2 -t v0.4.3.post2-rocm630 -f Dockerfile.rocm .
