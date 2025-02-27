@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from deep_gemm import cell_div, get_col_major_tma_aligned_tensor
+from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,
 )
@@ -28,7 +28,7 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros(
-        (cell_div(m, 128) * 128, cell_div(n, 128) * 128), dtype=x.dtype, device=x.device
+        (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device
     )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
