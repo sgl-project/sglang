@@ -35,14 +35,15 @@ runtime_common = [
     "torchao>=0.7.0",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.10",
+    "xgrammar==0.1.14",
     "ninja",
     "transformers==4.48.3",
+    "llguidance>=0.6.15"
 ]
 srt = [
     "sglang[runtime_common]",
     "sgl-kernel>=0.0.3.post6",
-    "flashinfer_python>=0.2.1.post2",
+    "flashinfer_python>=0.2.2.post1",
     "torch==2.5.1",
     "vllm>=0.6.4.post1,<=0.7.2",
     "cuda-python",
