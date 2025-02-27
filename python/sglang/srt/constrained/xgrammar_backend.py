@@ -20,7 +20,6 @@ from typing import List, Tuple
 import torch
 from xgrammar import (
     CompiledGrammar,
-    Grammar,
     GrammarCompiler,
     GrammarMatcher,
     StructuralTagItem,
@@ -137,9 +136,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 return None
         elif key_type == "regex":
             try:
-                ctx = self.grammar_compiler.compile_grammar(
-                    Grammar.from_regex(key_string)
-                )
+                ctx = self.grammar_compiler.compile_regex(key_string)
             except RuntimeError as e:
                 logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
                 return None
