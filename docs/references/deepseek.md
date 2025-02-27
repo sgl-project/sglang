@@ -8,74 +8,94 @@ Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model
 
 SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). To run DeepSeek V3/R1 models, the requirements are as follows:
 
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Weight Configurations</title>
-    <style>
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 20px 0;
-        }
-        th, td {
-            border: 1px solid #ddd;
-            padding: 12px;
-            text-align: left;
-        }
-        th {
-            background-color: #f2f2f2;
-        }
-        tr:nth-child(even) {
-            background-color: #f9f9f9;
-        }
-    </style>
-</head>
-<body>
-    <table>
-        <thead>
-            <tr>
-                <th>Weight Type</th>
-                <th>Configuration</th>
-            </tr>
-        </thead>
-        <tbody>
-            <tr>
-                <td rowspan="3"><b>Full precision FP8 (recommended)</b></td>
-                <td>8 x H200</td>
-            </tr>
-            <tr>
-                <td>8 x MI300X</td>
-            </tr>
-            <tr>
-                <td>2 x 8 x H100/800/20</td>
-            </tr>
-            <tr>
-                <td rowspan="4">Full precision BF16</td>
-                <td>2 x 8 x H200</td>
-            </tr>
-            <tr>
-                <td>2 x 8 x MI300X</td>
-            </tr>
-            <tr>
-                <td>4 x 8 x H100/800/20</td>
-            </tr>
-            <tr>
-                <td>4 x 8 x A100/A800</td>
-            </tr>
-            <tr>
-                <td rowspan="2">Quantized weights (AWQ)</td>
-                <td>8 x H100/800/20</td>
-            </tr>
-            <tr>
-                <td>8 x A100/A800</td>
-            </tr>
-        </tbody>
-    </table>
-</body>
-</html>
+<div class="table-container">
+<style>
+  .table-container {
+    overflow-x: auto;
+    margin: 20px 0;
+  }
+  .config-table {
+    width: 100%;
+    border-collapse: collapse;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+  }
+  .config-table th {
+    background-color: #1a2b47;
+    color: white;
+    padding: 12px 15px;
+    text-align: left;
+    font-weight: 600;
+  }
+  .config-table td {
+    padding: 10px 15px;
+    border-bottom: 1px solid #333;
+    color: white;
+  }
+  .config-table tr:nth-child(odd) td {
+    background-color: #2c3e50;
+  }
+  .config-table tr:nth-child(even) td {
+    background-color: #34495e;
+  }
+  .config-table tr:hover td {
+    background-color: #1a2b47;
+  }
+  .weight-type {
+    background-color: #243342 !important;
+    font-weight: 500;
+  }
+  .recommended {
+    color: #2ecc71;
+    font-size: 0.9em;
+    font-style: italic;
+  }
+</style>
+
+  <table class="config-table">
+    <thead>
+      <tr>
+        <th>Weight Type</th>
+        <th>Configuration</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td rowspan="3" class="weight-type"><strong>Full precision FP8</strong><br><span class="recommended">(recommended)</span></td>
+        <td>8 x H200</td>
+      </tr>
+      <tr>
+        <td>8 x MI300X</td>
+      </tr>
+      <tr>
+        <td>2 x 8 x H100/800/20</td>
+      </tr>
+      <tr>
+        <td rowspan="4" class="weight-type"><strong>Full precision BF16</strong></td>
+        <td>2 x 8 x H200</td>
+      </tr>
+      <tr>
+        <td>2 x 8 x MI300X</td>
+      </tr>
+      <tr>
+        <td>4 x 8 x H100/800/20</td>
+      </tr>
+      <tr>
+        <td>4 x 8 x A100/A800</td>
+      </tr>
+      <tr>
+        <td rowspan="2" class="weight-type"><strong>Quantized weights (AWQ)</strong></td>
+        <td>8 x H100/800/20</td>
+      </tr>
+      <tr>
+        <td>8 x A100/A800</td>
+      </tr>
+    </tbody>
+  </table>
+
+</div>
+
 
 Detailed commands for reference:
 
