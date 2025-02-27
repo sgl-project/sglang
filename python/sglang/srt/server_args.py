@@ -79,6 +79,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
+    dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
 
@@ -161,7 +162,6 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
-    return_hidden_states: bool = False
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
@@ -535,6 +535,12 @@ class ServerArgs:
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
         )
         parser.add_argument(
+            "--dist-timeout",
+            type=int,
+            default=ServerArgs.dist_timeout,
+            help="Set timeout for torch.distributed initialization.",
+        )
+        parser.add_argument(
             "--download-dir",
             type=str,
             default=ServerArgs.download_dir,
@@ -691,7 +697,7 @@ class ServerArgs:
         parser.add_argument(
             "--grammar-backend",
             type=str,
-            choices=["xgrammar", "outlines"],
+            choices=["xgrammar", "outlines", "llguidance"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
@@ -909,11 +915,6 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
-        )
-        parser.add_argument(
-            "--return-hidden-states",
-            action="store_true",
-            help="Return hidden states in the response.",
         )
         parser.add_argument(
             "--tool-call-parser",

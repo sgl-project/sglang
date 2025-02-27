@@ -1030,7 +1030,6 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
-            self.server_args.return_hidden_states,
         )
         new_batch.prepare_for_extend()
 
@@ -1154,6 +1153,10 @@ class Scheduler:
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_batch_result(result.bid)
+                if batch.next_batch_sampling_info:
+                    batch.next_batch_sampling_info.update_regex_vocab_mask()
+                    self.current_stream.synchronize()
+                    batch.next_batch_sampling_info.sampling_info_done.set()
         elif batch.forward_mode.is_dummy_first():
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
@@ -1217,9 +1220,8 @@ class Scheduler:
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
-
                     if (
-                        self.server_args.return_hidden_states
+                        req.sampling_params.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
                         req.hidden_states.append(
@@ -1327,7 +1329,7 @@ class Scheduler:
                     )
 
             if (
-                self.server_args.return_hidden_states
+                req.sampling_params.return_hidden_states
                 and logits_output.hidden_states is not None
             ):
                 req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
@@ -1455,7 +1457,10 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            output_hidden_states = [] if self.server_args.return_hidden_states else None
+            return_hidden_states = any(
+                req.sampling_params.return_hidden_states for req in reqs
+            )
+            output_hidden_states = [] if return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1522,7 +1527,7 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                    if self.server_args.return_hidden_states:
+                    if req.sampling_params.return_hidden_states:
                         output_hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
@@ -1615,7 +1620,6 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
-            self.server_args.return_hidden_states,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -1630,16 +1634,34 @@ class Scheduler:
             except futures._base.TimeoutError:
                 break
 
-        if self.tp_size > 1:
-            # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
-            )
-            num_ready_reqs_max = tensor.item()
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
-            num_ready_reqs = num_ready_reqs_max
+        if self.server_args.enable_dp_attention:
+            if self.attn_tp_size > 1:
+                # Sync across attn TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=self.attn_tp_cpu_group,
+                )
+                num_ready_reqs_max = tensor.item()
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    self.grammar_queue[i].grammar = self.grammar_queue[
+                        i
+                    ].grammar.result()
+                num_ready_reqs = num_ready_reqs_max
+        else:
+            if self.tp_size > 1:
+                # Sync across TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+                )
+                num_ready_reqs_max = tensor.item()
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    self.grammar_queue[i].grammar = self.grammar_queue[
+                        i
+                    ].grammar.result()
+                num_ready_reqs = num_ready_reqs_max
 
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
