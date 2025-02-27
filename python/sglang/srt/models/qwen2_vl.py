@@ -414,6 +414,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             if token == self.config.image_token_id
         ]
         image_inputs.image_offsets = []
+        image_inputs.image_pad_len = []
 
         input_ids_with_image = []
         for image_cnt, _ in enumerate(image_grid_thws):
@@ -432,6 +433,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 (num_image_tokens + len(pad_values)) // len(pad_values)
             )
             input_ids_with_image.extend(pad_ids[:num_image_tokens])
+            image_inputs.image_pad_len.append(num_image_tokens)
         input_ids_with_image.extend(input_ids[image_indices[-1] + 1 :])
 
         return input_ids_with_image
@@ -499,15 +501,31 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             positions = forward_batch.mrope_positions
 
         image_inputs = None
+        need_vision = True
         if forward_batch.image_inputs is not None:
             image_inputs = [
                 img for img in forward_batch.image_inputs if img is not None
             ]
+            max_image_offset = []
+            for im in image_inputs:
+                if im and im.image_offsets and im.image_pad_len:
+                    max_image_offset.append(
+                        np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
+                    )
+                else:
+                    max_image_offset.append(-1)
+            start_positions = positions[forward_batch.extend_start_loc][0].cpu().numpy()
+            need_vision = (start_positions <= np.array(max_image_offset)).any()
 
+        # Clamp input ids. This is because the input_ids for the image tokens are
+        # filled with the hash values of the image for the prefix matching in the radix attention.
+        # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+        input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
         if (
             forward_batch.forward_mode.is_decode()
             or image_inputs is None
             or len(image_inputs) == 0
+            or not need_vision
         ):
             inputs_embeds = self.model.embed_tokens(input_ids)
         else:
@@ -516,11 +534,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-
-            # Clamp input ids. This is because the input_ids for the image tokens are
-            # filled with the hash values of the image for the prefix matching in the radix attention.
-            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-            input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
             inputs_embeds = self.model.embed_tokens(input_ids)
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
