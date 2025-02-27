@@ -123,7 +123,7 @@ class VerlEngine:
                         )
                     ],
                     load_format=load_format,
-                    has_more=tensor_index != len(named_tensors) - 1,
+                    flush_cache=tensor_index == len(named_tensors) - 1,
                 )
 
     def release_memory_occupation(self):

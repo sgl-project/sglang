@@ -275,14 +275,14 @@ class Engine:
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
-        has_more: bool = False,
+        flush_cache: bool = True,
     ):
-        """Update weights from distributed source. If there are going to be more updates, set `has_more` to be true
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
         to avoid duplicated operations such as clearing cache."""
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors),
             load_format=load_format,
-            has_more=has_more,
+            flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(

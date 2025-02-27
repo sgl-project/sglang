@@ -450,7 +450,7 @@ class UpdateWeightsFromDistributedReqOutput:
 class UpdateWeightsFromTensorReqInput:
     serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
     load_format: Optional[str]
-    has_more: bool
+    flush_cache: bool
 
 
 @dataclass
