@@ -9,6 +9,8 @@ python3 -m sglang.bench_serving --backend sglang --num-prompt 10
 
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate-range 1,2,4,8,16,32 --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --multi
+
+python3 -m sglang.bench_serving --backend triton-grpc --dataset-name sharegpt --num-prompts 30 --base-url --grpc-port --tokenizer  --model
 """
 
 import argparse
@@ -19,18 +21,23 @@ import pickle
 import random
 import resource
 import sys
+import threading
 import time
 import traceback
 import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
 import requests
+import tritonclient.grpc as grpcclient
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoTokenizer,
@@ -38,6 +45,7 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+from tritonclient.utils import np_to_triton_dtype
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -386,6 +394,137 @@ async def async_request_sglang_generate(
     return output
 
 
+def prepare_tensor(name, input_tensor):
+    """Create grpcclient's InferInput instance according to a given tensor."""
+    t = grpcclient.InferInput(
+        name, list(input_tensor.shape), np_to_triton_dtype(input_tensor.dtype)
+    )
+    t.set_data_from_numpy(input_tensor)
+    return t
+
+
+def stream_callback(que, st, request_func_input, result, error):
+    """Callback function invoked by triton."""
+    que.put((st, request_func_input, result, error))
+
+
+def process_result(que, output):
+    """Process and print results in queue."""
+    ttft = 0.0
+    most_recent_timestamp = 0.0
+    while True:
+        res = que.get()
+        if res is not None:
+            st, request_func_input, result, err = res
+            if err is not None:
+                print(err)
+                output.error = err
+                output.success = False
+            else:
+                timestamp = time.perf_counter()
+                latency = timestamp - st
+                response = result.as_numpy("answer").item().decode("utf-8")
+                try:
+                    response_dict = json.loads(response)
+                    output.generated_text = response_dict["choices"][0]["message"][
+                        "content"
+                    ]
+                    output.full_text = response
+                except Exception as e:
+                    output.generated_text += response
+
+                    # output.full_text += response
+                output.success = True
+                output.latency = latency
+                output.output_len = request_func_input.output_len
+                if ttft == 0.0:
+                    ttft = time.perf_counter() - st
+                    output.ttft = ttft
+                else:
+                    output.itl.append(
+                        timestamp
+                        - (
+                            st
+                            if most_recent_timestamp == 0.0
+                            else most_recent_timestamp
+                        )
+                    )
+                most_recent_timestamp = time.perf_counter()
+        else:
+            break
+
+
+def request_sglang_generate_grpc(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+    outputQueue: Optional[Queue] = None,
+) -> RequestFuncOutput:
+    """Send gRPC request to Triton Inference Server for text generation."""
+    api_url = request_func_input.api_url
+    prompt = request_func_input.prompt
+    model_name = request_func_input.model
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    res_que = Queue()
+    process_thread = threading.Thread(
+        target=process_result,
+        args=(
+            res_que,
+            output,
+        ),
+    )
+    process_thread.start()
+    st = time.perf_counter()
+    try:
+        # Connect to Triton server
+        with grpcclient.InferenceServerClient(api_url) as client:
+            inputs = [
+                prepare_tensor(
+                    "text" if isinstance(prompt, str) else "messages",
+                    np.array(
+                        (
+                            [prompt.encode()]
+                            if isinstance(prompt, str)
+                            else [json.dumps(prompt, ensure_ascii=False)]
+                        ),
+                        dtype=np.object_,
+                    ),
+                ),
+                prepare_tensor(
+                    "max_tokens",
+                    np.array([request_func_input.output_len], dtype=np.int32),
+                ),
+                prepare_tensor("temperature", np.array([0.0], dtype=np.float32)),
+                prepare_tensor(
+                    "ignore_eos",
+                    np.array([not args.disable_ignore_eos], dtype=np.bool_),
+                ),
+                prepare_tensor(
+                    "stream", np.array([not args.disable_stream], dtype=np.bool_)
+                ),
+            ]
+
+            # Start streaming inference
+            client.start_stream(
+                partial(stream_callback, res_que, st, request_func_input)
+            )
+            client.async_stream_infer(
+                model_name, inputs, sequence_start=True, sequence_end=True
+            )
+    except Exception as e:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
+
+    res_que.put(None)
+    process_thread.join()
+    if pbar:
+        pbar.update(1)
+    if outputQueue:
+        outputQueue.put(output)
+    return output
+
+
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -480,6 +619,7 @@ def get_dataset(args, tokenizer):
 
 ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
+    "triton-grpc": request_sglang_generate_grpc,
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
     "vllm": async_request_openai_completions,
@@ -939,7 +1079,10 @@ async def benchmark(
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
-    test_output = await request_func(request_func_input=test_input)
+    if backend == "triton-grpc":
+        test_output = request_func(request_func_input=test_input, pbar=None)
+    else:
+        test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please make sure benchmark arguments "
@@ -968,23 +1111,48 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = request
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=prompt,
-            api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            lora_name=lora_name,
-            extra_request_body=extra_request_body,
-        )
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+    if backend == "triton-grpc":
+        threads = []
+        outputQueue = Queue()
+        async for request in get_request(input_requests, request_rate):
+            prompt, prompt_len, output_len = request
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                lora_name=lora_name,
+                extra_request_body=extra_request_body,
             )
-        )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+            t = Thread(
+                target=request_func, args=(request_func_input, pbar, outputQueue)
+            )
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+        outputs = [outputQueue.get() for _ in range(len(threads))]
+    else:
+        async for request in get_request(input_requests, request_rate):
+            prompt, prompt_len, output_len = request
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                lora_name=lora_name,
+                extra_request_body=extra_request_body,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input, pbar=pbar
+                    )
+                )
+            )
+        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     # Stop profiler
     if profile:
@@ -1226,6 +1394,8 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/models/model:predict"
         )
+    elif args.backend == "triton-grpc":
+        api_url = f"{args.base_url}:{args.grpc_port}"
     base_url = (
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
     )
@@ -1331,6 +1501,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--base-url",
+        type=str,
+        default=None,
+        help="Server or API base url if not using http host and port.",
+    )
+    parser.add_argument(
+        "--grpc-port",
         type=str,
         default=None,
         help="Server or API base url if not using http host and port.",
