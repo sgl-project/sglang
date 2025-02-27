@@ -36,8 +36,77 @@ from iree.turbine.kernel.wave.templates.extend_attention import (
 )
 
 import os
+import functools
 
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
+kernel_hash = []
+
+
+@functools.lru_cache
+def get_wave_kernel(
+    shape: AttentionShape,
+    q_shape: tuple[int],
+    k_shape: tuple[int],
+    v_shape: tuple[int],
+    block_table_shape: tuple[int],
+    k_cache_shape: tuple[int],
+    v_cache_shape: tuple[int],
+    o_shape: tuple[int],
+    input_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    size_dtype: torch.dtype,
+    is_causal: bool,
+    logit_cap: float,
+    layer_scaling: float,
+):
+    assert shape.num_query_heads % shape.num_kv_heads == 0
+
+    mfma_variant = (MMAType.F32_16x16x32_K8_F16, MMAType.F32_16x16x16_F16)
+    (
+        extend_attention,
+        hyperparams,
+        dynamic_symbols,
+        dynamic_symbols_map,
+    ) = get_extend_attention_kernel(
+        shape,
+        mfma_variant,
+        q_shape,
+        k_shape,
+        v_shape,
+        block_table_shape,
+        k_cache_shape,
+        v_cache_shape,
+        o_shape,
+        input_dtype=input_dtype,
+        output_dtype=output_dtype,
+        size_dtype=size_dtype,
+        is_causal=is_causal,
+        layer_scaling=layer_scaling,
+        logit_cap=logit_cap,
+    )
+
+    hyperparams.update(get_default_scheduling_params())
+    config = get_default_run_config()
+    compile_config = {"waves_per_eu": 2, "denorm_fp_math_f32": "preserve-sign"}
+    config["gpu-native-math-precision"] = True
+    launch_context = tk.gen.TestLaunchContext(
+        hyperparams,
+        canonicalize=True,
+        run=True,
+        run_bench=False,
+        run_config=config,
+        compile_config=compile_config,
+        schedule=False,
+        use_scheduling_barriers=False,
+        dynamic_symbols=dynamic_symbols,
+        dynamic_symbols_map=dynamic_symbols_map,
+        kernel_hash=kernel_hash,
+    )
+
+    return (
+        launch_context,
+        extend_attention,
+    )
 
 
 def extend_attention_wave(
@@ -57,7 +126,7 @@ def extend_attention_wave(
     layer_scaling=None,
     logit_cap=0,
 ):
-
+    global kernel_hash
     shape = AttentionShape(
         num_query_heads=q_extend.shape[1],
         num_kv_heads=k_extend.shape[1],
@@ -68,18 +137,12 @@ def extend_attention_wave(
         block_size=64,
     )
 
-    assert shape.num_query_heads % shape.num_kv_heads == 0
-
     # Run the wave kernel.
-    mfma_variant = (MMAType.F32_16x16x32_K8_F16, MMAType.F32_16x16x16_F16)
     (
+        launch_context,
         extend_attention,
-        hyperparams,
-        dynamic_symbols,
-        dynamic_symbols_map,
-    ) = get_extend_attention_kernel(
+    ) = get_wave_kernel(
         shape,
-        mfma_variant,
         q_extend.shape,
         k_extend.shape,
         v_extend.shape,
@@ -95,24 +158,7 @@ def extend_attention_wave(
         logit_cap=logit_cap,
     )
 
-    hyperparams.update(get_default_scheduling_params())
-    config = get_default_run_config()
-    compile_config = {"waves_per_eu": 2, "denorm_fp_math_f32": "preserve-sign"}
-    config["gpu-native-math-precision"] = True
-
-    with tk.gen.TestLaunchContext(
-        hyperparams,
-        canonicalize=True,
-        run=True,
-        run_bench=False,
-        run_config=config,
-        compile_config=compile_config,
-        schedule=False,
-        use_scheduling_barriers=False,
-        dynamic_symbols=dynamic_symbols,
-        dynamic_symbols_map=dynamic_symbols_map,
-    ):
-        # TODO: Add scaling of QK as part of kernel.
+    with launch_context:
         mb = extend_attention(
             q_extend,
             k_extend,
