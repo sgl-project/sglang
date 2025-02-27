@@ -587,9 +587,12 @@ class StreamExecutor:
 
                 else:  # Speculative execution on models with completion interface
                     comp, meta_info = self._spec_gen(sampling_params)
-
+            # print("comp", comp) 
             if isinstance(comp, list):
                 self.text_ += comp[0]
+            else:
+                assert isinstance(comp, str)
+                self.text_ += comp
 
             self.variables[name] = comp
             self.meta_info[name] = meta_info
