@@ -1457,7 +1457,10 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            output_hidden_states = [] if self.server_args.return_hidden_states else None
+            return_hidden_states = any(
+                req.sampling_params.return_hidden_states for req in reqs
+            )
+            output_hidden_states = [] if return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []

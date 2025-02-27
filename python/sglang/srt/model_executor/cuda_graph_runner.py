@@ -412,6 +412,15 @@ class CudaGraphRunner:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
             self.capture()
 
+        # Here we don't need to check spec_info because it will be checked in
+        # `capture()` if the hidden mode is NULL.
+        if (
+            not forward_batch.sampling_info.return_hidden_states
+            and self.capture_hidden_mode == CaptureHiddenMode.NULL
+        ):
+            self.capture_hidden_mode = CaptureHiddenMode.NULL
+            self.capture()
+
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 

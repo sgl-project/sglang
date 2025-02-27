@@ -75,6 +75,46 @@ class TestHiddenState(unittest.TestCase):
                 )
             )
 
+    def test_repeatedly_changes_hidden_states(self):
+        prompts = ["Today is", "Today is a sunny day and I like"]
+        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        input_ids = tokenizer(prompts).input_ids
+
+        sampling_params1 = {
+            "temperature": 0,
+            "max_new_tokens": 8,
+            "return_hidden_states": True,
+        }
+
+        sampling_params2 = {
+            "temperature": 0,
+            "max_new_tokens": 8,
+            "return_hidden_states": False,
+        }
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            random_seed=42,
+            skip_tokenizer_init=True,
+        )
+        outputs1 = engine.generate(
+            input_ids=input_ids, sampling_params=sampling_params1
+        )
+        outputs2 = engine.generate(
+            input_ids=input_ids, sampling_params=sampling_params2
+        )
+
+        outputs3 = engine.generate(
+            input_ids=input_ids, sampling_params=sampling_params1
+        )
+        engine.shutdown()
+
+        for output1, output2, output3 in zip(outputs1, outputs2, outputs3):
+            self.assertEqual(len(output1["meta_info"]["hidden_states"]), 8)
+            self.assertNotIn("hidden_states", output2["meta_info"])
+            self.assertEqual(len(output3["meta_info"]["hidden_states"]), 8)
+
 
 if __name__ == "__main__":
     unittest.main()
