@@ -403,7 +403,9 @@ class CudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
-
+        hidden_mode_from_spec_info = getattr(
+            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+        )
         # If the capture_hidden_mode changes, we need to recapture the graph
         if (
             forward_batch.sampling_info.return_hidden_states
@@ -411,14 +413,11 @@ class CudaGraphRunner:
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
             self.capture()
-
-        # Here we don't need to check spec_info because it will be checked in
-        # `capture()` if the hidden mode is NULL.
-        if (
+        elif (
             not forward_batch.sampling_info.return_hidden_states
-            and self.capture_hidden_mode == CaptureHiddenMode.FULL
+            and self.capture_hidden_mode != hidden_mode_from_spec_info
         ):
-            self.capture_hidden_mode = CaptureHiddenMode.NULL
+            self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
 
         raw_bs = forward_batch.batch_size
