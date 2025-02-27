@@ -150,6 +150,11 @@ def get_weight_shapes(tp_size):
     for k_t in k_tp:
         new_t = (k_t[0], k_t[1] // tp_size)
         weight_shapes.append(new_t)
+
+    # Remove shapes with n=7168 when tp_size=16 to avoid "Misaligned barriers" error in DeepGEMM
+    if tp_size == 16:
+        weight_shapes = [shape for shape in weight_shapes if shape[0] != 7168]
+
     return weight_shapes
 
 
