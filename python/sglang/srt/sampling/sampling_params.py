@@ -49,6 +49,7 @@ class SamplingParams:
         no_stop_trim: bool = False,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
+        return_hidden_states: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.temperature = temperature
@@ -74,6 +75,7 @@ class SamplingParams:
         self.ebnf = ebnf
         self.structural_tag = structural_tag
         self.no_stop_trim = no_stop_trim
+        self.return_hidden_states = return_hidden_states
         self.custom_params = custom_params
 
         # Process some special cases
