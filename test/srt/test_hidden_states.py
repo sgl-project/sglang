@@ -81,13 +81,13 @@ class TestHiddenState(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
-        sampling_params1 = {
+        sample_completion = {
             "temperature": 0,
             "max_new_tokens": 8,
             "return_hidden_states": True,
         }
 
-        sampling_params2 = {
+        sample_hidden_state = {
             "temperature": 0,
             "max_new_tokens": 8,
             "return_hidden_states": False,
@@ -98,19 +98,23 @@ class TestHiddenState(unittest.TestCase):
             random_seed=42,
             skip_tokenizer_init=True,
         )
-        outputs1 = engine.generate(
-            input_ids=input_ids, sampling_params=sampling_params1
+        output_completion_first_round = engine.generate(
+            input_ids=input_ids, sampling_params=sample_completion
         )
-        outputs2 = engine.generate(
-            input_ids=input_ids, sampling_params=sampling_params2
+        output_hidden_state = engine.generate(
+            input_ids=input_ids, sampling_params=sample_hidden_state
         )
 
-        outputs3 = engine.generate(
-            input_ids=input_ids, sampling_params=sampling_params1
+        output_completion_last_round = engine.generate(
+            input_ids=input_ids, sampling_params=sample_completion
         )
         engine.shutdown()
 
-        for output1, output2, output3 in zip(outputs1, outputs2, outputs3):
+        for output1, output2, output3 in zip(
+            output_completion_first_round,
+            output_hidden_state,
+            output_completion_last_round,
+        ):
             self.assertEqual(len(output1["meta_info"]["hidden_states"]), 8)
             self.assertNotIn("hidden_states", output2["meta_info"])
             self.assertEqual(len(output3["meta_info"]["hidden_states"]), 8)
