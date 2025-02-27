@@ -7,6 +7,9 @@ import torch
 import triton
 import triton.language as tl
 from deep_gemm import cell_div, get_col_major_tma_aligned_tensor
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,
+)
 
 from sglang.srt.layers.quantization.fp8_kernel import w8a8_block_fp8_matmul
 
@@ -68,28 +71,57 @@ def fp8_gemm_sglang(x: torch.Tensor, y: torch.Tensor, m: int, n: int, k: int):
     return out
 
 
+def fp8_gemm_vllm(x: torch.Tensor, y: torch.Tensor, m: int, n: int, k: int):
+    """vLLM implementation of FP8 GEMM"""
+    # Convert inputs to FP8 format
+    x_fp8, x_scale = per_token_cast_to_fp8(x)
+    y_fp8, y_scale = per_block_cast_to_fp8(y)
+
+    block_size = [128, 128]  # Matches the block size in per_block_cast_to_fp8
+
+    # Run vLLM kernel
+    out = vllm_w8a8_block_fp8_matmul(
+        x_fp8, y_fp8, x_scale, y_scale, block_size, torch.bfloat16
+    )
+    return out
+
+
 def calculate_diff(m: int, n: int, k: int):
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
     out_deepgemm = fp8_gemm_deepgemm(x.clone(), y.clone(), m, n, k)
     out_sglang = fp8_gemm_sglang(x.clone(), y.clone(), m, n, k)
+    out_vllm = fp8_gemm_vllm(x.clone(), y.clone(), m, n, k)
 
-    diff = torch.abs(out_deepgemm - out_sglang).mean().item()
+    diff_sglang_deepgemm = torch.abs(out_deepgemm - out_sglang).mean().item()
+    diff_vllm_deepgemm = torch.abs(out_deepgemm - out_vllm).mean().item()
+    diff_vllm_sglang = torch.abs(out_vllm - out_sglang).mean().item()
 
     print(f"Shape m={m}, n={n}, k={k}:")
     print(f"DeepGEMM output: {out_deepgemm[0, 0:5]}")
     print(f"SGLang output: {out_sglang[0, 0:5]}")
-    print(f"Mean absolute difference: {diff}")
+    print(f"vLLM output: {out_vllm[0, 0:5]}")
+    print(f"Mean absolute difference (SGLang-DeepGEMM): {diff_sglang_deepgemm}")
+    print(f"Mean absolute difference (vLLM-DeepGEMM): {diff_vllm_deepgemm}")
+    print(f"Mean absolute difference (vLLM-SGLang): {diff_vllm_sglang}")
 
-    if torch.allclose(out_deepgemm, out_sglang, atol=1e-2, rtol=1e-2):
-        print("✅ Both implementations match\n")
+    sglang_deepgemm_match = torch.allclose(
+        out_deepgemm, out_sglang, atol=1e-2, rtol=1e-2
+    )
+    vllm_deepgemm_match = torch.allclose(out_deepgemm, out_vllm, atol=1e-2, rtol=1e-2)
+    vllm_sglang_match = torch.allclose(out_vllm, out_sglang, atol=1e-2, rtol=1e-2)
+
+    if sglang_deepgemm_match and vllm_deepgemm_match and vllm_sglang_match:
+        print("✅ All implementations match\n")
     else:
-        print("❌ Implementations differ\n")
+        print("❌ Some implementations differ:")
+        print(f"  - SGLang vs DeepGEMM: {'✅' if sglang_deepgemm_match else '❌'}")
+        print(f"  - vLLM vs DeepGEMM: {'✅' if vllm_deepgemm_match else '❌'}")
+        print(f"  - vLLM vs SGLang: {'✅' if vllm_sglang_match else '❌'}\n")
 
 
 def get_weight_shapes(tp_size):
-    # NOTE(HandH1998): The weight shapes only works for DeepSeek-V3. Modify them, if you tune for another different model.
     # cannot TP
     total = [
         (512 + 64, 7168),
@@ -134,7 +166,6 @@ def create_benchmark_configs(tp_size):
 
 
 def get_benchmark(tp_size):
-    # Create configs for the specified tp_size
     all_configs = create_benchmark_configs(tp_size)
 
     @triton.testing.perf_report(
@@ -142,16 +173,15 @@ def get_benchmark(tp_size):
             x_names=["m", "n", "k", "tp_size"],
             x_vals=[list(config) for config in all_configs],
             line_arg="provider",
-            line_vals=["deepgemm", "sglang"],
-            line_names=["DeepGEMM", "SGLang"],
-            styles=[("blue", "-"), ("red", "-")],
+            line_vals=["deepgemm", "sglang", "vllm"],
+            line_names=["DeepGEMM", "SGLang", "vLLM"],
+            styles=[("blue", "-"), ("red", "-"), ("green", "-")],
             ylabel="ms",
             plot_name=f"fp8-gemm-performance-comparison-tp{tp_size}",
             args={},
         )
     )
     def benchmark(m, n, k, tp_size, provider):
-        # Create input tensors
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
         y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
@@ -162,9 +192,14 @@ def get_benchmark(tp_size):
                 lambda: fp8_gemm_deepgemm(x.clone(), y.clone(), m, n, k),
                 quantiles=quantiles,
             )
-        else:  # sglang
+        elif provider == "sglang":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: fp8_gemm_sglang(x.clone(), y.clone(), m, n, k),
+                quantiles=quantiles,
+            )
+        else:  # vllm
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: fp8_gemm_vllm(x.clone(), y.clone(), m, n, k),
                 quantiles=quantiles,
             )
 
@@ -175,7 +210,6 @@ def get_benchmark(tp_size):
         # Print shape-specific results with TFLOPS
         print(f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), Provider: {provider}")
         print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
-
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark
@@ -208,7 +242,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
 
-    # Enable TF32
+    # Enable TF32, adapted from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_core.py#L148
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
