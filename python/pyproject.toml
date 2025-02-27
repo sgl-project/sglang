@@ -35,7 +35,7 @@ runtime_common = [
     "torchao>=0.7.0",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.10",
+    "xgrammar==0.1.14",
     "ninja",
     "transformers==4.48.3",
     "llguidance>=0.6.15"
