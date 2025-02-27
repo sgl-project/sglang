@@ -71,29 +71,35 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void align_global_cumsum(int32_t* local_offsets 
                                                          int32_t* local_offsets_buf, int* smem_ptr, const int tid,
                                                          const int32_t& block_size, const int32_t& num_experts) {
   int active_threads = CEILDIV(num_experts, kElementsPerThr);
+  int start = tid * kElementsPerThr + 1;
+  int end = MIN((tid + 1) * kElementsPerThr, num_experts) + 1;
   if (tid == 0) {
     smem_ptr[0] = 0;
   }
-  for (int i = tid * kElementsPerThr + 1; i < MIN((tid + 1) * kElementsPerThr + 1, num_experts + 1); ++i) {
-    smem_ptr[i] = local_offsets[i] - local_offsets[i - 1];
+  if (tid < active_threads) {
+    for (int i = start; i < end; ++i) {
+      smem_ptr[i] = local_offsets[i] - local_offsets[i - 1];
+    }
   }
   __syncthreads();
 
-  for (int i = tid * kElementsPerThr + 1; i < MIN((tid + 1) * kElementsPerThr + 1, num_experts + 1); ++i) {
-    int last_val = (i - 1) % kElementsPerThr == 0 ? 0 : local_offsets[i - 1];
-    local_offsets[i] = last_val + CEILDIV(smem_ptr[i], block_size) * block_size;
-  }
+  if (tid < active_threads) {
+    for (int i = start; i < end; ++i) {
+      int last_val = (i - 1) % kElementsPerThr == 0 ? 0 : local_offsets[i - 1];
+      local_offsets[i] = last_val + CEILDIV(smem_ptr[i], block_size) * block_size;
+    }
 
-  local_offsets_buf[tid] = local_offsets[(tid + 1) * kElementsPerThr];
+    local_offsets_buf[tid] = local_offsets[end - 1];
+  }
   __syncthreads();
 
   if (tid < active_threads && tid > 0) {
     int offset = 0;
-    for (int j = 0; j < threadIdx.x; ++j) {
+    for (int j = 0; j < tid; ++j) {
       offset += local_offsets_buf[j];
     }
 
-    for (int i = tid * kElementsPerThr + 1; i < MIN((tid + 1) * kElementsPerThr + 1, num_experts + 1); ++i) {
+    for (int i = start; i < end; ++i) {
       local_offsets[i] += offset;
     }
   }
@@ -149,6 +155,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void reduce_unaligned_cumsum(int* tokens_cnts_pt
             int gCol = gBlockColOff + gWarpColOff_0 + sThrColOff;
             if (gCol < num_experts) {
               atomicAdd(local_offsets + gCol + 1, *(smem_ptr + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol));
+              // atomicAdd(tokens_cnts_ptr + gCol, *(smem_ptr + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol));
             }
           }
         }
@@ -181,7 +188,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void parallel_unaligned_local_cumsum(
     local_offsets[0] = 0;
   }
   if (threadIdx.x < active_threads) {
-    for (int i = threadIdx.x * kElementsPerThr + 1; i < MIN((threadIdx.x + 1) * kElementsPerThr + 1, num_experts + 1);
+    for (int i = threadIdx.x * kElementsPerThr + 1; i < MIN((threadIdx.x + 1) * kElementsPerThr, num_experts) + 1;
          ++i) {
       int warp_idx = (i - 1) / experts_per_warp;
       int expert_offset = (i - 1) % experts_per_warp;
@@ -192,7 +199,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void parallel_unaligned_local_cumsum(
       local_offsets[i] = last_val + expert_count;
     }
 
-    local_offsets_buf[threadIdx.x] = local_offsets[(threadIdx.x + 1) * kElementsPerThr];
+    local_offsets_buf[threadIdx.x] = local_offsets[MIN((threadIdx.x + 1) * kElementsPerThr, num_experts)];
   }
   __syncthreads();
 
@@ -202,7 +209,7 @@ SGLANG_FORCE_INLINE_DEVICE_FUNC void parallel_unaligned_local_cumsum(
       offset += local_offsets_buf[j];
     }
 
-    for (int i = threadIdx.x * kElementsPerThr + 1; i < MIN((threadIdx.x + 1) * kElementsPerThr + 1, num_experts + 1);
+    for (int i = threadIdx.x * kElementsPerThr + 1; i < MIN((threadIdx.x + 1) * kElementsPerThr, num_experts) + 1;
          ++i) {
       local_offsets[i] += offset;
     }
@@ -229,7 +236,7 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
                                             int32_t block_size, size_t numel, int32_t* __restrict__ tokens_cnts,
                                             int32_t* __restrict__ cumsum, const int tokens_per_block,
                                             const int tokens_per_thread, const int K) {
-  __shared__ int32_t smem[FRAG_SIZE_M * FRAG_SIZE_N * FRAGS_PER_BLOCK + 1];
+  __shared__ int32_t smem[FRAG_SIZE_M * FRAG_SIZE_N * FRAGS_PER_BLOCK];
   int32_t(*shared_counts)[EXPERTS_PER_WARP] = (int32_t(*)[EXPERTS_PER_WARP]) & smem[0];
 
   __shared__ int32_t local_offsets[MAX_NUM_EXPERTS + 1];
