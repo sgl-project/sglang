@@ -47,7 +47,7 @@ RUN pip install IPython \
     && pip install pybind11
 
 RUN pip uninstall -y triton
-RUN git clone ${TRITON_REPO} \
+RUN git clone ${TRITON_REPO} -b main \
     && cd triton \
     && git checkout ${TRITON_COMMIT} \
     && cd python \
