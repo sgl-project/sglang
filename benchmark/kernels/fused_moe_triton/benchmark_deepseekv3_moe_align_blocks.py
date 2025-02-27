@@ -225,10 +225,8 @@ def calculate_diff(batch_size, seq_len, num_experts):
         )
     else:
         print("❌ CUDA and Triton implementations do not match")
-        torch.set_printoptions(profile="full")
         print("CUDA sorted ids:", sorted_ids_cuda_snapshot)
         print("Triton sorted ids:", sorted_ids_triton_snapshot)
-        torch.set_printoptions(profile="default")
         print("CUDA expert_ids:", expert_ids_cuda)
         print("Triton expert_ids:", expert_ids_triton)
         print("CUDA num_tokens_post_pad:", num_tokens_post_pad_cuda)

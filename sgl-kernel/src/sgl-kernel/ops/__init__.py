@@ -98,11 +98,7 @@ def moe_align_block_size(
     token_cnts_buffer,
     cumsum_buffer,
 ):
-    if hasattr(torch.ops.sgl_kernels, "moe_align_block_size"):
-        _impl = torch.ops.sgl_kernels.moe_align_block_size
-    else:
-        _impl = sgl_kernel.ops._kernels.moe_align_block_size
-    _impl(
+    torch.ops.sgl_kernels.moe_align_block_size(
         topk_ids,
         num_experts,
         block_size,
