@@ -133,6 +133,7 @@ Please consult the documentation below to learn more about the parameters you ma
 
 * `attention_backend`: The backend for attention computation and KV cache management.
 * `sampling_backend`: The backend for sampling.
+* `enable_flashinfer_mla`: The backend for flashinfer MLA wrapper. It can optimize the throughput of deepseek models.
 
 ## Constrained Decoding
 
