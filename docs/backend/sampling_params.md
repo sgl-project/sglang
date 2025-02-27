@@ -1,4 +1,4 @@
-# Sampling Parameters in SGLang Runtime
+# Sampling Parameters
 
 This doc describes the sampling parameters of the SGLang Runtime.
 It is the low-level endpoint of the runtime.
@@ -55,6 +55,7 @@ Please refer to our dedicated guide on [constrained decoding](https://docs.sglan
 * `ignore_eos`: Don't stop generation when EOS token is sampled.
 * `skip_special_tokens`: Remove special tokens during decoding.
 * `custom_params`: Used when employing `CustomLogitProcessor`. For usage see below.
+* `return_hidden_states`: Whether to return hidden states of the model. Note that each time it changes, the cuda graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/hidden_states.py) for more information.
 
 
 ### Custom Logit Processor

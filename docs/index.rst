@@ -1,5 +1,5 @@
 SGLang Documentation
-====================================
+====================
 
 SGLang is a fast serving framework for large language models and vision language models.
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
@@ -10,10 +10,9 @@ The core features include:
 - **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, QWen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte) and reward models (Skywork), with easy extensibility for integrating new models.
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
-
 .. toctree::
    :maxdepth: 1
-   :caption: Getting Started
+   :caption: Installation
 
    start/install.md
 
@@ -27,18 +26,26 @@ The core features include:
    backend/openai_api_embeddings.ipynb
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
-   backend/structured_outputs.ipynb
-   backend/speculative_decoding.ipynb
-   backend/function_calling.ipynb
    backend/server_arguments.md
+   backend/sampling_params.md
+   backend/hyperparameter_tuning.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Advanced Features
+
+   backend/speculative_decoding.ipynb
+   backend/structured_outputs.ipynb
+   backend/function_calling.ipynb
+   backend/custom_chat_template.md
+   backend/quantization.md
 
 .. toctree::
    :maxdepth: 1
    :caption: Frontend Tutorial
 
-   frontend/frontend.md
+   frontend/frontend.ipynb
    frontend/choices_methods.md
-
 
 .. toctree::
    :maxdepth: 1
@@ -46,24 +53,12 @@ The core features include:
 
    router/router.md
 
-
 .. toctree::
-   :maxdepth: 1
-   :caption: References
+      :maxdepth: 1
+      :caption: References
 
-   references/supported_models.md
-   references/sampling_params.md
-   references/hyperparameter_tuning.md
-   references/benchmark_and_profiling.md
-   references/accuracy_evaluation.md
-   references/custom_chat_template.md
-   references/amd_configure.md
-   references/deepseek.md
-   references/multi_node.md
-   references/modelscope.md
-   references/quantization.md
-   references/contribution_guide.md
-   references/troubleshooting.md
-   references/nvidia_jetson.md
-   references/faq.md
-   references/learn_more.md
+      references/deepseek
+      references/general
+      references/hardware
+      references/advanced_deploy
+      references/performance_tuning

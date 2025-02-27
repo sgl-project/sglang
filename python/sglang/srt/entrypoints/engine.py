@@ -98,7 +98,7 @@ class Engine:
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
 
-        # Shutdown the subprocesses automatically when the program exists
+        # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
         # Launch subprocesses
@@ -330,7 +330,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.1.post1",
+            "0.2.1.post2",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
