@@ -26,8 +26,14 @@ from tqdm import tqdm
 
 mp.set_start_method("spawn", force=True)
 
+from sglang.srt.layers.quantization.fp8_kernel import (
+    _w8a8_block_fp8_matmul,
+    _w8a8_block_fp8_matmul_unrolledx4,
+)
 from sglang.srt.layers.quantization.int8_kernel import _w8a8_block_int8_matmul
-from sglang.srt.utils import get_device_name
+from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
+
+is_hip_ = is_hip()
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -37,7 +43,7 @@ DTYPE_MAP = {
 }
 
 
-def w8a8_block_int8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
@@ -83,7 +89,23 @@ def w8a8_block_int8_matmul(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
-    _w8a8_block_int8_matmul[grid](
+    # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
+    # Empirical testing shows the sweet spot lies when it's less than the # of
+    # compute units available on the device.
+    num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
+        N, config["BLOCK_SIZE_N"]
+    )
+
+    if A.dtype == torch.float8_e4m3fnuz or A.dtype == torch.float8_e4m3fn:
+        kernel = (
+            _w8a8_block_fp8_matmul_unrolledx4
+            if (is_hip_ == True and num_workgroups <= get_device_core_count())
+            else _w8a8_block_fp8_matmul
+        )
+    else:
+        kernel = _w8a8_block_int8_matmul
+
+    kernel[grid](
         A,
         B,
         C,
@@ -110,15 +132,15 @@ def w8a8_block_int8_matmul(
     return C
 
 
-def get_configs_compute_bound():
+def get_rocm_configs_compute_bound():
     configs = []
-
-    for num_stages in [2, 3, 4, 5]:
-        for block_m in [16, 32, 64, 128, 256]:
-            for block_k in [64, 128]:
-                for block_n in [32, 64, 128, 256]:
+    waves_per_eu_range = 0
+    for num_stages in [2]:
+        for block_m in [32, 64, 128, 256]:
+            for block_k in [32, 64, 128, 256]:
+                for block_n in [16, 32, 64, 128, 256]:
                     for num_warps in [4, 8]:
-                        for group_size in [1, 16, 32, 64]:
+                        for group_size in [1, 4, 8, 16, 32]:
                             configs.append(
                                 {
                                     "BLOCK_SIZE_M": block_m,
@@ -127,9 +149,33 @@ def get_configs_compute_bound():
                                     "GROUP_SIZE_M": group_size,
                                     "num_warps": num_warps,
                                     "num_stages": num_stages,
+                                    "waves_per_eu": waves_per_eu_range,
                                 }
                             )
+    return configs
 
+
+def get_configs_compute_bound():
+    configs = []
+    if is_hip_:
+        configs = get_rocm_configs_compute_bound()
+    else:
+        for num_stages in [2, 3, 4, 5]:
+            for block_m in [16, 32, 64, 128, 256]:
+                for block_k in [64, 128]:
+                    for block_n in [32, 64, 128, 256]:
+                        for num_warps in [4, 8]:
+                            for group_size in [1, 16, 32, 64]:
+                                configs.append(
+                                    {
+                                        "BLOCK_SIZE_M": block_m,
+                                        "BLOCK_SIZE_N": block_n,
+                                        "BLOCK_SIZE_K": block_k,
+                                        "GROUP_SIZE_M": group_size,
+                                        "num_warps": num_warps,
+                                        "num_stages": num_stages,
+                                    }
+                                )
     return configs
 
 
@@ -167,10 +213,10 @@ def get_weight_shapes(tp_size):
 
 
 def benchmark_config(
-    A_int8, B_int8, As, Bs, block_size, config, out_dtype=torch.float16, num_iters=10
+    A, B, As, Bs, block_size, config, out_dtype=torch.float16, num_iters=10
 ):
     def run():
-        w8a8_block_int8_matmul(A_int8, B_int8, As, Bs, block_size, config, out_dtype)
+        w8a8_block_matmul(A, B, As, Bs, block_size, config, out_dtype)
 
     torch.cuda.synchronize()
     # JIT complication & warmup
@@ -193,16 +239,41 @@ def benchmark_config(
     return avg
 
 
-def tune(M, N, K, block_size, out_dtype, search_space):
+def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     factor_for_scale = 1e-2
-    int8_info = torch.iinfo(torch.int8)
-    int8_max, int8_min = int8_info.max, int8_info.min
 
-    A_fp32 = (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
-    A_int8 = A_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
+    if input_type == "fp8":
+        fp8_info = torch.finfo(
+            torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+        )
+        fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
-    B_fp32 = (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
-    B_int8 = B_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
+        A_fp32 = (
+            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
+        )
+        A = A_fp32.clamp(min=fp8_min, max=fp8_max).to(
+            torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+        )
+
+        B_fp32 = (
+            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
+        )
+        B = B_fp32.clamp(min=fp8_min, max=fp8_max).to(
+            torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+        )
+    else:
+        int8_info = torch.iinfo(torch.int8)
+        int8_max, int8_min = int8_info.max, int8_info.min
+
+        A_fp32 = (
+            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
+        )
+        A = A_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
+
+        B_fp32 = (
+            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
+        )
+        B = B_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
 
     block_n, block_k = block_size[0], block_size[1]
     n_tiles = (N + block_n - 1) // block_n
@@ -219,8 +290,8 @@ def tune(M, N, K, block_size, out_dtype, search_space):
     for config in tqdm(search_space):
         try:
             kernel_time = benchmark_config(
-                A_int8,
-                B_int8,
+                A,
+                B,
                 As,
                 Bs,
                 block_size,
@@ -248,10 +319,11 @@ def save_configs(
     block_k,
     configs,
     save_path,
+    input_type="fp8",
 ) -> None:
     os.makedirs(save_path, exist_ok=True)
     device_name = get_device_name().replace(" ", "_")
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n}, {block_k}].json"
+    json_file_name = f"N={N},K={K},device_name={device_name},dtype={input_type}_w8a8,block_shape=[{block_n}, {block_k}].json"
 
     config_file_path = os.path.join(save_path, json_file_name)
     print(f"Writing best config to {config_file_path}...")
@@ -280,6 +352,7 @@ def tune_on_gpu(args_dict):
     block_k = args.block_k
     out_dtype = DTYPE_MAP[args.out_dtype]
     save_path = args.save_path
+    input_type = args.input_type
 
     search_space = get_configs_compute_bound()
     search_space = [
@@ -287,15 +360,24 @@ def tune_on_gpu(args_dict):
     ]
 
     start = time.time()
+    results = {}
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
         N, K = shape[0], shape[1]
         print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")
         benchmark_results = [
-            tune(batch_size, N, K, [block_n, block_k], out_dtype, search_space)
+            tune(
+                batch_size,
+                N,
+                K,
+                [block_n, block_k],
+                out_dtype,
+                search_space,
+                input_type,
+            )
             for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
         ]
         best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
-        save_configs(N, K, block_n, block_k, best_configs, save_path)
+        save_configs(N, K, block_n, block_k, best_configs, save_path, input_type)
 
     end = time.time()
     print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
@@ -372,6 +454,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--tp-size", "-tp", type=int, default=8)
+    parser.add_argument(
+        "--input-type", type=str, choices=["fp8", "int8"], default="fp8"
+    )
     parser.add_argument(
         "--out-dtype",
         type=str,
