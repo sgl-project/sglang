@@ -8,94 +8,46 @@ Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model
 
 SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). To run DeepSeek V3/R1 models, the requirements are as follows:
 
-<div class="table-container">
+| Weight Type | Configuration |
+|------------|-------------------|
+| **Full precision FP8**<br>*(recommended)* | 8 x H200 |
+| | 8 x MI300X |
+| | 2 x 8 x H100/800/20 |
+| **Full precision BF16** | 2 x 8 x H200 |
+| | 2 x 8 x MI300X |
+| | 4 x 8 x H100/800/20 |
+| | 4 x 8 x A100/A800 |
+| **Quantized weights (AWQ)** | 8 x H100/800/20 |
+| | 8 x A100/A800 |
+
 <style>
-  .table-container {
-    overflow-x: auto;
-    margin: 20px 0;
-  }
-  .config-table {
-    width: 100%;
-    border-collapse: collapse;
-    border-radius: 8px;
-    overflow: hidden;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-  }
-  .config-table th {
-    background-color: #1a2b47;
-    color: white;
-    padding: 12px 15px;
-    text-align: left;
-    font-weight: 600;
-  }
-  .config-table td {
-    padding: 10px 15px;
-    border-bottom: 1px solid #333;
-    color: white;
-  }
-  .config-table tr:nth-child(odd) td {
-    background-color: #2c3e50;
-  }
-  .config-table tr:nth-child(even) td {
-    background-color: #34495e;
-  }
-  .config-table tr:hover td {
-    background-color: #1a2b47;
-  }
-  .weight-type {
-    background-color: #243342 !important;
-    font-weight: 500;
-  }
-  .recommended {
-    color: #2ecc71;
-    font-size: 0.9em;
-    font-style: italic;
-  }
+.md-typeset__table {
+  width: 100%;
+}
+
+.md-typeset__table table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  border: 2px solid var(--md-typeset-table-color);
+  table-layout: fixed;
+}
+
+.md-typeset__table th {
+  border: 1px solid var(--md-typeset-table-color);
+  border-bottom: 2px solid var(--md-typeset-table-color);
+  background-color: var(--md-default-bg-color--lighter);
+  padding: 12px;
+}
+
+.md-typeset__table td {
+  border: 1px solid var(--md-typeset-table-color);
+  padding: 12px;
+}
+
+.md-typeset__table tr:nth-child(2n) {
+  background-color: var(--md-default-bg-color--lightest);
+}
 </style>
-
-  <table class="config-table">
-    <thead>
-      <tr>
-        <th>Weight Type</th>
-        <th>Configuration</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td rowspan="3" class="weight-type"><strong>Full precision FP8</strong><br><span class="recommended">(recommended)</span></td>
-        <td>8 x H200</td>
-      </tr>
-      <tr>
-        <td>8 x MI300X</td>
-      </tr>
-      <tr>
-        <td>2 x 8 x H100/800/20</td>
-      </tr>
-      <tr>
-        <td rowspan="4" class="weight-type"><strong>Full precision BF16</strong></td>
-        <td>2 x 8 x H200</td>
-      </tr>
-      <tr>
-        <td>2 x 8 x MI300X</td>
-      </tr>
-      <tr>
-        <td>4 x 8 x H100/800/20</td>
-      </tr>
-      <tr>
-        <td>4 x 8 x A100/A800</td>
-      </tr>
-      <tr>
-        <td rowspan="2" class="weight-type"><strong>Quantized weights (AWQ)</strong></td>
-        <td>8 x H100/800/20</td>
-      </tr>
-      <tr>
-        <td>8 x A100/A800</td>
-      </tr>
-    </tbody>
-  </table>
-
-</div>
-
 
 Detailed commands for reference:
 
