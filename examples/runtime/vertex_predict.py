@@ -11,10 +11,13 @@ instead of a local server. After deploying the model to a Vertex AI Online
 Prediction Endpoint, send requests via the Python SDK:
 
 response = endpoint.predict(
-  instances=[{"text": "A car is "}, {"text": "Which number is larger, 3.11 or 3.9?"}],
-  parameters={"sampling_params": {"max_new_tokens": 256}},
+    instances=[
+        {"text": "The capital of France is"},
+        {"text": "What is a car?"},
+    ],
+    parameters={"sampling_params": {"max_new_tokens": 16}},
 )
-print(response["predictions"])
+print(response.predictions)
 
 More details about get online predictions from Vertex AI can be found at
 https://cloud.google.com/vertex-ai/docs/predictions/get-online-predictions.
