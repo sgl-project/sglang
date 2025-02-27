@@ -424,29 +424,40 @@ impl Router {
         return "".to_string();
     }
 
-    // TODO: return Result<String, String> instead of panicking
-    fn select_generate_worker(&self, body: &Bytes, route: &str) -> String {
-        let text = self.get_text_from_request(&body, route);
 
+    fn select_generate_worker(&self, body: &Bytes, route: &str) -> Result<String, String> {
+        let text = self.get_text_from_request(&body, route);
         let worker_url = match self {
             Router::RoundRobin {
                 worker_urls,
                 current_index,
                 ..
             } => {
+                let urls = worker_urls.read().map_err(|e| format!("Failed to read worker URLs: {}", e))?;
+                if urls.is_empty() {
+                    return Err("No worker URLs available".to_string());
+                }
+
                 let idx = current_index
                     .fetch_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
-                        |x| Some((x + 1) % worker_urls.read().unwrap().len()),
+                        |x| Some((x + 1) % urls.len()),
                     )
-                    .unwrap();
-                worker_urls.read().unwrap()[idx].clone()
+                    .map_err(|e| format!("Failed to update current index: {}", e))?;
+
+                Ok(urls[idx].clone())
             }
 
-            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
-                [rand::random::<usize>() % worker_urls.read().unwrap().len()]
-            .clone(),
+            Router::Random { worker_urls, .. } => {
+                let urls = worker_urls.read().map_err(|e| format!("Failed to read worker URLs: {}", e))?;
+                if urls.is_empty() {
+                    return Err("No worker URLs available".to_string());
+                }
+
+                let idx = rand::random::<usize>() % urls.len();
+                Ok(urls[idx].clone())
+            }
 
             Router::CacheAware {
                 worker_urls,
@@ -471,16 +482,18 @@ impl Router {
                 // 1. (max - min) > abs_threshold AND
                 // 2. max > rel_threshold * min
                 let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
-                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
+                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold) || ( max_load > 0 && min_load == 0 );
 
                 let selected_url = if is_imbalanced {
-                    // Log load balancing trigger and current queue state
-                    info!(
-                        "Load balancing triggered due to workload imbalance:\n\
-                        Max load: {}, Min load: {}\n\
-                        Current running queue: {:?}",
-                        max_load, min_load, running_queue
-                    );
+                    if !( max_load > 0 && min_load == 0 ) {
+                        // Log load balancing trigger and current queue state
+                        info!(
+                            "Load balancing triggered due to workload imbalance:\n\
+                            Max load: {}, Min load: {}\n\
+                            Current running queue: {:?}",
+                            max_load, min_load, running_queue
+                        );
+                    }
 
                     // Use shortest queue routing when load is imbalanced
                     running_queue
@@ -504,18 +517,19 @@ impl Router {
                 // Update queues and tree
                 if let Some(count) = running_queue.get_mut(&selected_url) {
                     *count += 1;
+                    debug!("add count to {}",  selected_url);
                 } else {
-                    error!("Key {} not found in running_queue", selected_url);
+                    return Err(format!("Key {} not found in running_queue", selected_url));
                 }
-                let mut processed_queue = processed_queue.lock().unwrap();
+                let  mut processed_queue = processed_queue.lock().unwrap();
                 if let Some(count) = processed_queue.get_mut(&selected_url) {
                     *count += 1;
                 } else {
-                    error!("Key {} not found in processed_queue", selected_url);
+                     return Err(format!("Key {} not found in processed_queue", selected_url));
                 }
                 tree.insert(&text, &selected_url);
 
-                selected_url
+                Ok(selected_url)
             }
         };
 
@@ -561,8 +575,19 @@ impl Router {
                 }
             };
 
+            // Then decrement running queue counter if using CacheAware
+            if let Router::CacheAware { running_queue, .. } = self {
+                if let Ok(mut queue) = running_queue.lock() {
+                    if let Some(count) = queue.get_mut(worker_url) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+            }
+
             response
-        } else if let Router::CacheAware { .. } = self {
+        } else if let Router::CacheAware { running_queue, .. } = self {
+            let running_queue = Arc::clone(running_queue);
+            let worker_url = worker_url.to_string();
 
             HttpResponse::build(status)
                 .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
@@ -574,12 +599,18 @@ impl Router {
                         .inspect(move |result| {
                             if let Ok(bytes) = result {
                                 if bytes
-                                    .as_ref()
-                                    .windows(12)
-                                    .any(|window| window == b"data: [DONE]")
-                                    {
-                                        debug!("Streaming is done!!")
+                                .as_ref()
+                                .windows(12)
+                                .any(|window| window == b"data: [DONE]")
+                                {
+
+                                    if let Ok(mut queue) = running_queue.lock() {
+                                        if let Some(count) = queue.get_mut(&worker_url) {
+                                            *count = count.saturating_sub(1);
+                                        }
                                     }
+                                    debug!("Streaming is done!!")
+                                }
                             }
                         }),
                 )
@@ -602,9 +633,11 @@ impl Router {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
-
         while total_retries < MAX_TOTAL_RETRIES {
-            let worker_url = self.select_generate_worker(body, route);
+            let worker_url = match self.select_generate_worker(body, route) {
+                Ok(worker_url) => worker_url,
+                Err(_) => return HttpResponse::InternalServerError().finish(),
+            };
             let mut request_retries = 0;
 
             // Try the same worker multiple times
@@ -615,14 +648,7 @@ impl Router {
                 let response = self
                     .send_generate_request(client, req, body, route, &worker_url)
                     .await;
-                // Then decrement running queue counter if using CacheAware
-                if let Router::CacheAware { running_queue, .. } = self {
-                    if let Ok(mut queue) = running_queue.lock() {
-                        if let Some(count) = queue.get_mut(&worker_url) {
-                            *count = count.saturating_sub(1);
-                        }
-                    }
-                }
+
                 if response.status().is_success() {
                     return response;
                 } else {
