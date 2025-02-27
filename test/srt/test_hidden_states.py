@@ -98,26 +98,34 @@ class TestHiddenState(unittest.TestCase):
             random_seed=42,
             skip_tokenizer_init=True,
         )
-        output_completion_first_round = engine.generate(
+        outputs_completion_first_round = engine.generate(
             input_ids=input_ids, sampling_params=sample_completion
         )
-        output_hidden_state = engine.generate(
+        outputs_hidden_state = engine.generate(
             input_ids=input_ids, sampling_params=sample_hidden_state
         )
 
-        output_completion_last_round = engine.generate(
+        outputs_completion_last_round = engine.generate(
             input_ids=input_ids, sampling_params=sample_completion
         )
         engine.shutdown()
 
-        for output1, output2, output3 in zip(
+        for (
             output_completion_first_round,
             output_hidden_state,
             output_completion_last_round,
+        ) in zip(
+            outputs_completion_first_round,
+            outputs_hidden_state,
+            outputs_completion_last_round,
         ):
-            self.assertEqual(len(output1["meta_info"]["hidden_states"]), 8)
-            self.assertNotIn("hidden_states", output2["meta_info"])
-            self.assertEqual(len(output3["meta_info"]["hidden_states"]), 8)
+            self.assertEqual(
+                len(output_completion_first_round["meta_info"]["hidden_states"]), 8
+            )
+            self.assertNotIn("hidden_states", output_hidden_state["meta_info"])
+            self.assertEqual(
+                len(output_completion_last_round["meta_info"]["hidden_states"]), 8
+            )
 
 
 if __name__ == "__main__":
