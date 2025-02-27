@@ -149,6 +149,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
+    enable_deepep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -240,7 +241,7 @@ class ServerArgs:
             self.disable_cuda_graph = True
 
         # Expert parallelism
-        if self.enable_ep_moe:
+        if self.enable_ep_moe or self.enable_deepep_moe:
             self.ep_size = self.tp_size
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -927,6 +928,11 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--enable-deepep-moe",
+            action="store_true",
+            help="Enabling DeepEP MoE implementation for moe.",
         )
 
     @classmethod

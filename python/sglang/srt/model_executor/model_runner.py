@@ -158,6 +158,11 @@ class ModelRunner:
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
 
+        if self.server_args.enable_deepep_moe:
+            logger.info(
+                "DeepEP is turned on."
+            )
+
         # Global vars
         if server_args.show_time_cost:
             enable_show_time_cost()
@@ -176,6 +181,7 @@ class ModelRunner:
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
+                "enable_deepep_moe": server_args.enable_deepep_moe,
                 "device": server_args.device,
                 "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
                 "disable_radix_cache": server_args.disable_radix_cache,
