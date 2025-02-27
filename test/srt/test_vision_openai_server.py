@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import openai
 import requests
-from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
@@ -182,6 +181,13 @@ class TestOpenAIVisionServer(unittest.TestCase):
     def prepare_video_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
         # the size of the video embeds differs from the `modality` argument when preprocessed
+
+        # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+        # The following import order will cause Segmentation fault.
+        # import decord
+        # from transformers import AutoTokenizer
+        from decord import VideoReader, cpu
+
         max_frames_num = 12
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
@@ -252,6 +258,18 @@ class TestOpenAIVisionServer(unittest.TestCase):
         print("-" * 30)
 
         # Add assertions to validate the video response
+        assert "iPod" in video_response or "device" in video_response, video_response
+        assert (
+            "man" in video_response
+            or "person" in video_response
+            or "individual" in video_response
+        ), video_response
+        assert (
+            "present" in video_response
+            or "examine" in video_response
+            or "display" in video_response
+        )
+        assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
 
@@ -361,6 +379,30 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
+class TestQWen2_5_VLServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "qwen2-vl",
+                # FIXME: workaround to chunked prefill within image embeds
+                "--chunked-prefill-size",
+                "10000",
+                "--mem-fraction-static",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"

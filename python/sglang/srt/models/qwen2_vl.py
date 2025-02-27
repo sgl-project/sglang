@@ -31,8 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from transformers import Qwen2VLConfig
+from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
 
-from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -558,7 +559,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     ]
                     image_embeds_offset += num_image_tokens
 
-        input_ids = None
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -585,6 +585,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
