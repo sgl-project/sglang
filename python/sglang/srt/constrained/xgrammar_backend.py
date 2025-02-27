@@ -148,7 +148,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 structural_tag = json.loads(key_string)
                 tags = [
                     StructuralTagItem(
-                        start=structure["start"],
+                        begin=structure["begin"],
                         schema=json.dumps(structure["schema"]),
                         end=structure["end"],
                     )
