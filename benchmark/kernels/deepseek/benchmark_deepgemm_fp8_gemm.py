@@ -182,6 +182,7 @@ def get_benchmark(tp_size):
         )
     )
     def benchmark(m, n, k, tp_size, provider):
+        print(f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), Provider: {provider}")
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
         y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
@@ -208,7 +209,6 @@ def get_benchmark(tp_size):
         tflops = flops / (ms * 1e-3) / 1e12
 
         # Print shape-specific results with TFLOPS
-        print(f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), Provider: {provider}")
         print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
