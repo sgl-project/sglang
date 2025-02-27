@@ -1030,7 +1030,6 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
-            self.server_args.return_hidden_states,
         )
         new_batch.prepare_for_extend()
 
@@ -1221,9 +1220,8 @@ class Scheduler:
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
-
                     if (
-                        self.server_args.return_hidden_states
+                        req.sampling_params.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
                         req.hidden_states.append(
@@ -1331,7 +1329,7 @@ class Scheduler:
                     )
 
             if (
-                self.server_args.return_hidden_states
+                req.sampling_params.return_hidden_states
                 and logits_output.hidden_states is not None
             ):
                 req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
@@ -1459,7 +1457,10 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            output_hidden_states = [] if self.server_args.return_hidden_states else None
+            return_hidden_states = any(
+                req.sampling_params.return_hidden_states for req in reqs
+            )
+            output_hidden_states = [] if return_hidden_states else None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1526,7 +1527,7 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                    if self.server_args.return_hidden_states:
+                    if req.sampling_params.return_hidden_states:
                         output_hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
@@ -1619,7 +1620,6 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
-            self.server_args.return_hidden_states,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
