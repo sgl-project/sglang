@@ -303,9 +303,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     weight = w
                     weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                    w = int8_block_dequant(
-                        weight, weight_scale, weight_block_size
-                    ).to(torch.bfloat16)
+                    w = int8_block_dequant(weight, weight_scale, weight_block_size).to(
+                        torch.bfloat16
+                    )
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
