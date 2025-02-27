@@ -140,12 +140,12 @@ def is_weak_contiguous(inp: torch.Tensor):
 
 
 class CustomAllreduce:
-
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    # _MAX_CAR_SIZE = int(os.getenv("_MAX_CAR_SIZE", "16777216")) # default: 16MB for ROCm
     _MAX_CAR_SIZE = 8192 * 1024
     if is_hip():
         # crossover is at 16MB buffer size for ROCm
-        _MAX_CAR_SIZE = 2 * 8192 * 1024    # TODO (hubert): Check this
+        _MAX_CAR_SIZE = 2 * 8192 * 1024
     # max_size: max supported allreduce size
     def __init__(
         self,
@@ -166,6 +166,10 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True
 
+        # TODO (hubert): add DISABLE_AR for debugging
+        DISABLE_CAR = os.getenv("DISABLE_CAR", "0") == "1"
+        if DISABLE_CAR:
+            return
         if not custom_ar:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
@@ -289,12 +293,13 @@ class CustomAllreduce:
                 )
                 handles, offsets = self._gather_ipc_meta(shard_data)
                 self.rank_data = torch.empty(
-                    8 * 1024 * 1024, dtype=torch.uint8, device=self.device   # TODO (hubert): check this
+                    8 * 1024 * 1024, dtype=torch.uint8, device=self.device
                 )
                 self._ptr = ops.init_custom_ar(
                     self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
                 )
                 self.register_buffer(self.buffer)
+                self.MSCCL = os.getenv("RCCL_MSCCL_ENABLE", "1") == "1"
             else:
                 # From TensorRT-LLM getMaxRequiredWorkspaceSize
                 self.max_required_workspace_size = [16 * 1024 * 1024, 8 * 1024 * 1024]
@@ -450,9 +455,20 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        if ops.use_vllm_custom_allreduce or is_hip():
+        if ops.use_vllm_custom_allreduce and not is_hip():
             if self.world_size == 2 or self.full_nvlink:
                 return inp_size < self.max_size
+            return False
+
+        if is_hip():
+            if self.full_nvlink:
+                if self.world_size == 8:
+                    if self.MSCCL:
+                        return inp_size <= 64 * 1024
+                    else:
+                        return inp_size < self.max_size # always turn on CAR
+                if self.world_size == 2 or self.world_size == 4 or self.world_size == 6:
+                    return inp_size < self.max_size
             return False
 
         if self.world_size == 2:
@@ -550,3 +566,4 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
