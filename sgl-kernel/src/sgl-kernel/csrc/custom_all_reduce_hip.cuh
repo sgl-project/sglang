@@ -3,10 +3,10 @@
 
 #include <hip/hip_runtime.h>
 #ifdef USE_ROCM
-  #include <hip/hip_bf16.h>
+#include <hip/hip_bf16.h>
 typedef __hip_bfloat16 nv_bfloat16;
 #else
-  #include <hip/hip_bf16.h>
+#include <hip/hip_bf16.h>
 #endif
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -17,14 +17,13 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <unordered_map>
 #include <vector>
 
-#define CUDACHECK(cmd)                                              \
-  do {                                                              \
-    hipError_t e = cmd;                                            \
-    if (e != hipSuccess) {                                         \
-      printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, \
-             hipGetErrorString(e));                                \
-      exit(EXIT_FAILURE);                                           \
-    }                                                               \
+#define CUDACHECK(cmd)                                                                     \
+  do {                                                                                     \
+    hipError_t e = cmd;                                                                    \
+    if (e != hipSuccess) {                                                                 \
+      printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, hipGetErrorString(e)); \
+      exit(EXIT_FAILURE);                                                                  \
+    }                                                                                      \
   } while (0)
 
 namespace vllm {
@@ -76,7 +75,9 @@ struct packed_t {
 #define DINLINE __device__ __forceinline__
 
 // scalar cast functions
-DINLINE float upcast_s(half val) { return __half2float(val); }
+DINLINE float upcast_s(half val) {
+  return __half2float(val);
+}
 
 template <typename T>
 DINLINE T downcast_s(float val);
@@ -92,10 +93,14 @@ DINLINE half& assign_add(half& a, half b) {
   a = __hadd(a, b);
   return a;
 }
-DINLINE float& assign_add(float& a, float b) { return a += b; }
+DINLINE float& assign_add(float& a, float b) {
+  return a += b;
+}
 
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-DINLINE float upcast_s(nv_bfloat16 val) { return __bfloat162float(val); }
+DINLINE float upcast_s(nv_bfloat16 val) {
+  return __bfloat162float(val);
+}
 template <>
 DINLINE nv_bfloat16 downcast_s(float val) {
   return __float2bfloat16(val);
@@ -159,12 +164,12 @@ DINLINE void start_sync(const RankSignals& sg,
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
-    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
-                            flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED,
+                            __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
-    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                  __ATOMIC_RELAXED,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
+    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) <
+           flag)
+      ;
   }
   __syncthreads();
   // use one thread to update flag
@@ -177,7 +182,8 @@ DINLINE void start_sync(const RankSignals& sg,
     // Latency = 1 p2p write
     sg.signals[threadIdx.x]->start[blockIdx.x][rank] = 1;
     // wait until we got true from all ranks
-    while (!self_sg->start[blockIdx.x][threadIdx.x]);
+    while (!self_sg->start[blockIdx.x][threadIdx.x])
+      ;
   }
   __syncthreads();
 #endif
@@ -203,15 +209,12 @@ DINLINE void end_sync(const RankSignals& sg,
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
-    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
-                            flag,
-                            final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
-                            __MEMORY_SCOPE_SYSTEM);
+    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], flag,
+                            final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
-    while (
-        __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                               final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                               __MEMORY_SCOPE_DEVICE) < flag);
+    while (__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                                  final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < flag)
+      ;
   }
   __syncthreads();
   // use one thread to update flag
@@ -230,7 +233,8 @@ DINLINE void end_sync(const RankSignals& sg,
     // Latency = 1 p2p write
     sg.signals[threadIdx.x]->end[blockIdx.x][rank] = 1;
     // wait until we got true from all ranks
-    while (!self_sg->end[blockIdx.x][threadIdx.x]);
+    while (!self_sg->end[blockIdx.x][threadIdx.x])
+      ;
   }
   if constexpr (!final_sync) __syncthreads();
 #endif
@@ -247,13 +251,12 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_1stage(RankData* _dp, RankSignals sg,
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _dp, RankSignals sg,
 #ifndef USE_ROCM
-                               volatile
+                                                                     volatile
 #endif
-                               Signal* self_sg,
-                               T* __restrict__ result, int rank, int size) {
+                                                                     Signal* self_sg,
+                                                                     T* __restrict__ result, int rank, int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   // note: we don't reorder the address so the accumulation order is the same
@@ -261,8 +264,7 @@ __global__ void __launch_bounds__(512, 1)
   auto dp = *_dp;
   start_sync<ngpus>(sg, self_sg, rank);
   // do the actual reduction
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
-       idx += gridDim.x * blockDim.x) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
   end_sync<ngpus, true>(sg, self_sg, rank);
@@ -278,13 +280,12 @@ DINLINE P* get_tmp_buf(volatile Signal* sg) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_2stage(RankData* _dp, RankSignals sg,
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _dp, RankSignals sg,
 #ifndef USE_ROCM
-                               volatile
+                                                                     volatile
 #endif
-                               Signal* self_sg,
-                               T* __restrict__ result, int rank, int size) {
+                                                                     Signal* self_sg,
+                                                                     T* __restrict__ result, int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
@@ -356,10 +357,8 @@ class CustomAllreduce {
    * note: this class does not own any device memory. Any required buffers
    * are passed in from the constructor
    */
-  CustomAllreduce(Signal* meta, void* rank_data, size_t rank_data_sz,
-                  const hipIpcMemHandle_t* handles,
-                  const std::vector<int64_t>& offsets, int rank,
-                  bool full_nvlink = true)
+  CustomAllreduce(Signal* meta, void* rank_data, size_t rank_data_sz, const hipIpcMemHandle_t* handles,
+                  const std::vector<int64_t>& offsets, int rank, bool full_nvlink = true)
       : rank_(rank),
         world_size_(offsets.size()),
         full_nvlink_(full_nvlink),
@@ -380,20 +379,17 @@ class CustomAllreduce {
   }
 
   char* open_ipc_handle(const void* ipc_handle) {
-    auto [it, new_handle] =
-        ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
+    auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
     if (new_handle) {
       char* ipc_ptr;
-      CUDACHECK(hipIpcOpenMemHandle((void**)&ipc_ptr,
-                                     *((const hipIpcMemHandle_t*)ipc_handle),
-                                     hipIpcMemLazyEnablePeerAccess));
+      CUDACHECK(hipIpcOpenMemHandle((void**)&ipc_ptr, *((const hipIpcMemHandle_t*)ipc_handle),
+                                    hipIpcMemLazyEnablePeerAccess));
       it->second = ipc_ptr;
     }
     return it->second;
   }
 
-  std::pair<std::vector<uint8_t>, std::vector<int64_t>>
-  get_graph_buffer_ipc_meta() {
+  std::pair<std::vector<uint8_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta() {
     auto num_buffers = graph_unreg_buffers_.size();
     auto handle_sz = sizeof(hipIpcMemHandle_t);
     std::vector<uint8_t> handles(handle_sz * num_buffers, 0);
@@ -405,14 +401,13 @@ class CustomAllreduce {
       // address
       if (hipPointerGetAttribute(&base_ptr,
 #ifdef USE_ROCM
-                                HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                 HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #else
-                                CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                 CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #endif
-                                (hipDeviceptr_t)ptr) != hipSuccess)
+                                 (hipDeviceptr_t)ptr) != hipSuccess)
         throw std::runtime_error("failed to get pointer attr");
-      CUDACHECK(hipIpcGetMemHandle(
-          (hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
+      CUDACHECK(hipIpcGetMemHandle((hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);
     }
     return std::make_pair(handles, offsets);
@@ -420,13 +415,11 @@ class CustomAllreduce {
 
   void check_rank_data_capacity(size_t num = 1) {
     if (d_rank_data_base_ + num > d_rank_data_end_)
-      throw std::runtime_error(
-          "Rank data buffer is overflowed by " +
-          std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
+      throw std::runtime_error("Rank data buffer is overflowed by " +
+                               std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
   }
 
-  void register_buffer(const std::vector<std::string>& handles,
-                       const std::vector<int64_t>& offsets, void* self) {
+  void register_buffer(const std::vector<std::string>& handles, const std::vector<int64_t>& offsets, void* self) {
     check_rank_data_capacity();
     RankData data;
     for (int i = 0; i < world_size_; i++) {
@@ -439,8 +432,7 @@ class CustomAllreduce {
       }
     }
     auto d_data = d_rank_data_base_++;
-    CUDACHECK(
-        hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+    CUDACHECK(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
     buffers_[self] = d_data;
   }
 
@@ -451,9 +443,8 @@ class CustomAllreduce {
   // rank 1 may get the same input address for the second allreduce, but rank 2
   // got a different address. IPC handles have internal reference counting
   // mechanism so overhead should be small.
-  void register_graph_buffers(
-      const std::vector<std::string>& handles,
-      const std::vector<std::vector<int64_t>>& offsets) {
+  void register_graph_buffers(const std::vector<std::string>& handles,
+                              const std::vector<std::vector<int64_t>>& offsets) {
     auto num_buffers = graph_unreg_buffers_.size();
     check_rank_data_capacity(num_buffers);
     std::vector<RankData> rank_data(num_buffers);
@@ -462,8 +453,7 @@ class CustomAllreduce {
       auto& rd = rank_data[i];
       for (int j = 0; j < world_size_; j++) {
         if (j != rank_) {
-          char* handle =
-              open_ipc_handle(&handles[j][i * sizeof(hipIpcMemHandle_t)]);
+          char* handle = open_ipc_handle(&handles[j][i * sizeof(hipIpcMemHandle_t)]);
           handle += offsets[j][i];
           rd.ptrs[j] = handle;
         } else {
@@ -471,9 +461,7 @@ class CustomAllreduce {
         }
       }
     }
-    CUDACHECK(hipMemcpy(d_rank_data_base_, rank_data.data(),
-                         sizeof(RankData) * num_buffers,
-                         hipMemcpyHostToDevice));
+    CUDACHECK(hipMemcpy(d_rank_data_base_, rank_data.data(), sizeof(RankData) * num_buffers, hipMemcpyHostToDevice));
     d_rank_data_base_ += num_buffers;
     graph_unreg_buffers_.clear();
   }
@@ -499,8 +487,7 @@ class CustomAllreduce {
         "of " +
         std::to_string(d));
   if (block_limit > kMaxBlocks)
-    throw std::runtime_error("max supported block limit is " +
-                             std::to_string(kMaxBlocks) + ". Got " +
+    throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " +
                              std::to_string(block_limit));
 
   RankData* ptrs;
@@ -512,32 +499,29 @@ class CustomAllreduce {
   } else {
     auto it = buffers_.find(input);
     if (it == buffers_.end())
-      throw std::runtime_error(
-          "buffer address " +
-          std::to_string(reinterpret_cast<uint64_t>(input)) +
-          " is not registered!");
+      throw std::runtime_error("buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) +
+                               " is not registered!");
     ptrs = it->second;
   }
 
   size /= d;
   auto bytes = size * sizeof(typename packed_t<T>::P);
   int blocks = ::min(block_limit, (size + threads - 1) / threads);
-#define KL(ngpus, name)                                                       \
- hipLaunchKernelGGL(( name<T, ngpus>), dim3(blocks), dim3(threads), 0, stream, ptrs, sg_, self_sg_, output, \
-                                                 rank_, size);
-#define REDUCE_CASE(ngpus)                            \
-  case ngpus: {                                       \
-    if (world_size_ == 2) {                           \
-      KL(ngpus, cross_device_reduce_1stage);          \
-    } else if (full_nvlink_) {                        \
-      if ((world_size_ <= 4 && bytes < 512 * 1024) || \
-          (world_size_ <= 8 && bytes < 256 * 1024)) { \
-        KL(ngpus, cross_device_reduce_1stage);        \
-      } else {                                        \
-        KL(ngpus, cross_device_reduce_2stage);        \
-      }                                               \
-    }                                                 \
-    break;                                            \
+#define KL(ngpus, name)                                                                                            \
+  hipLaunchKernelGGL((name<T, ngpus>), dim3(blocks), dim3(threads), 0, stream, ptrs, sg_, self_sg_, output, rank_, \
+                     size);
+#define REDUCE_CASE(ngpus)                                                                        \
+  case ngpus: {                                                                                   \
+    if (world_size_ == 2) {                                                                       \
+      KL(ngpus, cross_device_reduce_1stage);                                                      \
+    } else if (full_nvlink_) {                                                                    \
+      if ((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024)) { \
+        KL(ngpus, cross_device_reduce_1stage);                                                    \
+      } else {                                                                                    \
+        KL(ngpus, cross_device_reduce_2stage);                                                    \
+      }                                                                                           \
+    }                                                                                             \
+    break;                                                                                        \
   }
 
   switch (world_size_) {
