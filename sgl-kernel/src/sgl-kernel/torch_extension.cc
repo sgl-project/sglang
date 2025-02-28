@@ -171,6 +171,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
       " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
   m.impl("cublas_grouped_gemm", torch::kCUDA, &cublas_grouped_gemm);
+
+  // deepseek gemm
+  m.def(
+    "gemm_fp8_fp8_bf16_nt(Tensor lhs, Tensor lhs_scales,
+                          Tensor rhs, Tensor rhs_scales,
+                          Tensor out) -> ()"
+  )
+  m.impl("gemm_fp8_fp8_bf16_nt", torch.::kCUDA, &gemm_fp8_fp8_bf16_nt);
 }
 
 REGISTER_EXTENSION(_kernels)
