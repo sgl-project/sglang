@@ -368,7 +368,7 @@ class Req:
         # request has at least one token. Later, we can relax this requirement and use `input_len`.
         max_prefix_len = input_len - 1
 
-        if self.sampling_params.max_new_tokens > 0:
+        if (self.sampling_params.max_new_tokens or 0) > 0:
             # Need at least one token to compute logits
             max_prefix_len = min(max_prefix_len, input_len - 1)
 
