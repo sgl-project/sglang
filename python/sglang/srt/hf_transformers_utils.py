@@ -31,6 +31,8 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import ChatGLMConfig, DbrxConfig, ExaoneConfig, Qwen2_5_VLConfig
+from sglang.srt.connector import create_remote_connector
+from sglang.srt.utils import is_remote_url
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -139,6 +141,14 @@ def get_tokenizer(
     if is_gguf:
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
+
+    if is_remote_url(tokenizer_name):
+        # BaseConnector implements __del__() to clean up the local dir.
+        # Since config files need to exist all the time, so we DO NOT use
+        # with statement to avoid closing the client.
+        client = create_remote_connector(tokenizer_name)
+        client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+        tokenizer_name = client.get_local_dir()
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
