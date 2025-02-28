@@ -32,7 +32,7 @@ try:
     if ops.use_vllm_custom_allreduce:
         ops.meta_size()
     else:
-        import sgl_kernel
+        pass
     custom_ar = True
 except Exception:
     # For AMD GPUs and CPUs

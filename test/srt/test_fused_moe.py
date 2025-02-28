@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_vllm
 

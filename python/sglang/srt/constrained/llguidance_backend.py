@@ -13,7 +13,6 @@
 # ==============================================================================
 """Constrained decoding with llguidance backend."""
 
-import json
 import os
 from typing import List, Optional, Tuple
 
