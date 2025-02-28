@@ -1159,7 +1159,7 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=ret_item["text"] if tool_calls is None else None,
+                    content=text if tool_calls is None else None,
                     reasoning_content=reasoning_content if tool_calls is None else None,
                     tool_calls=tool_calls,
                 ),
