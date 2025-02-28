@@ -613,7 +613,7 @@ class ServerArgs:
             type=str,
             choices=REASONING_MODELS,
             default=ServerArgs.reasoning_parser,
-            help="Specify the parser for reasoning models, supported parsers are: {REASONING_MODELS}.",
+            help=f"Specify the parser for reasoning models, supported parsers are: {REASONING_MODELS}.",
         )
 
         # Data parallelism
