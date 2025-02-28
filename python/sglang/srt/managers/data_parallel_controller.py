@@ -121,7 +121,7 @@ class DataParallelController:
                 args=(server_args, tmp_port_args, base_gpu_id, dp_rank),
             )
             threads.append(thread)
-            base_gpu_id += server_args.tp_size
+            base_gpu_id += server_args.tp_size * server_args.gpu_id_step
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:

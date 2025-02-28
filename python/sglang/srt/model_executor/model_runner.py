@@ -526,7 +526,6 @@ class ModelRunner:
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
             for name, tensor in named_tensors
         ]
-        # TODO should we name it "direct" or "megatron"?
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format is None:
