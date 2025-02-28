@@ -309,6 +309,7 @@ class ModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
+            name_pattern_tp_checkpoint=self.server_args.name_pattern_tp_checkpoint,
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
