@@ -1,12 +1,15 @@
 import re
-from typing import Dict, Optional
+from typing import Dict
 
 REASONING_MODELS = ["deepseek-r1"]
 
 
 def is_reasoning_model(model_name: str) -> bool:
     """Checks if the model is a reasoning model."""
-    return model_name.lower() in REASONING_MODELS
+    for model in REASONING_MODELS:
+        if re.match(f".*{model}.*", model_name, re.IGNORECASE):
+            return True
+    return False
 
 
 class StreamingParseResult:

@@ -1039,7 +1039,12 @@ def v1_chat_generate_request(
 
 
 def v1_chat_generate_response(
-    request, ret, to_file=False, cache_report=False, tool_call_parser=None
+    request,
+    ret,
+    to_file=False,
+    cache_report=False,
+    tool_call_parser=None,
+    reasoning_parser=None,
 ):
     choices = []
 
@@ -1099,11 +1104,13 @@ def v1_chat_generate_response(
             tools = request.tools
             model = request.model
 
-        if request.separate_reasoning and is_reasoning_model(model):
+        if reasoning_parser or (
+            request.separate_reasoning and is_reasoning_model(model)
+        ):
             try:
                 parser = ReasoningParser(model, True)
                 parse_result = parser.parse_non_stream(text)
-                ret_item["text"] = (
+                text = (
                     None
                     if parse_result.normal_text and len(parse_result.normal_text) == 0
                     else parse_result.normal_text
@@ -1146,7 +1153,7 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": ret_item["text"] if tool_calls is None else None,
+                    "content": text if tool_calls is None else None,
                     "tool_calls": tool_calls,
                 },
                 "logprobs": choice_logprobs,
@@ -1164,7 +1171,7 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=ret_item["text"] if tool_calls is None else None,
+                    content=text if tool_calls is None else None,
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text,
                 ),
@@ -1307,8 +1314,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     if is_first:
                         # First chunk with role
                         is_first = False
-                        if request.separate_reasoning and is_reasoning_model(
-                            request.model
+                        if tokenizer_manager.server_args.reasoning_parser or (
+                            request.separate_reasoning
+                            and is_reasoning_model(request.model)
                         ):
                             delta = DeltaMessage(role="assistant", reasoning_content="")
                         else:
@@ -1339,7 +1347,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
-                    if request.separate_reasoning and is_reasoning_model(request.model):
+                    if tokenizer_manager.server_args.reasoning_parser or (
+                        request.separate_reasoning and is_reasoning_model(request.model)
+                    ):
                         if index not in reasoning_parser_dict:
                             reasoning_parser_dict[index] = ReasoningParser(
                                 request.model, request.stream_reasoning
@@ -1530,6 +1540,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+        reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
     )
 
     return response

@@ -346,8 +346,8 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -370,8 +370,8 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
