@@ -37,4 +37,4 @@ repos:
     rev: v0.9.9
     hooks:
       - id: ruff
-        args: ["--select=F401"]
+        args: ["--select=F401", "--exclude=*.ipynb"]
