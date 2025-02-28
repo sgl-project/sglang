@@ -322,7 +322,7 @@ class SRTRunner:
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
         )
-        self.tokenizer = get_tokenizer(model_path)
+        self.tokenizer = get_tokenizer(model_path, trust_remote_code=trust_remote_code)
 
     def forward(
         self,
