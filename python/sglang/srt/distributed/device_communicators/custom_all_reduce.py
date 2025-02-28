@@ -145,6 +145,7 @@ class CustomAllreduce:
     if is_hip():
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024
+
     # max_size: max supported allreduce size
     def __init__(
         self,
@@ -561,4 +562,3 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
-

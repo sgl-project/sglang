@@ -1,6 +1,8 @@
 import ctypes
 import os
+
 import torch
+
 if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
     ctypes.CDLL(
         "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
