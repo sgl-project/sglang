@@ -241,7 +241,11 @@ def fused_moe_kernel(
 
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
-                accumulator += tl.dot(a, b)
+                # fix out of shared memory issue
+                if use_fp8_w8a8:
+                    accumulator = tl.dot(a, b, acc=accumulator)
+                else:
+                    accumulator += tl.dot(a, b)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -520,7 +524,7 @@ def invoke_fused_moe_kernel(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
-            # activation tensor-wise fp8 quantization
+            # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             A, A_scale = ops.scaled_fp8_quant(A, A_scale)
         else:
