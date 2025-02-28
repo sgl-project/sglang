@@ -23,7 +23,7 @@ class SamplingParams:
     The sampling parameters.
 
     See docs/references/sampling_params.md or
-    https://docs.sglang.ai/references/sampling_params.html
+    https://docs.sglang.ai/backend/sampling_params.html
     for the documentation.
     """
 
