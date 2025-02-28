@@ -1,4 +1,4 @@
-# Guide on Hyperparameter Tuning
+# Hyperparameter Tuning
 
 ## Achieving Peak Throughput
 Achieving a large batch size is the most important thing for attaining high throughput.

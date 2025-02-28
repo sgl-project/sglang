@@ -78,6 +78,7 @@ else:
         bmm_fp8,
         build_tree_kernel,
         build_tree_kernel_efficient,
+        cublas_grouped_gemm,
         custom_dispose,
         custom_reduce,
         fp8_blockwise_scaled_mm,
@@ -107,6 +108,7 @@ else:
     __all__ = [
         "apply_rope_with_cos_sin_cache_inplace",
         "bmm_fp8",
+        "cublas_grouped_gemm",
         "custom_dispose",
         "custom_reduce",
         "fp8_blockwise_scaled_mm",

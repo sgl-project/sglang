@@ -336,7 +336,7 @@ class Runtime:
     """
     A wrapper for the HTTP server.
     This is used for launching the server in a python program without
-    using the commond line interface.
+    using the command line interface.
 
     It is mainly used for the frontend language.
     You should use the Engine class if you want to do normal offline processing without the frontend language.

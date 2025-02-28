@@ -474,7 +474,7 @@ class TritonMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-        max_bs = model_runner.req_to_token_pool.size
+        max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
                 self.speculative_num_steps,

@@ -559,7 +559,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     ]
                     image_embeds_offset += num_image_tokens
 
-        input_ids = None
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -586,6 +585,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

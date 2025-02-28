@@ -66,6 +66,7 @@ global_server_args_dict = {
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "device": ServerArgs.device,
     "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
+    "disable_radix_cache": ServerArgs.disable_radix_cache,
 }
 
 logger = logging.getLogger(__name__)
@@ -606,9 +607,6 @@ class ScheduleBatch:
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
 
-    # Return hidden states
-    return_hidden_states: bool = False
-
     @classmethod
     def init_new(
         cls,
@@ -620,7 +618,6 @@ class ScheduleBatch:
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
-        return_hidden_states: bool = False,
     ):
         return cls(
             reqs=reqs,
@@ -635,7 +632,6 @@ class ScheduleBatch:
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
-            return_hidden_states=return_hidden_states,
         )
 
     def batch_size(self):
@@ -1204,7 +1200,7 @@ class ScheduleBatch:
             spec_info=self.spec_info,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
-                if self.return_hidden_states
+                if self.sampling_info.return_hidden_states
                 else (
                     getattr(
                         self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
