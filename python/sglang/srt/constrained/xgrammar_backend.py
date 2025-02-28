@@ -13,6 +13,7 @@
 # ==============================================================================
 """Constrained decoding with xgrammar backend."""
 
+import json
 import logging
 from typing import List, Tuple
 
@@ -21,6 +22,7 @@ from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
+    StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
     apply_token_bitmask_inplace,
@@ -135,6 +137,23 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         elif key_type == "regex":
             try:
                 ctx = self.grammar_compiler.compile_regex(key_string)
+            except RuntimeError as e:
+                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+                return None
+        elif key_type == "structural_tag":
+            try:
+                structural_tag = json.loads(key_string)
+                tags = [
+                    StructuralTagItem(
+                        begin=structure["begin"],
+                        schema=json.dumps(structure["schema"]),
+                        end=structure["end"],
+                    )
+                    for structure in structural_tag["structures"]
+                ]
+                ctx = self.grammar_compiler.compile_structural_tag(
+                    tags, structural_tag["triggers"]
+                )
             except RuntimeError as e:
                 logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
                 return None
