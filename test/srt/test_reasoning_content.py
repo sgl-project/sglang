@@ -25,7 +25,7 @@ class TestReasoningContentAPI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_REASONING_MODEL_NAME_FOR_TEST
-        cls.base_url = "http://0.0.0.0:5000"  # DEFAULT_URL_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -34,7 +34,7 @@ class TestReasoningContentAPI(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # kill_process_tree(cls.process.pid)
+        kill_process_tree(cls.process.pid)
         pass
 
     def test_streaming_separate_reasoning_false(self):
