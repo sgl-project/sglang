@@ -3,19 +3,19 @@
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 
-#include "deep_seek_extensions/fp8_gemm.cuh"
+#include "deepseek_extensions/fp8_gemm.cuh"
 
 using namespace deep_gemm;
 
 int get_num_sms(){
-    """
+    /*
     Get the current maximum limit of SM count for all GEMM kernels to use.
     If the count is never specified, the function will return the number of device SMs.
     It is equivalent to torch.cuda.get_device_properties(device='cuda').multi_processor_count.
 
     Returns:
         Current maximum limit of SM count for all GEMM kernels to use.
-    """
+    */
     int device_idx = 0;
     cudaError_t result = cudaGetDevice(&device_idx);
 
@@ -35,9 +35,7 @@ int get_num_sms(){
 }
 
 int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k = 128){
-    '''
-    fork from deep_gemm/jit_kernels/gemm.py, translate py to cu
-    '''
+    // fork from deep_gemm/jit_kernels/gemm.py, translate py to cu
     int smem_d = block_m * block_n * 2;
     int smem_a_per_stage = block_m * block_k;
     int smem_scales_a_per_stage = block_m * 4;
@@ -61,31 +59,29 @@ int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k =
 void gemm_fp8_fp8_bf16_nt(const torch::Tensor& lhs, const torch::Tensor& lhs_scales,
                         const torch::Tensor& rhs, const torch::Tensor& rhs_scales,
                         torch::Tensor& out) {
-    '''
-    fork from deep_gemm/jit_kernels/gemm.py, translate py to cu
-    '''
-    constexpr auto m = lhs.size(0);
-    constexpr auto k = lhs.size(1);
-    constexpr auto n = rhs.size(0);
-    constexpr auto k_ = rhs.size(1);
-    constexpr auto m_ = out.size(0);
-    constexpr auto n_ = out.size(1);
-    constexpr auto N = n, K = k;
+    // fork from deep_gemm/jit_kernels/gemm.py, translate py to cu
+    const uint32_t m = lhs.size(0);
+    const uint32_t k = lhs.size(1);
+    const uint32_t n = rhs.size(0);
+    const uint32_t k_ = rhs.size(1);
+    const uint32_t m_ = out.size(0);
+    const uint32_t n_ = out.size(1);
+    const uint32_t N = n, K = k;
     //TODO(laixinn): tune configs
     constexpr auto BLOCK_M = 128;
     constexpr auto BLOCK_N = 128;
     constexpr auto kNumStages = 8;
     constexpr auto kNumTMAMulticast = 1;
 
-    constexpr int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
+    const int smem_size = get_smem_size(kNumStages, k, BLOCK_M, BLOCK_N);
     auto stream = at::cuda::getCurrentCUDAStream(lhs.get_device());
     int num_sms = get_num_sms();
 
-    TORCH_CHECK(n % 64 == 0 and k % 128 == 0)
+    TORCH_CHECK(n % 64 == 0 && k % 128 == 0)
 
     // Type and shape checks
-    TORCH_CHECK(m == m_ and n == n_ and k == k_)
-    TORCH_CHECK(n > 0 and k > 0)
+    TORCH_CHECK(m == m_ && n == n_ && k == k_)
+    TORCH_CHECK(n > 0 && k > 0)
     TORCH_CHECK(lhs_scales.size(0) == m && lhs_scales.size(1) == (k + 127) / 128)
     TORCH_CHECK(rhs_scales.size(0) == (n + 127) / 128 && rhs_scales.size(1) == (k + 127) / 128)
     TORCH_CHECK(lhs.scalar_type() == torch::kFloat8_e4m3fn && lhs_scales.scalar_type() == torch::kFloat8_e4m3fn)
