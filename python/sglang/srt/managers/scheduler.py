@@ -80,7 +80,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.managers.utils import validate_input_length, pack_err_batch_tokenid_out
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -642,15 +642,13 @@ class Scheduler:
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
-                self.waiting_queue.append(req)
-                return
+                return pack_err_batch_tokenid_out(req)
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
-                self.waiting_queue.append(req)
-                return
+                return pack_err_batch_tokenid_out(req)
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
@@ -673,8 +671,7 @@ class Scheduler:
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                self.waiting_queue.append(req)
-                return
+                return pack_err_batch_tokenid_out(req)
 
         # Validate prompts length
         error_msg = validate_input_length(
@@ -683,8 +680,7 @@ class Scheduler:
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
-            self.waiting_queue.append(req)
-            return
+            return pack_err_batch_tokenid_out(req)
 
         # Copy more attributes
         if recv_req.logprob_start_len == -1:
