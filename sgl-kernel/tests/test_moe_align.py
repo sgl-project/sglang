@@ -171,12 +171,12 @@ def test_moe_align_block_size_compare_implementations(block_size, num_tokens, to
     num_tokens_post_pad_cuda = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
     )
-    token_cnts_buffer = torch.empty(
+    token_cnts_buffer = torch.zeros(
         (num_experts + 1) * num_experts,
         dtype=torch.int32,
         device=topk_ids.device,
     )
-    cumsum_buffer = torch.empty(
+    cumsum_buffer = torch.zeros(
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
 
