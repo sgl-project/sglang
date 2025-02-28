@@ -36,15 +36,15 @@ jobs:
           VERSION=$(grep -o '__version__ = "[^"]*"' python/sglang/version.py | cut -d'"' -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Wait for PyPI to process the upload
+      - name: Calculate SHA-256 hashes locally
         run: |
-          echo "Waiting for PyPI to process the upload..."
-          sleep 60
-
-      - name: Extract SHA-256 hashes from PyPI
+          python scripts/release/calculate_local_hashes.py sglang --version ${{ steps.get_version.outputs.version }} --dist-dir python/dist --output hash.txt
+          
+      - name: Extract SHA-256 hashes from PyPI as fallback
+        if: failure()
         run: |
           pip install requests
-          python scripts/release/extract_pypi_hashes.py sglang --version ${{ steps.get_version.outputs.version }} --output hash.txt
+          python scripts/release/extract_pypi_hashes.py sglang --version ${{ steps.get_version.outputs.version }} --output hash.txt --wait --max-wait-time 300
 
       - name: Upload hash.txt as artifact
         uses: actions/upload-artifact@v3
