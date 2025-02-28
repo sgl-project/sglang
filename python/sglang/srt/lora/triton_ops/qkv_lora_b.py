@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.lora import LoraBatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 @triton.jit
@@ -108,7 +108,7 @@ def _qkv_lora_b_kernel(
 def qkv_lora_b_fwd(
     x: torch.Tensor,
     qkv_lora_b: torch.Tensor,
-    batch_info: LoraBatchInfo,
+    batch_info: LoRABatchInfo,
     output_offset: torch.Tensor,
     max_qkv_out_dim: int,
     base_output: torch.Tensor = None,
@@ -123,11 +123,11 @@ def qkv_lora_b_fwd(
     # output: (s, output_dim_q + 2 * output_dim_kv)
 
     # Compute lora_output with shape (s, output_dim) as follows:
-    # lora_output[:, :output_dim_q] = sgemm(lora_output_a[:, :r], )
+    # lora_output[:, :output_dim_q] = sgemm(x[:, :r], qkv_lora_b[:, :outptu_dim_q, :])
     # lora_output[:, output_dim_q: output_dim_q + output_dim_kv]
-    #      = sgemm(lora_output_a[:, r: 2 * r], kv_lora_b[0])
+    #      = sgemm(x[:, r: 2 * r], qkv_lora_b[:, outptu_dim_q: output_dim_q + output_dim_kv, :])
     # lora_output[:, output_dim_q + output_dim_kv: ]
-    #      = sgemm(lora_output_a[:, 2 * r: 3 * r], kv_lora_b[1])
+    #      = sgemm(x[:, 2 * r: , qkv_lora_b[:, output_dim_q + output_dim_kv: , :])
 
     # Get dims
     s = x.shape[0]

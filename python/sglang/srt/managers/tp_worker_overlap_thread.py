@@ -156,6 +156,10 @@ class TpModelWorkerClient:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                     )
+            if logits_output.hidden_states is not None:
+                logits_output.hidden_states = logits_output.hidden_states.to(
+                    "cpu", non_blocking=True
+                )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 

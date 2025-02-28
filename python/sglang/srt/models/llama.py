@@ -476,9 +476,14 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading kv_scale from ckpts towards new design.
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                else:
+                    logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

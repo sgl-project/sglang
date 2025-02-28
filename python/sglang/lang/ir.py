@@ -63,6 +63,7 @@ class SglSamplingParams:
             warnings.warn("Regular expression is not supported in the OpenAI backend.")
         return {
             "max_tokens": self.max_new_tokens,
+            "max_completion_tokens": self.max_new_tokens,
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,

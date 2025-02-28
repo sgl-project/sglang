@@ -35,7 +35,10 @@ is_hip_ = is_hip()
 if is_hip_:
     from outlines_core.fsm.json_schema import build_regex_from_schema
 else:
-    from outlines.fsm.json_schema import build_regex_from_schema
+    try:
+        from outlines.fsm.json_schema import build_regex_from_schema
+    except ImportError:
+        from outlines_core.fsm.json_schema import build_regex_from_schema
 
 
 logger = logging.getLogger(__name__)

@@ -33,6 +33,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.utils import is_hip
+
+is_hip_ = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -129,6 +132,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         if bs <= model_runner.req_to_token_pool.size
         and bs <= server_args.cuda_graph_max_bs
     ]
+    if is_hip_:
+        capture_bs += [i * 8 for i in range(21, 33)]
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -237,6 +242,7 @@ class CudaGraphRunner:
                 "1. disable cuda graph by --disable-cuda-graph\n"
                 "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
+                "4. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -348,7 +354,13 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL
+                if self.model_runner.server_args.return_hidden_states
+                else (
+                    spec_info.capture_hidden_mode
+                    if spec_info
+                    else CaptureHiddenMode.NULL
+                )
             ),
         )
 
@@ -462,8 +474,11 @@ class CudaGraphRunner:
                     ),
                     positions=None,
                     retrive_index=None,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
                     retrive_cum_len=None,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    spec_steps=self.model_runner.server_args.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
 

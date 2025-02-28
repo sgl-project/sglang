@@ -33,11 +33,11 @@ __global__ void lightning_attention_decode_kernel(const T* __restrict__ q,      
                                                   const int batch_size, const int num_heads, const int qk_dim,
                                                   const int v_dim) {
   extern __shared__ char smem[];
-  T* q_shared = reinterpret_cast<T*>(smem);
-  T* k_shared = reinterpret_cast<T*>(smem + qk_dim * sizeof(T));
-  T* v_shared = reinterpret_cast<T*>(smem + 2 * qk_dim * sizeof(T));
-  float* new_kv_shared = reinterpret_cast<float*>(smem + (2 * qk_dim + v_dim) * sizeof(T));
-  T* output_shared =
+  T* __restrict__ q_shared = reinterpret_cast<T*>(smem);
+  T* __restrict__ k_shared = reinterpret_cast<T*>(smem + qk_dim * sizeof(T));
+  T* __restrict__ v_shared = reinterpret_cast<T*>(smem + 2 * qk_dim * sizeof(T));
+  float* __restrict__ new_kv_shared = reinterpret_cast<float*>(smem + (2 * qk_dim + v_dim) * sizeof(T));
+  T* __restrict__ output_shared =
       reinterpret_cast<T*>(smem + (2 * qk_dim + v_dim) * sizeof(T) + qk_dim * (v_dim + 1) * sizeof(float));
 
   const int32_t tid = threadIdx.x;
@@ -51,6 +51,7 @@ __global__ void lightning_attention_decode_kernel(const T* __restrict__ q,      
   const int32_t v_offset = b * num_heads * v_dim + h * v_dim;
   const int32_t kv_offset = b * num_heads * qk_dim * v_dim + h * qk_dim * v_dim;
 
+  // Load q, k, v into shared memory
   for (int d = tid; d < qk_dim; d += blockDim.x) {
     q_shared[d] = q[qk_offset + d];
     k_shared[d] = k[qk_offset + d];
@@ -63,33 +64,36 @@ __global__ void lightning_attention_decode_kernel(const T* __restrict__ q,      
 
   const float ratio = expf(-1.0f * slope[h]);
 
+  // Compute new_kv
   for (int d = tid; d < qk_dim; d += blockDim.x) {
-    T k_val = k_shared[d];
+    const T k_val = k_shared[d];
     for (int e = 0; e < v_dim; ++e) {
-      int past_kv_idx = kv_offset + d * v_dim + e;
-      T v_val = v_shared[e];
-      float new_val = ratio * past_kv[past_kv_idx] + k_val * v_val;
-      int shared_idx = d * (v_dim + 1) + e;
+      const int past_kv_idx = kv_offset + d * v_dim + e;
+      const T v_val = v_shared[e];
+      const float new_val = ratio * past_kv[past_kv_idx] + k_val * v_val;
+      const int shared_idx = d * (v_dim + 1) + e;
       new_kv_shared[shared_idx] = new_val;
     }
   }
 
   __syncthreads();
 
+  // Store new_kv to global memory
   for (int idx = tid; idx < qk_dim * v_dim; idx += blockDim.x) {
-    int d = idx / v_dim;
-    int e = idx % v_dim;
-    int shared_idx = d * (v_dim + 1) + e;
-    int global_idx = kv_offset + idx;
+    const int d = idx / v_dim;
+    const int e = idx % v_dim;
+    const int shared_idx = d * (v_dim + 1) + e;
+    const int global_idx = kv_offset + idx;
     new_kv[global_idx] = new_kv_shared[shared_idx];
   }
 
   __syncthreads();
 
+  // Compute output
   for (int e = tid; e < v_dim; e += blockDim.x) {
     float sum = 0.0f;
     for (int d = 0; d < qk_dim; ++d) {
-      int shared_idx = d * (v_dim + 1) + e;
+      const int shared_idx = d * (v_dim + 1) + e;
       sum += q_shared[d] * new_kv_shared[shared_idx];
     }
     output_shared[e] = static_cast<T>(sum);
@@ -97,6 +101,7 @@ __global__ void lightning_attention_decode_kernel(const T* __restrict__ q,      
 
   __syncthreads();
 
+  // Store output to global memory
   if (tid == 0) {
     for (int e = 0; e < v_dim; ++e) {
       output[v_offset + e] = output_shared[e];

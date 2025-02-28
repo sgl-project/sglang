@@ -1,4 +1,12 @@
+import ctypes
+import os
 import torch
+if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
+    ctypes.CDLL(
+        "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
+        mode=ctypes.RTLD_GLOBAL,
+    )
+from .version import __version__
 
 if torch.version.hip is not None:
     from sgl_kernel.ops import (
@@ -66,8 +74,11 @@ else:
     from sgl_kernel.ops import (
         apply_rope_with_cos_sin_cache_inplace,
         bmm_fp8,
+        build_tree_kernel,
+        build_tree_kernel_efficient,
         custom_dispose,
         custom_reduce,
+        fp8_blockwise_scaled_mm,
         fp8_scaled_mm,
         fused_add_rmsnorm,
         gelu_and_mul,
@@ -83,10 +94,12 @@ else:
         register_graph_buffers,
         rmsnorm,
         sampling_scaling_penalties,
+        sgl_per_token_group_quant_fp8,
         silu_and_mul,
         top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
         top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
     )
 
     __all__ = [
@@ -94,6 +107,7 @@ else:
         "bmm_fp8",
         "custom_dispose",
         "custom_reduce",
+        "fp8_blockwise_scaled_mm",
         "fp8_scaled_mm",
         "fused_add_rmsnorm",
         "gelu_and_mul",
@@ -113,4 +127,8 @@ else:
         "top_k_renorm_prob",
         "top_k_top_p_sampling_from_probs",
         "top_p_renorm_prob",
+        "tree_speculative_sampling_target_only",
+        "build_tree_kernel_efficient",
+        "build_tree_kernel",
+        "sgl_per_token_group_quant_fp8",
     ]

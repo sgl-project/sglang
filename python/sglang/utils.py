@@ -306,20 +306,110 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+import fcntl
+
+
+def is_in_ci():
+    from sglang.test.test_utils import is_in_ci
+
+    return is_in_ci()
+
+
+LOCKFILE = os.path.expanduser("~/.sglang_port_lock")
+PORT_REGISTRY = os.path.expanduser("~/.sglang_port_registry.json")
+
+if not os.path.exists(LOCKFILE):
+    with open(LOCKFILE, "w") as f:
+        pass
+
+if not os.path.exists(PORT_REGISTRY):
+    with open(PORT_REGISTRY, "w") as f:
+        json.dump([], f)
+
+
+def print_highlight(html_content: str):
+    if is_in_ci():
+        html_content = str(html_content).replace("\n", "<br>")
+        display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
+    else:
+        print(html_content)
+
+
+def init_port_registry():
+    """Initialize the port registry file if it doesn't exist."""
+    if not os.path.exists(PORT_REGISTRY):
+        with open(PORT_REGISTRY, "w") as f:
+            json.dump([], f)
+
+
+def reserve_port(start=30000, end=40000):
+    """
+    Reserve an available port using a file lock and a registry.
+    Returns the allocated port.
+    """
+    init_port_registry()
+    with open(LOCKFILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(PORT_REGISTRY, "r") as f:
+                used = json.load(f)
+        except Exception:
+            used = []
+        for port in range(start, end):
+            if port not in used:
+                used.append(port)
+                with open(PORT_REGISTRY, "w") as f:
+                    json.dump(used, f)
+                return port
+    raise RuntimeError("No free port available")
+
+
+def release_port(port):
+    """Release the reserved port by removing it from the registry."""
+    with open(LOCKFILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(PORT_REGISTRY, "r") as f:
+                used = json.load(f)
+        except Exception:
+            used = []
+        if port in used:
+            used.remove(port)
+        with open(PORT_REGISTRY, "w") as f:
+            json.dump(used, f)
+
+
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
-    Execute a shell command and return the process handle
-
-    Args:
-        command: Shell command as a string (can include \\ line continuations)
-    Returns:
-        subprocess.Popen: Process handle
+    Execute a shell command and return its process handle.
     """
-    # Replace \ newline with space and split
+    # Replace newline continuations and split the command string.
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-
     return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+
+
+def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
+    """
+    Launch the server using the given command.
+    If no port is specified, a free port is reserved.
+    """
+    if port is None:
+        port = reserve_port()
+    full_command = f"{command} --port {port}"
+    process = execute_shell_command(full_command)
+    return process, port
+
+
+def terminate_process(process, port=None):
+    """
+    Terminate the process and, if a port was reserved, release it.
+    """
+    from sglang.srt.utils import kill_process_tree
+
+    kill_process_tree(process.pid)
+    if port is not None:
+        release_port(port)
 
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
@@ -343,6 +433,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
@@ -351,17 +442,6 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
-
-
-def terminate_process(process):
-    from sglang.srt.utils import kill_process_tree
-
-    kill_process_tree(process.pid)
-
-
-def print_highlight(html_content: str):
-    html_content = str(html_content).replace("\n", "<br>")
-    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
 
 
 class TypeBasedDispatcher:
