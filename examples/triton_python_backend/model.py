@@ -17,7 +17,7 @@ from sglang.srt.openai_api.protocol import (
     ChatCompletionStreamResponse,
     ChatMessage,
     DeltaMessage,
-    UsageInfo
+    UsageInfo,
 )
 
 
@@ -122,7 +122,9 @@ class TritonPythonModel:
                     add_generation_prompt=True,
                 )
             else:
-                text = pb_utils.get_input_tensor_by_name(request, "prompt").as_numpy()[0]
+                text = pb_utils.get_input_tensor_by_name(request, "prompt").as_numpy()[
+                    0
+                ]
                 if isinstance(text, bytes):
                     text = text.decode("utf-8")
                 prompt = text
@@ -171,7 +173,7 @@ class TritonPythonModel:
                         ).model_dump_json()
                     else:
                         text = content["text"]
-                        delta = text[len(stream_buffer):]
+                        delta = text[len(stream_buffer) :]
                         stream_buffer = stream_buffer + delta
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
