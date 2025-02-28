@@ -24,7 +24,6 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 
-
 if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
     sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
@@ -51,7 +50,8 @@ def _get_version():
 
 operator_namespace = "sgl_kernels"
 cutlass_default = root / "3rdparty" / "cutlass"
-cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
+cutlass = Path(
+    os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
 turbomind = root / "3rdparty" / "turbomind"
 include_dirs = [
@@ -114,10 +114,14 @@ sources = [
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
 enable_fp8 = os.getenv("SGL_KERNEL_ENABLE_FP8", "0") == "1"
 enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
+enable_sm100a = os.getenv("SGL_KERNEL_ENABLE_SM100A", "0") == "1"
 cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
 
 if torch.cuda.is_available():
+    if cuda_version >= (12, 8) and sm_version >= 100:
+        nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+        nvcc_flags.append("-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1")
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
     if sm_version >= 90:
@@ -128,16 +132,19 @@ else:
     # compilation environment without GPU
     if enable_sm90a:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+    if enable_sm100a:
+        nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+        nvcc_flags.append("-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1")
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
     if enable_bf16:
         nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
 
 for flag in [
-    "-D__CUDA_NO_HALF_OPERATORS__",
-    "-D__CUDA_NO_HALF_CONVERSIONS__",
-    "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "-D__CUDA_NO_HALF2_OPERATORS__",
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
 ]:
     try:
         torch.utils.cpp_extension.COMMON_NVCC_FLAGS.remove(flag)
@@ -146,7 +153,11 @@ for flag in [
 
 cxx_flags = ["-O3"]
 libraries = ["c10", "torch", "torch_python", "cuda", "cublas"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
+machine_arch = os.uname().machine
+extra_link_args = [
+    "-Wl,-rpath,$ORIGIN/../../torch/lib",
+    "-L/usr/lib/%s-linux-gnu" % machine_arch
+]
 
 ext_modules = [
     CUDAExtension(
@@ -170,9 +181,11 @@ setup(
     package_dir={"": "src"},
     ext_modules=ext_modules,
     cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=True, max_jobs=multiprocessing.cpu_count()
-        )
+        "build_ext":
+        BuildExtension.with_options(use_ninja=True,
+                                    max_jobs=multiprocessing.cpu_count())
     },
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    options={"bdist_wheel": {
+        "py_limited_api": "cp39"
+    }},
 )
