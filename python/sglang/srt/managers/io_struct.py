@@ -449,6 +449,8 @@ class UpdateWeightsFromDistributedReqOutput:
 @dataclass
 class UpdateWeightsFromTensorReqInput:
     serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    load_format: Optional[str]
+    flush_cache: bool
 
 
 @dataclass
@@ -568,3 +570,9 @@ class FunctionCallReqInput:
     tool_call_parser: Optional[str] = (
         None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
     )
+
+
+@dataclass
+class VertexGenerateReqInput:
+    instances: List[dict]
+    parameters: Optional[dict] = None

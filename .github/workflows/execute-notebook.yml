@@ -1,11 +1,6 @@
 name: Execute Notebooks
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "python/sglang/**"
-      - "docs/**"
   pull_request:
     branches: [ main ]
     paths:

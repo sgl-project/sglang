@@ -82,6 +82,7 @@ class ServerArgs:
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
+    gpu_id_step: int = 1
 
     # Logging
     log_level: str = "info"
@@ -162,7 +163,6 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
-    return_hidden_states: bool = False
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
@@ -553,6 +553,12 @@ class ServerArgs:
             default=ServerArgs.base_gpu_id,
             help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
         )
+        parser.add_argument(
+            "--gpu-id-step",
+            type=int,
+            default=ServerArgs.gpu_id_step,
+            help="The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
+        )
 
         # Logging
         parser.add_argument(
@@ -698,7 +704,7 @@ class ServerArgs:
         parser.add_argument(
             "--grammar-backend",
             type=str,
-            choices=["xgrammar", "outlines"],
+            choices=["xgrammar", "outlines", "llguidance"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
@@ -918,11 +924,6 @@ class ServerArgs:
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
         parser.add_argument(
-            "--return-hidden-states",
-            action="store_true",
-            help="Return hidden states in the response.",
-        )
-        parser.add_argument(
             "--tool-call-parser",
             type=str,
             choices=["qwen25", "mistral", "llama3"],
@@ -963,6 +964,7 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
