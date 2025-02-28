@@ -50,6 +50,7 @@ suites = {
         "test_hidden_states.py",
         "test_update_weights_from_disk.py",
         "test_update_weights_from_tensor.py",
+        "test_vertex_endpoint.py",
         "test_vision_chunked_prefill.py",
         "test_vision_llm.py",
         "test_vision_openai_server.py",
