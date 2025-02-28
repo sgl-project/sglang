@@ -39,16 +39,16 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def fp8_gemm_deepgemm(x: torch.Tensor, y: torch.Tensor, m: int, n: int, k: int):
+def fp8_gemm_deepgemm(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    y_fp8: torch.Tensor,
+    y_scale: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+):
     """DeepGEMM implementation of FP8 GEMM"""
-    # Convert inputs to FP8 format
-    x_fp8, x_scale = per_token_cast_to_fp8(x)
-    y_fp8, y_scale = per_block_cast_to_fp8(y)
-
-    # Transpose earlier so that the testing will not trigger transposing kernels
-    x_scale = get_col_major_tma_aligned_tensor(x_scale)
-
-    # Prepare inputs for DeepGEMM
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
 
     # Run DeepGEMM kernel
@@ -56,12 +56,16 @@ def fp8_gemm_deepgemm(x: torch.Tensor, y: torch.Tensor, m: int, n: int, k: int):
     return out
 
 
-def fp8_gemm_sglang(x: torch.Tensor, y: torch.Tensor, m: int, n: int, k: int):
+def fp8_gemm_sglang(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    y_fp8: torch.Tensor,
+    y_scale: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+):
     """SGLang implementation of FP8 GEMM"""
-    # Convert inputs to FP8 format
-    x_fp8, x_scale = per_token_cast_to_fp8(x)
-    y_fp8, y_scale = per_block_cast_to_fp8(y)
-
     block_size = [128, 128]  # Matches the block size in per_block_cast_to_fp8
 
     # Run SGLang kernel
@@ -71,12 +75,16 @@ def fp8_gemm_sglang(x: torch.Tensor, y: torch.Tensor, m: int, n: int, k: int):
     return out
 
 
-def fp8_gemm_vllm(x: torch.Tensor, y: torch.Tensor, m: int, n: int, k: int):
+def fp8_gemm_vllm(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    y_fp8: torch.Tensor,
+    y_scale: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+):
     """vLLM implementation of FP8 GEMM"""
-    # Convert inputs to FP8 format
-    x_fp8, x_scale = per_token_cast_to_fp8(x)
-    y_fp8, y_scale = per_block_cast_to_fp8(y)
-
     block_size = [128, 128]  # Matches the block size in per_block_cast_to_fp8
 
     # Run vLLM kernel
@@ -90,9 +98,25 @@ def calculate_diff(m: int, n: int, k: int):
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
-    out_deepgemm = fp8_gemm_deepgemm(x.clone(), y.clone(), m, n, k)
-    out_sglang = fp8_gemm_sglang(x.clone(), y.clone(), m, n, k)
-    out_vllm = fp8_gemm_vllm(x.clone(), y.clone(), m, n, k)
+    x_fp8, x_scale = per_token_cast_to_fp8(x.clone())
+    y_fp8, y_scale = per_block_cast_to_fp8(y.clone())
+    x_scale_col_major = get_col_major_tma_aligned_tensor(x_scale.clone())
+
+    out_deepgemm = fp8_gemm_deepgemm(
+        x_fp8.clone(),
+        x_scale_col_major.clone(),
+        y_fp8.clone(),
+        y_scale.clone(),
+        m,
+        n,
+        k,
+    )
+    out_sglang = fp8_gemm_sglang(
+        x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone(), m, n, k
+    )
+    out_vllm = fp8_gemm_vllm(
+        x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone(), m, n, k
+    )
 
     diff_sglang_deepgemm = torch.abs(out_deepgemm - out_sglang).mean().item()
     diff_vllm_deepgemm = torch.abs(out_deepgemm - out_vllm).mean().item()
@@ -151,10 +175,6 @@ def get_weight_shapes(tp_size):
         new_t = (k_t[0], k_t[1] // tp_size)
         weight_shapes.append(new_t)
 
-    # Remove shapes with n=7168 when tp_size=16 to avoid "Misaligned barriers" error in DeepGEMM
-    if tp_size == 16:
-        weight_shapes = [shape for shape in weight_shapes if shape[0] != 7168]
-
     return weight_shapes
 
 
@@ -191,21 +211,50 @@ def get_benchmark(tp_size):
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
         y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
+        # 预处理数据，在计时之前完成
+        x_fp8, x_scale = per_token_cast_to_fp8(x)
+        y_fp8, y_scale = per_block_cast_to_fp8(y)
+        x_scale_col_major = get_col_major_tma_aligned_tensor(x_scale.clone())
+
         quantiles = [0.5, 0.2, 0.8]
 
         if provider == "deepgemm":
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: fp8_gemm_deepgemm(x.clone(), y.clone(), m, n, k),
+                lambda: fp8_gemm_deepgemm(
+                    x_fp8.clone(),
+                    x_scale_col_major.clone(),
+                    y_fp8.clone(),
+                    y_scale.clone(),
+                    m,
+                    n,
+                    k,
+                ),
                 quantiles=quantiles,
             )
         elif provider == "sglang":
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: fp8_gemm_sglang(x.clone(), y.clone(), m, n, k),
+                lambda: fp8_gemm_sglang(
+                    x_fp8.clone(),
+                    x_scale.clone(),
+                    y_fp8.clone(),
+                    y_scale.clone(),
+                    m,
+                    n,
+                    k,
+                ),
                 quantiles=quantiles,
             )
         else:  # vllm
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: fp8_gemm_vllm(x.clone(), y.clone(), m, n, k),
+                lambda: fp8_gemm_vllm(
+                    x_fp8.clone(),
+                    x_scale.clone(),
+                    y_fp8.clone(),
+                    y_scale.clone(),
+                    m,
+                    n,
+                    k,
+                ),
                 quantiles=quantiles,
             )
 
