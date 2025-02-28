@@ -94,4 +94,24 @@ inline int getSMVersion() {
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
-#define CEILDIV(x, y) (((x) + (y)-1) / (y))
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+
+// Pads to a multiple of `alignment` rows.
+inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment = 4, bool is_column_major = false) {
+  int64_t rows = tensor.size(0);
+  int64_t cols = tensor.size(1);
+  int64_t pad_rows = (alignment - (rows % alignment)) % alignment;  // Compute padding size
+
+  if (pad_rows == 0) {
+    return tensor;  // Already aligned
+  }
+
+  torch::Tensor padding = torch::zeros({pad_rows, cols}, tensor.options());
+  torch::Tensor tensor_padded = torch::cat({tensor, padding}, 0);  // Pad along rows
+
+  // Ensure column-major layout
+  if (is_column_major) {
+    return tensor_padded.t().contiguous().t();
+  }
+  return tensor_padded;
+}
