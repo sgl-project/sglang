@@ -796,7 +796,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         index=index,
                         text=delta,
                         logprobs=logprobs,
-                        finish_reason=(finish_reason["type"] if finish_reason else None),
+                        finish_reason=(
+                            finish_reason["type"] if finish_reason else None
+                        ),
                         matched_stop=(
                             finish_reason["matched"]
                             if finish_reason and "matched" in finish_reason
