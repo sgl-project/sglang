@@ -261,45 +261,11 @@ class HFRunner:
                             base_model=self.base_model,
                             prompts=prompts,
                             max_new_tokens=max_new_tokens,
-                            return_dict_in_generate=True,
-                            output_scores=(not self.output_str_only),
-                        )
-
-                        text = self.tokenizer.decode(
-                            outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
-                        )
-                        # Check if the text is empty or only whitespace.
-                        if not text.strip():
-                            raise ValueError(
-                                "Received an empty text response. Please verify your input or model configuration."
-                            )
-                        output_strs.append(text)
-
-                        if not self.output_str_only:
-                            # outputs.scores: (num_token, 1, vocab_size)
-                            top_output_logprobs.append(
-                                [
-                                    get_top_logprobs(
-                                        logits[0], NUM_TOP_LOGPROBS
-                                    ).tolist()
-                                    for logits in outputs.scores
-                                ]
-                            )
-                            del outputs
-
-                            input_logits = self.model.forward(input_ids).logits[0]
-                            top_input_logprobs.append(
-                                get_top_logprobs(
-                                    input_logits, NUM_TOP_LOGPROBS
-                                ).tolist()
-                            )
-                            del input_logits
-
-                    out_queue.put(
-                        ModelOutput(
-                            output_strs=output_strs,
-                            top_input_logprobs=top_input_logprobs,
-                            top_output_logprobs=top_output_logprobs,
+                            base_model=self.base_model,
+                            tokenizer=self.tokenizer,
+                            lora_paths=lora_paths,
+                            torch_dtype=torch_dtype,
+                            output_str_only=self.output_str_only,
                         )
                     )
                 elif self.model_type == "embedding":
@@ -480,7 +446,7 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             mem_fraction_static=mem_fraction_static,
-            trust_remote_code=False,
+            trust_remote_code=trust_remote_code,
             is_embedding=not self.is_generation,
             lora_paths=lora_paths,
             max_loras_per_batch=max_loras_per_batch,
@@ -508,6 +474,36 @@ class SRTRunner:
         token_ids_logprob: Optional[List[int]] = None,
     ):
         if self.is_generation:
+            return self.forward_generation_raw(
+                prompts=prompts,
+                max_new_tokens=max_new_tokens,
+                lora_paths=lora_paths,
+                engine=self.engine,
+            )
+        else:
+            response = self.engine.encode(prompts)
+            if self.model_type == "embedding":
+                logits = [x["embedding"] for x in response]
+                return ModelOutput(embed_logits=logits)
+            else:
+                scores = [x["embedding"][0] for x in response]
+                return ModelOutput(scores=scores)
+
+    def batch_forward(
+        self,
+        prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
+        image_data: Optional[List[str]] = None,
+        max_new_tokens: int = 8,
+        lora_paths: Optional[List[str]] = None,
+        logprob_start_len: int = 0,
+        top_k: Optional[int] = None,
+        token_ids_logprob: Optional[List[int]] = None,
+    ):
+        """
+        testing serving by sending all prompts once
+        only return output strings and no logprobs
+        """
+        if self.is_generation:
             # the return value contains logprobs from prefill
             output_strs = []
             top_input_logprobs = []
@@ -524,33 +520,33 @@ class SRTRunner:
                 )
                 text = response["text"]
 
-                # Check if the text is empty or only whitespace.
-                if not text.strip():
-                    raise ValueError(
-                        "Received an empty text response. Please verify your input or model configuration."
-                    )
-                output_strs.append(text)
+            # Check if the text is empty or only whitespace.
+            if not text.strip():
+                raise ValueError(
+                    "Received an empty text response. Please verify your input or model configuration."
+                )
+            output_strs.append(text)
 
-                top_input_logprobs.append(
+            top_input_logprobs.append(
+                [
+                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
+                    for x in response["meta_info"]["input_top_logprobs"][1:]
+                ]
+                + [
                     [
-                        [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                        for x in response["meta_info"]["input_top_logprobs"][1:]
-                    ]
-                    + [
-                        [
-                            tup[0]
-                            for tup in response["meta_info"]["output_top_logprobs"][0][
-                                :NUM_TOP_LOGPROBS
-                            ]
+                        tup[0]
+                        for tup in response["meta_info"]["output_top_logprobs"][0][
+                            :NUM_TOP_LOGPROBS
                         ]
                     ]
-                )
-                top_output_logprobs.append(
-                    [
-                        [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                        for x in response["meta_info"]["output_top_logprobs"]
-                    ]
-                )
+                ]
+            )
+            top_output_logprobs.append(
+                [
+                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
+                    for x in response["meta_info"]["output_top_logprobs"]
+                ]
+            )
 
             return ModelOutput(
                 output_strs=output_strs,
