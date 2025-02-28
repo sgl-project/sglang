@@ -67,6 +67,8 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+HIP_FP8_E4M3_FNUZ_MAX = 224
+
 
 def is_hip() -> bool:
     """Return whether it is HIP on the AMD ROCm platform."""
