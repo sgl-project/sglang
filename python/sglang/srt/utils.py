@@ -71,6 +71,8 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+HIP_FP8_E4M3_FNUZ_MAX = 224
+
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
