@@ -1760,8 +1760,9 @@ class Scheduler:
         success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
-            flash_cache_success = self.flush_cache()
-            assert flash_cache_success, "Cache flush failed after updating weights"
+            if recv_req.flush_cache:
+                flash_cache_success = self.flush_cache()
+                assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromTensorReqOutput(success, message)
