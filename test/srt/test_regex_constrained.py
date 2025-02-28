@@ -1,6 +1,10 @@
 """
 python3 -m unittest test_regex_constrained.TestRegexConstrained.test_regex_generate_email
 python3 -m unittest test_regex_constrained.TestRegexConstrained.test_regex_generate_greeting
+python3 -m unittest test_regex_constrained.TestRegexConstrainedLLGuidance.test_regex_generate_email
+python3 -m unittest test_regex_constrained.TestRegexConstrainedLLGuidance.test_regex_generate_greeting
+python3 -m unittest test_regex_constrained.TestJumpForwardLLGuidance.test_regex_generate_email
+python3 -m unittest test_regex_constrained.TestJumpForwardLLGuidance.test_regex_generate_greeting
 """
 
 import json
@@ -17,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 
-def setup_class(cls, disable_overlap: bool):
+def setup_class(cls, backend: str, disable_overlap: bool):
     cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     cls.base_url = DEFAULT_URL_FOR_TEST
 
@@ -25,7 +29,7 @@ def setup_class(cls, disable_overlap: bool):
         "--max-running-requests",
         "10",
         "--grammar-backend",
-        "xgrammar",
+        backend,
     ]
 
     if disable_overlap:
@@ -42,7 +46,7 @@ def setup_class(cls, disable_overlap: bool):
 class TestRegexConstrained(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, disable_overlap=False)
+        setup_class(cls, "xgrammar", disable_overlap=False)
         cls.check_jump_forward = False
 
     @classmethod
@@ -178,8 +182,21 @@ class TestRegexConstrained(unittest.TestCase):
 class TestJumpForward(TestRegexConstrained):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, disable_overlap=True)
+        setup_class(cls, "xgrammar", disable_overlap=True)
         cls.check_jump_forward = True
+
+
+class TestJumpForwardLLGuidance(TestRegexConstrained):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, "llguidance", disable_overlap=True)
+        cls.check_jump_forward = True
+
+
+class TestRegexConstrainedLLGuidance(TestRegexConstrained):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, "llguidance", disable_overlap=True)
 
 
 if __name__ == "__main__":
