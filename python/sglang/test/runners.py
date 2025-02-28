@@ -95,9 +95,11 @@ class HFRunner:
         torch_dtype: torch.dtype,
         model_type: str = "generation",
         output_str_only: bool = False,
+        trust_remote_code: bool = False,
     ):
         self.model_type = model_type
         self.output_str_only = output_str_only
+        self.trust_remote_code = trust_remote_code
 
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
@@ -130,7 +132,7 @@ class HFRunner:
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
-                trust_remote_code=True,
+                trust_remote_code=self.trust_remote_code,
                 low_cpu_mem_usage=True,
             ).cuda()
         elif self.model_type == "embedding":
@@ -148,7 +150,9 @@ class HFRunner:
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
         self.tokenizer = get_tokenizer(
-            model_path, torch_dtype=torch.dtype, trust_remote_code=True
+            model_path,
+            torch_dtype=torch.dtype,
+            trust_remote_code=self.trust_remote_code,
         )
 
         # Run forward
@@ -300,6 +304,7 @@ class SRTRunner:
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
         mem_fraction_static: float = 0.65,
+        trust_remote_code: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -309,7 +314,7 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             mem_fraction_static=mem_fraction_static,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             is_embedding=not self.is_generation,
             lora_paths=lora_paths,
             max_loras_per_batch=max_loras_per_batch,

@@ -44,6 +44,7 @@ class ModelCase:
     decode_tolerance: float = 5e-2
     rouge_l_tolerance: float = 1
     skip_long_prompt: bool = False
+    trust_remote_code: bool = False
 
 
 # Popular models that run on the CI
@@ -58,7 +59,7 @@ ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
     ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
-    ModelCase("THUDM/glm-4-9b-chat"),
+    ModelCase("THUDM/glm-4-9b-chat", trust_remote_code=True),
     ModelCase("openai-community/gpt2"),
     ModelCase("microsoft/Phi-3-small-8k-instruct"),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
@@ -92,6 +93,7 @@ class TestGenerationModels(unittest.TestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="generation",
+            trust_remote_code=model_case.trust_remote_code,
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -100,6 +102,7 @@ class TestGenerationModels(unittest.TestCase):
             tp_size=model_case.tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",
+            trust_remote_code=model_case.trust_remote_code,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
