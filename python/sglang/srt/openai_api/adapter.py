@@ -1492,7 +1492,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         async_function_with_timeout(
             response_wrapper, timeout_short=30, timeout_long=30 * 60
         ),
-        media_type="text/event-stream",
+        media_type="application/json",
         background=tokenizer_manager.create_abort_task(adapted_request),
     )
 
