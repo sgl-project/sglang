@@ -28,17 +28,11 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
-from sglang.srt.utils import is_hip
 
-is_hip_ = is_hip()
-
-if is_hip_:
+try:
+    from outlines.fsm.json_schema import build_regex_from_schema
+except ImportError:
     from outlines_core.fsm.json_schema import build_regex_from_schema
-else:
-    try:
-        from outlines.fsm.json_schema import build_regex_from_schema
-    except ImportError:
-        from outlines_core.fsm.json_schema import build_regex_from_schema
 
 
 logger = logging.getLogger(__name__)

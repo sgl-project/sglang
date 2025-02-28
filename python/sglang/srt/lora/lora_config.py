@@ -26,6 +26,11 @@ class LoRAConfig:
         self.path = path
         self.hf_config = self.get_lora_config()
         self.target_modules = self.hf_config["target_modules"]
+
+        # TODO: Support more modules
+        if any(module in self.target_modules for module in ["embed_tokens", "lm_head"]):
+            raise ValueError("Not supported yet")
+
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
 

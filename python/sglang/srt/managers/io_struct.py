@@ -568,3 +568,9 @@ class FunctionCallReqInput:
     tool_call_parser: Optional[str] = (
         None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
     )
+
+
+@dataclass
+class VertexGenerateReqInput:
+    instances: List[dict]
+    parameters: Optional[dict] = None

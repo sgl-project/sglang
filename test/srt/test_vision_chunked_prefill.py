@@ -12,7 +12,6 @@ from typing import Union
 
 import numpy as np
 import requests
-from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
@@ -25,6 +24,12 @@ from sglang.test.test_utils import (
 
 class TestVisionChunkedPrefill(unittest.TestCase):
     def prepare_video_messages(self, video_path, max_frames_num=8):
+        # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+        # The following import order will cause Segmentation fault.
+        # import decord
+        # from transformers import AutoTokenizer
+        from decord import VideoReader, cpu
+
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
