@@ -53,12 +53,6 @@ jobs:
     - name: Calculate SHA-256 hashes locally
       run: |
         python scripts/release/calculate_local_hashes.py sgl-kernel --version ${{ steps.get_version.outputs.version }} --dist-dir sgl-kernel/dist --output hash.txt
-        
-    - name: Extract SHA-256 hashes from PyPI as fallback
-      if: failure()
-      run: |
-        pip install requests
-        python scripts/release/extract_pypi_hashes.py sgl-kernel --version ${{ steps.get_version.outputs.version }} --output hash.txt --wait --max-wait-time 300
 
     - name: Upload hash.txt as artifact
       uses: actions/upload-artifact@v3
