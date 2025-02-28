@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_port_available,
+    is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -296,6 +297,9 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        if is_remote_url(self.model_path):
+            self.load_format = "remote"
+
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
@@ -348,6 +352,7 @@ class ServerArgs:
                 "gguf",
                 "bitsandbytes",
                 "layered",
+                "remote",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
