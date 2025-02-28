@@ -5,13 +5,15 @@ python3 -m unittest test_skip_tokenizer_init.TestSkipTokenizerInit.run_decode_st
 
 import json
 import unittest
+from io import BytesIO
 
 import requests
-from transformers import AutoTokenizer
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
 
+from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -174,6 +176,41 @@ class TestSkipTokenizerInit(unittest.TestCase):
 
     def test_simple_decode_stream(self):
         self.run_decode_stream()
+
+    def get_input_ids(self, prompt_text) -> list[int]:
+        input_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"][
+            0
+        ].tolist()
+        return input_ids
+
+
+class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
+    @classmethod
+    def setUpClass(cls):
+        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        response = requests.get(cls.image_url)
+        cls.image = Image.open(BytesIO(response.content))
+        cls.model = "Qwen/Qwen2-VL-2B"
+        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
+        cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--skip-tokenizer-init"],
+        )
+
+    def get_input_ids(self, _) -> list[int]:
+        chat_template = get_chat_template_by_model_path(self.model)
+        text = f"{chat_template.image_token}What is in this picture?"
+        inputs = self.processor(
+            text=[text],
+            images=[self.image],
+            return_tensors="pt",
+        )
+
+        return inputs.input_ids[0].tolist()
 
 
 if __name__ == "__main__":
