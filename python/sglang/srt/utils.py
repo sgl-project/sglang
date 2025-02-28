@@ -1386,7 +1386,6 @@ def get_ip() -> str:
 
 
 def get_open_port() -> int:
-
     port = os.getenv("SGLANG_PORT")
     if port is not None:
         while True:
