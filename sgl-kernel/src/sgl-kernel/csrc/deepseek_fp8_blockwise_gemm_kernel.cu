@@ -66,7 +66,6 @@ void gemm_fp8_fp8_bf16_nt(const torch::Tensor& lhs, const torch::Tensor& lhs_sca
     const uint32_t k_ = rhs.size(1);
     const uint32_t m_ = out.size(0);
     const uint32_t n_ = out.size(1);
-    const uint32_t N = n, K = k;
     //TODO(laixinn): tune configs
     constexpr auto BLOCK_M = 128;
     constexpr auto BLOCK_N = 128;
@@ -80,17 +79,17 @@ void gemm_fp8_fp8_bf16_nt(const torch::Tensor& lhs, const torch::Tensor& lhs_sca
     TORCH_CHECK(n % 64 == 0 && k % 128 == 0)
 
     // Type and shape checks
-    TORCH_CHECK(m == m_ && n == n_ && k == k_)
-    TORCH_CHECK(n > 0 && k > 0)
-    TORCH_CHECK(lhs_scales.size(0) == m && lhs_scales.size(1) == (k + 127) / 128)
-    TORCH_CHECK(rhs_scales.size(0) == (n + 127) / 128 && rhs_scales.size(1) == (k + 127) / 128)
-    TORCH_CHECK(lhs.scalar_type() == torch::kFloat8_e4m3fn && lhs_scales.scalar_type() == torch::kFloat8_e4m3fn)
-    TORCH_CHECK(rhs.scalar_type() == torch::kFloat8_e4m3fn && rhs_scales.scalar_type() == torch::kFloat8_e4m3fn)
-    TORCH_CHECK(out.scalar_type() == torch::kBFloat16)
-    TORCH_CHECK(lhs.is_contiguous() && rhs.is_contiguous() && out.is_contiguous())
+    TORCH_CHECK(m == m_ && n == n_ && k == k_);
+    TORCH_CHECK(n > 0 && k > 0);
+    TORCH_CHECK(lhs_scales.size(0) == m && lhs_scales.size(1) == (k + 127) / 128);
+    TORCH_CHECK(rhs_scales.size(0) == (n + 127) / 128 && rhs_scales.size(1) == (k + 127) / 128);
+    TORCH_CHECK(lhs.scalar_type() == torch::kFloat8_e4m3fn && lhs_scales.scalar_type() == torch::kFloat8_e4m3fn);
+    TORCH_CHECK(rhs.scalar_type() == torch::kFloat8_e4m3fn && rhs_scales.scalar_type() == torch::kFloat8_e4m3fn);
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16);
+    TORCH_CHECK(lhs.is_contiguous() && rhs.is_contiguous() && out.is_contiguous());
 
     // Make a templated GEMM
-    using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
+    using GemmType = Gemm<BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>(n, k);
 
     // Launch kernel
     auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);

@@ -27,15 +27,14 @@ __device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
     return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
 
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup,
           uint32_t kNumTMAMulticast,
           GemmType kGemmType>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
-                uint32_t shape_m,
+                uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                 const __grid_constant__ CUtensorMap tensor_map_a,
                 const __grid_constant__ CUtensorMap tensor_map_b,
                 const __grid_constant__ CUtensorMap tensor_map_scales_a,
@@ -55,14 +54,14 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_SCALES_A_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
-    static constexpr uint32_t SHAPE_K_SCALES = ceil_div(SHAPE_K, BLOCK_K);
+    static constexpr uint32_t SHAPE_K_SCALES = ceil_div(shape_k, BLOCK_K);
     static constexpr uint32_t SMEM_SCALES_B_SIZE = ceil_div<uint32_t>(SHAPE_K_SCALES * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float), sizeof(Barrier)) * sizeof(Barrier);
 
     // Configs
     constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
     constexpr uint32_t kNumThreads = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
     constexpr uint32_t kNumMathThreads = kNumThreads - kNumTMAThreads;
-    constexpr uint32_t kNumIterations = ceil_div(SHAPE_K, kFullKOfAllStages);
+    constexpr uint32_t kNumIterations = ceil_div(shape_k, kFullKOfAllStages);
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_id();
 
@@ -128,7 +127,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     struct DivisibleK {};
     struct NotDivisibleK {};
     auto launch_k_iterations = [](const auto& func) {
-        if constexpr (SHAPE_K % kFullKOfAllStages == 0) {
+        if constexpr (shape_k % kFullKOfAllStages == 0) {
             for (int k_iter = 0; k_iter < kNumIterations; ++ k_iter)
                 func(k_iter, DivisibleK{});
         } else {
@@ -144,7 +143,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(shape_m, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(shape_m, shape_n, grouped_layout);
 
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-group for loading data
@@ -156,7 +155,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 launch_k_iterations([&](int k_iter, auto type) {
                     constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
-                    constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                    constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (shape_k % kFullKOfAllStages) / BLOCK_K;
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
                     #pragma unroll
@@ -175,7 +174,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
                         // Issue TMA B without broadcasting
                         tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                 smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                                 smem_b[s], k_idx, scheduler.get_global_idx<false>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }
 
@@ -206,18 +205,18 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             // Decide the number of scales B to load
-            DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
+            DG_STATIC_ASSERT(shape_n % 8 == 0, "Invalid shape N");
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
             if constexpr (not kMustUseUniformedScaleB) {
                 num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
-                num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
+                num_full_iters = min(shape_n - n_block_idx * BLOCK_N, BLOCK_N) / 8;
             }
             uint32_t num_scales_b = SHAPE_K_SCALES * (num_former_iters >= num_full_iters ? 1 : 2);
 
             // Load B scales with math warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
             if (threadIdx.x >= 32) {
-                auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
+                auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(shape_n, BLOCK_K), 0, 0, m_block_idx);
                 auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
                 #pragma unroll
                 for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
@@ -240,7 +239,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             // Launch MMAs
             launch_k_iterations([&](int k_iter, auto type) {
                 constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
-                constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (shape_k % kFullKOfAllStages) / BLOCK_K;
                 DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
                 #pragma unroll
@@ -339,17 +338,18 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 #endif
 }
 
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
           uint32_t kNumTMAMulticast,
           GemmType kGemmType>
 class Gemm {
 private:
     using Barrier = cuda::barrier<cuda::thread_scope_block>;
+    const uint32_t shape_n;
+    const uint32_t shape_k;
 
 public:
-    Gemm() = default;
+    Gemm(uint32_t n, uint32_t k): shape_n(n), shape_k(k){}
 
     static void run(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     uint32_t shape_m,
@@ -362,9 +362,9 @@ public:
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
         constexpr uint32_t kNumTMAThreads = 128;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
+        auto kernel = fp8_gemm_kernel<BLOCK_M, BLOCK_N, BLOCK_K,
                                       kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
-                                      kNumTMAMulticast, kGemmType>;
+                                      kNumTMAMulticast, kGemmType>(shape_n, shape_k);
         DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
 
         // Cluster launch
@@ -393,19 +393,19 @@ public:
     template <typename T>
     static CUtensorMap make_2d_tma_a_desc(T* global_address, uint32_t shape_m) {
         return make_2d_tma_desc(global_address, Layout::RowMajor,
-                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_K, BLOCK_M, BLOCK_K);
+                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), shape_k, BLOCK_M, BLOCK_K);
     }
 
     template <typename T>
     static CUtensorMap make_2d_tma_b_desc(T* global_address) {
         return make_2d_tma_desc(global_address, Layout::ColMajor,
-                                SHAPE_K, SHAPE_N * (kGemmType != GemmType::Normal ? kNumGroups : 1), BLOCK_K, BLOCK_N);
+                                shape_k, shape_n * (kGemmType != GemmType::Normal ? kNumGroups : 1), BLOCK_K, BLOCK_N);
     }
 
     template <typename T>
     static CUtensorMap make_2d_tma_d_desc(T* global_address, uint32_t shape_m) {
         return make_2d_tma_desc(global_address, Layout::RowMajor,
-                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_N,
+                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), shape_n,
                                 min(BLOCK_M, shape_m), BLOCK_N,
                                 CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
     }
@@ -417,7 +417,7 @@ public:
         shape_m = ceil_div(shape_m, kAlignment) * kAlignment;
 
         return make_2d_tma_desc(global_address, Layout::ColMajor,
-                                shape_m, ceil_div(SHAPE_K, BLOCK_K) * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), BLOCK_M, 1,
+                                shape_m, ceil_div(shape_k, BLOCK_K) * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), BLOCK_M, 1,
                                 CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
     }
 
