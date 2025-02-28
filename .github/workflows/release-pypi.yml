@@ -29,3 +29,25 @@ jobs:
           python3 -m build
           pip install twine
           python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+
+      - name: Get package version
+        id: get_version
+        run: |
+          VERSION=$(grep -o '__version__ = "[^"]*"' python/sglang/version.py | cut -d'"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Wait for PyPI to process the upload
+        run: |
+          echo "Waiting for PyPI to process the upload..."
+          sleep 60
+
+      - name: Extract SHA-256 hashes from PyPI
+        run: |
+          pip install requests
+          python scripts/release/extract_pypi_hashes.py sglang --version ${{ steps.get_version.outputs.version }} --output hash.txt
+
+      - name: Upload hash.txt as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sglang-hashes
+          path: hash.txt
