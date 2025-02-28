@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio;
+use serde_json::Value;
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
@@ -403,25 +404,42 @@ impl Router {
     }
 
     fn get_text_from_request(&self, body: &Bytes, route: &str) -> String {
-        // convert body to json
-        let json = serde_json::from_slice::<serde_json::Value>(body).unwrap();
-
-        if route == "generate" {
-            // get the "text" field
-            let text = json.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            return text.to_string();
-        } else if route == "v1/chat/completions" {
-            // get the messages field as raw text
-            if let Some(messages) = json.get("messages") {
-                // Convert messages back to a string, preserving all JSON formatting
-                return serde_json::to_string(messages).unwrap_or_default();
+        // Convert body to JSON
+        let json: Value = match serde_json::from_slice(body) {
+            Ok(j) => j,
+            Err(_) => {
+                warn!("Failed to parse JSON from request body.");
+                return String::new();
             }
-        } else if route == "v1/completions" {
-            let prompt = json.get("prompt").and_then(|t| t.as_str()).unwrap_or("");
-            return prompt.to_string();
-        }
+        };
 
-        return "".to_string();
+        match route {
+            "/generate" => {
+                // For /generate, always use the "text" field.
+                match json.get("text").and_then(Value::as_str) {
+                    Some(text) => text.to_string(),
+                    None => {
+                        warn!("No 'text' field found in request body for route /generate.");
+                        String::new()
+                    }
+                }
+            }
+            "/v1/chat/completions" | "/v1/completions" => {
+                // For these routes, try "messages", then "prompt", then "text".
+                if let Some(messages) = json.get("messages") {
+                    serde_json::to_string(messages).unwrap_or_default()
+                } else if let Some(prompt) = json.get("prompt").and_then(Value::as_str) {
+                    prompt.to_string()
+                } else {
+                    warn!("Failed to find 'messages', 'prompt' in request body.");
+                    String::new()
+                }
+            }
+            _ => {
+                warn!("Unknown route: {} - defaulting to fallback string", route);
+                String::new()
+            }
+        }
     }
 
     // TODO: return Result<String, String> instead of panicking
