@@ -4,7 +4,44 @@ import json
 import time
 import sys
 
-def extract_hashes(package_name, version=None, max_retries=10, retry_delay=5):
+def wait_for_package_on_pypi(package_name, version, max_wait_time=300, poll_interval=5):
+    """
+    Wait for a specific package version to be available on PyPI.
+    
+    Args:
+        package_name (str): Name of the package
+        version (str): Version of the package to wait for
+        max_wait_time (int): Maximum time to wait in seconds
+        poll_interval (int): Time between polling attempts in seconds
+        
+    Returns:
+        bool: True if the package is available, False otherwise
+    """
+    url = f'https://pypi.org/pypi/{package_name}/{version}/json'
+    start_time = time.time()
+    
+    print(f"Waiting for {package_name} {version} to be available on PyPI...")
+    
+    while time.time() - start_time < max_wait_time:
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                print(f"Package {package_name} {version} is now available on PyPI")
+                return True
+                
+            elapsed = time.time() - start_time
+            remaining = max_wait_time - elapsed
+            print(f"Package not yet available. Retrying in {poll_interval} seconds... (Timeout in {int(remaining)} seconds)")
+            time.sleep(poll_interval)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error checking PyPI: {e}")
+            time.sleep(poll_interval)
+    
+    print(f"Timed out waiting for {package_name} {version} to be available on PyPI")
+    return False
+
+def extract_hashes(package_name, version=None, max_retries=10, retry_delay=5, wait_for_version=False, max_wait_time=300):
     """
     Extract SHA-256 hashes for a package from PyPI.
     
@@ -14,10 +51,17 @@ def extract_hashes(package_name, version=None, max_retries=10, retry_delay=5):
                                 If None, the latest version will be used.
         max_retries (int): Maximum number of retries if the package is not found
         retry_delay (int): Delay between retries in seconds
+        wait_for_version (bool): Whether to wait for the version to be available on PyPI
+        max_wait_time (int): Maximum time to wait for the version in seconds
         
     Returns:
         dict: Dictionary containing the hashes for each file
     """
+    # If we need to wait for a specific version to be available
+    if version and wait_for_version:
+        if not wait_for_package_on_pypi(package_name, version, max_wait_time, retry_delay):
+            return {}
+    
     # PyPI API URL
     url = f'https://pypi.org/pypi/{package_name}/json'
     if version:
@@ -130,10 +174,20 @@ def main():
                        help="Output format (file, changelog, or both)")
     parser.add_argument("--retries", type=int, default=10, help="Maximum number of retries")
     parser.add_argument("--delay", type=int, default=5, help="Delay between retries in seconds")
+    parser.add_argument("--wait", action="store_true", help="Wait for the package to be available on PyPI")
+    parser.add_argument("--max-wait-time", type=int, default=300, 
+                       help="Maximum time to wait for the package to be available on PyPI in seconds")
     
     args = parser.parse_args()
     
-    hashes = extract_hashes(args.package_name, args.version, args.retries, args.delay)
+    hashes = extract_hashes(
+        args.package_name, 
+        args.version, 
+        args.retries, 
+        args.delay, 
+        wait_for_version=args.wait,
+        max_wait_time=args.max_wait_time
+    )
     
     if not hashes:
         print(f"Failed to extract hashes for {args.package_name} {args.version or 'latest'}")
