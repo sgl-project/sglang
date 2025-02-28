@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import json
 import threading
 from functools import partial
 from queue import Queue
@@ -38,21 +39,19 @@ def process_result(que):
 
 
 if __name__ == "__main__":
-    model_name = "sglang_model"
-    prompts = "please introduce yourself"
+    model_name = "Qwen2-7B"
+    prompts = json.dumps([{'role': 'user', 'content': "please introduce yourself"}])
     max_tokens = 512
     temperature = 1.0
     top_p = 1.0
     top_k = 1
     ignore_eos = False
     stream = True
-    bad_words = ["User:", "GPT:"]
 
     res_que = Queue()
 
     process_thread = threading.Thread(target=process_result, args=(res_que,))
     process_thread.start()
-
     with grpcclient.InferenceServerClient("0.0.0.0:33337") as client:
         inputs = [
             prepare_tensor("prompt", np.array([prompts.encode()], dtype=np.object_)),
@@ -62,7 +61,6 @@ if __name__ == "__main__":
             prepare_tensor("top_k", np.array([top_k], dtype=np.int32)),
             prepare_tensor("ignore_eos", np.array([ignore_eos], dtype=np.bool_)),
             prepare_tensor("stream", np.array([stream], dtype=np.bool_)),
-            prepare_tensor("bad_words", np.array(bad_words, dtype=np.object_)),
         ]
 
         # async_stream

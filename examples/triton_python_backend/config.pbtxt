@@ -54,26 +54,20 @@ input [
     optional: true
   },
   {
-    name: "repetition_penalty"
+    name: "presence_penalty"
     data_type: TYPE_FP64
     dims: [ 1 ]
     optional: true
   },
   {
-    name: "stop_words"
-    data_type: TYPE_STRING
-    dims: [ -1 ]
+    name: "frequency_penalty"
+    data_type: TYPE_FP64
+    dims: [ 1 ]
     optional: true
   },
   {
-    name: "bad_words"
-    data_type: TYPE_STRING
-    dims: [ -1 ]
-    optional: true
-  },
-  {
-    name: "skip_special_tokens"
-    data_type: TYPE_BOOL
+    name: "repetition_penalty"
+    data_type: TYPE_FP64
     dims: [ 1 ]
     optional: true
   }
@@ -88,15 +82,31 @@ output [
 ]
 
 parameters {
-  key: "model_name"
+  key: "tp"
   value: {
-    string_value: "llama2"
+    string_value: "1"
   }
 }
 
 parameters {
-  key: "tp"
+  key: "is_chat"
   value: {
-    string_value: "1"
+    # if True, use chat_completion API
+    # if False, use completion API，by default
+    string_value: "True"
+  }
+}
+
+parameters {
+  key: "enable_prefix_caching"
+  value: {
+    string_value: "True"
+  }
+}
+
+parameters {
+  key: "quant_policy"
+  value: {
+    string_value: "None"
   }
 }

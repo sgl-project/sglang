@@ -1,5 +1,3 @@
-import sys
-
 import asyncio
 import json
 import os
@@ -12,6 +10,15 @@ import torch
 import triton_python_backend_utils as pb_utils
 
 from sglang.api import Engine
+from sglang.srt.openai_api.protocol import (
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
+    ChatMessage,
+    DeltaMessage,
+    UsageInfo
+)
 
 
 class TritonPythonModel:
@@ -26,13 +33,13 @@ class TritonPythonModel:
         parameters = self.model_config["parameters"]
 
         self.is_chat = parameters["is_chat"]["string_value"].lower() == "true"
-        self.app_key = parameters["appkey"]["string_value"].lower()
         enable_prefix_caching = (
             parameters["enable_prefix_caching"]["string_value"].lower() == "true"
         )
         tp_size = torch.cuda.device_count()
 
-        quant_policy = int(parameters["quant_policy"]["string_value"])
+        quant_policy_value = parameters["quant_policy"]["string_value"].lower()
+        quant_policy = None if quant_policy_value == "none" else quant_policy_value
 
         # load engine
         model_path = os.path.join(
@@ -77,28 +84,6 @@ class TritonPythonModel:
                 except asyncio.CancelledError:
                     self.logger.log_info("Unfinished task is cancelled")
 
-    def build_no_stream_json(
-        self, answer, request_id, input_len, output_len, finish_reason
-    ):
-        # Build non-streaming JSON response
-        response = {
-            "choices": [
-                {
-                    "finish_reason": finish_reason,
-                    "index": 0,
-                    "message": {"content": answer},
-                }
-            ],
-            "model": self.triton_model_name,
-            "id": request_id,
-            "usage": {
-                "completion_tokens": output_len,
-                "prompt_tokens": input_len,
-                "total_tokens": input_len + output_len,
-            },
-        }
-        return json.dumps(response, ensure_ascii=False)
-
     def _get_optional_configs(self, request):
         optional_configs = {}
         config_names = [
@@ -126,7 +111,7 @@ class TritonPythonModel:
             # Construct prompt
             if self.is_chat:
                 messages = pb_utils.get_input_tensor_by_name(
-                    request, "messages"
+                    request, "prompt"
                 ).as_numpy()[0]
                 if isinstance(messages, bytes):
                     messages = messages.decode("utf-8")
@@ -137,7 +122,7 @@ class TritonPythonModel:
                     add_generation_prompt=True,
                 )
             else:
-                text = pb_utils.get_input_tensor_by_name(request, "text").as_numpy()[0]
+                text = pb_utils.get_input_tensor_by_name(request, "prompt").as_numpy()[0]
                 if isinstance(text, bytes):
                     text = text.decode("utf-8")
                 prompt = text
@@ -152,11 +137,6 @@ class TritonPythonModel:
             optional_configs = self._get_optional_configs(request)
 
             outputs = []
-            input_token_len = 0
-            finish_reason = "None"
-            output_token_len = 0
-            is_first = True
-            is_second = False
             sampling_params = {"max_new_tokens": max_tokens, **optional_configs}
             gen = await self.engine.async_generate(
                 prompt=prompt,
@@ -164,56 +144,102 @@ class TritonPythonModel:
                 stream=stream,
             )
             if stream:
-                async for output in gen:
-                    if is_first and stream:
-                        is_second = True
-
-                    if is_second and is_first is False and stream:
-                        is_second = False
-
+                is_first = True
+                stream_buffer = ""
+                async for content in gen:
+                    index = content.get("index", 0)
+                    finish_reason = content["meta_info"]["finish_reason"]
+                    if is_first:
+                        # First chunk with role
+                        is_first = False
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(role="assistant", content=""),
+                            finish_reason=(
+                                finish_reason["type"] if finish_reason else ""
+                            ),
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                        )
+                        response = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            choices=[choice_data],
+                            model=self.triton_model_name,
+                        ).model_dump_json()
+                    else:
+                        text = content["text"]
+                        delta = text[len(stream_buffer):]
+                        stream_buffer = stream_buffer + delta
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(role="assistant", content=delta),
+                            finish_reason=(
+                                finish_reason["type"] if finish_reason else ""
+                            ),
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                        )
+                        response = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            choices=[choice_data],
+                            model=self.triton_model_name,
+                        ).model_dump_json()
                     # for stream mode, send the partial response one by one
                     triton_output_tensor = pb_utils.Tensor(
-                        "answer", np.asarray(output["text"], dtype=np.object_)
+                        "response", np.asarray(response, dtype=np.object_)
                     )
                     resp = pb_utils.InferenceResponse(
                         output_tensors=[triton_output_tensor]
                     )
-                    if output["meta_info"]["finish_reason"] is not None:
+                    if finish_reason is not None:
                         response_sender.send(
                             resp, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
                         )
                     else:
                         response_sender.send(resp)
-
-                    if is_first:
-                        is_first = False
             else:
-                if type(gen) == list:
-                    output = gen[0]
-                else:
-                    output = gen
-                outputs.append(output["text"])
-                input_token_len = output["meta_info"]["prompt_tokens"]
-                output_token_len = output["meta_info"]["completion_tokens"]
-                if output["meta_info"]["finish_reason"] is not None:
-                    finish_reason = output["meta_info"]["finish_reason"]
+                content = gen
+                outputs.append(content["text"])
+                prompt_tokens = content["meta_info"]["prompt_tokens"]
+                completion_tokens = content["meta_info"]["completion_tokens"]
+                finish_reason = content["meta_info"]["finish_reason"]
                 # for non-stream mode, send concatenated response at one time
-                text_outputs = self.build_no_stream_json(
-                    "".join(outputs),
-                    request_id,
-                    input_token_len,
-                    output_token_len,
-                    finish_reason,
+                choice = ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        content="".join(outputs),
+                    ),
+                    finish_reason=finish_reason["type"] if finish_reason else "",
+                    matched_stop=(
+                        finish_reason["matched"]
+                        if finish_reason and "matched" in finish_reason
+                        else None
+                    ),
                 )
+                response = ChatCompletionResponse(
+                    id=content["meta_info"]["id"],
+                    model=self.triton_model_name,
+                    choices=[choice],
+                    usage=UsageInfo(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    ),
+                ).model_dump_json()
                 triton_output_tensor = pb_utils.Tensor(
-                    "answer", np.asarray(text_outputs, dtype=np.object_)
+                    "response", np.asarray(response, dtype=np.object_)
                 )
                 resp = pb_utils.InferenceResponse(output_tensors=[triton_output_tensor])
                 response_sender.send(
                     resp, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
                 )
-                if is_first:
-                    is_first = False
         except Exception as e:
             self.logger.log_info(
                 f"Error when processing request: {traceback.format_exc()}"
@@ -227,7 +253,7 @@ class TritonPythonModel:
                     f"Error when processing request: {traceback.format_exc()}"
                 )
             triton_output_tensor = pb_utils.Tensor(
-                "answer", np.asarray(["N/A"], dtype=np.object_)
+                "response", np.asarray(["N/A"], dtype=np.object_)
             )
             resp = pb_utils.InferenceResponse(
                 output_tensors=[triton_output_tensor], error=error
