@@ -65,7 +65,7 @@ class DeepSeekR1ReasoningParser(BaseReasoningParser):
     """
 
     def __init__(self):
-        super().__init__("<think> ", "</think> ")
+        super().__init__("<think>", "</think>")
 
 
 class ReasoningParser:
