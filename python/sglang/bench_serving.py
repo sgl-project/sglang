@@ -480,7 +480,7 @@ def request_sglang_generate_grpc(
         with grpcclient.InferenceServerClient(api_url) as client:
             inputs = [
                 prepare_tensor(
-                    "text" if isinstance(prompt, str) else "messages",
+                    "prompt",
                     np.array(
                         (
                             [prompt.encode()]

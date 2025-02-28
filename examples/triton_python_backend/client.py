@@ -40,7 +40,7 @@ def process_result(que):
 
 if __name__ == "__main__":
     model_name = "Qwen2-7B"
-    prompts = json.dumps([{'role': 'user', 'content': "please introduce yourself"}])
+    prompts = json.dumps([{"role": "user", "content": "please introduce yourself"}])
     max_tokens = 512
     temperature = 1.0
     top_p = 1.0
