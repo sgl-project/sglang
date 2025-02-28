@@ -1106,14 +1106,14 @@ def v1_chat_generate_response(
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             model = request[idx].model
+            separate_reasoning = request[idx].separate_reasoning
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             model = request.model
+            separate_reasoning = request.separate_reasoning
 
-        if reasoning_parser or (
-            request.separate_reasoning and is_reasoning_model(model)
-        ):
+        if reasoning_parser or (separate_reasoning and is_reasoning_model(model)):
             try:
                 parser = ReasoningParser(model, True)
                 parse_result = parser.parse_non_stream(text)
