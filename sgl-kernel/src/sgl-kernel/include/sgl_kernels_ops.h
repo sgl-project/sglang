@@ -157,3 +157,8 @@ void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q, at::Te
 void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& weights,
                          const std::vector<torch::Tensor>& outputs, const torch::Dtype& out_dtype,
                          int64_t cublas_handle, int64_t cuda_stream);
+
+// deepseek gemm
+torch::Tensor fp8_blockwise_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                                      const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                                      const torch::Dtype& out_dtype)
