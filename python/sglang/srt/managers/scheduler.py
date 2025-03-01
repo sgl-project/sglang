@@ -683,6 +683,8 @@ class Scheduler:
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
+            req.origin_input_ids = [0]
+            req.sampling_params.max_new_tokens = 0
             self.waiting_queue.append(req)
             return
 
@@ -708,6 +710,7 @@ class Scheduler:
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
             or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
         ):
             assert self.grammar_backend is not None
             if req.sampling_params.json_schema is not None:
@@ -716,6 +719,8 @@ class Scheduler:
                 key = ("regex", req.sampling_params.regex)
             elif req.sampling_params.ebnf is not None:
                 key = ("ebnf", req.sampling_params.ebnf)
+            elif req.sampling_params.structural_tag:
+                key = ("structural_tag", req.sampling_params.structural_tag)
 
             req.grammar = self.grammar_backend.get_cached_value(key)
             if not req.grammar:
@@ -1755,8 +1760,9 @@ class Scheduler:
         success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
-            flash_cache_success = self.flush_cache()
-            assert flash_cache_success, "Cache flush failed after updating weights"
+            if recv_req.flush_cache:
+                flash_cache_success = self.flush_cache()
+                assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromTensorReqOutput(success, message)

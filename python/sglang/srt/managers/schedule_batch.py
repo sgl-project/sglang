@@ -67,6 +67,7 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
+    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
 }
 
 logger = logging.getLogger(__name__)

@@ -271,10 +271,18 @@ class Engine:
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        """Update weights from distributed source."""
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
+        to avoid duplicated operations such as clearing cache."""
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
+            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors),
+            load_format=load_format,
+            flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
@@ -384,7 +392,10 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
         )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
-            gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+            gpu_id = (
+                server_args.base_gpu_id
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),

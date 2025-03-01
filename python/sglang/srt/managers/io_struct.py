@@ -449,6 +449,8 @@ class UpdateWeightsFromDistributedReqOutput:
 @dataclass
 class UpdateWeightsFromTensorReqInput:
     serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    load_format: Optional[str]
+    flush_cache: bool
 
 
 @dataclass
@@ -560,7 +562,7 @@ class Tool:
 
 
 @dataclass
-class FunctionCallReqInput:
+class ParseFunctionCallReq:
     text: str  # The text to parse.
     tools: List[Tool] = field(
         default_factory=list
