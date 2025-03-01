@@ -74,6 +74,7 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -1045,7 +1046,12 @@ def v1_chat_generate_request(
 
 
 def v1_chat_generate_response(
-    request, ret, to_file=False, cache_report=False, tool_call_parser=None
+    request,
+    ret,
+    to_file=False,
+    cache_report=False,
+    tool_call_parser=None,
+    reasoning_parser=None,
 ):
     choices = []
 
@@ -1091,11 +1097,21 @@ def v1_chat_generate_response(
         else:
             choice_logprobs = None
 
-        finish_reason = ret_item["meta_info"]["finish_reason"]
-
-        tool_calls = None
+        reasoning_content = None
         text = ret_item["text"]
+        if reasoning_parser:
+            try:
+                parser = ReasoningParser(reasoning_parser)
+                reasoning_content, text = parser.parse_non_stream(text)
+            except Exception as e:
+                logger.error(f"Exception: {e}")
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "Failed to parse reasoning content",
+                )
 
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+        tool_calls = None
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
@@ -1131,7 +1147,10 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": ret_item["text"] if tool_calls is None else None,
+                    "content": text if tool_calls is None else None,
+                    "reasoning_content": (
+                        reasoning_content if tool_calls is None else None
+                    ),
                     "tool_calls": tool_calls,
                 },
                 "logprobs": choice_logprobs,
@@ -1147,7 +1166,8 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=ret_item["text"] if tool_calls is None else None,
+                    content=text if tool_calls is None else None,
+                    reasoning_content=reasoning_content if tool_calls is None else None,
                     tool_calls=tool_calls,
                 ),
                 logprobs=choice_logprobs,
@@ -1215,6 +1235,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
     if adapted_request.stream:
         parser_dict = {}
+        reasoning_parser_dict = {}
 
         async def generate_stream_resp():
             is_firsts = {}
@@ -1309,6 +1330,16 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
+                    reasoning_content = None
+                    if tokenizer_manager.server_args.enable_reasoning:
+                        if index not in reasoning_parser_dict:
+                            reasoning_parser_dict[index] = ReasoningParser(
+                                tokenizer_manager.server_args.reasoning_parser
+                            )
+                        reasoning_content, delta = reasoning_parser_dict[
+                            index
+                        ].parse_stream_chunk(delta)
+
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:
                             parser_dict[index] = FunctionCallParser(
@@ -1320,11 +1351,14 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         # parse_increment => returns (normal_text, calls)
                         normal_text, calls = parser.parse_stream_chunk(delta)
 
-                        # 1) if there's normal_text, output it as normal content
+                        # 1) if there's normal_text, output it as normal content, the reasoning content is also included
                         if normal_text:
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(content=normal_text),
+                                delta=DeltaMessage(
+                                    content=normal_text,
+                                    reasoning_content=reasoning_content,
+                                ),
                                 finish_reason=(
                                     finish_reason["type"] if finish_reason else ""
                                 ),
@@ -1393,7 +1427,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         # No tool calls => just treat this as normal text
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(content=delta),
+                            delta=DeltaMessage(
+                                content=delta, reasoning_content=reasoning_content
+                            ),
                             finish_reason=(
                                 finish_reason["type"] if finish_reason else ""
                             ),
@@ -1463,6 +1499,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+        reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
     )
 
     return response
