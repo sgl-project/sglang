@@ -23,10 +23,10 @@ The `/generate` endpoint accepts the following parameters in JSON format. For in
 ### Core Parameters
 
 * `max_new_tokens`: The maximum output length measured in tokens. `int = 128`
-* `stop`: One or multiple [stop words](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#let_the_model_know_when_to_stop). Generation will stop if one of these words is sampled. `Optional[Union[str, List[str]]] = None`
+* `stop`: One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled. `Optional[Union[str, List[str]]] = None`
 * `stop_token_ids`: Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled. `Optional[List[int]] = []`
-* `temperature`: [Temperature](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) when sampling the next token. `temperature = 0` corresponds to greedy sampling, higher temperature leads to more diversity. `float = 1.0`
-* `top_p`: [Top-p](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens. `top_p: float = 1.0`
+* `temperature`: [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, higher temperature leads to more diversity. `float = 1.0`
+* `top_p`: [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens. `top_p: float = 1.0`
 * `top_k`: [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens. `int = -1`
 * `min_p`: [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`. `float = 0.0`
 
