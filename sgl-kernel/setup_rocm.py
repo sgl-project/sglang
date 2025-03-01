@@ -38,12 +38,14 @@ def _get_version():
 operator_namespace = "sgl_kernels"
 include_dirs = [
     root / "src" / "sgl-kernel" / "include",
+    root / "src" / "sgl-kernel" / "include" / "impl",
     root / "src" / "sgl-kernel" / "csrc",
 ]
 
 sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
+    "src/sgl-kernel/csrc/per_token_group_quant_fp8.cu",
 ]
 
 cxx_flags = ["-O3"]

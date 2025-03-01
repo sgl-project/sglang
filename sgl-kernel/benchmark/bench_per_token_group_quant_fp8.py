@@ -81,7 +81,11 @@ def triton_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
-    fp8_max = finfo.max
+
+    if is_hip_:
+        fp8_max = 224
+    else:
+        fp8_max = finfo.max
 
     fp8_min = -fp8_max
 
@@ -127,7 +131,11 @@ def sglang_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
-    fp8_max = finfo.max
+
+    if is_hip_:
+        fp8_max = 224
+    else:
+        fp8_max = finfo.max
 
     fp8_min = -fp8_max
 
